@@ -1,0 +1,30 @@
+.git
+.git/**
+.codex
+.agents
+HexClient
+# Records are generated at startup from HEX_GAMEDATA when needed.
+Records/
+HexPlugin/
+BepInEx/
+experimental/
+docs/generated/
+generated/
+*.dll
+*.zip
+*.swp
+.mimocode/
+.env
+.env.*
+__pycache__
+**/__pycache__
+*.pyc
+# Runtime database sidecars and local extraction mounts are not part of the
+# Docker build context.
+*.db
+*.db-shm
+*.db-wal
+/mnt/
+/tmp/
+hex-state
+*.log

@@ -1,0 +1,2 @@
+;0;0;6;SessionId;1;1;1;m_UID64;2;2;0;2a00000000000000;SessionName;3;3;0;11;TestSessionMinimumPlayerCount;4;4;0;02000000;MaximumPlayerCount;5;4;0;02000000;EncounterData;6;5;0;JoinInsteadOfReconnect;7;6;0;0Game.Shared.SessionState;Game.Shared.UID;System.UInt64;System.String;System.Int32;Game.Shared.SessionStateEncounterData;System.Boolean
+204;47;31;32;34;34;20;30

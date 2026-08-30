@@ -1,0 +1,2 @@
+;0;0;1;Items;1;1;0;1;0;2;2;6;Id;3;3;0;e903000000000000;TemplateID;4;4;1;guid;5;5;0;36;abc12345-1234-5678-9012-abcdef000001BoundToProfile;6;6;0;1ItemQuantity;7;7;0;03000000;ClaimDate;8;8;0;19;01/01/0001 00:00:00EscrowStatus;9;9;0;5;CleanTest.Items;System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits;Game.Shared.Domain.inventory_bits;System.UInt64;Game.Shared.ResourceId;System.Guid;System.Boolean;System.Int32;System.DateTime;System.String
+236;229;215;26;67;50;22;28;38;26

@@ -1,0 +1,2 @@
+;0;0;1;StoreItems;1;1;0;0;Game.Shared.Network.Escrow.GetStoreItemsResponseArgs;System.Collections.Generic.List`1#Game.Shared.StoreItem;Game.Shared.StoreItem;System.Byte[];System.UInt64;Game.Shared.ResourceId;System.Guid;System.Int32;System.String;System.Boolean
+26;19

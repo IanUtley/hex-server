@@ -1,0 +1,2 @@
+;0;0;6;MyInt;1;1;0;2a000000;MyUlong;2;2;0;d204000000000000;MyBool;3;3;0;1MyBoolF;4;3;0;0MyGuid;5;4;0;36;12345678-1234-5678-9012-123456789012MyStr;6;5;0;5;helloTest.Basic;System.Int32;System.UInt64;System.Boolean;System.Guid;System.String
+159;21;31;14;15;52;19
