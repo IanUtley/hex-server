@@ -25,12 +25,13 @@ jobs:
       - name: Verify protocol golden files
         run: python3 tests/verify_goldens.py
 
-      - name: Run focused regression scripts
-        run: |
-          python3 tests/tests_conditions.py
-          python3 tests/tests_leaves.py
-          python3 tests/tests_store.py
-          python3 tests/tests_card_coverage.py
+      - name: Compile Python sources
+        run: python3 -m compileall -q .
+
+      # These regression scripts require the local hconnect.db or a complete
+      # Records source, neither of which is committed to the public project.
+      # Run them locally or during Docker first-database bootstrap instead of
+      # making publication depend on private runtime/client data.
 
       - name: Check release version
         if: startsWith(github.ref, 'refs/tags/v')
