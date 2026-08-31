@@ -203,6 +203,20 @@ In WSL, use the address from `hostname -I`, not `127.0.0.1`, unless the game
 client is running in the same network namespace. See [README.md](README.md)
 for the Windows and Docker examples.
 
+For a local Docker Desktop server on the same Windows PC, the default client
+installation can be updated from Command Prompt:
+
+```cmd
+set "HEX_GAME=C:\Program Files (x86)\Steam\steamapps\common\HEX SHARDS OF FATE"
+copy "%HEX_GAME%\config.ini" "%HEX_GAME%\config.ini.backup"
+notepad "%HEX_GAME%\config.ini"
+```
+
+Set the existing `[SystemSettings]` values to `127.0.0.1:9933` for
+`GameServerIP` and `http://127.0.0.1:8081/...` for `CZEAuthUrl`, `CZEPayUrl`,
+and `NewsEventsURL`. Run Command Prompt as Administrator if the installation
+under `Program Files (x86)` is not writable, then fully restart the client.
+
 ### Ports
 - 9933 — HConnect game server
 - 8081 — HTTP proxy (Steam auth + news)
