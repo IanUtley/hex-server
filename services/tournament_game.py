@@ -454,6 +454,10 @@ def _pvp_sync_view_to_state(state, view, player_pid, opponent_pid):
             (f"sp_{opponent_pid}", "ai_spell_points", opponent_pid)):
         if view_key in view:
             state[key] = int(view.get(view_key, state.get(key, 0)) or 0)
+    if "briar_legions_entered" in view:
+        state["briar_legions_entered"] = int(
+            view.get("briar_legions_entered",
+                     state.get("briar_legions_entered", 0)) or 0)
     if "player_threshold" in view:
         state[f"thresh_{player_pid}"] = dict(view.get("player_threshold") or {})
     if "ai_threshold" in view:
@@ -2217,7 +2221,10 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
                 ab_list = _js.loads(ab_row[0])
             except Exception:
                 ab_list = []
-        if not ab_list:
+        # An explicit empty instance list is meaningful: a ONE-SHOT ability
+        # has been consumed and must not be restored from the canonical card
+        # template.  Only repair genuinely missing legacy instance data.
+        if ab_row is None or ab_row[0] is None:
             trow = _db.execute(
                 "SELECT abilities_json FROM card_templates WHERE guid=?",
                 (tpl_guid,)).fetchone()
@@ -4055,6 +4062,8 @@ def pvp_handle_transaction(handler, session, inner_bytes):
     # Route both spellings before generic ability activation; otherwise the
     # picker response falls through and is misread as a champion activation.
     pending_state = pvp_load_state(session) or {}
+    if pending_state.get("pending_choice") and b"m_UID64" in inner_bytes:
+        return _pvp_resolve_choice(handler, session, inner_bytes, my_pid)
     is_ability_data = b"AbilityActivationData" in inner_bytes
     if (b"SetAbilityActivationDataTransaction" in inner_bytes or
             (is_ability_data and
@@ -4475,6 +4484,93 @@ def pvp_handle_transaction(handler, session, inner_bytes):
         _send_pvp_packet(turn_h, session, gg, my_uid, "greenlight-after-play")
     state["priority_pid"] = my_pid
     pvp_save_state(session, state)
+    return True
+
+
+def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
+    """Resolve a private ChooseAndPlay choice and resume its parent BOM."""
+    import battle_engine as _be
+    from abilities.framework.effects.choices import (
+        CHOOSE_AND_PLAY_ABILITY, extract_card_uids, play_choice_card,
+        resolve_choice_card_abilities)
+    state = pvp_load_state(session) or {}
+    pending = state.get("pending_choice")
+    if not pending:
+        return False
+    selected = extract_card_uids(inner_bytes)
+    legal = {int(uid) for uid in pending.get("choice_uids", [])}
+    chosen_uid = next((uid for uid in reversed(selected) if int(uid) in legal),
+                      None)
+    owner_id = int(pending.get("owner_id", 0))
+    if owner_id != int(my_pid) or chosen_uid is None:
+        log_req(f"    PvP choice answer invalid: pid={my_pid} "
+                f"chosen={chosen_uid} owner={owner_id}")
+        return True
+
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        return True
+    opponent_id = next(pid for pid in pids if int(pid) != owner_id)
+    pl_t = _ge.UID.make(244, owner_id)
+    ai_t = _ge.UID.make(244, opponent_id)
+    view = _pvp_fra_view(state, owner_id, opponent_id)
+    view.pop("pending_choice", None)
+    view.pop("resolution_paused", None)
+    g = _ge.Game(int(session.session_id), pl_t, ai_t)
+    _pvp_populate_game_state(g, state, owner_id, opponent_id)
+    if not play_choice_card(g, session, _db, handler, pl_t, ai_t, view,
+                            chosen_uid, owner_id):
+        log_req(f"    PvP choice card no longer selectable: {chosen_uid}")
+        state["pending_choice"] = pending
+        state["resolution_paused"] = True
+        pvp_save_state(session, state)
+        return True
+    resolve_choice_card_abilities(
+        g, session, _db, handler, pl_t, ai_t, view, chosen_uid,
+        pending.get("source_uid"), owner_id)
+
+    from abilities.framework.resolution import resolve_ability
+    target_map = {int(key): value for key, value in
+                  (pending.get("target_map") or {}).items()}
+    resolve_ability(
+        handler, g, session, _db, pl_t, ai_t, view,
+        pending["ability_guid"], pending.get("source_uid"), owner_id,
+        target_map=target_map, variables=pending.get("variables") or {},
+        resume_from_order=int(pending.get("resume_effect_order", 0)))
+    state["stack"] = view.get("stack") or []
+    state["stack_player_passed"] = False
+    state["stack_ai_passed"] = False
+    _pvp_sync_view_to_state(state, view, owner_id, opponent_id)
+    pvp_save_state(session, state)
+    _pvp_send_same_events(session, g, pl_t, ai_t)
+
+    if state.get("pending_choice"):
+        # The resumed second DoubleChoice prompt was sent privately by the
+        # shared prompt helper. Only the selected card's public move was sent
+        # above; leave priority in the picker until the next answer.
+        log_req(f"    PvP choice selected: {hex(int(chosen_uid))}; "
+                "second choice pending")
+        return True
+
+    g2 = _ge.Game(int(session.session_id), pl_t, ai_t)
+    g2.push_chain_empty()
+    state["priority_pid"] = int(state.get("turn_pid") or owner_id)
+    pvp_save_state(session, state)
+    turn_pid = int(state["priority_pid"])
+    turn_handler = player_handlers.get(turn_pid)
+    if turn_handler is not None:
+        turn_uid = _ge.UID.make(244, turn_pid)
+        other_uid = _ge.UID.make(244, opponent_id if turn_pid == owner_id
+                                  else owner_id)
+        g2 = _ge.Game(int(session.session_id), turn_uid, other_uid)
+        g2.push_green_light(turn_uid, _ge.EPriorityContext.Normal)
+        _send_pvp_packet(turn_handler, session, g2, turn_uid,
+                         "greenlight-after-choice")
+    if state.get("phase") in (_ge.ETurnPhases.FirstMainPhase,
+                               _ge.ETurnPhases.SecondMainPhase):
+        pvp_push_main_phase_options(session, state)
+    log_req(f"    PvP choice selected: {hex(int(chosen_uid))}; "
+            "choice sequence complete")
     return True
 
 
@@ -5468,7 +5564,8 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
     # those continuation markers so this resolver does not immediately send
     # the ordinary chain-empty/priority packet over the picker.
     persisted = pvp_load_state(session) or {}
-    for _pending_key in ("pending_trigger", "pending_deck_search"):
+    for _pending_key in ("pending_trigger", "pending_deck_search",
+                         "pending_choice"):
         if persisted.get(_pending_key):
             state[_pending_key] = persisted[_pending_key]
     chain_empty = _be.stack_empty(state)
@@ -5476,6 +5573,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
         (state.get("pending_deck_search") or {}).get("kind")
         == "revealed_troop")
     pending_trigger = bool(state.get("pending_trigger"))
+    pending_choice = bool(state.get("pending_choice"))
     # Shards of Fate / Adaptable Infusion Device sends a private class-39
     # deck picker to the controller.  Its picker packet already owns the
     # next green-light; sending the normal chain-empty/options packet here
@@ -5483,7 +5581,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
     pending_deck_search = bool(state.get("pending_deck_search"))
     _pvp_log_stack(state, "resolve")
     if chain_empty and not (pending_revealed_choice or pending_deck_search
-                            or pending_trigger):
+                            or pending_trigger or pending_choice):
         g.push_chain_empty()
     pvp_save_state(session, state)
     # State-based deaths: when the stack empties, troops at <=0 effective
@@ -5527,6 +5625,12 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
         # which is why the target cursor appeared briefly and then vanished.
         pvp_save_state(session, state)
         log_req("    PvP chain paused for triggered target choice")
+        return True
+    if chain_empty and pending_choice:
+        # The private picker packet was sent by _prompt_choice_cards. Do not
+        # replace it with a chain-empty/normal-priority packet.
+        pvp_save_state(session, state)
+        log_req("    PvP chain paused for card choice")
         return True
     # Chain damage can kill a champion (e.g. burn / Lifedrain) — end the game
     # properly instead of continuing into the next priority handoff.
@@ -5622,6 +5726,8 @@ def _pvp_fra_view(state, attacker_pid, defender_pid):
         "ai_charges": int(state.get(f"chg_{defender_pid}", 0)),
         "player_spell_points": int(state.get(f"sp_{attacker_pid}", 0)),
         "ai_spell_points": int(state.get(f"sp_{defender_pid}", 0)),
+        "briar_legions_entered": int(
+            state.get("briar_legions_entered", 0)),
         # Chain/stack aliased to the persisted state so trigger pushes land in
         # the DB-persisted dict (pvp_save_state persists session.turn_order).
         "stack": state.setdefault("stack", []),

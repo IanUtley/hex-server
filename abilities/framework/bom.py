@@ -18,6 +18,8 @@ from .effects.damage import deal_damage
 from .effects.registry import _LEAFS, leaf_register
 from .effects.tokens import summon_token, conscript_cards, load_player_deck
 from .effects.counters import card_counters
+from .effects import combat as _combat  # register combat effects
+from .effects import choices as _choices  # register card-choice effects
 from .effects import utility as _utility  # register generic client effects
 from .fields import (ability_record, effect_field, effect_template,
                      effect_template_value, modifier_metadata)
@@ -100,29 +102,40 @@ def _leaf_draw(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, para
     """Draw for the resolved target (Oracle Song: "Target champion draws 2
     cards") or the caster when there is no target."""
     import re as _re
-    count = 1
-    text = _ability_text(db, bstate) or ""
-    m = _re.search(r'draw[s]?\s+(\w+)\s+card', text.lower())
-    if m:
-        g = m.group(1)
-        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-        count = words.get(g, int(g) if g.isdigit() else count)
+    # The client calls m_InputValue.GetValue(effectInstance), including when
+    # that value is zero.  Do not use the displayed ability text as the
+    # primary source: dynamic abilities intentionally have no literal number
+    # in their localized text.
+    template = effect_template(effect_guid) or {}
+    count = None
+    if "m_InputValue" in template:
+        count = effect_field(
+            db, bstate, effect_guid, "m_InputValue", default=0)
     if param:
         try:
             d = json.loads(param)
-            count = int(d.get("count", count))
+            if count is None:
+                count = int(d.get("count", 1))
         except Exception:
             pass
-    typed_count = effect_field(
-        db, bstate, effect_guid, "m_InputValue", default=0)
-    if typed_count > 0:
-        count = typed_count
+    if count is None:
+        # Compatibility for databases built before typed effect records were
+        # loaded.  This is deliberately the last fallback.
+        count = 1
+        text = _ability_text(db, bstate) or ""
+        m = _re.search(r'draw[s]?\s+(\w+)\s+card', text.lower())
+        if m:
+            g = m.group(1)
+            words = {"one": 1, "two": 2, "three": 3, "four": 4,
+                     "five": 5, "six": 6, "seven": 7, "eight": 8,
+                     "nine": 9, "ten": 10}
+            count = words.get(g, int(g) if g.isdigit() else count)
+    count = max(0, int(count))
     target = (bstate or {}).get("player_spell_target")
     owner = None
     if target is not None:
         owner = _deck_owner_for_target(db, handler, session, bstate, target)
-    for _ in range(max(1, count)):
+    for _ in range(count):
         if owner == 0:
             import ai as _ai
             _ai.ai_draw_card(handler, game, session, ai_t, bstate)
@@ -202,7 +215,50 @@ def _leaf_put_top_into_hand(game, session, db, handler, pl_t, ai_t, bstate, effe
 
 @leaf_register("DiscardCardAbilityEffectTemplate")
 def _leaf_discard(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    return "discard a card (paid as activation cost)"
+    """Discard the card selected by the ability target instance.
+
+    ``DiscardCardAbilityEffectTemplate`` is also used for random and
+    multi-card effects.  The resolver supplies one metadata-legal target at a
+    time, so this leaf must only move that target and must not infer a card
+    from the ability's display text.  The same path is used for PvP, PvE, and
+    champion/talent abilities.
+    """
+    target = _resolve_leaf_target(bstate)
+    if target is None:
+        return "discard: no target"
+    row = db.execute(
+        "SELECT template_guid, card_template_id, user_id, location, "
+        "card_state FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session.session_id, int(target))).fetchone()
+    if not row:
+        return f"discard: target {hex(int(target))} not found"
+    # The client discard operation is only meaningful for a card in a card
+    # collection such as hand/choosing.  A stale target must not silently
+    # discard a troop from play.
+    if str(row[3]).lower() not in ("hand", "choosing"):
+        return f"discard: target {hex(int(target))} is in {row[3]}"
+    from ._shared import owner_uid, card_collection_for_location
+    from db import db_discard_card
+    owner_id = db_discard_card(
+        session.session_id, int(target), connection=db,
+        extra_set="card_state=0, card_damage=0, temporary_buffs=?, "
+                   "temporary_attributes=0",
+        extra_params=["{}"])
+    if owner_id is None:
+        return f"discard: target {hex(int(target))} disappeared"
+    scid = game_engine.SessionCardId(game_engine.UID(int(target)))
+    owner = owner_uid(owner_id, pl_t, ai_t, bstate)
+    tpl_guid, ct, name, cost, atk, defense, gem = handler._card_full_data(
+        game, scid, row[0], row[1])
+    game.push_card_discarded(scid, owner)
+    game.push_card_moved(
+        scid, owner, game_engine.ECardCollections.Discard,
+        game_engine.ECardLocations.Top, 0)
+    game.push_card_updated(
+        scid, owner, game_engine.ECardCollections.Discard, ct,
+        template_id=tpl_guid, attack=atk, defense=defense, cost=cost,
+        gems=gem, state=0, nulling=(row[3] == "deck"))
+    return f"discarded {hex(int(target))}"
 
 
 @leaf_register("RandomizeVariableAbilityEffectTemplate")
@@ -344,29 +400,21 @@ def _apply_resource_property(game, session, db, handler, pl_t, ai_t, bstate,
             (bstate or {}).get("resolving_owner_id", 0),
             int((bstate or {}).get("resolving_source_uid") or 0),
             pm.get("property") or "") or 0)
-    sides = []
-    if "each champion" in text or "each opposing champion" in text:
+    owner = None
+    if target_uid is not None:
+        owner = _controller_id_for_target(
+            db, session, handler, bstate, target_uid)
+    if owner is None:
+        owner = (bstate or {}).get("resolving_owner_id", 0) or \
+                (handler.user_profile["id"] if handler.user_profile else 0)
+    # A resolved target is authoritative. This handles both
+    # EachOpposingChampion (the player's champion when the Fortune is
+    # opponent-owned) and EachChampion (one target event per champion).
+    # The old text-based both-sides branch applied EachChampion twice and sent
+    # opposing-champion effects to both sides.
+    sides = ["player" if owner else "ai"]
+    if target_uid is None and "each champion" in text:
         sides = ["player", "ai"]
-    else:
-        owner = None
-        if target_uid is not None:
-            row = db.execute(
-                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(target_uid))).fetchone()
-            if row:
-                owner = row[0]
-            else:
-                p = getattr(handler, "_player_champ_scid", None)
-                a = getattr(handler, "_ai_champ_scid", None)
-                if p is not None and int(target_uid) == int(p.uid.uid64):
-                    owner = (handler.user_profile["id"]
-                             if handler.user_profile else 0)
-                elif a is not None and int(target_uid) == int(a.uid.uid64):
-                    owner = 0
-        if owner is None:
-            owner = (bstate or {}).get("resolving_owner_id", 0) or \
-                    (handler.user_profile["id"] if handler.user_profile else 0)
-        sides = ["player" if owner else "ai"]
     logs = []
     prop = pm.get("property")
     color_flag = 0
@@ -374,6 +422,11 @@ def _apply_resource_property(game, session, db, handler, pl_t, ai_t, bstate,
         m = _re.search(r'\[([A-Za-z]+)\]', text)
         if m:
             color_flag = game_engine.SHARD_TO_FLAG.get(m.group(1).lower(), 0)
+        elif "random threshold" in text:
+            color_flags = list({int(flag) for flag in
+                                game_engine.SHARD_TO_FLAG.values() if flag})
+            if color_flags:
+                color_flag = random.choice(color_flags)
     for side in sides:
         if prop == "currentresource":
             key = f"{side}_resources"
@@ -506,7 +559,8 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
             str(v.get("_t", "")).split(".")[-1] in (
                 "CounterVariable", "TriggerTargetPropertyVariable",
                 "ExpressionAbilityVariable", "CardSumAbilityVariable",
-                "CardCountAbilityVariable", "CountListAttrAbilityVariable")
+                "CardCountAbilityVariable", "CountListAttrAbilityVariable",
+                "AbilityPropertyVariable")
             for v in _raw_vars if isinstance(v, dict))
 
         if pm.get("property") == "intattr":
@@ -729,6 +783,16 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                 source_owner = (bstate or {}).get("resolving_owner_id",
                                                   handler.user_profile["id"]
                                                   if handler.user_profile else 0)
+            # Targeted health belongs to the resolved champion. A Fortune is
+            # resolved from the opponent's side, so its
+            # EachOpposingChampion target is the player champion rather than
+            # the AI source. Untargeted "gain health" effects still belong to
+            # the ability controller.
+            if target_uid is not None:
+                target_owner = _controller_id_for_target(
+                    db, session, handler, bstate, target_uid)
+                if target_owner is not None:
+                    source_owner = target_owner
             return _apply_health_gain(game, bstate, pl_t, ai_t, amount,
                                       source_owner, db=db, handler=handler,
                                       session=session)
@@ -1129,6 +1193,33 @@ def _resolve_leaf_target(bstate):
             or (bstate or {}).get("player_mod_target")
             or (bstate or {}).get("resolving_target_uid")
             or (bstate or {}).get("resolving_source_uid"))
+
+
+def _record_ability_list_target(db, bstate, target_uid):
+    """Record a target in any metadata-declared CountListAttr variable."""
+    if target_uid is None:
+        return
+    ability_guid = (bstate or {}).get("resolving_ability")
+    if not ability_guid:
+        return
+    record = ability_record(db, ability_guid)
+    for variable in record.get("m_Variables") or []:
+        if not isinstance(variable, dict):
+            continue
+        if str(variable.get("_t", "")).rsplit(".", 1)[-1] != \
+                "CountListAttrAbilityVariable":
+            continue
+        name = str(variable.get("m_Name") or "")
+        list_name = str(variable.get("m_ListAttrName") or name)
+        if not name or not list_name:
+            continue
+        lists = (bstate or {}).setdefault("ability_lists", {})
+        values = lists.setdefault(list_name, [])
+        if int(target_uid) not in {int(value) for value in values}:
+            values.append(int(target_uid))
+        active_variables = (bstate or {}).get("ability_variables")
+        if isinstance(active_variables, dict):
+            active_variables[name] = len(values)
 
 
 def _push_card_state(game, session, db, handler, pl_t, ai_t, uid, new_state,
@@ -1742,8 +1833,11 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
     """Reveal cards described by the effect's target-template metadata."""
     count = 1
     target_kind = ""
+    target_template_id = ""
+    random_target = False
     reveal_collection = game_engine.ECardCollections.Deck
     ability_guid = (bstate or {}).get("resolving_ability", "")
+    effect_target_index = 0
     try:
         erow = db.execute(
             "SELECT target_index FROM ability_effects "
@@ -1754,6 +1848,53 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
         # Preserve their text-based count fallback while production uses the
         # extracted target metadata above.
         erow = None
+    if erow and erow[0] is not None:
+        effect_target_index = int(erow[0])
+    elif ability_guid:
+        # Transitive card abilities such as Jank Bot are intentionally not
+        # all materialized in the compact ability_effects table. Recover the
+        # effect's target index from the authoritative AbilityTemplate so the
+        # reveal still follows the typed target contract.
+        record = ability_record(db, ability_guid)
+        for entry in record.get("m_AbilityEffectList") or []:
+            if not isinstance(entry, dict):
+                continue
+            guid = str((entry.get("m_EffectTemplateId") or {}).get(
+                "m_Guid") or "").lower()
+            if guid == str(effect_guid or "").lower():
+                value = entry.get("m_TargetTemplateIndex")
+                if value is not None:
+                    effect_target_index = int(value)
+                break
+    target_ids = []
+    if ability_guid:
+        try:
+            target_row = db.execute(
+                "SELECT target_template_ids FROM card_abilities_meta "
+                "WHERE ability_guid=?", (ability_guid,)).fetchone()
+        except Exception:
+            target_row = None
+        if target_row and target_row[0]:
+            try:
+                target_ids = [str(value).lower() for value in
+                              (json.loads(target_row[0]) or []) if value]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                target_ids = []
+        if not target_ids:
+            record = ability_record(db, ability_guid)
+            target_ids = [str(item.get("m_Guid") or "").lower()
+                          for item in (record.get(
+                              "m_AbilityTargetTemplateIds") or [])
+                          if isinstance(item, dict) and item.get("m_Guid")]
+    if 0 <= effect_target_index < len(target_ids):
+        target_template_id = target_ids[effect_target_index]
+    target_meta = None
+    if target_template_id:
+        from .targeting import target_template
+        target_meta = target_template(db, target_template_id)
+        if target_meta:
+            target_kind = target_meta.get("target_kind") or ""
+            random_target = bool(target_meta.get("is_random_target"))
     if not erow:
         import re as _re
         text = (_ability_text(db, bstate) or "").lower()
@@ -1771,14 +1912,15 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
             "SELECT target_template_ids FROM card_abilities_meta "
             "WHERE ability_guid=?", (ability_guid,)).fetchone()
         try:
-            tids = json.loads(trow[0]) if trow and trow[0] else []
-            tid = tids[int(erow[0])] if 0 <= int(erow[0]) < len(tids) else None
+            tids = json.loads(trow[0]) if trow and trow[0] else target_ids
+            tid = tids[effect_target_index] if 0 <= effect_target_index < len(tids) else None
             frow = db.execute(
-                "SELECT filter_json, target_kind FROM target_templates "
+                "SELECT filter_json, target_kind, is_random_target FROM target_templates "
                 "WHERE template_id=?",
                 (str(tid),)).fetchone() if tid else None
             filt = json.loads(frow[0]) if frow and frow[0] else {}
             target_kind = (frow[1] or "") if frow else ""
+            random_target = bool(frow[2]) if frow else random_target
             top = next((f for f in filt.get("m_TargetFilters", [])
                         if str(f.get("_t", "")).split(".")[-1]
                         == "TopNOfDeck"), None)
@@ -1795,8 +1937,8 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
         trow = db.execute(
             "SELECT target_template_ids FROM card_abilities_meta "
             "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        tids = json.loads(trow[0]) if trow and trow[0] else []
-        tid = tids[int(erow[0])] if erow and 0 <= int(erow[0]) < len(tids) else None
+        tids = json.loads(trow[0]) if trow and trow[0] else target_ids
+        tid = tids[effect_target_index] if 0 <= effect_target_index < len(tids) else None
         frow = db.execute(
             "SELECT filter_json FROM target_templates WHERE template_id=?",
             (str(tid),)).fetchone() if tid else None
@@ -1840,13 +1982,34 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
             from ._shared import card_collection_for_location
             reveal_collection = card_collection_for_location(row[5])
     else:
-        rows = db.execute(
-            "SELECT card_uid, position, template_guid, user_id, card_state "
-            "FROM game_cards WHERE session_id=? "
-            "AND user_id=? AND location=? ORDER BY position LIMIT ?",
-            (session.session_id, owner, reveal_zone, count)).fetchall()
-        if reveal_zone == "hand" and rows:
-            rows = [random.choice(rows)]
+        if random_target and target_template_id:
+            # A random reveal is not the top card. Resolve the typed target
+            # filter, then choose one instance. The selected card remains in
+            # the deck until PlayCard consumes it, so the next repetition
+            # cannot reveal the same instance again.
+            from .targeting import legal_targets
+            candidates = legal_targets(
+                db, session.session_id, owner, target_template_id,
+                (bstate or {}).get("resolving_source_uid"),
+                both_players=False, champions=[], battle_state=bstate)
+            selected_uid = random.choice(candidates) if candidates else None
+            rows = []
+            if selected_uid is not None:
+                row = db.execute(
+                    "SELECT card_uid, position, template_guid, user_id, "
+                    "card_state FROM game_cards WHERE session_id=? "
+                    "AND card_uid=? AND user_id=? AND location=?",
+                    (session.session_id, int(selected_uid), owner,
+                     reveal_zone)).fetchone()
+                rows = [row] if row else []
+        else:
+            rows = db.execute(
+                "SELECT card_uid, position, template_guid, user_id, card_state "
+                "FROM game_cards WHERE session_id=? "
+                "AND user_id=? AND location=? ORDER BY position LIMIT ?",
+                (session.session_id, owner, reveal_zone, count)).fetchall()
+            if reveal_zone == "hand" and rows:
+                rows = [random.choice(rows)]
     uids = [int(r[0]) for r in rows]
     bstate["revealed_cards"] = uids
     if uids:
@@ -1860,7 +2023,11 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
         # event's player_id names the controller.
         from ._shared import owner_uid
         effect_param = param or ""
-        reveal_targets = "Everyone"
+        # m_PlayerRevealTargets is typed effect metadata. Jank Bot's authored
+        # value is Everyone, which must remain a shared event in PvP.
+        reveal_targets = str(
+            (effect_template(effect_guid) or {}).get(
+                "m_PlayerRevealTargets") or "Everyone")
         try:
             meta = json.loads(effect_param) if effect_param else {}
             if isinstance(meta, dict):
@@ -1950,7 +2117,7 @@ def _leaf_remember_keyword_powers(game, session, db, handler, pl_t, ai_t,
     from .triggers import ability_matches_keyword, _card_ability_guids
     remembered = (bstate or {}).setdefault("remembered_powers", {}).setdefault(
         (bstate or {}).get("resolving_ability", ""), [])
-    for ag in _card_ability_guids(db, session, int(target)):
+    for ag in _card_ability_guids(db, session.session_id, int(target)):
         if all_powers or ability_matches_keyword(db, ag, keyword):
             if ag not in remembered:
                 remembered.append(ag)
@@ -2093,6 +2260,7 @@ def _leaf_sacrifice(game, session, db, handler, pl_t, ai_t, bstate,
         return "sacrifice: no target"
     kill_troop(game, session, db, handler, pl_t, ai_t, int(target),
                bstate, cause="sacrifice")
+    _record_ability_list_target(db, bstate, int(target))
     return f"sacrificed {hex(int(target))}"
 
 
@@ -2641,6 +2809,83 @@ def _leaf_copy_ability(game, session, db, handler, pl_t, ai_t, bstate,
             ability_instance_id=instance_id)
     return f"copied ability {str(original['ability_guid'])[:8]}"
 
+
+def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
+                            card_uid, owner_id, template_guid, card_type):
+    """Put a free-played non-resource card onto the authoritative chain.
+
+    ``PlayCardAbilityEffectTemplate`` is allowed to bypass normal cost and
+    threshold checks, but it still uses the ordinary CastSpells/stack path.
+    Keeping the card there until the stack resolves is important for attack
+    triggers and for the client to render each random card as a separate
+    chain item.
+    """
+    import battle_engine as _be
+    from db import db_set_card_played_to_zone
+
+    card_uid = int(card_uid)
+    owner = owner_uid(owner_id, pl_t, ai_t, bstate)
+    scid = game_engine.SessionCardId(game_engine.UID(card_uid))
+    _tpl, card_type_bits, _name, cost, attack, defense, gems = \
+        handler._card_full_data(game, scid, template_guid)
+    # Production handlers return ECardTypes, while lightweight handlers may
+    # return the database's string representation. Normalize before applying
+    # bit flags or serializing the free-play event.
+    if isinstance(card_type_bits, str):
+        card_type_bits = game_engine.card_type_from_db(card_type_bits)
+    db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells")
+    game.push_card_updated(
+        scid, owner, game_engine.ECardCollections.CastSpells,
+        card_type_bits, template_id=template_guid, cost=cost,
+        attack=attack, defense=defense, gems=gems, nulling=False)
+    game.push_card_moved(
+        scid, owner, game_engine.ECardCollections.CastSpells,
+        game_engine.ECardLocations.Top, 0)
+
+    permanent = bool(card_type_bits & (
+        game_engine.ECardTypes.Troop | game_engine.ECardTypes.Artifact |
+        game_engine.ECardTypes.Constant))
+    if permanent:
+        if card_type_bits & game_engine.ECardTypes.Artifact:
+            game.push_artifact_card_played(scid, owner)
+        else:
+            game.push_troop_card_played(scid, owner)
+        kind = "troop"
+    else:
+        # SpellCardCast is the public cast/reveal event for an action waiting
+        # on the chain. The free flag tells the client no resource payment was
+        # made, while the later SpellCardPlayed event is emitted on resolve.
+        game.push_spell_card_cast(scid, owner, free=True)
+        kind = "spell"
+
+    abilities_row = db.execute(
+        "SELECT card_abilities FROM game_cards "
+        "WHERE session_id=? AND card_uid=?",
+        (session.session_id, card_uid)).fetchone()
+    try:
+        ability_guids = [str(value).lower() for value in json.loads(
+            abilities_row[0] or "[]") if value] if abilities_row else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        ability_guids = []
+    instance_id = int((bstate or {}).get("_next_instance_id", 1))
+    bstate["_next_instance_id"] = instance_id + 1
+    _be.stack_push(bstate, {
+        "kind": kind, "source_uid": card_uid,
+        "ability_guids": ability_guids, "target_uid": None,
+        "instance_id": instance_id, "x_cost": 0,
+        "free": True,
+    })
+    # PLAY_CARD_ABILITY_TEMPLATE_ID is a built-in client chain renderer. It
+    # works even when the random card has no ability of its own.
+    chain_guid = (ability_guids[0] if ability_guids else
+                  game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID)
+    game.push_ability_on_chain(
+        scid, game_engine.ResourceId.from_str(chain_guid),
+        ability_instance_id=instance_id)
+    _be.save_state(session, bstate)
+    return f"queued {kind} {card_uid} for free (chain={instance_id})"
+
+
 @leaf_register("PlayCardAbilityEffectTemplate")
 def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
     """Play a card for free using the effect's gamedata target.
@@ -2655,14 +2900,41 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         "SELECT ability_guid FROM ability_effects "
         "WHERE effect_guid=? AND effect_type='PlayCardAbilityEffectTemplate' "
         "LIMIT 1", (effect_guid,)).fetchone()
-    if parent:
+    target_ability_guid = (parent[0] if parent else
+                           (bstate or {}).get("resolving_ability"))
+    target_index = 0
+    if target_ability_guid:
+        current_effect = db.execute(
+            "SELECT target_index FROM ability_effects "
+            "WHERE ability_guid=? AND effect_guid=? LIMIT 1",
+            (target_ability_guid, effect_guid)).fetchone()
+        if current_effect and current_effect[0] is not None:
+            target_index = int(current_effect[0])
+        else:
+            record = ability_record(db, target_ability_guid)
+            for entry in record.get("m_AbilityEffectList") or []:
+                if not isinstance(entry, dict):
+                    continue
+                guid = str((entry.get("m_EffectTemplateId") or {}).get(
+                    "m_Guid") or "").lower()
+                if guid == str(effect_guid or "").lower():
+                    if entry.get("m_TargetTemplateIndex") is not None:
+                        target_index = int(entry["m_TargetTemplateIndex"])
+                    break
+    if target_ability_guid:
         target_row = db.execute(
             "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (parent[0],)).fetchone()
+            "WHERE ability_guid=?", (target_ability_guid,)).fetchone()
         try:
             target_ids = json.loads(target_row[0] or "[]") if target_row else []
         except (TypeError, ValueError, json.JSONDecodeError):
             target_ids = []
+        if not target_ids:
+            record = ability_record(db, target_ability_guid)
+            target_ids = [str(item.get("m_Guid") or "").lower()
+                          for item in (record.get(
+                              "m_AbilityTargetTemplateIds") or [])
+                          if isinstance(item, dict) and item.get("m_Guid")]
         if target_ids:
             # A PlayCard effect can have a target template for two very
             # different purposes.  Resource abilities use an auto-target
@@ -2675,7 +2947,10 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             # troops stay in hand with "no matching target in deck".
             from .targeting import legal_targets, target_template
 
-            target = target_template(db, target_ids[0])
+            target_id = (target_ids[target_index]
+                         if 0 <= target_index < len(target_ids)
+                         else target_ids[0])
+            target = target_template(db, target_id)
             target_kind = (target or {}).get("target_kind") or ""
             is_random_deck_target = False
             if target_kind == "AbilityTargetTemplate" and target:
@@ -2709,15 +2984,36 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                     zone_filter is not None and
                     str(zone_filter.get("m_Collection", "")).lower() == "deck")
 
-            if is_random_deck_target:
+            # SourceRevealedTargetTemplate is the second half of Jank Bot's
+            # authored two-effect child ability. Reuse the exact card chosen
+            # by RevealCards rather than rolling a second random target (or
+            # falling back to Jank Bot itself).
+            resolved_uid = _resolve_leaf_target(bstate)
+            revealed_uids = {int(uid) for uid in
+                             ((bstate or {}).get("revealed_cards") or [])}
+            selected_uid = None
+            if resolved_uid is not None and int(resolved_uid) in revealed_uids:
+                selected_row = db.execute(
+                    "SELECT card_uid FROM game_cards WHERE session_id=? "
+                    "AND card_uid=? AND user_id=? AND location='deck'",
+                    (session.session_id, int(resolved_uid),
+                     int((bstate or {}).get("resolving_owner_id", 0) or 0))
+                ).fetchone()
+                if selected_row:
+                    selected_uid = int(selected_row[0])
+
+            if selected_uid is None and is_random_deck_target:
 
                 owner_id = int((bstate or {}).get("resolving_owner_id", 0) or 0)
                 source_uid = (bstate or {}).get("resolving_source_uid")
                 candidates = legal_targets(
-                    db, session.session_id, owner_id, target_ids[0], source_uid,
+                    db, session.session_id, owner_id, target_id, source_uid,
                     both_players=False)
                 if candidates:
                     selected_uid = int(random.choice(candidates))
+            if selected_uid is not None:
+                owner_id = int((bstate or {}).get("resolving_owner_id", 0) or 0)
+                try:
                     try:
                         selected = db.execute(
                             "SELECT gc.template_guid, gc.card_template_id, "
@@ -2867,13 +3163,16 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                                 f"(+{current_grant} current/+{max_grant} total, "
                                 f"thresholds={threshold_flags}, charge={charge_grant})")
 
+                    if selected:
+                        return _queue_free_played_card(
+                            game, session, db, handler, pl_t, ai_t, bstate,
+                            selected_uid, owner_id, selected[0], selected[2])
+                except Exception:
+                    raise
+
                 return "play for free: no matching target in deck"
 
-    from db import (
-        db_set_card_played_to_zone,
-        db_card_set_warzone_arrival,
-        db_set_card_resolved_at,
-    )
+    from db import db_set_card_played_to_zone
     src_uid = (bstate or {}).get("resolving_source_uid")
     if src_uid is None:
         return "play for free: no source"
@@ -2883,36 +3182,18 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     if not row:
         return "play for free: source not found"
     tpl_guid, ctype = row
-    if ctype != "Troop":
-        return f"play for free: {ctype} not supported yet"
-    scid = game_engine.SessionCardId(game_engine.UID(int(src_uid)))
-    _tpl, ct, _n, cost, atk, def_, _g = handler._card_full_data(
-        game, scid, tpl_guid)
-    # Hand -> CastSpells (the stack), then auto-resolve to Warzone (the AI
-    # opponent always passes), exactly like a normally played troop.
-    db_set_card_played_to_zone(session.session_id, int(src_uid), 'CastSpells')
-    game.push_card_updated(scid, pl_t, game_engine.ECardCollections.CastSpells,
-                           ct, template_id=tpl_guid, cost=cost, attack=atk,
-                           defense=def_)
-    game.push_card_moved(scid, pl_t, game_engine.ECardCollections.CastSpells,
-                         game_engine.ECardLocations.Top, 0)
-    game.push_troop_card_played(scid, pl_t)
-    game.push_green_light(ai_t, game_engine.EPriorityContext.ResolveTopOfChain)
-    db_card_set_warzone_arrival(session.session_id, int(src_uid))
-    db_set_card_resolved_at(session.session_id, int(src_uid),
-                            handler._next_resolve_counter(session))
-    game.push_card_moved(scid, pl_t, game_engine.ECardCollections.Warzone,
-                         game_engine.ECardLocations.Top, 0)
-    game.push_card_updated(scid, pl_t, game_engine.ECardCollections.Warzone, ct,
-                           template_id=tpl_guid, cost=cost, attack=atk,
-                           defense=def_)
-    # The free-played troop fires its own enters-play triggers (e.g. a
-    # Scrivener already on board heals when it resolves).
-    from .triggers import resolve_enters_play_triggers
-    resolve_enters_play_triggers(
-        db, handler, game, session, pl_t, ai_t, bstate,
-        int(src_uid), (bstate or {}).get("resolving_owner_id", 0), cost)
-    return f"played {tpl_guid[:8]} for free"
+    owner_id = int((bstate or {}).get("resolving_owner_id", 0) or 0)
+    owner_row = db.execute(
+        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session.session_id, int(src_uid))).fetchone()
+    if owner_row:
+        owner_id = int(owner_row[0] or 0)
+    # Source-card PlayCard effects use the same free CastSpells/stack path as
+    # random deck cards. This preserves the normal response window and avoids
+    # resolving a permanent immediately inside its parent's ability.
+    return _queue_free_played_card(
+        game, session, db, handler, pl_t, ai_t, bstate,
+        int(src_uid), owner_id, tpl_guid, ctype)
 
 @leaf_register("FireEventEffectTemplate")
 def _leaf_fire_event(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):

@@ -1,6 +1,4 @@
-"""Regression tests for the Batch 1 BOM leaves: DestroyCard, Tap, Untap,
-RevealCards, StoreTargets (+ stored-target fallback) and MoveCardToZone
-hand/warzone destinations."""
+"""Regression tests for metadata-driven BOM leaves and zone operations."""
 
 import os
 import sqlite3
@@ -13,7 +11,10 @@ import game_engine
 
 from abilities.framework.bom import _LEAFS
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 
 class SessionStub:
@@ -123,6 +124,80 @@ def test_tap_untap(db):
         game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
     s, _ = state(db, 100)
     assert not (s & game_engine.ECardStates.Tapped), s
+
+
+def test_discard_moves_target_and_emits_events(db):
+    add_card(db, 100, 5, loc="hand",
+             state=game_engine.ECardStates.Tapped)
+    pl_t, ai_t, game, bstate = new_game(db)
+    bstate["player_spell_target"] = 100
+    result = _LEAFS["DiscardCardAbilityEffectTemplate"](
+        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
+    assert result == "discarded 0x64", result
+    row = db.execute(
+        "SELECT location, card_state, card_damage, temporary_buffs "
+        "FROM game_cards WHERE card_uid=100").fetchone()
+    assert row == ("discard", 0, 0, "{}"), row
+    assert any(isinstance(ev, game_engine.CardDiscardedSessionEventArgs)
+               for ev in game.events)
+    assert any(isinstance(ev, game_engine.CardMovedSessionEventArgs)
+               and ev.collection == game_engine.ECardCollections.Discard
+               for ev in game.events)
+
+
+def test_block_assigns_secondary_target_and_emits_event(db):
+    """BlockEffect uses the created troop as the blocker and the selected
+    attacking troop as the primary target, matching the client BOM wiring."""
+    add_card(db, 100, 5, loc="warzone")
+    add_card(db, 200, 6, loc="warzone",
+             state=game_engine.ECardStates.Attacking)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(244, 6)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {
+        "pvp": True,
+        "champ_map": {"5": 900, "6": 901},
+        "attackers": {"200": "900"},
+        "resolving_ability": "block-test",
+        "resolving_secondary_target_uid": 100,
+        "player_spell_target": 200,
+    }
+    result = _LEAFS["BlockEffectTemplate"](
+        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
+    assert result == "blocked 0xc8 with 0x64", result
+    state_value, _ = state(db, 100)
+    assert state_value & game_engine.ECardStates.Blocking
+    assert state_value & game_engine.ECardStates.HasBlocked
+    assert bstate["blockers"] == {"200": ["100"]}, bstate
+    assert any(isinstance(ev, game_engine.BlockersAssignedSessionEventArgs)
+               for ev in game.events)
+
+
+def test_block_assigns_pve_player_blocker(db):
+    """The same BlockEffect wiring works when the AI attacks the player."""
+    add_card(db, 100, 5, loc="warzone")
+    add_card(db, 200, 0, loc="warzone",
+             state=game_engine.ECardStates.Attacking)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub()
+    handler._player_champ_scid = game_engine.SessionCardId(pl_t)
+    handler._ai_champ_scid = game_engine.SessionCardId(ai_t)
+    bstate = {
+        "ai_attackers": {"200": str(int(pl_t.uid64))},
+        "resolving_ability": "block-test",
+        "resolving_secondary_target_uid": 100,
+        "player_spell_target": 200,
+    }
+    result = _LEAFS["BlockEffectTemplate"](
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "e", None)
+    assert result == "blocked 0xc8 with 0x64", result
+    state_value, _ = state(db, 100)
+    assert state_value & game_engine.ECardStates.Blocking
+    assert bstate["ai_blockers"] == {"200": ["100"]}, bstate
+    assert any(isinstance(ev, game_engine.BlockersAssignedSessionEventArgs)
+               for ev in game.events)
 
 
 def test_reveal(db):
@@ -359,6 +434,12 @@ def test_dynamic_cost_formula(db):
 if __name__ == "__main__":
     run("DestroyCard kills target", test_destroy)
     run("Tap / Untap toggle state", test_tap_untap)
+    run("Discard moves target and emits events",
+        test_discard_moves_target_and_emits_events)
+    run("Block assigns secondary target and emits event",
+        test_block_assigns_secondary_target_and_emits_event)
+    run("Block assigns PvE player blocker",
+        test_block_assigns_pve_player_blocker)
     run("RevealCards reveals N + class-51", test_reveal)
     run("StoreTargets remembers target", test_store_targets_fallback)
     run("MoveCardToZone hand destination", test_move_to_hand)

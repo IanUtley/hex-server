@@ -303,6 +303,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     enters_exhausted = 0
     deck_location = "Unknown"
     into_hand = False
+    into_choosing = False
     param_has_dynamic_amount = False
     amount_var = ""
     resolved_removed_amount = None
@@ -314,10 +315,14 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                 token_guid = p["token_guid"]
             if isinstance(p.get("card_filter"), dict):
                 param_filter = p["card_filter"]
-            if p.get("collection") == "Deck":
+            collection = str(p.get("collection") or "").rsplit(
+                ".", 1)[-1].lower()
+            if collection == "deck":
                 into_deck = True
-            if str(p.get("collection") or "").lower() == "hand":
+            if collection == "hand":
                 into_hand = True
+            if collection == "choosing":
+                into_choosing = True
             deck_location = p.get("location", "Unknown")
             amount_var = p.get("amount_variable", "")
             param_has_dynamic_amount = bool(amount_var)
@@ -376,8 +381,10 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     typed_collection = effect_template_value(
         db, bstate, effect_guid, "m_CardCollection")
     if typed_collection:
-        into_deck = str(typed_collection).lower() == "deck"
-        into_hand = str(typed_collection).lower() == "hand"
+        collection = str(typed_collection).rsplit(".", 1)[-1].lower()
+        into_deck = collection == "deck"
+        into_hand = collection == "hand"
+        into_choosing = collection == "choosing"
     typed_location = effect_template_value(
         db, bstate, effect_guid, "m_CardLocation")
     if typed_location:
@@ -419,6 +426,10 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         db, bstate, effect_guid, "m_EntersPlayExhausted")
     if typed_exhausted is not None:
         enters_exhausted = int(typed_exhausted or 0)
+    typed_attacking = effect_template_value(
+        db, bstate, effect_guid, "m_EntersPlayAttacking")
+    copy_gems = bool(effect_template_value(
+        db, bstate, effect_guid, "m_CopyGems") or 0)
 
     # Some summon effects name a concrete token through m_CardTemplateId;
     # others, such as Moqui's power, leave that GUID empty and provide a
@@ -514,9 +525,22 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     # A token put into hand has not entered the warzone, so it must not carry
     # the warzone-only CameOutThisTurn state.  That state would otherwise
     # leak into the hand and make the created card look like a summoned troop.
-    token_state = (0 if into_hand else game_engine.ECardStates.CameOutThisTurn)
+    token_state = (0 if into_hand or into_choosing
+                   else game_engine.ECardStates.CameOutThisTurn)
     if enters_exhausted:
         token_state |= game_engine.ECardStates.Tapped
+    if typed_attacking and not into_hand and not into_deck and not into_choosing:
+        token_state |= game_engine.ECardStates.Attacking
+
+    copied_gems = 0
+    if copy_gems:
+        source_uid = (bstate or {}).get("resolving_source_uid")
+        if source_uid is not None:
+            source_row = db.execute(
+                "SELECT gems FROM game_cards WHERE session_id=? "
+                "AND card_uid=?", (session.session_id, int(source_uid))
+            ).fetchone()
+            copied_gems = int(source_row[0] or 0) if source_row else 0
 
     try:
         subtype = db.execute(
@@ -537,7 +561,8 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             "WHERE session_id=?", (session.session_id,)).fetchone()[0]
         card_uid = next_game_card_uid(db, session.session_id)
         location = ("hand" if into_hand else
-                    ("deck" if into_deck else "warzone"))
+                    ("deck" if into_deck else
+                     ("choosing" if into_choosing else "warzone")))
         # Unknown deck location means the card is shuffled into the deck.
         # Start it at a temporary position; after all cards are created the
         # deck-relative insertion helper assigns an unbiased permutation.
@@ -564,7 +589,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             "PRAGMA table_info(game_cards)").fetchall()}
         for column, value in (("owner_user_id", player_uid),
                               ("original_template_guid", tpl_guid),
-                              ("gems", 0)):
+                              ("gems", copied_gems)):
             if column in existing:
                 columns.append(column)
                 values.append(value)
@@ -604,6 +629,14 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                                  game_engine.ECardLocations.Top, 1)
             game.push_card_updated(scid, owner, game_engine.ECardCollections.Deck,
                                    ct, template_id=tpl_guid2, nulling=True)
+        elif into_choosing:
+            game.push_card_moved(
+                scid, owner, game_engine.ECardCollections.Choosing,
+                game_engine.ECardLocations.Top, 1)
+            game.push_card_updated(
+                scid, owner, game_engine.ECardCollections.Choosing, ct,
+                attack=atk, defense=defense, cost=cost, template_id=tpl_guid2,
+                gems=gem, card_name=token_name, state=0)
         else:
             game.push_card_moved(
                 scid, owner, game_engine.ECardCollections.Warzone,
@@ -619,12 +652,13 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             resolve_triggers(
                 db, handler, game, session, pl_t, ai_t, bstate,
                 "CardEnteredZoneEvent", card_uid, player_uid)
-    elif not into_deck and created_cards:
+    elif not into_deck and not into_choosing and created_cards:
         from ..triggers import resolve_enters_play_triggers
         for card_uid in created_cards:
             resolve_enters_play_triggers(
                 db, handler, game, session, pl_t, ai_t, bstate, card_uid,
                 player_uid, 0)
-    destination = "hand" if into_hand else ("into deck" if into_deck
-                                             else "to warzone")
+    destination = ("hand" if into_hand else
+                   ("into deck" if into_deck else
+                    ("to choosing" if into_choosing else "to warzone")))
     return f"summon {count}x {token_name} {destination}"

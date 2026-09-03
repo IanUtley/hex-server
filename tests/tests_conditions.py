@@ -3,6 +3,7 @@
 gamedata m_TriggerCondition / m_AbilityCondition / effect-condition trees."""
 
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -17,7 +18,10 @@ from abilities.framework.condition_engine import (
     trigger_condition_met,
 )
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 SCRIVENER = "e6e77180-238a-a5db-08da-16f07cb67836"
 ANGEL = "0d22faf5-a934-0983-ca9d-9d0a11636891"
@@ -198,6 +202,25 @@ def test_source_passes_filter_condition(db):
     assert not trigger_condition_met(raw(db, DROO), c2)
 
 
+def test_ability_variable_condition_accepts_variable_rhs(db):
+    """AbilityVariableCondition can compare two ability variables."""
+    condition_id = "condition-variable-rhs"
+    db.execute(
+        "INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+        (condition_id, "SacrificeWasMade", json.dumps({
+            "_t": "Game.Shared.Mechanics.Abilities.Conditions."
+                   "AbilityVariableCondition",
+            "m_Lhs": "a", "m_Rhs": "SacrificedCards",
+            "m_ComparisonOp": "LessThanOrEqual"})))
+    db.commit()
+    no_sacrifice = ctx(db)
+    no_sacrifice.ability_variables = {"a": 1, "SacrificedCards": 0}
+    assert not evaluate_effect_condition(db, condition_id, no_sacrifice)
+    sacrifice = ctx(db)
+    sacrifice.ability_variables = {"a": 1, "SacrificedCards": 1}
+    assert evaluate_effect_condition(db, condition_id, sacrifice)
+
+
 def test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card(db):
     """A template-less legacy/fallback card entering Hand is not a Spider
     entering Warzone.  Missing card-template metadata must not turn the
@@ -255,5 +278,7 @@ if __name__ == "__main__":
     run("Angel blocked on second draw", test_angel_second_draw_blocked)
     run("Incantation SourceCardHasCounters gate", test_incantation_counter_condition)
     run("Source passes filter gates activation", test_source_passes_filter_condition)
+    run("Ability variable condition accepts variable RHS",
+        test_ability_variable_condition_accepts_variable_rhs)
     run("Vilefang trigger fails closed for unknown hand card", test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card)
     run("Ridge Raider only triggers for dead warzone troops", test_ridge_raider_requires_dead_warzone_troop)

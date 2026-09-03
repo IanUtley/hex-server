@@ -1501,7 +1501,8 @@ class HCPHandler:
         # Warzone-troop manual abilities (e.g. Shift): light up as Activate.
         affordable = self._affordable_troop_abilities(session, bstate)
         if affordable:
-            self._add_troop_ability_options(game2, pl_t, session, affordable)
+            self._add_troop_ability_options(game2, pl_t, session, affordable,
+                                             bstate)
         # Always carry a fresh PlayerUpdated so the client's resource/charge/SP
         # display reflects the real battle state (a bare Game defaults them to
         # 0, wiping the UI).
@@ -1622,7 +1623,8 @@ class HCPHandler:
                             _db, session.session_id, self.user_profile["id"],
                             tid, card_uid,
                             both_players=target_uses_both_players(_db, tid),
-                            champions=self._champion_targets())
+                            champions=self._champion_targets(),
+                            battle_state=bstate)
                         if cands:
                             has_target = True
                         else:
@@ -1675,7 +1677,8 @@ class HCPHandler:
                 result[(card_uid, tpl_guid)] = affordable
         return result
 
-    def _add_troop_ability_options(self, game, pl_t, session, affordable):
+    def _add_troop_ability_options(self, game, pl_t, session, affordable,
+                                   bstate=None):
         """Append warzone-troop ability options (ECardUsage.Activate) to the
         most recent PlayerOptionList, one OptionInstance per affordable ability.
 
@@ -1740,7 +1743,8 @@ class HCPHandler:
                             _db, session.session_id, self.user_profile["id"],
                             tid, int(card_uid),
                             both_players=target_uses_both_players(_db, tid),
-                            champions=self._champion_targets())
+                            champions=self._champion_targets(),
+                            battle_state=bstate)
                         if not others:
                             # Auto/self templates with no real filter (e.g.
                             # Living Totem "this") fall back to the full
@@ -2089,6 +2093,183 @@ class HCPHandler:
         log_req(f"    Deck-search prompt: {ability_guid[:8]} source={hex(source_uid)} "
                 f"candidates={len(pend['candidates'])} inst={inst_id}")
         return f"deck search: awaiting {len(pend['candidates'])} candidates"
+
+    def _prompt_choice_cards(self, game, session, pl_t, ai_t, bstate,
+                             pending):
+        """Publish the client's built-in ChooseAndPlay card picker.
+
+        DoubleChoice creates real Choice-card instances in the Choosing zone,
+        then advertises the built-in ability that plays one of them for free.
+        PvP choice cards and their picker are private to the controller; the
+        selected card's eventual PlayedResources move is public.
+        """
+        import battle_engine as _be
+        from abilities.framework.effects.choices import (
+            CHOOSE_AND_PLAY_ABILITY, CHOICE_TARGET_TEMPLATE)
+
+        def build_prompt(target_game, player_uid):
+            ev = target_game._make_event(
+                game_engine.PlayerOptionListSessionEventArgs)
+            ev.player_id = player_uid
+            opt = target_game._make_event(
+                game_engine.PlayerOptionSessionEventArgs)
+            opt.card = game_engine.SessionCardId(
+                game_engine.UID(int(pending["source_uid"])))
+            opt.state = game_engine.ECardUsage.Activate
+            inst = target_game._make_event(
+                game_engine.OptionInstanceSessionEventArgs)
+            inst.opt_id = game_engine.ResourceId.from_str(
+                CHOOSE_AND_PLAY_ABILITY)
+            inst.target_ids.append(game_engine.ResourceId.from_str(
+                CHOICE_TARGET_TEMPLATE))
+            inst.min_target_counts = [1]
+            inst.max_target_counts = [1]
+            target = target_game._make_event(
+                game_engine.TargetInstanceSessionEventArgs)
+            target.target_index = 0
+            target.target_id = game_engine.ResourceId.from_str(
+                CHOICE_TARGET_TEMPLATE)
+            target.targets = [game_engine.SessionCardId(game_engine.UID(int(uid)))
+                              for uid in pending["choice_uids"]]
+            inst.target_instances.append(target)
+            opt.instances.append(inst)
+            ev.options.append(opt)
+            target_game._push(ev)
+            # DoubleChoice is resolved by the client's normal triggered-ability
+            # configuration flow: PlayerOptionList supplies the generated cards,
+            # then class 23 tells UIBattle to push BattleStateUseTriggeredAbility
+            # for the built-in ChooseAndPlay ability. Without this event the
+            # options only update the cache; no picker state is pushed.
+            req = target_game._make_event(
+                game_engine.AbilityActivationDataRequiredSessionEventArgs)
+            req.player_id = player_uid
+            req.ability_instance_id = int(pending.get("instance_id", 1))
+            req.ability_parent_id = 0
+            req.source_card_id = game_engine.SessionCardId(
+                game_engine.UID(int(pending["source_uid"])))
+            req.ability_template_id = game_engine.ResourceId.from_str(
+                CHOOSE_AND_PLAY_ABILITY)
+            req.effect_group_id = 1
+            req.effect_instance_ids = []
+            req.resolve_chain = False
+            target_game._push(req)
+            target_game.push_green_light(
+                player_uid, game_engine.EPriorityContext.Normal)
+
+        bstate["pending_choice"] = pending
+        bstate["resolution_paused"] = True
+        if bstate.get("pvp"):
+            from services.tournament_game import (
+                pvp_load_state, pvp_save_state, _send_pvp_packet)
+            from gamemodes.tournament_engine import player_handlers
+            from db import db_game_session_pids
+            state = pvp_load_state(session) or {}
+            state["pending_choice"] = pending
+            state["resolution_paused"] = True
+            pvp_save_state(session, state)
+            chooser_id = int(pending["owner_id"])
+            pids = db_game_session_pids(session.session_id)
+            opponent_id = next((pid for pid in pids if int(pid) != chooser_id), 0)
+            chooser = game_engine.UID.make(244, chooser_id)
+            private = game_engine.Game(
+                int(session.session_id), chooser,
+                game_engine.UID.make(244, opponent_id))
+            choice_ids = ({int(uid) for uid in pending["choice_uids"]} |
+                          {int(uid) for uid in
+                           (bstate.pop("private_choice_uids", []) or [])})
+            # The generated cards and picker are controller-private. Keep the
+            # chain-resolution events in the shared game stream.
+            private.events = []
+            for event in list(game.events):
+                card_id = getattr(event, "session_card_id", None)
+                card_uid = getattr(getattr(card_id, "uid", None), "uid64", None)
+                if card_uid is not None and int(card_uid) in choice_ids:
+                    private.events.append(event)
+            game.events = [
+                event for event in game.events
+                if not (
+                    event.__class__.__name__ in (
+                        "PlayerOptionListSessionEventArgs",
+                        "GreenLightSessionEventArgs")
+                    or (getattr(getattr(
+                        getattr(event, "session_card_id", None), "uid", None),
+                        "uid64", None) in choice_ids))]
+            build_prompt(private, chooser)
+            prompt_handler = player_handlers.get(chooser_id)
+            if prompt_handler is not None:
+                _send_pvp_packet(prompt_handler, session, private, chooser,
+                                 "choice")
+            return
+        _be.save_state(session, bstate)
+        build_prompt(game, pl_t)
+
+    def _resolve_pending_choice(self, session, pl_t, ai_t, inner_bytes,
+                                ability_guid=None):
+        """Play a selected Choice token and resume its parent BOM."""
+        import battle_engine as _be
+        from abilities.framework.effects.choices import (
+            CHOOSE_AND_PLAY_ABILITY, extract_card_uids, play_choice_card,
+            resolve_choice_card_abilities)
+        bstate = _be.load_state(session)
+        pending = bstate.get("pending_choice")
+        if not pending:
+            return False
+        if (ability_guid and str(ability_guid).lower() !=
+                CHOOSE_AND_PLAY_ABILITY):
+            return False
+        selected = extract_card_uids(inner_bytes)
+        chosen_uid = next((uid for uid in reversed(selected)
+                           if int(uid) in {
+                               int(value) for value in
+                               pending.get("choice_uids", [])}), None)
+        if chosen_uid is None:
+            log_req("    Choice answer invalid: no legal choice card")
+            self._push_transaction_ack(session)
+            return True
+        owner_id = int(pending.get("owner_id", self.user_profile["id"]))
+        if owner_id != int(self.user_profile["id"]):
+            log_req(f"    Choice answer rejected for owner {owner_id}")
+            self._push_transaction_ack(session)
+            return True
+        bstate.pop("pending_choice", None)
+        bstate.pop("resolution_paused", None)
+        g = self._fresh_game(session, pl_t, ai_t, bstate)
+        if not play_choice_card(g, session, _db, self, pl_t, ai_t, bstate,
+                                chosen_uid, owner_id):
+            log_req(f"    Choice answer rejected: {hex(int(chosen_uid))}")
+            bstate["pending_choice"] = pending
+            bstate["resolution_paused"] = True
+            _be.save_state(session, bstate)
+            self._push_transaction_ack(session)
+            return True
+        resolve_choice_card_abilities(
+            g, session, _db, self, pl_t, ai_t, bstate, chosen_uid,
+            pending.get("source_uid"), owner_id)
+        from abilities.framework.resolution import resolve_ability
+        target_map = {int(key): value for key, value in
+                      (pending.get("target_map") or {}).items()}
+        resolve_ability(
+            self, g, session, _db, pl_t, ai_t, bstate,
+            pending["ability_guid"], pending.get("source_uid"), owner_id,
+            target_map=target_map, variables=pending.get("variables") or {},
+            resume_from_order=int(pending.get("resume_effect_order", 0)))
+        _be.save_state(session, bstate)
+        if bstate.get("pending_choice"):
+            # The resumed BOM has opened its second choice. The prompt helper
+            # already supplied the new PlayerOptionList and green light.
+            self._send_battle_events(session, g, pl_t)
+        else:
+            g.push_chain_empty()
+            g.push_green_light(pl_t, game_engine.EPriorityContext.Normal)
+            self._send_battle_events(session, g, pl_t)
+            if _be.current_phase(bstate) in (
+                    game_engine.ETurnPhases.FirstMainPhase,
+                    game_engine.ETurnPhases.SecondMainPhase):
+                self._push_main_phase_options(session, pl_t, ai_t)
+        self._push_transaction_ack(session)
+        log_req(f"    Choice selected: {hex(int(chosen_uid))} "
+                f"for {pending['ability_guid'][:8]}")
+        return True
 
     def _push_private_revealed_cards(self, session, bstate, owner_id, rows,
                                      pl_t, ai_t):
@@ -3019,7 +3200,8 @@ class HCPHandler:
         # are castable in ANY priority window — include them here for non-main phases.
         affordable = self._affordable_troop_abilities(session, bstate)
         if affordable:
-            self._add_troop_ability_options(game, pl_t, session, affordable)
+            self._add_troop_ability_options(game, pl_t, session, affordable,
+                                             bstate)
         game.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
         game.push_player_updated(ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
         self._push_warzone_card_updates(game, session, pl_t, ai_t)
@@ -3874,8 +4056,21 @@ class HCPHandler:
                 self._resolve_champion_void_targets(
                     game, session, pl_t, ai_t, bstate, str(ag))
                 fn = _abil.resolve_effect(ag)
+                ability_log = ""
                 if fn:
-                    fn(game, session, _db, self, pl_t, ai_t, bstate, ag, None)
+                    ability_log = fn(
+                        game, session, _db, self, pl_t, ai_t, bstate, ag, None)
+                else:
+                    # Keep the authoritative BOM path available even when the
+                    # compatibility resolver was loaded before a runtime
+                    # metadata refresh. Champion powers must not silently
+                    # consume their charge and resolve to no effect merely
+                    # because the registry lookup missed the GUID.
+                    from abilities.framework.resolution import resolve_ability
+                    ability_log = resolve_ability(
+                        self, game, session, _db, pl_t, ai_t, bstate, ag,
+                        bstate.get("resolving_source_uid"),
+                        bstate.get("resolving_owner_id", 0), {})
                 # Damage/heal leaves normally emit class 38.  Add a fallback
                 # for ability implementations that update the battle state
                 # directly, so the champion HUD changes immediately rather
@@ -3892,6 +4087,10 @@ class HCPHandler:
                 game.push_champion_health_changed_if_missing(
                     ai_t, ability_ai_health_before,
                     ability_ai_health_after, since=ability_event_start)
+                log_req(f"    Champion ability BOM {str(ag)[:8]}: "
+                        f"{ability_log} health="
+                        f"{ability_player_health_before}->{ability_player_health_after}/"
+                        f"{ability_ai_health_before}->{ability_ai_health_after}")
                 if self._bom_has_discard(ag):
                     self._push_discard_prompt(
                         game, session, pl_t, ai_t, bstate, str(ag))
@@ -5363,6 +5562,13 @@ class HCPHandler:
             log = fn(game, session, _db, self, pl_t, ai_t, bstate, ability_guid, None)
         self._remove_one_shot_ability(
             session, source_uid, ability_guid, game, pl_t, ai_t, bstate)
+        # Manual troop abilities resolve directly rather than as stack items.
+        # Apply state-based effects here as well, so a stat reduction that
+        # lowers a troop's effective defense to zero sends it to the crypt
+        # before the player receives another priority window.
+        if _be.stack_empty(bstate):
+            _ability_mod.state_based_deaths(
+                game, session, _db, self, pl_t, ai_t, bstate)
         _be.save_state(session, bstate)
         # Exhaust-as-cost: tap the source card now that the ability resolved
         # (e.g. Prairie Scout's [ACT] ... — the tap is part of the cost).
@@ -5407,7 +5613,10 @@ class HCPHandler:
             self._push_discard_prompt(
                 game, session, pl_t, ai_t, bstate, ability_guid)
             discard_prompted = bool(bstate.get("pending_discard_ability"))
-        if not discard_prompted:
+        if (not discard_prompted and
+                not bstate.get("pending_choice") and
+                not bstate.get("pending_deck_search") and
+                not bstate.get("pending_trigger")):
             game.push_green_light(pl_t, self._priority_context_for(
                 __import__("battle_engine").current_phase(bstate), bstate))
         if game.events:
@@ -5603,6 +5812,16 @@ class HCPHandler:
         except Exception as e:
             import traceback
             log(f"Error {self.addr}: {e}\n{traceback.format_exc()}")
+            # A handler can fail after a legacy helper has opened a write
+            # transaction on the shared connection (for example, when a
+            # game-card sync exhausts its SQLite lock retries).  Leaving that
+            # transaction open blocks every other process using the database,
+            # including the auth proxy.  Roll it back before closing this
+            # client connection so a failed request cannot poison the server.
+            try:
+                _db.rollback()
+            except Exception as rollback_error:
+                log(f"Rollback after handler error failed: {rollback_error}")
         finally:
             self._handle_disconnect()
             self.conn.close()
@@ -6384,6 +6603,16 @@ class HCPHandler:
         else:
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
             ai_t = game_engine.UID.make(3, 1000)
+            # The selected Fortune is consumed when the human finishes the
+            # opening-hand decision.  ReadyToStartGame has its own local
+            # campaign-id variable, so derive it again here rather than
+            # relying on that unrelated handler scope.
+            try:
+                camp_id = int((session.session_name or "camp_0").split("_")[-1]
+                              or 0) if (session.session_name or "").startswith(
+                                  "camp_") else 0
+            except (TypeError, ValueError):
+                camp_id = 0
         if not handled:
             game = game_engine.Game(session.session_id, pl_t, ai_t)
             game.player_resources = 0
@@ -6453,6 +6682,43 @@ class HCPHandler:
             # Champion starting health (persisted for combat + reconnect).
             bstate["player_health"] = getattr(self, "_player_starting_health", 20)
             bstate["ai_health"] = getattr(self, "_ai_starting_health", 10)
+            # Fortune readings are opponent-owned encounter effects. Resolve
+            # the selected card through the normal metadata/BOM path so its
+            # target templates choose the player's champion for
+            # EachOpposingChampion, while EachChampion effects still affect
+            # both champions. Sapphire's opening-hand modifier was applied
+            # before the hand was dealt above.
+            fortune_ability = getattr(
+                self, "_campaign_fortune_ability_guid", None)
+            fortune_guid = getattr(self, "_campaign_fortune_guid", None)
+            if fortune_ability:
+                self._current_bstate = bstate
+                try:
+                    from abilities.framework.resolution import resolve_ability
+                    fortune_source = int(self._ai_champ_scid.uid.uid64)
+                    fortune_log = resolve_ability(
+                        self, game, session, _db, pl_t, ai_t, bstate,
+                        fortune_ability, fortune_source, 0, {})
+                    log_req(f"    Fortune {fortune_guid}: {fortune_log}")
+                except Exception as exc:
+                    log_req(f"    Fortune {fortune_guid} error: {exc}")
+                finally:
+                    for key in ("player_mod_target", "player_spell_target",
+                                "resolving_target_uid", "resolving_effect_guid"):
+                        bstate.pop(key, None)
+                    campaign.consume_fortune(_db, camp_id, fortune_guid)
+                    self._campaign_fortune_guid = None
+                    self._campaign_fortune_ability_guid = None
+            game.player_threshold = dict(bstate.get("player_threshold", {}))
+            game.player_charges = bstate.get("player_charges", 0)
+            game.player_resources = bstate.get("player_resources", 0)
+            game.player_total_resources = bstate.get("player_total_resources", 0)
+            game.ai_threshold = dict(bstate.get("ai_threshold", {}))
+            game.ai_charges = bstate.get("ai_charges", 0)
+            game.ai_resources = bstate.get("ai_resources", 0)
+            game.ai_total_resources = bstate.get("ai_total_resources", 0)
+            game.player_health = bstate.get("player_health", 20)
+            game.ai_health = bstate.get("ai_health", 10)
             # Apply any phase stops the client configured before the battle
             # state existed (SetTurnPhasesTransaction during setup), or the
             # player's saved preferences from previous battles.
@@ -7252,7 +7518,8 @@ class HCPHandler:
                     # after playing a card (a fresh troop just resolved).
                     affordable3 = self._affordable_troop_abilities(session, bstate)
                     if affordable3:
-                        self._add_troop_ability_options(g3, pl_t, session, affordable3)
+                        self._add_troop_ability_options(
+                            g3, pl_t, session, affordable3, bstate)
                     # Re-grant priority so the player keeps the Pass Priority
                     # button visible after playing a card.
                     g3.push_green_light(pl_t, self._priority_context_for(_be.current_phase(bstate), bstate))
@@ -7420,6 +7687,17 @@ class HCPHandler:
                 ability_guid = m.group(1).decode().lower()
         log_req(f"    Ability activation: guid={ability_guid}")
 
+        # A DoubleChoice effect exposes the client's built-in
+        # ChooseAndPlay ability. Consume that selection before normal
+        # champion/troop ability routing can mistake the generated Choice
+        # card for an ordinary activation.
+        if ability_guid:
+            import battle_engine as _choice_be
+            if _choice_be.load_state(session).get("pending_choice"):
+                if self._resolve_pending_choice(
+                        session, pl_t, ai_t, inner_bytes, ability_guid):
+                    return True
+
         # A triggered-ability target response (e.g. Solitary Exile's
         # Deploy "Void another target card") arrives as an
         # AbilityActivationData transaction too — the client submits a
@@ -7493,6 +7771,9 @@ class HCPHandler:
                         session, pl_t, ai_t, bstate,
                         int(src_row[0]), ability_guid, inner_bytes)
                     if (not bstate.get("stack") and
+                            not bstate.get("pending_choice") and
+                            not bstate.get("pending_deck_search") and
+                            not bstate.get("pending_trigger") and
                             not bstate.get("pending_discard_ability") and
                             _be.current_phase(bstate) in (
                                 game_engine.ETurnPhases.FirstMainPhase,
@@ -8282,13 +8563,20 @@ class HCPHandler:
                         # after a heal) reports the real health/resources.
                         gs = self._fresh_game(session, pl_t, ai_t, bstate)
                         self._resolve_stack_item(session, pl_t, ai_t, bstate, item, gs)
-                        if _be.stack_empty(bstate):
+                        if (_be.stack_empty(bstate) and
+                                not bstate.get("pending_choice") and
+                                not bstate.get("pending_trigger") and
+                                not bstate.get("pending_deck_search")):
                             gs.push_chain_empty()
                         # Priority to the active player for the next item
                         # (or the next phase). ResolveTopOfChain keeps the
                         # pass button labelled "Resolve <Card>".
                         cur_phase = _be.current_phase(bstate)
-                        if _be.stack_empty(bstate) and bstate.get("turn_player") == _be.PLAYER:
+                        if (_be.stack_empty(bstate) and
+                                not bstate.get("pending_choice") and
+                                not bstate.get("pending_trigger") and
+                                not bstate.get("pending_deck_search") and
+                                bstate.get("turn_player") == _be.PLAYER):
                             if cur_phase == game_engine.ETurnPhases.FirstMainPhase:
                                 # A troop may have entered during this chain
                                 # (notably a Speed troop). Recompute before
@@ -8306,8 +8594,11 @@ class HCPHandler:
                             # "Continue to Second Main Phase <CardName>".
                             gs.push_turn_phase(cur_phase, pl_t, pl_t)
                             self._push_phase_options(session, pl_t, ai_t, cur_phase)
-                        gs.push_green_light(pl_t, self._priority_context_for(
-                            cur_phase, bstate))
+                        if not (bstate.get("pending_choice") or
+                                bstate.get("pending_trigger") or
+                                bstate.get("pending_deck_search")):
+                            gs.push_green_light(pl_t, self._priority_context_for(
+                                cur_phase, bstate))
                         self._send_battle_events(session, gs, pl_t)
                         log_req(f"    Resolved chain item {item.get('kind')} "
                                 f"({item.get('ability_guid', '')[:8] or hex(item.get('source_uid') or 0)})")
@@ -9496,7 +9787,7 @@ class HCPHandler:
             player_name = self.user_profile["name"] if self.user_profile else "TestPlayer"
             log_req(f"    SESS: raw={session.session_id:#x}, tut={sess_tutorial.uid64:#x}")
 
-            # Game mode: campaign (training/dungeon) vs FRA.
+            # Game mode: campaign (training/dungeon), Practice mirror, or FRA.
             # Campaign sessions are named "camp_<CampID>" by the campaign
             # 'start' handler, so we can distinguish them thread-safely from
             # the DB-backed session row.
@@ -9505,12 +9796,18 @@ class HCPHandler:
             self._scene_targeted_ability_guids = []
             self._scene_targeted_ability_owners = {}
             self._champion_granted_ability_guids = {}
+            self._campaign_fortune_guid = None
+            self._campaign_fortune_ability_guid = None
+            self._campaign_fortune_starting_hand_bonus = 0
             player_champ_id = game._new_card_id()
             ai_champ_id = game._new_card_id()
             player_talents_json = "[]"
 
             is_campaign = (session.session_name or "").startswith("camp_")
-            log_req(f"    Game mode: {'CAMPAIGN' if is_campaign else 'FRA'} (session={session.session_name})")
+            is_practice = (session.session_name or "").startswith("Session-")
+            mode_name = ("CAMPAIGN" if is_campaign else
+                         "PRACTICE" if is_practice else "FRA")
+            log_req(f"    Game mode: {mode_name} (session={session.session_name})")
 
             if is_campaign:
                 camp_id = int((session.session_name or "camp_0").split("_")[-1] or 0)
@@ -9533,9 +9830,16 @@ class HCPHandler:
                 player_starting_health = cfg["player_starting_health"]
                 is_tutorial = cfg["is_tutorial"]
                 player_champ_guid = cfg["player_champ_guid"]
+                self._campaign_fortune_guid = cfg.get("fortune_guid")
+                self._campaign_fortune_ability_guid = cfg.get(
+                    "fortune_ability_guid")
+                self._campaign_fortune_starting_hand_bonus = int(
+                    cfg.get("fortune_starting_hand_bonus", 0) or 0)
                 log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}")
             else:
-                # Get player champion from arena state's selected deck
+                # Get player champion from the selected deck. Practice uses
+                # this same deck as the AI's mirror; FRA uses it only as the
+                # player's deck and obtains an authored challenger below.
                 arena = db_get_arena_state(self.user_profile["id"])
                 deck_db_id = self._resolve_fra_deck_id(arena["deck_id"])
                 player_champ_guid = db_get_player_champion_guid(deck_db_id) or "1d462ffb-0744-4996-804c-ba61b2c5c2f1"
@@ -9558,20 +9862,29 @@ class HCPHandler:
                     (self.user_profile["id"], deck_db_id)).fetchone()
                 if _talent_row and _talent_row[0]:
                     player_talents_json = _talent_row[0]
-                log_req(f"    FRA battle: deck={deck_db_id} (arena={arena['deck_id']}) "
-                        f"champ={player_champ_guid} health={player_starting_health}")
+                log_req(f"    {mode_name} battle: deck={deck_db_id} "
+                        f"(arena={arena['deck_id']}) champ={player_champ_guid} "
+                        f"health={player_starting_health}")
 
-                # Get AI champion from current challenger
-                challengers = db_get_fra_challengers(self.user_profile["id"])
-                cidx = arena["challenger_index"]
-                if cidx < len(challengers):
-                    ai_champ_guid = challengers[cidx]["champion_guid"]
-                    ai_name = challengers[cidx]["name"]
-                    ai_deck_guid = challengers[cidx]["deck"]
-                else:
+                if is_practice:
+                    # Practice is a mirror match, not an FRA encounter. Keep
+                    # the neutral AI champion presentation, but select its
+                    # deck from the player's resolved deck below.
                     ai_champ_guid = "f8f86969-2e47-4901-8c9e-7fbf8d859e22"
-                    ai_name = "Angel of Dawn"
+                    ai_name = "AI Opponent"
                     ai_deck_guid = None
+                else:
+                    # Get AI champion from the current FRA challenger.
+                    challengers = db_get_fra_challengers(self.user_profile["id"])
+                    cidx = arena["challenger_index"]
+                    if cidx < len(challengers):
+                        ai_champ_guid = challengers[cidx]["champion_guid"]
+                        ai_name = challengers[cidx]["name"]
+                        ai_deck_guid = challengers[cidx]["deck"]
+                    else:
+                        ai_champ_guid = "f8f86969-2e47-4901-8c9e-7fbf8d859e22"
+                        ai_name = "Angel of Dawn"
+                        ai_deck_guid = None
                 ai_charge_power = db_get_charge_power(ai_champ_guid)
 
                 # FRA encounters currently have no authored campaign
@@ -9640,7 +9953,8 @@ class HCPHandler:
                     _db, session, self.user_profile["id"], race_name, cls_name,
                     pl_abilities)
                 self._campaign_starting_hand_size = max(
-                    0, int(hand_cfg["starting_hand_size"]))
+                    0, int(hand_cfg["starting_hand_size"]) +
+                    self._campaign_fortune_starting_hand_bonus)
                 self._campaign_max_hand_size = max(
                     0, int(hand_cfg["maximum_hand_size"]))
                 self._campaign_starting_hand_effects = list(
@@ -9727,6 +10041,7 @@ class HCPHandler:
                 deck_rows = _db.execute("SELECT cards FROM decks WHERE id=? AND user_id=?", (deck_db_id, self.user_profile["id"])).fetchone()
             player_deck_cards = []
             player_card_tpl_ids = []
+            player_resolved_tpl_ids = []
             if deck_rows and deck_rows[0]:
                 card_ids = _json.loads(deck_rows[0])
                 random.shuffle(card_ids)
@@ -9741,6 +10056,7 @@ class HCPHandler:
                     player_card_tpl_ids.append(card_tpl_id)
                     card_uid = cid.uid.to_uint64()
                     _tpl, ctype, _n, _c, _a, _d = self._resolve_card_ref(card_tpl_id)
+                    player_resolved_tpl_ids.append(_tpl)
                     _db.execute("INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, card_type, template_guid, location, position, owner_user_id, original_template_guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (self.user_profile["id"], session.session_id, card_uid, card_tpl_id, ctype or "Unknown", _tpl, 'deck', pos, self.user_profile["id"], _tpl))
                     # Populate per-instance ability/attribute data from the template
@@ -9884,11 +10200,46 @@ class HCPHandler:
             # AI deck (shuffled). For campaign battles use the encounter's
             # real AI deck from encounter_deck_cards; otherwise a simple deck.
             ai_deck_cards = []
-            if ai_deck_guid:
-                import json as _aj
-                ai_card_specs = []
-                scene_ai_ability_guids = []
-                scene_mod_card_guids = set()
+            import json as _aj
+            ai_card_specs = []
+            scene_ai_ability_guids = []
+            scene_mod_card_guids = set()
+            if is_practice:
+                # Practice is explicitly a mirror match. Use the resolved
+                # player deck templates, preserving one AI card per player
+                # card and the current socketed-gem abilities.
+                active_gems = {}
+                if deck_db_id:
+                    _ga_row = _db.execute(
+                        "SELECT active_gems FROM decks WHERE id=?",
+                        (deck_db_id,)).fetchone()
+                    if _ga_row and _ga_row[0]:
+                        try:
+                            active_gems = _aj.loads(_ga_row[0]) or {}
+                        except (TypeError, ValueError):
+                            active_gems = {}
+                for idx, cg in enumerate(player_resolved_tpl_ids):
+                    if not cg:
+                        continue
+                    gem_key = str(player_card_tpl_ids[idx])
+                    gem_type = int(active_gems.get(gem_key, 0) or 0)
+                    gem_ability_guids = deck_gem_abilities.get(gem_key) or []
+                    ai_card_specs.append((cg, gem_type, gem_ability_guids))
+            elif not ai_deck_guid:
+                # Practice sessions do not provide an encounter deck GUID.
+                # Use a validated extracted starter deck so the opponent has
+                # real card templates, resources, abilities, and a deck that
+                # can also be inspected by !zones. The Human list is a
+                # neutral fallback; encounter-specific decks still take
+                # precedence below.
+                fallback_deck = _STARTER_DECKS.get("Human") or {}
+                for card_guid, quantity in fallback_deck.get("cards", []):
+                    for _ in range(max(0, int(quantity or 0))):
+                        if _db.execute(
+                                "SELECT 1 FROM card_templates WHERE guid=?",
+                                (card_guid,)).fetchone():
+                            ai_card_specs.append((card_guid, 0, []))
+            if ai_deck_guid or ai_card_specs:
                 gem_types_by_name = {
                     str(name): (int(gem_type or 0),
                                 _aj.loads(abilities_json or "[]")
@@ -9950,12 +10301,73 @@ class HCPHandler:
                         for item in mod.get("mods", [])
                         if item.get("guid")
                     }
+                    scene_setup_card_guids = set()
+
+                    def _has_game_started_grant(card_guid):
+                        """Whether a scene card grants a GameStarted ability.
+
+                        Untargeted encounter setup cards are authored as
+                        scene modifiers, but their ``You`` and ``opposing
+                        champion`` ownership is evaluated from the encounter
+                        side that owns the hidden card.  Keep those cards in
+                        the AI mod zone so the normal metadata/BOM resolver
+                        applies the opposing-champion target correctly.
+                        """
+                        card_row = _db.execute(
+                            "SELECT abilities_json FROM card_templates "
+                            "WHERE guid=?", (card_guid,)).fetchone()
+                        try:
+                            ability_guids = _aj.loads(
+                                card_row[0] or "[]") if card_row else []
+                        except (TypeError, ValueError):
+                            ability_guids = []
+                        for ability_guid in ability_guids:
+                            for _eg, effect_type, raw_param in _db.execute(
+                                    "SELECT effect_guid,effect_type,param "
+                                    "FROM ability_effects WHERE ability_guid=?",
+                                    (ability_guid,)).fetchall():
+                                if effect_type != "GrantAbilityEffectTemplate":
+                                    continue
+                                try:
+                                    grant_data = _aj.loads(raw_param or "{}")
+                                except (TypeError, ValueError):
+                                    grant_data = None
+                                granted_guid = (
+                                    grant_data.get("ability_guid") or
+                                    grant_data.get("abilityId")
+                                    if isinstance(grant_data, dict)
+                                    else str(raw_param or "").strip())
+                                if not granted_guid:
+                                    continue
+                                trigger_row = _db.execute(
+                                    "SELECT trigger_event_type "
+                                    "FROM card_abilities_meta "
+                                    "WHERE ability_guid=?", (str(
+                                        granted_guid).lower(),)).fetchone()
+                                if (trigger_row and
+                                        "GameStartedEvent" in (trigger_row[0] or "")):
+                                    return True
+                        return False
+
                     for mod in scene_mods:
                         for item in mod.get("mods", []):
                             mg = item.get("guid")
+                            mg_key = str(mg or "").lower()
+                            # A scene-level card with a start-of-game grant is
+                            # an encounter setup card.  Cockatwice's Taming
+                            # modifier is the canonical example: the hidden AI
+                            # source grants the sphere to its opposing player.
+                            # If the authored data already contains an
+                            # explicit AI copy (Wild Cub), use that copy once.
+                            if (mg and not mod.get("target") and
+                                    mg_key not in targeted_scene_mod_guids and
+                                    _has_game_started_grant(mg)):
+                                ai_card_specs.append((mg, 0, []))
+                                scene_mod_card_guids.add(mg_key)
+                                scene_setup_card_guids.add(mg_key)
                             if mg and mod.get("target") == "AIPlayer":
                                 ai_card_specs.append((mg, 0, []))
-                                scene_mod_card_guids.add(str(mg).lower())
+                                scene_mod_card_guids.add(mg_key)
                                 # Resolve controller-only grants (for example
                                 # the Untamed Dire Toad passive) and apply them
                                 # later to matching visible troops.
@@ -10003,8 +10415,8 @@ class HCPHandler:
                             # a passive ability to the encounter's troops.
                             # Resolve the grant through the ability metadata;
                             # do not infer it from display text.
-                            if (mg and str(mg).lower()
-                                    not in targeted_scene_mod_guids):
+                            if (mg and mg_key not in targeted_scene_mod_guids
+                                    and mg_key not in scene_setup_card_guids):
                                 _arow = _db.execute(
                                     "SELECT abilities_json FROM card_templates WHERE guid=?",
                                     (mg,)).fetchone()
@@ -10096,7 +10508,11 @@ class HCPHandler:
                         # drawn, and keeps later CardUpdated pushes consistent.
                         self._card_full_data(game, cid, cg)
                     _db.commit()
-                    log_req(f"    AI deck: {len(ai_deck_cards)} cards from encounter {ai_deck_guid} (hands dealt after PickGoesFirst)")
+                    source = (f"encounter {ai_deck_guid}" if ai_deck_guid
+                              else "player mirror" if is_practice
+                              else "Human starter fallback")
+                    log_req(f"    AI deck: {len(ai_deck_cards)} cards from "
+                            f"{source} (hands dealt after PickGoesFirst)")
             if not ai_deck_cards:
                 # If an encounter has no usable deck data, use a neutral
                 # generated fallback.  Never copy the player's deck into a
@@ -12488,30 +12904,13 @@ class HCPHandler:
                         session, command, session_id, comp, conh),
                 )
 
-            # Respond to 3029 (skip for mulligan keep/redraw and phase-stop
-            # updates — the client is driven by 3055 events for those, and the
-            # client has no 3029 response handler ("Command handler not found").
-            # Also skip ALL 3029 responses for tournament sessions.
-            is_tourney = session and (session.session_name or "").startswith("tourney-")
-            # Skip 3029 response for tournament sessions EXCEPT when a direct reply is required.
-            if not is_tourney and not is_mulligan_keep and not is_mulligan_redraw and not is_set_stops and not is_choose_pick:
-                resp_inner = encode_objfmt_response(
-                    ["Game.Client.Network.GameSession.PlayerTransactionResponse",
-                     "System.String", "System.Int32"],
-                    [("Error", "int", 0),
-                     ("ErrorMessage", "string", ""),
-                    ]
-                )
-                resp_body = compress_gzip(resp_inner) if comp else resp_inner
-                resp_reqid = reqid | 1
-                dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
-                issuer_str = f"0.0.0.0.ServiceGameSession.{SERVICE_GAME_SESSION_UID}.ServicePlayer.{self.client_uid}.{resp_reqid}"
-                self.scnt += 1
-                self.send({
-                    "issuer": issuer_str, "target": target, "instance": instance,
-                    "reqid": resp_reqid, "c": comp, "conh": conh, "sid": self.sid,
-                }, dw_bytes)
-                log_req(f"    Sent PlayerTransaction response ({len(dw_bytes)}b)")
+            # PlayerTransaction is fire-and-forget in the battle client. Its
+            # SessionClient advances only after a 3055 sync packet, and the
+            # client has no usable 3029 response handler for this server-side
+            # transaction path. Sending the legacy 3029 response therefore
+            # produces "Command handler not found for data wrapper type 3029"
+            # and can strand the next transaction. Every handled path above
+            # sends either its event packet or the empty 3055 acknowledgement.
 
             if transaction_capture_id is not None:
                 try:

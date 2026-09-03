@@ -1,6 +1,17 @@
 """Hex TCG domain enum types (matching Game.Shared.Mechanics enums on the client)."""
 
 
+class EAnimationTrigger:
+    """Game.Shared.Mechanics.EAnimationTrigger wire values."""
+    Invalid = 0
+    CannonTalent = 1
+    MageTalent = 2
+    WarriorTalent = 3
+    ClericTalent = 4
+    RangerTalent = 5
+    Kraken = 8
+
+
 # ======================================================================
 #  Turn Phases
 # ======================================================================

@@ -224,24 +224,20 @@ def run_tests(path: Path) -> None:
         print("[docker] HEX_RUN_TESTS_ON_BOOT disables startup tests", flush=True)
         return
 
-    test_files = sorted((ROOT / "tests").glob("tests_*.py"))
-    if not test_files:
-        raise RuntimeError("No direct test scripts were copied into the image")
-
     test_env = os.environ.copy()
-    test_env["HEX_DB_PATH"] = str(path)
-    print(f"[docker] running {len(test_files)} test scripts serially", flush=True)
-    failures = []
-    for test_file in test_files:
-        print(f"[docker] test {test_file.relative_to(ROOT)}", flush=True)
-        result = subprocess.run(
-            [sys.executable, str(test_file)],
-            cwd=str(ROOT),
-            env=test_env,
-            check=False,
-        )
-        if result.returncode:
-            failures.append(test_file.relative_to(ROOT))
+    test_env["HEX_TEST_SOURCE_DB"] = str(path)
+    runner = ROOT / "tests" / "run_all.py"
+    if not runner.is_file():
+        raise RuntimeError(f"Test runner is missing: {runner}")
+
+    print("[docker] running the supported test suite", flush=True)
+    result = subprocess.run(
+        [sys.executable, str(runner)],
+        cwd=str(ROOT),
+        env=test_env,
+        check=False,
+    )
+    failures = [runner.relative_to(ROOT)] if result.returncode else []
 
     if failures:
         print(

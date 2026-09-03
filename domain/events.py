@@ -1161,6 +1161,20 @@ class NetworkPacketSessionEventArgs(SessionEventArgs):
         raise NotImplementedError("NetworkPacket is NOT serialized by custom binary format")
 
 
+class AnimationTriggerSessionEventArgs(SessionEventArgs):
+    """Game.Shared.AnimationTriggerSessionEventArgs (client class 76)."""
+    CLASS_ID = 76
+
+    def __init__(self):
+        super().__init__()
+        self.trigger_value = 0
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_enum_int(self.trigger_value)
+        return self.end_write()
+
+
 # The following protocol events are present in the shipped client but were
 # previously absent from the server event model.  Keep their field order
 # identical to Game.Shared.Serializer on the client.

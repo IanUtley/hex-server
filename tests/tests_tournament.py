@@ -96,6 +96,49 @@ def test_orphaned_started_tournaments_are_closed_but_live_and_waiting_remain():
         test_db.close()
 
 
+def test_old_tournaments_close_and_remove_only_their_game_state():
+    previous_db = db._db
+    test_db = sqlite3.connect(":memory:")
+    try:
+        test_db.executescript(
+            """
+            CREATE TABLE tournaments (
+                id INTEGER PRIMARY KEY, status TEXT, session_id TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE game_sessions (session_id TEXT PRIMARY KEY);
+            CREATE TABLE game_cards (session_id TEXT, card_uid INTEGER);
+            INSERT INTO tournaments VALUES
+                (10001, 'started', 'old-session', datetime('now', '-2 days')),
+                (10002, 'waiting', NULL, datetime('now', '-2 days')),
+                (10003, 'started', 'new-session', datetime('now'));
+            INSERT INTO game_sessions VALUES ('old-session'), ('new-session');
+            INSERT INTO game_cards VALUES ('old-session', 1), ('new-session', 2);
+            """
+        )
+        db._db = test_db
+
+        assert db.db_tournament_cleanup_old() == {
+            "tournaments_closed": 2,
+            "game_sessions_removed": 1,
+            "game_cards_removed": 1,
+        }
+        assert test_db.execute(
+            "SELECT id, status FROM tournaments ORDER BY id"
+        ).fetchall() == [
+            (10001, "closed"), (10002, "closed"), (10003, "started")
+        ]
+        assert test_db.execute(
+            "SELECT session_id FROM game_sessions ORDER BY session_id"
+        ).fetchall() == [("new-session",)]
+        assert test_db.execute(
+            "SELECT session_id FROM game_cards ORDER BY session_id"
+        ).fetchall() == [("new-session",)]
+    finally:
+        db._db = previous_db
+        test_db.close()
+
+
 def test_pvp_result_is_published_before_game_over():
     events = []
 
@@ -374,6 +417,7 @@ def test_completed_result_publishes_final_full_snapshot_synchronously():
 if __name__ == "__main__":
     test_pvp_concede_ends_for_both_players()
     test_tournament_session_pids_ignore_non_player_card_owners()
+    test_old_tournaments_close_and_remove_only_their_game_state()
     test_pvp_champion_damage_uses_target_player_health()
     test_completed_match_is_visible_in_tournament_lobby()
     test_forfeit_completes_active_bo1_match()

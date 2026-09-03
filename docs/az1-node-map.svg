@@ -1,0 +1,487 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1900" viewBox="0 0 2600 1900">
+<rect width="100%" height="100%" fill="#101820"/>
+<rect x="30" y="30" width="1940" height="1810" rx="16" fill="#172630" stroke="#4d6570" stroke-width="2"/>
+<text x="60" y="70" fill="#f3f6f7" font-family="sans-serif" font-size="28" font-weight="bold">AZ1 — Howling Plains</text>
+<text x="60" y="100" fill="#aebfc6" font-family="sans-serif" font-size="15">Exact x/z layout from campaign/az01/nodes; Unity y is omitted from the projection.</text>
+<polyline points="1524.6,853.0 1583.8,830.7 1458.5,758.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1524.6,853.0 1492.0,894.6 1454.3,921.2 1405.8,918.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1524.6,853.0 1522.5,911.8 1501.9,955.1 1452.1,983.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1689.4,710.1 1635.3,732.0 1587.3,763.8 1458.5,758.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1689.4,710.1 1703.5,734.6 1735.7,734.6 1761.0,746.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1024.8,585.3 1036.4,614.9 1067.2,609.3 1078.0,662.1 1114.9,647.5 1158.2,668.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1776.9,113.3 1731.4,182.4 1681.2,245.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1681.2,245.0 1668.3,366.9 1682.1,435.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1682.1,435.1 1622.4,463.4 1572.7,439.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1682.1,435.1 1755.4,430.8 1808.6,397.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1682.1,435.1 1689.8,502.9 1694.9,557.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1808.6,397.8 1870.0,350.6 1848.1,269.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1694.9,557.0 1651.2,598.6 1598.4,628.2 1555.5,660.8 1515.6,657.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1694.9,557.0 1742.7,557.3 1760.3,600.3 1689.4,710.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1515.6,657.9 1527.6,593.0 1525.4,535.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1515.6,657.9 1512.2,717.9 1458.5,758.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1816.6,545.4 1835.2,616.6 1761.0,746.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1699.2,850.9 1699.2,789.5 1761.0,746.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1458.5,758.2 1435.8,778.8 1391.2,826.0 1372.3,851.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1405.8,918.6 1367.2,957.3 1315.7,957.3 1246.6,953.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1372.3,851.3 1320.8,904.5 1272.3,908.4 1246.6,953.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1246.6,953.4 1148.3,944.4 1058.2,905.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1246.6,953.4 1225.6,995.9 1225.6,1047.4 1225.6,1111.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1246.6,953.4 1328.5,1008.7 1367.2,1047.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1246.6,953.4 1210.1,891.2 1201.5,822.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1201.5,822.5 1140.2,840.1 1033.8,822.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1201.5,822.5 1156.1,774.5 1158.2,668.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1201.5,822.5 1231.6,746.2 1272.3,708.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="710.7,738.4 685.0,789.9 685.0,880.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="710.7,738.4 775.1,699.8 826.5,622.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1158.2,668.9 1188.7,639.8 1229.4,602.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1272.3,708.0 1288.2,665.9 1267.2,584.0 1292.9,534.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="991.7,491.3 1035.9,485.3 1091.7,485.3 1201.1,475.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1292.9,534.6 1319.1,499.9 1320.0,413.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1320.0,413.7 1345.7,342.9 1400.2,300.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1320.0,413.7 1255.2,456.6 1201.1,475.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1058.2,905.8 1045.4,944.4 1019.6,970.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1058.2,905.8 1030.8,928.1 969.9,977.4 942.4,995.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1019.6,970.1 942.4,880.0 942.4,687.0 865.2,519.6 800.8,468.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="800.8,468.1 672.1,493.9 607.7,609.7 646.3,777.1 594.9,854.3 659.2,995.9 813.7,1060.2 916.6,1073.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="916.6,1073.1 942.4,995.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="775.1,995.9 852.3,1008.7 942.4,995.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="620.6,455.3 530.5,481.0 440.4,455.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="355.5,1500.0 388.9,1330.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="355.5,1500.0 316.0,1613.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="942.4,995.9 890.9,931.5 852.3,828.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="942.4,995.9 981.0,1047.4 1019.6,1098.8 1045.4,1150.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="852.3,828.5 775.1,867.2 685.0,880.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="273.1,957.3 298.8,1034.5 337.4,1163.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="826.5,622.6 736.4,596.9 710.7,532.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1045.4,1150.3 1019.6,1266.2 878.0,1266.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="1045.4,1150.3 1122.6,1111.7 1084.0,1008.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="878.0,1266.2 787.9,1150.3 697.8,1073.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="878.0,1266.2 813.7,1291.9 762.2,1343.4 659.2,1394.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="659.2,1394.9 775.1,1459.3 852.3,1420.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="659.2,1394.9 633.5,1291.9 569.1,1176.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="659.2,1394.9 556.2,1433.5 479.0,1407.8 388.9,1330.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="569.1,1176.1 530.5,1124.6 504.8,1060.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,1304.8 594.9,1343.4 659.2,1394.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="504.8,1060.2 569.1,1034.5 607.7,1008.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="504.8,1060.2 504.8,983.0 466.1,918.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="337.4,1163.2 363.2,1240.4 388.9,1330.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="466.1,918.6 376.0,880.0 337.4,815.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="466.1,918.6 453.3,880.0 440.4,841.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="466.1,918.6 504.8,880.0 517.6,841.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="440.4,841.4 440.4,777.1 440.4,699.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="440.4,699.8 440.4,635.5 440.4,571.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="440.4,571.1 440.4,519.6 440.4,455.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="440.4,455.3 504.8,532.5 543.4,584.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="440.4,455.3 376.0,493.9 337.4,545.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,584.0 543.4,648.3 543.4,725.6" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,725.6 530.5,789.9 517.6,841.4" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="337.4,545.4 311.7,596.9 298.8,687.0" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="298.8,687.0 311.7,751.3 337.4,815.7" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="388.9,1330.5 317.7,1297.1 237.0,1289.8 157.2,1201.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,1588.0 552.4,1637.7 569.1,1690.9" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,1588.0 427.5,1613.7 316.0,1613.3" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="569.1,1690.9 672.1,1716.7 749.3,1678.1" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="144.4,1047.4 157.2,1201.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="144.4,1047.4 131.5,970.1 80.0,905.8" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="80.0,905.8 131.5,867.2 170.1,828.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="170.1,828.5 131.5,712.7 131.5,635.5" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<polyline points="543.4,1304.8 504.8,1214.7 453.3,1137.5 414.7,1073.1 401.8,995.9 298.8,931.5 260.2,892.9 183.0,738.4 183.0,622.6 170.1,558.2" fill="none" stroke="#8aa1aa" stroke-opacity="0.58" stroke-width="3"/>
+<g><title>Fork001 — Fork001 (Other); Unity (565.7001342773438, 8.49041748046875, -301.699951171875)</title><circle cx="1524.6" cy="853.0" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="1537.6" y="857.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Fork001</text></g>
+<g><title>Node00R — Vale of Oberon (Forest); Unity (604.1001586914062, 5.053253173828125, -268.3998718261719)</title><circle cx="1689.4" cy="710.1" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1702.4" y="714.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node00R</text></g>
+<g><title>Node00X — Short Cut (Canyon); Unity (449.20013427734375, 15.359649658203125, -239.2999267578125)</title><circle cx="1024.8" cy="585.3" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="1037.8" y="589.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node00X</text></g>
+<g><title>Node00Y — River of Whispers (None); Unity (337.0, 4.484283447265625, -406.9999694824219)</title><circle cx="543.4" cy="1304.8" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="556.4" y="1308.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node00Y</text></g>
+<g><title>Node00Z — River of Whispers (None); Unity (250.00009155273438, 3.21685791015625, -232.99990844726562)</title><circle cx="170.1" cy="558.2" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="183.1" y="562.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node00Z</text></g>
+<g><title>Node001 — Into The Woods (Forest); Unity (624.5001220703125, 6.497772216796875, -129.299560546875)</title><circle cx="1776.9" cy="113.3" r="13" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1789.9" y="117.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node001</text></g>
+<g><title>Node002 — North Feralroot Woods (Forest); Unity (602.2001953125, 5.48114013671875, -159.99984741210938)</title><circle cx="1681.2" cy="245.0" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1694.2" y="249.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node002</text></g>
+<g><title>Node003 — Dunnwood (Forest); Unity (602.400146484375, 4.859619140625, -204.2999267578125)</title><circle cx="1682.1" cy="435.1" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1695.1" y="439.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node003</text></g>
+<g><title>Node004 — Sporemist Hollow (Shroom); Unity (576.9000244140625, 5.2755126953125, -205.29989624023438)</title><circle cx="1572.7" cy="439.4" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="1585.7" y="443.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node004</text></g>
+<g><title>Node005 — Fonferek Thicket (CoastLine); Unity (631.9000854492188, 7.752593994140625, -195.59991455078125)</title><circle cx="1808.6" cy="397.8" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="1821.6" y="401.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node005</text></g>
+<g><title>Node006 — Horwich Sea (Island); Unity (641.1000366210938, 5.5, -165.59988403320312)</title><circle cx="1848.1" cy="269.1" r="9" fill="#4f72a6" stroke="#ffffff" stroke-width="2"/>
+<text x="1861.1" y="273.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node006</text></g>
+<g><title>Node007 — The Road of Oaks (Camp); Unity (605.4003295898438, 6.428985595703125, -232.69985961914062)</title><circle cx="1694.9" cy="557.0" r="9" fill="#d39432" stroke="#ffffff" stroke-width="2"/>
+<text x="1707.9" y="561.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node007</text></g>
+<g><title>Node008 — The Bleak Citadel (Dungeon); Unity (633.760009765625, 5.5, -230.00999450683594)</title><circle cx="1816.6" cy="545.4" r="9" fill="#b44e4e" stroke="#ffffff" stroke-width="2"/>
+<text x="1829.6" y="549.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node008</text></g>
+<g><title>Node009 — The Sutherland (Jungle); Unity (563.610107421875, 7.767791748046875, -256.2299499511719)</title><circle cx="1515.6" cy="657.9" r="9" fill="#327f72" stroke="#ffffff" stroke-width="2"/>
+<text x="1528.6" y="661.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node009</text></g>
+<g><title>Node010 — Sylvan Peninsula (Forest); Unity (565.89013671875, 6.898681640625, -227.74993896484375)</title><circle cx="1525.4" cy="535.7" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1538.4" y="539.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node010</text></g>
+<g><title>Node011 — Fort Romor (Dungeon); Unity (606.4002075195312, 2.62548828125, -301.1999206542969)</title><circle cx="1699.2" cy="850.9" r="9" fill="#b44e4e" stroke="#ffffff" stroke-width="2"/>
+<text x="1712.2" y="854.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node011</text></g>
+<g><title>Node012 — Bridge over the Zila - East (Bridge); Unity (550.300048828125, 7.63616943359375, -279.5999450683594)</title><circle cx="1458.5" cy="758.2" r="9" fill="#8b6f47" stroke="#ffffff" stroke-width="2"/>
+<text x="1471.5" y="762.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node012</text></g>
+<g><title>Node013 — Zila River (River); Unity (537.9999389648438, 0.205291748046875, -316.9999694824219)</title><circle cx="1405.8" cy="918.6" r="9" fill="#3e86b9" stroke="#ffffff" stroke-width="2"/>
+<text x="1418.8" y="922.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node013</text></g>
+<g><title>Node014 — Razortooth Forest (Jungle); Unity (548.8001098632812, 3.52777099609375, -331.9999084472656)</title><circle cx="1452.1" cy="983.0" r="9" fill="#327f72" stroke="#ffffff" stroke-width="2"/>
+<text x="1465.1" y="987.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node014</text></g>
+<g><title>Node015 — Bridge over the Zila - West (Bridge); Unity (530.2001953125, 5.230010986328125, -301.2999572753906)</title><circle cx="1372.3" cy="851.3" r="9" fill="#8b6f47" stroke="#ffffff" stroke-width="2"/>
+<text x="1385.3" y="855.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node015</text></g>
+<g><title>Node016 — The Road of Grass (Camp); Unity (500.900146484375, 6.08544921875, -325.0999755859375)</title><circle cx="1246.6" cy="953.4" r="9" fill="#d39432" stroke="#ffffff" stroke-width="2"/>
+<text x="1259.6" y="957.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node016</text></g>
+<g><title>Node017 — Cave-In (City); Unity (528.9999389648438, 3.565582275390625, -346.99993896484375)</title><circle cx="1367.2" cy="1047.4" r="9" fill="#7667a5" stroke="#ffffff" stroke-width="2"/>
+<text x="1380.2" y="1051.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node017</text></g>
+<g><title>Node018 — Shadowgrove (Forest); Unity (496.0, 6.9757080078125, -361.9999694824219)</title><circle cx="1225.6" cy="1111.7" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1238.6" y="1115.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node018</text></g>
+<g><title>Node019 — Brink Ridge (Forest); Unity (490.400146484375, 5.93951416015625, -294.6000061035156)</title><circle cx="1201.5" cy="822.5" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1214.5" y="826.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node019</text></g>
+<g><title>Node020 — Dreamsmoke Prairie (Canyon); Unity (376.0001220703125, 3.46502685546875, -274.9998779296875)</title><circle cx="710.7" cy="738.4" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="723.7" y="742.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node020</text></g>
+<g><title>Node021 — Clark Foothills (Forest); Unity (480.30010986328125, 4.1455078125, -258.7999572753906)</title><circle cx="1158.2" cy="668.9" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1171.2" y="672.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node021</text></g>
+<g><title>Node022 — Lake Wyalusing (Island); Unity (496.900146484375, 1.26837158203125, -243.29989624023438)</title><circle cx="1229.4" cy="602.4" r="9" fill="#4f72a6" stroke="#ffffff" stroke-width="2"/>
+<text x="1242.4" y="606.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node022</text></g>
+<g><title>Node023 — Node023 (Other); Unity (506.900146484375, 7.33941650390625, -267.89990234375)</title><circle cx="1272.3" cy="708.0" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="1285.3" y="712.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node023</text></g>
+<g><title>Node024 — Tomb of the Rose Knights (Dungeon); Unity (441.5001220703125, 9.5836181640625, -217.39987182617188)</title><circle cx="991.7" cy="491.3" r="9" fill="#b44e4e" stroke="#ffffff" stroke-width="2"/>
+<text x="1004.7" y="495.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node024</text></g>
+<g><title>Node025 — Lena Grotto (Shroom); Unity (620.8001098632812, 4.514129638671875, -276.7999572753906)</title><circle cx="1761.0" cy="746.2" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="1774.0" y="750.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node025</text></g>
+<g><title>Node026 — Node026 (Other); Unity (511.70013427734375, 5.128936767578125, -227.4998779296875)</title><circle cx="1292.9" cy="534.6" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="1305.9" y="538.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node026</text></g>
+<g><title>Node027 — Silver Forest (Forest); Unity (518.0000610351562, 6.658294677734375, -199.2999267578125)</title><circle cx="1320.0" cy="413.7" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1333.0" y="417.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node027</text></g>
+<g><title>Node028 — Garden of Ophelia (Jungle); Unity (536.7001342773438, 3.591278076171875, -172.79989624023438)</title><circle cx="1400.2" cy="300.0" r="9" fill="#327f72" stroke="#ffffff" stroke-width="2"/>
+<text x="1413.2" y="304.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node028</text></g>
+<g><title>Node029 — Hoff Mines (Shroom); Unity (490.3001708984375, 3.30902099609375, -213.60000610351562)</title><circle cx="1201.1" cy="475.0" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="1214.1" y="479.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node029</text></g>
+<g><title>Node030 — Bridge over the Zodiac - East (Bridge); Unity (457.0001220703125, 3.97265625, -313.9999694824219)</title><circle cx="1058.2" cy="905.8" r="9" fill="#8b6f47" stroke="#ffffff" stroke-width="2"/>
+<text x="1071.2" y="909.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node030</text></g>
+<g><title>Node031 — Zodiac River (River); Unity (448.0001220703125, 0.6034698486328125, -328.99993896484375)</title><circle cx="1019.6" cy="970.1" r="9" fill="#3e86b9" stroke="#ffffff" stroke-width="2"/>
+<text x="1032.6" y="974.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node031</text></g>
+<g><title>Node032 — Zodiac River - North (River); Unity (397.00006103515625, 0.66278076171875, -211.9998779296875)</title><circle cx="800.8" cy="468.1" r="9" fill="#3e86b9" stroke="#ffffff" stroke-width="2"/>
+<text x="813.8" y="472.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node032</text></g>
+<g><title>Node033 — Indigo River (River); Unity (424.0001220703125, 1.3427581787109375, -352.99993896484375)</title><circle cx="916.6" cy="1073.1" r="9" fill="#3e86b9" stroke="#ffffff" stroke-width="2"/>
+<text x="929.6" y="1077.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node033</text></g>
+<g><title>Node034 — Ambling Mesa (City); Unity (391.0001220703125, 3.6929473876953125, -334.9999084472656)</title><circle cx="775.1" cy="995.9" r="9" fill="#7667a5" stroke="#ffffff" stroke-width="2"/>
+<text x="788.1" y="999.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node034</text></g>
+<g><title>Node035 — Uuug&#x27;s Oasis (Shroom); Unity (355.0, 2.754486083984375, -208.99993896484375)</title><circle cx="620.6" cy="455.3" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="633.6" y="459.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node035</text></g>
+<g><title>Node037 — Blood Gate (Canyon); Unity (293.20013427734375, 6.667449951171875, -452.4999694824219)</title><circle cx="355.5" cy="1500.0" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="368.5" y="1504.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node037</text></g>
+<g><title>Node038 — Bridge over the Zodiac - West (Bridge); Unity (430.00006103515625, 3.87554931640625, -334.9999084472656)</title><circle cx="942.4" cy="995.9" r="9" fill="#8b6f47" stroke="#ffffff" stroke-width="2"/>
+<text x="955.4" y="999.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node038</text></g>
+<g><title>Node039 — Moonrise Canyon (Canyon); Unity (409.00006103515625, 4.50958251953125, -295.9999694824219)</title><circle cx="852.3" cy="828.5" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="865.3" y="832.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node039</text></g>
+<g><title>Node040 — Indigo River Bend (Dungeon); Unity (370.0001220703125, 3.572601318359375, -307.9999694824219)</title><circle cx="685.0" cy="880.0" r="9" fill="#b44e4e" stroke="#ffffff" stroke-width="2"/>
+<text x="698.0" y="884.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node040</text></g>
+<g><title>Node041 — Sunsoul Basin (Canyon); Unity (274.00006103515625, 3.42498779296875, -325.99993896484375)</title><circle cx="273.1" cy="957.3" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="286.1" y="961.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node041</text></g>
+<g><title>Node042 — Bauer Dunes (Shroom); Unity (403.0001220703125, 4.065521240234375, -247.99981689453125)</title><circle cx="826.5" cy="622.6" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="839.5" y="626.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node042</text></g>
+<g><title>Node044 — Wildwood (Jungle); Unity (454.0001220703125, 7.651824951171875, -370.9999694824219)</title><circle cx="1045.4" cy="1150.3" r="9" fill="#327f72" stroke="#ffffff" stroke-width="2"/>
+<text x="1058.4" y="1154.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node044</text></g>
+<g><title>Node045 — The Burk Heart (Forest); Unity (463.0001220703125, 5.5, -337.99993896484375)</title><circle cx="1084.0" cy="1008.7" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="1097.0" y="1012.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node045</text></g>
+<g><title>Node046 — Barking Forest (Forest); Unity (415.0001220703125, 6.2940673828125, -398.0)</title><circle cx="878.0" cy="1266.2" r="9" fill="#4f8a62" stroke="#ffffff" stroke-width="2"/>
+<text x="891.0" y="1270.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node046</text></g>
+<g><title>Node047 — Indigo Plains (Canyon); Unity (373.0001220703125, 3.51043701171875, -352.99993896484375)</title><circle cx="697.8" cy="1073.1" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="710.8" y="1077.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node047</text></g>
+<g><title>Node048 — The Road of Sand (Camp); Unity (364.0, 5.5587310791015625, -428.0)</title><circle cx="659.2" cy="1394.9" r="9" fill="#d39432" stroke="#ffffff" stroke-width="2"/>
+<text x="672.2" y="1398.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node048</text></g>
+<g><title>Node049 — The Thunderfield (Canyon); Unity (409.0001220703125, 4.1934814453125, -434.0)</title><circle cx="852.3" cy="1420.6" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="865.3" y="1424.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node049</text></g>
+<g><title>Node050 — Crescent Mesa (Canyon); Unity (343.0, 4.5964202880859375, -377.0)</title><circle cx="569.1" cy="1176.1" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="582.1" y="1180.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node050</text></g>
+<g><title>Node051 — Startouched Valley (Canyon); Unity (328.00006103515625, 5.2192535400390625, -349.99993896484375)</title><circle cx="504.8" cy="1060.2" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="517.8" y="1064.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node051</text></g>
+<g><title>Node052 — Badlands (Canyon); Unity (289.0000305175781, 5.1363525390625, -373.99993896484375)</title><circle cx="337.4" cy="1163.2" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="350.4" y="1167.2" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node052</text></g>
+<g><title>Node053 — South Desert (Canyon); Unity (319.0001220703125, 5.719573974609375, -317.0)</title><circle cx="466.1" cy="918.6" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="479.1" y="922.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node053</text></g>
+<g><title>Node054 — Southern Stretch (Canyon); Unity (313.00006103515625, 5.219879150390625, -298.9999694824219)</title><circle cx="440.4" cy="841.4" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="453.4" y="845.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node054</text></g>
+<g><title>Node055 — Deep Desert (Canyon); Unity (313.0, 4.553619384765625, -265.99993896484375)</title><circle cx="440.4" cy="699.8" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="453.4" y="703.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node055</text></g>
+<g><title>Node056 — Northern Stretch (Canyon); Unity (313.00006103515625, 3.590545654296875, -235.99990844726562)</title><circle cx="440.4" cy="571.1" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="453.4" y="575.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node056</text></g>
+<g><title>Node057 — North Desert (Camp); Unity (313.00006103515625, 3.321258544921875, -208.99990844726562)</title><circle cx="440.4" cy="455.3" r="9" fill="#d39432" stroke="#ffffff" stroke-width="2"/>
+<text x="453.4" y="459.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node057</text></g>
+<g><title>Node058 — Northeast Desert (Canyon); Unity (337.00006103515625, 4.800384521484375, -238.99996948242188)</title><circle cx="543.4" cy="584.0" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="556.4" y="588.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node058</text></g>
+<g><title>Node059 — East Desert (Canyon); Unity (337.0, 3.9453125, -271.9999694824219)</title><circle cx="543.4" cy="725.6" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="556.4" y="729.6" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node059</text></g>
+<g><title>Node060 — Southeast Desert (Canyon); Unity (331.0001220703125, 4.509765625, -298.9999084472656)</title><circle cx="517.6" cy="841.4" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="530.6" y="845.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node060</text></g>
+<g><title>Node061 — Northwest Desert (Canyon); Unity (289.0001525878906, 2.785491943359375, -229.9998779296875)</title><circle cx="337.4" cy="545.4" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="350.4" y="549.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node061</text></g>
+<g><title>Node062 — West Desert (Canyon); Unity (280.0, 3.454925537109375, -262.9999694824219)</title><circle cx="298.8" cy="687.0" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="311.8" y="691.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node062</text></g>
+<g><title>Node063 — Southwest Desert (Canyon); Unity (289.0, 4.53948974609375, -293.0000305175781)</title><circle cx="337.4" cy="815.7" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="350.4" y="819.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node063</text></g>
+<g><title>Node064 — The Scar (Canyon); Unity (301.00006103515625, 5.2502593994140625, -413.0)</title><circle cx="388.9" cy="1330.5" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="401.9" y="1334.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node064</text></g>
+<g><title>Node065 — Sky&#x27;le Tepui (Canyon); Unity (376.0001220703125, 3.20281982421875, -226.99984741210938)</title><circle cx="710.7" cy="532.5" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="723.7" y="536.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node065</text></g>
+<g><title>Node066 — Forsaken Plateau (Canyon); Unity (352.0, 3.3820037841796875, -337.9999084472656)</title><circle cx="607.7" cy="1008.7" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="620.7" y="1012.7" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node066</text></g>
+<g><title>Node067 — Devonshire Hills (Canyon); Unity (337.0, 7.828071594238281, -473.0)</title><circle cx="543.4" cy="1588.0" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="556.4" y="1592.0" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node067</text></g>
+<g><title>Node068 — Devonshire Keep (Dungeon); Unity (343.00006103515625, 6.999382019042969, -497.0)</title><circle cx="569.1" cy="1690.9" r="9" fill="#b44e4e" stroke="#ffffff" stroke-width="2"/>
+<text x="582.1" y="1694.9" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node068</text></g>
+<g><title>Node069 — Painted Woods (None); Unity (385.0001220703125, 6.7687835693359375, -494.0)</title><circle cx="749.3" cy="1678.1" r="9" fill="#777777" stroke="#ffffff" stroke-width="2"/>
+<text x="762.3" y="1682.1" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node069</text></g>
+<g><title>Node070 — Steepdale (Canyon); Unity (284.0000305175781, 6.366157531738281, -478.8999938964844)</title><circle cx="316.0" cy="1613.3" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="329.0" y="1617.3" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node070</text></g>
+<g><title>Node071 — Valley of Sighs (Canyon); Unity (244.00006103515625, 5.5, -346.99993896484375)</title><circle cx="144.4" cy="1047.4" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="157.4" y="1051.4" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node071</text></g>
+<g><title>Node073 — Sapphire Gate (Canyon); Unity (247.00006103515625, 6.8202972412109375, -383.0)</title><circle cx="157.2" cy="1201.8" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="170.2" y="1205.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node073</text></g>
+<g><title>Node074 — Dusk Hollow (Canyon); Unity (229.00003051757812, 5.734222412109375, -314.0000305175781)</title><circle cx="80.0" cy="905.8" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="93.0" y="909.8" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node074</text></g>
+<g><title>Node075 — Eagle Mesa (Canyon); Unity (249.99996948242188, 3.7183837890625, -295.99993896484375)</title><circle cx="170.1" cy="828.5" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="183.1" y="832.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node075</text></g>
+<g><title>Node077 — Blau Flats (Shroom); Unity (451.30010986328125, 5.032440185546875, -294.59991455078125)</title><circle cx="1033.8" cy="822.5" r="9" fill="#9b65b7" stroke="#ffffff" stroke-width="2"/>
+<text x="1046.8" y="826.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node077</text></g>
+<g><title>Node078 — Skittering Ridge (Canyon); Unity (240.99996948242188, 4.125091552734375, -250.99984741210938)</title><circle cx="131.5" cy="635.5" r="9" fill="#bf7b3e" stroke="#ffffff" stroke-width="2"/>
+<text x="144.5" y="639.5" fill="#f3f6f7" font-family="sans-serif" font-size="12">Node078</text></g>
+<rect x="2010" y="30" width="560" height="1810" rx="16" fill="#172630" stroke="#4d6570" stroke-width="2"/>
+<text x="2040" y="75" fill="#f3f6f7" font-family="sans-serif" font-size="24" font-weight="bold">AZ1 node key</text>
+<text x="2040" y="103" fill="#aebfc6" font-family="sans-serif" font-size="14">Hover a node for its Unity coordinates.</text>
+<circle cx="2046" cy="135" r="6" fill="#777777"/>
+<text x="2058" y="140" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Fork001</text>
+<text x="2058" y="156" fill="#aebfc6" font-family="sans-serif" font-size="10">Fork001</text>
+<circle cx="2046" cy="195" r="6" fill="#4f8a62"/>
+<text x="2058" y="200" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node00R</text>
+<text x="2058" y="216" fill="#aebfc6" font-family="sans-serif" font-size="10">Vale of Oberon</text>
+<circle cx="2046" cy="255" r="6" fill="#bf7b3e"/>
+<text x="2058" y="260" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node00X</text>
+<text x="2058" y="276" fill="#aebfc6" font-family="sans-serif" font-size="10">Short Cut</text>
+<circle cx="2046" cy="315" r="6" fill="#777777"/>
+<text x="2058" y="320" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node00Y</text>
+<text x="2058" y="336" fill="#aebfc6" font-family="sans-serif" font-size="10">River of Whispers</text>
+<circle cx="2046" cy="375" r="6" fill="#777777"/>
+<text x="2058" y="380" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node00Z</text>
+<text x="2058" y="396" fill="#aebfc6" font-family="sans-serif" font-size="10">River of Whispers</text>
+<circle cx="2046" cy="435" r="6" fill="#4f8a62"/>
+<text x="2058" y="440" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node001</text>
+<text x="2058" y="456" fill="#aebfc6" font-family="sans-serif" font-size="10">Into The Woods</text>
+<circle cx="2046" cy="495" r="6" fill="#4f8a62"/>
+<text x="2058" y="500" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node002</text>
+<text x="2058" y="516" fill="#aebfc6" font-family="sans-serif" font-size="10">North Feralroot Woods</text>
+<circle cx="2046" cy="555" r="6" fill="#4f8a62"/>
+<text x="2058" y="560" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node003</text>
+<text x="2058" y="576" fill="#aebfc6" font-family="sans-serif" font-size="10">Dunnwood</text>
+<circle cx="2046" cy="615" r="6" fill="#9b65b7"/>
+<text x="2058" y="620" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node004</text>
+<text x="2058" y="636" fill="#aebfc6" font-family="sans-serif" font-size="10">Sporemist Hollow</text>
+<circle cx="2046" cy="675" r="6" fill="#777777"/>
+<text x="2058" y="680" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node005</text>
+<text x="2058" y="696" fill="#aebfc6" font-family="sans-serif" font-size="10">Fonferek Thicket</text>
+<circle cx="2046" cy="735" r="6" fill="#4f72a6"/>
+<text x="2058" y="740" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node006</text>
+<text x="2058" y="756" fill="#aebfc6" font-family="sans-serif" font-size="10">Horwich Sea</text>
+<circle cx="2046" cy="795" r="6" fill="#d39432"/>
+<text x="2058" y="800" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node007</text>
+<text x="2058" y="816" fill="#aebfc6" font-family="sans-serif" font-size="10">The Road of Oaks</text>
+<circle cx="2046" cy="855" r="6" fill="#b44e4e"/>
+<text x="2058" y="860" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node008</text>
+<text x="2058" y="876" fill="#aebfc6" font-family="sans-serif" font-size="10">The Bleak Citadel</text>
+<circle cx="2046" cy="915" r="6" fill="#327f72"/>
+<text x="2058" y="920" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node009</text>
+<text x="2058" y="936" fill="#aebfc6" font-family="sans-serif" font-size="10">The Sutherland</text>
+<circle cx="2046" cy="975" r="6" fill="#4f8a62"/>
+<text x="2058" y="980" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node010</text>
+<text x="2058" y="996" fill="#aebfc6" font-family="sans-serif" font-size="10">Sylvan Peninsula</text>
+<circle cx="2046" cy="1035" r="6" fill="#b44e4e"/>
+<text x="2058" y="1040" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node011</text>
+<text x="2058" y="1056" fill="#aebfc6" font-family="sans-serif" font-size="10">Fort Romor</text>
+<circle cx="2046" cy="1095" r="6" fill="#8b6f47"/>
+<text x="2058" y="1100" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node012</text>
+<text x="2058" y="1116" fill="#aebfc6" font-family="sans-serif" font-size="10">Bridge over the Zila - Ea…</text>
+<circle cx="2046" cy="1155" r="6" fill="#3e86b9"/>
+<text x="2058" y="1160" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node013</text>
+<text x="2058" y="1176" fill="#aebfc6" font-family="sans-serif" font-size="10">Zila River</text>
+<circle cx="2046" cy="1215" r="6" fill="#327f72"/>
+<text x="2058" y="1220" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node014</text>
+<text x="2058" y="1236" fill="#aebfc6" font-family="sans-serif" font-size="10">Razortooth Forest</text>
+<circle cx="2046" cy="1275" r="6" fill="#8b6f47"/>
+<text x="2058" y="1280" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node015</text>
+<text x="2058" y="1296" fill="#aebfc6" font-family="sans-serif" font-size="10">Bridge over the Zila - We…</text>
+<circle cx="2046" cy="1335" r="6" fill="#d39432"/>
+<text x="2058" y="1340" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node016</text>
+<text x="2058" y="1356" fill="#aebfc6" font-family="sans-serif" font-size="10">The Road of Grass</text>
+<circle cx="2046" cy="1395" r="6" fill="#7667a5"/>
+<text x="2058" y="1400" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node017</text>
+<text x="2058" y="1416" fill="#aebfc6" font-family="sans-serif" font-size="10">Cave-In</text>
+<circle cx="2046" cy="1455" r="6" fill="#4f8a62"/>
+<text x="2058" y="1460" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node018</text>
+<text x="2058" y="1476" fill="#aebfc6" font-family="sans-serif" font-size="10">Shadowgrove</text>
+<circle cx="2046" cy="1515" r="6" fill="#4f8a62"/>
+<text x="2058" y="1520" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node019</text>
+<text x="2058" y="1536" fill="#aebfc6" font-family="sans-serif" font-size="10">Brink Ridge</text>
+<circle cx="2046" cy="1575" r="6" fill="#bf7b3e"/>
+<text x="2058" y="1580" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node020</text>
+<text x="2058" y="1596" fill="#aebfc6" font-family="sans-serif" font-size="10">Dreamsmoke Prairie</text>
+<circle cx="2046" cy="1635" r="6" fill="#4f8a62"/>
+<text x="2058" y="1640" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node021</text>
+<text x="2058" y="1656" fill="#aebfc6" font-family="sans-serif" font-size="10">Clark Foothills</text>
+<circle cx="2046" cy="1695" r="6" fill="#4f72a6"/>
+<text x="2058" y="1700" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node022</text>
+<text x="2058" y="1716" fill="#aebfc6" font-family="sans-serif" font-size="10">Lake Wyalusing</text>
+<circle cx="2226" cy="135" r="6" fill="#777777"/>
+<text x="2238" y="140" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node023</text>
+<text x="2238" y="156" fill="#aebfc6" font-family="sans-serif" font-size="10">Node023</text>
+<circle cx="2226" cy="195" r="6" fill="#b44e4e"/>
+<text x="2238" y="200" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node024</text>
+<text x="2238" y="216" fill="#aebfc6" font-family="sans-serif" font-size="10">Tomb of the Rose Knights</text>
+<circle cx="2226" cy="255" r="6" fill="#9b65b7"/>
+<text x="2238" y="260" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node025</text>
+<text x="2238" y="276" fill="#aebfc6" font-family="sans-serif" font-size="10">Lena Grotto</text>
+<circle cx="2226" cy="315" r="6" fill="#777777"/>
+<text x="2238" y="320" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node026</text>
+<text x="2238" y="336" fill="#aebfc6" font-family="sans-serif" font-size="10">Node026</text>
+<circle cx="2226" cy="375" r="6" fill="#4f8a62"/>
+<text x="2238" y="380" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node027</text>
+<text x="2238" y="396" fill="#aebfc6" font-family="sans-serif" font-size="10">Silver Forest</text>
+<circle cx="2226" cy="435" r="6" fill="#327f72"/>
+<text x="2238" y="440" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node028</text>
+<text x="2238" y="456" fill="#aebfc6" font-family="sans-serif" font-size="10">Garden of Ophelia</text>
+<circle cx="2226" cy="495" r="6" fill="#9b65b7"/>
+<text x="2238" y="500" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node029</text>
+<text x="2238" y="516" fill="#aebfc6" font-family="sans-serif" font-size="10">Hoff Mines</text>
+<circle cx="2226" cy="555" r="6" fill="#8b6f47"/>
+<text x="2238" y="560" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node030</text>
+<text x="2238" y="576" fill="#aebfc6" font-family="sans-serif" font-size="10">Bridge over the Zodiac - …</text>
+<circle cx="2226" cy="615" r="6" fill="#3e86b9"/>
+<text x="2238" y="620" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node031</text>
+<text x="2238" y="636" fill="#aebfc6" font-family="sans-serif" font-size="10">Zodiac River</text>
+<circle cx="2226" cy="675" r="6" fill="#3e86b9"/>
+<text x="2238" y="680" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node032</text>
+<text x="2238" y="696" fill="#aebfc6" font-family="sans-serif" font-size="10">Zodiac River - North</text>
+<circle cx="2226" cy="735" r="6" fill="#3e86b9"/>
+<text x="2238" y="740" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node033</text>
+<text x="2238" y="756" fill="#aebfc6" font-family="sans-serif" font-size="10">Indigo River</text>
+<circle cx="2226" cy="795" r="6" fill="#7667a5"/>
+<text x="2238" y="800" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node034</text>
+<text x="2238" y="816" fill="#aebfc6" font-family="sans-serif" font-size="10">Ambling Mesa</text>
+<circle cx="2226" cy="855" r="6" fill="#9b65b7"/>
+<text x="2238" y="860" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node035</text>
+<text x="2238" y="876" fill="#aebfc6" font-family="sans-serif" font-size="10">Uuug&#x27;s Oasis</text>
+<circle cx="2226" cy="915" r="6" fill="#bf7b3e"/>
+<text x="2238" y="920" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node037</text>
+<text x="2238" y="936" fill="#aebfc6" font-family="sans-serif" font-size="10">Blood Gate</text>
+<circle cx="2226" cy="975" r="6" fill="#8b6f47"/>
+<text x="2238" y="980" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node038</text>
+<text x="2238" y="996" fill="#aebfc6" font-family="sans-serif" font-size="10">Bridge over the Zodiac - …</text>
+<circle cx="2226" cy="1035" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1040" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node039</text>
+<text x="2238" y="1056" fill="#aebfc6" font-family="sans-serif" font-size="10">Moonrise Canyon</text>
+<circle cx="2226" cy="1095" r="6" fill="#b44e4e"/>
+<text x="2238" y="1100" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node040</text>
+<text x="2238" y="1116" fill="#aebfc6" font-family="sans-serif" font-size="10">Indigo River Bend</text>
+<circle cx="2226" cy="1155" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1160" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node041</text>
+<text x="2238" y="1176" fill="#aebfc6" font-family="sans-serif" font-size="10">Sunsoul Basin</text>
+<circle cx="2226" cy="1215" r="6" fill="#9b65b7"/>
+<text x="2238" y="1220" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node042</text>
+<text x="2238" y="1236" fill="#aebfc6" font-family="sans-serif" font-size="10">Bauer Dunes</text>
+<circle cx="2226" cy="1275" r="6" fill="#327f72"/>
+<text x="2238" y="1280" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node044</text>
+<text x="2238" y="1296" fill="#aebfc6" font-family="sans-serif" font-size="10">Wildwood</text>
+<circle cx="2226" cy="1335" r="6" fill="#4f8a62"/>
+<text x="2238" y="1340" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node045</text>
+<text x="2238" y="1356" fill="#aebfc6" font-family="sans-serif" font-size="10">The Burk Heart</text>
+<circle cx="2226" cy="1395" r="6" fill="#4f8a62"/>
+<text x="2238" y="1400" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node046</text>
+<text x="2238" y="1416" fill="#aebfc6" font-family="sans-serif" font-size="10">Barking Forest</text>
+<circle cx="2226" cy="1455" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1460" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node047</text>
+<text x="2238" y="1476" fill="#aebfc6" font-family="sans-serif" font-size="10">Indigo Plains</text>
+<circle cx="2226" cy="1515" r="6" fill="#d39432"/>
+<text x="2238" y="1520" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node048</text>
+<text x="2238" y="1536" fill="#aebfc6" font-family="sans-serif" font-size="10">The Road of Sand</text>
+<circle cx="2226" cy="1575" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1580" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node049</text>
+<text x="2238" y="1596" fill="#aebfc6" font-family="sans-serif" font-size="10">The Thunderfield</text>
+<circle cx="2226" cy="1635" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1640" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node050</text>
+<text x="2238" y="1656" fill="#aebfc6" font-family="sans-serif" font-size="10">Crescent Mesa</text>
+<circle cx="2226" cy="1695" r="6" fill="#bf7b3e"/>
+<text x="2238" y="1700" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node051</text>
+<text x="2238" y="1716" fill="#aebfc6" font-family="sans-serif" font-size="10">Startouched Valley</text>
+<circle cx="2406" cy="135" r="6" fill="#bf7b3e"/>
+<text x="2418" y="140" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node052</text>
+<text x="2418" y="156" fill="#aebfc6" font-family="sans-serif" font-size="10">Badlands</text>
+<circle cx="2406" cy="195" r="6" fill="#bf7b3e"/>
+<text x="2418" y="200" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node053</text>
+<text x="2418" y="216" fill="#aebfc6" font-family="sans-serif" font-size="10">South Desert</text>
+<circle cx="2406" cy="255" r="6" fill="#bf7b3e"/>
+<text x="2418" y="260" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node054</text>
+<text x="2418" y="276" fill="#aebfc6" font-family="sans-serif" font-size="10">Southern Stretch</text>
+<circle cx="2406" cy="315" r="6" fill="#bf7b3e"/>
+<text x="2418" y="320" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node055</text>
+<text x="2418" y="336" fill="#aebfc6" font-family="sans-serif" font-size="10">Deep Desert</text>
+<circle cx="2406" cy="375" r="6" fill="#bf7b3e"/>
+<text x="2418" y="380" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node056</text>
+<text x="2418" y="396" fill="#aebfc6" font-family="sans-serif" font-size="10">Northern Stretch</text>
+<circle cx="2406" cy="435" r="6" fill="#d39432"/>
+<text x="2418" y="440" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node057</text>
+<text x="2418" y="456" fill="#aebfc6" font-family="sans-serif" font-size="10">North Desert</text>
+<circle cx="2406" cy="495" r="6" fill="#bf7b3e"/>
+<text x="2418" y="500" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node058</text>
+<text x="2418" y="516" fill="#aebfc6" font-family="sans-serif" font-size="10">Northeast Desert</text>
+<circle cx="2406" cy="555" r="6" fill="#bf7b3e"/>
+<text x="2418" y="560" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node059</text>
+<text x="2418" y="576" fill="#aebfc6" font-family="sans-serif" font-size="10">East Desert</text>
+<circle cx="2406" cy="615" r="6" fill="#bf7b3e"/>
+<text x="2418" y="620" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node060</text>
+<text x="2418" y="636" fill="#aebfc6" font-family="sans-serif" font-size="10">Southeast Desert</text>
+<circle cx="2406" cy="675" r="6" fill="#bf7b3e"/>
+<text x="2418" y="680" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node061</text>
+<text x="2418" y="696" fill="#aebfc6" font-family="sans-serif" font-size="10">Northwest Desert</text>
+<circle cx="2406" cy="735" r="6" fill="#bf7b3e"/>
+<text x="2418" y="740" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node062</text>
+<text x="2418" y="756" fill="#aebfc6" font-family="sans-serif" font-size="10">West Desert</text>
+<circle cx="2406" cy="795" r="6" fill="#bf7b3e"/>
+<text x="2418" y="800" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node063</text>
+<text x="2418" y="816" fill="#aebfc6" font-family="sans-serif" font-size="10">Southwest Desert</text>
+<circle cx="2406" cy="855" r="6" fill="#bf7b3e"/>
+<text x="2418" y="860" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node064</text>
+<text x="2418" y="876" fill="#aebfc6" font-family="sans-serif" font-size="10">The Scar</text>
+<circle cx="2406" cy="915" r="6" fill="#bf7b3e"/>
+<text x="2418" y="920" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node065</text>
+<text x="2418" y="936" fill="#aebfc6" font-family="sans-serif" font-size="10">Sky&#x27;le Tepui</text>
+<circle cx="2406" cy="975" r="6" fill="#bf7b3e"/>
+<text x="2418" y="980" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node066</text>
+<text x="2418" y="996" fill="#aebfc6" font-family="sans-serif" font-size="10">Forsaken Plateau</text>
+<circle cx="2406" cy="1035" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1040" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node067</text>
+<text x="2418" y="1056" fill="#aebfc6" font-family="sans-serif" font-size="10">Devonshire Hills</text>
+<circle cx="2406" cy="1095" r="6" fill="#b44e4e"/>
+<text x="2418" y="1100" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node068</text>
+<text x="2418" y="1116" fill="#aebfc6" font-family="sans-serif" font-size="10">Devonshire Keep</text>
+<circle cx="2406" cy="1155" r="6" fill="#777777"/>
+<text x="2418" y="1160" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node069</text>
+<text x="2418" y="1176" fill="#aebfc6" font-family="sans-serif" font-size="10">Painted Woods</text>
+<circle cx="2406" cy="1215" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1220" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node070</text>
+<text x="2418" y="1236" fill="#aebfc6" font-family="sans-serif" font-size="10">Steepdale</text>
+<circle cx="2406" cy="1275" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1280" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node071</text>
+<text x="2418" y="1296" fill="#aebfc6" font-family="sans-serif" font-size="10">Valley of Sighs</text>
+<circle cx="2406" cy="1335" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1340" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node073</text>
+<text x="2418" y="1356" fill="#aebfc6" font-family="sans-serif" font-size="10">Sapphire Gate</text>
+<circle cx="2406" cy="1395" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1400" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node074</text>
+<text x="2418" y="1416" fill="#aebfc6" font-family="sans-serif" font-size="10">Dusk Hollow</text>
+<circle cx="2406" cy="1455" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1460" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node075</text>
+<text x="2418" y="1476" fill="#aebfc6" font-family="sans-serif" font-size="10">Eagle Mesa</text>
+<circle cx="2406" cy="1515" r="6" fill="#9b65b7"/>
+<text x="2418" y="1520" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node077</text>
+<text x="2418" y="1536" fill="#aebfc6" font-family="sans-serif" font-size="10">Blau Flats</text>
+<circle cx="2406" cy="1575" r="6" fill="#bf7b3e"/>
+<text x="2418" y="1580" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">Node078</text>
+<text x="2418" y="1596" fill="#aebfc6" font-family="sans-serif" font-size="10">Skittering Ridge</text>
+</svg>

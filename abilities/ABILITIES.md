@@ -685,20 +685,35 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 
 | `effect_type` (class name) | Status | Notes |
 |----------------------------|--------|-------|
-| `DrawNCardsAbilityEffectTemplate` | implemented | Always draws 1; N from `m_InputValue` is not yet honoured. |
+| `DrawNCardsAbilityEffectTemplate` | implemented | Uses the typed `m_InputValue` field, including dynamic ability variables; localized text is only a legacy fallback. |
 | `PutTopOfDeckIntoHandAbilityEffectTemplate` | implemented | Moves AI deck-top to hand. |
-| `DiscardCardAbilityEffectTemplate` | stub | Logs only; real discard is driven by the class-23 prompt flow. |
+| `DiscardCardAbilityEffectTemplate` | implemented | Moves the metadata-selected hand/choosing card to its owner's discard pile and emits the discard, move, and updated-card events. |
 | `CardModifierAbilityEffectTemplate` | implemented (text-derived) | Amount/property read from `param` JSON when present, else parsed from game text (`+N[ATK]`/`+N[DEF]`, "gain/lose health"). |
-| `SummonTokenTroopAbilityEffectTemplate` | implemented (text-derived) | Token GUID + count + destination parsed from game text links; `m_CardTemplateId`/`m_Amount`/`m_CardCollection` not yet read directly. |
+| `SummonTokenTroopAbilityEffectTemplate` | implemented | Uses typed token GUID, amount/amount field, collection/location, exhausted/attacking, filter, and copy-gems fields; links/text are compatibility fallbacks. |
 | `MoveCardToZoneEffectTemplate` | implemented | Reads the typed `m_DestinationCollection` when present, with legacy effect parameters as a fallback; selected revealed cards are reinserted into the deck. |
 | `BuryCardAbilityEffectTemplate` | implemented | Count from `param` JSON, else 1. |
-| `VoidCardAbilityEffectTemplate` | stub | Logs only. |
-| `UntapCardAbilityEffectTemplate` / `TapCardAbilityEffectTemplate` | stub | Logs only. |
+| `VoidCardAbilityEffectTemplate` | implemented | Moves the resolved target to Void, emits the client zone events, records the source/voided relationship, and fires exit triggers. |
+| `UntapCardAbilityEffectTemplate` / `TapCardAbilityEffectTemplate` | implemented | Changes the resolved card state and supports metadata auto-target lists. |
+| `AnimationTriggerEffectTemplate` | implemented | Reads the typed `m_AnimationTrigger` enum and emits the client class-76 session event. |
+| `BlockEffectTemplate` | implemented | Uses the authored secondary target as the blocker, validates the active combat assignment, updates PvE/PvP blocker state, emits class-28 `BlockersAssigned`, and runs blocked-card triggers. |
+| `DoubleChoiceAbilityEffectTemplate` | implemented | Creates the metadata-defined random Choice cards, exposes the built-in Choose-and-Play picker, supports the second-choice stage, and resumes the parent ability after selection in PvE and PvP. |
 | `TransformCardAbilityEffectTemplate` | implemented | Target from bstate; template GUID from game-text link or `effect_guid`. |
 | `ActivateAbilityEffectTemplate` | implemented | Recurses via `param` (m_AbilityToInvoke). |
 | `TACAbilityEffectTemplate` | partial | Decodes operation + GUID; only `ShiftAbility` handled. |
 | `RandomizeVariableEffectTemplate` | partial | Registered under stale name `RandomizeVariableAbilityEffectTemplate`; delegates to `replenish_spell_power`. |
 | `GrantAbilityEffectTemplate`, `PlayCardAbilityEffectTemplate`, `FireEventEffectTemplate`, `RevertPermanentModificationsAbilityEffectTemplate`, `RevealCardsAbilityEffectTemplate`, `StoreTargetsAbilityEffectTemplate`, `VerdictAbilityEffectTemplate` | stubs | Log-only placeholders. |
+
+`RepeatingAbilityEffectTemplate` is resolved by the main resolver because it
+contains a nested typed ability and loop-count field rather than a normal
+per-target leaf. Random target templates are likewise resolved from their
+metadata filter and count, even when the template is not marked as an
+auto-target in the extracted record.
+
+`ConversationAbilityEffectTemplate` is the remaining unregistered effect
+family. It is deliberately left for human guidance because it starts authored
+campaign/UI conversations rather than changing card state; implementing it
+requires deciding which campaign conversation and client presentation each
+record should invoke.
 
 ### Triggered-ability handling (`abilities/framework/triggers.py`, `deathcry.py`)
 `resolve_triggers` fires abilities whose `card_abilities_meta.trigger_event_type`

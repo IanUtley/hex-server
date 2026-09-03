@@ -23,7 +23,10 @@ import game_engine
 from tests.tests_cards_fixes import _copy_card, _copy_ability
 from tests.tests_combat import make_db, add_card, HandlerStub, SessionStub
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 TPL_BROOD_CREEPER = "5f2c8a4b-5f38-4743-aff8-a1bd5abd9ad5"
 TPL_SPIDESPAWN = "a9ebe40e-ef30-4c9e-b4dd-1b414dc35d0c"

@@ -1525,7 +1525,7 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
     # Shards of Fate ("Choose a Standard resource in your deck. Gain the
     # thresholds it provides.") — data-driven detection; the AI picks a random
     # Standard resource from its deck, gains that threshold, and grants the
-    # template's resource fields (m_MaxResourcesGranted=1 -> +1 max mana only).
+    # template's resource fields (m_MaxResourcesGranted=1 -> +1 max resources only).
     shard_ability = shard_tpl = None
     ab_row = _db.execute(
         "SELECT abilities_json FROM card_templates WHERE guid=?",
@@ -1819,7 +1819,7 @@ def ai_main_phase_play(handler, game, session, ai_t, pl_t, battle_state,
                                battle_state):
         return True
     # 1c) Manual warzone troop abilities (AIAbilityManager thunks).
-    if ai_use_troop_ability(handler, game, session, ai_t, pl_t,
+    if ai_use_warzone_ability(handler, game, session, ai_t, pl_t,
                             battle_state):
         return True
     # 2) Removal step (BuildBoard): answer a threatening permanent.
@@ -1836,8 +1836,16 @@ def ai_main_phase_play(handler, game, session, ai_t, pl_t, battle_state,
     # 3) Best board builder (troop/constant/artifact/basic action).
     best = ev.get_best_board_builder(pre_combat, include_resources=False)
     if best is None:
+        if not pre_combat and ai_use_warzone_ability(
+                handler, game, session, ai_t, pl_t, battle_state,
+                include_non_troops=True, resource_sink=True):
+            return True
         return False
     if ev.is_playable(best) != "True":
+        if not pre_combat and ai_use_warzone_ability(
+                handler, game, session, ai_t, pl_t, battle_state,
+                include_non_troops=True, resource_sink=True):
+            return True
         return False
     ai_play_hand_card(handler, game, session, ai_t, battle_state, best,
                       evaluator=ev)
@@ -2120,23 +2128,32 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
     return False
 
 
-def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
-    """Port of AIAbilityManager's activation thunks for the AI's warzone
-    troops: scan manual abilities, decide from the BOM whether the effect is
-    worth activating (damage/exhaust a threat, buff our troop, draw, gain
-    health/resources, summon, transform up), pay the cost, and resolve through
-    the same handler path the player uses."""
+def ai_use_warzone_ability(handler, game, session, ai_t, pl_t, battle_state,
+                            include_non_troops=False, resource_sink=False):
+    """Activate a worthwhile manual ability on an AI warzone permanent.
+
+    The normal call scans troops for tactical activations.  The optional
+    ``resource_sink`` call also scans non-troop permanents during Second Main so
+    variable-resource abilities (for example Soul Marble) can consume the
+    resources the AI cannot use from hand.  Both paths use the same metadata
+    and BOM resolver.
+    """
     import json as _j
     import battle_engine as _be
     if not _be.stack_empty(battle_state):
         return False
+    if (resource_sink and
+            _be.current_phase(battle_state) != game_engine.ETurnPhases.SecondMainPhase):
+        return False
     resources = int(battle_state.get("ai_resources", 0))
+    permanent_filter = ("" if include_non_troops else
+                        "AND gc.card_type LIKE '%Troop%'\n        ")
     troops = _db.execute(
         "SELECT gc.card_uid, gc.template_guid, gc.card_state, ct.attributes, "
         "       gc.card_attributes, gc.card_abilities "
         "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
         "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='warzone' "
-        "AND gc.card_type LIKE '%Troop%'",
+        + permanent_filter,
         (session.session_id,)).fetchall()
     from abilities.framework.statics import effective_stats
     for uid, tpl, cstate, t_attrs, c_attrs, card_ab in troops:
@@ -2156,7 +2173,18 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
                 continue
             cost = int(meta[0] or 0)
             exh = int(meta[3] or 0)
-            if cost > resources:
+            variable_x, variable_min = handler._ability_x_cost_metadata(ag)
+            x_cost = 0
+            if variable_x and resource_sink:
+                # A sink spends all resources that remain after its fixed
+                # activation cost. The ability metadata supplies the floor.
+                x_cost = max(0, resources - cost)
+                if x_cost < int(variable_min or 0):
+                    continue
+            elif resource_sink and cost <= 0:
+                # A zero-cost, non-X ability is not a resource sink.
+                continue
+            if cost + x_cost > resources:
                 continue
             if exh and (cstate & game_engine.ECardStates.Tapped
                         or (not (cstate & game_engine.ECardStates.StartedATurnOnYourSide)
@@ -2183,6 +2211,64 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
             s_atk, s_def = source_stats[0], source_stats[1]
             target_uid = None
             worth = False
+            requires_blocking_target = False
+            # BlockingFilter(IsAbilitySource) means this ability exists only
+            # while this troop is attacking and has a declared blocker.  Use
+            # the metadata target template against the live combat assignment
+            # instead of the generic self-target fallback below.  This covers
+            # Chickatwice and keeps the AI from targeting its own attacker.
+            target_row = _db.execute(
+                "SELECT target_template_ids FROM card_abilities_meta "
+                "WHERE ability_guid=?", (ag,)).fetchone()
+            try:
+                target_templates = _j.loads(target_row[0]) \
+                    if target_row and target_row[0] else []
+            except (TypeError, ValueError, _j.JSONDecodeError):
+                target_templates = []
+            from abilities.framework.targeting import (
+                legal_targets, target_uses_both_players,
+            )
+            if resource_sink:
+                worth = True
+                # Let the authoritative resolver handle source/player/choice
+                # targets, but do not fire a generic sink that still needs a
+                # human-selected troop or other explicit target.
+                for target_template in target_templates:
+                    target_meta = _db.execute(
+                        "SELECT target_kind, is_auto_target FROM target_templates "
+                        "WHERE template_id=?", (target_template,)).fetchone()
+                    kind = (target_meta[0] if target_meta else "") or ""
+                    auto = int(target_meta[1] or 0) if target_meta else 0
+                    if not (auto or kind in (
+                            "PlayerTargetTemplate",
+                            "AbilitySourceCardTargetTemplate",
+                            "AbilityCreatedTargetTemplate")):
+                        worth = False
+                        break
+                if not worth:
+                    continue
+            for target_template in target_templates:
+                target_meta = _db.execute(
+                    "SELECT filter_json FROM target_templates "
+                    "WHERE template_id=?", (target_template,)).fetchone()
+                if not target_meta or "BlockingFilter" not in (target_meta[0] or ""):
+                    continue
+                requires_blocking_target = True
+                candidates = legal_targets(
+                    _db, session.session_id, 0, target_template, int(uid),
+                    both_players=target_uses_both_players(
+                        _db, target_template),
+                    champions=handler._champion_targets(),
+                    battle_state=battle_state)
+                if candidates:
+                    worth = True
+                    target_uid = int(candidates[0])
+                break
+            if requires_blocking_target and not worth:
+                # This is a conditional combat ability, not a generic
+                # self-buff.  In particular, Chickatwice must not target
+                # itself when it is not currently being blocked.
+                continue
             # Damage / exhaust / void / destroy an opposing troop.
             dmg = 0
             for etype, pm in params:
@@ -2283,7 +2369,9 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
                 continue
             # Pay + resolve via the player path with AI-side state.
             bstate = battle_state
-            bstate["ai_resources"] = resources - cost
+            bstate["ai_resources"] = resources - cost - x_cost
+            if variable_x and resource_sink:
+                bstate["x_cost"] = x_cost
             bstate["player_mod_target"] = target_uid if target_uid else int(uid)
             bstate["player_transform_target"] = (target_uid if target_uid
                                                  else int(uid))
@@ -2304,6 +2392,14 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
                 fn(game2, session, _db, handler, pl_t, ai_t, bstate, ag, None)
             handler._remove_one_shot_ability(
                 session, int(uid), ag, game2, pl_t, ai_t, bstate)
+            # State-based effects are checked after every resolved ability,
+            # not only after a stack item resolves.  This matters for
+            # abilities such as Chickatwice's one-shot -1/-1: its effective
+            # defense can become zero while the AI activation is resolved
+            # directly, so it must move to the crypt before the next priority
+            # window is offered.
+            _ability_mod.state_based_deaths(
+                game2, session, _db, handler, pl_t, ai_t, bstate)
             if exh:
                 _db.execute(
                     "UPDATE game_cards SET card_state = card_state | ? "
@@ -2311,9 +2407,16 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
                     (game_engine.ECardStates.Tapped, session.session_id,
                      int(uid)))
                 _db.commit()
-                _abil.resolve_triggers(
+                _ability_mod.resolve_triggers(
                     _db, handler, game2, session, pl_t, ai_t, bstate,
                     "CardTappedEvent", int(uid), 0)
+            game2.ai_resources = bstate["ai_resources"]
+            ev_cur = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
+            ev_cur.player_id = ai_t
+            ev_cur.operation = 2
+            ev_cur.delta = cost + x_cost
+            ev_cur.new_value = bstate["ai_resources"]
+            game2._push(ev_cur)
             # Token/deck leaves emit their CardMoved/CardUpdated events on the
             # fresh game used for resolution.  Flush that event batch now;
             # otherwise the DB changes are real but the client never sees the
@@ -2331,9 +2434,12 @@ def ai_use_troop_ability(handler, game, session, ai_t, pl_t, battle_state):
             bstate.pop("resolving_owner_id", None)
             bstate.pop("player_shift_source", None)
             bstate.pop("player_shift_target", None)
+            if variable_x and resource_sink:
+                bstate.pop("x_cost", None)
             _be.save_state(session, bstate)
-            log_req(f"    AI troop ability {ag[:8]} on {hex(int(uid))} "
-                    f"(cost={cost}, target={hex(target_uid) if target_uid else 'self'})")
+            action = "resource sink" if resource_sink else "troop ability"
+            log_req(f"    AI {action} {ag[:8]} on {hex(int(uid))} "
+                    f"(cost={cost}+{x_cost}, target={hex(target_uid) if target_uid else 'self'})")
             return True
     return False
 

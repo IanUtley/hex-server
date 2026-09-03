@@ -20,7 +20,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import game_engine
 import ai
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 TPL_GLADIATOR = "b7172b6a-ef85-4fef-91e1-81975b4ce7cd"
 TPL_PRIESTESS = "14909185-1070-48df-9508-61d5a9650bd2"

@@ -1336,6 +1336,10 @@ def ensure_schema(db):
                    "WHERE script_name='az01_tamed' AND (start_hook IS NULL OR start_hook='')")
         db.execute("UPDATE quest_templates SET start_hook='az1_find_horwich_sea_start' "
                    "WHERE script_name='q_seawitch' AND (start_hook IS NULL OR start_hook='')")
+        db.execute("UPDATE quest_templates SET start_hook='az1_find_cave_in_start' "
+                   "WHERE script_name='az01_uw_find_cave_in' AND (start_hook IS NULL OR start_hook='')")
+        db.execute("UPDATE quest_templates SET start_hook='az1_find_ambling_mesa_start' "
+                   "WHERE script_name='az01_ar_find_ambling_mesa' AND (start_hook IS NULL OR start_hook='')")
         # Add state qualifiers to existing node-conversation rows when a
         # database was seeded before the extractor recorded them.  The
         # conversation name is authored metadata; this is only an idempotent
@@ -1536,6 +1540,22 @@ def ensure_schema(db):
                     {"end_of_game_condition": {
                         "type": "void_tamed_troop", "owner": "opponent"},
                      "card_guid": "$condition.template_guid",
+                     "quantity": 1, "one_time": True},
+                ]
+            elif (ename or "").upper() == "AZ 1 - NODE 09 - COCKATWICE CHICK":
+                # Cockatwice awards Effigy of Nulzann once on a successful
+                # completion.  Keep the normal currency reward repeatable,
+                # while making the card its own one-time claim so retries do
+                # not duplicate it.
+                rewards.pop("gold", None)
+                rewards.pop("xp", None)
+                rewards.pop("one_time", None)
+                rewards.pop("end_of_game_condition", None)
+                rewards.pop("card_guid", None)
+                rewards.pop("quantity", None)
+                rewards["end_of_game_rewards"] = [
+                    {"gold": amount, "xp": amount, "one_time": False},
+                    {"card_guid": "3b18b39a-ff4f-4ecf-b7a8-c446f9d89bb0",
                      "quantity": 1, "one_time": True},
                 ]
             else:

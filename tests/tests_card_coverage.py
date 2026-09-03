@@ -22,7 +22,7 @@ from abilities.framework.triggers import ability_matches_keyword
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "hconnect.db")
+SRC = os.environ.get("HEX_TEST_SOURCE_DB", os.path.join(ROOT, "hconnect.db"))
 
 
 class Session:
@@ -129,14 +129,9 @@ def test_effect_inventory_has_no_unexpected_unregistered_types():
                 "SELECT DISTINCT effect_type FROM ability_effects")
             if effect_type not in _LEAFS and effect_type not in special
         }
-        # These are deliberately left as explicit UI/narrative mechanics;
-        # none is silently mistaken for an ordinary card effect.
-        assert unknown == {
-            "AnimationTriggerEffectTemplate",
-            "BlockEffectTemplate",
-            "ConversationAbilityEffectTemplate",
-            "DoubleChoiceAbilityEffectTemplate",
-        }, sorted(unknown)
+        # Conversation remains an explicit UI/narrative mechanic; it is not
+        # silently mistaken for an ordinary card effect.
+        assert unknown == {"ConversationAbilityEffectTemplate"}, sorted(unknown)
     finally:
         db.close()
 

@@ -21,6 +21,8 @@ import db as _db
 # How many waiting rooms of each type to keep available.
 POOL_SIZES = {1: 2, 2: 2, 3: 2}  # type_id → target count
 REFILL_INTERVAL = 5.0
+STALE_CLEANUP_INTERVAL = 60.0
+STALE_TOURNAMENT_AGE_DAYS = 1
 SEALED_PACK_COUNT = 6   # 6 packs for sealed
 DRAFT_PACK_COUNT = 3    # 3 packs for draft
 CARDS_PER_PACK = 15     # standard 15-card packs
@@ -151,11 +153,30 @@ def generate_draft_deck(tournament_id, player_uid, set_id):
 # ---------------------------------------------------------------------------
 
 _scheduler_running = False
+_last_stale_cleanup = 0.0
+
+
+def _cleanup_old_state(force=False):
+    """Close old tournament rows and remove their game state periodically."""
+    global _last_stale_cleanup
+    now = time.monotonic()
+    if not force and now - _last_stale_cleanup < STALE_CLEANUP_INTERVAL:
+        return
+    result = _db.db_tournament_cleanup_old(STALE_TOURNAMENT_AGE_DAYS)
+    _last_stale_cleanup = now
+    if any(result.values()):
+        print(
+            "[tournament_server] Old-state cleanup: "
+            f"closed={result['tournaments_closed']} "
+            f"sessions={result['game_sessions_removed']} "
+            f"cards={result['game_cards_removed']}"
+        )
 
 
 def _scheduler_loop():
     while _scheduler_running:
         try:
+            _cleanup_old_state()
             refill_pool()
         except Exception as e:
             print(f"[tournament_server] Scheduler error: {e}")
@@ -164,6 +185,7 @@ def _scheduler_loop():
 
 def start():
     global _scheduler_running
+    _cleanup_old_state(force=True)
     closed = _db.db_tournament_close_orphaned_started()
     if closed:
         print(f"[tournament_server] Closed {closed} orphaned started tournament(s)")

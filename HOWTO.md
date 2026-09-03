@@ -851,11 +851,17 @@ phase-paced**:
    `_ai_play_resource` (play a shard from hand if able, push
    `CardUpdated(PlayedResources)` BEFORE `ResourceCardPlayed` so the shard
    clears the chain)
-4. When a phase is a human stop (opponent-stop), the AI turn pauses and the
+4. During `SecondMainPhase`, after normal hand plays are exhausted, the AI
+   searches its warzone for metadata-backed manual resource abilities. X-cost
+   abilities spend all remaining resources (subject to their authored minimum),
+   so cards such as Soul Marble can be pumped before the AI ends its turn.
+   AI-owned choice effects continue through the normal server-side AI choice
+   policy rather than pausing for human input.
+5. When a phase is a human stop (opponent-stop), the AI turn pauses and the
    human gets a `ResumeTopOfChain` GreenLight → `BattleStateInactivePriorityWindow`
    (this is the ONLY context in which `GainGreenLight` pushes the priority
    window / Pass button on the opponent's turn)
-5. EndTurn → switch turn player back to the human; the player's new turn
+6. EndTurn → switch turn player back to the human; the player's new turn
    auto-starts and `player_resource_played_this_turn` is reset
 
 ### GreenLight / Pass button
@@ -1787,10 +1793,11 @@ At startup, `docker/docker_bootstrap.py` validates `HEX_GAMEDATA` (or the legacy
 `GAMEDATA` alias). If `HEX_DB_PATH` does not exist, it creates `Records/` from
 the mounted gamedata when that directory is absent or incomplete, then creates
 the database in an atomic temporary file with `static.ensure_schema`, which
-invokes the shared `AssetExtraction/gamedata_seed.py` pipeline. It then runs
-generates `generated/starter_decks.json` from the same DeckTemplate source and
-runs every direct test script in `tests/` serially. Set `HEX_RUN_TESTS_ON_BOOT=0` to
-skip the first-start test pass.
+invokes the shared `AssetExtraction/gamedata_seed.py` pipeline. It then generates
+`generated/starter_decks.json` from the same DeckTemplate source and runs the
+supported test suite through `tests/run_all.py`. The runner creates one database
+snapshot and restores it into an isolated in-memory database for each test
+process. Set `HEX_RUN_TESTS_ON_BOOT=0` to skip the first-start test pass.
 Test failures are reported but do not block service startup unless
 `HEX_FAIL_ON_TEST_FAILURE=1` is set. Existing database files are reused and
 are not overwritten.
@@ -1863,7 +1870,7 @@ section with the full answer.
 | Encode an ObjFmt response | `encode_objfmt_response()` plus the type/size-table rules. See "ObjFmt Encoding Rules" and "Protocol encoding details". |
 | Push a card/player/inventory update | `push_card_updated` (needs a registered CardDef), `push_player_updated` (needs a valid `champ_id`), and ProfileGenericUpdate 2211 for inventory. See "Critical game-session debugging" and "PlayerProfile". |
 | Run a battle / test an encounter | Debug console (backtick): `camp.encounter AZ0_Necrotic` (scene names in `docs/ENCOUNTERS.md`). In-game chat: `!resource`, `!threshold`, `!drawcard`, `!game_end`. See `docs/DebugConsole.md`, `docs/COMMANDS.md`. |
-| Run card/rules sweeps | Run focused scripts serially, especially `python3 tests/tests_set1_sweep.py` and `python3 tests/tests_set1_pvp_sweep.py`; they use temporary databases and should not run in parallel against `hconnect.db`. |
+| Run card/rules sweeps | Run `python3 tests/run_all.py` for the supported suite, or run `python3 tests/tests_set1_sweep.py` separately for the optional Set 1 rules sweep. |
 | Understand the canonical rules | `RULES.md` (turn phases, playability, champion abilities, mulligan). Battle decisions derive from it. |
 | Debug/replay a game session | Inspect the `session_events` DB table and use the replay service work described in "Replay event logging". |
 | Identify a template's fields | Check `Assembly-CSharp-firstpass/Game/Shared/...` source or gamedata `_v` version arrays. |

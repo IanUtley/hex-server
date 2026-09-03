@@ -20,7 +20,10 @@ from abilities.framework.statics import (
     global_flags,
 )
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 LIGHT = "fb84ad94-e6ed-f04b-353d-eda325e0ae43"   # +2/+2 per card in your hand
 SOUL = "d60496f7-9c0c-f6f2-9e1b-ae889a675112"     # troops you control +2/+2

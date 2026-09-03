@@ -82,6 +82,7 @@ from domain.events import (
     SkipSetupSessionEventArgs,
     DisableInterfaceSessionEventArgs,
     NetworkPacketSessionEventArgs,
+    AnimationTriggerSessionEventArgs,
     make_game_ended_packet,
 )
 from domain.game import CardDef, Game, parse_tutorial_script

@@ -15,7 +15,10 @@ import game_engine
 from abilities.framework import triggers
 from abilities.framework.targeting import legal_targets, evaluate_card_filter
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 EXILE_DEPLOY = "952e3555-5ee1-50de-38f6-25cf34037c67"
 EXILE_TARGET = "33b1ecf2-a9de-5bae-9918-9203f43b79aa"
@@ -29,6 +32,7 @@ TOPN_TARGET = "33333333-3333-3333-3333-333333333333"
 RESOURCE_TPL = "44444444-4444-4444-4444-444444444444"
 PET_TPL = "55555555-5555-5555-5555-555555555555"
 PET_TARGET = "66666666-6666-6666-6666-666666666666"
+BLOCKING_TARGET = "f4a8f2ec-c96a-29a8-210e-607c936fda99"
 
 
 class SessionStub:
@@ -101,7 +105,7 @@ def make_db():
         guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
         defense INTEGER, attributes INTEGER, abilities_json TEXT,
         threshold_json TEXT, subtype TEXT)""")
-    for tid in (EXILE_TARGET, PRAIRIE_TARGET, CHAMP_TARGET):
+    for tid in (EXILE_TARGET, PRAIRIE_TARGET, CHAMP_TARGET, BLOCKING_TARGET):
         for row in src.execute(
                 "SELECT * FROM target_templates WHERE template_id=?", (tid,)):
             db.execute("INSERT INTO target_templates VALUES "
@@ -249,6 +253,40 @@ def test_attacking_filter(db):
         {"card_type": "Troop", "state": 0}, f, 0)
 
 
+def test_blocking_filter_uses_active_combat_assignment(db):
+    """A BlockingFilter target is the troop blocking this attacker only."""
+    add_card(db, 100, 5, PLAIN_TPL, "warzone",
+             position=1)
+    add_card(db, 200, 0, PLAIN_TPL, "warzone",
+             position=2)
+    add_card(db, 201, 0, PLAIN_TPL, "warzone",
+             position=3)
+    bstate = {
+        "player_attackers": {"100": 900},
+        "ai_blockers": {"100": ["200"]},
+    }
+    cands = legal_targets(
+        db, 1, 5, BLOCKING_TARGET, 100, both_players=True,
+        battle_state=bstate)
+    assert cands == [200], cands
+
+    # PvP stores the same relationship under its shorter keys.
+    pvp_state = {
+        "attackers": {"100": 900},
+        "blockers": {"100": ["201"]},
+    }
+    cands = legal_targets(
+        db, 1, 5, BLOCKING_TARGET, 100, both_players=True,
+        battle_state=pvp_state)
+    assert cands == [201], cands
+
+    # The same troop must not be targetable outside its active combat.
+    cands = legal_targets(
+        db, 1, 5, BLOCKING_TARGET, 100, both_players=True,
+        battle_state={"blockers": {"100": ["200"]}})
+    assert not cands, cands
+
+
 def test_champion_targets(db):
     """'Target champion' (IsHero) templates offer the champions, who are not
     game_cards rows — they join the pool via the champions parameter."""
@@ -321,6 +359,7 @@ if __name__ == "__main__":
         test_placeholder_card_name_targets_only_matching_templates)
     run("TopNOfDeck uses controller and deck order", test_top_n_of_controller_deck)
     run("IsAttacking target filter", test_attacking_filter)
+    run("BlockingFilter follows the active combat", test_blocking_filter_uses_active_combat_assignment)
     run("champion targets join the pool", test_champion_targets)
     run("human deploy triggers class-39 prompt", test_deploy_prompt_human)
     run("AI deploy auto-picks + chains", test_deploy_auto_ai)

@@ -81,3 +81,5 @@ the narrative conversation.
   outcome split is NOT encoded in encounter/quest data — it's scripted quest
   logic. **TODO: implement server-side outcome tracking + EscrowAction rewards
   in `gameendnotify`.**
+
+  completing Cockatwice at Node009 awards one Effigy of Nulzann.

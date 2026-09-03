@@ -317,6 +317,225 @@ def test_deck_search_detection_uses_filter_not_collection_flags(db):
     })
 
 
+def test_empty_sacrifice_target_does_not_sacrifice_source(db):
+    """An optional target with no legal card must not fall back to the source."""
+    from abilities.framework.resolution import resolve_ability
+
+    ability = _ag("empty-sacrifice")
+    target = _ag("optional-troop")
+    db.execute(
+        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (target, "a troop you control", 0, 0, 0, 0, "Self", "Warzone",
+         1, 1, '{"_t":"Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
+         "AbilityTargetTemplate"))
+    _insert_ability(db, ability, [target], [{
+        "order": 0, "type": "SacrificeCardAbilityEffectTemplate",
+        "target_index": 0,
+    }])
+    add_card(db, 200, 0, TPL_GLADIATOR, loc="warzone")
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = HandlerStub(db)
+    game = game_engine.Game(1, pl_t, ai_t)
+    resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t,
+                    {"turn_number": 1}, ability, 200, 0, {})
+    location = db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=200").fetchone()[0]
+    assert location == "warzone", location
+
+
+def test_ai_sacrifice_target_excludes_source(db):
+    """AI deploy targeting chooses another troop, or no target if absent."""
+    from abilities.framework.triggers import _ai_trigger_target
+
+    ability = _ag("ai-sacrifice-target")
+    target = _ag("ai-optional-troop")
+    db.execute(
+        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (target, "a troop you control", 0, 0, 0, 0, "Self", "Warzone",
+         1, 1, '{"_t":"Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
+         "AbilityTargetTemplate"))
+    _insert_ability(db, ability, [target], [{
+        "order": 0, "type": "SacrificeCardAbilityEffectTemplate",
+        "target_index": 0,
+    }])
+    add_card(db, 210, 0, TPL_GLADIATOR, loc="warzone")
+    session = SessionStub()
+    assert _ai_trigger_target(db, session, ability, 210, 0, {}, []) is None
+    add_card(db, 211, 0, TPL_GLADIATOR, loc="warzone")
+    assert _ai_trigger_target(db, session, ability, 210, 0, {}, []) == 211
+
+
+def test_double_choice_creates_random_choices_and_clears_before_second(db):
+    """DoubleChoice follows the client sequence without using card text."""
+    from abilities.framework.effects import choices
+
+    choice_guids = [_ag(f"choice-{i}") for i in range(6)]
+    for guid in choice_guids:
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (guid, f"Choice {guid[-4:]}", "Choice", 0, 0, 0, 0, "[]",
+             "[]", ""))
+    db.commit()
+    add_card(db, 400, 5, TPL_GLADIATOR, loc="warzone")
+    session = SessionStub()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {
+        "resolving_ability": "choice-ability",
+        "resolving_effect_order": 0,
+        "resolving_source_uid": 400,
+        "resolving_owner_id": 5,
+        "ability_target_map": {},
+        "ability_variables": {},
+    }
+    first_guid = "effect-first"
+    second_guid = "effect-second"
+
+    def typed(effect_guid):
+        return {"m_SecondChoice": effect_guid == second_guid}
+
+    def value(_db, _state, effect_guid, field_name, default=None):
+        if field_name == "m_Choices" and effect_guid == first_guid:
+            return [{"m_Guid": guid} for guid in choice_guids]
+        return default
+
+    with mock.patch.object(choices, "effect_template", side_effect=typed), \
+            mock.patch.object(choices, "effect_template_value",
+                              side_effect=value), \
+            mock.patch.object(choices, "effect_field", return_value=3), \
+            mock.patch("random.randrange", side_effect=[0, 0, 0]):
+        result = choices.double_choice(
+            game, session, db, handler, pl_t, ai_t, bstate, first_guid, "")
+    assert "awaiting 3" in result, result
+    assert len(bstate["pending_choice"]["choice_uids"]) == 3
+    assert db.execute(
+        "SELECT COUNT(*) FROM game_cards WHERE location='choosing'").fetchone()[0] == 3
+    bstate.pop("pending_choice")
+    bstate.pop("resolution_paused")
+    bstate["resolving_effect_order"] = 1
+    with mock.patch.object(choices, "effect_template", side_effect=typed), \
+            mock.patch.object(choices, "effect_template_value",
+                              side_effect=value), \
+            mock.patch.object(choices, "effect_field", return_value=3):
+        result = choices.double_choice(
+            game, session, db, handler, pl_t, ai_t, bstate, second_guid, "")
+    assert "awaiting 3" in result, result
+    assert db.execute(
+        "SELECT COUNT(*) FROM game_cards WHERE location='choosing'").fetchone()[0] == 3
+    assert db.execute(
+        "SELECT COUNT(*) FROM game_cards WHERE location='PlayedResources'").fetchone()[0] == 3
+
+
+def test_summon_choosing_collection_stays_out_of_warzone(db):
+    """A typed Choosing summon creates option cards, not permanents."""
+    from abilities.framework.effects.tokens import summon_token
+
+    choice = _ag("choosing-token")
+    db.execute(
+        "INSERT INTO card_templates "
+        "(guid,name,card_type,cost,attack,defense,attributes,"
+        "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (choice, "A Choice", "Choice", 0, 0, 0, 0, "[]", "[]", ""))
+    db.commit()
+    session = SessionStub()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"resolving_owner_id": 5, "resolving_ability": ""}
+    result = summon_token(
+        game, session, db, HandlerStub(db), pl_t, ai_t, bstate,
+        _ag("choosing-effect"), json.dumps({
+            "token_guid": choice, "amount": 1, "collection": "Choosing"}))
+    assert "to choosing" in result, result
+    uid = bstate["created_token_uids"][0]
+    assert db.execute(
+        "SELECT location, card_state FROM game_cards WHERE card_uid=?",
+        (uid,)).fetchone() == ("choosing", 0)
+    assert any(
+        ev.__class__.__name__ == "CardMovedSessionEventArgs" and
+        ev.collection == game_engine.ECardCollections.Choosing
+        for ev in game.events)
+    assert not any(
+        ev.__class__.__name__ == "CardMovedSessionEventArgs" and
+        ev.collection == game_engine.ECardCollections.Warzone
+        for ev in game.events)
+
+
+def test_choice_ability_transforms_real_parent(db):
+    """Playing a Choice token applies its automatic ability to its parent."""
+    import db as db_module
+    from abilities.framework.effects.choices import (
+        play_choice_card, resolve_choice_card_abilities)
+    from abilities.framework.effects.tokens import summon_token
+
+    source_uid = 401
+    source_tpl = TPL_GLADIATOR
+    output_tpl = _ag("choice-output")
+    choice_tpl = _ag("choice-card")
+    choice_ability = _ag("choice-transform")
+    effect_guid = _ag("choice-transform-effect")
+    db.execute(
+        "INSERT INTO card_templates "
+        "(guid,name,card_type,cost,attack,defense,attributes,"
+        "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (output_tpl, "Choice Output", "Troop", 3, 4, 4, 0, "[]", "[]", ""))
+    db.execute(
+        "INSERT INTO card_templates "
+        "(guid,name,card_type,cost,attack,defense,attributes,"
+        "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (choice_tpl, "Choose Output", "Choice", 0, 0, 0, 0,
+         json.dumps([choice_ability]), "[]", ""))
+    _insert_ability(db, choice_ability, [
+        "190a4d8c-7c2c-10d0-6429-99c5aeb0791f"], [{
+            "order": 0, "type": "TransformCardAbilityEffectTemplate",
+            "effect_guid": effect_guid, "target_index": 0}])
+    db.execute(
+        "UPDATE card_abilities_meta SET game_text=? WHERE ability_guid=?",
+        (f"Transform this into <a data={output_tpl}>Choice Output</a>.",
+         choice_ability))
+    # _insert_ability generates the effect GUID; use the requested one so the
+    # test can assert the same metadata fallback path as a real transform.
+    db.execute(
+        "UPDATE ability_effects SET effect_guid=? WHERE ability_guid=?",
+        (effect_guid, choice_ability))
+    db.commit()
+    add_card(db, source_uid, 5, source_tpl)
+    session = SessionStub()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"resolving_source_uid": source_uid,
+              "resolving_owner_id": 5}
+    summon_token(
+        game, session, db, handler, pl_t, ai_t, bstate, _ag("choice-summon"),
+        json.dumps({"token_guid": choice_tpl, "amount": 1,
+                    "collection": "Choosing"}))
+    choice_uid = bstate["created_token_uids"][0]
+    old_db = db_module._db
+    db_module._db = db
+    try:
+        assert play_choice_card(
+            game, session, db, handler, pl_t, ai_t, bstate,
+            choice_uid, 5)
+        resolve_choice_card_abilities(
+            game, session, db, handler, pl_t, ai_t, bstate,
+            choice_uid, source_uid, 5)
+    finally:
+        db_module._db = old_db
+    assert db.execute(
+        "SELECT template_guid FROM game_cards WHERE card_uid=?",
+        (source_uid,)).fetchone()[0] == output_tpl
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=?",
+        (choice_uid,)).fetchone()[0] == "PlayedResources"
+
+
 def main():
     tests = [
         ("Random variable + conditions + recursion",
@@ -331,6 +550,16 @@ def main():
          test_deck_search_prompt_pauses_before_second_effect),
         ("Deck search detection uses the zone filter",
          test_deck_search_detection_uses_filter_not_collection_flags),
+        ("Empty sacrifice target does not sacrifice source",
+         test_empty_sacrifice_target_does_not_sacrifice_source),
+        ("AI sacrifice target excludes source",
+         test_ai_sacrifice_target_excludes_source),
+        ("DoubleChoice creates and refreshes choices",
+         test_double_choice_creates_random_choices_and_clears_before_second),
+        ("Choosing summon creates option cards",
+         test_summon_choosing_collection_stays_out_of_warzone),
+        ("Choice transforms its real parent",
+         test_choice_ability_transforms_real_parent),
     ]
     failed = 0
     for name, fn in tests:

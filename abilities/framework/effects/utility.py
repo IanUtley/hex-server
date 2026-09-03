@@ -129,6 +129,21 @@ def replenish_resources(game, session, db, handler, pl_t, ai_t, bstate,
     return f"replenish resources {current}->{total}"
 
 
+@leaf_register("AnimationTriggerEffectTemplate")
+def animation_trigger(game, session, db, handler, pl_t, ai_t, bstate,
+                      effect_guid, param):
+    """Dispatch the typed presentation-only animation trigger."""
+    trigger = effect_template_value(
+        db, bstate, effect_guid, "m_AnimationTrigger", "Invalid")
+    values = {"Invalid": 0, "CannonTalent": 1, "MageTalent": 2,
+              "WarriorTalent": 3, "ClericTalent": 4, "RangerTalent": 5,
+              "Kraken": 8}
+    value = values.get(str(trigger).rsplit(".", 1)[-1], 0)
+    if value:
+        game.push_animation_trigger(value)
+    return f"animation trigger {trigger}"
+
+
 @leaf_register("LoseThresholdAbilityEffectTemplate")
 def lose_threshold(game, session, db, handler, pl_t, ai_t, bstate,
                    effect_guid, param):
@@ -300,7 +315,8 @@ def create_token_matching_target(game, session, db, handler, pl_t, ai_t,
     collection = effect_template_value(db, bstate, effect_guid,
                                        "m_CardCollection") or "Warzone"
     made = _create_matching_target(game, session, db, handler, pl_t, ai_t,
-                                   int(target), max(1, count), collection)
+                                   bstate, int(target), max(1, count),
+                                   collection)
     return f"created {made} matching token(s)"
 
 

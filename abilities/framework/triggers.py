@@ -35,6 +35,76 @@ from .effects.counters import (
 from .stat_mod import apply_card_stat_mod
 
 
+def _card_uses_variable(db, session_id, card_uid, variable_type):
+    """Whether a live card has a typed ability variable.
+
+    This follows the current card ability list, so transformed cards and
+    Mimic-created copies are evaluated from their instance metadata rather
+    than from a card-name special case.
+    """
+    from .fields import ability_record
+    row = db.execute(
+        "SELECT card_abilities FROM game_cards "
+        "WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+    if not row or not row[0]:
+        return False
+    try:
+        ability_guids = json.loads(row[0])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    for ability_guid in ability_guids or []:
+        meta = db.execute(
+            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
+            (str(ability_guid).lower(),)).fetchone()
+        try:
+            record = json.loads(meta[0]) if meta and meta[0] else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            record = None
+        if not isinstance(record, dict):
+            record = ability_record(db, ability_guid)
+        for variable in record.get("m_Variables") or []:
+            if str(variable.get("_t", "")).rsplit(".", 1)[-1] == variable_type:
+                return True
+    return False
+
+
+def _refresh_variable_cards(db, handler, game, session, pl_t, ai_t,
+                            bstate, variable_type):
+    """Re-send warzone cards whose continuous stats use a changed variable."""
+    if not hasattr(handler, "_card_full_data"):
+        return
+    handler._current_bstate = bstate
+    rows = db.execute(
+        "SELECT card_uid, template_guid, user_id, card_state, card_type "
+        "FROM game_cards WHERE session_id=? AND location='warzone'",
+        (session.session_id,)).fetchall()
+    for card_uid, template_guid, user_id, card_state, card_type in rows:
+        if not _card_uses_variable(db, session.session_id, card_uid,
+                                   variable_type):
+            continue
+        scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
+        try:
+            # SessionCardId is a wire wrapper without value equality. Remove
+            # an older definition for this UID before rebuilding it, otherwise
+            # repeated refreshes leave stale CardDefs in the same event batch.
+            for old_scid in list(game.card_defs):
+                if int(old_scid.uid.uid64) == int(card_uid):
+                    del game.card_defs[old_scid]
+            handler._card_full_data(game, scid, template_guid)
+            cdef = game.card_defs.get(scid)
+            game.push_card_updated(
+                scid, owner_uid(user_id, pl_t, ai_t, bstate),
+                game_engine.ECardCollections.Warzone,
+                game_engine.card_type_from_db(card_type),
+                template_id=template_guid,
+                attributes=cdef.attributes if cdef else 0,
+                state=int(card_state or 0))
+        except Exception as exc:
+            _log(f"    Static refresh failed for {variable_type} card "
+                 f"{card_uid}: {exc}")
+
+
 def _parse_leaf_param(param):
     """Parse an ability_effects.param JSON blob (parent-level child params)."""
     if not param:
@@ -95,7 +165,11 @@ def ability_matches_keyword(db, ability_guid, keyword):
     as a compatibility fallback for older records whose serialized TAC is
     absent, never as the primary source of the effect configuration.
     """
-    key = str(keyword or "").lower().rstrip("s")
+    key = str(keyword or "").lower()
+    if key.endswith("ies"):
+        key = key[:-3] + "y"
+    elif key.endswith("s"):
+        key = key[:-1]
     row = db.execute(
         "SELECT trigger_event_type, game_text, raw_json "
         "FROM card_abilities_meta WHERE ability_guid=?",
@@ -113,8 +187,14 @@ def ability_matches_keyword(db, ability_guid, keyword):
                 return True
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-        return bool(re.search(r"(?:^|>)\s*deathcry\b",
-                             str(game_text or "").lower()))
+        # Older records may not have a serialized TAC, but the keyword still
+        # has to be the ability's leading label.  A plain substring search
+        # would misclassify abilities such as "Trigger the Deathcry of ..."
+        # as Deathcry abilities themselves and can recursively retrigger the
+        # same card.
+        return bool(re.match(
+            r"\s*(?:\[one-shot\]\s*)?(?:<[^>]+>\s*)*deathcr(?:y|ies)\b",
+            str(game_text or "").lower()))
     if key == "momentum":
         return "CardInspiredEvent" in str(event_type or "")
     return key in str(game_text or "").lower()
@@ -239,6 +319,58 @@ def _ai_battle_target(db, session, source_uid, ability_guid, candidates):
     killable = [uid for uid in candidates
                 if 0 < by_uid.get(int(uid), (0, 0))[1] <= damage]
     return random.choice(killable or candidates)
+
+
+def _ai_trigger_target(db, session, ability_guid, source_uid, owner_id,
+                       bstate, champions):
+    """Choose a non-auto trigger target using its typed target metadata."""
+    from .targeting import legal_targets
+
+    row = db.execute(
+        "SELECT target_template_ids FROM card_abilities_meta "
+        "WHERE ability_guid=?", (ability_guid,)).fetchone()
+    if row and row[0]:
+        try:
+            target_ids = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            target_ids = []
+    else:
+        from .fields import ability_record
+        target_ids = [entry.get("m_Guid") for entry in
+                      (ability_record(db, ability_guid).get(
+                          "m_AbilityTargetTemplateIds") or [])
+                      if isinstance(entry, dict)]
+    effects = db.execute(
+        "SELECT target_index, effect_type FROM ability_effects "
+        "WHERE ability_guid=? AND target_index>=0 ORDER BY effect_order",
+        (ability_guid,)).fetchall()
+    for target_index, effect_type in effects:
+        if int(target_index) >= len(target_ids):
+            continue
+        target_id = target_ids[int(target_index)]
+        template = db.execute(
+            "SELECT is_auto_target, target_kind FROM target_templates "
+            "WHERE template_id=?", (target_id,)).fetchone()
+        if not template or int(template[0] or 0) or template[1] in (
+                "PlayerTargetTemplate", "AbilitySourceCardTargetTemplate",
+                "SourceRevealedTargetTemplate", "SourceDrawnTargetTemplate",
+                "SourceBuriedTargetTemplate", "SourceStoredTargetTemplate",
+                "VoidedTargetTemplate", "AbilityCreatedTargetTemplate",
+                "AbilityTriggerCardTargetTemplate"):
+            continue
+        candidates = legal_targets(
+            db, session.session_id, owner_id, target_id, source_uid,
+            both_players=True, champions=champions, battle_state=bstate)
+        # Some authored sacrifice target filters say only "a troop you
+        # control".  For a deploy sacrifice, the source is not an eligible
+        # replacement for the optional "another troop" choice.
+        if effect_type == "SacrificeCardAbilityEffectTemplate":
+            candidates = [uid for uid in candidates
+                          if int(uid) != int(source_uid)]
+        if candidates:
+            return _ai_battle_target(db, session, source_uid, ability_guid,
+                                     candidates)
+    return None
 
 
 def _apply_health_gain(game, bstate, pl_t, ai_t, amount, source_owner_uid,
@@ -1271,6 +1403,16 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                             explicit_tpls, candidates)
                         logs.append(f"{event_type} {ag[:8]} -> awaiting target")
                         continue
+                elif ability_owner_id == 0:
+                    # Non-explicit targets are normally auto-resolved by the
+                    # client.  The server still needs to make that choice for
+                    # AI triggers; otherwise a missing target reaches a leaf
+                    # and can incorrectly fall back to the source card.
+                    champ_pool = getattr(handler, "_champion_targets",
+                                         lambda: None)()
+                    extra_target = _ai_trigger_target(
+                        db, session, ag, cu, ability_owner_id, bstate,
+                        champ_pool or [])
                 # Check if this ability ignores the chain (Deploy/Inspire/Deathcry
                 # have m_IgnoresChain=1 — execute immediately, no priority window)
                 ignores = True
@@ -1413,20 +1555,30 @@ def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
         entering_cost = int(crow[0] or 0) if crow else 0
     else:
         entering_cost = int(entering_cost)
-    # The client's SourcePlayerBriarLegionVariable counts how many Briar
-    # Legions entered play under your control this game (drives Briar Legion's
-    # "+2/+2 for each time a Briar Legion entered play under your control").
+    # SourcePlayerBriarLegionVariable is a typed card variable. The match-wide
+    # event count is shared by both controllers, so a Briar Legion played by
+    # either controller increases the value seen by every Briar.
     try:
-        erow = db.execute(
-            "SELECT ct.name FROM game_cards gc JOIN card_templates ct "
-            "ON ct.guid=gc.template_guid WHERE gc.session_id=? AND gc.card_uid=?",
-            (session.session_id, int(entering_uid))).fetchone()
-        if erow and (erow[0] or "").lower() == "briar legion":
-            side = "player" if entering_owner_id else "ai"
-            key = f"{side}_briar_legions_entered"
-            bstate[key] = int(bstate.get(key, 0)) + 1
-    except Exception:
-        pass
+        is_briar_counter_card = _card_uses_variable(
+            db, session.session_id, entering_uid,
+            "SourcePlayerBriarLegionVariable")
+    except Exception as exc:
+        is_briar_counter_card = False
+        _log(f"    Briar Legion metadata lookup failed for {entering_uid}: "
+             f"{exc}")
+    if is_briar_counter_card:
+        if "briar_legions_entered" not in bstate:
+            bstate["briar_legions_entered"] = (
+                int(bstate.get("player_briar_legions_entered", 0)) +
+                int(bstate.get("ai_briar_legions_entered", 0)))
+        bstate["briar_legions_entered"] = int(
+            bstate.get("briar_legions_entered", 0)) + 1
+        try:
+            _refresh_variable_cards(
+                db, handler, game, session, pl_t, ai_t, bstate,
+                "SourcePlayerBriarLegionVariable")
+        except Exception as exc:
+            _log(f"    Briar Legion static refresh failed: {exc}")
     # Deploy: the entering card's own CardEnteredZone triggers
     logs.append(resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                                  "CardEnteredZoneEvent", entering_uid,

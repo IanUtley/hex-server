@@ -237,6 +237,8 @@ when the area state is loaded. The current AZ1 gates are seeded as:
 |---|---|---|
 | `az01_tamed` | `az1_tamed_start` | hide/block Node005 (Fonferek Thicket) |
 | `q_seawitch` | `az1_find_horwich_sea_start` | unblock/reveal Node005 |
+| `az01_uw_find_cave_in` | `az1_find_cave_in_start` | reveal/mark Node017 and hide Node034 |
+| `az01_ar_find_ambling_mesa` | `az1_find_ambling_mesa_start` | reveal/mark Node034 and hide Node017 |
 
 Adding another quest-specific map transition therefore requires a named hook
 and a `start_hook` value on the quest row; the quest grant path itself does not

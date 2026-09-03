@@ -553,6 +553,12 @@ class Game:
         self.interface_disabled = disabled
         self._push(ev)
 
+    def push_animation_trigger(self, trigger: int):
+        """Queue the class-76 animation event consumed by the client."""
+        ev = self._make_event(AnimationTriggerSessionEventArgs)
+        ev.trigger_value = int(trigger)
+        self._push(ev)
+
     def push_game_started(self, champion_names=None, champion_template_ids=None,
                           player_first=None):
         ev = self._make_event(GameStartedSessionEventArgs)

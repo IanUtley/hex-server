@@ -466,11 +466,15 @@ The AI has no client, so its turn is played out server-side, but it is
    / priority window state stays consistent) and the AI passes each one
    server-side. `Draw` → draw the top card of the AI deck; `FirstMainPhase` →
    play one resource if available (obeys the 1-per-turn rule).
-4. When a phase is a **stop for the human (opponent-stop)**, the AI turn pauses
+4. During `SecondMainPhase`, after normal hand plays are exhausted, the AI
+   searches AI-controlled permanents for metadata-backed manual resource
+   abilities. X-cost abilities use all remaining resources, subject to the
+   authored minimum, and AI-owned choices use the server's AI choice policy.
+5. When a phase is a **stop for the human (opponent-stop)**, the AI turn pauses
    and the human gets a `ResumeTopOfChain` GreenLight → the client pushes
    `BattleStateInactivePriorityWindow` (their priority window); the AI resumes
    after the human passes.
-5. `EndTurn` → switch the turn player back to the human; the player's turn
+6. `EndTurn` → switch the turn player back to the human; the player's turn
    auto-starts (`_advance_to_priority`), resetting
    `player_resource_played_this_turn` for the new turn.
 

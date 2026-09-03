@@ -80,7 +80,7 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if not parts:
         return ("Commands: !help !game_end !encounter !hand !zones !playable !gencard "
                 "!update !threshold !resource !pass !phase !draw !discard "
-                "!addcard")
+                "!addcard !top")
 
     action = parts[0].lower()
     args = parts[1:]
@@ -242,6 +242,7 @@ def _cmd_game_end(handler, args):
     result = args[0].lower() if args else "victory"
     won = result in ("win", "won", "victory", "winlose", "true", "1")
     out = []
+    campaign_handled = False
 
     # 1) Battle GameEnded event so the client leaves the battle UI.
     player_uid = encoder.make_uid(hconnect_server.UID_TYPE["ServicePlayer"],
@@ -251,6 +252,22 @@ def _cmd_game_end(handler, args):
         try:
             _push_battle_game_end(handler, session, won)
             out.append(f"GameEnded pushed to session {session.session_id} ({result})")
+
+            # Campaign battles need the complete result path: it applies
+            # authored rewards, advances quest state, sends gameendnotify,
+            # and removes the finished session/cards.  Sending only the
+            # lightweight campaign notification leaves an encounter's
+            # autostart state active, so the client immediately launches it
+            # again after returning to the map.
+            if str(session.session_name or "").startswith("camp_"):
+                campaign_handled = True
+                handled = campaign.handle_battle_gameend(
+                    handler, db, session, won,
+                    hconnect_server.SERVICE_MAIL_UID,
+                    hconnect_server.UID_TYPE["ServiceCampaign"])
+                out.append(
+                    "Campaign battle result applied"
+                    if handled else "Campaign battle result was not applied")
         except Exception as e:
             out.append(f"GameEnded error: {e}")
     else:
@@ -264,7 +281,7 @@ def _cmd_game_end(handler, args):
     ).fetchone()
     if not camp_row:
         out.append("No active campaign for this player")
-    else:
+    elif not campaign_handled:
         camp_id = camp_row[0]
         msg = campaign.push_gameendnotify(
             handler, db, camp_id, won, 0, "00000000-0000-0000-0000-000000000000",
@@ -620,6 +637,92 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         _send_game_events(handler, game, session, pl_t)
         return f"Discarded a card ({len(hand_rows)} in hand)"
 
+    elif action == "top":
+        # Move one of the human player's hand cards to position zero of their
+        # deck.  Accept the card UID or a case-insensitive name/substring, as
+        # !addcard does, so !hand output can be used directly.
+        if not args:
+            return "Usage: !top <card_id|name>"
+        selector = " ".join(args).strip()
+        target = None
+        try:
+            card_uid = int(selector)
+        except ValueError:
+            card_uid = None
+        if card_uid is not None:
+            target = db.execute(
+                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
+                "ct.name FROM game_cards gc "
+                "JOIN card_templates ct ON ct.guid=gc.template_guid "
+                "WHERE gc.session_id=? AND gc.user_id=? "
+                "AND gc.location='hand' AND gc.card_uid=? LIMIT 1",
+                (session.session_id, command_owner_id, card_uid)).fetchone()
+        else:
+            target = db.execute(
+                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
+                "ct.name FROM game_cards gc "
+                "JOIN card_templates ct ON ct.guid=gc.template_guid "
+                "WHERE gc.session_id=? AND gc.user_id=? "
+                "AND gc.location='hand' AND LOWER(ct.name)=LOWER(?) "
+                "ORDER BY gc.position, gc.card_uid LIMIT 1",
+                (session.session_id, command_owner_id, selector)).fetchone()
+            if target is None:
+                target = db.execute(
+                    "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
+                    "ct.name FROM game_cards gc "
+                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
+                    "WHERE gc.session_id=? AND gc.user_id=? "
+                    "AND gc.location='hand' AND LOWER(ct.name) LIKE LOWER(?) "
+                    "ORDER BY gc.position, gc.card_uid LIMIT 1",
+                    (session.session_id, command_owner_id,
+                     "%" + selector + "%")).fetchone()
+        if target is None:
+            return f"No card matching '{selector}' in hand"
+
+        card_uid, tpl_guid, card_tpl_id, card_name = target
+        # Reindex the existing deck before inserting the selected card at the
+        # top.  The temporary offset avoids collisions if a uniqueness
+        # constraint is added to (session_id, user_id, location, position).
+        deck_count = db.execute(
+            "SELECT COUNT(*) FROM game_cards WHERE session_id=? AND user_id=? "
+            "AND location='deck'", (session.session_id, command_owner_id)
+        ).fetchone()[0]
+        db.execute(
+            "UPDATE game_cards SET position=position+? "
+            "WHERE session_id=? AND user_id=? AND location='deck'",
+            (int(deck_count) + 1, session.session_id, command_owner_id))
+        db.execute(
+            "UPDATE game_cards SET location='deck', position=0, card_state=0 "
+            "WHERE session_id=? AND user_id=? AND card_uid=? "
+            "AND location='hand'",
+            (session.session_id, command_owner_id, int(card_uid)))
+        db.execute(
+            "UPDATE game_cards SET position=position-? "
+            "WHERE session_id=? AND user_id=? AND location='deck' "
+            "AND card_uid<>?",
+            (int(deck_count), session.session_id, command_owner_id,
+             int(card_uid)))
+        db.commit()
+
+        owner_player_uid = (pl_t if not is_tourney
+                            else game_engine.UID.make(244, command_owner_id))
+        game = game_engine.Game(session.session_id, pl_t, ai_t)
+        scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
+        tpl_d, ct_d, _name_d, cost_d, atk_d, def_d, gem_d = \
+            handler._card_full_data(game, scid, tpl_guid, card_tpl_id)
+        card_type = (game_engine.card_type_from_db(ct_d)
+                     if isinstance(ct_d, str) else ct_d)
+        game.push_card_moved(scid, owner_player_uid,
+                             game_engine.ECardCollections.Deck,
+                             game_engine.ECardLocations.Top, 0)
+        game.push_card_updated(scid, owner_player_uid,
+                               game_engine.ECardCollections.Deck, card_type,
+                               template_id=tpl_d, cost=cost_d,
+                               attack=atk_d, defense=def_d, gems=gem_d,
+                               state=0, nulling=True)
+        _send_game_events(handler, game, session, pl_t)
+        return f"Put {card_name} on top of deck"
+
     elif action == "pass":
         TURN_PHASES = [
             game_engine.ETurnPhases.FirstMainPhase,
@@ -911,6 +1014,7 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             "!pass — advance turn phase",
             "!phase <Name> — jump to phase",
             "!draw N — draw N cards",
+            "!top <id|name> — put a card from your hand on top of your deck",
             "!zones — list cards by zone",
             "!move <id> <zone> — move card to zone",
             "!state <id> <flags> — set card state (Tapped|Attacking|...)",

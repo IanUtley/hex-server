@@ -22,7 +22,10 @@ from abilities.framework import triggers
 from abilities.framework.bom import _LEAFS
 from abilities import resolve_played_spell
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 TPL = {
     "scrivener": "2ce8233b-c5bd-4be0-86c6-a17021b071ee",
@@ -65,9 +68,14 @@ class SessionStub:
     session_id = 1
     server_id = 100
 
+    def _persist(self):
+        pass
+
 
 class HandlerStub:
     user_profile = {"id": 5}
+    _player_champ_scid = game_engine.SessionCardId(game_engine.UID.make(244, 5))
+    _ai_champ_scid = game_engine.SessionCardId(game_engine.UID.make(3, 1000))
 
     @staticmethod
     def _next_resolve_counter(session):
@@ -829,7 +837,9 @@ def test_angel_draw(db):
     drain_stack(db, handler, game, session, pl_t, ai_t, bstate)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=400").fetchone()[0]
-    assert loc == "warzone", loc
+    # Free play follows the normal chain contract: the card waits in
+    # CastSpells until the battle engine resolves its queued play item.
+    assert loc == "CastSpells", loc
 
 
 def test_angel_draw_gate(db):

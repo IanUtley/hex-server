@@ -29,7 +29,10 @@ from tests.tests_combat import (
     make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER,
 )
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 
 
 def _copy_card(db, guid):

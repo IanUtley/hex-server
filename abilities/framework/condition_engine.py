@@ -523,8 +523,23 @@ def evaluate_condition(node, ctx):
         if lhs not in ctx.ability_variables:
             return False
         op = node.get("m_ComparisonOp", "Equals")
-        return _compare(int(ctx.ability_variables[lhs]),
-                        op, int(rhs))
+        try:
+            rhs_value = int(rhs)
+        except (TypeError, ValueError):
+            # Both literal values and variable names are serialized as
+            # strings.  CountListAttr variables (for example
+            # ``SacrificedCards``) are populated by earlier effects.
+            if rhs not in ctx.ability_variables:
+                return False
+            try:
+                rhs_value = int(ctx.ability_variables[rhs])
+            except (TypeError, ValueError):
+                return False
+        try:
+            lhs_value = int(ctx.ability_variables[lhs])
+        except (TypeError, ValueError):
+            return False
+        return _compare(lhs_value, op, rhs_value)
 
     if t in ("NotContingentAbilityCondition", "NotContingentEffectCondition"):
         # "Otherwise N": true when the referenced effect instance did NOT

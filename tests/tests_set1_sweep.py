@@ -32,7 +32,10 @@ from abilities.framework.triggers import (
     resolve_stack_trigger,
 )
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 SET1 = "0382f729-7710-432b-b761-13677982dcd2"
 OUT = "/tmp/set1_sweep_failures.txt"
 

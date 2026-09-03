@@ -456,8 +456,23 @@ _db.execute("PRAGMA foreign_keys=ON")
 
 # Ensure the static schema (incl. game_cards, session_events) exists and apply
 # any column migrations for databases created before columns were added.
+#
+# The test runner supplies a fully initialized, immutable SQLite snapshot and
+# asks each subprocess to restore it into its own in-memory connection.  This
+# keeps production startup unchanged while avoiding a full seed/migration pass
+# for every test process.
 import static
-static.ensure_schema(_db)
+_test_db_template = os.environ.get("HEX_TEST_DB_TEMPLATE")
+if (os.environ.get("HEX_TEST_DB_READY") == "1"
+        and DB_PATH == ":memory:"
+        and _test_db_template):
+    _template_db = sqlite3.connect(_test_db_template)
+    try:
+        _template_db.backup(_db)
+    finally:
+        _template_db.close()
+else:
+    static.ensure_schema(_db)
 
 
 # === Identity helpers ===
@@ -1368,6 +1383,90 @@ def db_tournament_close_orphaned_started():
     )
     _db.commit()
     return int(cursor.rowcount or 0)
+
+
+def db_tournament_cleanup_old(age_days=1):
+    """Close stale tournaments and remove their database-owned game state.
+
+    Tournament rows are retained as closed history.  Only sessions referenced
+    by tournaments past the age threshold are removed, so old campaign/PvP
+    sessions outside the tournament system are not affected.  ``created_at``
+    is stored as SQLite's UTC datetime text by the schema.
+    """
+    try:
+        days = max(1, int(age_days))
+    except (TypeError, ValueError):
+        days = 1
+    cutoff = f"-{days} days"
+
+    # Cleanup runs in the tournament scheduler while HConnect may be creating
+    # a battle and inserting its deck.  Do not use the process-wide legacy
+    # connection here: if a competing writer wins between two statements, a
+    # failed UPDATE can leave that shared connection inside an uncommitted
+    # transaction and block the battle for the remainder of the request.
+    # Instead, take one short-lived write transaction.  A busy database is a
+    # normal scheduler condition; leave this pass for the next interval.
+    owns_cleanup_db = True
+    # Keep the in-memory test database usable when callers temporarily replace
+    # the legacy connection.  The production connection is a
+    # RetryingConnection, so it always uses the isolated connection below and
+    # never touches a handler's active transaction from the scheduler thread.
+    if isinstance(_db, sqlite3.Connection) and not isinstance(
+            _db, RetryingConnection):
+        cleanup_db = _db
+        owns_cleanup_db = False
+    else:
+        cleanup_db = sqlite3.connect(DB_PATH, timeout=0.5)
+    try:
+        cleanup_db.execute("PRAGMA busy_timeout=500")
+        cleanup_db.execute("BEGIN IMMEDIATE")
+        stale_sessions = [
+            str(row[0]) for row in cleanup_db.execute(
+                "SELECT DISTINCT session_id FROM tournaments "
+                "WHERE session_id IS NOT NULL AND TRIM(session_id)<>'' "
+                "AND created_at IS NOT NULL "
+                "AND datetime(created_at) <= datetime('now', ?)",
+                (cutoff,)).fetchall()
+            if row and row[0] is not None
+        ]
+
+        closed_cursor = cleanup_db.execute(
+            "UPDATE tournaments SET status='closed' "
+            "WHERE status<>'closed' AND created_at IS NOT NULL "
+            "AND datetime(created_at) <= datetime('now', ?)",
+            (cutoff,))
+
+        cards_removed = 0
+        sessions_removed = 0
+        for session_id in stale_sessions:
+            card_cursor = cleanup_db.execute(
+                "DELETE FROM game_cards WHERE CAST(session_id AS TEXT)=?",
+                (session_id,))
+            cards_removed += int(card_cursor.rowcount or 0)
+            session_cursor = cleanup_db.execute(
+                "DELETE FROM game_sessions "
+                "WHERE CAST(session_id AS TEXT)=?",
+                (session_id,))
+            sessions_removed += int(session_cursor.rowcount or 0)
+
+        cleanup_db.commit()
+        return {
+            "tournaments_closed": int(closed_cursor.rowcount or 0),
+            "game_sessions_removed": sessions_removed,
+            "game_cards_removed": cards_removed,
+        }
+    except sqlite3.OperationalError as exc:
+        cleanup_db.rollback()
+        if _is_sqlite_lock_error(exc):
+            return {
+                "tournaments_closed": 0,
+                "game_sessions_removed": 0,
+                "game_cards_removed": 0,
+            }
+        raise
+    finally:
+        if owns_cleanup_db:
+            cleanup_db.close()
 
 
 def db_tournament_count_active_by_type(type_id):

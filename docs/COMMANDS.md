@@ -13,6 +13,7 @@ The server accepts these commands only when `allowcon` is present in
 | `!playable` | `!playable [id|name ...]` | Set which cards get golden outlines. No args = all playable. |
 | `!drawcard` | `!drawcard <id\|name> [id\|name ...]` | Draw specific cards from deck to hand |
 | `!draw` | `!draw N` | Draw N cards from deck |
+| `!top` | `!top <id\|name>` | Move a card from your hand to the top of your deck |
 | `!discard` | `!discard` | Prompt to choose a card from hand to discard (DiscardACard target picker) |
 | `!move` | `!move <card_id> <zone>` | Move card: `deck`, `hand`, `warzone`, `discard`, `void`, `playedresources`, `underground` |
 | `!update` | `!update <card_id>` | Resend CardUpdated event for a card (restores thresholds/gems) |

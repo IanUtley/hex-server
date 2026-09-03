@@ -109,6 +109,48 @@ def _find_filter_type(node, filter_type):
     return None
 
 
+def _blocking_targets(battle_state, source_uid):
+    """Return troops currently blocking ``source_uid``.
+
+    ``ai_blockers`` is the attacker -> blocker assignment used by PvE, while
+    PvP stores the same relationship as ``blockers``. The key is the attacking
+    troop and the values are the defending troops, regardless of which side is
+    controlled by the AI. The client calls this relationship
+    ``BlockingFilter(IsAbilitySource)``.
+    """
+    if not battle_state or source_uid is None:
+        return set()
+    try:
+        source_uid = int(source_uid)
+    except (TypeError, ValueError):
+        return set()
+    attacking = set()
+    for key in ("ai_attackers", "player_attackers", "attackers"):
+        for attacker in (battle_state.get(key) or {}):
+            try:
+                attacking.add(int(attacker))
+            except (TypeError, ValueError):
+                pass
+    if source_uid not in attacking:
+        return set()
+    for blocker_map in (battle_state.get("ai_blockers") or {},
+                        battle_state.get("blockers") or {}):
+        for attacker, blockers in blocker_map.items():
+            try:
+                if int(attacker) != source_uid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            result = set()
+            for blocker in blockers or []:
+                try:
+                    result.add(int(blocker))
+                except (TypeError, ValueError):
+                    continue
+            return result
+    return set()
+
+
 def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
                          source_card=None):
     """Evaluate a gamedata CardFilter tree against one card.
@@ -488,6 +530,9 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     except Exception:
         fjson = {}
     top_n = _find_filter_type(fjson, "TopNOfDeck")
+    blocking_filter = _find_filter_type(fjson, "BlockingFilter")
+    blocking_targets = _blocking_targets(battle_state, source_uid) \
+        if blocking_filter is not None else None
 
     # collection_flags is a visibility mask in the client data, not always
     # the actual target zone. TopNOfDeck is explicitly evaluated against a
@@ -560,6 +605,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             pass
         if int_attrs.get("Tamed", 0) > 0:
             int_attrs.pop("Untamed", None)
+        if blocking_targets is not None and int(cu) not in blocking_targets:
+            continue
         card = {"card_uid": int(cu), "card_type": ctype, "location": loc,
                 "user_id": uid, "state": int(state or 0),
                 "attack": atk, "defense": def_, "name": name or "",
@@ -620,6 +667,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     if wants_champions and champions:
         for c_uid, c_owner, c_name, c_hp in champions:
             if not both_players and c_owner != controller_uid:
+                continue
+            if blocking_targets is not None and int(c_uid) not in blocking_targets:
                 continue
             champ_card = {"card_uid": int(c_uid), "card_type": "Champion",
                           "location": "warzone", "user_id": c_owner,

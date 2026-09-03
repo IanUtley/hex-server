@@ -4,12 +4,24 @@ import os
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db")
+SRC = os.environ.get(
+    "HEX_TEST_SOURCE_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
+)
 GREAT_SPORE_ABILITY = "9f000616-e866-ef3c-efa6-8b85b6079e80"
 ZODIAC_ABILITY = "11483a8a-a568-ce6b-0d03-8d14ae49a373"
+ZODIAC_BY_MONTH = {
+    1: "Zodiac Dream", 2: "Zodiac Dream",
+    3: "Zodiac Plainsrunner", 4: "Zodiac Plainsrunner",
+    5: "Zodiac Thunderbird", 6: "Zodiac Thunderbird",
+    7: "Zodiac Sands", 8: "Zodiac Sands",
+    9: "Zodiac Observer", 10: "Zodiac Observer",
+    11: "Zodiac Sister Midnight", 12: "Zodiac Sister Midnight",
+}
 
 
 def _database_copy():
@@ -25,7 +37,7 @@ def _database_copy():
 def test_skylak_uses_original_deck_size_for_both_talents():
     db, path = _database_copy()
     try:
-        os.environ["HEX_DB_PATH"] = path
+        expected_zodiac = ZODIAC_BY_MONTH[datetime.now().month]
         from tests.tests_combat import HandlerStub, SessionStub
         from abilities.framework.conditions import apply_pregame_abilities
         from db import db_backfill_ability_effect_meta
@@ -71,9 +83,9 @@ def test_skylak_uses_original_deck_size_for_both_talents():
                 "'Zodiac Observer','Zodiac Sister Midnight') GROUP BY ct.name",
                 (session_id,)).fetchall()
             assert dict(rows).get("Great Spore Beast") == expected_count, rows
-            assert dict(rows).get("Zodiac Sands") == expected_count, rows
+            assert dict(rows).get(expected_zodiac) == expected_count, rows
             assert sum(count for _, count in rows) == expected_count * 2, rows
-            assert all(name in ("Great Spore Beast", "Zodiac Sands")
+            assert all(name in ("Great Spore Beast", expected_zodiac)
                        for name, _ in rows), rows
     finally:
         db.close()

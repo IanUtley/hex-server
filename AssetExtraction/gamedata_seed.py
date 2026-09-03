@@ -971,6 +971,8 @@ _QUEST_OWNER_FACTIONS = {
 _QUEST_START_HOOKS = {
     "az01_tamed": "az1_tamed_start",
     "q_seawitch": "az1_find_horwich_sea_start",
+    "az01_uw_find_cave_in": "az1_find_cave_in_start",
+    "az01_ar_find_ambling_mesa": "az1_find_ambling_mesa_start",
 }
 
 

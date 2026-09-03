@@ -105,6 +105,34 @@ def _target_owner(db, session_id, owner, player_filter):
     return owner
 
 
+def _card_property_value(db, session_id, card_uid, prop):
+    """Read a typed current-card property for an ability variable."""
+    row = db.execute(
+        "SELECT COALESCE(ct.attack, 0), COALESCE(ct.defense, 0), "
+        "COALESCE(gc.card_attack_mod, 0), COALESCE(gc.card_defense_mod, 0), "
+        "gc.permanent_buffs, gc.temporary_buffs "
+        "FROM game_cards gc JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+    if not row:
+        return None
+    if prop == "ResourceCostTrue":
+        return effective_cost(db, session_id, {}, int(card_uid))
+    if prop not in ("CurrentAttackValue", "CurrentDefenseValue"):
+        return None
+    value = int(row[0 if prop == "CurrentAttackValue" else 1] or 0)
+    value += int(row[2 if prop == "CurrentAttackValue" else 3] or 0)
+    key = "atk" if prop == "CurrentAttackValue" else "def"
+    for raw_buffs in row[4:6]:
+        try:
+            buffs = json.loads(raw_buffs or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        value += int(buffs.get(key, 0) or 0)
+    return value
+
+
 def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
                     stat_prop=None):
     """Compute one named ability variable from raw_json m_Variables."""
@@ -142,6 +170,12 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
         if t == "CounterVariable":
             return _counter_variable(db, session_id, bstate, owner, var,
                                      source_uid)
+        if t == "CardPropertyVariable":
+            prop = var.get("m_Property") or ""
+            value = _card_property_value(db, session_id, source_uid, prop)
+            if value is not None:
+                return value
+            return int(var.get("m_DefaultValue", 0) or 0)
         if t == "SumVariableInListAttrCardsAbilityVariable":
             return _sum_list_attr_variable(db, session_id, bstate, owner,
                                             var, source_uid)
@@ -192,8 +226,14 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
             named = (bstate or {}).get("ability_variables") or {}
             return int(named.get(var.get("m_Name"), 0) or 0)
         if t == "SourcePlayerBriarLegionVariable":
-            side = "player" if owner else "ai"
-            return int(bstate.get(f"{side}_briar_legions_entered", 0))
+            # The variable is defined by the card's typed metadata, but the
+            # match-wide event counter is shared by both controllers. Keep
+            # the old side-specific keys as a fallback for battles created by
+            # an older server process.
+            return int(bstate.get(
+                "briar_legions_entered",
+                int(bstate.get("player_briar_legions_entered", 0)) +
+                int(bstate.get("ai_briar_legions_entered", 0))))
         if t == "AbilityConstant":
             try:
                 return int(var.get("m_DefaultValue", 0) or 0)
@@ -466,7 +506,9 @@ def _leaf_numeric_value(db, session_id, bstate, param, raw, owner, source_uid,
                 "CounterVariable",
                 "TriggerTargetPropertyVariable",
                 "SourcePlayerHealthVariable",
-                "SourcePlayerThresholdAbilityVariable"):
+                "SourcePlayerThresholdAbilityVariable",
+                "SourcePlayerBriarLegionVariable",
+                "AbilityPropertyVariable", "CardPropertyVariable"):
             n = var.get("m_Name")
             if n and n not in seen:
                 seen.add(n)
@@ -479,7 +521,10 @@ def _leaf_numeric_value(db, session_id, bstate, param, raw, owner, source_uid,
             if t in ("ExpressionAbilityVariable", "CardSumAbilityVariable",
                      "CounterVariable", "TriggerTargetPropertyVariable",
                      "SourcePlayerHealthVariable",
-                     "SourcePlayerThresholdAbilityVariable") and name not in seen:
+                     "SourcePlayerThresholdAbilityVariable",
+                     "SourcePlayerBriarLegionVariable",
+                     "AbilityPropertyVariable", "CardPropertyVariable") and \
+                    name not in seen:
                 v = _variable_value(db, session_id, bstate, raw, name, owner,
                                     source_uid, stat_prop=prop)
                 if v is not None:
