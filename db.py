@@ -359,6 +359,67 @@ def db_ensure_resource_grants(db=None):
         "max_resources_granted=1 WHERE card_type='Resource' "
         "AND current_resources_granted=0 AND max_resources_granted=0")
     con.commit()
+    # Shards of Fate ("Choose a Standard resource in your deck. Gain the
+    # thresholds it provides.") increases MAX resources only — the gamedata
+    # snapshot reports it as current+max.  Detect it the same data-driven way
+    # the play path does (an ability chain whose target templates filter a
+    # Standard RESOURCE in the DECK) and override to max-only (0/1).
+    try:
+        _snext = []
+        _scols = {r[1] for r in con.execute("PRAGMA table_info(card_templates)")}
+        if "abilities_json" not in _scols:
+            raise RuntimeError("no abilities_json")
+        _rows = con.execute(
+            "SELECT guid, abilities_json FROM card_templates "
+            "WHERE card_type='Resource'").fetchall()
+        for _guid, _aj in _rows:
+            try:
+                _ags = _json.loads(_aj or "[]")
+            except Exception:
+                _ags = []
+            _look = list(_ags)
+            _seen = set()
+            _sift = None
+            while _look:
+                _ag = str(_look.pop()).lower()
+                if _ag in _seen:
+                    continue
+                _seen.add(_ag)
+                _trow = con.execute(
+                    "SELECT target_template_ids FROM card_abilities_meta "
+                    "WHERE ability_guid=?", (_ag,)).fetchone()
+                if _trow and _trow[0]:
+                    try:
+                        _tids = _json.loads(_trow[0])
+                    except Exception:
+                        _tids = []
+                    for _tid in (_tids or []):
+                        _tt = con.execute(
+                            "SELECT filter_json FROM target_templates "
+                            "WHERE template_id=?", (str(_tid),)).fetchone()
+                        _fj = (_tt[0] if _tt else "") or ""
+                        if ("IsSubType" in _fj and '"Standard"' in _fj
+                                and "IsResource" in _fj
+                                and "InZone" in _fj and '"Deck"' in _fj):
+                            _sift = _ag
+                            break
+                    if _sift:
+                        break
+                for _e in con.execute(
+                        "SELECT param FROM ability_effects "
+                        "WHERE ability_guid=? "
+                        "AND effect_type='ActivateAbilityEffectTemplate'",
+                        (_ag,)).fetchall():
+                    if _e and _e[0]:
+                        _look.append(_e[0].lower())
+            if _sift:
+                con.execute(
+                    "UPDATE card_templates SET "
+                    "current_resources_granted=0, max_resources_granted=1 "
+                    "WHERE guid=?", (_guid,))
+        con.commit()
+    except Exception:
+        pass
 
 
 def db_card_ability_list(session_id, card_uid):
