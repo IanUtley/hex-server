@@ -1291,8 +1291,10 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     # the source card's authoritative current zone and controller, then move
     # the top card of that controller's deck through the normal zone path.
     if (dest in ("", "none") and
-            (p.get("name") or "") ==
-            "PutTheTopCardOfYourDeckIntoDestinationZone"):
+            ((p.get("name") or "") ==
+             "PutTheTopCardOfYourDeckIntoDestinationZone"
+             or 'put the top card of your deck into'
+                in (_ability_text(db, bstate) or '').lower())):
         if src_uid is None:
             return "bane move: no source"
         source_row = db.execute(
