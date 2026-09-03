@@ -803,6 +803,16 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 old_health = bstate.get(def_health, 20)
                 bstate[def_health] = max(0, old_health - remaining)
                 log_req(f"    Trample: {hex(u)} deals {remaining} leftover -> defender health {old_health}->{bstate[def_health]}")
+            # Lifelink (SpiritDrain) is keyed to the ACTUAL damage this attacker
+            # dealt to its blockers/champion — not its full printed attack.  The
+            # first-strike step only assigns `step_atk - remaining` to blockers;
+            # any leftover that does not break through is not reflected as dealt
+            # damage and must not heal.  (HexTCG's Gameforge recovery heals
+            # min(remaining defense, amount) per target.)
+            a_dealt_this_step = step_atk - remaining
+            if (a_attrs & game_engine.ECardAttributes.Juggernaught
+                    and remaining > 0):
+                a_dealt_this_step += remaining
             # Each blocker deals its full attack back to the attacker.
             if a_prevent:
                 log_req(f"    Blocked combat: {hex(u)} prevents combat damage")
@@ -833,9 +843,10 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
             elif not a_deals:
                 log_req(f"    Blocked combat: {hex(u)} does not deal damage this step")
             # Lifelink (SpiritDrain): the attacker's controller heals for the
-            # combat damage the attacker dealt to its blockers.
-            if a_attrs & game_engine.ECardAttributes.SpiritDrain and step_atk:
-                att_lifegain += step_atk
+            # combat damage the attacker actually dealt to its blockers
+            # (and any trample leftover to the champion), not the full attack.
+            if a_attrs & game_engine.ECardAttributes.SpiritDrain and a_dealt_this_step:
+                att_lifegain += a_dealt_this_step
         else:
             # Unblocked: the attacker hits the defender's champion.
             if a_deals:

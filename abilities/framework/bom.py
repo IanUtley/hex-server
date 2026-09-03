@@ -1352,6 +1352,23 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
               else _resolve_leaf_target(bstate))
     if target is None:
         return "move card: no target/source"
+    # A MoveCardToZone whose destination could not be resolved from the effect
+    # metadata (param / typed m_DestinationCollection, e.g. a deck-search
+    # effect whose authoritative zone lives only in the extracted gamedata
+    # snapshot) but whose resolved target currently resides in its controller's
+    # deck is a deck-search effect: "search your deck for X" moves the chosen
+    # card to its controller's hand.  The destination is established here from
+    # the target's current zone (deck), not from any card name or GUID.
+    if not dest and target is not None:
+        row = db.execute(
+            "SELECT user_id, location FROM game_cards "
+            "WHERE session_id=? AND card_uid=?",
+            (session.session_id, int(target))).fetchone()
+        if row is not None and row[0] and row[1] == "deck":
+            from .effects.search import move_deck_card_to_hand
+            return move_deck_card_to_hand(
+                game, session, db, handler, pl_t, ai_t,
+                int(target), int(row[0]), bstate)
     zone = {"hand": ("hand", game_engine.ECardCollections.Hand),
             "deck_target": ("deck", game_engine.ECardCollections.Deck),
             "warzone": ("warzone", game_engine.ECardCollections.Warzone),

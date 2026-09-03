@@ -213,6 +213,41 @@ def test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card(db):
     assert not trigger_condition_met(raw(db, VILEFANG), c)
 
 
+def test_dead_card_persistent_modifiers_reported(db):
+    """Phase 41 oracle: a death-trigger's previous-state context must reflect
+    the dying card's PERSISTENT stat modifiers (card_defense_mod + permanent
+    buffs) — which survive into the graveyard — while excluding the transient
+    combat layer (temporary_buffs) that kill_troop clears.
+
+    HexTCG test_phase41_previous_state_death.py:
+      - permanent modifier remains in post-move current context
+      - warzone-only aura is removed before the death condition is evaluated.
+    """
+    # Base template defense 1, but the instance carries +4 through permanent
+    # modifier and card_defense_mod (persistent).
+    add_card(db, 600, 5, "Troop")  # template defense=1
+    db.execute(
+        "UPDATE game_cards SET card_defense_mod=2, "
+        "permanent_buffs='{\"def\": 2, \"atk\": 1}', "
+        "temporary_buffs='{\"def\": 9, \"atk\": 9}', card_damage=0 "
+        "WHERE card_uid=600")
+    db.execute(
+        "UPDATE game_cards SET location='discard', "
+        "temporary_buffs='{}' WHERE card_uid=600")
+    db.commit()
+    c = ctx(db, event_type="CardEnteredZoneEvent",
+            ability_source_uid=600, ability_source_owner_id=5,
+            trigger_uid=600,
+            event_source_collection="warzone",
+            event_destination_collection="discard",
+            event_previous_state=game_engine.ECardStates.Dead,
+            uses_previous_state=True)
+    data = c.card(600)
+    # Base 1 + card_defense_mod 2 + permanent_buffs def 2 = 5.  The transient
+    # temporary_buffs def 9 must NOT be included (cleared on death).
+    assert data["defense"] == 5, data
+
+
 def test_ridge_raider_requires_dead_warzone_troop(db):
     """Ridge Raider's authored previous-state trigger only accepts a real
     Warzone -> Discard death, not a hand/deck card buried into the crypt."""
@@ -257,3 +292,4 @@ if __name__ == "__main__":
     run("Source passes filter gates activation", test_source_passes_filter_condition)
     run("Vilefang trigger fails closed for unknown hand card", test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card)
     run("Ridge Raider only triggers for dead warzone troops", test_ridge_raider_requires_dead_warzone_troop)
+    run("Dead card persistent modifiers reported", test_dead_card_persistent_modifiers_reported)

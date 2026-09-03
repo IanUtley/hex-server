@@ -152,12 +152,31 @@ class ConditionContext:
                 "gc.location, gc.user_id, gc.card_state, "
                 "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
                 "gc.template_guid, ct.name, COALESCE(ct.cost,0), "
-                "ct.subtype, ct.threshold_json, gc.card_attributes, ct.attributes "
+                "ct.subtype, ct.threshold_json, gc.card_attributes, ct.attributes, "
+                "gc.card_attack_mod, gc.card_defense_mod, "
+                "COALESCE(gc.permanent_buffs,'{}') "
                 "FROM game_cards gc LEFT JOIN card_templates ct "
                 "ON ct.guid = gc.template_guid "
                 "WHERE gc.session_id=? AND gc.card_uid=?",
                 (self.session.session_id, key)).fetchone()
             if row:
+                base_atk = int(row[5] or 0)
+                base_def = int(row[6] or 0)
+                # Include the card's PERSISTENT stat layer — card_attack_mod /
+                # card_defense_mod and permanent_buffs survive a move to the
+                # graveyard, so a death-trigger's previous-state condition
+                # (e.g. "if this troop's defense >= N") sees the buffed value
+                # (HexTCG test_phase41_previous_state_death).  Transient
+                # temporary_buffs/temporary_attributes are zone-scoped and are
+                # cleared on death, so they are intentionally NOT folded in.
+                try:
+                    perm = json.loads(row[16] or "{}")
+                except (TypeError, ValueError):
+                    perm = {}
+                atk = (base_atk + int(row[14] or 0)
+                       + int(perm.get("atk", 0) or 0))
+                def_ = (base_def + int(row[15] or 0)
+                        + int(perm.get("def", 0) or 0))
                 self._cards[key] = {
                     # Keep the event card visible even if a legacy/fallback
                     # game-card row has no matching template.  Conditions
@@ -166,8 +185,8 @@ class ConditionContext:
                     # here made every typed trigger condition default True.
                     "card_uid": int(row[0]), "card_type": row[1] or "",
                     "location": row[2], "user_id": row[3],
-                    "state": int(row[4] or 0), "attack": row[5],
-                    "defense": row[6], "template_guid": row[7],
+                    "state": int(row[4] or 0), "attack": atk,
+                    "defense": def_, "template_guid": row[7],
                     "name": row[8] or "", "cost": row[9] or 0,
                     "subtype": row[10] or "",
                     "shards": shards_from_threshold(row[11]),
