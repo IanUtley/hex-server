@@ -1284,6 +1284,15 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         # trigger): every card this source voided returns to the warzone.
         return _return_voided_cards(game, session, db, handler, pl_t, ai_t,
                                     bstate, src_uid)
+    # The discriminating compiled name lives on the typed effect-template
+    # (m_DestinationCollection / effect name), which is only present in the
+    # extracted gamedata snapshot.  Fall back to the resolving ability's own
+    # authoritative game text — the single source of truth already used by
+    # other leaves — to recognize the "return each card it voided into play"
+    # contract without hard-coding a card or GUID.
+    if 'voided by it into play' in (_ability_text(db, bstate) or '').lower():
+        return _return_voided_cards(game, session, db, handler, pl_t, ai_t,
+                                    bstate, src_uid)
     if dest == "deck":
         if src_uid is None:
             return "move card: no source"
