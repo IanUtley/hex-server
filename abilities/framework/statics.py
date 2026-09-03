@@ -199,6 +199,39 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
                 return int(var.get("m_DefaultValue", 0) or 0)
             except Exception:
                 return 0
+        if t == "CardPropertyVariable":
+            # Reads a current stat off the ability's source card (e.g. the
+            # Outrider's SelfsDefenseValue -> CurrentDefenseValue drives
+            # "+[ATK] equal to this troop's [DEF]").  Base template stat plus
+            # the live mod/buff layers, matching the trigger/attribute view.
+            prop = str(var.get("m_Property") or "")
+            if source_uid is None:
+                return int(var.get("m_DefaultValue", 0) or 0)
+            row = db.execute(
+                "SELECT ct.attack, ct.defense, ct.cost, gc.card_attack_mod, "
+                "gc.card_defense_mod, gc.permanent_buffs, gc.temporary_buffs "
+                "FROM game_cards gc JOIN card_templates ct "
+                "ON ct.guid=gc.template_guid "
+                "WHERE gc.session_id=? AND gc.card_uid=?",
+                (session_id, int(source_uid))).fetchone()
+            if not row:
+                return int(var.get("m_DefaultValue", 0) or 0)
+            atk = int(row[0] or 0) + int(row[3] or 0)
+            defense = int(row[1] or 0) + int(row[4] or 0)
+            for raw_buffs in (row[5], row[6]):
+                try:
+                    buffs = json.loads(raw_buffs or "{}")
+                    atk += int(buffs.get("atk", 0) or 0)
+                    defense += int(buffs.get("def", 0) or 0)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if prop == "CurrentDefenseValue":
+                return defense
+            if prop == "CurrentAttackValue":
+                return atk
+            if prop == "CurrentCostValue":
+                return int(row[2] or 0)
+            return int(var.get("m_DefaultValue", 0) or 0)
         if t == "ExpressionAbilityVariable":
             flat = str(var.get("m_ExpressionText") or "").replace(" ", "")
             # Extracted expressions commonly add a fixed constant to a
