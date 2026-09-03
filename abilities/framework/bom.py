@@ -1223,6 +1223,45 @@ def _leaf_activate_triggered(game, session, db, handler, pl_t, ai_t, bstate,
             if result else f"activated {keyword}: no matching ability")
 
 
+def _move_source_card_to_deck(game, session, db, handler, pl_t, ai_t,
+                              bstate, src_uid, deck_owner):
+    """Move the resolving source card back into its owner's library at a
+    uniformly random index, publishing the CardMoved/CardUpdated events.
+
+    Shared tail of a MoveCardToZone whose destination is Deck (an escalation
+    spell returning to its library).  ``deck_owner`` is the user id whose deck
+    receives the card.
+    """
+    db.execute(
+        "UPDATE game_cards SET location='deck', position=0, card_state=? "
+        "WHERE session_id=? AND card_uid=?",
+        (state_after_zone_exit(0), session.session_id, int(src_uid)))
+    db.commit()
+    # Draws leave gaps in the persisted position values.  Choosing a
+    # random absolute position therefore biases a returned card toward
+    # the top of the deck.  Reinsert against the current ordered deck so
+    # every slot is equally likely and only this player's deck is used.
+    from db import db_randomly_insert_deck_cards
+    db_randomly_insert_deck_cards(
+        session.session_id, deck_owner, [int(src_uid)], connection=db)
+    pos_row = db.execute(
+        "SELECT position FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session.session_id, int(src_uid))).fetchone()
+    pos = int(pos_row[0]) if pos_row else 0
+    scid = game_engine.SessionCardId(game_engine.UID(int(src_uid)))
+    trow = db.execute(
+        "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session.session_id, int(src_uid))).fetchone()
+    tpl = trow[0] if trow else None
+    _tpl, ct, _n, cost, atk, def_, _g = handler._card_full_data(game, scid, tpl)
+    deck_player = owner_uid(deck_owner, pl_t, ai_t, bstate)
+    game.push_card_moved(scid, deck_player, game_engine.ECardCollections.Deck,
+                         game_engine.ECardLocations.Unknown, 0)
+    game.push_card_updated(scid, deck_player, game_engine.ECardCollections.Deck, ct,
+                           template_id=tpl, cost=cost, attack=atk,
+                           defense=def_, state=0, nulling=True)
+    return f"put {hex(src_uid)} into deck (pos {pos})"
+
 
 @leaf_register("MoveCardToZoneEffectTemplate")
 def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
@@ -1327,35 +1366,9 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                         "WHERE session_id=? AND card_uid=?",
                         (deck_owner, session.session_id, int(src_uid)))
                     db.commit()
-        db.execute(
-            "UPDATE game_cards SET location='deck', position=0, card_state=? "
-            "WHERE session_id=? AND card_uid=?",
-            (state_after_zone_exit(0), session.session_id, int(src_uid)))
-        db.commit()
-        # Draws leave gaps in the persisted position values.  Choosing a
-        # random absolute position therefore biases a returned card toward
-        # the top of the deck.  Reinsert against the current ordered deck so
-        # every slot is equally likely and only this player's deck is used.
-        from db import db_randomly_insert_deck_cards
-        db_randomly_insert_deck_cards(
-            session.session_id, deck_owner, [int(src_uid)], connection=db)
-        pos_row = db.execute(
-            "SELECT position FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
-        pos = int(pos_row[0]) if pos_row else 0
-        scid = game_engine.SessionCardId(game_engine.UID(int(src_uid)))
-        trow = db.execute(
-            "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
-        tpl = trow[0] if trow else None
-        _tpl, ct, _n, cost, atk, def_, _g = handler._card_full_data(game, scid, tpl)
-        deck_player = owner_uid(deck_owner, pl_t, ai_t, bstate)
-        game.push_card_moved(scid, deck_player, game_engine.ECardCollections.Deck,
-                             game_engine.ECardLocations.Unknown, 0)
-        game.push_card_updated(scid, deck_player, game_engine.ECardCollections.Deck, ct,
-                               template_id=tpl, cost=cost, attack=atk,
-                               defense=def_, state=0, nulling=True)
-        return f"put {hex(src_uid)} into deck (pos {pos})"
+        return _move_source_card_to_deck(
+            game, session, db, handler, pl_t, ai_t, bstate, int(src_uid),
+            deck_owner)
     # Other destinations: move the resolved target (or the source card).
     target = (forced_target if forced_target is not None
               else _resolve_leaf_target(bstate))
@@ -1378,6 +1391,21 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             return move_deck_card_to_hand(
                 game, session, db, handler, pl_t, ai_t,
                 int(target), int(row[0]), bstate)
+        # An Escalation spell's return-to-library is delivered as a
+        # self-target MoveCardToZone whose destination (Deck) again lives only
+        # in the extracted gamedata snapshot.  It resolves the resolving source
+        # card against its own current zone (hand / in play) and is recognized
+        # by the ability's authoritative Escalation text — never by card name.
+        elif (int(target) == int(src_uid)
+              and 'escalation' in (_ability_text(db, bstate) or '').lower()):
+            sr = db.execute(
+                "SELECT user_id FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (session.session_id, int(src_uid))).fetchone()
+            if sr is not None and sr[0] is not None:
+                return _move_source_card_to_deck(
+                    game, session, db, handler, pl_t, ai_t, bstate,
+                    int(src_uid), int(sr[0]))
     zone = {"hand": ("hand", game_engine.ECardCollections.Hand),
             "deck_target": ("deck", game_engine.ECardCollections.Deck),
             "warzone": ("warzone", game_engine.ECardCollections.Warzone),
