@@ -1316,10 +1316,27 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     # effects such as "put this into your deck").  A SourceRevealed target,
     # however, supplies each selected card explicitly and must use the normal
     # target-move path below (Oakhenge's remaining revealed cards).
-    resolved_target = _resolve_leaf_target(bstate)
-    if (dest == "deck" and resolved_target is not None
-            and src_uid is not None and int(resolved_target) != int(src_uid)):
-        dest = "deck_target"
+    # A "put this into your deck" self-move (Escalation verse etc.) must route
+    # the resolving SOURCE card to its owner's library even when an earlier
+    # leaf in the same spell already locked a card target into the activation
+    # map (Ragefire's "Deal ESC damage ... put this into your deck").  The
+    # typed effect's compiled name/game text carry the contract; fall back to
+    # the resolving ability's authoritative text when the snapshot is absent.
+    ab_text = (_ability_text(db, bstate) or '').lower()
+    if dest == "deck" and src_uid is not None:
+        eff_name = "".join((
+            str((effect_template(effect_guid) or {}).get("m_Name") or ""),
+            str((effect_template(effect_guid) or {}).get("m_GameText") or ""))).lower()
+        if ("putthisintoyourdeck" in eff_name.replace("_", "")
+                or "put this into your deck" in ab_text):
+            forced_target = int(src_uid)
+            resolved_target = None
+            dest = "deck"
+    if dest == "deck" and not forced_target:
+        resolved_target = _resolve_leaf_target(bstate)
+        if (resolved_target is not None and src_uid is not None
+                and int(resolved_target) != int(src_uid)):
+            dest = "deck_target"
     if (p.get("name") or "") == "PutEachCardVoidedByItIntoPlay":
         # "put each card voided by it into play" (Solitary Exile's leave
         # trigger): every card this source voided returns to the warzone.
