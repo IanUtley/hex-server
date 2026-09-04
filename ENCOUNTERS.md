@@ -82,4 +82,6 @@ the narrative conversation.
   logic. **TODO: implement server-side outcome tracking + EscrowAction rewards
   in `gameendnotify`.**
 
-  completing Cockatwice at Node009 awards one Effigy of Nulzann.
+  Each AZ1 Tamed encounter remains retryable after a win without a capture;
+  capturing the objective troop awards that captured card once and advances
+  the Tamed quest.

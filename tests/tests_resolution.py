@@ -10,6 +10,7 @@ recursion, auto "You" targets, and contingent effect instances.
 import json
 import os
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -50,6 +51,39 @@ def _insert_ability(db, ag, tids, effects):
              e.get("contingent", -1), e.get("secondary", -1), 1, 0,
              e.get("duration", "Instant"), "{}"))
     db.commit()
+
+
+def _fixture_effect_list(db, ability_guid):
+    """Build the resolver ABI for an intentionally synthetic test ability."""
+    rows = db.execute(
+        "SELECT effect_guid, effect_order, effect_type, param, "
+        "effect_group_id, condition_id, target_index, effect_instance_id, "
+        "contingent_effect_instance_id, secondary_target_index, "
+        "recalculate_targets, is_optional, effect_duration, output_variables "
+        "FROM ability_effects WHERE ability_guid=? ORDER BY effect_order",
+        (ability_guid,)).fetchall()
+    return [{
+        "effect_guid": row[0], "effect_order": row[1],
+        "effect_type": row[2] or "", "param": row[3] or "",
+        "effect_group_id": int(row[4] or 0), "condition_id": row[5] or "",
+        "target_index": int(row[6] if row[6] is not None else -1),
+        "effect_instance_id": int(row[7] if row[7] is not None else -1),
+        "contingent_effect_instance_id": int(
+            row[8] if row[8] is not None else -1),
+        "secondary_target_index": int(row[9] if row[9] is not None else -1),
+        "recalculate_targets": int(row[10] if row[10] is not None else -1),
+        "is_optional": int(row[11] or 0),
+        "effect_duration": row[12] or "Instant",
+        "output_variables": row[13] or "{}",
+    } for row in rows]
+
+
+def _fixture_target_template_ids(db, ability_guid):
+    row = db.execute(
+        "SELECT target_template_ids FROM card_abilities_meta "
+        "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
+    return [str(value).lower() for value in (
+        json.loads(row[0] or "[]") if row and row[0] else []) if value]
 
 
 def _condition(db, cid, lhs, rhs):
@@ -346,7 +380,7 @@ def test_empty_sacrifice_target_does_not_sacrifice_source(db):
 
 def test_ai_sacrifice_target_excludes_source(db):
     """AI deploy targeting chooses another troop, or no target if absent."""
-    from abilities.framework.triggers import _ai_trigger_target
+    from abilities.framework import triggers
 
     ability = _ag("ai-sacrifice-target")
     target = _ag("ai-optional-troop")
@@ -361,9 +395,16 @@ def test_ai_sacrifice_target_excludes_source(db):
     }])
     add_card(db, 210, 0, TPL_GLADIATOR, loc="warzone")
     session = SessionStub()
-    assert _ai_trigger_target(db, session, ability, 210, 0, {}, []) is None
+    graph = SimpleNamespace(targets=(SimpleNamespace(guid=target),))
+    with mock.patch.object(triggers, "ability_graph",
+                           lambda _store, _guid: graph):
+        assert triggers._ai_trigger_target(
+            db, session, ability, 210, 0, {}, []) is None
     add_card(db, 211, 0, TPL_GLADIATOR, loc="warzone")
-    assert _ai_trigger_target(db, session, ability, 210, 0, {}, []) == 211
+    with mock.patch.object(triggers, "ability_graph",
+                           lambda _store, _guid: graph):
+        assert triggers._ai_trigger_target(
+            db, session, ability, 210, 0, {}, []) == 211
 
 
 def test_double_choice_creates_random_choices_and_clears_before_second(db):
@@ -537,6 +578,8 @@ def test_choice_ability_transforms_real_parent(db):
 
 
 def main():
+    from abilities.framework import resolution
+
     tests = [
         ("Random variable + conditions + recursion",
          test_random_variable_conditions_and_recursion),
@@ -565,7 +608,14 @@ def main():
     for name, fn in tests:
         db = make_db()
         try:
-            fn(db)
+            # These tests intentionally use tiny SQLite-only abilities. Keep
+            # their source adapter in the test module so production resolution
+            # has exactly one supported Records path.
+            with mock.patch.object(resolution, "_effect_list",
+                                   _fixture_effect_list), \
+                    mock.patch.object(resolution, "_target_template_ids",
+                                      _fixture_target_template_ids):
+                fn(db)
             print(f"PASS {name}")
         except Exception as e:
             failed += 1

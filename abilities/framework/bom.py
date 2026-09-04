@@ -21,48 +21,25 @@ from .effects.counters import card_counters
 from .effects import combat as _combat  # register combat effects
 from .effects import choices as _choices  # register card-choice effects
 from .effects import utility as _utility  # register generic client effects
+from gamedata import RecordStore, ability_graph, runtime_effects
+
 from .fields import (ability_record, effect_field, effect_template,
-                     effect_template_value, modifier_metadata)
+                     effect_template_value, modifier_metadata,
+                     counter_template_name)
+
+
+_RECORD_STORE = RecordStore()
 
 
 def _walk_bom(db, ability_guid):
-    """Return ordered BOM rows (dicts) for an ability from ability_effects."""
-    rows = db.execute(
-        "SELECT effect_guid, effect_type, param FROM ability_effects "
-        "WHERE ability_guid=? ORDER BY effect_order",
-        (ability_guid,)).fetchall()
-    if not rows:
-        # A granted sub-ability can be absent from the compact normalized seed
-        # when it is only reachable through GrantAbility.  Recover its BOM
-        # from the extracted AbilityTemplate and typed effect templates.
-        from .fields import ability_record, effect_template
-        record = ability_record(db, ability_guid)
-        for entry in record.get("m_AbilityEffectList") or []:
-            if not isinstance(entry, dict):
-                continue
-            effect = entry.get("m_EffectTemplateId") or {}
-            effect_guid = str(effect.get("m_Guid") or "").lower()
-            template = effect_template(effect_guid) or {}
-            effect_type = str(template.get("_t") or "").rsplit(".", 1)[-1]
-            param = ""
-            if effect_type == "ActivateAbilityEffectTemplate":
-                param = str((template.get("m_AbilityToInvoke") or {}).get(
-                    "m_Guid") or "").lower()
-            elif effect_type == "GrantAbilityEffectTemplate":
-                param = str((template.get("m_GrantedAbilityTemplateId") or {}).get(
-                    "m_Guid") or "").lower()
-            elif effect_type == "CardModifierAbilityEffectTemplate":
-                modifier = template.get("m_Modifier") or {}
-                kind = str(modifier.get("_t") or "").rsplit(".", 1)[-1]
-                prop = {"DamageModifier": "damage",
-                        "AttackModifier": "attack",
-                        "DefenseModifier": "defense"}.get(kind, "")
-                param = json.dumps({"property": prop,
-                                    "amount": 0,
-                                    "duration": entry.get("m_EffectDuration",
-                                                             "Instant")})
-            rows.append((effect_guid, effect_type, param))
-    return [{"effect_guid": r[0], "effect_type": r[1] or "", "param": r[2] or ""} for r in rows]
+    """Return ordered BOM rows from the current typed Records graph."""
+    if not ability_guid:
+        return []
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        raise RuntimeError(
+            f"ability {str(ability_guid).lower()} is missing from current Records")
+    return list(runtime_effects(graph))
 
 
 def _deck_owner_for_target(db, handler, session, bstate, target):
@@ -119,8 +96,8 @@ def _leaf_draw(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, para
         except Exception:
             pass
     if count is None:
-        # Compatibility for databases built before typed effect records were
-        # loaded.  This is deliberately the last fallback.
+        # Synthetic leaves may provide their own compact count in the test
+        # adapter; production Records always provide the typed field.
         count = 1
         text = _ability_text(db, bstate) or ""
         m = _re.search(r'draw[s]?\s+(\w+)\s+card', text.lower())
@@ -350,16 +327,12 @@ def _opposing_champion_uid(handler, bstate, db, session):
             target_filter = {}
         # MultiplePlayers alone is not enough: it can describe a target pool
         # containing troops and champions.  The typed filter must identify a
-        # champion and exclude the source controller.  The localized phrase
-        # remains only for pre-metadata rows.
+        # champion and exclude the source controller.
         opposing_champion = (
             _has_filter(target_filter, "IsHero") and
             (_has_filter(target_filter, "IsNotControlledBy") or
              str(trow[1] or "").lower() in ("opponent", "opposing")))
-        legacy_opposing = (not trow[2] and
-                           "each opposing champion" in
-                           (trow[0] or "").lower())
-        if opposing_champion or legacy_opposing:
+        if opposing_champion:
             owner = (bstate or {}).get("resolving_owner_id", 0)
             if (bstate or {}).get("pvp"):
                 opponent_pid = pvp_opponent_pid(bstate, owner)
@@ -387,13 +360,8 @@ def _apply_resource_property(game, session, db, handler, pl_t, ai_t, bstate,
     # extracted parent param quite correctly has amount=0.  Resolve that
     # operand from the ability metadata instead of treating zero as a no-op.
     if amount == 0:
-        raw_row = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            ((bstate or {}).get("resolving_ability", ""),)).fetchone()
-        raw = raw_row[0] if raw_row else ""
-        if not raw:
-            raw = json.dumps(ability_record(
-                db, (bstate or {}).get("resolving_ability", "")))
+        raw = json.dumps(ability_record(
+            db, (bstate or {}).get("resolving_ability", "")))
         from .statics import _leaf_numeric_value
         amount = int(_leaf_numeric_value(
             db, session.session_id, bstate, pm, raw,
@@ -504,9 +472,9 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
     pm = _parse_leaf_param(param)
     typed_modifier = modifier_metadata(effect_guid)
     if typed_modifier:
-        # Parent params from older extractions remain useful for duration and
-        # target wiring, while the child effect template is authoritative for
-        # the operation and modifier-specific fields.
+        # The generated adapter payload carries duration and target wiring;
+        # the child effect template is authoritative for the operation and
+        # modifier-specific fields.
         pm = dict(pm or {})
         if typed_modifier.get("property"):
             pm.setdefault("property", typed_modifier["property"])
@@ -535,13 +503,8 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
         # Resolve numeric values from the ability's serialized variables.  In
         # particular, CounterVariable and TriggerTargetPropertyVariable are
         # not literal values even when the effect row carries amount=0 or 1.
-        raw_row = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            ((bstate or {}).get("resolving_ability", ""),)).fetchone()
-        raw = raw_row[0] if raw_row else ""
-        if not raw:
-            raw = json.dumps(ability_record(
-                db, (bstate or {}).get("resolving_ability", "")))
+        raw = json.dumps(ability_record(
+            db, (bstate or {}).get("resolving_ability", "")))
         src_uid = (bstate or {}).get("resolving_source_uid")
         src_owner = (bstate or {}).get("resolving_owner_id", 0)
 
@@ -675,6 +638,11 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
             if not cost_target:
                 return "cardcost: no target"
             delta = int(pm.get("amount") or 0)
+            if delta == 0 and typed_modifier:
+                # CardCostModifier's current Records form carries the
+                # literal in its typed EffectInputVariable (M1/P2/etc.), not
+                # in the deprecated m_Amount field.
+                delta = int(_numeric("cardcost") or 0)
             if delta == 0:
                 # Dynamic cost reduction (e.g. Pterobot "cost -1 for each Dwarf
                 # and/or Robot you control"): the leaf amount is 0, the real
@@ -915,6 +883,7 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                     # databases; use the compatibility text only when that
                     # optional lookup table is absent.
                     cname = ""
+                cname = cname or counter_template_name(counter_guid)
             cname = cname or counter_name_from_text(pm.get("text")) or "counter"
             amount = int(pm.get("amount") or 0)
             low_text = (pm.get("text") or "").lower()
@@ -1838,54 +1807,27 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
     reveal_collection = game_engine.ECardCollections.Deck
     ability_guid = (bstate or {}).get("resolving_ability", "")
     effect_target_index = 0
+    # ``param`` is the compact adapter payload used by synthetic interpreter
+    # fixtures; live Records reveal effects derive these values from the typed
+    # target template below.
     try:
-        erow = db.execute(
-            "SELECT target_index FROM ability_effects "
-            "WHERE ability_guid=? AND effect_guid=?",
-            (ability_guid, effect_guid)).fetchone()
-    except Exception:
-        # Minimal focused leaf fixtures predate the normalized BOM table.
-        # Preserve their text-based count fallback while production uses the
-        # extracted target metadata above.
-        erow = None
-    if erow and erow[0] is not None:
-        effect_target_index = int(erow[0])
-    elif ability_guid:
-        # Transitive card abilities such as Jank Bot are intentionally not
-        # all materialized in the compact ability_effects table. Recover the
-        # effect's target index from the authoritative AbilityTemplate so the
-        # reveal still follows the typed target contract.
-        record = ability_record(db, ability_guid)
-        for entry in record.get("m_AbilityEffectList") or []:
-            if not isinstance(entry, dict):
-                continue
-            guid = str((entry.get("m_EffectTemplateId") or {}).get(
-                "m_Guid") or "").lower()
-            if guid == str(effect_guid or "").lower():
-                value = entry.get("m_TargetTemplateIndex")
-                if value is not None:
-                    effect_target_index = int(value)
-                break
-    target_ids = []
-    if ability_guid:
-        try:
-            target_row = db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        except Exception:
-            target_row = None
-        if target_row and target_row[0]:
-            try:
-                target_ids = [str(value).lower() for value in
-                              (json.loads(target_row[0]) or []) if value]
-            except (TypeError, ValueError, json.JSONDecodeError):
-                target_ids = []
-        if not target_ids:
-            record = ability_record(db, ability_guid)
-            target_ids = [str(item.get("m_Guid") or "").lower()
-                          for item in (record.get(
-                              "m_AbilityTargetTemplateIds") or [])
-                          if isinstance(item, dict) and item.get("m_Guid")]
+        adapter = json.loads(param) if isinstance(param, str) and param else {}
+        if isinstance(adapter, dict):
+            count = max(0, int(adapter.get("count", count) or count))
+            target_template_id = str(
+                adapter.get("target_template_id") or "").lower()
+            target_kind = str(adapter.get("target_kind") or "")
+            random_target = bool(adapter.get("random_target", random_target))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        return "reveal: ability is missing from current Records"
+    target_ids = [target.guid for target in graph.targets]
+    for effect in graph.effects:
+        if effect.guid == str(effect_guid or "").lower():
+            effect_target_index = effect.target_index
+            break
     if 0 <= effect_target_index < len(target_ids):
         target_template_id = target_ids[effect_target_index]
     target_meta = None
@@ -1895,67 +1837,41 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
         if target_meta:
             target_kind = target_meta.get("target_kind") or ""
             random_target = bool(target_meta.get("is_random_target"))
-    if not erow:
-        import re as _re
-        text = (_ability_text(db, bstate) or "").lower()
-        words = {"one": 1, "two": 2, "three": 3, "four": 4,
-                 "five": 5, "six": 6, "seven": 7, "eight": 8,
-                 "nine": 9, "ten": 10}
-        match = _re.search(
-            r"(?:look at|reveal)\s+(one|two|three|four|five|six|seven|"
-            r"eight|nine|ten|\d+)\s+.*?card", text)
-        if match:
-            count = (int(match.group(1)) if match.group(1).isdigit()
-                     else words.get(match.group(1), 1))
-    if erow:
-        trow = db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        try:
-            tids = json.loads(trow[0]) if trow and trow[0] else target_ids
-            tid = tids[effect_target_index] if 0 <= effect_target_index < len(tids) else None
-            frow = db.execute(
-                "SELECT filter_json, target_kind, is_random_target FROM target_templates "
-                "WHERE template_id=?",
-                (str(tid),)).fetchone() if tid else None
-            filt = json.loads(frow[0]) if frow and frow[0] else {}
-            target_kind = (frow[1] or "") if frow else ""
-            random_target = bool(frow[2]) if frow else random_target
-            top = next((f for f in filt.get("m_TargetFilters", [])
-                        if str(f.get("_t", "")).split(".")[-1]
-                        == "TopNOfDeck"), None)
-            if top:
-                count = max(0, int(top.get("m_Amount", 1) or 1))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+    if 0 <= effect_target_index < len(target_ids):
+        tid = target_ids[effect_target_index]
+        frow = db.execute(
+            "SELECT filter_json, target_kind, is_random_target FROM target_templates "
+            "WHERE template_id=?", (str(tid),)).fetchone()
+        filt = json.loads(frow[0]) if frow and frow[0] else {}
+        target_kind = (frow[1] or "") if frow else ""
+        random_target = bool(frow[2]) if frow else random_target
+        top = next((f for f in filt.get("m_TargetFilters", [])
+                    if str(f.get("_t", "")).split(".")[-1]
+                    == "TopNOfDeck"), None)
+        if top:
+            count = max(0, int(top.get("m_Amount", 1) or 1))
     owner = int((bstate or {}).get("resolving_owner_id", 0))
     # The reveal effect's target template specifies the source zone.  Do not
     # assume Deck: Shadowgrove Witch's child ability targets a random card in
     # the opposing champion's Hand, while other reveal effects target Deck.
     reveal_zone = "deck"
-    try:
-        trow = db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        tids = json.loads(trow[0]) if trow and trow[0] else target_ids
-        tid = tids[effect_target_index] if 0 <= effect_target_index < len(tids) else None
-        frow = db.execute(
-            "SELECT filter_json FROM target_templates WHERE template_id=?",
-            (str(tid),)).fetchone() if tid else None
-        filt = json.loads(frow[0]) if frow and frow[0] else {}
-        stack = [filt]
-        while stack:
-            node = stack.pop()
-            if isinstance(node, dict):
-                typ = str(node.get("_t", "")).rsplit(".", 1)[-1]
-                if typ == "InZone" and node.get("m_Collection"):
-                    reveal_zone = str(node["m_Collection"]).lower()
-                    break
-                stack.extend(node.values())
-            elif isinstance(node, list):
-                stack.extend(node)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
+    tid = (target_ids[effect_target_index]
+           if 0 <= effect_target_index < len(target_ids) else None)
+    frow = db.execute(
+        "SELECT filter_json FROM target_templates WHERE template_id=?",
+        (str(tid),)).fetchone() if tid else None
+    filt = json.loads(frow[0]) if frow and frow[0] else {}
+    stack = [filt]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            typ = str(node.get("_t", "")).rsplit(".", 1)[-1]
+            if typ == "InZone" and node.get("m_Collection"):
+                reveal_zone = str(node["m_Collection"]).lower()
+                break
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
     # The reveal event must carry the same collection as the metadata-selected
     # source zone.  Leaving the default Deck collection makes a hand reveal
     # render in the client's deck coverflow even when the correct hand card
@@ -2500,14 +2416,13 @@ def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
     if not isinstance(filter_json, dict):
         return "transform random: no typed filter"
     source_uid = (bstate or {}).get("resolving_source_uid")
-    source_row = db.execute(
+    target_row = db.execute(
         "SELECT gc.template_guid, gc.card_type, gc.location, gc.user_id, "
         "gc.card_state, gc.permanent_buffs, ct.name, ct.cost, ct.rarity, "
         "ct.threshold_json, ct.subtype, ct.attributes, gc.card_attributes "
         "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
         "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session.session_id, int(source_uid))).fetchone() \
-        if source_uid is not None else None
+        (session.session_id, int(target))).fetchone()
 
     def card_record(row, uid):
         data = {
@@ -2528,7 +2443,39 @@ def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
         data["counter_guids"] = saved.get("counter_guids") or {}
         return data
 
-    source_card = card_record(source_row, source_uid) if source_row else None
+    # HasSourceCastingCostFilter is evaluated by the client with the card
+    # currently being transformed as its sourceCard (TransformCardAtRandom's
+    # Apply(targetCard, ...)), not with the card whose ability initiated the
+    # transform.  Using the activated Cosmic Transmogrifier here made every
+    # target look like a cost-5 card.
+    source_card = card_record(target_row, target) if target_row else None
+    target_types = {
+        part.strip() for part in (source_card.get("card_type", "") if
+                                  source_card else "").split("|")
+        if part.strip()
+    }
+    # This authored filter is a category union (Artifact | Constant | Troop)
+    # plus the source-cost comparison.  The card's category selects the
+    # corresponding branch for each target: a troop remains a troop, a
+    # constant remains a constant, and an artifact remains an artifact.
+    type_union = None
+    if str(filter_json.get("_t", "")).rsplit(".", 1)[-1] == "AndCardFilter":
+        for child in filter_json.get("m_TargetFilters", []):
+            if str(child.get("_t", "")).rsplit(".", 1)[-1] != "OrCardFilter":
+                continue
+            categories = set()
+            for branch in child.get("m_TargetFilters", []):
+                branch_type = str(branch.get("_t", "")).rsplit(".", 1)[-1]
+                if branch_type == "IsArtifact":
+                    categories.add("Artifact")
+                elif branch_type == "IsTroop":
+                    categories.add("Troop")
+                elif (branch_type == "IsType" and
+                      str(branch.get("m_CardType") or "") == "Constant"):
+                    categories.add("Constant")
+            if categories == {"Artifact", "Constant", "Troop"}:
+                type_union = categories
+                break
     if source_card:
         ability_guid = (bstate or {}).get("resolving_ability", "")
         try:
@@ -2553,9 +2500,18 @@ def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
             if variable:
                 source_card["cost_delta"] = int(
                     source_card["ability_variables"].get(variable, 0))
-    rows = db.execute(
-        "SELECT guid, name, card_type, cost, rarity, threshold_json, subtype, "
-        "attributes FROM card_templates WHERE is_pve=0").fetchall()
+    try:
+        rows = db.execute(
+            "SELECT guid, name, card_type, cost, rarity, threshold_json, "
+            "subtype, attributes FROM card_templates WHERE is_pve=0").fetchall()
+    except Exception:
+        # Focused test adapters from before the PvP/PvE eligibility column
+        # was materialized have no is_pve field.  Production always uses the
+        # filtered query above; the fallback keeps the leaf testable without
+        # changing its candidate semantics.
+        rows = db.execute(
+            "SELECT guid, name, card_type, cost, rarity, threshold_json, "
+            "subtype, attributes FROM card_templates").fetchall()
     candidates = []
     cant_same = bool(typed.get("m_CantBeSameCard"))
     for row in rows:
@@ -2569,7 +2525,11 @@ def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
             if source_card else 0,
         }
         if cant_same and source_card and row[0].lower() == \
-                source_row[0].lower():
+                source_card["template_guid"].lower():
+            continue
+        if type_union and target_types and not target_types.intersection(
+                {part.strip() for part in (candidate["card_type"] or "").split("|")
+                 if part.strip()}):
             continue
         if evaluate_card_filter(candidate, filter_json, source_uid,
                                 source_card=source_card):
@@ -3290,6 +3250,13 @@ def bom_leaf_prompt_data(db, ability_guid, leaf_type):
     used by follow-up client prompts (such as choose-and-discard) so protocol
     code does not need to know the GUID of a shared child ability.
     """
+    from gamedata import RecordStore, ability_graph
+    from gamedata.records import reference_guid
+
+    store = getattr(bom_leaf_prompt_data, "_record_store", None)
+    if store is None:
+        store = RecordStore()
+        bom_leaf_prompt_data._record_store = store
     seen = set()
 
     def walk(guid):
@@ -3297,29 +3264,20 @@ def bom_leaf_prompt_data(db, ability_guid, leaf_type):
         if not guid or guid in seen:
             return None
         seen.add(guid)
-        rows = db.execute(
-            "SELECT effect_type, param, target_index FROM ability_effects "
-            "WHERE ability_guid=? ORDER BY effect_order", (guid,)).fetchall()
-        for effect_type, param, target_index in rows:
-            if effect_type == leaf_type:
-                row = db.execute(
-                    "SELECT target_template_ids FROM card_abilities_meta "
-                    "WHERE ability_guid=? LIMIT 1", (guid,)).fetchone()
-                try:
-                    targets = json.loads(row[0] or "[]") if row else []
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    targets = []
-                try:
-                    index = int(target_index)
-                except (TypeError, ValueError):
-                    index = 0
-                if 0 <= index < len(targets):
-                    return guid, str(targets[index])
-                if targets:
-                    return guid, str(targets[0])
-                return guid, None
-            if effect_type == "ActivateAbilityEffectTemplate" and param:
-                found = walk(param)
+        graph = ability_graph(store, guid)
+        if graph is None:
+            return None
+        for effect in graph.effects:
+            if effect.concrete_type == leaf_type:
+                index = int(effect.target_index)
+                target = (graph.targets[index]
+                          if 0 <= index < len(graph.targets) else None)
+                return guid, target.guid if target is not None else None
+            if effect.concrete_type == "ActivateAbilityEffectTemplate":
+                child = reference_guid(
+                    effect.template.field("m_AbilityToInvoke")
+                    if effect.template is not None else None)
+                found = walk(child)
                 if found:
                     return found
         return None

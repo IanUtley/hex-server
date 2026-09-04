@@ -1,9 +1,12 @@
 """Regression tests for metadata-driven BOM leaves and zone operations."""
 
 import os
+import json
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -209,8 +212,14 @@ def test_reveal(db):
         "INSERT INTO card_abilities_meta VALUES ('test-ability',0,'','look at two "
         "random cards from your deck.','{}',0,0,0,0,0,'[]')")
     db.commit()
-    _LEAFS["RevealCardsAbilityEffectTemplate"](
-        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
+    graph = SimpleNamespace(
+        targets=(), effects=())
+    from abilities.framework import bom
+    with mock.patch.object(bom, "ability_graph",
+                           lambda _store, _guid: graph):
+        _LEAFS["RevealCardsAbilityEffectTemplate"](
+            game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate,
+            "e", json.dumps({"count": 2}))
     revealed = bstate.get("revealed_cards") or []
     assert len(revealed) == 2, revealed
     assert any(isinstance(ev, game_engine.CardsRevealedSessionEventArgs)

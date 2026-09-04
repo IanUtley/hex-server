@@ -122,6 +122,48 @@ from db import (player_id_from_name, player_id_from_steam, display_name_from_ide
                 STARDUST_TEMPLATES, CHEST_TEMPLATE)
 from static import CRAYBURN_PACK_CARD_SEEDS
 
+
+def _records_ability_graph(handler, ability_guid):
+    """Resolve an ability through the current Records snapshot.
+
+    A few focused tests use small handler doubles rather than a fully
+    initialized HCPHandler.  They may provide the bound helper themselves;
+    production handlers use their cached PlayPlan RecordStore.
+    """
+    resolver = getattr(handler, "_current_ability_graph", None)
+    if callable(resolver):
+        return resolver(ability_guid)
+    from gamedata import RecordStore, ability_graph
+    store = getattr(handler, "_play_plan_store", None)
+    if store is None:
+        store = RecordStore()
+        try:
+            handler._play_plan_store = store
+        except AttributeError:
+            pass
+    return ability_graph(store, str(ability_guid).lower())
+
+
+def _records_target_spec(handler, target_guid):
+    resolver = getattr(handler, "_current_target_spec", None)
+    if callable(resolver):
+        return resolver(target_guid)
+    from gamedata import RecordStore
+    store = getattr(handler, "_play_plan_store", None) or RecordStore()
+    target = store.get("AbilityTargetTemplate", str(target_guid).lower())
+    return target.target_spec if target is not None else None
+
+
+def _records_ability_cost_templates(handler, ability_guid):
+    resolver = getattr(handler, "_ability_cost_templates", None)
+    if callable(resolver):
+        return resolver(ability_guid)
+    from gamedata import CardPlayCost
+    graph = _records_ability_graph(handler, ability_guid)
+    return ([(guid, CardPlayCost.cost_type(kind))
+             for kind, guid in graph.additional_cost_targets]
+            if graph is not None else [])
+
 import domain.constants as _dc
 _dc.event_logger = _record_session_events
 # Game imported ``event_logger`` by value, so updating domain.constants alone
@@ -903,7 +945,7 @@ class HCPHandler:
                     reqs.add("any")
         return reqs
 
-    def _card_target_requirements_met(self, session, ability_guids):
+    def _card_target_requirements_met(self, session, play_plan):
         """A hand card is only playable when every EXPLICIT target template of
         its non-manual abilities has at least one legal candidate.  This is
         what makes Countermagic ("Interrupt target card" — CollectionFlags
@@ -911,54 +953,72 @@ class HCPHandler:
         targets are cards in CastSpells, so with an empty chain the card is
         not offered.  Auto targets and player-champion targets never gate.
         """
-        from db import db_ability_meta_targets
-        from abilities.framework.targeting import legal_targets, ZONE_MAP
-        for ag in (ability_guids or []):
-            meta = db_ability_meta_targets(ag)
-            if not meta or not meta[0]:
+        for ability in play_plan.abilities:
+            graph = ability.graph
+            if graph is None or graph.manual or ability.is_triggered:
                 continue
-            if meta[4]:  # is_manual — a warzone activation, not a play cost
-                continue
-            try:
-                tpl_ids = json.loads(meta[0])
-            except Exception:
-                continue
-            for tid in tpl_ids:
-                trow = _db.execute(
-                    "SELECT filter_json, target_kind, is_auto_target, "
-                    "collection_flags, min_target_count FROM target_templates "
-                    "WHERE template_id=?", (tid,)).fetchone()
-                if not trow:
+            for index in ability.referenced_target_indexes:
+                if index >= len(graph.targets):
                     continue
-                kind = trow[1] or ""
-                auto = int(trow[2] or 0)
-                flags = trow[3] or ""
-                minc = int(trow[4] or 1)
-                if auto or minc < 1:
+                target = graph.targets[index]
+                if not target.requires_input or target.minimum < 1:
                     continue
-                if kind == "PlayerTargetTemplate":
-                    continue  # the controller's champion always exists
-                if not flags or flags.strip().lower() in ("none", ""):
-                    continue
-                zones = [ZONE_MAP.get(z, z.lower())
-                         for z in flags.split("|") if z]
-                if not zones:
-                    continue
-                try:
-                    candidates = legal_targets(
-                        _db, session.session_id, self.user_profile["id"],
-                        str(tid), 0, both_players=True,
-                        champions=self._champion_targets())
-                except Exception:
-                    continue
+                candidates = self._valid_targets_for_template(
+                    session, None, None, target.guid)
                 if not candidates:
-                    log_req(f"    Playability: {str(tid)[:8]} zone "
-                            f"{flags} has no legal target — card not playable")
+                    log_req(f"    Playability: {target.guid[:8]} has no legal target")
                     return False
         return True
 
     def _warzone_troop_count(self, session, user_id):
         return db_warzone_troop_count(session.session_id, user_id)
+
+    def _card_play_plan(self, template_guid, card_uid=0, owner_id=None):
+        """Return the current Records-backed plan for a card template.
+
+        The current Records snapshot is the only supported card-data source.
+        A missing record is invalid card data, not a request to use the old
+        database-materialized rules path.
+        """
+        if not template_guid:
+            return None
+        store = getattr(self, "_play_plan_store", None)
+        if store is None:
+            from gamedata import RecordStore
+            store = RecordStore()
+            self._play_plan_store = store
+        cache = getattr(self, "_play_plan_cache", None)
+        if cache is None:
+            cache = {}
+            self._play_plan_cache = cache
+        key = str(template_guid).lower()
+        if key not in cache:
+            from gamedata import PlayPlan
+            try:
+                cache[key] = PlayPlan.from_card(
+                    store, key, source_uid=card_uid,
+                    owner_id=(owner_id if owner_id is not None else
+                              (self.user_profile["id"]
+                               if self.user_profile else 0)))
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"card template {key} is missing from the current Records "
+                    "snapshot") from exc
+        return cache[key]
+
+    def _plan_target_bounds(self, template_guid):
+        """Read min/max directly from the current target record."""
+        store = getattr(self, "_play_plan_store", None)
+        if store is None:
+            return 1, 1
+        target = store.get("AbilityTargetTemplate", template_guid)
+        if target is None:
+            return 1, 1
+        minimum = max(0, int(target.minimum))
+        maximum = int(target.maximum)
+        if maximum <= 0:
+            maximum = max(1, minimum)
+        return minimum, maximum
 
     def _valid_targets_for_template(self, session, pl_t, ai_t, tid):
         """Compute the valid SessionCardId targets for an AbilityTargetTemplate,
@@ -966,22 +1026,24 @@ class HCPHandler:
         come from the filter's IsHero, troops from the filter, and
         PlayerTargetTemplate ('You') resolves to the controller's champion."""
         from abilities.framework.targeting import legal_targets
-        trow = _db.execute(
-            "SELECT filter_json, target_kind, is_auto_target FROM target_templates "
-            "WHERE template_id=?", (tid,)).fetchone()
-        if not trow:
+        store = getattr(self, "_play_plan_store", None)
+        if store is None:
+            from gamedata import RecordStore
+            store = RecordStore()
+            self._play_plan_store = store
+        target = store.get("AbilityTargetTemplate", str(tid).lower())
+        if target is None:
             return None
-        kind = trow[1] or ""
-        auto = int(trow[2] or 0)
-        fj = trow[0] or "{}"
-        if auto:
+        spec = target.target_spec
+        kind = spec.target_kind
+        if spec.is_auto:
             # Auto targets (e.g. a shard's 'You') resolve automatically server-
             # side — never attach a hand-play target picker for them.
             return None
         if kind == "PlayerTargetTemplate":
             champ = getattr(self, "_player_champ_scid", None)
             return [champ] if champ else []
-        if not fj or fj.strip() == "{}":
+        if not spec.card_filter:
             return None
         candidates = legal_targets(
             _db, session.session_id, self.user_profile["id"], tid, 0,
@@ -989,23 +1051,25 @@ class HCPHandler:
         return [game_engine.SessionCardId(game_engine.UID(int(u)))
                 for u in candidates]
 
-    def _play_ability_targets(self, session, pl_t, ai_t, ability_guids):
+    def _play_ability_targets(self, session, play_plan):
         """For a hand card's abilities return [(ability_guid, index, template_id,
         [SessionCardId])] for each targeting template with computable targets."""
-        from db import db_ability_meta_targets
         result = []
-        for ag in (ability_guids or []):
-            meta = db_ability_meta_targets(ag)
-            if not meta or not meta[0]:
+        for ability in play_plan.abilities:
+            graph = ability.graph
+            if graph is None or graph.manual or ability.is_triggered:
                 continue
-            try:
-                tpl_ids = json.loads(meta[0])
-            except Exception:
-                continue
-            for i, tid in enumerate(tpl_ids):
-                targets = self._valid_targets_for_template(session, pl_t, ai_t, str(tid))
+            for index in ability.referenced_target_indexes:
+                if index >= len(graph.targets):
+                    continue
+                target = graph.targets[index]
+                if not target.requires_input:
+                    continue
+                targets = self._valid_targets_for_template(
+                    session, None, None, target.guid)
                 if targets is not None and targets:
-                    result.append((str(ag), i, str(tid), targets))
+                    result.append((ability.ability_guid, index, target.guid,
+                                   targets))
         return result
 
     def _add_play_target_options(self, game, session, pl_t, ai_t):
@@ -1017,7 +1081,6 @@ class HCPHandler:
         OptionInstance + TargetInstance in PlayerOptions.m_Targets. Without this,
         a targeted spell (e.g. Bravery "+1/+1 target troop") is played with no
         target and no effect."""
-        from db import db_get_card_abilities, db_card_template_field, db_target_template_text
         if not game.events:
             return
         last_ev = game.events[-1]
@@ -1030,25 +1093,26 @@ class HCPHandler:
                 (session.session_id, card_uid)).fetchone()
             if not row:
                 continue
-            ab_json, _attrs = db_get_card_abilities(row[0])
-            ab = []
-            if ab_json:
-                try:
-                    ab = [g.lower() for g in json.loads(ab_json)]
-                except Exception:
-                    pass
-            for ag, idx, tid, targets in self._play_ability_targets(session, pl_t, ai_t, ab):
+            play_plan = self._card_play_plan(row[0], card_uid,
+                                             self.user_profile["id"]
+                                             if self.user_profile else 0)
+            for ag, idx, tid, targets in self._play_ability_targets(
+                    session, play_plan):
                 # Troop abilities are NOT playable from hand.  Only the
                 # card itself may be played (cost/threshold gate).
                 # Manual abilities activate from the warzone, not hand.
-                from db import db_ability_meta_targets
-                meta = db_ability_meta_targets(ag)
-                if meta and meta[4]:  # is_manual
-                    continue
+                min_count, max_count = 1, 1
+                for ability in play_plan.abilities:
+                    if ability.ability_guid != ag or idx >= len(ability.targets):
+                        continue
+                    target = ability.targets[idx]
+                    min_count = max(0, target.minimum)
+                    max_count = max(min_count, target.maximum or min_count or 1)
+                    break
                 inst = game._make_event(game_engine.OptionInstanceSessionEventArgs)
                 inst.opt_id = game_engine.ResourceId.from_str(ag)
-                inst.min_target_counts.append(1)
-                inst.max_target_counts.append(1)
+                inst.min_target_counts.append(min_count)
+                inst.max_target_counts.append(max_count)
                 inst.target_ids.append(game_engine.ResourceId.from_str(tid))
                 tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
                 tgt.target_index = idx
@@ -1063,8 +1127,8 @@ class HCPHandler:
                 for inst2 in opt.instances:
                     if str(inst2.opt_id.guid) == game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID:
                         inst2.target_ids.append(game_engine.ResourceId.from_str(tid))
-                        inst2.min_target_counts.append(1)
-                        inst2.max_target_counts.append(1)
+                        inst2.min_target_counts.append(min_count)
+                        inst2.max_target_counts.append(max_count)
                         tgt2 = game._make_event(game_engine.TargetInstanceSessionEventArgs)
                         tgt2.target_index = len(inst2.target_instances)
                         tgt2.target_id = game_engine.ResourceId.from_str(tid)
@@ -1076,38 +1140,46 @@ class HCPHandler:
             # PlayCard instance so the client's BattleStateAssignXCost prompts for
             # the sacrificed troop BEFORE the effect target. Without it the client
             # skips the cost and only asks for the single effect target.
-            from db import db_card_template_field
-            sac_target_guid = db_card_template_field(row[0], "sacrifice_target")
-            if sac_target_guid and sac_target_guid != "00000000-0000-0000-0000-000000000000":
-                sac_targets = self._valid_targets_for_template(session, pl_t, ai_t, sac_target_guid)
-                if sac_targets:
-                    from db import db_target_template_text
-                    ttext = db_target_template_text(sac_target_guid)
-                    count = _target_count_from_text(ttext)
-                    # Find the PlayCard instance — its opt_id MUST match the
-                    # client's BuiltInResources.PlayCardAbilityTemplateId, or
-                    # GetCostsFor(cardId, PlayCard) can't see this CostInstance
-                    # and the client never prompts for the sacrifice.
-                    for inst in opt.instances:
-                        if str(inst.opt_id.guid) == game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID:
-                            ci = game._make_event(game_engine.CostInstanceSessionEventArgs)
-                            HCPHandler._set_cost_instance_bounds(ci, count, count)
-                            ci.cost_type = 2  # EAbilityCostType.SacrificeAbilityCostType
-                            ci.target_template_id = game_engine.ResourceId.from_str(
-                                sac_target_guid)
-                            ci.targets = list(sac_targets)
-                            inst.target_instances.append(ci)
-                            break
+            for cost_spec in play_plan.cost_instances:
+                if cost_spec["auto"]:
+                    continue
+                cost_guid = cost_spec["target_guid"]
+                cost_targets = self._valid_targets_for_template(
+                    session, pl_t, ai_t, cost_guid)
+                if not cost_targets:
+                    continue
+                minimum = int(cost_spec["minimum"])
+                maximum = int(cost_spec["maximum"])
+                if maximum < 0:
+                    maximum = len(cost_targets)
+                # Find the PlayCard instance — its opt_id MUST match the
+                # client's built-in PlayCard ability, or it cannot see this
+                # CostInstance.
+                for inst in opt.instances:
+                    if (str(inst.opt_id.guid) ==
+                            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID):
+                        ci = game._make_event(
+                            game_engine.CostInstanceSessionEventArgs)
+                        HCPHandler._set_cost_instance_bounds(
+                            ci, minimum, maximum)
+                        ci.cost_type = int(cost_spec["cost_type"])
+                        ci.target_template_id = game_engine.ResourceId.from_str(
+                            cost_guid)
+                        ci.targets = list(cost_targets)
+                        inst.target_instances.append(ci)
+                        break
             # Variable X cost (e.g. Burn to the Ground "Deal X damage"): attach
             # an XCostAbilityCostType CostInstance to the PlayCard instance so
             # the client's BattleStateAssignXCost pushes the X slider
             # (BattleStateResourceXCost).  Without this the cost list is empty
             # and the dialog auto-commits at X=0 without ever showing.
-            if self._template_has_x_cost(row[0]):
+            has_x_cost = play_plan.cost.variable
+            if has_x_cost:
                 for inst in opt.instances:
                     if str(inst.opt_id.guid) == game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID:
                         ci = game._make_event(game_engine.CostInstanceSessionEventArgs)
-                        HCPHandler._set_cost_instance_bounds(ci, 0, 0)
+                        minimum = play_plan.cost.variable_minimum
+                        HCPHandler._set_cost_instance_bounds(ci, minimum, 0)
                         ci.cost_type = 256  # EAbilityCostType.XCostAbilityCostType
                         ci.target_template_id = game_engine.ResourceId.invalid()
                         ci.targets = []
@@ -1129,6 +1201,132 @@ class HCPHandler:
             n = db_warzone_troop_count(session.session_id, self.user_profile["id"])
         return n >= count
 
+    def _card_play_cost_selections(self, session, play_plan, source_uid,
+                                   selected_uids):
+        """Bind a card-play TargetMap to its authored CostInstances."""
+        selected_uids = [int(uid) for uid in (selected_uids or [])]
+        used = set()
+        selections = []
+        for spec in play_plan.cost_instances:
+            if spec["auto"]:
+                selections.append((spec, (int(source_uid),)))
+                continue
+            candidates = self._valid_targets_for_template(
+                session, None, None, spec["target_guid"])
+            if not candidates:
+                return None
+            candidate_set = {int(card.uid.uid64) for card in candidates}
+            available = [uid for uid in selected_uids
+                         if uid in candidate_set and uid not in used]
+            minimum = int(spec["minimum"])
+            maximum = int(spec["maximum"])
+            if maximum < 0:
+                maximum = len(available)
+            if len(available) < minimum:
+                return None
+            chosen = tuple(available[:maximum])
+            used.update(chosen)
+            selections.append((spec, chosen))
+        return selections, used
+
+    def _apply_card_play_costs(self, game, session, bstate, pl_t, ai_t,
+                               selections):
+        """Apply card-level CostInstances before a card enters the chain."""
+        from db import db_discard_card, db_randomly_insert_deck_cards
+        from abilities.framework.triggers import resolve_triggers
+
+        def push_zone(uid, owner_id, location):
+            row = _db.execute(
+                "SELECT template_guid, card_type, card_state FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (session.session_id, int(uid))).fetchone()
+            if not row:
+                return
+            scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
+            self._card_full_data(game, scid, row[0])
+            owner = pl_t if int(owner_id or 0) != 0 else ai_t
+            collection = {
+                "hand": game_engine.ECardCollections.Hand,
+                "deck": game_engine.ECardCollections.Deck,
+                "discard": game_engine.ECardCollections.Discard,
+                "void": game_engine.ECardCollections.Void,
+                "warzone": game_engine.ECardCollections.Warzone,
+            }.get(location, game_engine.ECardCollections.Warzone)
+            cdef = game.card_defs.get(scid)
+            game.push_card_updated(
+                scid, owner, collection, game_engine.card_type_from_db(row[1]),
+                template_id=row[0], state=int(row[2] or 0),
+                cost=cdef.cost if cdef else 0,
+                attack=cdef.attack if cdef else 0,
+                defense=cdef.defense if cdef else 0,
+                nulling=location == "deck")
+            game.push_card_moved(
+                scid, owner, collection, game_engine.ECardLocations.Top, 0)
+
+        for spec, selected in selections:
+            kind = spec["kind"]
+            for uid in selected:
+                uid = int(uid)
+                row = _db.execute(
+                    "SELECT user_id, location FROM game_cards "
+                    "WHERE session_id=? AND card_uid=?",
+                    (session.session_id, uid)).fetchone()
+                if not row:
+                    continue
+                owner_id = int(row[0] or 0)
+                if kind == "sacrifice":
+                    self._sacrifice_troop(game, session, pl_t, ai_t, uid)
+                    continue
+                if kind == "exhaust":
+                    _db.execute(
+                        "UPDATE game_cards SET card_state=card_state | ? "
+                        "WHERE session_id=? AND card_uid=?",
+                        (game_engine.ECardStates.Tapped, session.session_id, uid))
+                    _db.commit()
+                    push_zone(uid, owner_id, row[1])
+                    continue
+                destination = {
+                    "discard": "discard",
+                    "void": "void",
+                    "put_into_deck": "deck",
+                    "shuffle_into_deck": "deck",
+                    "put_into_hand": "hand",
+                }.get(kind)
+                if destination is None:
+                    if kind == "reveal":
+                        event = game._make_event(
+                            game_engine.CardsRevealedSessionEventArgs)
+                        event.player_id = (pl_t if owner_id else ai_t)
+                        event.session_card_ids = [
+                            game_engine.SessionCardId(game_engine.UID(uid))]
+                        event.collections = [game_engine.ECardCollections.Warzone]
+                        event.owning_players = [event.player_id]
+                        event.positions = [0]
+                        game._push(event)
+                    continue
+                if destination == "discard":
+                    db_discard_card(session.session_id, uid, connection=_db)
+                elif destination == "hand":
+                    _db.execute(
+                        "UPDATE game_cards SET location='hand', position=100 "
+                        "WHERE session_id=? AND card_uid=?",
+                        (session.session_id, uid))
+                    _db.commit()
+                else:
+                    _db.execute(
+                        "UPDATE game_cards SET location=?, position=0, "
+                        "card_state=0 WHERE session_id=? AND card_uid=?",
+                        (destination, session.session_id, uid))
+                    _db.commit()
+                    if destination == "deck":
+                        db_randomly_insert_deck_cards(
+                            session.session_id, owner_id, [uid], connection=_db)
+                push_zone(uid, owner_id, destination)
+                if destination in ("discard", "void"):
+                    resolve_triggers(
+                        _db, self, game, session, pl_t, ai_t, bstate,
+                        "CardEnteredZoneEvent", uid, owner_id)
+
     @staticmethod
     def _set_cost_instance_bounds(cost_instance, minimum, maximum):
         """Populate class-66 bounds for both event-schema revisions."""
@@ -1141,18 +1339,18 @@ class HCPHandler:
 
     @staticmethod
     def _ability_x_cost_metadata(ability_guid):
-        """Read variable activation cost fields from the raw ability record."""
-        row = _db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if not row or not row[0]:
+        """Read variable activation cost fields from the current graph."""
+        from gamedata import RecordStore, ability_graph
+        store = getattr(HCPHandler._ability_x_cost_metadata,
+                        "_record_store", None)
+        if store is None:
+            store = RecordStore()
+            HCPHandler._ability_x_cost_metadata._record_store = store
+        graph = ability_graph(store, str(ability_guid).lower())
+        if graph is None:
             return 0, 0
-        try:
-            raw = json.loads(row[0])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return 0, 0
-        return (int(raw.get("m_VariableActivationCost", 0) or 0),
-                int(raw.get("m_VariableActivationCostMinimum", 0) or 0))
+        return (int(graph.costs.variable_activation or 0),
+                int(graph.costs.variable_minimum or 0))
 
     @staticmethod
     def _template_has_x_cost(tpl_guid):
@@ -1161,10 +1359,9 @@ class HCPHandler:
         Burn to the Ground "1X" = 1 base + X.  These cards must show the
         client's X-cost dialog and the chosen X is paid as extra resources.
         """
-        row = _db.execute(
-            "SELECT variable_cost FROM card_templates WHERE guid=?",
-            (tpl_guid,)).fetchone()
-        return bool(row and int(row[0] or 0) > 0)
+        from gamedata import RecordStore
+        card = RecordStore().get("CardTemplate", str(tpl_guid).lower())
+        return bool(card and card.variable_cost)
 
     def _resolve_gem_abilities(self, active_gems):
         """Bake a deck's socketed gems into per-instance ability lists at DECK
@@ -1260,35 +1457,47 @@ class HCPHandler:
         against the prompt ability's OWN AbilityTargetTemplateIds, and only
         accepts candidates whose collection is covered by that template.
         Returns (ability_guid, target_template_id) or (None, None)."""
-        import json as _j
+        from gamedata.records import reference_guid
+
+        def contains(node, type_name, field=None, wanted=None):
+            if isinstance(node, dict):
+                if str(node.get("_t", "")).rsplit(".", 1)[-1] == type_name:
+                    if field is None:
+                        return True
+                    value = node.get(field)
+                    if wanted is None or str(value).lower() == str(wanted).lower():
+                        return True
+                return any(contains(child, type_name, field, wanted)
+                           for child in node.values())
+            if isinstance(node, list):
+                return any(contains(child, type_name, field, wanted)
+                           for child in node)
+            return False
+
         seen = set()
-        stack = [ability_guid]
+        stack = [str(ability_guid).lower()]
         while stack:
             ag = stack.pop()
             if ag in seen:
                 continue
             seen.add(ag)
-            trow = _db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            if trow and trow[0]:
-                try:
-                    tids = _j.loads(trow[0])
-                except Exception:
-                    tids = []
-                for tid in (tids or []):
-                    tt = _db.execute(
-                        "SELECT collection_flags FROM target_templates "
-                        "WHERE template_id=?", (tid,)).fetchone()
-                    if tt and "Choosing" in (tt[0] or "") and \
-                            "deck" in (tt[0] or "").lower():
-                        return ag, str(tid)
-            for e in _db.execute(
-                    "SELECT param FROM ability_effects WHERE ability_guid=? "
-                    "AND effect_type='ActivateAbilityEffectTemplate'",
-                    (ag,)).fetchall():
-                if e and e[0]:
-                    stack.append(e[0].lower())
+            graph = _records_ability_graph(self, ag)
+            if graph is None:
+                continue
+            for target in graph.targets:
+                if ("Choosing" in (target.collection_flags or "") and
+                        "deck" in (target.collection_flags or "").lower()):
+                    return ag, str(target.guid)
+            for effect in graph.effects:
+                if effect.concrete_type not in (
+                        "ActivateAbilityEffectTemplate",
+                        "ActivateTriggeredAbilityEffectTemplate"):
+                    continue
+                child = reference_guid(
+                    effect.template.field("m_AbilityToInvoke")
+                    if effect.template is not None else None)
+                if child:
+                    stack.append(child.lower())
         return None, None
 
     def _shards_of_fate_template(self, ability_guids):
@@ -1297,7 +1506,23 @@ class HCPHandler:
         when a target template filters a Standard RESOURCE in the DECK
         ("Choose a Standard resource in your deck. Gain the thresholds it
         provides.").  Returns (None, None) for ordinary resources."""
-        import json as _j
+        from gamedata.records import reference_guid
+
+        def contains(node, type_name, field=None, wanted=None):
+            if isinstance(node, dict):
+                if str(node.get("_t", "")).rsplit(".", 1)[-1] == type_name:
+                    if field is None:
+                        return True
+                    value = node.get(field)
+                    if wanted is None or str(value).lower() == str(wanted).lower():
+                        return True
+                return any(contains(child, type_name, field, wanted)
+                           for child in node.values())
+            if isinstance(node, list):
+                return any(contains(child, type_name, field, wanted)
+                           for child in node)
+            return False
+
         seen = set()
         stack = [str(a).lower() for a in (ability_guids or [])]
         while stack:
@@ -1305,30 +1530,27 @@ class HCPHandler:
             if ag in seen:
                 continue
             seen.add(ag)
-            trow = _db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            if trow and trow[0]:
-                try:
-                    tids = _j.loads(trow[0])
-                except Exception:
-                    tids = []
-                for tid in (tids or []):
-                    tt = _db.execute(
-                        "SELECT filter_json FROM target_templates "
-                        "WHERE template_id=?", (tid,)).fetchone()
-                    fj = (tt[0] if tt else "") or ""
-                    if ("IsSubType" in fj and "Standard" in fj
-                            and "IsResource" in fj
-                            and "InZone" in fj
-                            and '"Deck"' in fj):
-                        return ag, str(tid)
-            for e in _db.execute(
-                    "SELECT param FROM ability_effects WHERE ability_guid=? "
-                    "AND effect_type='ActivateAbilityEffectTemplate'",
-                    (ag,)).fetchall():
-                if e and e[0]:
-                    stack.append(e[0].lower())
+            graph = _records_ability_graph(self, ag)
+            if graph is None:
+                continue
+            for target in graph.targets:
+                card_filter = target.card_filter
+                if hasattr(card_filter, "to_dict"):
+                    card_filter = card_filter.to_dict()
+                if (contains(card_filter, "IsSubType", "m_SubType", "Standard")
+                        and contains(card_filter, "IsResource")
+                        and contains(card_filter, "InZone", "m_Collection", "Deck")):
+                    return ag, str(target.guid)
+            for effect in graph.effects:
+                if effect.concrete_type not in (
+                        "ActivateAbilityEffectTemplate",
+                        "ActivateTriggeredAbilityEffectTemplate"):
+                    continue
+                child = reference_guid(
+                    effect.template.field("m_AbilityToInvoke")
+                    if effect.template is not None else None)
+                if child:
+                    stack.append(child.lower())
         return None, None
 
     def _resolve_shards_of_fate(self, game, session, pl_t, ai_t, bstate,
@@ -1396,30 +1618,26 @@ class HCPHandler:
             return False
         if not self._thresholds_met(thresh_json, threshold):
             return False
-        reqs = self._card_troop_requirements(ability_guids)
-        if reqs:
-            if "friendly" in reqs and not friendly_count:
-                return False
-            if "enemy" in reqs and not enemy_count:
-                return False
-            if "any" in reqs and not (friendly_count or enemy_count):
-                return False
+        card_row = _db.execute(
+            "SELECT template_guid FROM game_cards "
+            "WHERE session_id=? AND card_uid=?",
+            (session.session_id, card_uid)).fetchone()
+        play_plan = self._card_play_plan(
+            card_row[0] if card_row else "", card_uid,
+            self.user_profile["id"] if self.user_profile else 0)
         # Zone-bound explicit targets (e.g. Countermagic's CastSpells-only
         # "Interrupt target card") must have a legal candidate to be playable.
-        if not self._card_target_requirements_met(session, ability_guids):
+        if not self._card_target_requirements_met(session, play_plan):
             return False
-        # Additional sacrifice cost: the player must be able to pay it. The
-        # gamedata card template's m_SacrificeTarget is an AbilityTargetTemplate
-        # (e.g. "a troop you control" — sacrifice is restricted to your own).
-        from db import db_card_template_field, db_target_template_text
-        sac_target = db_card_template_field(
-            _db.execute(
-                "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, card_uid)).fetchone()[0],
-            "sacrifice_target")
-        if sac_target and sac_target != "00000000-0000-0000-0000-000000000000":
-            if not self._cost_targets_available(session, sac_target,
-                                                _target_count_from_text(db_target_template_text(sac_target))):
+        # Every non-automatic card-level cost must have enough legal targets
+        # before the card is offered.  This mirrors the client's
+        # GetPotentialCostsForAbility/AreXCostsComplete gates.
+        for cost_spec in play_plan.cost_instances:
+            if cost_spec["auto"]:
+                continue
+            cost_targets = self._valid_targets_for_template(
+                session, None, None, cost_spec["target_guid"])
+            if len(cost_targets or ()) < int(cost_spec["minimum"]):
                 return False
         return True
 
@@ -1550,26 +1768,17 @@ class HCPHandler:
             uses = self._card_uses(session, card_uid)
             affordable = []
             for ag in ab_list:
-                m = _db.execute(
-                    "SELECT casting_behavior, is_manual, activation_cost, "
-                    "uses_per_game, uses_per_turn, exhausts_on_use "
-                    "FROM card_abilities_meta WHERE ability_guid=?",
-                    (ag,)).fetchone()
-                if not m:
+                graph = _records_ability_graph(self, ag)
+                if graph is None:
                     continue
-                casting, manual, cost, upg, upt, exh = m
-                variable_x, variable_min = HCPHandler._ability_x_cost_metadata(ag)
-                if not manual:
+                if not graph.manual:
                     continue
                 # Ability conditions gate manual activation (client's
                 # CanActivateAbilityBase: TriggerCondition.IsValid). E.g.
                 # Droo's Colossal Walker "While this is exhausted: ..." has a
                 # RequiresSourcePassesFilterCondition(IsTapped) trigger
                 # condition — it is only activatable while the troop is tapped.
-                raw_row = _db.execute(
-                    "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-                    (ag,)).fetchone()
-                if raw_row and raw_row[0]:
+                if graph.ability_condition or graph.trigger_condition:
                     from abilities.framework.condition_engine import (
                         ConditionContext,
                         trigger_condition_met,
@@ -1578,22 +1787,14 @@ class HCPHandler:
                         _db, session, bstate,
                         ability_source_uid=card_uid,
                         ability_source_owner_id=self.user_profile["id"])
-                    if not trigger_condition_met(raw_row[0], cond_ctx):
+                    if not trigger_condition_met(graph.source.to_dict(), cond_ctx):
                         continue
                 # The ability must have at least one legal target for its
                 # explicit target templates, and attacking-target abilities
                 # (Prairie Scout's "target attacking troop") are only
                 # activatable during combat steps — after attackers were
                 # declared, until the second main phase.
-                trow2 = _db.execute(
-                    "SELECT target_template_ids FROM card_abilities_meta "
-                    "WHERE ability_guid=?", (ag,)).fetchone()
-                tids = []
-                if trow2 and trow2[0]:
-                    try:
-                        tids = json.loads(trow2[0])
-                    except Exception:
-                        tids = []
+                tids = [target.guid for target in graph.targets]
                 if tids:
                     from abilities.framework.targeting import (
                         legal_targets as _lt, target_uses_both_players,
@@ -1601,18 +1802,18 @@ class HCPHandler:
                     wants_attacking = False
                     has_target = False
                     explicit_target_missing = False
-                    for tid in tids:
-                        tt = _db.execute(
-                            "SELECT filter_json, target_kind, is_auto_target "
-                            "FROM target_templates WHERE template_id=?",
-                            (tid,)).fetchone()
-                        if tt and tt[0] and "IsAttacking" in tt[0]:
+                    cost_ids = {str(tid).lower() for tid, _ in
+                                _records_ability_cost_templates(self, ag)}
+                    for target in graph.targets:
+                        tid = target.guid
+                        if tid.lower() in cost_ids:
+                            continue
+                        target_filter = target.card_filter
+                        if hasattr(target_filter, "to_dict"):
+                            target_filter = target_filter.to_dict()
+                        if "IsAttacking" in json.dumps(target_filter or {}):
                             wants_attacking = True
-                        kind = (tt[1] if tt else "") or ""
-                        auto = int(tt[2] or 0) if tt else 0
-                        if auto or kind in ("PlayerTargetTemplate",
-                                            "AbilitySourceCardTargetTemplate",
-                                            "AbilityCreatedTargetTemplate"):
+                        if not target.requires_input:
                             # Auto targets (e.g. Incubation Slave's 'You' —
                             # "Remove all egg counters from this and sacrifice
                             # it") resolve automatically; no picker, always
@@ -1640,7 +1841,7 @@ class HCPHandler:
                         continue
                     if not has_target:
                         continue
-                if exh:
+                if graph.costs.exhausts_card_on_use:
                     # Exhaust-as-cost (e.g. Prairie Scout): the card must be
                     # able to pay the tap — not already tapped, and not
                     # summoning sick (entered this turn without Speed).
@@ -1650,6 +1851,7 @@ class HCPHandler:
                     if (not (cstate & game_engine.ECardStates.StartedATurnOnYourSide)
                             and not ((attrs or 0) & game_engine.ECardAttributes.Speed)):
                         continue
+                casting = 64 if graph.casting_behavior == "QuickAction" else 8
                 if casting != 64:
                     # BasicAction etc. — main phases only; QuickAction(64) any.
                     # Main phase is meaningful only on this player's turn,
@@ -1663,14 +1865,34 @@ class HCPHandler:
                         continue
                     if not _be.stack_empty(bstate):
                         continue
+                cost = int(graph.costs.activation or 0)
                 if cost > resources:
                     continue
-                if variable_x and resources < int(variable_min or 0):
+                if graph.costs.variable_activation and resources < int(
+                        graph.costs.variable_minimum or 0):
+                    continue
+                payment_unavailable = False
+                from abilities.framework.targeting import legal_targets as _lt
+                for cost_tid, _cost_type in _records_ability_cost_templates(self, ag):
+                    cost_target = _records_target_spec(self, cost_tid)
+                    if cost_target is None:
+                        payment_unavailable = True
+                        break
+                    if not cost_target.requires_input:
+                        continue
+                    payment_candidates = _lt(
+                        _db, session.session_id, self.user_profile["id"],
+                        cost_target.guid, card_uid, both_players=False,
+                        champions=self._champion_targets(), battle_state=bstate)
+                    if len(payment_candidates) < int(cost_target.minimum or 0):
+                        payment_unavailable = True
+                        break
+                if payment_unavailable:
                     continue
                 used = int(uses.get(ag, 0))
-                if upg and used >= upg:
+                if graph.costs.uses_per_game and used >= graph.costs.uses_per_game:
                     continue
-                if upt and used >= upt:
+                if graph.costs.uses_per_turn and used >= graph.costs.uses_per_turn:
                     continue
                 affordable.append(ag)
             if affordable:
@@ -1708,37 +1930,22 @@ class HCPHandler:
             for ag in abilities:
                 inst = game._make_event(game_engine.OptionInstanceSessionEventArgs)
                 inst.opt_id = game_engine.ResourceId.from_str(ag)
-                # The ability's own target template ids (JSON list from
-                # card_abilities_meta.target_template_ids).
-                mrow = _db.execute(
-                    "SELECT target_template_ids FROM card_abilities_meta "
-                    "WHERE ability_guid=?",
-                    (ag,)).fetchone()
-                tpls = []
-                if mrow and mrow[0]:
-                    try:
-                        tpls = json.loads(mrow[0])
-                    except Exception:
-                        tpls = []
-                if tpls:
-                    inst.min_target_counts = [1] * len(tpls)
-                    inst.max_target_counts = [1] * len(tpls)
+                graph = _records_ability_graph(self, ag)
+                if graph is not None and graph.targets:
                     built = []
-                    for i, tid in enumerate(tpls):
-                        tt = _db.execute(
-                            "SELECT target_kind, is_auto_target "
-                            "FROM target_templates WHERE template_id=?",
-                            (tid,)).fetchone()
-                        kind = (tt[0] if tt else "") or ""
-                        auto = int(tt[1] or 0) if tt else 0
-                        if auto or kind in ("PlayerTargetTemplate",
-                                            "AbilitySourceCardTargetTemplate",
-                                            "AbilityCreatedTargetTemplate"):
+                    min_counts = []
+                    max_counts = []
+                    for i, target in enumerate(graph.targets):
+                        tid = target.guid
+                        if not target.requires_input:
                             # Auto targets resolve server-side — never attach a
                             # picker (the client's target cursor appears when a
                             # TargetInstance is present).
                             continue
                         built.append(i)
+                        min_counts.append(max(0, int(target.minimum)))
+                        maximum = int(target.maximum)
+                        max_counts.append(max(0, maximum) if maximum > 0 else 0)
                         others = _legal_targets(
                             _db, session.session_id, self.user_profile["id"],
                             tid, int(card_uid),
@@ -1751,11 +1958,10 @@ class HCPHandler:
                             # friendly pool; restricting filters (e.g. Prairie
                             # Scout's IsAttacking) keep their empty pool so the
                             # ability is never offered without a valid target.
-                            tt = _db.execute(
-                                "SELECT filter_json FROM target_templates "
-                                "WHERE template_id=?", (tid,)).fetchone()
-                            filt = (tt[0] if tt else "") or ""
-                            if filt.strip() in ("", "{}"):
+                            filt = target.card_filter
+                            if hasattr(filt, "to_dict"):
+                                filt = filt.to_dict()
+                            if not filt:
                                 others = [r[0] for r in _db.execute(
                                     "SELECT card_uid FROM game_cards WHERE session_id=? "
                                     "AND user_id=? AND location='warzone' ORDER BY position",
@@ -1765,12 +1971,35 @@ class HCPHandler:
                         tgt.target_id = game_engine.ResourceId.from_str(tid)
                         tgt.targets = [game_engine.SessionCardId(game_engine.UID(int(u))) for u in others]
                         inst.target_instances.append(tgt)
-                    if built:
-                        inst.min_target_counts = [1] * len(built)
-                        inst.max_target_counts = [1] * len(built)
-                    else:
-                        inst.min_target_counts = []
-                        inst.max_target_counts = []
+                    inst.min_target_counts = min_counts if built else []
+                    inst.max_target_counts = max_counts if built else []
+                if graph is not None:
+                    for kind, cost_guid in graph.additional_cost_targets:
+                        cost_target = _records_target_spec(self, cost_guid)
+                        if cost_target is None or not cost_target.requires_input:
+                            continue
+                        candidates = _legal_targets(
+                            _db, session.session_id, self.user_profile["id"],
+                            cost_guid, int(card_uid), both_players=False,
+                            champions=self._champion_targets(),
+                            battle_state=bstate)
+                        if len(candidates) < int(cost_target.minimum or 0):
+                            continue
+                        ci = game._make_event(
+                            game_engine.CostInstanceSessionEventArgs)
+                        minimum = max(0, int(cost_target.minimum))
+                        maximum = int(cost_target.maximum)
+                        if maximum <= 0:
+                            maximum = len(candidates)
+                        HCPHandler._set_cost_instance_bounds(
+                            ci, minimum, maximum)
+                        from gamedata import CardPlayCost
+                        ci.cost_type = CardPlayCost.cost_type(kind)
+                        ci.target_template_id = game_engine.ResourceId.from_str(
+                            cost_guid)
+                        ci.targets = [game_engine.SessionCardId(
+                            game_engine.UID(int(uid))) for uid in candidates]
+                        inst.target_instances.append(ci)
                 variable_x, variable_min = HCPHandler._ability_x_cost_metadata(ag)
                 if variable_x:
                     ci = game._make_event(game_engine.CostInstanceSessionEventArgs)
@@ -2816,10 +3045,9 @@ class HCPHandler:
     def _discard_prompt_data(self, ability_guid):
         """Return ``(ability_guid, hand_target_template)`` for a discard.
 
-        Most abilities expose a dedicated discard BOM leaf.  Older extracted
-        records such as Wretched Wrangler retain the discard in the typed
-        ability contract but not as a materialized leaf, so select the generic
-        authored ``a card from your hand`` target as the protocol contract.
+        Most abilities expose a dedicated discard BOM leaf.  An ability-level
+        discard payment is represented by the same typed target contract and
+        is returned directly when no discard leaf exists.
         """
         from abilities import bom_leaf_prompt_data
         prompt = bom_leaf_prompt_data(
@@ -2827,30 +3055,18 @@ class HCPHandler:
             "DiscardCardAbilityEffectTemplate")
         if prompt and prompt[1]:
             return prompt
-        row = _db.execute(
-            "SELECT game_text FROM card_abilities_meta "
-            "WHERE ability_guid=?", (str(ability_guid).lower(),)).fetchone()
-        import re as _re
-        if not (row and _re.match(
-                r"^\s*(?:\[[^]]+\]\s*)*discard\s+(?:a|one)\s+card\b",
-                row[0] or "", _re.IGNORECASE)):
+        graph = _records_ability_graph(self, ability_guid)
+        if graph is None:
             return None
-        target = _db.execute(
-            "SELECT template_id FROM target_templates "
-            "WHERE lower(game_text)=? AND lower(filter_json) LIKE ? "
-            "ORDER BY template_id LIMIT 1",
-            ("a card from your hand", "%hand%"),).fetchone()
-        return (str(ability_guid).lower(), target[0]) if target else None
+        for kind, target_guid in graph.additional_cost_targets:
+            if kind == "discard":
+                return str(ability_guid).lower(), target_guid
+        return None
 
     def _ability_requires_discard(self, ability_guid):
         """Return whether activation requires the controller to discard.
 
-        Most discard effects have a typed BOM leaf.  A few older extracted
-        abilities (including Wretched Wrangler) encode the activation cost in
-        the serialized ability contract but expose only the authored opening
-        sentence in the materialized effect rows.  Restrict the fallback to
-        an opening ``Discard a card`` cost so opponent-discard effects are not
-        mistaken for a controller payment.
+        The typed BOM/ability cost graph is the sole source of this payment.
         """
         return self._discard_prompt_data(ability_guid) is not None
 
@@ -2890,102 +3106,60 @@ class HCPHandler:
         out = {}
         for aid in ability_ids:
             ag = str(aid.guid)
-            row = _db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            if not row or not row[0]:
-                row = _db.execute(
-                    "SELECT target_template_ids FROM champion_abilities "
-                    "WHERE ability_guid=?", (ag,)).fetchone()
-            if not row or not row[0]:
-                # PvE champion powers are granted by talents. Their target
-                # contracts come from the source AbilityTemplate and are
-                # materialized in talent_abilities.
-                row = _db.execute(
-                    "SELECT target_template_ids FROM talent_abilities "
-                    "WHERE ability_guid=? LIMIT 1", (ag,)).fetchone()
-            if not row or not row[0]:
+            graph = _records_ability_graph(self, ag)
+            if graph is None:
                 continue
-            try:
-                tpls = json.loads(row[0])
-            except Exception:
-                continue
-            cost_tids = {t for t, _ in self._ability_cost_templates(ag)}
-            for target_index, tid in enumerate(tpls):
+            cost_tids = {str(t).lower() for t, _ in
+                         _records_ability_cost_templates(self, ag)}
+            for target_index, target in enumerate(graph.targets):
+                tid = target.guid
                 # Card costs (void/sacrifice/exhaust...) are paid via the
                 # client's X-cost dialog (CostInstance events) — never as
                 # effect targets.
-                if tid in cost_tids:
+                if tid.lower() in cost_tids:
                     continue
-                trow = _db.execute(
-                    "SELECT target_kind, is_auto_target, min_target_count, "
-                    "max_target_count FROM target_templates WHERE template_id=?",
-                    (tid,)).fetchone()
-                if not trow:
-                    continue
-                kind = trow[0] or ""
-                auto = int(trow[1] or 0)
-                if auto or kind == "PlayerTargetTemplate":
+                if not target.requires_input:
                     # Auto targets (e.g. Poca's 'You' — "Summon a Blaze
                     # Elemental") resolve automatically: never attach a picker.
-                    continue
-                if kind in ("AbilitySourceCardTargetTemplate",
-                            "AbilityCreatedTargetTemplate"):
                     continue
                 cands = _lt(_db, session.session_id, self.user_profile["id"],
                             tid, int(champ_uid or 0),
                             both_players=target_uses_both_players(_db, tid),
                             champions=self._champion_targets())
-                mn = int(trow[2] or 1)
-                mx = int(trow[3] or 1)
+                mn = max(0, int(target.minimum))
+                mx = int(target.maximum)
+                if mx <= 0:
+                    mx = -1
                 out.setdefault(ag, []).append(
                     (tid, cands, mn, mx, target_index))
         return out
 
-    _ABILITY_COST_FIELD_TYPES = {
-        "m_VoidTarget": 16,               # EAbilityCostType.VoidAbilityCostType
-        "m_SacrificeTarget": 2,           # SacrificeAbilityCostType
-        "m_ExhaustTarget": 1,             # ExhaustAbilityCostType
-        "m_DiscardTarget": 8,             # DiscardAbilityCostType
-        "m_RevealTarget": 64,             # RevealAbilityCostType
-        "m_PutIntoDeckTarget": 32,        # PutIntoDeckAbilityCostType
-        "m_PutIntoDeckTarget2": 32,       # PutIntoDeckAbilityCostType
-        "m_PutIntoHandTarget": 128,       # PutIntoHandAbilityCostType
-        "m_ShuffleIntoDeckTarget": 4,     # ShuffleIntoDeckAbilityCostType
-    }
-
     def _ability_cost_templates(self, ability_guid):
-        """[(target_template_id, EAbilityCostType)] parsed from the ability's
-        gamedata raw_json cost fields (m_VoidTarget / m_SacrificeTarget /
-        m_ExhaustTargets ...).  These are card costs the player pays when
-        activating the ability, not effect targets."""
-        import re as _re
-        row = _db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if not row or not row[0]:
+        """Return payment targets from the current typed AbilityGraph."""
+        from gamedata import CardPlayCost
+        graph = _records_ability_graph(self, ability_guid)
+        if graph is None:
             return []
-        raw = row[0]
-        out = []
-        for field, ctype in self._ABILITY_COST_FIELD_TYPES.items():
-            m = _re.search(
-                rf'"{field}"\s*:\s*\{{[^}}]*"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"',
-                raw)
-            if m:
-                g = m.group(1).lower()
-                if g != "00000000-0000-0000-0000-000000000000":
-                    out.append((g, ctype))
-                continue
-            # Plural array variants (m_ExhaustTargets / m_DiscardTargets).
-            m_arr = _re.search(rf'"{field}"\s*:\s*\[(.*?)\]', raw)
-            if not m_arr:
-                continue
-            for g in _re.findall(r'"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"',
-                                 m_arr.group(1)):
-                g = g.lower()
-                if g != "00000000-0000-0000-0000-000000000000":
-                    out.append((g, ctype))
-        return out
+        return [(guid, CardPlayCost.cost_type(kind))
+                for kind, guid in graph.additional_cost_targets]
+
+    def _current_ability_graph(self, ability_guid):
+        from gamedata import ability_graph
+        store = getattr(self, "_play_plan_store", None)
+        if store is None:
+            from gamedata import RecordStore
+            store = RecordStore()
+            self._play_plan_store = store
+        return ability_graph(store, str(ability_guid).lower())
+
+    def _current_target_spec(self, target_guid):
+        store = getattr(self, "_play_plan_store", None)
+        if store is None:
+            from gamedata import RecordStore
+            store = RecordStore()
+            self._play_plan_store = store
+        target = store.get("AbilityTargetTemplate", str(target_guid).lower())
+        return target.target_spec if target is not None else None
 
     def _champion_ability_costs(self, session, ability_ids, champ_uid=0):
         """{ability_guid: [(target_template_id, EAbilityCostType, [candidate
@@ -2996,12 +3170,13 @@ class HCPHandler:
         out = {}
         for aid in (ability_ids or []):
             ag = str(aid.guid)
-            for tid, ctype in self._ability_cost_templates(ag):
-                trow = _db.execute(
-                    "SELECT min_target_count, max_target_count "
-                    "FROM target_templates WHERE template_id=?", (tid,)).fetchone()
-                mn = int(trow[0] or 1) if trow else 1
-                mx = int(trow[1] or 1) if trow else 1
+            graph = _records_ability_graph(self, ag)
+            for tid, ctype in _records_ability_cost_templates(self, ag):
+                target = _records_target_spec(self, tid)
+                mn = max(0, int(target.minimum)) if target else 1
+                mx = int(target.maximum) if target else 1
+                if mx <= 0:
+                    mx = -1
                 cands = _lt(_db, session.session_id, self.user_profile["id"],
                             tid, int(champ_uid or 0), both_players=False,
                             champions=self._champion_targets())
@@ -3018,23 +3193,25 @@ class HCPHandler:
         so a sacrifice target must be removed from the effect-target pool
         before the chain item is created.
         """
-        import json as _json
         from abilities.framework.targeting import (
             legal_targets as _lt, target_uses_both_players)
+        graph = _records_ability_graph(self, ability_guid)
+        if graph is None:
+            return None
         selected_uids = [int(uid) for uid in (selected_uids or [])]
         used = set()
         sacrifices = []
-        cost_templates = self._ability_cost_templates(ability_guid)
+        cost_templates = _records_ability_cost_templates(self, ability_guid)
         for tid, cost_type in cost_templates:
-            trow = _db.execute(
-                "SELECT target_kind, is_auto_target, min_target_count, "
-                "max_target_count FROM target_templates "
-                "WHERE template_id=?", (tid,)).fetchone()
-            kind = (trow[0] if trow else "") or ""
-            auto = bool(int(trow[1] or 0)) if trow else False
-            minimum = int(trow[2] or 1) if trow else 1
-            maximum = int(trow[3] or 1) if trow else 1
-            if auto and kind == "AbilitySourceCardTargetTemplate":
+            target = _records_target_spec(self, tid)
+            if target is None:
+                return None
+            minimum = max(0, int(target.minimum))
+            maximum = int(target.maximum)
+            if maximum <= 0:
+                maximum = -1
+            if not target.requires_input and target.target_kind == \
+                    "AbilitySourceCardTargetTemplate":
                 candidates = [int(champ_uid)]
                 available = candidates
             else:
@@ -3052,39 +3229,17 @@ class HCPHandler:
             if int(cost_type) == 2:
                 sacrifices.extend(chosen)
 
-        row = _db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        if not row or not row[0]:
-            row = _db.execute(
-                "SELECT target_template_ids FROM champion_abilities "
-                "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        if not row or not row[0]:
-            row = _db.execute(
-                "SELECT target_template_ids FROM talent_abilities "
-                "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
-        try:
-            target_templates = _json.loads(row[0]) if row and row[0] else []
-        except (TypeError, ValueError, _json.JSONDecodeError):
-            target_templates = []
         effect_candidates = []
         explicit_required = False
-        for tid in target_templates:
-            tid = str(tid).lower()
+        cost_ids = {str(tid).lower() for tid, _ in cost_templates}
+        for target in graph.targets:
+            tid = str(target.guid).lower()
             if any(tid == cost_tid for cost_tid, _ in cost_templates):
                 continue
-            trow = _db.execute(
-                "SELECT target_kind, is_auto_target, min_target_count "
-                "FROM target_templates WHERE template_id=?", (tid,)
-            ).fetchone()
-            kind = (trow[0] if trow else "") or ""
-            auto = int(trow[1] or 0) if trow else 0
-            if auto or kind in ("PlayerTargetTemplate",
-                                "AbilitySourceCardTargetTemplate",
-                                "AbilityCreatedTargetTemplate"):
+            if not target.requires_input:
                 continue
             explicit_required = explicit_required or bool(
-                int(trow[2] or 1) if trow else 1)
+                int(target.minimum) if target.minimum is not None else 1)
             effect_candidates.extend(int(uid) for uid in _lt(
                 _db, session.session_id, self.user_profile["id"], tid,
                 int(champ_uid),
@@ -3934,7 +4089,8 @@ class HCPHandler:
             bstate["x_cost"] = int(item.get("x_cost") or 0)
             esc_before = int(bstate.get("player_escalation_uses", 0))
             _abil.resolve_played_spell(game, session, _db, self, pl_t, ai_t, bstate,
-                                       item.get("ability_guids", []))
+                                       item.get("ability_guids", []),
+                                       activations=item.get("activations"))
             # "When you play an action/... " triggers (e.g. Chimes of the
             # Zodiac's "copy it") fire against the played spell.
             if item.get("source_uid"):
@@ -4614,7 +4770,7 @@ class HCPHandler:
             return None
         return db_template_by_guid(template_guid)
 
-    def _resolve_card_ref(self, card_ref):
+    def _resolve_card_ref(self, card_ref, user_id=None):
         """Resolve a game_cards.card_template_id to card template info.
 
         card_template_id is either an integer card_instances.instance_id
@@ -4628,10 +4784,15 @@ class HCPHandler:
             if t:
                 return t
             return None, None, None, 0, 0, 0
+        if user_id is None and self.user_profile:
+            user_id = self.user_profile.get("id")
+        if user_id is None:
+            return None, None, None, 0, 0, 0
         row = _db.execute(
             "SELECT ci.template_guid, ct.card_type, ct.name, ct.cost, ct.attack, ct.defense "
             "FROM card_instances ci JOIN card_templates ct ON ci.template_guid=ct.guid "
-            "WHERE ci.instance_id=?", (card_ref,)).fetchone()
+            "WHERE ci.user_id=? AND ci.instance_id=?",
+            (user_id, card_ref)).fetchone()
         if row:
             return row[0], row[1], row[2], row[3] or 0, row[4] or 0, row[5] or 0
         return None, None, None, 0, 0, 0
@@ -5395,16 +5556,22 @@ class HCPHandler:
         TACAbilityEffectTemplate leaf dispatches to ShiftPower generically via
         the serialized TAC (never hardcoded).
         """
-        m = _db.execute(
-            "SELECT casting_behavior, activation_cost, uses_per_game, uses_per_turn, "
-            "exhausts_on_use "
-            "FROM card_abilities_meta WHERE ability_guid=?", (ability_guid,)).fetchone()
-        casting = m[0] if m else 64
-        cost = m[1] if m else 0
-        upg = m[2] if m else 0
-        upt = m[3] if m else 0
-        exh = m[4] if m else 0
-        variable_x, variable_min = HCPHandler._ability_x_cost_metadata(ability_guid)
+        graph = _records_ability_graph(self, ability_guid)
+        if graph is None:
+            log_req(f"    Troop ability {ability_guid[:8]}: missing current "
+                    "Records ability")
+            return
+        from gamedata import AbilityInstance, ActivationData
+        ability = AbilityInstance.from_graph(
+            graph, source_uid=int(source_uid), owner_id=self.user_profile["id"],
+            responsible_player_id=self.user_profile["id"], store=self._play_plan_store)
+        casting = 64 if graph.casting_behavior == "QuickAction" else 8
+        cost = int(ability.costs.activation or 0)
+        upg = int(ability.costs.uses_per_game or 0)
+        upt = int(ability.costs.uses_per_turn or 0)
+        exh = bool(ability.costs.exhausts_card_on_use)
+        variable_x = int(ability.costs.variable_activation or 0)
+        variable_min = int(ability.costs.variable_minimum or 0)
         resources = bstate.get("player_resources", 0)
         x_cost = 0
         if variable_x:
@@ -5442,10 +5609,7 @@ class HCPHandler:
         # Ability conditions gate activation (client CanActivateAbilityBase:
         # TriggerCondition.IsValid). E.g. Droo's Colossal Walker only activates
         # while exhausted.
-        raw_row = _db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if raw_row and raw_row[0]:
+        if graph.ability_condition or graph.trigger_condition:
             from abilities.framework.condition_engine import (
                 ConditionContext,
                 trigger_condition_met,
@@ -5454,7 +5618,7 @@ class HCPHandler:
                 _db, session, bstate,
                 ability_source_uid=int(source_uid),
                 ability_source_owner_id=self.user_profile["id"])
-            if not trigger_condition_met(raw_row[0], cond_ctx):
+            if not trigger_condition_met(graph.source.to_dict(), cond_ctx):
                 log_req(f"    Troop ability {ability_guid[:8]}: ability condition not met")
                 return
         import battle_engine as _be
@@ -5485,28 +5649,16 @@ class HCPHandler:
         # the transaction against the same gamedata filter used to build the
         # picker.  This keeps activation data-driven and prevents an invalid or
         # missing target from silently resolving against the source card.
-        target_row = _db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-        try:
-            target_templates = json.loads(target_row[0]) if target_row and target_row[0] else []
-        except (TypeError, ValueError, json.JSONDecodeError):
-            target_templates = []
-        cost_templates = {tid for tid, _ctype in self._ability_cost_templates(ability_guid)}
+        cost_templates = {
+            str(tid).lower() for tid, _ctype in
+            _records_ability_cost_templates(self, ability_guid)
+        }
         explicit_templates = []
-        for tid in target_templates:
-            if tid in cost_templates:
+        for target in graph.targets:
+            tid = str(target.guid).lower()
+            if tid in cost_templates or not target.requires_input:
                 continue
-            tt = _db.execute(
-                "SELECT target_kind, is_auto_target, min_target_count "
-                "FROM target_templates WHERE template_id=?", (tid,)).fetchone()
-            kind = (tt[0] if tt else "") or ""
-            auto = int(tt[1] or 0) if tt else 0
-            if auto or kind in ("PlayerTargetTemplate",
-                                "AbilitySourceCardTargetTemplate",
-                                "AbilityCreatedTargetTemplate"):
-                continue
-            explicit_templates.append((str(tid), int(tt[2] or 1) if tt else 1))
+            explicit_templates.append((tid, int(target.minimum or 0)))
         if explicit_templates:
             from abilities.framework.targeting import (
                 legal_targets as _legal_targets, target_uses_both_players,
@@ -7284,13 +7436,46 @@ class HCPHandler:
                 # thresholds/abilities/gems and returns full stats.
                 tpl_guid, ct_n, nm, cost, atk, def_, gem = self._card_full_data(
                     g3, scid_played, crow[0], inst_id)
-                x_cost = 0  # set below for variable-X spells
-                if cost > bstate.get("player_resources", 0):
+                play_plan = self._card_play_plan(
+                    crow[0], tid, self.user_profile["id"]
+                    if self.user_profile else 0)
+                targets = self._extract_transaction_targets(
+                    inner_bytes, played_card_uid)
+                cost_selection = self._card_play_cost_selections(
+                    session, play_plan, tid, targets)
+                if cost_selection is None:
+                    log_req(f"    REJECTED play {crow[2]}: incomplete/illegal "
+                            "card cost target")
+                    g3 = game_engine.Game(session.session_id, pl_t, ai_t)
+                    g3.push_player_updated(pl_t, champ_id=getattr(
+                        self, "_player_champ_scid", None))
+                    self._send_battle_events(session, g3, pl_t)
+                    self._push_transaction_ack(session)
+                    handled = True
+                    return True
+                cost_selections, cost_uids = cost_selection
+                x_cost = self._extract_int32_field(
+                    inner_bytes, "m_ResourceXCost")
+                x_cost = max(0, int(x_cost or 0))
+                if play_plan.cost.variable:
+                    if x_cost < play_plan.cost.variable_minimum:
+                        log_req(f"    REJECTED play {crow[2]}: X={x_cost} "
+                                f"below minimum {play_plan.cost.variable_minimum}")
+                        self._push_transaction_ack(session)
+                        handled = True
+                        return True
+                elif x_cost:
+                    log_req(f"    REJECTED play {crow[2]}: non-variable card "
+                            f"has X={x_cost}")
+                    self._push_transaction_ack(session)
+                    handled = True
+                    return True
+                if cost + x_cost > bstate.get("player_resources", 0):
                     # Defense-in-depth: the client's playability is the
                     # normal gate, but a drag shouldn't be able to play
                     # an unaffordable card (e.g. an undiscounted Fury of
                     # the Mountain God) and push resources negative.
-                    log_req(f"    REJECTED play {crow[2]}: cost {cost} > "
+                    log_req(f"    REJECTED play {crow[2]}: cost {cost}+{x_cost} > "
                             f"resources {bstate.get('player_resources', 0)}")
                     g3 = game_engine.Game(session.session_id, pl_t, ai_t)
                     g3.push_player_updated(pl_t, champ_id=getattr(
@@ -7299,11 +7484,39 @@ class HCPHandler:
                     self._push_transaction_ack(session)
                     handled = True
                     return True
-                bstate["player_resources"] = bstate.get("player_resources", 0) - cost
+                # Build and validate the complete current-record activation
+                # before mutating resources or moving the card.  This is the
+                # single card-play boundary for target/option/X data; leaves
+                # must never discover a missing target after payment.
+                activations, _cost_target_map = play_plan.activation_bundle(
+                    targets, x_cost=x_cost)
+                selected_cost_map = {
+                    index: tuple(selected)
+                    for index, (_spec, selected) in enumerate(cost_selections)
+                    if selected
+                }
+                plan_errors = play_plan.validate(
+                    variable_cost=x_cost,
+                    activations=activations,
+                    cost_target_map=selected_cost_map)
+                if plan_errors:
+                    log_req(f"    REJECTED play {crow[2]}: "
+                            f"activation validation: {'; '.join(plan_errors)}")
+                    g3 = game_engine.Game(session.session_id, pl_t, ai_t)
+                    g3.push_player_updated(pl_t, champ_id=getattr(
+                        self, "_player_champ_scid", None))
+                    self._send_battle_events(session, g3, pl_t)
+                    self._push_transaction_ack(session)
+                    handled = True
+                    return True
+                bstate["player_resources"] = (
+                    bstate.get("player_resources", 0) - cost - x_cost)
                 # Move from hand to CastSpells in DB
                 from db import db_set_card_played_to_zone, db_card_set_warzone_arrival, db_set_card_resolved_at
                 db_set_card_played_to_zone(session.session_id, tid, 'CastSpells')
                 # Push chain events
+                self._apply_card_play_costs(
+                    g3, session, bstate, pl_t, ai_t, cost_selections)
                 g3.push_card_updated(scid_played, pl_t, game_engine.ECardCollections.CastSpells,
                                     game_engine.card_type_from_db(played_card_type),
                                     template_id=crow[0], cost=cost, attack=atk, defense=def_, gems=gem)
@@ -7346,48 +7559,26 @@ class HCPHandler:
                     # the chain (CastSpells = the visual stack). The BOM
                     # (draw / buff / etc.) executes when the chain resolves
                     # (both players pass) — ONE chain item, sub-effects
-                    # bundled. The sacrifice cost (if any) is paid now.
-                    import ability as _abil
-                    targets = self._extract_transaction_targets(inner_bytes, played_card_uid)
-                    # Sacrifice cost (e.g. Abominate "sacrifice a troop you
-                    # control"): card_templates.sacrifice_target is set.
-                    # The cost is paid first, so the sacrificed troop is
-                    # the FIRST non-source UID; the effect target is last.
-                    from db import db_card_template_field
-                    sac_row_val = db_card_template_field(crow[0], "sacrifice_target")
-                    sacrifice_uid = None
-                    if sac_row_val and sac_row_val != "00000000-0000-0000-0000-000000000000":
-                        sacrifice_uid = targets[0] if targets else None
-                        target_uid = targets[-1] if len(targets) > 1 else None
-                    else:
-                        target_uid = targets[-1] if targets else None
+                    # bundled. Card-level costs were already paid and bound
+                    # above; only the remaining IDs are effect targets.
+                    effect_targets = [uid for uid in targets
+                                      if int(uid) not in cost_uids]
+                    target_uid = effect_targets[-1] if effect_targets else None
                     log_req(f"    Spell {played_card_uid}: targets={[hex(t) for t in targets]} "
-                            f"sacrifice={hex(sacrifice_uid) if sacrifice_uid else None} "
+                            f"costs={[hex(t) for t in cost_uids]} "
                             f"target={hex(target_uid) if target_uid else None}")
-                    if sacrifice_uid:
-                        self._sacrifice_troop(g3, session, pl_t, ai_t, sacrifice_uid)
-                    # Variable X cost: the X the player chose in the
-                    # client's X-cost dialog travels as
-                    # xCostData.m_ResourceXCost on the play transaction.
-                    x_cost = self._extract_int32_field(
-                        inner_bytes, "m_ResourceXCost")
-                    x_cost = max(0, int(x_cost or 0))
-                    from db import db_get_card_abilities
-                    ab_json, _ = db_get_card_abilities(crow[0])
-                    try:
-                        ability_guids = [g.lower() for g in json.loads(ab_json)] if ab_json else []
-                    except Exception:
-                        ability_guids = []
+                    ability_guids = [ability.ability_guid
+                                     for ability in play_plan.abilities
+                                     if not ability.is_triggered]
                     _be.stack_push(bstate, {
                         "kind": "spell", "source_uid": int(tid),
                         "ability_guids": ability_guids, "target_uid": target_uid,
                         "instance_id": 1, "x_cost": x_cost,
+                        "activations": {
+                            guid: activation.as_dict()
+                            for guid, activation in activations.items()
+                        },
                     })
-                    if x_cost:
-                        bstate["player_resources"] = max(
-                            0, bstate.get("player_resources", 0) - x_cost)
-                        log_req(f"    Spell X cost: {x_cost} paid "
-                                f"(resources left {bstate['player_resources']})")
                     g3.push_ability_on_chain(
                         scid_played,
                         game_engine.ResourceId.from_str(crow[0]))
@@ -7721,51 +7912,59 @@ class HCPHandler:
         bstate = _be.load_state(session)
         self._current_bstate = bstate
         if ability_guid and not handled:
+            # A GUID can be present in both the card-ability index and
+            # champion metadata.  The transaction's SourceCardId is the
+            # authoritative discriminator: when it identifies a matching
+            # player-controlled warzone card carrying this ability, route it
+            # through the card-ability resolver first.  Otherwise a card power
+            # such as Crown of the Primals can enter the champion path, where
+            # its selected source/target cards are mistaken for champion
+            # payment targets and voided.
             champ_owned = _db.execute(
                 "SELECT 1 FROM talent_abilities WHERE ability_guid=? LIMIT 1",
                 (ability_guid,)).fetchone()
-            if not champ_owned:
-                # The same ability GUID can be present on multiple card
-                # instances (for example, two Howling Braves).  The option
-                # list is per source card, so route by the transaction's
-                # SessionCardId rather than selecting the first matching row.
-                source_uid = None
-                if isinstance(inner_bytes, bytes):
-                    scid_pos = inner_bytes.find(b"m_SessionCardId")
-                    if scid_pos >= 0:
-                        uid_pos = inner_bytes.find(b"m_UID64", scid_pos)
-                        if uid_pos >= 0:
-                            rest = inner_bytes[uid_pos + 7:]
-                            parts = rest.split(b";", 6)
-                            if len(parts) >= 5:
-                                try:
-                                    source_uid = struct.unpack(
-                                        '<Q', bytes.fromhex(
-                                            parts[4].decode("ascii")))[0]
-                                    if (source_uid & 0xFF) != 1:
-                                        source_uid = None
-                                except (ValueError, TypeError, struct.error):
+            # The same ability GUID can be present on multiple card instances
+            # (for example, two Howling Braves).  The option list is per
+            # source card, so route by SourceCardId rather than selecting the
+            # first matching row.
+            source_uid = None
+            if isinstance(inner_bytes, bytes):
+                scid_pos = inner_bytes.find(b"SourceCardId")
+                if scid_pos >= 0:
+                    uid_pos = inner_bytes.find(b"m_UID64", scid_pos)
+                    if uid_pos >= 0:
+                        rest = inner_bytes[uid_pos + 7:]
+                        parts = rest.split(b";", 6)
+                        if len(parts) >= 5:
+                            try:
+                                source_uid = struct.unpack(
+                                    '<Q', bytes.fromhex(
+                                        parts[4].decode("ascii")))[0]
+                                if (source_uid & 0xFF) != 1:
                                     source_uid = None
-                src_row = None
-                if source_uid is not None:
-                    src_row = _db.execute(
-                        "SELECT card_uid, card_uses FROM game_cards "
-                        "WHERE session_id=? AND user_id=? AND location='warzone' "
-                        "AND card_uid=? AND card_abilities LIKE ?",
-                        (session.session_id, self.user_profile["id"],
-                         int(source_uid), f'%"{ability_guid}"%')).fetchone()
-                if src_row is None and source_uid is None:
-                    # Older clients may omit the source field. Preserve the
-                    # unambiguous single-copy case, but never guess between
-                    # multiple copies of the same ability.
-                    matches = _db.execute(
-                        "SELECT card_uid, card_uses FROM game_cards "
-                        "WHERE session_id=? AND user_id=? AND location='warzone' "
-                        "AND card_abilities LIKE ?",
-                        (session.session_id, self.user_profile["id"],
-                         f'%"{ability_guid}"%')).fetchall()
-                    if len(matches) == 1:
-                        src_row = matches[0]
+                            except (ValueError, TypeError, struct.error):
+                                source_uid = None
+            src_row = None
+            if source_uid is not None:
+                src_row = _db.execute(
+                    "SELECT card_uid, card_uses FROM game_cards "
+                    "WHERE session_id=? AND user_id=? AND location='warzone' "
+                    "AND card_uid=? AND card_abilities LIKE ?",
+                    (session.session_id, self.user_profile["id"],
+                     int(source_uid), f'%"{ability_guid}"%')).fetchone()
+            if src_row is None and source_uid is None:
+                # Older clients may omit the source field. Preserve the
+                # unambiguous single-copy case, but never guess between
+                # multiple copies of the same ability.
+                matches = _db.execute(
+                    "SELECT card_uid, card_uses FROM game_cards "
+                    "WHERE session_id=? AND user_id=? AND location='warzone' "
+                    "AND card_abilities LIKE ?",
+                    (session.session_id, self.user_profile["id"],
+                     f'%"{ability_guid}"%')).fetchall()
+                if len(matches) == 1:
+                    src_row = matches[0]
+            if src_row or not champ_owned:
                 if src_row:
                     self._activate_troop_ability(
                         session, pl_t, ai_t, bstate,
@@ -10055,7 +10254,8 @@ class HCPHandler:
                         card_tpl_id = card_ref
                     player_card_tpl_ids.append(card_tpl_id)
                     card_uid = cid.uid.to_uint64()
-                    _tpl, ctype, _n, _c, _a, _d = self._resolve_card_ref(card_tpl_id)
+                    _tpl, ctype, _n, _c, _a, _d = self._resolve_card_ref(
+                        card_tpl_id, self.user_profile["id"])
                     player_resolved_tpl_ids.append(_tpl)
                     _db.execute("INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, card_type, template_guid, location, position, owner_user_id, original_template_guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (self.user_profile["id"], session.session_id, card_uid, card_tpl_id, ctype or "Unknown", _tpl, 'deck', pos, self.user_profile["id"], _tpl))
@@ -10109,8 +10309,9 @@ class HCPHandler:
                 else:
                     row = _db.execute(
                         "SELECT ci.template_guid, ct.card_type, ct.name, ct.cost, ct.attack, ct.defense "
-                        "FROM card_instances ci JOIN card_templates ct ON ci.template_guid=ct.guid WHERE ci.instance_id=?",
-                         (instance_id,)).fetchone()
+                        "FROM card_instances ci JOIN card_templates ct ON ci.template_guid=ct.guid "
+                        "WHERE ci.user_id=? AND ci.instance_id=?",
+                         (self.user_profile["id"], instance_id)).fetchone()
                 if row:
                     tpl_guid = row[0]
                     ctype_name = row[1]
@@ -11866,6 +12067,10 @@ class HCPHandler:
                     w(str(card_idx)); sep(); w(str(eidx)); sep(); w(str(ft(ctype_names[2]))); sep(); w("6"); sep()
                     f1 = cbuf.tell(); csizes.append(0)
                     w("Id"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
+                    # card_instance_bits.Id is the raw instance number.  The
+                    # client wraps it as CardId(UID.Type.Card, Id); putting a
+                    # UID type byte into this field changes the instance id
+                    # and makes collection entries fail to match.
                     w(hexlify(struct.pack("<Q", 6000 + card_idx)).decode("ascii")); sep()
                     csizes[-1] = cbuf.tell() - f1
                     f2 = cbuf.tell(); csizes.append(0); tidx = len(csizes)-1
@@ -13491,6 +13696,25 @@ class HCPHandler:
                                    c[8] or 0, 0, champion_talents, c[10] or ""))
         champ_count = len(champ_data)
         log(f">>> Profile push: {champ_count} champions from DB")
+
+        # ReckoningBits.Cards is a List<card_instance_bits>, not an inventory
+        # collection.  Build it from the persisted instances so the client
+        # receives one entry per owned copy (with the raw instance Id that
+        # card_instance_bits/CardId expects).
+        profile_cards = []
+        if self.user_profile:
+            card_rows = _db.execute(
+                "SELECT ci.template_guid, ct.name, ct.cost, ct.attack, "
+                "ct.defense, ci.instance_id, ci.is_extended_art "
+                "FROM card_instances ci JOIN card_templates ct "
+                "ON ct.guid = ci.template_guid WHERE ci.user_id=? "
+                "ORDER BY ci.instance_id", (self.user_profile["id"],)
+            ).fetchall()
+            profile_cards = [
+                (r[0], r[1] or "", r[5], r[2] or 0, r[3] or 0, r[4] or 0)
+                for r in card_rows
+            ]
+        log(f">>> Profile push: {len(profile_cards)} card instances from DB")
         reck = encode_objfmt_response(
              ["Game.Shared.Domain.reckoning_bits",
               "System.UInt64", "System.String", "System.Int32", "System.Int32",
@@ -13529,7 +13753,11 @@ class HCPHandler:
               ("Platinum",   "int",     platinum),
               ("InventoryIds", "coll", ("System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits", inv_count, inv_items)),
                ("Champions", "champlist", ("System.Collections.Generic.List`1#Game.Shared.Domain.champion_bits", champ_count, champ_data)),
-               ("Cards",     "coll", ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
+              # The client receives owned cards as separate card_collection
+              # objects in the profile stream and merges them into this set
+              # before GetUserProfileInfoResponse.  Keep the reckoning_bits
+              # field empty to match that login path.
+              ("Cards",     "coll", ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
                ("Decks",     "coll", ("System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits", 0)),
               ("Profile",    "class", "Game.Shared.Domain.authentication_bits"),
               ("EloRank",    "int",     1500),
@@ -13568,6 +13796,45 @@ class HCPHandler:
                     "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
                 }, ed_dw)
                 log_req(f">>> PUSH EncodedDecks (dt=2210) {deck_count} decks, dw_sz={len(ed_dw)}")
+
+        # The original profile stream sends card_collection objects in
+        # manageable chunks. HandleProfileStream buffers these and appends
+        # every card to reckoning_bits.Cards immediately before loading the
+        # PlayerProfile collection cache.
+        CARD_COLLECTION_CHUNK = 500
+        for start in range(0, len(profile_cards), CARD_COLLECTION_CHUNK):
+            chunk = profile_cards[start:start + CARD_COLLECTION_CHUNK]
+            card_collection = encode_objfmt_response(
+                ["Game.Shared.Domain.card_collection",
+                 "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
+                 "Game.Shared.Domain.card_instance_bits",
+                 "System.UInt64", "Game.Shared.ResourceId", "System.Guid",
+                 "System.Boolean", "System.String"],
+                [("Cards", "cardlist", (
+                    "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
+                    len(chunk), chunk))]
+            )
+            card_profile = encode_objfmt_response(
+                ["Game.Shared.Network.Profile.ProfileStreamEventArgs",
+                 "System.Byte[]", "System.Boolean"],
+                [("Data", "bytes", card_collection),
+                 ("done", "bool", False)]
+            )
+            card_dw = encode_datawrapper(
+                0, 2210, compress_gzip(card_profile), 1,
+                "00000000-0000-0000-0000-000000000000")
+            issuer_cards = (
+                f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+                f"ServicePlayer.{self.client_uid}.{self.scnt}")
+            self.scnt += 1
+            self.send({
+                "issuer": issuer_cards, "target": "ServiceProfile",
+                "instance": "Shared", "reqid": 0, "c": 0, "conh": 0,
+                "sid": self.sid,
+            }, card_dw)
+            log_req(
+                f">>> PUSH card_collection (dt=2210) {len(chunk)} cards, "
+                f"dw_sz={len(card_dw)}")
 
         args2 = encode_objfmt_response(
             ["Game.Shared.Network.Profile.ProfileStreamEventArgs",

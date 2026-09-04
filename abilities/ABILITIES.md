@@ -593,10 +593,14 @@ which the server must reproduce to stay authoritative (§13, §14):
 
 ---
 
-## 13. Server-side pipeline: JSONL → SQLite → BOM
+## 13. Server-side pipeline: JSONL → typed graph + SQLite indexes → BOM
 
-The server does **not** read the JSONL files at runtime. The gamedata is
-materialized into `hconnect.db` at seed time:
+Bootstrap still materializes the extracted data into `hconnect.db` for fast
+runtime indexes and persisted state, but the ability interpreter reads the
+current `Records/` snapshot through `gamedata.RecordStore` at runtime. There is
+one supported card-data version: Records. The SQLite rows are not a second
+rules implementation. Synthetic fixture abilities are adapted in the tests;
+production resolution rejects an ability absent from Records.
 
 1. **`AssetExtraction/gamedata_seed.py`** reads the client gamedata or
    `Records/*.jsonl` and inserts the extracted seed rows into a fresh SQLite
@@ -608,27 +612,26 @@ materialized into `hconnect.db` at seed time:
      activatable_phases, casting_behavior, condition)` — head of the BOM for a
      **talent**: costs + phase + a compact condition spec.
    - `ability_effects(ability_guid, effect_guid, effect_order, effect_type,
-     param)` — the ordered leaf chain, expanded **transitively** through
-     `ActivateAbilityEffectTemplate.m_AbilityToInvoke`. `effect_type` is the
-     concrete class name; `param` is `m_AbilityToInvoke` (or, for
-     `CardModifierAbilityEffectTemplate`, a JSON blob of text/property/amount/
-     duration; for `TACAbilityEffectTemplate`, the serialized TAC data).
+     param)` — a generated runtime index of the ordered leaf chain. The
+     Records graph remains authoritative for effect type, wiring, and typed
+     fields; `param` is only the compact adapter payload consumed by the
+     existing leaf ABI.
    - `card_abilities_meta(ability_guid, casting_behavior, is_manual,
      activation_cost, uses_per_game, uses_per_turn, cooldown, exhausts_on_use,
      is_triggered, target_template_ids, trigger_event_type, game_text, raw_json)` —
-     per-ability activation metadata for **card** abilities, mirroring the
-     talent cost/phase columns, plus `target_template_ids` (JSON list of target
-     GUIDs — the client's targeting picker keys on these) and `raw_json` (the
-     full cleaned ability record so the resolver can data-drive per-effect
-     values at runtime).
+     generated activation/index data for **card** abilities. It mirrors the
+     talent cost/phase columns for queries and client-facing metadata; it is
+     not a second rules-data source. The interpreter reads the current typed
+     AbilityTemplate and effect graph from Records.
    - `target_templates(template_id, game_text)` — target template GUID → text.
    - `champion_abilities(champion_guid, …)` — champion charge powers and their
      cost/game text.
 3. **Resolution**: `abilities.resolve_effect(guid)` returns a registered custom
-   handler (in `abilities/cards/`) or a BOM-walking wrapper that iterates
-   `ability_effects` in `effect_order` and dispatches each `effect_type` to a
-   leaf executor in `_LEAFS` (`abilities/framework/bom.py`), recursing through
-   `ActivateAbilityEffectTemplate` rows via `param`.
+   handler (in `abilities/cards/`) or a BOM-walking wrapper that builds the
+   `AbilityGraph` from Records, adapts its typed effect templates to the leaf
+   ABI, and dispatches each concrete effect type to `_LEAFS`
+   (`abilities/framework/bom.py`). `ActivateAbilityEffectTemplate` recursion
+   follows the typed `m_AbilityToInvoke` field.
 
 ### Data-driven resolution algorithm (target state)
 
@@ -637,30 +640,24 @@ For an ability GUID, build a resolution plan without any card-specific code:
 ```python
 def plan_ability(db, ability_guid):
     """Return an ordered plan for one ability GUID."""
-    meta = db.execute(
-        "SELECT casting_behavior, is_manual, activation_cost, uses_per_game, "
-        "uses_per_turn, cooldown, exhausts_on_use, is_triggered, "
-        "target_template_ids, trigger_event_type, raw_json "
-        "FROM card_abilities_meta WHERE ability_guid=?", (ability_guid,)).fetchone()
+    graph = ability_graph(record_store, ability_guid)
+    if graph is None:
+        raise InvalidCardData(ability_guid)
 
-    target_ids = json.loads(meta[8])          # AbilityTargetTemplate GUIDs, in order
-    targets = [load_target_template(g) for g in target_ids]
-
-    bom = db.execute(
-        "SELECT effect_guid, effect_type, param FROM ability_effects "
-        "WHERE ability_guid=? ORDER BY effect_order", (ability_guid,)).fetchall()
+    targets = graph.targets
+    effects = graph.effects
 
     plan = []
-    for effect_guid, effect_type, param in bom:
-        # 1. Resolve the concrete AbilityEffectTemplate (raw_json or Records/).
-        # 2. Resolve its wiring from the parent ability's m_AbilityEffectList:
+    for effect in effects:
+        # 1. Use the concrete AbilityEffectTemplate from the Records graph.
+        # 2. Use its wiring from the parent ability's m_AbilityEffectList:
         #    effect duration, target index, condition, contingency, optional.
         # 3. Resolve the target template at m_TargetTemplateIndex.
         # 4. Resolve the effect's typed parameters (draw N, summon amount,
         #    destination zone, …) from the effect record fields.
         # 5. Resolve m_Variables to literals / runtime lookups.
         # 6. Dispatch to a leaf executor keyed by effect_type.
-        plan.append((effect_type, effect_guid, param))
+        plan.append(effect)
     return plan
 ```
 
@@ -685,12 +682,12 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 
 | `effect_type` (class name) | Status | Notes |
 |----------------------------|--------|-------|
-| `DrawNCardsAbilityEffectTemplate` | implemented | Uses the typed `m_InputValue` field, including dynamic ability variables; localized text is only a legacy fallback. |
+| `DrawNCardsAbilityEffectTemplate` | implemented | Uses the typed `m_InputValue` field, including dynamic ability variables. |
 | `PutTopOfDeckIntoHandAbilityEffectTemplate` | implemented | Moves AI deck-top to hand. |
 | `DiscardCardAbilityEffectTemplate` | implemented | Moves the metadata-selected hand/choosing card to its owner's discard pile and emits the discard, move, and updated-card events. |
 | `CardModifierAbilityEffectTemplate` | implemented (text-derived) | Amount/property read from `param` JSON when present, else parsed from game text (`+N[ATK]`/`+N[DEF]`, "gain/lose health"). |
-| `SummonTokenTroopAbilityEffectTemplate` | implemented | Uses typed token GUID, amount/amount field, collection/location, exhausted/attacking, filter, and copy-gems fields; links/text are compatibility fallbacks. |
-| `MoveCardToZoneEffectTemplate` | implemented | Reads the typed `m_DestinationCollection` when present, with legacy effect parameters as a fallback; selected revealed cards are reinserted into the deck. |
+| `SummonTokenTroopAbilityEffectTemplate` | implemented | Uses typed token GUID, amount/amount field, collection/location, exhausted/attacking, filter, and copy-gems fields. |
+| `MoveCardToZoneEffectTemplate` | implemented | Reads the typed `m_DestinationCollection`; selected revealed cards are reinserted into the deck. |
 | `BuryCardAbilityEffectTemplate` | implemented | Count from `param` JSON, else 1. |
 | `VoidCardAbilityEffectTemplate` | implemented | Moves the resolved target to Void, emits the client zone events, records the source/voided relationship, and fires exit triggers. |
 | `UntapCardAbilityEffectTemplate` / `TapCardAbilityEffectTemplate` | implemented | Changes the resolved card state and supports metadata auto-target lists. |
@@ -723,40 +720,47 @@ Deploy/Deathcry, `CardAttackedEvent`, `CardBlockedEvent`, `CardInspiredEvent`).
 `TriggerEvent` types; other triggers (e.g. `CardCastEvent`, `SpellCastEvent`,
 `DamageEvent`, …) are not yet wired.
 
-### NOT yet data-driven (work needed)
-- **Target resolution** — targets are currently hand-picked into `bstate`
-  (`player_spell_target`, `player_mod_target`, …) or read from the client
-  transaction; `AbilityTargetTemplate` filters/counts/player/zone logic
-  (`m_PlayerFilter`, `m_CollectionFlags`, `m_CardFilter`, min/max counts,
-  best-effort minimums) is not evaluated server-side.
-- **Costs** — activation/charge/spell/life costs are read per-source
-  (`card_abilities_meta.activation_cost`, `talent_abilities.charge_cost`,
-  `spell_cost`); `m_VariableActivationCost`, `m_VariableActivationCostMinimum`,
-  X-cost card targets, and `m_LifeCost`/`m_SpellPointCost` are not fully enforced.
-- **Durations** — `m_EffectDuration` is captured for CardModifier but the
-  teardown semantics (WhileCardInPlay, EndOfTurn, etc.) are not implemented.
-- **Conditions** — `talent_abilities.condition` supports only the handful of
-  pre-game specs in `conditions.py`; the full
-  `AbilityEffectConditionTemplate`/`m_ConditionId`/`m_AbilityCondition`/
-  `m_TriggerCondition` tree is not evaluated.
-- **Options** — `m_AbilityOptions`/`AbilityOptionEntry` choices are not
-  prompted/consumed.
-- **Variables** — `m_Variables[]` literals are read for CardModifier/Replenish;
-  the `AbilityVariable`/`EffectField`/`TargetField` value resolution is not
-  generalised.
-- **Output variables** — `m_OutputVariables` → `EffectOutputVariable` feedback
-  is not implemented.
-- **Limits** — `m_UsesPerTurn`/`m_UsesPerGame`/`m_Cooldown` are stored but not
-  enforced as counters.
-- **`m_SerializedTAC`** — only the Shift path in `tac.py` is decoded.
+### Shared activation/play boundary
+
+`gamedata.PlayPlan` and `gamedata.AbilityInstance` now mirror the client's
+`AbilityInstance`/`AbilityActivationData` boundary. They preserve the card's
+resource/variable/life/threshold metadata, separate card-play abilities from
+triggered abilities, expose typed prompts for target/option/variable/X/additional
+cost input, normalize `TargetMap`/`OptionMap`, validate target and payment
+counts, and order effects by `m_EffectGroupId` then `m_EffectInstanceId`. The
+live resolver uses the same Records-backed instance and a small adapter for the
+existing leaf ABI. `PlayPlan.activation_bundle()` preserves the client’s single
+card-play selection payload while partitioning card-cost targets from each
+ability’s authored target-template indexes; those activation maps travel with
+the chain item into resolution. `PlayPlan.cost_instances` is also the source
+for the client CostInstance presentation, including min/max bounds and all
+authored card-cost kinds. HConnect and PvP card-play presentation, target
+availability, payment targets, X costs, and ability dispatch consume this plan
+directly. The current Records snapshot is the only supported card-data version;
+compact SQLite tables are runtime indexes. Synthetic interpreter fixtures are
+adapted in the test module only. A production card or ability missing from
+Records is invalid installation data, not an alternate rules version.
+
+### Remaining boundaries
+
+- **Continuous statics** — the on-demand aura/stat calculator still consumes
+  generated SQLite indexes for efficient board queries; those rows are
+  materialized from the current Records snapshot and are not an alternate
+  card-data version.
+- **Pre-game conditions** — the separate campaign/talent pre-game adapter
+  supports its authored condition set; it is not a second general ability
+  interpreter.
+- **`m_SerializedTAC`** — only the TAC operations currently required by the
+  server are decoded; unknown operations fail closed rather than selecting a
+  legacy implementation.
 
 ---
 
 ## 15. Warnings & gotchas
 
-1. **Do not hardcode per-card logic.** Prefer fields in the record; treat
-   `m_GameText` parsing as a fallback, never the source of truth, because it is
-   a *localization key* whose runtime value is pulled from `localization.db`.
+1. **Do not hardcode per-card logic.** Prefer fields in the record. The current
+   execution path has no alternate gamedata version; `m_GameText` is display
+   data and must not select rules behavior.
 2. **Effect class names change.** `RandomizeVariableEffectTemplate` vs the stale
    `RandomizeVariableAbilityEffectTemplate` registered in `bom.py` is one
    example. Derive the dispatch key from the record's `_t` (last segment), not

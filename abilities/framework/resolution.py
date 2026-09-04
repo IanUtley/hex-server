@@ -28,11 +28,16 @@ import game_engine
 
 from .condition_engine import ConditionContext, evaluate_effect_condition
 from .bom import _LEAFS
-from .fields import (ability_record, ability_variables, effect_template,
+from .fields import (ability_variables, effect_template,
                      effect_template_value, resolve_field)
 from .targeting import (legal_targets, evaluate_card_filter,
                          validate_target_selection)
 from ._shared import pvp_champion_uid, pvp_opponent_pid
+from gamedata import RecordStore, ability_graph, runtime_effects
+from gamedata.play_plan import AbilityInstance, ActivationData
+
+
+_RECORD_STORE = RecordStore()
 
 
 def _parse_param(param):
@@ -46,159 +51,19 @@ def _parse_param(param):
 
 
 def _effect_list(db, ability_guid):
-    rows = db.execute(
-        "SELECT effect_guid, effect_order, effect_type, param, "
-        "effect_group_id, condition_id, target_index, "
-        "effect_instance_id, contingent_effect_instance_id, "
-        "secondary_target_index, recalculate_targets, is_optional, "
-        "effect_duration, output_variables "
-        "FROM ability_effects WHERE ability_guid=? ORDER BY effect_order",
-        (ability_guid,)).fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "effect_guid": r[0],
-            "effect_order": r[1],
-            "effect_type": r[2] or "",
-            "param": r[3] or "",
-            "effect_group_id": int(r[4] or 0),
-            "condition_id": r[5] or "",
-            "target_index": int(r[6] if r[6] is not None else -1),
-            "effect_instance_id": int(r[7] if r[7] is not None else -1),
-            "contingent_effect_instance_id": int(r[8] if r[8] is not None else -1),
-            "secondary_target_index": int(r[9] if r[9] is not None else -1),
-            "recalculate_targets": int(r[10] if r[10] is not None else -1),
-            "is_optional": int(r[11] or 0),
-            "effect_duration": r[12] or "Instant",
-            "output_variables": r[13] or "{}",
-        })
-    if out:
-        # Some development databases contain the BOM rows but predate the
-        # parent-level effect metadata columns being populated.  A target
-        # index of -1 is valid for targetless effects, but group 0 is never an
-        # authored effect group.  Recover the missing wiring from the
-        # authoritative AbilityTemplate so conditional branches (such as
-        # Skylak's twelve monthly Zodiac effects) cannot all execute.
-        if any(effect["effect_group_id"] == 0 for effect in out):
-            record = ability_record(db, ability_guid)
-            for order, entry in enumerate(
-                    record.get("m_AbilityEffectList") or []):
-                if order >= len(out) or not isinstance(entry, dict):
-                    continue
-                effect = out[order]
-                def _index(value, default=-1):
-                    if value is None:
-                        return default
-                    try:
-                        return int(value)
-                    except (TypeError, ValueError):
-                        return default
-                condition_id = str(
-                    (entry.get("m_ConditionId") or {}).get("m_Guid")
-                    or "").lower()
-                if condition_id == "00000000-0000-0000-0000-000000000000":
-                    condition_id = ""
-                effect["effect_group_id"] = _index(
-                    entry.get("m_EffectGroupId"), effect["effect_group_id"])
-                effect["condition_id"] = condition_id
-                effect["target_index"] = _index(
-                    entry.get("m_TargetTemplateIndex"), effect["target_index"])
-                effect["effect_instance_id"] = _index(
-                    entry.get("m_EffectInstanceId"),
-                    effect["effect_instance_id"])
-                effect["contingent_effect_instance_id"] = _index(
-                    entry.get("m_ContingentEffectInstanceId"),
-                    effect["contingent_effect_instance_id"])
-                effect["secondary_target_index"] = _index(
-                    entry.get("m_SecondaryTargetIndex"),
-                    effect["secondary_target_index"])
-                recalc = entry.get("m_RecalculateTargets")
-                effect["recalculate_targets"] = {
-                    "True": 1, "False": 0, "UseDefault": -1,
-                }.get(str(recalc), effect["recalculate_targets"])
-                effect["is_optional"] = _index(
-                    entry.get("m_IsOptional"), effect["is_optional"])
-                effect["effect_duration"] = (
-                    entry.get("m_EffectDuration") or effect["effect_duration"])
-                effect["output_variables"] = json.dumps(
-                    entry.get("m_OutputVariables") or {})
-        return out
-    # Recover an unmaterialized transitive grant directly from the extracted
-    # AbilityTemplate.  This keeps the resolver data-driven for abilities that
-    # are referenced only by a GrantAbility child.
-    record = ability_record(db, ability_guid)
-    for order, entry in enumerate(record.get("m_AbilityEffectList") or []):
-        if not isinstance(entry, dict):
-            continue
-        effect = entry.get("m_EffectTemplateId") or {}
-        effect_guid = str(effect.get("m_Guid") or "").lower()
-        template = effect_template(effect_guid) or {}
-        effect_type = str(template.get("_t") or "").rsplit(".", 1)[-1]
-        param = ""
-        if effect_type == "ActivateAbilityEffectTemplate":
-            param = str((template.get("m_AbilityToInvoke") or {}).get(
-                "m_Guid") or "").lower()
-        elif effect_type == "GrantAbilityEffectTemplate":
-            param = str((template.get("m_GrantedAbilityTemplateId") or {}).get(
-                "m_Guid") or "").lower()
-        elif effect_type == "CardModifierAbilityEffectTemplate":
-            modifier = template.get("m_Modifier") or {}
-            kind = str(modifier.get("_t") or "").rsplit(".", 1)[-1]
-            prop = {"DamageModifier": "damage",
-                    "AttackModifier": "attack",
-                    "DefenseModifier": "defense"}.get(kind, "")
-            param = json.dumps({"property": prop, "amount": 0,
-                                "duration": entry.get("m_EffectDuration",
-                                                         "Instant")})
-        out.append({
-            "effect_guid": effect_guid,
-            "effect_order": order,
-            "effect_type": effect_type,
-            "param": param,
-            "effect_group_id": int(entry.get("m_EffectGroupId", order + 1) or 0),
-            "condition_id": str((entry.get("m_ConditionId") or {}).get(
-                "m_Guid") or "").lower(),
-            # Zero is the first (and most common) target-template index; do
-            # not turn it into -1 through a truthiness fallback.
-            "target_index": int(entry.get("m_TargetTemplateIndex", -1)
-                                 if entry.get("m_TargetTemplateIndex") is not None
-                                 else -1),
-            "effect_instance_id": int(entry.get("m_EffectInstanceId", order) or 0),
-            "contingent_effect_instance_id": int(entry.get(
-                "m_ContingentEffectInstanceId", -1) or -1),
-            "secondary_target_index": int(entry.get("m_SecondaryTargetIndex", -1) or -1),
-            "recalculate_targets": 1 if str(entry.get("m_RecalculateTargets", "")).lower() == "true" else 0,
-            "is_optional": int(entry.get("m_IsOptional", 0) or 0),
-            "effect_duration": entry.get("m_EffectDuration") or "Instant",
-            "output_variables": json.dumps(entry.get("m_OutputVariables") or {}),
-        })
-    return out
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        raise RuntimeError(
+            f"ability {str(ability_guid).lower()} is missing from current Records")
+    return list(runtime_effects(graph))
 
 
 def _target_template_ids(db, ability_guid):
-    # Card abilities, PvP champion powers, and PvE talent abilities all use
-    # the same AbilityTemplate target contract.  Champion/talent abilities
-    # are not necessarily present in card_abilities_meta.
-    for table in ("card_abilities_meta", "champion_abilities",
-                  "talent_abilities"):
-        try:
-            row = db.execute(
-                "SELECT target_template_ids FROM %s "
-                "WHERE ability_guid=? LIMIT 1" % table,
-                (str(ability_guid).lower(),)).fetchone()
-        except Exception:
-            row = None
-        if not row or not row[0]:
-            continue
-        try:
-            tids = json.loads(row[0])
-        except (ValueError, TypeError):
-            continue
-        return [str(t).lower() for t in (tids or []) if t]
-    record = ability_record(db, ability_guid)
-    return [str(item.get("m_Guid") or "").lower()
-            for item in (record.get("m_AbilityTargetTemplateIds") or [])
-            if isinstance(item, dict) and item.get("m_Guid")]
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        raise RuntimeError(
+            f"ability {str(ability_guid).lower()} is missing from current Records")
+    return [target.guid for target in graph.targets]
 
 
 def _target_template(db, template_id):
@@ -221,6 +86,29 @@ def _target_template(db, template_id):
         "max_target_count": int(row[9] or 1),
         "filter_json": row[10] or "{}",
         "target_kind": row[11] or "",
+    }
+
+
+def _target_template_from_spec(spec):
+    """Adapt one current Records TargetSpec for the targeting ABI."""
+    if spec is None:
+        return None
+    card_filter = spec.card_filter
+    if hasattr(card_filter, "to_dict"):
+        card_filter = card_filter.to_dict()
+    return {
+        "template_id": spec.guid,
+        "game_text": spec.name or "",
+        "is_auto_target": int(spec.is_auto),
+        "is_random_target": int(spec.is_random),
+        "optional": int(spec.optional),
+        "explicit": int(spec.explicit),
+        "player_filter": spec.player_filter or "",
+        "collection_flags": spec.collection_flags or "",
+        "min_target_count": int(spec.minimum or 0),
+        "max_target_count": int(spec.maximum or 0),
+        "filter_json": card_filter or {},
+        "target_kind": spec.target_kind or "",
     }
 
 
@@ -370,6 +258,14 @@ def _auto_target_uids(db, handler, bstate, session, ability_guid, source_uid,
             "VoidedCards")
         if voided is None:
             voided = (bstate or {}).get("champion_void_uids") or []
+        # Card-scoped void relationships are recorded by the void leaf under
+        # the resolving source card.  This is the generic client meaning of
+        # VoidedTargetTemplate for abilities such as "put each card voided by
+        # it into play"; it is not limited to champion void effects.
+        if not voided:
+            source_voided = ((bstate or {}).get("voided_by") or {}).get(
+                str(int(source_uid))) if source_uid is not None else None
+            voided = source_voided or []
         return [int(uid) for uid in voided if uid is not None], True
     if kind in ("SourceRevealedTargetTemplate", "SourceDrawnTargetTemplate",
                 "SourceBuriedTargetTemplate", "SourceStoredTargetTemplate"):
@@ -426,7 +322,7 @@ def _fallback_target_uid(bstate):
 def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     ability_guid, source_uid, owner_id, target_map=None,
                     variables=None, depth=0, root_ability_guid=None,
-                    resume_from_order=None):
+                    resume_from_order=None, activation_data=None):
     """Resolve an ability's BOM data-driven, mirroring the client's
     authoritative AbilityInstance: effects run group-by-group in order, each
     gated by its gamedata condition and contingencies, with ability variables
@@ -434,13 +330,52 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     if depth > 16:
         return "resolution depth exceeded"
     bstate = bstate or {}
-    supplied_variables = dict(variables or {})
-    variables = ability_variables(db, ability_guid)
+    incoming_activation = (ActivationData.from_dict(activation_data)
+                           if activation_data is not None else None)
+    if incoming_activation is not None:
+        if target_map is None:
+            target_map = incoming_activation.target_map
+        supplied_variables = dict(incoming_activation.variables)
+        supplied_variables.update(variables or {})
+    else:
+        supplied_variables = dict(variables or {})
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is not None:
+        variables = {
+            str(variable.field("m_Name", "")): int(
+                variable.field("m_DefaultValue", 0) or 0)
+            for variable in graph.variables
+            if variable.field("m_Name")
+        }
+    else:
+        # Synthetic unit tests may replace the two runtime loaders with an
+        # explicit fixture adapter. Production abilities are Records-backed
+        # and fail below when no graph is available.
+        variables = ability_variables(db, ability_guid)
     variables.update(supplied_variables)
     if root_ability_guid is None:
         root_ability_guid = ability_guid
     target_map = dict(target_map or {})
-    tids = _target_template_ids(db, ability_guid)
+    if graph is not None:
+        tids = [target.guid for target in graph.targets]
+        effect_rows = list(runtime_effects(graph))
+    else:
+        tids = _target_template_ids(db, ability_guid)
+        effect_rows = _effect_list(db, ability_guid)
+    activation = incoming_activation or ActivationData.from_values(
+        target_map=target_map, variables=supplied_variables)
+    if graph is not None:
+        ability_instance = AbilityInstance.from_graph(
+            graph, source_uid=source_uid, owner_id=owner_id,
+            responsible_player_id=owner_id, activation=activation,
+            store=_RECORD_STORE)
+    else:
+        # Explicit test adapters only; live resolution never reaches this
+        # branch because the current Records graph is required.
+        ability_instance = AbilityInstance.from_runtime(
+            ability_guid, effect_rows, len(tids), source_uid=source_uid,
+            owner_id=owner_id, activation=activation)
+    target_map = dict(activation.target_map)
     logs = []
     # m_WasApplied per effect instance (contingencies test it), plus a
     # (ability_guid, effect_order) dedupe so duplicate rows (double-seeded
@@ -477,12 +412,18 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     # Group the effect list by m_EffectGroupId, preserving effect order.
     groups = {}
     order = []
-    for eff in _effect_list(db, ability_guid):
+    for eff in ability_instance.ordered_effects:
         gid = eff["effect_group_id"]
         if gid not in groups:
             groups[gid] = []
             order.append(gid)
         groups[gid].append(eff)
+
+    def _target_at(index):
+        if graph is not None and 0 <= index < len(ability_instance.targets):
+            return _target_template_from_spec(ability_instance.targets[index])
+        return _target_template(
+            db, tids[index] if 0 <= index < len(tids) else "")
 
     def _condition_met(eff):
         cid = eff["condition_id"]
@@ -522,10 +463,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         # reads the target filter's TopN value and selects the cards itself.
         if eff.get("effect_type") == "RevealCardsAbilityEffectTemplate":
             return ([int(source_uid)] if source_uid is not None else [None]), False
-        if 0 <= tidx < len(tids):
-            template = _target_template(db, tids[tidx])
-        else:
-            template = None
+        template = _target_at(tidx)
 
         def _validate_selected(values):
             if template is None or not values:
@@ -936,9 +874,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 continue
             uids, needs_prompt = _resolve_targets(eff)
             if needs_prompt:
-                logs.append(_prompt_or_auto_pick(eff, _target_template(
-                    db, (tids[eff["target_index"]]
-                         if 0 <= eff["target_index"] < len(tids) else ""))))
+                logs.append(_prompt_or_auto_pick(
+                    eff, _target_at(eff["target_index"])))
                 applied[inst_id] = False
                 if bstate.get("resolution_paused"):
                     break
@@ -949,9 +886,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             if bstate.get("resolution_paused"):
                 applied[inst_id] = False
                 break
-            target_template = _target_template(
-                db, (tids[eff["target_index"]]
-                     if 0 <= eff["target_index"] < len(tids) else ""))
+            target_template = _target_at(eff["target_index"])
             # An explicit SourceRevealed target can legitimately have no
             # legal cards (Oakhenge Ceremony when the reveal contains no
             # troops).  Treat that effect as a no-op.  Running the leaf with

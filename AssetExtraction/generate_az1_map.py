@@ -13,6 +13,7 @@ import html
 import json
 import math
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,11 +35,23 @@ class Transform:
 
 
 @dataclass(frozen=True)
+class NodeDetails:
+    encounters: tuple[str, ...] = ()
+    champions: tuple[str, ...] = ()
+    conversations: tuple[str, ...] = ()
+    pre_conversations: tuple[str, ...] = ()
+    post_conversations: tuple[str, ...] = ()
+    quest_starts: tuple[str, ...] = ()
+    quest_finishes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Node:
     node_id: str
     title: str
     terrain: str
     position: tuple[float, float, float]
+    details: NodeDetails = NodeDetails()
 
 
 def vec(value) -> tuple[float, float, float]:
@@ -143,6 +156,126 @@ def scene_labels(records_path: Path) -> dict[str, tuple[str, str]]:
     return labels
 
 
+def champion_names(records_path: Path) -> dict[str, str]:
+    names = {}
+    path = records_path.parent / "ChampionTemplate.jsonl"
+    if not path.exists():
+        return names
+    for line_number, line in enumerate(path.open(encoding="utf-8"), 1):
+        if line_number == 1 or not line.strip():
+            continue
+        try:
+            outer = json.loads(line)
+            record = json.loads(outer) if isinstance(outer, str) else outer
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        guid = (record.get("m_Id") or {}).get("m_Guid")
+        if guid and record.get("m_Name"):
+            names[str(guid).lower()] = str(record["m_Name"]).strip()
+    return names
+
+
+def scene_node_id(scene_name: str) -> str | None:
+    match = re.search(r"\bNODE\s*-?\s*([0-9]+|[A-Z])", scene_name or "", re.I)
+    if not match:
+        return None
+    token = match.group(1).upper()
+    return f"Node{int(token):03d}" if token.isdigit() else f"Node00{token}"
+
+
+def conversation_label(name: str) -> str:
+    parts = [part.strip() for part in str(name or "").split(" - ", 2)]
+    return parts[2] if len(parts) == 3 else str(name or "")
+
+
+def load_node_details(database_path: Path, records_path: Path) -> dict[str, NodeDetails]:
+    """Load authored AZ1 encounter/conversation details when the DB exists."""
+    if not database_path.exists():
+        return {}
+    champion_map = champion_names(records_path)
+    details = {}
+    try:
+        db = sqlite3.connect(str(database_path))
+        scene_rows = db.execute(
+            "SELECT name, title, ai_champion_guid FROM encounter_scenes "
+            "WHERE name LIKE 'AZ 1 - NODE %' "
+            "AND TRIM(COALESCE(ai_champion_guid, '')) <> '' "
+            "AND ai_champion_guid <> '00000000-0000-0000-0000-000000000000' "
+            "ORDER BY name"
+        ).fetchall()
+        conversation_rows = db.execute(
+            "SELECT node_id, conversation_name, trigger_json "
+            "FROM campaign_node_conversations "
+            "WHERE campaign_template='AZ1' AND enabled=1 "
+            "ORDER BY node_id, priority, conversation_guid"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        try:
+            db.close()
+        except UnboundLocalError:
+            pass
+
+    accumulated = {}
+    for scene_name, scene_title, champion_guid in scene_rows:
+        node_id = scene_node_id(scene_name)
+        if not node_id:
+            continue
+        entry = accumulated.setdefault(node_id, {
+            "encounters": [], "champions": [], "conversations": [],
+            "pre": [], "post": [],
+            "starts": [], "finishes": [],
+        })
+        encounter = str(scene_title or "").strip() or re.sub(
+            r"^AZ\s*1\s*-\s*NODE\s*-?\s*[0-9A-Z]+\s*-\s*",
+            "", str(scene_name), flags=re.I).strip()
+        if encounter and encounter not in entry["encounters"]:
+            entry["encounters"].append(encounter)
+        champion = champion_map.get(str(champion_guid or "").lower(),
+                                    str(champion_guid or ""))
+        if champion and champion not in entry["champions"]:
+            entry["champions"].append(champion)
+
+    for node_id, name, raw_trigger in conversation_rows:
+        entry = accumulated.setdefault(node_id, {
+            "encounters": [], "champions": [], "conversations": [],
+            "pre": [], "post": [],
+            "starts": [], "finishes": [],
+        })
+        label = conversation_label(name)
+        lower = label.lower()
+        try:
+            trigger = json.loads(raw_trigger or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trigger = {}
+        outcome = str((trigger or {}).get("outcome") or "").lower()
+        if "quest start" in lower:
+            entry["starts"].append(label)
+        elif "quest end" in lower:
+            entry["finishes"].append(label)
+        elif "quest not complete" not in lower and "quest completed" not in lower:
+            bucket = "post" if outcome in {"success", "fail"} else "pre"
+            entry[bucket].append(label)
+
+    return {
+        node_id: NodeDetails(
+            encounters=tuple(values["encounters"]),
+            champions=tuple(values["champions"]),
+            conversations=(tuple(values["pre"])
+                           if not values["encounters"] else ()),
+            pre_conversations=(tuple(values["pre"])
+                               if values["encounters"] else ()),
+            post_conversations=tuple(values["post"]),
+            quest_starts=tuple(values["starts"]),
+            quest_finishes=tuple(values["finishes"]),
+        )
+        for node_id, values in accumulated.items()
+    }
+
+
 def extract(resources_path: Path, records_path: Path):
     env = UnityPy.load(str(resources_path))
     prefab = next((obj for obj in env.objects if obj.path_id == PREFAB_PATH_ID), None)
@@ -216,6 +349,61 @@ COLORS = {
     "Other": "#777777",
 }
 
+STATUS_COLORS = {
+    "quest_start": "#52d6ff",
+    "quest_finish": "#ffd166",
+    "encounter": "#ff4d6d",
+    "pre_conversation": "#c084fc",
+    "post_conversation": "#ff8c69",
+}
+
+STATUS_LABELS = {
+    "quest_start": "Quest start",
+    "quest_finish": "Quest finish",
+    "encounter": "Encounter",
+    "pre_conversation": "Pre-encounter conversation",
+    "post_conversation": "Post-encounter conversation",
+}
+
+
+def node_statuses(node: Node) -> list[str]:
+    details = node.details
+    statuses = []
+    if details.quest_starts:
+        statuses.append("quest_start")
+    if details.quest_finishes:
+        statuses.append("quest_finish")
+    if details.encounters:
+        statuses.append("encounter")
+    if details.pre_conversations and details.encounters:
+        statuses.append("pre_conversation")
+    if details.post_conversations and details.encounters:
+        statuses.append("post_conversation")
+    return statuses
+
+
+def node_tooltip(node: Node) -> str:
+    details = node.details
+    lines = [f"{node.node_id} — {node.title}", f"Terrain: {node.terrain}",
+             f"Unity: {node.position}"]
+    if details.quest_starts:
+        lines.append("Quest start: " + "; ".join(details.quest_starts))
+    if details.quest_finishes:
+        lines.append("Quest finish: " + "; ".join(details.quest_finishes))
+    if details.encounters:
+        lines.append("Encounter: " + "; ".join(details.encounters))
+    if details.champions:
+        lines.append("Champion: " + "; ".join(details.champions))
+    if details.conversations:
+        lines.append("Conversation: " + "; ".join(details.conversations))
+    if details.pre_conversations:
+        lines.append("Pre-encounter conversation: " +
+                     "; ".join(details.pre_conversations))
+    if details.post_conversations:
+        lines.append("Post-encounter conversation: " +
+                     "; ".join(details.post_conversations))
+    return "\n".join(lines)
+
 
 def natural_key(value: str):
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", value)]
@@ -272,26 +460,37 @@ def write_svg(output: Path, nodes, paths, project):
         x, y = project(node.position)
         color = COLORS.get(node.terrain, COLORS["Other"])
         radius = 9 if node_id != "Node001" else 13
-        title = html.escape(f"{node_id} — {node.title} ({node.terrain}); Unity {node.position}")
-        lines.append(f'<g><title>{title}</title><circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" stroke="#ffffff" stroke-width="2"/>')
-        lines.append(f'<text x="{x + 13:.1f}" y="{y + 4:.1f}" fill="#f3f6f7" font-family="sans-serif" font-size="12">{html.escape(node_id)}</text></g>')
+        tooltip = html.escape(node_tooltip(node))
+        lines.append(f'<g><title>{tooltip}</title>')
+        for index, status in enumerate(node_statuses(node)):
+            lines.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius + 4 + index * 3:.1f}" fill="none" stroke="{STATUS_COLORS[status]}" stroke-width="2"/>')
+        lines.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" stroke="#ffffff" stroke-width="2"/>')
+        lines.append(f'<text x="{x + 13:.1f}" y="{y + 4:.1f}" fill="#f3f6f7" font-family="sans-serif" font-size="12">{html.escape(node.title)}</text></g>')
     lines += [
         '<rect x="2010" y="30" width="560" height="1810" rx="16" fill="#172630" stroke="#4d6570" stroke-width="2"/>',
         '<text x="2040" y="75" fill="#f3f6f7" font-family="sans-serif" font-size="24" font-weight="bold">AZ1 node key</text>',
-        '<text x="2040" y="103" fill="#aebfc6" font-family="sans-serif" font-size="14">Hover a node for its Unity coordinates.</text>',
+        '<text x="2040" y="103" fill="#aebfc6" font-family="sans-serif" font-size="14">Fill = terrain; rings = authored quest, encounter, and conversation metadata.</text>',
     ]
+    status_positions = [(2040, 126), (2220, 126), (2400, 126),
+                        (2040, 160), (2220, 160)]
+    for status, (x, y) in zip(STATUS_LABELS, status_positions):
+        lines.append(f'<circle cx="{x + 6}" cy="{y - 5}" r="6" fill="none" stroke="{STATUS_COLORS[status]}" stroke-width="2"/>')
+        lines.append(f'<text x="{x + 18}" y="{y}" fill="#aebfc6" font-family="sans-serif" font-size="10">{STATUS_LABELS[status]}</text>')
     sorted_nodes = sorted(nodes.values(), key=lambda node: natural_key(node.node_id))
     col_x = [2040, 2220, 2400]
     for index, node in enumerate(sorted_nodes):
         column = index // 27
         row = index % 27
         x = col_x[column]
-        y = 140 + row * 60
+        y = 205 + row * 60
         color = COLORS.get(node.terrain, COLORS["Other"])
+        lines.append(f'<g><title>{html.escape(node_tooltip(node))}</title>')
         lines.append(f'<circle cx="{x + 6}" cy="{y - 5}" r="6" fill="{color}"/>')
-        lines.append(f'<text x="{x + 18}" y="{y}" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">{html.escape(node.node_id)}</text>')
+        for status in node_statuses(node):
+            lines.append(f'<circle cx="{x + 6}" cy="{y - 5}" r="8" fill="none" stroke="{STATUS_COLORS[status]}" stroke-width="1.5"/>')
         title = html.escape(node.title[:25] + ("…" if len(node.title) > 25 else ""))
-        lines.append(f'<text x="{x + 18}" y="{y + 16}" fill="#aebfc6" font-family="sans-serif" font-size="10">{title}</text>')
+        lines.append(f'<text x="{x + 18}" y="{y}" fill="#f3f6f7" font-family="sans-serif" font-size="12" font-weight="bold">{title}</text>')
+        lines.append(f'<text x="{x + 18}" y="{y + 16}" fill="#aebfc6" font-family="sans-serif" font-size="10">{html.escape(node.node_id)}</text></g>')
     lines.append('</svg>')
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -330,12 +529,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-root", type=Path, default=DEFAULT_CLIENT_ROOT)
     parser.add_argument("--records", type=Path, default=Path("Records/SceneData.jsonl"))
+    parser.add_argument("--database", type=Path, default=Path("hconnect.db"))
     parser.add_argument("--output", type=Path, default=Path("docs/az1-node-map"))
     args = parser.parse_args()
     resources = args.client_root / "Hex_Data" / "resources.assets"
     if not resources.exists():
         raise SystemExit(f"Missing Unity resources file: {resources}")
+    details = load_node_details(args.database, args.records)
     nodes, paths = extract(resources, args.records)
+    nodes = {
+        node_id: Node(node.node_id, node.title, node.terrain, node.position,
+                      details.get(node_id, NodeDetails()))
+        for node_id, node in nodes.items()
+    }
     if len(nodes) < 70:
         raise SystemExit(f"Refusing to generate incomplete map: found only {len(nodes)} nodes")
     args.output.parent.mkdir(parents=True, exist_ok=True)

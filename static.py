@@ -14,6 +14,11 @@ import json
 DDL = [
     # --- players / accounts -------------------------------------------------
     """
+    CREATE TABLE IF NOT EXISTS system_properties (
+        version INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
@@ -1107,14 +1112,16 @@ CRAYBURN_PACK_CARD_SEEDS = {
 # AZ1 map topology.  Node positions and visuals remain client-owned by the
 # NodesPrefab; the server only needs the graph to validate movement and reveal
 # fog-of-war neighbours.  This seed contains the authored opening route and
-# the confirmed direct Dunnwood -> Road of Oaks branch.  Additional extracted
-# edges can be inserted without changing campaign logic.
+# the confirmed direct Dunnwood -> Road of Oaks branch, including the authored
+# path-fork links around the Zila bridge.  Additional extracted edges can be
+# inserted without changing campaign logic.
 _AZ1_PATH_NAMES = """
 Path_Node001_Node002 Path_Node002_Node003 Path_Node003_Node004
 Path_Node003_Node005 Path_Node003_Node007 Path_Node005_Node006
 Path_Node007_Node009 Path_Node007_Node00R Path_Node008_Node025
 Path_Node009_Node010 Path_Node009_Node012 Path_Node00R_Node012
-Path_Node00R_Node025 Path_Node00X_Node021 Path_Node00Y_Node00Z
+Path_Node00R_Node025 Path_Fork001_Node012 Path_Fork001_Node013
+Path_Fork001_Node014 Path_Node00X_Node021 Path_Node00Y_Node00Z
 Path_Node00Y_Node048 Path_Node011_Node025 Path_Node012_Node015
 Path_Node013_Node016 Path_Node015_Node016 Path_Node016_Node017
 Path_Node016_Node018 Path_Node016_Node019 Path_Node016_Node030
@@ -1244,6 +1251,16 @@ def ensure_schema(db):
     """
     for stmt in DDL:
         db.execute(stmt)
+    db.commit()
+
+    # Keep the schema version in the database so release-time upgrades can
+    # distinguish fresh databases from older player databases.  Do not add a
+    # second row when ensure_schema runs again.
+    db.execute(
+        "INSERT INTO system_properties(version) "
+        "SELECT 1 WHERE NOT EXISTS "
+        "(SELECT 1 FROM system_properties)"
+    )
     db.commit()
 
     # Seed map topology independently of SceneData.  Store both directions so
@@ -1463,6 +1480,23 @@ def ensure_schema(db):
     # campaign scene resolves to an encounter deck whose card list is absent,
     # and setup falls back to template-less placeholder cards.
     try:
+        # Resolve the Tamed encounter set from the quest objectives rather
+        # than maintaining a second list of encounter names/GUIDs. This keeps
+        # existing databases and freshly extracted seeds aligned if the quest
+        # gains another creature objective.
+        tamed_scene_guids = set()
+        tamed_row = db.execute(
+            "SELECT objectives_json FROM quest_templates "
+            "WHERE script_name='az01_tamed' LIMIT 1"
+        ).fetchone()
+        try:
+            tamed_objectives = json.loads(tamed_row[0] or "[]") if tamed_row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            tamed_objectives = []
+        for objective in tamed_objectives if isinstance(tamed_objectives, list) else []:
+            if isinstance(objective, dict) and objective.get("encounter"):
+                tamed_scene_guids.add(str(objective["encounter"]).lower())
+
         ecols = {r[1] for r in db.execute("PRAGMA table_info(encounter_scenes)")}
         if "ai_champion_guid" not in ecols:
             db.execute("ALTER TABLE encounter_scenes ADD COLUMN ai_champion_guid TEXT")
@@ -1524,11 +1558,11 @@ def ensure_schema(db):
                 amount = 200
             else:
                 amount = 100
-            # Currency is repeatable for repeatable encounters.  Wild Cub's
-            # conditional captured-card reward is a separate one-time record;
-            # keeping it separate prevents an old claim from suppressing the
-            # next run's normal gold/XP.
-            if (ename or "").upper() == "AZ 1 - NODE 03 - WILD CUB":
+            # Currency is repeatable for repeatable encounters. Every
+            # encounter referenced by the AZ01 Tamed quest gets a separate
+            # one-time captured-card reward; a win without capture therefore
+            # leaves its map node retryable until the objective is satisfied.
+            if str(eguid).lower() in tamed_scene_guids:
                 rewards.pop("gold", None)
                 rewards.pop("xp", None)
                 rewards.pop("one_time", None)
@@ -1540,22 +1574,6 @@ def ensure_schema(db):
                     {"end_of_game_condition": {
                         "type": "void_tamed_troop", "owner": "opponent"},
                      "card_guid": "$condition.template_guid",
-                     "quantity": 1, "one_time": True},
-                ]
-            elif (ename or "").upper() == "AZ 1 - NODE 09 - COCKATWICE CHICK":
-                # Cockatwice awards Effigy of Nulzann once on a successful
-                # completion.  Keep the normal currency reward repeatable,
-                # while making the card its own one-time claim so retries do
-                # not duplicate it.
-                rewards.pop("gold", None)
-                rewards.pop("xp", None)
-                rewards.pop("one_time", None)
-                rewards.pop("end_of_game_condition", None)
-                rewards.pop("card_guid", None)
-                rewards.pop("quantity", None)
-                rewards["end_of_game_rewards"] = [
-                    {"gold": amount, "xp": amount, "one_time": False},
-                    {"card_guid": "3b18b39a-ff4f-4ecf-b7a8-c446f9d89bb0",
                      "quantity": 1, "one_time": True},
                 ]
             else:

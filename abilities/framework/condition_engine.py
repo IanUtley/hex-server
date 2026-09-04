@@ -8,6 +8,7 @@ Unknown/unmodeled condition types default to True so they never wrongly block.
 
 import datetime
 import json
+from collections.abc import Mapping
 
 import game_engine
 
@@ -159,11 +160,10 @@ class ConditionContext:
                 (self.session.session_id, key)).fetchone()
             if row:
                 self._cards[key] = {
-                    # Keep the event card visible even if a legacy/fallback
-                    # game-card row has no matching template.  Conditions
-                    # such as IsSubType(Spider) must then fail closed from
-                    # the available card_type/subtype data; returning None
-                    # here made every typed trigger condition default True.
+                    # Keep the event card visible even if its runtime template
+                    # row is absent. Conditions such as IsSubType(Spider)
+                    # then fail closed from the available card_type/subtype
+                    # data; returning None would default every condition True.
                     "card_uid": int(row[0]), "card_type": row[1] or "",
                     "location": row[2], "user_id": row[3],
                     "state": int(row[4] or 0), "attack": row[5],
@@ -576,14 +576,21 @@ def evaluate_effect_condition(db, condition_id, ctx):
 
 
 def trigger_condition_met(raw_json, ctx):
-    """Evaluate the ability's m_AbilityCondition + m_TriggerCondition trees
-    from its raw_json.  Returns True when both hold (or are absent)."""
+    """Evaluate an ability's condition trees from its current record.
+
+    The argument is normally the typed ``AbilityTemplate`` mapping produced by
+    Records.  A JSON string is accepted only for the leaf-condition adapter,
+    not as a second rules-data source.
+    """
     if not raw_json:
         return True
-    try:
-        rec = json.loads(raw_json)
-    except Exception:
-        return True
+    if isinstance(raw_json, Mapping):
+        rec = raw_json
+    else:
+        try:
+            rec = json.loads(raw_json)
+        except Exception:
+            return True
     if not isinstance(rec, dict):
         return True
     ab = rec.get("m_AbilityCondition")

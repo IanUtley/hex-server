@@ -250,55 +250,13 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                  param):
     """Create token cards from structured effect parameters.
 
-    The legacy text link remains only as a fallback for older extracted
-    records; current records should provide ``token_guid`` and amount/location
-    fields in ``param``.
+    The parameter is an adapter generated from the current typed
+    AbilityEffectTemplate. Localized game text is not a rules input.
     """
     ability_guid = (bstate or {}).get("resolving_ability", "")
-    game_text = ""
-    if ability_guid:
-        g_row = db.execute(
-            "SELECT game_text FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if g_row:
-            game_text = g_row[0] or ""
-        else:
-            c_row = db.execute(
-                "SELECT game_text FROM champion_abilities WHERE ability_guid=?",
-                (ability_guid,)).fetchone()
-            if c_row:
-                game_text = c_row[0] or ""
-
-    def token_guid_from_text(text):
-        match = re.search(
-            r'data=([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})', text or "")
-        return match.group(1).lower() if match else None
-
-    def count_from_text(text):
-        words = {"one": 1, "two": 2, "three": 3, "four": 4,
-                 "five": 5, "six": 6, "seven": 7, "eight": 8,
-                 "nine": 9, "ten": 10}
-        low = (text or "").lower()
-        for pattern in (r'create\s+(?:a\s+)?(?:copy\s+of\s+)?([a-z]+)\b',
-                        r'summon\s+(?:a\s+)?(?:copy\s+of\s+)?([a-z]+)\b'):
-            match = re.search(pattern, low)
-            if match and match.group(1) in words:
-                return words[match.group(1)]
-        return 1
-
-    def token_name_from_text(text):
-        match = re.search(r'<b>(.+?)</b>', text or "")
-        if match:
-            return match.group(1)
-        match = re.search(
-            r'[Ss]ummon\s+an?\s+([A-Za-z][\w\s]*?)(?:\s*\.|$)',
-            text or "")
-        return match.group(1).strip() if match else None
-
-    token_guid = token_guid_from_text(game_text)
-    count = count_from_text(game_text)
-    into_deck = ("into your deck" in game_text.lower() or
-                 "into their deck" in game_text.lower())
+    token_guid = None
+    count = 1
+    into_deck = False
     token_name = "token troop"
     enters_exhausted = 0
     deck_location = "Unknown"
@@ -356,23 +314,17 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                     else:
                         count = 0
                 else:
-                    raw = db.execute(
-                        "SELECT raw_json FROM card_abilities_meta "
-                        "WHERE ability_guid=?", (ability_guid,)).fetchone()
-                    if raw and raw[0]:
-                        match = re.search(
-                            r'"m_Name"\s*:\s*"' + re.escape(amount_var) +
-                            r'"\s*,\s*"m_DefaultValue"\s*:\s*(\d+)', raw[0])
-                        if match:
-                            count = int(match.group(1))
+                    # A named variable is resolved below from the typed
+                    # AbilityTemplate. Do not recover its default from a
+                    # materialized JSON row.
+                    pass
             if not amount_var and p.get("amount"):
                 count = int(p["amount"])
             enters_exhausted = int(p.get("exhausted", 0) or 0)
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
-    # Prefer the typed AbilityEffectTemplate fields used by the client.  The
-    # extracted param remains a compatibility fallback for older databases.
+    # Confirm the typed AbilityEffectTemplate fields used by the client.
     typed_guid = effect_template_value(
         db, bstate, effect_guid, "m_CardTemplateId")
     if typed_guid and str(typed_guid).lower() != \
@@ -452,19 +404,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             "SELECT guid FROM card_templates WHERE guid=?", (token_guid,)
         ).fetchone()
     if not tpl_row:
-        token_name = token_name_from_text(game_text)
-        if token_name:
-            tpl_row = db.execute(
-                "SELECT guid FROM card_templates WHERE LOWER(name)=LOWER(?) "
-                "LIMIT 1", (token_name,)).fetchone()
-    if not tpl_row:
-        token_name = token_name_from_text(game_text)
-        if token_name:
-            tpl_row = db.execute(
-                "SELECT guid FROM card_templates WHERE LOWER(name) LIKE ? "
-                "LIMIT 1", ("%" + token_name.lower() + "%",)).fetchone()
-    if not tpl_row:
-        return f"summon {token_name}: no card template found"
+        return "summon token: no typed card template found"
 
     tpl_guid = tpl_row[0]
     # A granted start-of-game ability can be visited more than once while

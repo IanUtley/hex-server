@@ -17,15 +17,13 @@ Supported trigger events:
 
 import json
 import random
-import re
 
 import game_engine
+from gamedata import RecordStore, ability_graph
 
 from ._shared import (
     _log,
-    _stat_delta,
     apply_attribute_grant,
-    number_word_to_int,
     owner_uid,
 )
 from .effects.counters import (
@@ -35,6 +33,9 @@ from .effects.counters import (
 from .stat_mod import apply_card_stat_mod
 
 
+_RECORD_STORE = RecordStore()
+
+
 def _card_uses_variable(db, session_id, card_uid, variable_type):
     """Whether a live card has a typed ability variable.
 
@@ -42,7 +43,6 @@ def _card_uses_variable(db, session_id, card_uid, variable_type):
     Mimic-created copies are evaluated from their instance metadata rather
     than from a card-name special case.
     """
-    from .fields import ability_record
     row = db.execute(
         "SELECT card_abilities FROM game_cards "
         "WHERE session_id=? AND card_uid=?",
@@ -54,17 +54,11 @@ def _card_uses_variable(db, session_id, card_uid, variable_type):
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     for ability_guid in ability_guids or []:
-        meta = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (str(ability_guid).lower(),)).fetchone()
-        try:
-            record = json.loads(meta[0]) if meta and meta[0] else None
-        except (TypeError, ValueError, json.JSONDecodeError):
-            record = None
-        if not isinstance(record, dict):
-            record = ability_record(db, ability_guid)
-        for variable in record.get("m_Variables") or []:
-            if str(variable.get("_t", "")).rsplit(".", 1)[-1] == variable_type:
+        graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+        if graph is None:
+            continue
+        for variable in graph.variables:
+            if variable.short_type == variable_type:
                 return True
     return False
 
@@ -103,17 +97,6 @@ def _refresh_variable_cards(db, handler, game, session, pl_t, ai_t,
         except Exception as exc:
             _log(f"    Static refresh failed for {variable_type} card "
                  f"{card_uid}: {exc}")
-
-
-def _parse_leaf_param(param):
-    """Parse an ability_effects.param JSON blob (parent-level child params)."""
-    if not param:
-        return None
-    try:
-        d = json.loads(param)
-        return d if isinstance(d, dict) else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _warzone_ability_holders(db, session_id, controller_uid, zones=("warzone",)):
@@ -161,43 +144,32 @@ def ability_matches_keyword(db, ability_guid, keyword):
     """Match a current ability against ActivateTriggered's typed keyword.
 
     The client stores keyword flags in the ability TAC for Deathcry and uses
-    the event type for Momentum powers.  The extracted game text is retained
-    as a compatibility fallback for older records whose serialized TAC is
-    absent, never as the primary source of the effect configuration.
+    the event type for Momentum powers.  The current Records contract is the
+    only rules-data source.
     """
     key = str(keyword or "").lower()
     if key.endswith("ies"):
         key = key[:-3] + "y"
     elif key.endswith("s"):
         key = key[:-1]
-    row = db.execute(
-        "SELECT trigger_event_type, game_text, raw_json "
-        "FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid).lower(),)).fetchone()
-    if not row:
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
         return False
-    event_type, game_text, raw = row
     if key == "deathcry":
         try:
             from .tac import _tac_attr_hash, decode_tac
-            record = json.loads(raw or "{}")
-            tac = record.get("m_SerializedTAC") or {}
-            data = tac.get("data") if isinstance(tac, dict) else ""
+            tac = graph.source.field("m_SerializedTAC")
+            data = (tac.field("data", "") if hasattr(tac, "field")
+                    else tac.get("data", "") if isinstance(tac, dict)
+                    else "")
             if data and _tac_attr_hash("Deathcry") in decode_tac(data):
                 return True
         except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-        # Older records may not have a serialized TAC, but the keyword still
-        # has to be the ability's leading label.  A plain substring search
-        # would misclassify abilities such as "Trigger the Deathcry of ..."
-        # as Deathcry abilities themselves and can recursively retrigger the
-        # same card.
-        return bool(re.match(
-            r"\s*(?:\[one-shot\]\s*)?(?:<[^>]+>\s*)*deathcr(?:y|ies)\b",
-            str(game_text or "").lower()))
+            return False
+        return False
     if key == "momentum":
-        return "CardInspiredEvent" in str(event_type or "")
-    return key in str(game_text or "").lower()
+        return "CardInspiredEvent" in graph.trigger_event_type
+    return False
 
 
 def manually_trigger_abilities(db, handler, game, session, pl_t, ai_t,
@@ -326,20 +298,8 @@ def _ai_trigger_target(db, session, ability_guid, source_uid, owner_id,
     """Choose a non-auto trigger target using its typed target metadata."""
     from .targeting import legal_targets
 
-    row = db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (ability_guid,)).fetchone()
-    if row and row[0]:
-        try:
-            target_ids = json.loads(row[0])
-        except (TypeError, ValueError, json.JSONDecodeError):
-            target_ids = []
-    else:
-        from .fields import ability_record
-        target_ids = [entry.get("m_Guid") for entry in
-                      (ability_record(db, ability_guid).get(
-                          "m_AbilityTargetTemplateIds") or [])
-                      if isinstance(entry, dict)]
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    target_ids = [target.guid for target in graph.targets] if graph else []
     effects = db.execute(
         "SELECT target_index, effect_type FROM ability_effects "
         "WHERE ability_guid=? AND target_index>=0 ORDER BY effect_order",
@@ -423,482 +383,63 @@ def _apply_health_gain(game, bstate, pl_t, ai_t, amount, source_owner_uid,
 def _resolve_ability_bom(db, handler, game, session, pl_t, ai_t, bstate,
                          ability_guid, source_uid, game_text, target_uid=None,
                          source_owner_uid=None):
-    """Resolve one ability's BOM against a source card (and optional target)."""
-    from .bom import _walk_bom, _LEAFS
-    from .transform import transform_card
+    """Resolve one current-Records ability through the shared interpreter.
 
-    bstate = bstate or {}
+    Trigger dispatch and card-play resolution use the same client-style
+    AbilityInstance interpreter.  This compatibility-shaped entry point is
+    retained for callers that still use its historical name, but it has no
+    alternate flat/BOM implementation.
+    """
+    from gamedata import ability_graph
+    from gamedata.play_plan import ActivationData
+
+    ability_guid = str(ability_guid).lower()
+    graph = ability_graph(_RECORD_STORE, ability_guid)
+    if graph is None:
+        raise RuntimeError(
+            f"ability {ability_guid} is missing from current Records")
+
+    target_map = {}
+    if target_uid is not None:
+        explicit_indexes = [
+            index for index, target in enumerate(graph.targets)
+            if target.requires_input and target.explicit
+        ]
+        indexes = explicit_indexes or ([0] if graph.targets else [])
+        target_map = {
+            index: (int(target_uid),) for index in indexes
+        }
+
+    previous = {
+        key: bstate.get(key)
+        for key in ("resolving_target_uid", "resolving_trigger_target_uid",
+                    "player_spell_target", "player_mod_target",
+                    "grant_target")
+    }
+    bstate["resolving_target_uid"] = target_uid
+    bstate["resolving_trigger_target_uid"] = target_uid
     bstate["resolving_ability"] = ability_guid
     bstate["resolving_owner_id"] = source_owner_uid or 0
     bstate["resolving_source_uid"] = source_uid
-    bstate["resolving_target_uid"] = target_uid
-    # Keep the event target separate from the leaf's current target.  A
-    # TriggerTargetPropertyVariable (for example a card's true cast cost)
-    # refers to the card that caused the trigger, even after a later effect
-    # resolves against another target.
-    previous_trigger_target = bstate.get("resolving_trigger_target_uid")
-    bstate["resolving_trigger_target_uid"] = target_uid
-    bstate["_skip_transform"] = False
-
-    def _resolve_target():
-        """Leaf target: explicit > stored target for this ability > source."""
-        if target_uid is not None:
-            return target_uid
-        stored = (bstate or {}).get("stored_targets", {}).get(ability_guid)
-        if stored:
-            return stored[-1]
-        return source_uid
-
-    # GrantAbility leaves need to know which card receives the ability.
-    # For Deploy/Inspire, it's the entering troop (target_uid);
-    # for self-targeting triggers, it's the source.
-    bstate["grant_target"] = target_uid if target_uid is not None else source_uid
-    logs = []
-    # Brief "shake" on the source card: set Activated state, then clear it after
-    if source_uid is not None:
-        src_row = db.execute(
-            "SELECT card_state, template_guid, location FROM game_cards "
-            "WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(source_uid))).fetchone()
-        hidden_setup = bool(db.execute(
-            "SELECT 1 FROM card_templates WHERE guid=? AND "
-            "LOWER(COALESCE(subtype,''))='battleboard' LIMIT 1",
-            (src_row[1],)).fetchone()) if src_row else False
-        if src_row and src_row[2] == "warzone" and not hidden_setup:
-            orig_state = src_row[0] or 0
-            scid_src = game_engine.SessionCardId(game_engine.UID(int(source_uid)))
-            owner = owner_uid(source_owner_uid, pl_t, ai_t, bstate)
-            _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid_src, src_row[1])
-            game.push_card_updated(scid_src, owner, game_engine.ECardCollections.Warzone, ct,
-                                   state=orig_state | game_engine.ECardStates.Activated,
-                                   template_id=src_row[1], attack=atk, defense=def_)
-    # Authoritative path: walk the ability's BOM data-driven (effect groups,
-    # gamedata conditions, ability variables, target templates, ActivateAbility
-    # recursion).  Only fall back to the legacy flat walk when this ability has
-    # NO effect rows at all — trusting the engine's (possibly empty) result
-    # avoids double-applying leaves.
-    rows_exist = db.execute(
-        "SELECT 1 FROM ability_effects WHERE ability_guid=? LIMIT 1",
-        (ability_guid,)).fetchone()
-    if not rows_exist:
-        from .fields import ability_record
-        rows_exist = bool(ability_record(db, ability_guid).get(
-            "m_AbilityEffectList"))
-    if rows_exist:
+    bstate["grant_target"] = (target_uid if target_uid is not None
+                               else source_uid)
+    bstate.pop("player_spell_target", None)
+    bstate.pop("player_mod_target", None)
+    try:
         from .resolution import resolve_ability
-        # Triggers carry their explicit target only (target_uid); the generic
-        # player_spell_target / player_mod_target fields may hold a STALE value
-        # from an enclosing resolution (e.g. a heal trigger firing inside
-        # another ability's leaf) — clear them so the engine can't mis-target.
-        saved_targets = {}
-        for _k in ("player_spell_target", "player_mod_target"):
-            if _k in bstate:
-                saved_targets[_k] = bstate.pop(_k)
-        # The activation target belongs to the explicit target template, not
-        # necessarily target index zero.  Crazed Squirrel Titan, for example,
-        # has [This, target opposing troop]; putting the chosen troop at index
-        # zero makes the StoreTargets leaf remember the wrong card and leaves
-        # the Battle2Cards leaf without its intended target.
-        target_map = {}
-        if target_uid is not None:
-            target_row = db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ability_guid,)).fetchone()
-            try:
-                target_ids = json.loads(target_row[0]) if target_row and target_row[0] else []
-            except (TypeError, ValueError, json.JSONDecodeError):
-                target_ids = []
-            explicit_indexes = []
-            for target_index, target_id in enumerate(target_ids):
-                explicit_row = db.execute(
-                    "SELECT explicit FROM target_templates "
-                    "WHERE template_id=?", (str(target_id),)).fetchone()
-                if explicit_row and int(explicit_row[0] or 0):
-                    explicit_indexes.append(target_index)
-            if explicit_indexes:
-                target_map = {
-                    int(target_index): int(target_uid)
-                    for target_index in explicit_indexes
-                }
+        return resolve_ability(
+            handler, game, session, db, pl_t, ai_t, bstate,
+            ability_guid, source_uid, source_owner_uid or 0,
+            target_map=target_map,
+            activation_data=ActivationData.from_values(target_map=target_map))
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                bstate.pop(key, None)
             else:
-                # Preserve the legacy shape for focused/minimal metadata
-                # fixtures whose single target has no explicit flag.
-                target_map = {0: int(target_uid)}
-        try:
-            out = resolve_ability(handler, game, session, db, pl_t, ai_t,
-                                  bstate, ability_guid, source_uid,
-                                  source_owner_uid or 0, target_map)
-        finally:
-            for _k, _v in saved_targets.items():
-                bstate[_k] = _v
-        # A source can emit additional CardUpdated events while its BOM is
-        # resolving (for example Wyldeboar's permanent stat bonuses).  If the
-        # final leaf moved that source out of play, reassert the destination
-        # after those updates so the client does not leave a deck card face-up
-        # or retain an old battle state.
-        if source_uid is not None and src_row and src_row[2] == "warzone":
-            current = db.execute(
-                "SELECT template_guid, location, card_state "
-                "FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(source_uid))).fetchone()
-            if current and current[1] != "warzone":
-                _scid = game_engine.SessionCardId(
-                    game_engine.UID(int(source_uid)))
-                _tpl3, _ct3, _n3, _c3, _a3, _d3, _g3 = handler._card_full_data(
-                    game, _scid, current[0])
-                _zone3 = {
-                    "hand": game_engine.ECardCollections.Hand,
-                    "deck": game_engine.ECardCollections.Deck,
-                    "discard": game_engine.ECardCollections.Discard,
-                    "void": game_engine.ECardCollections.Void,
-                    "CastSpells": game_engine.ECardCollections.CastSpells,
-                }.get(current[1], game_engine.ECardCollections.Warzone)
-                game.push_card_updated(
-                    _scid, owner, _zone3, _ct3, template_id=current[0],
-                    attack=_a3, defense=_d3, state=int(current[2] or 0),
-                    nulling=current[1] == "deck")
-        return out or ""
-    rows = _walk_bom(db, ability_guid)
-    card_mod_applied = False
-    for row in rows:
-        etype = row["effect_type"]
-        eg = row["effect_guid"]
-        param = row["param"]
-        if etype == "CardModifierAbilityEffectTemplate":
-            # Data-driven path: each leaf's parent-level param JSON carries
-            # {property, amount, duration} resolved from the top-level ability
-            # record (Guard Dog = one +2 ATK leaf + one +2 DEF leaf, both
-            # EndOfTurn). Apply per-leaf so the property/amount/duration are
-            # exactly what gamedata specified.
-            pm = _parse_leaf_param(param)
-            if pm and pm.get("property") in ("attack", "defense", "cardcost",
-                                             "healhero", "attribute", "counter",
-                                             "damage"):
-                if pm.get("property") == "healhero":
-                    amount = int(pm.get("amount") or 0)
-                    if amount > 0:
-                        # Data-driven heal (e.g. Adamanthian Scrivener "gain 1
-                        # health." -> property healhero, amount 1).  Rows with
-                        # amount 0 are dynamic ("gain 1 health for each ...")
-                        # and fall through to the text-derived fallback.
-                        logs.append(_apply_health_gain(
-                            game, bstate, pl_t, ai_t, amount, source_owner_uid,
-                            db=db, handler=handler, session=session))
-                    continue
-                elif pm.get("property") == "damage":
-                    target = _resolve_target()
-                    if target is None or target == source_uid:
-                        # Deploy "This deals N damage to you" — the 'You'
-                        # target template means the controller's champion.
-                        from .bom import _champion_target_uid
-                        target = _champion_target_uid(
-                            handler, bstate, db, session) or target
-                    if target is not None:
-                        from .statics import _leaf_numeric_value
-                        raw_row = db.execute(
-                            "SELECT raw_json FROM card_abilities_meta "
-                            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-                        raw = raw_row[0] if raw_row else ""
-                        amount = _leaf_numeric_value(
-                            db, session.session_id, bstate, pm, raw,
-                            source_owner_uid or 0, source_uid, "damage")
-                        if amount <= 0:
-                            import re as _re
-                            m_dmg = _re.search(
-                                r'deal\s+(\d+)\s+damage',
-                                (pm.get("text") or "").lower())
-                            if m_dmg:
-                                amount = int(m_dmg.group(1))
-                        if amount > 0:
-                            if "esc:" in (pm.get("text") or "").lower() or \
-                                    "esc " in (pm.get("text") or "").lower():
-                                bstate["player_escalation_uses"] = int(
-                                    bstate.get("player_escalation_uses", 0)) + 1
-                            from .bom import _deal_damage
-                            logs.append(_deal_damage(
-                                game, session, db, handler, pl_t, ai_t,
-                                bstate, target, amount))
-                    continue
-                elif pm.get("property") == "attribute":
-                    target = _resolve_target()
-                    if target is not None:
-                        temp_attr = pm.get("duration") in (
-                            "EndOfTurn", "BeginningOfOwnersTurn",
-                            "AfterCardsReadyOnPlayersTurn")
-                        bits = apply_attribute_grant(
-                            game, session, db, handler, pl_t, ai_t, target,
-                            pm.get("text") or game_text, temporary=temp_attr,
-                            bstate=bstate, duration=pm.get("duration"),
-                            source_owner_id=source_owner_uid)
-                        logs.append(f"CardModifier attribute +{bits:b} target={target}")
-                    continue
-                elif pm.get("property") == "counter":
-                    target = _resolve_target()
-                    amount = int(pm.get("amount") or 0)
-                    if amount > 0 and target is not None:
-                        cname = counter_name_from_text(pm.get("text")) or "counter"
-                        old_n = card_counters(db, session.session_id, target).get(cname, 0)
-                        n = add_card_counter(db, session.session_id, target, cname, amount)
-                        push_card_counters(game, session, db, handler, pl_t, ai_t,
-                                           target, changed_counter=cname,
-                                           old_value=old_n)
-                        logs.append(f"CardModifier counter {cname}+{amount} -> {n} "
-                                    f"target={target}")
-                    else:
-                        # "remove all X counters from all your <cards> in all
-                        # zones" — gated by the effect's condition (e.g. the
-                        # Incantation of Righteousness five-or-more transform).
-                        logs.append(_resolve_remove_all_counters(
-                            db, handler, game, session, pl_t, ai_t, bstate,
-                            pm, game_text, source_uid))
-                    continue
-                elif pm.get("property") == "cardcost":
-                    target = target_uid if target_uid is not None else (bstate or {}).get("player_spell_target")
-                    if target is None:
-                        target = source_uid
-                    if target is not None:
-                        delta = int(pm.get("amount") or 0)
-                        if delta == 0:
-                            # Dynamic cost reduction (e.g. Pterobot "cost -1 for
-                            # each Dwarf and/or Robot you control"): the leaf
-                            # amount is 0, the real value comes from the
-                            # ability's m_Variables.  Store the parsed formula
-                            # on the instance and evaluate it on demand.
-                            from .cost_mod import formula_from_raw
-                            raw_row = db.execute(
-                                "SELECT raw_json FROM card_abilities_meta "
-                                "WHERE ability_guid=?", (ability_guid,)).fetchone()
-                            formula = formula_from_raw(raw_row[0] if raw_row else "")
-                            if formula:
-                                existing = db.execute(
-                                    "SELECT cost_mod_json FROM game_cards "
-                                    "WHERE session_id=? AND card_uid=?",
-                                    (session.session_id, int(target))).fetchone()
-                                try:
-                                    entries = json.loads(
-                                        existing[0] or "[]") if existing else []
-                                except Exception:
-                                    entries = []
-                                entries.append(formula)
-                                db.execute(
-                                    "UPDATE game_cards SET cost_mod_json=? "
-                                    "WHERE session_id=? AND card_uid=?",
-                                    (json.dumps(entries), session.session_id,
-                                     int(target)))
-                                db.commit()
-                                logs.append(
-                                    f"CardModifier cardcost dynamic "
-                                    f"zones={formula['zones']} "
-                                    f"x{formula['multiplier']} target={target}")
-                                continue
-                        db.execute(
-                            "UPDATE game_cards SET card_cost_mod = COALESCE(card_cost_mod, 0) + ? "
-                            "WHERE session_id=? AND card_uid=?",
-                            (delta, session.session_id, int(target)))
-                        db.commit()
-                        logs.append(f"CardModifier cardcost {delta:+} target={target}")
-                    continue
-                else:
-                    this_turn = (pm.get("duration") in ("EndOfTurn", "BeginningOfOwnersTurn",
-                                                        "AfterCardsReadyOnPlayersTurn")
-                                 or "this turn" in (game_text or "").lower())
-                    if pm.get("property") == "attack":
-                        atk_d, def_d = int(pm.get("amount") or 0), 0
-                    else:
-                        atk_d, def_d = 0, int(pm.get("amount") or 0)
-                    if atk_d == 0 and def_d == 0 and "equal to this troop's [def]" in (
-                            game_text or "").lower():
-                        # Dynamic stat: "+[ATK] equal to this troop's [DEF]"
-                        # (Chimera Guard Outrider) — amount comes from the
-                        # source card's current defense.
-                        srow = db.execute(
-                            "SELECT ct.defense, gc.card_defense_mod FROM game_cards gc "
-                            "JOIN card_templates ct ON ct.guid = gc.template_guid "
-                            "WHERE gc.session_id=? AND gc.card_uid=?",
-                            (session.session_id, int(source_uid))).fetchone()
-                        if srow:
-                            src_def = (srow[0] or 0) + (srow[1] or 0)
-                            if pm.get("property") == "attack":
-                                atk_d, def_d = src_def, 0
-                            else:
-                                atk_d, def_d = 0, src_def
-                    target = _resolve_target()
-                    apply_card_stat_mod(game, session, db, handler, pl_t, ai_t,
-                                        target, atk_d, def_d, this_turn=this_turn)
-                    logs.append(f"CardModifier {pm.get('property')} "
-                                f"{atk_d if atk_d else def_d:+} dur={pm.get('duration')} "
-                                f"target={target}")
-                    continue
-            # Fallback (no data-driven param): an ability can carry MULTIPLE
-            # CardModifier leaves and the game_text holds the COMBINED delta
-            # ("+2[ATK]/+2[DEF]"), so apply it exactly ONCE per ability —
-            # applying per-leaf would double the buff.
-            if card_mod_applied:
-                continue
-            card_mod_applied = True
-            # Stat buffs/attribute grants/heal parse from the ability text.
-            atk_d = _stat_delta(game_text, "ATK")
-            def_d = _stat_delta(game_text, "DEF")
-            low = (game_text or "").lower()
-            if "gain" in low and "health" in low:
-                # e.g. Spearcliff Pegasus "Gain 2 health"
-                import re as _re
-                m = _re.search(r'gain\s+(\d+)\s+health', low)
-                amount = int(m.group(1)) if m else 1
-                logs.append(_apply_health_gain(game, bstate, pl_t, ai_t,
-                                               amount, source_owner_uid,
-                                               db=db, handler=handler,
-                                               session=session))
-            elif any(k in low for k in ("flight", "steadfast", "spellshield",
-                                        "lifedrain", "first strike", "swiftstrike",
-                                        "immortal", "quick action", "canny block",
-                                        "can't attack", "can't block", "speed")):
-                target = _resolve_target()
-                if target is not None:
-                    bits = apply_attribute_grant(game, session, db, handler,
-                                                 pl_t, ai_t, target, game_text)
-                    logs.append(f"attribute grant +{bits:b}")
-            else:
-                target = _resolve_target()
-                if target is not None:
-                    # "this turn" buffs (Guard Dog) wear off at the owner's Prep;
-                    # permanent buffs (Inspire/Deploy) persist.
-                    this_turn = "this turn" in low
-                    apply_card_stat_mod(game, session, db, handler, pl_t, ai_t,
-                                        target, atk_d, def_d, this_turn=this_turn)
-                logs.append(f"{etype}: {atk_d:+}ATK/{def_d:+}DEF target={target}")
-        elif etype == "SummonTokenTroopAbilityEffectTemplate":
-            fn = _LEAFS.get(etype)
-            if fn:
-                logs.append(fn(game, session, db, handler, pl_t, ai_t, bstate, eg, param))
-        elif etype == "MoveCardToZoneEffectTemplate":
-            logs.append(_resolve_move_zone(db, handler, game, session, pl_t, ai_t,
-                                           bstate, eg, param, source_uid, game_text,
-                                           target_uid))
-        elif etype == "CounterSpellAbilityEffectTemplate":
-            logs.append(_resolve_counter_spell(db, handler, game, session, pl_t, ai_t,
-                                               bstate, eg, param, game_text))
-        elif etype == "TransformCardAbilityEffectTemplate":
-            import re as _re
-            links = _re.findall(r'data=([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})', game_text or "")
-            if links:
-                # The transform TARGET is the last card link in the text (e.g.
-                # Incantation's "...transform them into <a data=f0e3cf6c>
-                # Sentinels of Light</a>").
-                new_tpl = links[-1].lower()
-                pending = (bstate or {}).get("pending_transform_cards") or []
-                if pending:
-                    for entry in pending:
-                        if isinstance(entry, (tuple, list)):
-                            tuid, loc = entry[0], entry[1]
-                            transform_card(handler, game, session, pl_t, ai_t,
-                                           int(tuid), new_tpl, keep_zone=True,
-                                           bstate=bstate)
-                        else:
-                            transform_card(handler, game, session, pl_t, ai_t,
-                                           int(tuid), new_tpl, bstate=bstate)
-                    bstate.pop("pending_transform_cards", None)
-                    logs.append(f"transform {len(pending)} -> {new_tpl[:8]}")
-                elif source_uid is not None and not (bstate or {}).get("_skip_transform"):
-                    transform_card(handler, game, session, pl_t, ai_t,
-                                   int(source_uid), new_tpl, bstate=bstate)
-                    logs.append("transform")
-                elif (bstate or {}).get("_skip_transform"):
-                    logs.append("transform skipped (gate not met)")
-            else:
-                logs.append("transform: no template link in text")
-        elif etype == "ActivateAbilityEffectTemplate" and param:
-            _resolve_ability_bom(db, handler, game, session, pl_t, ai_t,
-                                 bstate, param, source_uid, game_text, target_uid,
-                                 source_owner_uid)
-        else:
-            fn = _LEAFS.get(etype)
-            if fn:
-                logs.append(fn(game, session, db, handler, pl_t, ai_t, bstate, eg, param))
-    # Restore the source card's original state (clear Activated shake)
-    current_source = None
-    if source_uid is not None and src_row and src_row[2] == "warzone":
-        current_source = db.execute(
-            "SELECT location FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(source_uid))).fetchone()
-    if (source_uid is not None and src_row and src_row[2] == "warzone"
-            and current_source and current_source[0] == "warzone"):
-        # Re-read the card AFTER the BOM so the restore carries any buffs the
-        # leaves just applied (a pre-resolution snapshot would visually revert
-        # e.g. Righteous Paladin's +1/+1 on the client).
-        _tpl2, ct2, _n2, _c2, atk2, def2, _g2 = handler._card_full_data(
-            game, scid_src, src_row[1])
-        game.push_card_updated(scid_src, owner, game_engine.ECardCollections.Warzone, ct2,
-                               state=orig_state,
-                               template_id=src_row[1], attack=atk2, defense=def2)
-        # Re-apply counter badges AFTER the restore push (it carries none) so a
-        # counter gained during this resolution stays visible on the client.
-        push_card_counters(game, session, db, handler, pl_t, ai_t, source_uid)
-    bstate.pop("resolving_ability", None)
-    bstate.pop("resolving_target_uid", None)
-    if previous_trigger_target is None:
-        bstate.pop("resolving_trigger_target_uid", None)
-    else:
-        bstate["resolving_trigger_target_uid"] = previous_trigger_target
-    bstate.pop("_skip_transform", None)
-    return "; ".join(str(l) for l in logs if l)
+                bstate[key] = value
 
 
-def _resolve_remove_all_counters(db, handler, game, session, pl_t, ai_t,
-                                 bstate, pm, game_text, source_uid):
-    """CardModifier "counter" leaf with amount 0: remove all counters of the
-    named kind from the controller's matching cards and stage them for the
-    ability's transform leaf.
-
-    The gate ("if there are five or more ...") is parsed from the ability text,
-    and the counter name from the leaf text — both data-driven, no GUIDs.
-    """
-    import re as _re
-    owner_id = (bstate or {}).get("resolving_owner_id", 0)
-    cname = counter_name_from_text(pm.get("text") or game_text) or "counter"
-    # Gate: the effect's gamedata condition (e.g. Incantation's "if there are
-    # five or more incantation counters on this" = SourceCardHasCounters) from
-    # the seeded ability_effect_conditions table — data-driven.  Fall back to
-    # the text-derived threshold only when the effect row predates the seed.
-    condition_id = (pm or {}).get("condition_id") or ""
-    if condition_id:
-        from .condition_engine import evaluate_effect_condition, ConditionContext
-        cond_ctx = ConditionContext(db, session, bstate,
-                                    ability_source_uid=source_uid,
-                                    ability_source_owner_id=owner_id)
-        if not evaluate_effect_condition(db, condition_id, cond_ctx):
-            bstate["_skip_transform"] = True
-            return f"condition {condition_id[:8]} not met: skip"
-    else:
-        gm = _re.search(r'if there are (\w+) or more', (game_text or "").lower())
-        threshold = number_word_to_int(gm.group(1)) if gm else None
-        if source_uid is not None and threshold is not None:
-            have = card_counters(db, session.session_id, source_uid).get(cname, 0)
-            if have < threshold:
-                bstate["_skip_transform"] = True
-                return f"counters {cname}={have} < {threshold}: skip"
-        elif threshold is not None:
-            bstate["_skip_transform"] = True
-            return "remove-all counters: no source"
-    # Remove the counter from every matching card the controller owns in ANY
-    # zone, and stage each one (with its zone) for the transform leaf — the
-    # client transforms copies in place (deck/hand/discard included).
-    rows = db.execute(
-        "SELECT card_uid, location FROM game_cards WHERE session_id=? AND user_id=?",
-        (session.session_id, owner_id)).fetchall()
-    cleared = []
-    pending = []
-    for cu, loc in rows:
-        old_n = card_counters(db, session.session_id, cu).get(cname, 0)
-        if old_n > 0:
-            remove_card_counters(db, session.session_id, cu, cname)
-            push_card_counters(game, session, db, handler, pl_t, ai_t, cu,
-                               changed_counter=cname, old_value=old_n)
-            cleared.append(int(cu))
-            pending.append((int(cu), loc))
-    if pending:
-        bstate["pending_transform_cards"] = pending
-    return f"removed {cname} counters from {len(cleared)} cards (transform {len(pending)})"
 
 def _resolve_move_zone(db, handler, game, session, pl_t, ai_t, bstate,
                        eg, param, source_uid, game_text, target_uid=None):
@@ -1055,79 +596,24 @@ def _resolve_counter_spell(db, handler, game, session, pl_t, ai_t, bstate,
     return f"countered {hex(int(target_uid))}"
 
 
-def _card_drawn_gate(raw_json, bstate, source_owner_uid):
-    """Evaluate the CardDrawnEvent trigger conditions modelled in gamedata:
-    TriggerCardIsNthCardDrawnThisTurnByThisPlayer (m_Nth) and
-    AbilityControllerHasThresholdAbilityCondition (m_ColorFlags /
-    m_RequiredQuantity).  Unknown conditions keep the legacy fire-on-match
-    behaviour."""
-    import re as _re
-    if not raw_json:
-        return True
-    side = "player" if source_owner_uid else "ai"
-    if "TriggerCardIsNthCardDrawnThisTurnByThisPlayer" in raw_json:
-        m = _re.search(r'"m_Nth"\s*:\s*(\d+)', raw_json)
-        nth = int(m.group(1)) if m else 1
-        drawn = int((bstate or {}).get(f"{side}_draws_this_turn", 0))
-        if drawn != nth:
-            return False
-    if "AbilityControllerHasThresholdAbilityCondition" in raw_json:
-        m = _re.search(r'"m_ColorFlags"\s*:\s*"([^"]+)"', raw_json)
-        q = _re.search(r'"m_RequiredQuantity"\s*:\s*(\d+)', raw_json)
-        color = m.group(1).lower() if m else ""
-        need = int(q.group(1)) if q else 1
-        flag = game_engine.SHARD_TO_FLAG.get(color, 0)
-        if flag:
-            have = int((bstate or {}).get(f"{side}_threshold", {}).get(flag, 0))
-            if have < need:
-                return False
-    return True
-
-
 def _explicit_target_templates(db, ability_guid):
-    """Target template ids for an ability that REQUIRE player choice
-    (m_Explicit=1 in AbilityTargetTemplate.jsonl -> target_templates.explicit)."""
-    try:
-        row = db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-    except Exception:
+    """Return current Records target templates that require player input."""
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
         return []
-    if row and row[0]:
-        try:
-            tids = json.loads(row[0])
-        except Exception:
-            tids = []
-    else:
-        from .fields import ability_record
-        record = ability_record(db, ability_guid)
-        tids = [item.get("m_Guid") for item in
-                (record.get("m_AbilityTargetTemplateIds") or [])
-                if isinstance(item, dict)]
-    out = []
-    for tid in tids:
-        try:
-            trow = db.execute(
-                "SELECT explicit FROM target_templates WHERE template_id=?",
-                (tid,)).fetchone()
-        except Exception:
-            continue
-        if trow and trow[0]:
-            out.append(tid)
-    return out
+    return [target.guid for target in graph.targets
+            if target.explicit and target.requires_input]
 
 
-def _trigger_collection_allows(raw_json, card_location):
+def _trigger_collection_allows(trigger_flags, card_location):
     """Mirror the client's Card.PassesCollectionFlagRequirements: a trigger
     only fires while its source card is in one of the ability's
     m_TriggerCollectionFlags zones.  Missing/None flags mean unrestricted;
     unknown card locations are allowed (the client allows None/Simulacrum).
     """
-    import re as _re
-    if not raw_json:
+    if not trigger_flags:
         return True
-    m = _re.search(r'"m_TriggerCollectionFlags"\s*:\s*"([^"]*)"', raw_json)
-    flags = m.group(1) if m else ""
+    flags = str(trigger_flags)
     if not flags or flags.strip().lower() in ("none", ""):
         return True
     allowed = {s.strip().lower() for s in flags.split("|") if s.strip()}
@@ -1253,19 +739,10 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
 
     for cu, ags in cand.items():
         for ag in list(ags):
-            mrow = db.execute(
-                "SELECT trigger_event_type, game_text FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            raw_record = None
-            if not mrow:
-                from .fields import ability_record
-                raw_record = ability_record(db, ag)
-                trigger = raw_record.get("m_TriggerEventType") or {}
-                mrow = (str(trigger.get("m_InternalType") or ""),
-                        raw_record.get("m_GameText") or "")
-            if not mrow:
+            graph = ability_graph(_RECORD_STORE, str(ag).lower())
+            if graph is None:
                 continue
-            trigger_type = mrow[0] or ""
+            trigger_type = graph.trigger_event_type or ""
             # Encounter setup can add a card whose permanent GrantAbility
             # supplies a start-of-game ability (for example Taming Dire
             # Toad granting the Taming Sphere summon).  Such grants have no
@@ -1273,23 +750,14 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             # GameStartedEvent so the granted ability is present in time.
             static_grant = False
             if event_type == "GameStartedEvent" and not trigger_type:
-                static_grant = bool(db.execute(
-                    "SELECT 1 FROM ability_effects "
-                    "WHERE ability_guid=? AND effect_type='GrantAbilityEffectTemplate' "
-                    "AND effect_duration='Permanent' LIMIT 1", (ag,)).fetchone())
+                static_grant = any(
+                    effect.concrete_type == "GrantAbilityEffectTemplate" and
+                    str(effect.duration).lower() == "permanent"
+                    for effect in graph.effects)
             if event_type in trigger_type or static_grant:
-                gtext = mrow[1] or ""
-                ir_row = db.execute(
-                    "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
-                raw = ir_row[0] if ir_row else ""
-                if not raw:
-                    from .fields import ability_record
-                    raw = json.dumps(raw_record or ability_record(db, ag))
-                try:
-                    uses_previous_state = bool(
-                        json.loads(raw).get("m_UsesPreviousState", 0))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    uses_previous_state = False
+                gtext = graph.game_text or ""
+                raw = graph.source.to_dict()
+                uses_previous_state = graph.uses_previous_state
                 # Data-driven trigger-condition evaluation (port of the client's
                 # Triggers/Conditions + Abilities.Conditions): the ability fires
                 # only when its m_AbilityCondition + m_TriggerCondition trees
@@ -1349,7 +817,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     "Champions" if _src_card is not None and
                     _src_card.get("card_type") == "Champion" else
                     ("Warzone" if src_loc == "mod" else src_loc))
-                if not _trigger_collection_allows(raw, trigger_location):
+                if not _trigger_collection_allows(
+                        graph.trigger_collection_flags, trigger_location):
                     log_req(f"    {event_type} {ag[:8]} -> source in "
                             f"{trigger_location} not in trigger collections; skipped")
                     continue
@@ -1415,9 +884,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                         champ_pool or [])
                 # Check if this ability ignores the chain (Deploy/Inspire/Deathcry
                 # have m_IgnoresChain=1 — execute immediately, no priority window)
-                ignores = True
-                if raw:
-                    ignores = '"m_IgnoresChain" : 1' in raw or '"m_IgnoresChain\": 1' in raw
+                ignores = graph.ignores_chain
                 src_scid = game_engine.SessionCardId(game_engine.UID(cu))
                 hidden_battleboard = bool(db.execute(
                     "SELECT 1 FROM game_cards gc JOIN card_templates ct "
@@ -1496,11 +963,18 @@ def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
 def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
     """Resolve a triggered ability that was pushed onto the chain."""
     ag = item.get("ability_guid", "")
+    # Card-play stack items are drained by the battle engine.  Lightweight
+    # trigger harnesses may pass those items through this historical helper;
+    # they do not represent an AbilityTemplate and therefore have no ability
+    # to interpret here.
+    if not ag:
+        return ""
     cu = item.get("source_uid")
     target_uid = item.get("target_uid")
-    mrow = db.execute(
-        "SELECT game_text FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
-    gtext = mrow[0] if mrow else ""
+    graph = ability_graph(_RECORD_STORE, str(ag).lower())
+    if graph is None:
+        raise RuntimeError(f"ability {str(ag).lower()} is missing from current Records")
+    gtext = graph.game_text
     # The trigger may belong to a PLAYER card (e.g. Adamanthian Scrivener):
     # look up the source card's owner so the effect targets the right champion.
     src_owner = item.get("source_owner_uid")

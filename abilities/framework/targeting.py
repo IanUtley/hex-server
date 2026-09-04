@@ -337,10 +337,9 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
     if t == "HasSourceCastingCostFilter":
         op = filter_json.get("m_ComparisonOp", "GreaterThanOrEqual")
         # The client compares the candidate's cost with the ability source's
-        # effective cost, then applies AddValue.  m_CastingCost is a legacy
-        # serialized field and is not used by IsMatch.
-        target = int(source_card.get("cost", 0) or 0) \
-            if source_card else int(filter_json.get("m_CastingCost", 0) or 0)
+        # effective cost, then applies AddValue. The current filter contract
+        # has no independent serialized casting-cost input.
+        target = int(source_card.get("cost", 0) or 0) if source_card else 0
         add_value = filter_json.get("m_AddValue")
         if isinstance(add_value, dict):
             # The common cost-relative filters use a constant or an ability

@@ -47,7 +47,11 @@ from .framework.triggers import (
     resolve_stack_trigger,
 )
 from .framework._shared import _stat_delta
+from gamedata import (ActivationData, RecordStore, ability_graph)
 from .registry import register_custom_ability, lookup, discover as _discover_cards
+
+
+_RECORD_STORE = RecordStore()
 
 
 def resolve_effect(ability_guid):
@@ -80,17 +84,13 @@ def resolve_effect(ability_guid):
                               ability_guid_, src, owner, {})
         return f"[{ability_guid_}] " + (out or "")
 
-    try:
-        import db as _dbmod
-        rows = _dbmod._db.execute(
-            "SELECT 1 FROM ability_effects WHERE ability_guid=? LIMIT 1",
-            (ability_guid,)).fetchone()
-    except Exception:
-        rows = None
-    return _bom_effect if rows else None
+    if ability_graph(_RECORD_STORE, str(ability_guid).lower()) is None:
+        return None
+    return _bom_effect
 
 
-def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate, ability_guids):
+def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
+                         ability_guids, activations=None):
     """Resolve a played spell (BasicAction/QuickAction) by walking each ability's
     BOM through the authoritative resolution engine — effect groups, gamedata
     conditions, ability variables, target templates and ActivateAbility
@@ -124,35 +124,32 @@ def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate, ability
     prev_esc_flag = bstate.get("_esc_counted_this_resolution")
     bstate["_esc_counted_this_resolution"] = False
     try:
+        record_store = _RECORD_STORE
+        activation_map = {str(key).lower(): ActivationData.from_dict(value)
+                          for key, value in (activations or {}).items()}
         for ag_str in (ability_guids or []):
             ag = str(ag_str)
-            has_rows = db.execute(
-                "SELECT 1 FROM ability_effects WHERE ability_guid=? LIMIT 1",
-                (ag,)).fetchone()
-            if has_rows:
-                target_map = {0: int(target_uid)} if target_uid is not None else {}
-                out = resolve_ability(handler, game, session, db, pl_t, ai_t,
-                                      bstate, ag, src_uid, owner_id, target_map)
-                logs.append(out)
-            else:
-                # Legacy fallback: no BOM rows for this ability — apply the
-                # text-derived stat delta against the chosen target so old cards
-                # without extracted effect data still resolve.
-                from .framework._shared import _stat_delta, _log
-                from .framework.stat_mod import apply_card_stat_mod
-                bstate["resolving_ability"] = ag
-                trow = db.execute(
-                    "SELECT game_text FROM card_abilities_meta WHERE ability_guid=?",
-                    (ag,)).fetchone()
-                game_text = trow[0] if trow else ""
-                atk_d = _stat_delta(game_text, "ATK")
-                def_d = _stat_delta(game_text, "DEF")
-                if target_uid:
-                    apply_card_stat_mod(game, session, db, handler, pl_t, ai_t,
-                                        target_uid, atk_d, def_d)
-                    logs.append(f"spell {ag[:8]} -> {hex(int(target_uid))} "
-                                f"{atk_d:+}/{def_d:+}")
-                bstate.pop("resolving_ability", None)
+            graph = ability_graph(record_store, ag.lower())
+            if graph is None:
+                raise RuntimeError(
+                    f"played ability {ag.lower()} is missing from current Records")
+            activation = activation_map.get(ag.lower())
+            target_map = (dict(activation.target_map)
+                          if activation is not None else {})
+            if not target_map and target_uid is not None:
+                # Card-play supplies one chosen spell target. Bind it to the
+                # first explicit target template in the ability graph; automatic
+                # target templates are resolved by the ability instance itself.
+                for index, target in enumerate(graph.targets):
+                    if target.requires_input:
+                        target_map[index] = int(target_uid)
+                        break
+            out = resolve_ability(
+                handler, game, session, db, pl_t, ai_t, bstate, ag, src_uid,
+                owner_id, target_map,
+                variables=(activation.variables if activation is not None
+                           else None), activation_data=activation)
+            logs.append(out)
     finally:
         if prev_esc_flag is None:
             bstate.pop("_esc_counted_this_resolution", None)

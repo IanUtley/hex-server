@@ -684,6 +684,21 @@ def _extract_encounters(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[An
             encounter_decks[deck_guid] = deck_templates.get(template_guid) or {
                 "cards": record.get("m_DeckOrder") or [], "champion": ""
             }
+    # Taming is authored by the AZ01 Tamed quest objectives, not by a
+    # particular encounter name. Resolve those encounter IDs once so every
+    # current (and future) Tamed objective gets the same capture-gated reward
+    # behavior without another name-based special case.
+    tamed_scene_guids = set()
+    for _, quest in records(data, "QuestTemplate")[0]:
+        if str(quest.get("m_ScriptName") or "").strip().lower() != "az01_tamed":
+            continue
+        for objective in quest.get("m_Objectives") or []:
+            if not isinstance(objective, dict):
+                continue
+            encounter_guid = nested_guid(objective, "m_EncounterId")
+            if encounter_guid and encounter_guid != ZERO_GUID:
+                tamed_scene_guids.add(encounter_guid)
+
     scenes = []
     deck_cards: dict[tuple[str, str], list[Any]] = {}
     for _, record in records(data, "SceneData")[0]:
@@ -740,16 +755,24 @@ def _extract_encounters(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[An
         if "SHROOM HAUS" in name.upper():
             rewards["card_choice"] = [
                 {"name": "Builder Bot", "guid": "85112245-7aed-4a5b-9de9-3c262f11168a"},
-                {"name": "Deployment Orders", "guid": "bd25218f-0ed6-4b58-a282-fe9e01eec99e"},
+                # Use the base card.  The client maps equipment-modified
+                # templates back to BaseVersionGuid when displaying owned
+                # counts, so rewarding/offering the equipped variant makes
+                # an otherwise owned card appear as zero copies.
+                {"name": "Deployment Orders", "guid": "fa7414ab-01d2-484f-8bab-68a03d9cce96"},
                 {"name": "Tricerobot", "guid": "5793dc95-b2e3-40d7-8010-5507d07f5328"},
             ]
         # The captured creature is determined by the battle state, not by a
-        # fixed card name.  Keep the reward declaration on the authored scene
-        # so the campaign engine can evaluate it generically at game end.
-        if name.upper() == "AZ 1 - NODE 03 - WILD CUB":
+        # fixed card name. Keep the reward declaration on every encounter
+        # referenced by the AZ01 Tamed quest so a win without capture remains
+        # retryable and a later capture awards that troop once.
+        if nested_guid(record, "m_Id") in tamed_scene_guids:
             rewards.pop("gold", None)
             rewards.pop("xp", None)
             rewards.pop("one_time", None)
+            rewards.pop("end_of_game_condition", None)
+            rewards.pop("card_guid", None)
+            rewards.pop("quantity", None)
             rewards["end_of_game_rewards"] = [
                 {"gold": 100, "xp": 100, "one_time": False},
                 {"end_of_game_condition": {
@@ -970,6 +993,7 @@ _QUEST_OWNER_FACTIONS = {
 }
 _QUEST_START_HOOKS = {
     "az01_tamed": "az1_tamed_start",
+    "az01_q_cross_the_river": "az1_cross_the_river_start",
     "q_seawitch": "az1_find_horwich_sea_start",
     "az01_uw_find_cave_in": "az1_find_cave_in_start",
     "az01_ar_find_ambling_mesa": "az1_find_ambling_mesa_start",
@@ -1005,6 +1029,10 @@ _QUEST_CONVERSATION_ALIASES = {
     # The authored AZ2 map calls this location Brutecrown Delta while the
     # quest template is named after the Bluff encounter.
     "q_brutecrown_bluff": ("Brutecrown Delta",),
+    # Winston's bridge-closed dialogue starts the AZ1 Cross the River quest,
+    # although the authored conversation name does not include the quest
+    # title or the words "Quest Start".
+    "az01_q_cross_the_river": ("Winston - Step 1",),
 }
 
 

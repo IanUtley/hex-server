@@ -23,12 +23,12 @@ The framework has two different axes and should keep them separate:
 | Death lifecycle | `kill_troop.py` | Move to discard, replacement effects, Deathcry dispatch |
 | Keyword lifecycle | `keywords/lifecycle.py` | Deploy/Inspire entry point over the trigger engine |
 | Combat keywords | `keywords/combat.py` | Rage adapter over metadata-derived stats |
-| BOM orchestration | `resolution.py` / `bom.py` | Walk effect groups and retain compatibility dispatch |
+| Ability orchestration | `resolution.py` | One Records-backed AbilityInstance interpreter for plays, activations, and triggers |
 
-`bom.py` remains large because it still contains the older leaf implementations
-that have not yet migrated into `effects/`. New leaf code should be added to a
-focused effect module and registered through `effects/registry.py`; the BOM
-name remains a compatibility import for existing callers and tests.
+`bom.py` remains large because it still contains leaf implementations that have
+not yet migrated into `effects/`. New leaf code should be added to a focused
+effect module and registered through `effects/registry.py`; the resolver itself
+does not maintain a second legacy flat-walk implementation.
 
 ## Keyword guidance
 
@@ -43,4 +43,3 @@ rules—not merely because they appear in card text:
 
 Keyword modules should consume structured gamedata and effect metadata. They
 must not become another place for card-name or localized `game_text` parsing.
-

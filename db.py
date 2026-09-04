@@ -2739,14 +2739,17 @@ def db_is_champion_template(template_guid):
 
 
 # Card instance resolve (for player collection cards): template_guid + card_type.
-def db_instance_resolve(instance_id):
+def db_instance_resolve(instance_id, user_id=None):
     """Return (template_guid, card_type, name, cost, attack, defense) for a
-    card_instances row by instance_id, or None."""
+    player-owned card_instances row by instance_id, or None."""
+    if user_id is None:
+        return None
     row = _db.execute(
         "SELECT ci.template_guid, ct.card_type, ct.name, ct.cost, ct.attack, "
         "ct.defense FROM card_instances ci JOIN card_templates ct "
-        "ON ci.template_guid=ct.guid WHERE ci.instance_id=?",
-        (instance_id,)).fetchone()
+        "ON ci.template_guid=ct.guid "
+        "WHERE ci.user_id=? AND ci.instance_id=?",
+        (user_id, instance_id)).fetchone()
     return row
 
 

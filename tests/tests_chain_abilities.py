@@ -310,8 +310,9 @@ def test_countermagic_offered_in_ai_chain_window(db):
             [AG_COUNTERMAGIC], 3, {16: 2}, True, 0, 0)
         assert playable is True, "Countermagic must be playable with 3 mana/2 sapphire"
         # And the target picker candidates for the interrupt template.
+        plan = h._card_play_plan(TPL_COUNTERMAGIC, 101, 5)
         targets = h._play_ability_targets(
-            SessionStub(), None, None, [AG_COUNTERMAGIC])
+            SessionStub(), plan)
         assert any(t[:8] == TID_INTERRUPT[:8] and
                    any(int(x.uid.uid64) == 202 for x in ts)
                    for _, _, t, ts in targets), targets

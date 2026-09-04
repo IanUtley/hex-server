@@ -24,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import game_engine
+import db as dbmod
 
 from tests.tests_combat import (
     make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER,
@@ -46,7 +47,10 @@ def _copy_card(db, guid):
         "FROM card_templates WHERE guid=?", (guid,)).fetchone()
     if row:
         db.execute(
-            "INSERT OR REPLACE INTO card_templates VALUES "
+            "INSERT OR REPLACE INTO card_templates "
+            "(guid, name, card_type, cost, attack, defense, attributes, "
+            "abilities_json, threshold_json, subtype, variable_cost, "
+            "variable_cost_minimum, rage_value) VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
         for ag in json.loads(row[7] or "[]"):
             _copy_ability(db, ag)
@@ -134,6 +138,21 @@ def _copy_ability(db, ag):
     db.commit()
 
 
+def _resolve_pending_trigger_stack(handler, game, bstate, db, pl_t, ai_t):
+    """Resolve trigger items in the focused test harness.
+
+    Current Records abilities with ``m_IgnoresChain=0`` must wait on the
+    chain.  The production battle engine drains these items after priority;
+    this helper models that part for direct trigger-dispatch tests.
+    """
+    from abilities.framework.triggers import resolve_stack_trigger
+
+    while bstate.get("stack"):
+        item = bstate["stack"].pop()
+        resolve_stack_trigger(handler, game, SessionStub(), db, pl_t, ai_t,
+                              bstate, item)
+
+
 def test_twisted_fate_buries_on_player_draw(db):
     """The player draws a card -> their Twisted Fate (warzone) fires and buries
     the top card of the AI's deck.  The trigger source is the drawing champion
@@ -216,6 +235,7 @@ def test_malfunctioning_war_bot_hits_a_random_champion_at_turn_start(db):
         "TurnStartedEvent", None, 1001)
 
     assert "278c9761" in log, log
+    _resolve_pending_trigger_stack(handler, game, bstate, db, pl_t, ai_t)
     assert sorted((bstate["player_health"], bstate["ai_health"])) == [19, 20], bstate
     assert any(isinstance(ev, game_engine.ChampionHealthChangedSessionEventArgs)
                for ev in game.events)
@@ -223,7 +243,7 @@ def test_malfunctioning_war_bot_hits_a_random_champion_at_turn_start(db):
 
 def test_argus_hand_trigger_fires_at_turn_start(db):
     """Argus's hand-based start-of-turn trigger must be discovered in PvP."""
-    from abilities.framework.triggers import resolve_triggers, resolve_stack_trigger
+    from abilities.framework.triggers import resolve_triggers
 
     argus = "e9b37ccc-6f20-4f8f-8a93-90a85179f5b3"
     trigger = "2fdfc7c6-2fa0-2eb8-9d71-ac2952359a0b"
@@ -254,8 +274,9 @@ def test_argus_hand_trigger_fires_at_turn_start(db):
         db, handler, game, SessionStub(), pl_t, ai_t, bstate,
         "TurnStartedEvent", None, 1001)
     assert "2fdfc7c6" in log, log
-    # Argus's extracted trigger ignores the chain, so the reveal and modifier
-    # resolve immediately rather than creating a stack item.
+    # Argus's extracted trigger does not ignore the chain, so resolve the
+    # pending item as the production priority loop would.
+    _resolve_pending_trigger_stack(handler, game, bstate, db, pl_t, ai_t)
     assert db.execute(
         "SELECT card_cost_mod FROM game_cards WHERE card_uid=?", (302,)
     ).fetchone()[0] == -1
@@ -273,6 +294,7 @@ def test_argus_hand_trigger_fires_at_turn_start(db):
     resolve_triggers(
         db, handler, game, SessionStub(), pl_t, ai_t, bstate,
         "TurnStartedEvent", None, 1001)
+    _resolve_pending_trigger_stack(handler, game, bstate, db, pl_t, ai_t)
     assert db.execute(
         "SELECT card_cost_mod FROM game_cards WHERE card_uid=?", (302,)
     ).fetchone()[0] == -2
@@ -477,6 +499,143 @@ def test_oakhenge_moves_revealed_troop_to_hand_with_its_template(db):
     assert any(isinstance(ev, game_engine.CardDrawnSessionEventArgs)
                and int(ev.session_card_id.uid.uid64) == 362
                for ev in game.events)
+
+
+def test_cosmic_transmogrifier_preserves_type_and_cost(db):
+    """Cosmic's random transform uses each target as the filter source.
+
+    The client passes the card being transformed to HasSourceCastingCostFilter;
+    the activating constant must not make every target look like cost 5.  The
+    authored category union also selects the target's own troop/constant/
+    artifact branch.
+    """
+    from abilities.framework.bom import _LEAFS
+
+    cosmic_tpl = "e3e88475-e2cd-4d60-adef-be0070d9213c"
+    cosmic_ag = "add058ec-ae27-6749-70ef-934b360f55b5"
+    effect_guid = "453fd3fe-cb93-b839-2cc4-e46f5b7d1de8"
+    # The shared combat fixture predates the two template columns used by the
+    # random-template pool; add them with their production defaults locally.
+    db.execute("ALTER TABLE card_templates ADD COLUMN rarity TEXT DEFAULT ''")
+    db.execute("ALTER TABLE card_templates ADD COLUMN is_pve INTEGER DEFAULT 0")
+    db.commit()
+    _copy_card(db, cosmic_tpl)
+    src = sqlite3.connect(SRC)
+    try:
+        cases = []
+        for card_type in ("Troop", "Constant", "Artifact"):
+            costs = src.execute(
+                "SELECT cost FROM card_templates WHERE is_pve=0 AND "
+                "card_type=? GROUP BY cost HAVING COUNT(*) >= 2 "
+                "ORDER BY cost", (card_type,)).fetchall()
+            chosen = None
+            for (cost,) in costs:
+                wrong = src.execute(
+                    "SELECT guid, card_type FROM card_templates "
+                    "WHERE is_pve=0 AND cost=? AND card_type<>? LIMIT 1",
+                    (cost, card_type)).fetchone()
+                if wrong:
+                    chosen = (cost, wrong)
+                    break
+            assert chosen, f"no test pool for {card_type}"
+            cost, wrong = chosen
+            same = src.execute(
+                "SELECT guid FROM card_templates WHERE is_pve=0 AND "
+                "card_type=? AND cost=? ORDER BY guid LIMIT 2",
+                (card_type, cost)).fetchall()
+            cases.append((card_type, int(cost), [r[0] for r in same], wrong[0]))
+    finally:
+        src.close()
+
+    old_db = dbmod._db
+    dbmod._db = db
+    try:
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        handler = HandlerStub(db)
+        session = SessionStub()
+        for index, (card_type, cost, same_guids, wrong_guid) in enumerate(cases):
+            guids = same_guids + [wrong_guid]
+            for guid in guids:
+                _copy_card(db, guid)
+            target_uid = 9000 + index
+            add_card(db, target_uid, 5, same_guids[0], loc="warzone")
+            db.execute(
+                "UPDATE game_cards SET card_type=(SELECT card_type FROM "
+                "card_templates WHERE guid=game_cards.template_guid), "
+                "card_attributes=(SELECT attributes FROM card_templates "
+                "WHERE guid=game_cards.template_guid) WHERE card_uid=?",
+                (target_uid,))
+            db.commit()
+            seen = []
+            game = game_engine.Game(1, pl_t, ai_t)
+            bstate = {
+                "resolving_ability": cosmic_ag,
+                "resolving_source_uid": 8000,
+                "resolving_target_uid": target_uid,
+                "player_mod_target": target_uid,
+            }
+            with mock.patch(
+                    "abilities.framework.bom.random.choice",
+                    side_effect=lambda values: (seen.extend(values), values[0])[1]):
+                _LEAFS["TransformCardAtRandomAbilityEffectTemplate"](
+                    game, session, db, handler, pl_t, ai_t, bstate,
+                    effect_guid, None)
+            assert seen, (card_type, cost)
+            assert all(
+                db.execute("SELECT card_type FROM card_templates WHERE guid=?",
+                           (guid,)).fetchone()[0] == card_type
+                for guid in seen), (card_type, seen)
+            result = db.execute(
+                "SELECT ct.card_type, ct.cost FROM game_cards gc "
+                "JOIN card_templates ct ON ct.guid=gc.template_guid "
+                "WHERE gc.card_uid=?", (target_uid,)).fetchone()
+            assert result == (card_type, cost), (card_type, cost, result)
+            db.execute("DELETE FROM game_cards WHERE card_uid=?", (target_uid,))
+            db.execute(
+                "DELETE FROM card_templates WHERE guid IN (%s)" %
+                ",".join("?" * len(guids)), guids)
+            db.commit()
+    finally:
+        dbmod._db = old_db
+
+
+def test_crown_of_the_primals_buffs_target_troop(db):
+    """Crown's card ability must resolve as a card ability, not as a
+    champion payment that voids the source and selected troop."""
+    from abilities.framework.resolution import resolve_ability
+
+    crown_tpl = "54691a8a-77c5-4d54-a21d-cbaa5739d944"
+    crown_ag = "10db0828-a6ce-1526-9eed-33387dfe33ba"
+    troop_tpl = "d790e8b9-a000-475e-8350-d11be117d6bc"
+    _copy_card(db, crown_tpl)
+    _copy_card(db, troop_tpl)
+    add_card(db, 9100, 5, crown_tpl, loc="warzone")
+    add_card(db, 9101, 5, troop_tpl, loc="warzone")
+    db.execute(
+        "UPDATE game_cards SET card_type=(SELECT card_type FROM "
+        "card_templates WHERE guid=game_cards.template_guid), "
+        "card_attributes=(SELECT attributes FROM card_templates "
+        "WHERE guid=game_cards.template_guid) WHERE card_uid=9101")
+    db.commit()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+    game = game_engine.Game(1, pl_t, ai_t)
+    resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+                    crown_ag, 9100, 5, {0: 9101})
+    source_loc = db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=9100").fetchone()[0]
+    target = db.execute(
+        "SELECT location, card_attributes, permanent_buffs FROM game_cards "
+        "WHERE card_uid=9101").fetchone()
+    assert source_loc == "warzone", source_loc
+    assert target[0] == "warzone", target
+    assert target[1] & game_engine.ECardAttributes.Speed, target
+    assert target[1] & game_engine.ECardAttributes.Juggernaught, target
+    assert target[1] & game_engine.ECardAttributes.FirstStrike, target
+    assert json.loads(target[2]).get("int_attrs", {}).get("Rage") == 3, target
 
 
 def test_spam_bot_charge_power_targets_one_robot_and_one_stat(db):
@@ -1138,6 +1297,10 @@ def main():
          test_crazed_squirrel_titan_respects_verdant_wyldeboar_buff),
         ("Oakhenge preserves revealed troop identity",
          test_oakhenge_moves_revealed_troop_to_hand_with_its_template),
+        ("Cosmic Transmogrifier preserves type and cost",
+         test_cosmic_transmogrifier_preserves_type_and_cost),
+        ("Crown of the Primals buffs its target troop",
+         test_crown_of_the_primals_buffs_target_troop),
         ("S.P.A.M. Bot charge power targets one Robot/stat",
          test_spam_bot_charge_power_targets_one_robot_and_one_stat),
         ("Jadiim triggers for a one-cost permanent",

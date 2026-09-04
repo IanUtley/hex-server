@@ -3,25 +3,22 @@
 The client does not read effect quantities from localized text.  It evaluates
 typed fields such as ``EffectInputVariable`` and ``EffectOutputVariable``
 against the current ``AbilityInstance``.  This module is the small server-side
-equivalent used by effect executors; legacy extracted ``param`` JSON remains a
-fallback for older databases.
+equivalent used by effect executors; the current Records snapshot is the only
+rules-data source.
 """
 
 import json
-from pathlib import Path
+
+from gamedata.records import RecordStore
 
 
 _EFFECT_TEMPLATES = None
 _ABILITY_TEMPLATES = None
+_RECORD_STORE = RecordStore()
 
 
 def _last_type(value):
     return str(value or "").rsplit(".", 1)[-1]
-
-
-def _records_path():
-    return Path(__file__).resolve().parents[2] / "Records" / \
-        "AbilityEffectTemplate.jsonl"
 
 
 def _load_effect_templates():
@@ -29,32 +26,11 @@ def _load_effect_templates():
     global _EFFECT_TEMPLATES
     if _EFFECT_TEMPLATES is not None:
         return _EFFECT_TEMPLATES
-    _EFFECT_TEMPLATES = {}
-    path = _records_path()
-    if not path.exists():
-        return _EFFECT_TEMPLATES
-    try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, str):
-                        # Extracted Records are near-JSON.  A number of the
-                        # older effect records contain a trailing comma in a
-                        # nested object, which the extraction scripts already
-                        # tolerate.  Apply the same normalization here so the
-                        # runtime can read the authoritative typed fields too.
-                        value = json.loads(
-                            __import__("re").sub(r",\s*([}\]])", r"\1", value))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                if not isinstance(value, dict):
-                    continue
-                guid = ((value.get("m_TemplateId") or {}).get("m_Guid") or "")
-                if guid:
-                    _EFFECT_TEMPLATES[str(guid).lower()] = value
-    except OSError:
-        pass
+    _EFFECT_TEMPLATES = {
+        record.guid.lower(): record.to_dict()
+        for record in _RECORD_STORE.load("AbilityEffectTemplate")
+        if record.guid
+    }
     return _EFFECT_TEMPLATES
 
 
@@ -66,58 +42,27 @@ def effect_template(effect_guid):
 
 
 def _load_ability_templates():
-    """Load raw AbilityTemplate records for metadata not materialized in DB.
+    """Load the current typed AbilityTemplate records from Records.
 
-    Card abilities keep their raw JSON in ``card_abilities_meta``.  Talent
-    abilities intentionally store only the compact talent link/BOM tables, so
-    their typed variables (for example ``DamageDealt``) must come from the
-    extracted AbilityTemplate snapshot.
+    SQLite stores generated indexes and runtime state; it is not consulted for
+    the ability definition or its typed variables.
     """
     global _ABILITY_TEMPLATES
     if _ABILITY_TEMPLATES is not None:
         return _ABILITY_TEMPLATES
-    _ABILITY_TEMPLATES = {}
-    path = _records_path().with_name("AbilityTemplate.jsonl")
-    if not path.exists():
-        return _ABILITY_TEMPLATES
-    try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, str):
-                        value = json.loads(
-                            __import__("re").sub(r",\s*([}\]])", r"\1", value))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                if not isinstance(value, dict):
-                    continue
-                guid = ((value.get("m_AbilityTemplateId") or {}).get("m_Guid")
-                        or "")
-                if guid:
-                    _ABILITY_TEMPLATES[str(guid).lower()] = value
-    except OSError:
-        pass
+    _ABILITY_TEMPLATES = {
+        record.guid.lower(): record.to_dict()
+        for record in _RECORD_STORE.load("AbilityTemplate")
+        if record.guid
+    }
     return _ABILITY_TEMPLATES
 
 
 def _raw_ability(db, ability_guid):
     if not ability_guid:
         return {}
-    for table in ("card_abilities_meta", "champion_abilities",
-                  "talent_abilities"):
-        try:
-            row = db.execute(
-                "SELECT raw_json FROM %s WHERE ability_guid=? LIMIT 1" % table,
-                (str(ability_guid).lower(),)).fetchone()
-        except Exception:
-            row = None
-        if row and row[0]:
-            try:
-                value = json.loads(row[0])
-                return value if isinstance(value, dict) else {}
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return {}
+    # SQLite contains indexes/materialized state. All callers resolve the
+    # current typed AbilityTemplate from Records.
     return _load_ability_templates().get(str(ability_guid).lower(), {})
 
 
@@ -214,16 +159,6 @@ def resolve_field(field, variables=None, outputs=None, bstate=None,
         card_values = bstate.get("card_integer_variables") or {}
         return int(card_values.get(name, variables.get(name, default)) or 0)
 
-    # Some older extracted records omit _t but retain the concrete value.
-    for key in ("m_Value", "m_DefaultValue", "m_Amount"):
-        if key in field and not isinstance(field[key], (dict, list)):
-            try:
-                return int(field[key] or 0)
-            except (TypeError, ValueError):
-                break
-    name = _field_name(field)
-    if name:
-        return int(variables.get(name, bstate.get(name, default)) or 0)
     return int(default or 0)
 
 
@@ -287,6 +222,12 @@ def effect_template_value(db, bstate, effect_guid, field_name, default=None):
     if isinstance(value, dict) and "m_Guid" in value:
         return str(value.get("m_Guid") or "").lower()
     return value
+
+
+def counter_template_name(counter_guid):
+    """Return the current Records name for a card-counter template."""
+    record = _RECORD_STORE.get("CardCounterTemplate", str(counter_guid).lower())
+    return str(record.field("m_Name", "")) if record is not None else ""
 
 
 def modifier_metadata(effect_guid):

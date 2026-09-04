@@ -175,6 +175,10 @@ type resolver cannot load a UInt64 dictionary, use the already validated
   server-owned seeds in place while preserving users, cards, decks, and
   campaign state; it never copies the repository's local `hconnect.db` into
   the image.
+- `system_properties(version)` stores the current database schema version.
+  `static.ensure_schema` creates the table and seeds version `1` when it is
+  missing or empty. For releases with schema changes, update `static.py` so
+  it can upgrade existing player databases in place and advance this value.
 - **Migrations** are one-off scripts in `migration.py`: `restart.sh` runs it if
   present, then deletes it. Each migration must be idempotent (check before
   altering). Add new column/schema changes to BOTH `static.py`'s DDL (for fresh

@@ -217,23 +217,16 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
             prop = var.get("m_Property") or ""
             if prop == "AbilityResourceXCost":
                 # For a variable-cost ability, X is the value selected in the
-                # activation dialog.  Spell resolution carries it in bstate;
-                # retain the effective-cost fallback for older callers that
-                # use this variable outside an active X-cost resolution.
-                if "x_cost" in (bstate or {}):
-                    return int((bstate or {}).get("x_cost", 0) or 0)
-                return effective_cost(db, session_id, bstate, source_uid)
+                # activation dialog. Spell resolution carries it in bstate;
+                # without an active activation the current client contract is
+                # zero, not the card's effective resource cost.
+                return int((bstate or {}).get("x_cost", 0) or 0)
             named = (bstate or {}).get("ability_variables") or {}
             return int(named.get(var.get("m_Name"), 0) or 0)
         if t == "SourcePlayerBriarLegionVariable":
             # The variable is defined by the card's typed metadata, but the
-            # match-wide event counter is shared by both controllers. Keep
-            # the old side-specific keys as a fallback for battles created by
-            # an older server process.
-            return int(bstate.get(
-                "briar_legions_entered",
-                int(bstate.get("player_briar_legions_entered", 0)) +
-                int(bstate.get("ai_briar_legions_entered", 0))))
+            # match-wide event counter is shared by both controllers.
+            return int(bstate.get("briar_legions_entered", 0) or 0)
         if t == "AbilityConstant":
             try:
                 return int(var.get("m_DefaultValue", 0) or 0)

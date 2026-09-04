@@ -810,7 +810,8 @@ def _activate_az1_area(db, champ_id):
                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (cid,lo,hi,champ_id,user_id,champ_name,"AZ1","AREA",1,"{}"))
     champ = _get_champion(db, champ_id)
-    area_locs, area_nodes = _az1_area_scene_state(champ[2] if champ else None)
+    area_locs, area_nodes = _az1_area_scene_state(
+        champ[2] if champ else None, db=db)
     # Resolve every authored AZ1 encounter by its NODE number.  The map node
     # owns the encounter reference; scene metadata supplies the GUID,
     # rewards, and scene type (including all Shroom Haus locations).
@@ -882,15 +883,29 @@ def _az1_scene_for_node(db, node):
 
 
 def _az1_node_conversation_rows(db, node, campaign_template="AZ1"):
-    """Return authored conversations for an area node with decoded triggers."""
+    """Return authored conversations for an area node with decoded triggers.
+
+    ConversationTemplate names abbreviate the map's padded alphabetic branch
+    IDs (for example, ``Node R``), while the AZ1 map identifies that same
+    location as ``Node00R``.  Prefer an exact metadata match, then fall back
+    to the authored abbreviation so existing databases need no data rewrite.
+    """
+    node_ids = [str(node or "")]
+    padded_branch = re.fullmatch(r"Node0+([A-Za-z]+)", node_ids[0], re.I)
+    if padded_branch:
+        node_ids.append(f"Node{padded_branch.group(1)}")
     try:
-        rows = db.execute(
-            "SELECT conversation_guid, trigger_json, priority, conversation_name "
-            "FROM campaign_node_conversations "
-            "WHERE campaign_template=? AND node_id=? AND enabled=1 "
-            "ORDER BY priority, conversation_guid",
-            (str(campaign_template or "AZ1"), str(node)),
-        ).fetchall()
+        rows = []
+        for node_id in node_ids:
+            rows = db.execute(
+                "SELECT conversation_guid, trigger_json, priority, conversation_name "
+                "FROM campaign_node_conversations "
+                "WHERE campaign_template=? AND node_id=? AND enabled=1 "
+                "ORDER BY priority, conversation_guid",
+                (str(campaign_template or "AZ1"), node_id),
+            ).fetchall()
+            if rows:
+                break
     except Exception:
         return []
     result = []
@@ -954,6 +969,18 @@ def _az1_node_conversation(db, node, state=None, campaign_template="AZ1",
     except (TypeError, ValueError):
         visit_count = 0
     has_fortune = bool(data.get("gaal_fortune"))
+    # A node's authored baseline dialogue wins on its first visit.  This
+    # prevents a fortune earned at another location from replacing Winston's
+    # initial bridge-closed conversation with the optional Milosh variant.
+    if visit_count <= 1:
+        for guid, trigger, _priority, _name in rows:
+            if (str(trigger.get("visit") or "").lower() == "first" and
+                    str(trigger.get("state") or "").strip() == ""):
+                return guid
+        for guid, trigger, _priority, name in rows:
+            label = str(trigger.get("label") or name or "")
+            if re.search(r"\bstep\s*1(?:\D|$)", label, re.I):
+                return guid
     # A state-qualified variant must win over an ordinary first/repeat
     # conversation.  Some authored records carry both predicates (for
     # example "First encounter - Player already has fortune"), while others
@@ -1053,6 +1080,93 @@ def _az1_pre_encounter_conversation(db, node, champ_id=None):
     return scored[0][1]
 
 
+def _az1_path_fork_ids(db):
+    """Return authored AZ1 path-fork nodes from the persisted map topology."""
+    try:
+        rows = db.execute(
+            "SELECT from_node, to_node FROM campaign_node_edges "
+            "WHERE campaign_template='AZ1'"
+        ).fetchall()
+    except Exception:
+        return set()
+    return {
+        str(node)
+        for row in rows
+        for node in row
+        if node and str(node).lower().startswith("fork")
+    }
+
+
+def _az1_append_path_forks(db, locations, nodes):
+    """Add non-interactive prefab path forks to a campaign state.
+
+    Path forks are real client map nodes, but they have no SceneData location
+    of their own.  They still need a state Location/Node pair in GameplayState
+    so the client can render them and reveal the paths that pass through them
+    (for example Fork001 at the Zila bridge).
+    """
+    if locations is None or nodes is None:
+        return False
+    existing_locations = {
+        str((loc.get("Data") or {}).get("node") or "")
+        for loc in locations
+    }
+    existing_nodes = {
+        str(node.get("Name") or (node.get("Data") or {}).get("id") or "")
+        for node in nodes
+    }
+    changed = False
+    for fork in sorted(_az1_path_fork_ids(db)):
+        if fork not in existing_locations:
+            locations.append({"Data": {
+                "name": fork, "node": fork, "type": "Empty",
+                "autostart": False, "autopan": False,
+                "autotrigger": False, "battle": None,
+                # A path fork is connective geometry, not quest content. It
+                # stays rendered so the client can reveal and traverse the
+                # paths leading to whichever real locations are unlocked,
+                # but remains disabled as a campaign destination.
+                "visible": True, "enabled": False,
+                "completed": False, "repeatable": False,
+                "givequest": False, "turninquest": False,
+                "impassable": False, "unknown": False,
+                "encounter": None, "encounter_desc": None,
+                "description": None, "title": fork,
+                "conversationId": None,
+            }})
+            changed = True
+        else:
+            # A path fork is rendered by the client's dedicated FORK node
+            # prefab, but is never a selectable campaign location.
+            for loc in locations:
+                data = loc.get("Data") or {}
+                if data.get("node") == fork:
+                    if data.get("visible") is not True:
+                        data["visible"] = True
+                        changed = True
+                    if data.get("enabled") is not False:
+                        data["enabled"] = False
+                        changed = True
+                    break
+        if fork not in existing_nodes:
+            nodes.append({"Name": fork,
+                          "Data": {"id": fork, "type": "FORK"}})
+            changed = True
+        else:
+            for node in nodes:
+                if str(node.get("Name") or
+                       (node.get("Data") or {}).get("id") or "") == fork:
+                    node_data = node.setdefault("Data", {})
+                    if node_data.get("id") != fork:
+                        node_data["id"] = fork
+                        changed = True
+                    if node_data.get("type") != "FORK":
+                        node_data["type"] = "FORK"
+                        changed = True
+                    break
+    return changed
+
+
 def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
     """Apply authored scene type/conversation data to AZ1 map locations.
 
@@ -1061,18 +1175,57 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
     every response repairs those states and, importantly, makes a DIALOG scene
     (such as Node007's Gaal Camp) a conversation instead of a Shroom Haus.
     """
+    if state is not None:
+        _az1_append_path_forks(
+            db, locations, state.setdefault("LocNodes", []))
     gaal_nodes = _gaal_camp_nodes(db, "AZ1")
     for loc in locations or []:
         data = loc.get("Data") or {}
         node = data.get("node") or ""
         scene = _az1_scene_for_node(db, node)
         if not scene:
+            # Not every authored conversation has an accompanying encounter
+            # scene.  Vale of Oberon, for example, is a conversation-only
+            # map node whose ConversationTemplate uses the abbreviated
+            # ``Node R`` identifier.  Hydrate it directly instead of leaving
+            # the client with an inert Empty location.
+            authored_conversation = _az1_node_conversation(
+                db, node, state, champ_id=champ_id)
+            if authored_conversation:
+                visits = (((state or {}).get("PublicState", {}) or {}).get(
+                    "Data", {}) or {}).get("conversation_visits", {})
+                try:
+                    visit_count = int(visits.get(str(node), 0) or 0)
+                except (TypeError, ValueError):
+                    visit_count = 0
+                # NodeR (Vale of Oberon) is conversation-only, but follows
+                # the same unfinished-node rule as a pre-encounter: if it is
+                # still incomplete, revisiting it must start its authored
+                # conversation even when an earlier visit was recorded.
+                is_node_r = str(node).lower() in {"noder", "node00r"}
+                data.update({
+                    "type": "Convo",
+                    "conversationId": authored_conversation,
+                    "repeatable": _az1_node_is_repeatable(db, node),
+                    "autostart": (not bool(data.get("completed")) and
+                                  (visit_count <= 0 or is_node_r)),
+                })
             continue
         guid, name, rewards_json = scene
-        data["encounter"] = guid
         upper_name = str(name or "").upper()
         if "SHROOM HAUS" in upper_name:
-            data["type"] = "ShroomHaus"
+            # Kooo's introductory conversation precedes the card-choice
+            # window. Keep the authored Shroom Haus choices attached, but
+            # expose the conversation on the first visit.
+            data["type"] = ("Convo" if (not data.get("completed") and
+                                         not data.get("shroomhaus_ready"))
+                            else "ShroomHaus")
+            if data["type"] == "Convo":
+                data["conversationId"] = _az1_node_conversation(
+                    db, node, state, champ_id=champ_id)
+                data["shroomhaus_convo"] = True
+                data["repeatable"] = False
+                data["autostart"] = True
             try:
                 choices = [x["guid"] for x in
                            (json.loads(rewards_json or "{}").get("card_choice") or [])
@@ -1082,6 +1235,13 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         elif "DIALOG" in upper_name:
+            # Dialogue scenes are map conversations, not battles.  The client
+            # tries to build an encounter champion panel whenever this field
+            # is present; authored dialogue scenes intentionally have no AI
+            # champion/deck, which makes that panel throw before the convo can
+            # start.  Keep the scene GUID in the encounter catalog for
+            # protocol compatibility, but omit it from the map location.
+            data["encounter"] = None
             # A Gaal camp is temporarily represented by the authored Gaal Camp
             # ModDisplay after a paid Milosh reading.  Do not let normal AZ1
             # scene hydration turn that active card window back into the
@@ -1129,7 +1289,9 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                 visit_count = 0
             data["autostart"] = (not bool(data.get("completed")) and
                                  visit_count <= 0)
-        elif str(data.get("type") or "").lower() in {"", "empty", "encounter"}:
+        elif (str(data.get("type") or "").lower() in
+              {"", "empty", "encounter"} or data.get("pre_encounter")):
+            data["encounter"] = guid
             # Some battle scenes have an authored opening conversation but do
             # not carry ``DIALOG`` in their scene name (for example Node009's
             # Cockatwice prelude). Bind that conversation before exposing the
@@ -1137,6 +1299,11 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             # to Encounter without a node-specific special case.
             prelude = (None if "PANORAMA" in upper_name else
                        _az1_pre_encounter_conversation(db, node, champ_id))
+            # Once the authored prelude is closed, keep the node as an
+            # Encounter so the player can start the battle.  The completion
+            # marker prevents hydration/reconnects from reopening the
+            # conversation; an unfinished battle remains startable until its
+            # game-end event marks the node completed.
             if (prelude and not data.get("pre_encounter_completed") and
                     not data.get("completed")):
                 data.update({
@@ -1150,14 +1317,17 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                 # Battles and authored dungeon/panorama scenes are actionable
                 # map encounters. Preserve explicit Convo/ShroomHaus overrides.
                 data["type"] = "Encounter"
-                if data.get("completed"):
+                if (data.get("completed") or
+                        data.get("pre_encounter_completed")):
                     data["autostart"] = False
+                if data.get("pre_encounter_completed"):
+                    data["conversationId"] = None
     if champ_id is not None and state is not None:
         _sync_az1_quest_gates(db, champ_id, state)
         _apply_az1_quest_markers(db, champ_id, state)
 
 
-def _az1_area_scene_state(champion_race=None, rewards_json=None):
+def _az1_area_scene_state(champion_race=None, rewards_json=None, db=None):
     """Build client locations from the authored Howling Plains SceneData."""
     try:
         raw = Path(__file__).parent.joinpath("Records", "SceneData.jsonl").read_text()
@@ -1200,6 +1370,8 @@ def _az1_area_scene_state(champion_race=None, rewards_json=None):
                                  "choices": [],
                                  "selection-type": "Shroomkin_Haus",
                                  "selection-desc": "Shroomkin_Instructions"})
+    if db is not None:
+        _az1_append_path_forks(db, locs, nodes)
     return locs, nodes
 
 
@@ -1215,15 +1387,77 @@ def _az1_neighbors(db, node):
     return {str(row[0]) for row in rows if row and row[0]}
 
 
+def _az1_failed_nodes(state):
+    """Return AZ1 encounter nodes whose latest attempt was a loss."""
+    pdata = ((state or {}).get("PublicState", {}) or {}).get("Data", {}) or {}
+    values = list(pdata.get("failed_nodes") or [])
+    # Accept the singular form from any short-lived development saves.
+    if pdata.get("failed_node"):
+        values.append(pdata["failed_node"])
+    return {
+        _resolve_node(state, str(node))
+        for node in values
+        if node
+    }
+
+
 def _az1_is_adjacent(db, start_node, end_node):
-    """Whether two AZ1 nodes share an authored map path."""
+    """Whether two AZ1 locations are joined by an authored map path.
+
+    The client walks through prefab-only path forks (such as ``Fork001``)
+    while the server receives only the destination Location.  Treat a
+    location pair joined by one such fork as adjacent for movement validation.
+    """
+    path_forks = _az1_path_fork_ids(db)
+    # Forks are client-only geometry. They may participate in a route, but
+    # neither endpoint of a server movement request may be a fork itself.
+    if start_node in path_forks or end_node in path_forks:
+        return False
     if not start_node or not end_node or start_node == end_node:
         return start_node == end_node
-    return bool(db.execute(
+    if db.execute(
         "SELECT 1 FROM campaign_node_edges "
         "WHERE campaign_template='AZ1' AND from_node=? AND to_node=?",
         (str(start_node), str(end_node)),
+    ).fetchone():
+        return True
+    return bool(db.execute(
+        "SELECT 1 FROM campaign_node_edges first "
+        "JOIN campaign_node_edges second "
+        "  ON second.campaign_template=first.campaign_template "
+        " AND second.from_node=first.to_node "
+        "WHERE first.campaign_template='AZ1' "
+        "  AND first.from_node=? AND second.to_node=? "
+        "  AND lower(first.to_node) LIKE 'fork%'",
+        (str(start_node), str(end_node)),
     ).fetchone())
+
+
+def _az1_has_safe_visited_route(db, state, destination, visited=None):
+    """Whether *destination* is adjacent to a previously visited safe node.
+
+    A failed encounter only blocks a destination that can be reached solely
+    through that failed node.  A destination with an alternate path from any
+    other visited node remains travelable (for example Node014 is reachable
+    from both Node013 and the already-visited Node012 bridge).  Failed nodes
+    are deliberately excluded from the alternate-route set so their own
+    downstream neighbours stay closed until the encounter is won.
+    """
+    destination = _resolve_node(state, str(destination or ""))
+    if not destination:
+        return False
+    if visited is None:
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        visited = {
+            _resolve_node(state, str(node))
+            for node in (pdata.get("visited_nodes") or [])
+            if node
+        }
+    failed = _az1_failed_nodes(state)
+    return any(
+        node not in failed and _az1_is_adjacent(db, node, destination)
+        for node in visited
+    )
 
 
 def _az1_reveal_neighbors(db, state, current_node=None):
@@ -1270,6 +1504,37 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         for node in (pdata.get("quest_hidden_nodes") or [])
         if node
     }
+    path_forks = _az1_path_fork_ids(db)
+    failed_nodes = _az1_failed_nodes(state)
+    # A failed node keeps an unvisited destination closed only when that
+    # destination has no alternate route from another safe visited node.  A
+    # shared path (for example Node012 -> Fork001 -> Node014) remains usable
+    # even when Node013, another neighbour, was failed.
+    for failed_node in failed_nodes:
+        failed_neighbors = set(_az1_neighbors(db, failed_node))
+        for fork in failed_neighbors & path_forks:
+            failed_neighbors.update(_az1_neighbors(db, fork))
+        blocked.update(
+            neighbor for neighbor in failed_neighbors
+            if (neighbor not in visited and neighbor not in path_forks and
+                not _az1_has_safe_visited_route(
+                    db, state, neighbor, visited=visited))
+        )
+    # While standing on a failed encounter, preserve any unvisited
+    # destination that is reachable from another safe visited node.  This
+    # allows backtracking through the bridge and then taking its alternate
+    # branch without allowing a failed node to open its own downstream path.
+    if current in failed_nodes:
+        blocked.update(
+            str((loc.get("Data") or {}).get("node"))
+            for loc in state.get("VisLocs", [])
+            if ((loc.get("Data") or {}).get("node") and
+                (loc.get("Data") or {}).get("node") not in visited and
+                (loc.get("Data") or {}).get("node") not in path_forks and
+                not _az1_has_safe_visited_route(
+                    db, state, (loc.get("Data") or {}).get("node"),
+                    visited=visited))
+        )
     for loc in state.get("VisLocs", []):
         data = loc.get("Data") or {}
         node = data.get("node")
@@ -1278,13 +1543,15 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         # A quest gate can hide an authored neighbour even when the static
         # map graph says it is adjacent.  A previously visited node remains
         # visible so reconnects never erase discovered map space.
-        known = ((node in reveal and node not in blocked) or
-                 node in visited or bool(data.get("completed")) or
+        known = (node in path_forks or node in visited or
+                 bool(data.get("completed")) or node in reveal or
                  node in forced_visible)
-        if node in forced_hidden:
+        if node in blocked and node not in visited and node not in path_forks:
+            known = False
+        if node in forced_hidden and node not in path_forks:
             known = False
         data["visible"] = known
-        data["enabled"] = known
+        data["enabled"] = False if node in path_forks else known
 
 
 def _az1_set_node_gate(state, node, blocked):
@@ -1400,11 +1667,37 @@ def _quest_row_matches_faction(row_faction, champion_faction):
 
 
 def _quest_hook_az1_tamed_start(db, champ_id, state):
-    """Tamed quest: keep the Fonferek branch closed until unlocked."""
+    """Tamed quest: keep gated branches closed until their quests unlock."""
     before = json.dumps(state, sort_keys=True)
     _az1_set_node_gate(state, "Node005", True)
+    # The west half of the Zila bridge is opened only after the Savage Lord
+    # route is resolved; it must not appear on a fresh AZ1 map.
+    _az1_set_node_gate(state, "Node015", True)
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    # A stale save may contain a prior west-bridge visit.  While the gate is
+    # active, purge that visit/path so reconnect hydration cannot resurrect
+    # the node merely because it was once discovered.
+    pdata["visited_nodes"] = [
+        value for value in (pdata.get("visited_nodes") or [])
+        if str(value) not in {"Node015", "Bridge over the Zila - West"}
+    ]
+    pdata["visited_paths"] = [
+        value for value in (pdata.get("visited_paths") or [])
+        if "Node015" not in str(value)
+    ]
+    if isinstance(pdata.get("conversation_visits"), dict):
+        pdata["conversation_visits"].pop("Node015", None)
     _az1_reveal_neighbors(db, state, state.get("LastNode"))
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") == "Node015":
+            data.update({"visible": False, "enabled": False})
     return json.dumps(state, sort_keys=True) != before
+
+
+def _az1_unlock_west_bridge(state):
+    """Open the west Zila bridge after the Savage Lord resolution."""
+    _az1_set_node_gate(state, "Node015", False)
 
 
 def _quest_hook_az1_find_horwich_sea_start(db, champ_id, state):
@@ -1415,22 +1708,46 @@ def _quest_hook_az1_find_horwich_sea_start(db, champ_id, state):
     return json.dumps(state, sort_keys=True) != before
 
 
-def _quest_hook_az1_find_cave_in_start(db, champ_id, state):
-    """Find the Cave-In: reveal Node017 and hide Ambling Mesa (Node034)."""
+def _quest_hook_az1_cross_the_river_start(db, champ_id, state):
+    """Cross the Zila River: reveal its authored route and objective nodes."""
     before = json.dumps(state, sort_keys=True)
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    # Fork001 is connective prefab geometry and is always visible.  The quest
+    # reveals only its two authored destinations; the first encounter uses a
+    # zero GUID in source data, so these node IDs cannot be inferred from it.
+    reveal = ("Node013", "Node014")
+    path_forks = _az1_path_fork_ids(db)
+    for key in ("quest_nodes", "quest_reveal_nodes", "unlocked_nodes"):
+        values = [str(value) for value in (pdata.get(key) or []) if value]
+        if key in {"quest_reveal_nodes", "unlocked_nodes"}:
+            values = [value for value in values if value not in path_forks]
+        for node in reveal:
+            if node not in values:
+                values.append(node)
+        pdata[key] = values
+    _az1_reveal_neighbors(db, state, state.get("LastNode"))
+    return json.dumps(state, sort_keys=True) != before
+
+
+def _quest_hook_az1_find_cave_in_start(db, champ_id, state):
+    """Find the Cave-In: reveal Node017; hide the opposing route and grotto."""
+    before = json.dumps(state, sort_keys=True)
+    _az1_set_node_gate(state, "Node025", True)  # Lena Grotto
     _az1_set_quest_route(db, state, "Node017", "Node034")
     return json.dumps(state, sort_keys=True) != before
 
 
 def _quest_hook_az1_find_ambling_mesa_start(db, champ_id, state):
-    """Find the Ambling Mesa: reveal Node034 and hide the Cave-In (Node017)."""
+    """Find Ambling Mesa: reveal Node034; hide the opposing route and grotto."""
     before = json.dumps(state, sort_keys=True)
+    _az1_set_node_gate(state, "Node025", True)  # Lena Grotto
     _az1_set_quest_route(db, state, "Node034", "Node017")
     return json.dumps(state, sort_keys=True) != before
 
 
 _QUEST_START_HOOKS = {
     "az1_tamed_start": _quest_hook_az1_tamed_start,
+    "az1_cross_the_river_start": _quest_hook_az1_cross_the_river_start,
     "az1_find_horwich_sea_start": _quest_hook_az1_find_horwich_sea_start,
     "az1_find_cave_in_start": _quest_hook_az1_find_cave_in_start,
     "az1_find_ambling_mesa_start": _quest_hook_az1_find_ambling_mesa_start,
@@ -3132,7 +3449,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             if (location_data and
                     (location_data.get("visible", True) or
                      requested_node in visited_nodes) and
-                    requested_node not in blocked_nodes):
+                    requested_node not in blocked_nodes and
+                    requested_node not in _az1_path_fork_ids(db)):
                 state["LastNode"] = requested_node
                 _note_visited(state, requested_node)
                 _az1_reveal_neighbors(db, state, requested_node)
@@ -3291,6 +3609,23 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                         visits[node_key] = int(visits.get(node_key, 0) or 0) + 1
                     except (TypeError, ValueError):
                         visits[node_key] = 1
+                # Completing the Savage Lord result conversation unlocks the
+                # west half of the Zila bridge. Until this point Node015 stays
+                # hidden/blocked even though the authored map graph contains
+                # a static Node012 <-> Node015 edge.
+                if (current_template == "AZ1" and
+                        current_data.get("node") == "Node014" and
+                        str(current_data.get("conversationId") or "") ==
+                        "0211e909-2945-4f84-b8c6-1e5d33169d6e"):
+                    _az1_unlock_west_bridge(state)
+                if (current_template == "AZ1" and
+                        current_data.get("shroomhaus_convo")):
+                    current_data.update({
+                        "type": "ShroomHaus", "conversationId": None,
+                        "autostart": True, "completed": False,
+                        "shroomhaus_ready": True,
+                    })
+                    current_data.pop("shroomhaus_convo", None)
                 # Quest assignment is driven by the extracted conversation
                 # catalog.  One conversation may grant several quests (for
                 # example Tamed plus the faction Find quest).
@@ -3340,7 +3675,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     })
                     state["ALoc"] = (current_data.get("name") or
                                       current_data.get("node") or current)
-                else:
+                elif not current_data.get("shroomhaus_ready"):
                     state["ALoc"] = None
             state["CurState"] = "EXPLORE"
             db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
@@ -3571,13 +3906,14 @@ def _apply_gameend(db, camp_id, won):
     panorama. Returns (camp_id, GameplayState) or (None, None) if not found.
     """
     row = db.execute(
-        "SELECT champion_id, state_json, campaign_type FROM campaigns WHERE id=?",
+        "SELECT champion_id, state_json, campaign_type, template_name "
+        "FROM campaigns WHERE id=?",
         (camp_id,)
     ).fetchone()
     if not row:
         return None, None
 
-    champ_id, state_json, ctype = row
+    champ_id, state_json, ctype, template_name = row
     if state_json:
         state = json.loads(state_json)
     else:
@@ -3669,8 +4005,19 @@ def _apply_gameend(db, camp_id, won):
         active_node = state.get("ALoc")
         condition_met = bool(state.pop("_last_encounter_condition_met", False))
         quest_pending = _quest_encounter_is_pending(db, champ_id, active_scene)
-        retryable = bool(quest_pending and not condition_met)
+        # Tamed encounters remain available after an uncaptured win even if
+        # the journal has not reached (or has not yet recorded) that specific
+        # objective. The authored condition identifies these scenes without
+        # naming individual creatures; a captured win closes the node and
+        # advances the matching quest objective when one is active.
+        tamed_scene = any(
+            str((record.get("end_of_game_condition") or {}).get("type") or "")
+                .strip().lower() == "void_tamed_troop"
+            for record in _scene_reward_records(db, active_scene)
+        )
+        retryable = bool((quest_pending or tamed_scene) and not condition_met)
         matched_index = None
+        result_node = None
         for idx, loc in enumerate(state.get("VisLocs", [])):
             data = loc.get("Data") or {}
             if ((active_scene and str(data.get("encounter") or "") == active_scene)
@@ -3687,21 +4034,38 @@ def _apply_gameend(db, camp_id, won):
                 matched_index = idx
                 node_name = data.get("node") or data.get("name")
                 if node_name:
+                    result_node = node_name
                     state["LastNode"] = node_name
                     visited = state.setdefault("PublicState", {}).setdefault(
                         "Data", {}).setdefault("visited_nodes", [])
                     if node_name not in visited:
                         visited.append(node_name)
+                    pdata = state.setdefault("PublicState", {}).setdefault(
+                        "Data", {})
+                    failed_nodes = [str(value) for value in
+                                    (pdata.get("failed_nodes") or []) if value]
+                    if not won and node_name not in failed_nodes:
+                        failed_nodes.append(node_name)
+                    elif won:
+                        failed_nodes = [value for value in failed_nodes
+                                        if value != str(node_name)]
+                    pdata["failed_nodes"] = failed_nodes
                 break
         if retryable:
             _mark_quest_objective_retryable(db, champ_id, active_scene)
-        if matched_index is not None:
+        # A successful completion can expose the next authored location. A
+        # loss leaves the player at the failed node; its unvisited neighbours
+        # stay hidden until a retry succeeds.
+        if won and matched_index is not None:
             for loc in state.get("VisLocs", [])[matched_index + 1:]:
                 data = loc.get("Data") or {}
                 if not data.get("completed"):
                     data["visible"] = True
                     data["enabled"] = True
                     break
+        if (str(template_name or "").upper() == "AZ1" and
+                result_node):
+            _az1_reveal_neighbors(db, state, result_node)
         state.pop("ActiveEncounterGuid", None)
 
     # Clear ALoc so the panorama doesn't auto-pop the encounter dialog when
@@ -4349,9 +4713,10 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         if retry_without_currency:
             gold = 0
             xp = 0
-        # A scene can have unconditional completion currency alongside a
-        # conditional capture card (Wild Cub is authored this way). Only the
-        # card template is gated by end_of_game_condition.
+        # Tamed scenes have unconditional completion currency alongside a
+        # conditional capture card. Only the card template is gated by
+        # end_of_game_condition, so an uncaptured win can be retried without
+        # awarding the captured card prematurely.
         template = reward_obj.get("card_guid") or reward_obj.get("template")
         template_guid = (_resolve_reward_template(template, context)
                          if (not condition or context) else None)
@@ -5207,16 +5572,63 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                 and requested.get("completed")
                 and not requested.get("repeatable"))
             movement_rejected = False
+            path_forks = (_az1_path_fork_ids(db)
+                          if ((ctype or "").upper() == "AREA" and
+                              str(template_name or "").upper() == "AZ1")
+                          else set())
+            if requested_node in path_forks:
+                # Fork nodes are present for client path geometry only; a
+                # stale or modified client must not turn one into ALoc.
+                log(f"    Campaign movement rejected: {requested_node} is "
+                    "a non-visitable path fork")
+                movement_rejected = True
+                node = previous_node or previous or state.get("LastNode") or ""
+                if node and node != requested_node:
+                    requested = next(
+                        ((l.get("Data") or {}) for l in state.get("VisLocs", [])
+                         if (l.get("Data") or {}).get("node") == node),
+                        requested)
             if not blocked_encounter and previous and previous != node:
                 previous_data = next(
                     ((l.get("Data") or {}) for l in state.get("VisLocs", [])
-                     if (l.get("Data") or {}).get("node") == previous), {})
+                     if ((l.get("Data") or {}).get("node") in
+                         {previous, previous_node} or
+                         (l.get("Data") or {}).get("name") == previous)), {})
                 # Do not silently complete an encounter merely because the
                 # client attempted to travel away from it. Battles complete
                 # only through the game-end flow.
-                if (previous_data.get("type") not in ("", "Empty", None) and
-                        not previous_data.get("completed")):
-                    node = previous
+                # Repeatable locations (for example Winston at the east
+                # bridge, or a Tamed encounter won without capture) deliberately
+                # remain incomplete so they can be entered again. They must
+                # not behave like unfinished one-time content and trap the
+                # player on the node when another adjacent location is chosen.
+                # Non-repeatable conversations and encounters still block
+                # movement until their event resolves.
+                previous_type = str(previous_data.get("type") or "").lower()
+                previous_repeatable = bool(previous_data.get("repeatable"))
+                failed_nodes = _az1_failed_nodes(state)
+                visited_nodes = {
+                    _resolve_node(state, str(value))
+                    for value in (state.setdefault("PublicState", {})
+                                  .setdefault("Data", {})
+                                  .get("visited_nodes") or [])
+                    if value
+                }
+                if (previous_node in failed_nodes and
+                        requested_node not in visited_nodes and
+                        not _az1_has_safe_visited_route(
+                            db, state, requested_node,
+                            visited=visited_nodes)):
+                    log(f"    Campaign movement rejected: {previous_node} "
+                        f"failed; {requested_node} has no safe visited route")
+                    node = previous_node or previous
+                    requested = previous_data
+                    movement_rejected = True
+                elif (previous_type not in ("", "empty") and
+                        previous_node not in failed_nodes and
+                        not previous_data.get("completed") and
+                        not previous_repeatable):
+                    node = previous_node or previous
                     requested = previous_data
                     blocked_encounter = True
                 elif ((ctype or "").upper() == "AREA" and
@@ -5228,7 +5640,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                     # location name directly.
                     log(f"    Campaign movement rejected: {previous_node} -> "
                         f"{requested_node} is not adjacent")
-                    node = previous
+                    node = previous_node or previous
                     requested = previous_data
                     movement_rejected = True
             if (not blocked_encounter and not movement_rejected and
@@ -5249,7 +5661,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                         requested_node not in visited_nodes) or not requested_visible:
                     log(f"    Campaign movement rejected: {previous_node} -> "
                         f"{requested_node} is hidden or quest-gated")
-                    node = previous
+                    node = previous_node or previous
                     requested = previous_data
                     movement_rejected = True
             _note_visited(state, node)
@@ -5284,7 +5696,8 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                     data = loc.get("Data", {}) or {}
                     if data.get("node") == node and data.get("type") == "Convo":
                         if (data.get("pre_encounter") and
-                                not data.get("pre_encounter_completed")):
+                                not data.get("pre_encounter_completed") and
+                                not data.get("completed")):
                             # Outcome conversations (Success/Fail) are in the
                             # same catalog as the opening narration.  While
                             # entering the encounter for the first time, use
@@ -5305,6 +5718,11 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
         state["CurState"] = "EXPLORE"
         for loc in state.get("VisLocs", []):
             ld = loc.get("Data", {})
+            if ((ctype or "").upper() == "AREA" and
+                    str(template_name or "").upper() == "AZ1" and
+                    (ld.get("node") or ld.get("name")) in
+                    _az1_path_fork_ids(db)):
+                continue
             if ld.get("node") == location_name or ld.get("name") == location_name:
                 ld["completed"] = True
                 _note_visited(state, ld.get("node") or location_name)

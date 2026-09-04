@@ -3,6 +3,7 @@
 import random, json, threading, re, time
 
 import game_engine as _ge
+from gamedata import CardPlayCost, RecordStore, ability_graph
 from db import (_db, log_req, db_game_session_pids, db_game_champion,
                 db_game_deck_cards, db_game_draw_cards, db_game_card_type,
                 db_game_shuffle_deck, db_champion_template_health,
@@ -17,6 +18,7 @@ from gamemodes.tournament_engine import (
 _ECardCollections = _ge.ECardCollections
 _ECardTypes = _ge.ECardTypes
 _PVP_INACTIVITY_TIMEOUT_SECONDS = 5 * 60
+_RECORD_STORE = RecordStore()
 
 
 def _pvp_resource_charge_points(session, card_uid):
@@ -1723,9 +1725,9 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
     explicit target template of its non-manual abilities has a legal candidate
     (mirrors PvE _hand_card_playable + _card_target_requirements_met — makes
     Countermagic unplayable with nothing on the chain)."""
-    import json as _js
-    from db import db_ability_meta_targets
-    from abilities.framework.targeting import legal_targets, ZONE_MAP
+    from gamedata import AbilityInstance, PlayPlan, RecordStore
+    from gamedata import ability_graph
+    from abilities.framework.targeting import legal_targets
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return True
@@ -1737,18 +1739,37 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
         if ccu:
             champ_targets.append((ccu, cpid, "Champ",
                                   int(state.get(f"hp_{cpid}", 20))))
+    store = _RECORD_STORE
+    try:
+        play_plan = PlayPlan.from_card(store, tpl_guid, source_uid=card_uid,
+                                       owner_id=turn_pid)
+    except KeyError:
+        return False
+    for cost_spec in play_plan.cost_instances:
+        if cost_spec["auto"]:
+            continue
+        candidates = legal_targets(
+            _db, session.session_id, turn_pid, cost_spec["target_guid"],
+            int(card_uid), both_players=False, champions=champ_targets,
+            battle_state=state)
+        if len(candidates) < int(cost_spec["minimum"]):
+            return False
     for ag in (ability_guids or []):
-        meta = db_ability_meta_targets(ag)
-        if not meta or not meta[0]:
+        graph = ability_graph(store, str(ag).lower())
+        if graph is None:
+            # A card whose current Records definition is unavailable is not
+            # playable; do not silently substitute a stale DB ability shape.
+            return False
+        if graph.manual or graph.trigger_event_type:
             continue
-        if meta[4]:  # is_manual — a warzone activation, not a play cost
-            continue
-        try:
-            tpl_ids = _js.loads(meta[0])
-        except Exception:
-            continue
-        for tid in tpl_ids:
-            tid = str(tid)
+        instance = AbilityInstance.from_graph(graph)
+        for index in instance.referenced_target_indexes:
+            if index >= len(graph.targets):
+                continue
+            target = graph.targets[index]
+            if not target.requires_input or target.minimum < 1:
+                continue
+            tid = target.guid
             trow = _db.execute(
                 "SELECT filter_json, target_kind, is_auto_target, "
                 "collection_flags, min_target_count FROM target_templates "
@@ -1757,17 +1778,9 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
                 continue
             kind = trow[1] or ""
             auto = int(trow[2] or 0)
-            flags = trow[3] or ""
-            minc = int(trow[4] or 1)
-            if auto or minc < 1:
+            if auto:
                 continue
             if kind == "PlayerTargetTemplate":
-                continue
-            if not flags or flags.strip().lower() in ("none", ""):
-                continue
-            zones = [ZONE_MAP.get(z, z.lower())
-                     for z in flags.split("|") if z]
-            if not zones:
                 continue
             try:
                 candidates = legal_targets(
@@ -1777,7 +1790,7 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
                 continue
             if not candidates:
                 log_req(f"    PvP options: {ct_name} not playable "
-                        f"(target template {tid[:8]} zone {flags} "
+                        f"(target template {tid[:8]} "
                         f"has no legal target)")
                 return False
     return True
@@ -1986,7 +1999,6 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     # client's target picker shows candidates — mirrors PvE
     # _champion_ability_targets.  Without this CanUseAbility is false and the
     # button is dead.
-    import json as _js
     from abilities.framework.targeting import legal_targets as _lt
     champ_map = state.get("champ_map") or {}
     champ_targets = []
@@ -1998,17 +2010,11 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     target_data = {}
     for rid in all_rids:
         ag = str(rid.guid)
-        row = _db.execute(
-            "SELECT target_template_ids FROM champion_abilities "
-            "WHERE ability_guid=?", (ag,)).fetchone()
-        if not row or not row[0]:
-            continue
-        try:
-            tpls = _js.loads(row[0])
-        except Exception:
+        target_guids = _pvp_ability_target_guids(ag)
+        if not target_guids:
             continue
         entries = []
-        for tid in tpls:
+        for tid in target_guids:
             tid = str(tid)
             trow = _db.execute(
                 "SELECT target_kind, is_auto_target, min_target_count, "
@@ -2069,8 +2075,8 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
          if isinstance(event, _ge.PlayerOptionListSessionEventArgs)), None)
     if last_ev is None:
         return
-    from db import db_get_card_abilities, db_ability_meta_targets, \
-        db_card_template_field, db_target_template_text, db_card_template_thresholds
+    from db import db_get_card_abilities
+    from gamedata import AbilityInstance, PlayPlan
     from abilities.framework.targeting import legal_targets as _lt
     champ_map = state.get("champ_map") or {}
     champ_targets = []
@@ -2087,25 +2093,23 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
             (session.session_id, card_uid)).fetchone()
         if not row:
             continue
-        ab_json, _attrs = db_get_card_abilities(row[0])
-        ab = []
-        if ab_json:
-            try:
-                ab = [x.lower() for x in _js.loads(ab_json)]
-            except Exception:
-                pass
-        for ag in ab:
-            meta = db_ability_meta_targets(ag)
-            if not meta or not meta[0]:
+        store = _RECORD_STORE
+        try:
+            plan = PlayPlan.from_card(store, row[0], source_uid=card_uid,
+                                      owner_id=turn_pid)
+        except KeyError:
+            continue
+        for ability in plan.abilities:
+            graph = ability.graph
+            if graph is None or graph.manual or ability.is_triggered:
                 continue
-            if meta[4]:  # is_manual — hand cards don't activate manual abilities
-                continue
-            try:
-                tpl_ids = _js.loads(meta[0])
-            except Exception:
-                continue
-            for i, tid in enumerate(tpl_ids):
-                tid = str(tid)
+            for i in ability.referenced_target_indexes:
+                if i >= len(graph.targets):
+                    continue
+                target = graph.targets[i]
+                if not target.requires_input:
+                    continue
+                tid = target.guid
                 trow = _db.execute(
                     "SELECT filter_json, target_kind, is_auto_target "
                     "FROM target_templates WHERE template_id=?",
@@ -2134,9 +2138,11 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
                 if not targets:
                     continue
                 inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
-                inst.opt_id = _ge.ResourceId.from_str(ag)
-                inst.min_target_counts.append(1)
-                inst.max_target_counts.append(1)
+                inst.opt_id = _ge.ResourceId.from_str(ability.ability_guid)
+                minimum = max(0, int(target.minimum))
+                maximum = max(minimum, int(target.maximum or minimum or 1))
+                inst.min_target_counts.append(minimum)
+                inst.max_target_counts.append(maximum)
                 inst.target_ids.append(_ge.ResourceId.from_str(tid))
                 tgt = g._make_event(_ge.TargetInstanceSessionEventArgs)
                 tgt.target_index = i
@@ -2150,25 +2156,53 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
                 for inst2 in opt.instances:
                     if str(inst2.opt_id.guid) == _ge.PLAY_CARD_ABILITY_TEMPLATE_ID:
                         inst2.target_ids.append(_ge.ResourceId.from_str(tid))
-                        inst2.min_target_counts.append(1)
-                        inst2.max_target_counts.append(1)
+                        inst2.min_target_counts.append(minimum)
+                        inst2.max_target_counts.append(maximum)
                         tgt2 = g._make_event(_ge.TargetInstanceSessionEventArgs)
                         tgt2.target_index = len(inst2.target_instances)
                         tgt2.target_id = _ge.ResourceId.from_str(tid)
                         tgt2.targets = list(targets)
                         inst2.target_instances.append(tgt2)
                         break
-        # Variable X cost: attach an XCost CostInstance to the PlayCard option
-        # so the client's BattleStateAssignXCost pushes the X slider — only for
-        # templates with variable_cost (mirrors PvE _template_has_x_cost).
-        vc = _db.execute(
-            "SELECT variable_cost FROM card_templates WHERE guid=?",
-            (row[0],)).fetchone()
-        if vc and int(vc[0] or 0) > 0:
+        # Card-level target costs use the same CostInstance contract as
+        # activated abilities.  Preserve their authored order so the client
+        # assigns them into the matching XCostData collection.
+        for cost_spec in plan.cost_instances:
+            if cost_spec["auto"]:
+                continue
+            cost_guid = cost_spec["target_guid"]
+            try:
+                cost_uids = _lt(
+                    _db, session.session_id, turn_pid, cost_guid,
+                    int(card_uid), both_players=False,
+                    champions=champ_targets, battle_state=state)
+            except Exception:
+                cost_uids = []
+            if not cost_uids:
+                continue
+            minimum = int(cost_spec["minimum"])
+            maximum = int(cost_spec["maximum"])
+            if maximum < 0:
+                maximum = len(cost_uids)
             for inst in opt.instances:
                 if str(inst.opt_id.guid) == _ge.PLAY_CARD_ABILITY_TEMPLATE_ID:
                     ci = g._make_event(_ge.CostInstanceSessionEventArgs)
-                    ci.min = 0
+                    ci.min = minimum
+                    ci.max = maximum
+                    ci.cost_type = int(cost_spec["cost_type"])
+                    ci.target_template_id = _ge.ResourceId.from_str(cost_guid)
+                    ci.targets = [_ge.SessionCardId(_ge.UID(int(uid)))
+                                  for uid in cost_uids]
+                    inst.target_instances.append(ci)
+                    break
+        # Variable X cost: attach an XCost CostInstance to the PlayCard option
+        # so the client's BattleStateAssignXCost pushes the X slider — only for
+        # templates with variable_cost (mirrors PvE _template_has_x_cost).
+        if plan.cost.variable:
+            for inst in opt.instances:
+                if str(inst.opt_id.guid) == _ge.PLAY_CARD_ABILITY_TEMPLATE_ID:
+                    ci = g._make_event(_ge.CostInstanceSessionEventArgs)
+                    ci.min = plan.cost.variable_minimum
                     ci.max = 0
                     ci.cost_type = 256  # EAbilityCostType.XCostAbilityCostType
                     ci.target_template_id = _ge.ResourceId.invalid()
@@ -2223,7 +2257,7 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
                 ab_list = []
         # An explicit empty instance list is meaningful: a ONE-SHOT ability
         # has been consumed and must not be restored from the canonical card
-        # template.  Only repair genuinely missing legacy instance data.
+        # template.
         if ab_row is None or ab_row[0] is None:
             trow = _db.execute(
                 "SELECT abilities_json FROM card_templates WHERE guid=?",
@@ -2239,36 +2273,22 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
         affordable = []
         for ag in ab_list:
             ag = str(ag)
-            m = _db.execute(
-                "SELECT casting_behavior, is_manual, activation_cost, "
-                "uses_per_game, uses_per_turn, exhausts_on_use "
-                "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
-            if not m:
+            graph = ability_graph(_RECORD_STORE, ag.lower())
+            if graph is None:
                 continue
-            casting, manual, cost, upg, upt, exh = m
-            if not manual:
+            casting = 64 if graph.casting_behavior == "QuickAction" else 8
+            if not graph.manual:
                 continue
-            raw_row = _db.execute(
-                "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-                (ag,)).fetchone()
-            if raw_row and raw_row[0]:
-                try:
-                    cond_ctx = ConditionContext(
-                        _db, session, state, ability_source_uid=int(card_uid),
-                        ability_source_owner_id=ability_pid)
-                    if not trigger_condition_met(raw_row[0], cond_ctx):
-                        continue
-                except Exception:
-                    pass
-            trow2 = _db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            tids = []
-            if trow2 and trow2[0]:
-                try:
-                    tids = _js.loads(trow2[0])
-                except Exception:
-                    tids = []
+            cost = graph.costs.activation
+            upg = graph.costs.uses_per_game
+            upt = graph.costs.uses_per_turn
+            exh = graph.costs.exhausts_card_on_use
+            cond_ctx = ConditionContext(
+                _db, session, state, ability_source_uid=int(card_uid),
+                ability_source_owner_id=ability_pid)
+            if not trigger_condition_met(graph.source.to_dict(), cond_ctx):
+                continue
+            tids = [target.guid for target in graph.targets]
             if tids:
                 wants_attacking = False
                 has_target = False
@@ -2338,45 +2358,19 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
     return result
 
 
-_PVP_ABILITY_COST_FIELD_TYPES = {
-    "m_VoidTarget": 16,
-    "m_SacrificeTarget": 2,
-    "m_ExhaustTarget": 1,
-    "m_DiscardTarget": 8,
-    "m_RevealTarget": 64,
-    "m_PutIntoDeckTarget": 32,
-    "m_PutIntoDeckTarget2": 32,
-    "m_PutIntoHandTarget": 128,
-    "m_ShuffleIntoDeckTarget": 4,
-}
-
-
 def _pvp_ability_cost_templates(ability_guid):
-    """Read card-payment target templates from an ability's raw metadata."""
-    row = _db.execute(
-        "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid).lower(),)).fetchone()
-    if not row or not row[0]:
+    """Return authored payment targets from the current AbilityTemplate."""
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
         return []
-    raw = row[0]
-    out = []
-    for field, cost_type in _PVP_ABILITY_COST_FIELD_TYPES.items():
-        match = re.search(
-            rf'"{field}"\s*:\s*\{{[^}}]*"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"',
-            raw)
-        if match:
-            guid = match.group(1).lower()
-            if guid != "00000000-0000-0000-0000-000000000000":
-                out.append((guid, cost_type))
-            continue
-        match = re.search(rf'"{field}"\s*:\s*\[(.*?)\]', raw)
-        if match:
-            for guid in re.findall(
-                    r'"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"', match.group(1)):
-                guid = guid.lower()
-                if guid != "00000000-0000-0000-0000-000000000000":
-                    out.append((guid, cost_type))
-    return out
+    return [(guid, CardPlayCost.cost_type(kind))
+            for kind, guid in graph.additional_cost_targets]
+
+
+def _pvp_ability_target_guids(ability_guid):
+    """Return target-template GUIDs from the current AbilityTemplate."""
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    return [target.guid for target in graph.targets] if graph is not None else []
 
 
 def _pvp_ability_cost_targets(session, state, pid, source_uid,
@@ -2387,15 +2381,20 @@ def _pvp_ability_cost_targets(session, state, pid, source_uid,
     if not costs:
         return []
     out = []
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    target_store = _RECORD_STORE
     for tid, cost_type in costs:
-        trow = _db.execute(
-            "SELECT min_target_count, max_target_count, target_kind, "
-            "is_auto_target "
-            "FROM target_templates WHERE template_id=?", (tid,)).fetchone()
-        minimum = int(trow[0] or 1) if trow else 1
-        maximum = int(trow[1] or 1) if trow else 1
-        target_kind = (trow[2] if trow else "") or ""
-        is_auto = bool(int(trow[3] or 0)) if trow else False
+        target_record = target_store.get(
+            "AbilityTargetTemplate", str(tid).lower())
+        target = target_record.target_spec if target_record is not None else None
+        if target is None:
+            return None
+        minimum = max(0, int(target.minimum))
+        maximum = int(target.maximum)
+        target_kind = target.target_kind
+        is_auto = bool(target.is_auto)
+        if maximum <= 0:
+            maximum = -1
         # Gamedata represents "sacrifice this" as an automatic source-card
         # target.  It is a payment target for the option contract, but the
         # client does not repeat the source UID in the submitted TargetMap.
@@ -2424,9 +2423,11 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
                                             ability_guid, selected_uids,
                                             champ_targets):
     """Split a champion activation's payment cards from its effect target."""
-    import json as _json
     from abilities.framework.targeting import (
         legal_targets as _lt, target_uses_both_players)
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        return None
     selected_uids = [int(uid) for uid in (selected_uids or [])]
     cost_targets = _pvp_ability_cost_targets(
         session, state, pid, source_uid, ability_guid, champ_targets)
@@ -2435,55 +2436,35 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
     used = set()
     sacrifices = []
     for tid, cost_type, candidates, minimum, maximum in cost_targets:
-        trow = _db.execute(
-            "SELECT target_kind, is_auto_target FROM target_templates "
-            "WHERE template_id=?", (str(tid),)).fetchone()
-        auto_source = bool(trow and int(trow[1] or 0)) and \
-            (trow[0] or "") == "AbilitySourceCardTargetTemplate"
+        target_record = _RECORD_STORE.get(
+            "AbilityTargetTemplate", str(tid).lower())
+        target = target_record.target_spec if target_record is not None else None
+        auto_source = bool(target and not target.requires_input) and \
+            (target.target_kind == "AbilitySourceCardTargetTemplate")
         available = ([int(source_uid)] if auto_source else
                      [uid for uid in selected_uids
                       if uid in {int(c) for c in candidates}
                       and uid not in used])
         if len(available) < int(minimum):
             return None
-        chosen = available[:int(maximum)]
+        limit = len(available) if int(maximum) < 0 else int(maximum)
+        chosen = available[:limit]
         used.update(chosen)
         if int(cost_type) == 2:
             sacrifices.extend(chosen)
 
-    row = _db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (ability_guid,)).fetchone()
-    if not row or not row[0]:
-        row = _db.execute(
-            "SELECT target_template_ids FROM champion_abilities "
-            "WHERE ability_guid=?", (ability_guid,)).fetchone()
-    if not row or not row[0]:
-        row = _db.execute(
-            "SELECT target_template_ids FROM talent_abilities "
-            "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
-    try:
-        target_templates = _json.loads(row[0]) if row and row[0] else []
-    except (TypeError, ValueError, _json.JSONDecodeError):
-        target_templates = []
+    target_templates = graph.targets
     cost_ids = {str(tid).lower() for tid, _ctype in
                 _pvp_ability_cost_templates(ability_guid)}
     legal_effects = set()
     explicit_required = False
-    for tid in target_templates:
-        tid = str(tid).lower()
+    for target in target_templates:
+        tid = str(target.guid).lower()
         if tid in cost_ids:
             continue
-        trow = _db.execute(
-            "SELECT target_kind, is_auto_target, min_target_count "
-            "FROM target_templates WHERE template_id=?", (tid,)).fetchone()
-        kind = (trow[0] if trow else "") or ""
-        auto = int(trow[1] or 0) if trow else 0
-        if auto or kind in ("PlayerTargetTemplate",
-                            "AbilitySourceCardTargetTemplate",
-                            "AbilityCreatedTargetTemplate"):
+        if not target.requires_input:
             continue
-        explicit_required = True
+        explicit_required = explicit_required or int(target.minimum or 0) > 0
         legal_effects.update(_lt(
             _db, session.session_id, pid, tid, int(source_uid),
             both_players=target_uses_both_players(_db, tid),
@@ -2498,29 +2479,13 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
 def _pvp_discard_prompt_data(ability_guid):
     """Return the child/target pair for a controller discard prompt.
 
-    The normal case is a materialized DiscardCard BOM leaf.  Wretched
-    Wrangler's extracted record stores the discard in the serialized ability
-    contract, so use the generic authored hand-card target as the prompt
-    contract when the leaf is absent.
+    The prompt is derived from the current effect graph.  Missing effect data
+    is invalid Records data and must not be inferred from localized text.
     """
     from abilities import bom_leaf_prompt_data
     prompt = bom_leaf_prompt_data(
         _db, ability_guid, "DiscardCardAbilityEffectTemplate")
-    if prompt and prompt[1]:
-        return prompt
-    row = _db.execute(
-        "SELECT game_text FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid).lower(),)).fetchone()
-    if not (row and re.match(
-            r"^\s*(?:\[[^]]+\]\s*)*discard\s+(?:a|one)\s+card\b",
-            row[0] or "", re.IGNORECASE)):
-        return None
-    target = _db.execute(
-        "SELECT template_id FROM target_templates "
-        "WHERE lower(game_text)=? AND lower(filter_json) LIKE ? "
-        "ORDER BY template_id LIMIT 1",
-        ("a card from your hand", "%hand%"),).fetchone()
-    return (str(ability_guid).lower(), target[0]) if target else None
+    return prompt if prompt and prompt[1] else None
 
 
 def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
@@ -2528,7 +2493,6 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
     """Append warzone-troop ability options (ECardUsage.Activate) to the most
     recent PlayerOptionList, one OptionInstance per affordable ability with
     target instances per target template — mirrors PvE _add_troop_ability_options."""
-    import json as _js
     if not g.events:
         return
     # Card/PlayerUpdated events can be appended while a packet is assembled.
@@ -2556,15 +2520,7 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
         for ag in abilities:
             inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
             inst.opt_id = _ge.ResourceId.from_str(ag)
-            mrow = _db.execute(
-                "SELECT target_template_ids FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            tpls = []
-            if mrow and mrow[0]:
-                try:
-                    tpls = _js.loads(mrow[0])
-                except Exception:
-                    tpls = []
+            tpls = _pvp_ability_target_guids(ag)
             if tpls:
                 built = []
                 for i, tid in enumerate(tpls):
@@ -2841,13 +2797,15 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
         log_req(f"    PvP troop ability {ability_guid[:8]}: not legal in "
                 f"phase {state.get('phase')} — rejected")
         return True
-    m = _db.execute(
-        "SELECT activation_cost, uses_per_game, uses_per_turn, exhausts_on_use "
-        "FROM card_abilities_meta WHERE ability_guid=?", (ability_guid,)).fetchone()
-    cost = int(m[0] or 0) if m else 0
-    upg = int(m[1] or 0) if m else 0
-    upt = int(m[2] or 0) if m else 0
-    exh = int(m[3] or 0) if m else 0
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        log_req(f"    PvP troop ability {ability_guid[:8]}: missing current "
+                "Records ability — rejected")
+        return True
+    cost = graph.costs.activation
+    upg = graph.costs.uses_per_game
+    upt = graph.costs.uses_per_turn
+    exh = graph.costs.exhausts_card_on_use
     resources = int(state.get(f"res_{my_pid}", 0))
     uses = db_card_uses(session.session_id, int(source_uid))
     used = int(uses.get(ability_guid, 0))
@@ -2954,17 +2912,8 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     # not consider source/auto target templates here; those are resolved by
     # the BOM from the source card and must not consume the payment target.
     target_uid = None
-    import json as _target_json
     from abilities.framework.targeting import legal_targets as _legal_targets
-    target_row = _db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (ability_guid,)).fetchone()
-    target_templates = []
-    if target_row and target_row[0]:
-        try:
-            target_templates = _target_json.loads(target_row[0])
-        except Exception:
-            target_templates = []
+    target_templates = _pvp_ability_target_guids(ability_guid)
     legal_effect_targets = set()
     for tid in target_templates:
         tt = _db.execute(
@@ -2984,15 +2933,10 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
         if int(uid) not in cost_target_uids and int(uid) in legal_effect_targets:
             target_uid = int(uid)
             break
-    if target_uid is None and not cost_targets and selected_uids:
-        # Preserve the legacy single-target activation behavior for abilities
-        # without card-payment targets.
-        target_uid = int(selected_uids[-1])
-        if target_templates:
-            if target_uid not in legal_effect_targets:
-                log_req(f"    PvP troop ability {ability_guid[:8]}: target "
-                        f"{target_uid} is not metadata-legal — rejected")
-                return True
+    if target_uid is None and selected_uids and target_templates:
+        log_req(f"    PvP troop ability {ability_guid[:8]}: no legal "
+                "effect target selected — rejected")
+        return True
     discard_prompt_data = _pvp_discard_prompt_data(ability_guid)
     # Resource payment is committed only after all card targets have passed
     # validation, so a stale client transaction cannot spend resources while
@@ -4260,7 +4204,8 @@ def pvp_handle_transaction(handler, session, inner_bytes):
             if ctype_num & (_ge.ECardTypes.BasicAction | _ge.ECardTypes.QuickAction):
                 return _pvp_play_spell(handler, session, played_card_uid,
                                        my_pid, inner_bytes)
-            return _pvp_play_troop(handler, session, played_card_uid, my_pid)
+            return _pvp_play_troop(handler, session, played_card_uid, my_pid,
+                                   inner_bytes)
         except Exception as e:
             # Never let a card-play crash kill the session thread and
             # disconnect both clients — log and ack so the game keeps going.
@@ -5443,7 +5388,8 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
                 view["resolving_owner_id"] = owner_id
                 view["x_cost"] = int(item.get("x_cost") or 0)
                 _rp_spell(g, session, _db, handler, pl_t, ai_t, view,
-                          item.get("ability_guids", []))
+                          item.get("ability_guids", []),
+                          activations=item.get("activations"))
                 view.pop("x_cost", None)
             except Exception as e:
                 import traceback
@@ -5737,10 +5683,11 @@ def _pvp_fra_view(state, attacker_pid, defender_pid):
     }
 
 
-def _pvp_play_troop(handler, session, played_card_uid, my_pid):
+def _pvp_play_troop(handler, session, played_card_uid, my_pid, inner_bytes):
     """Play a non-resource permanent in PvP: hand -> CastSpells -> Warzone,
     fire enters-play triggers, and push the events to BOTH players.  Returns
     True when handled."""
+    from gamedata import PlayPlan
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return False
@@ -5765,11 +5712,44 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid):
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     state = pvp_load_state(session) or {}
+    try:
+        play_plan = PlayPlan.from_card(
+            _RECORD_STORE, tpl_guid, source_uid=int(played_card_uid),
+            owner_id=my_pid)
+    except KeyError as exc:
+        log_req(f"    PvP REJECTED permanent {card_name}: {exc}")
+        return True
+    # Decode the one client TargetMap before paying any resource or card cost.
+    # Cost targets and effect targets share the wire list, so the PlayPlan
+    # partitions them using the authored target templates.
+    try:
+        targets = handler._extract_transaction_targets(
+            inner_bytes, int(played_card_uid))
+    except Exception:
+        targets = []
+    champ_map = state.get("champ_map") or {}
+    champ_targets = []
+    for cpid in state.get("pids") or pids:
+        cuid = int(champ_map.get(str(cpid), 0))
+        if cuid:
+            champ_targets.append((
+                cuid, int(cpid), "Champion",
+                int(state.get(f"hp_{cpid}", 20))))
+    cost_selection = _pvp_select_card_play_costs(
+        handler, session, state, play_plan, int(played_card_uid), my_pid,
+        targets, champ_targets)
+    if cost_selection is None:
+        log_req(f"    PvP REJECTED spell {card_name}: incomplete/illegal "
+                "card cost target")
+        return True
+    cost_selections, cost_uids = cost_selection
     # Defense-in-depth cost check: the client's options are the normal gate,
     # but don't let a drag play an unaffordable card and go negative.
     from db import db_template_by_guid
     _trow = db_template_by_guid(tpl_guid)
-    cost = _trow[3] if _trow else 0
+    cost = play_plan.cost.resource
+    if not cost and _trow and not play_plan.cost.variable:
+        cost = _trow[3] or 0
     # Effective cost (static cost modifiers) — charge what the client showed.
     try:
         from abilities.framework.statics import effective_cost as _ec
@@ -5781,6 +5761,19 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid):
     if cost > available:
         log_req(f"    PvP REJECTED play {card_name}: cost {cost} > "
                 f"resources {available}")
+        pvp_push_main_phase_options(session, state)
+        return True
+    activations, _cost_target_map = play_plan.activation_bundle(targets)
+    selected_cost_map = {
+        index: tuple(selected)
+        for index, (_spec, selected) in enumerate(cost_selections)
+        if selected
+    }
+    plan_errors = play_plan.validate(
+        activations=activations, cost_target_map=selected_cost_map)
+    if plan_errors:
+        log_req(f"    PvP REJECTED play {card_name}: activation validation: "
+                f"{'; '.join(plan_errors)}")
         pvp_push_main_phase_options(session, state)
         return True
     # Pay the cost FIRST (before any resolution) so the resource pool is
@@ -5798,6 +5791,9 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid):
     _db.commit()
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     _pvp_populate_game_state(g, state, my_pid, opp_pid)
+    _pvp_apply_card_play_costs(
+        handler, g, session, state, my_uid, opp_uid, cost_selections,
+        int(played_card_uid))
     # Register the CardDef FIRST so every CardUpdated carries the full stats
     # (mirrors the spell path).
     _tpl, ct, _n, cost2, atk, def_, _gx = \
@@ -5951,8 +5947,8 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
     the spell onto the chain, then resolve its BOM when the chain resolves and
     send CastSpells -> Discard.  A player may cast a QuickAction any time they
     hold priority and can pay the cost.  Pushes events to BOTH players."""
-    import json as _js
     import battle_engine as _be
+    from gamedata import PlayPlan
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return False
@@ -5965,10 +5961,38 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
     if not crow:
         return False
     tpl_guid, card_type, card_name, ab_json = crow
+    try:
+        play_plan = PlayPlan.from_card(
+            _RECORD_STORE, tpl_guid, source_uid=int(played_card_uid),
+            owner_id=my_pid)
+    except KeyError as exc:
+        log_req(f"    PvP REJECTED spell {card_name}: {exc}")
+        return True
     scid = _ge.SessionCardId(_ge.UID(int(played_card_uid)))
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     state = pvp_load_state(session) or {}
+    try:
+        targets = handler._extract_transaction_targets(
+            inner_bytes, int(played_card_uid))
+    except Exception:
+        targets = []
+    champ_map = state.get("champ_map") or {}
+    champ_targets = []
+    for cpid in state.get("pids") or pids:
+        cuid = int(champ_map.get(str(cpid), 0))
+        if cuid:
+            champ_targets.append((
+                cuid, int(cpid), "Champion",
+                int(state.get(f"hp_{cpid}", 20))))
+    cost_selection = _pvp_select_card_play_costs(
+        handler, session, state, play_plan, int(played_card_uid), my_pid,
+        targets, champ_targets)
+    if cost_selection is None:
+        log_req(f"    PvP REJECTED spell {card_name}: incomplete/illegal "
+                "card cost target")
+        return True
+    cost_selections, cost_uids = cost_selection
     # Defense-in-depth cost check; pay FIRST so resources are right even if
     # the resolution is interrupted.
     from db import db_template_by_guid
@@ -5981,32 +6005,53 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
                    _pvp_fra_view(state, my_pid, opp_pid), int(played_card_uid))
     except Exception:
         pass
+    # Read and validate the selected X before mutating resources.  The client
+    # enforces this in AreXCostsComplete; the server must reject stale or
+    # forged transactions by the same plan boundary.
+    try:
+        x_cost = max(0, int(handler._extract_int32_field(
+            inner_bytes, "m_ResourceXCost") or 0))
+    except Exception:
+        x_cost = 0
+    if play_plan.cost.variable:
+        if x_cost < play_plan.cost.variable_minimum:
+            log_req(f"    PvP REJECTED spell {card_name}: X={x_cost} below "
+                    f"minimum {play_plan.cost.variable_minimum}")
+            return True
+    elif x_cost:
+        log_req(f"    PvP REJECTED spell {card_name}: non-variable card has X={x_cost}")
+        return True
     available = int(state.get(f"res_{my_pid}", 0))
-    if cost > available:
+    if cost + x_cost > available:
         log_req(f"    PvP REJECTED spell {card_name}: cost {cost} > "
                 f"resources {available}")
         pvp_push_main_phase_options(session, state)
         return True
+    # Validate the complete current-record activation before paying or moving
+    # the card.  Target and option failures must reject the play atomically.
+    activations, _cost_target_map = play_plan.activation_bundle(
+        targets, x_cost=x_cost)
+    selected_cost_map = {
+        index: tuple(selected)
+        for index, (_spec, selected) in enumerate(cost_selections)
+        if selected
+    }
+    plan_errors = play_plan.validate(
+        variable_cost=x_cost, activations=activations,
+        cost_target_map=selected_cost_map)
+    if plan_errors:
+        log_req(f"    PvP REJECTED spell {card_name}: activation validation: "
+                f"{'; '.join(plan_errors)}")
+        pvp_push_main_phase_options(session, state)
+        return True
     state[f"res_{my_pid}"] = available - cost
-    # Variable X cost: the X the player chose in the client's X-cost dialog
-    # travels as xCostData.m_ResourceXCost on the play transaction.
-    try:
-        x_cost = handler._extract_int32_field(inner_bytes, "m_ResourceXCost")
-        x_cost = max(0, int(x_cost or 0))
-    except Exception:
-        x_cost = 0
     if x_cost:
         state[f"res_{my_pid}"] = max(0, int(state.get(f"res_{my_pid}", 0)) - x_cost)
         log_req(f"    PvP spell {card_name}: X cost {x_cost} paid "
                 f"(resources left {state.get(f'res_{my_pid}')})")
     view = _pvp_fra_view(state, my_pid, opp_pid)
-    # The client's targeting picker sends the chosen target in the transaction.
-    try:
-        targets = handler._extract_transaction_targets(
-            inner_bytes, int(played_card_uid))
-    except Exception:
-        targets = []
-    target_uid = targets[-1] if targets else None
+    effect_targets = [uid for uid in targets if int(uid) not in cost_uids]
+    target_uid = effect_targets[-1] if effect_targets else None
     view["player_spell_target"] = target_uid
     view["resolving_owner_id"] = my_pid
     view["resolving_source_uid"] = int(played_card_uid)
@@ -6017,6 +6062,9 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
     _db.commit()
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     _pvp_populate_game_state(g, state, my_pid, opp_pid)
+    _pvp_apply_card_play_costs(
+        handler, g, session, state, my_uid, opp_uid, cost_selections,
+        int(played_card_uid))
     _tpl, ct, _n, cost2, atk, def_, _gx = \
         handler._card_full_data(g, scid, tpl_guid)
     g.push_card_updated(scid, my_uid, _ge.ECardCollections.CastSpells, ct,
@@ -6025,16 +6073,18 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
     g.push_card_moved(scid, my_uid, _ge.ECardCollections.CastSpells,
                       _ge.ECardLocations.Top, 0)
     g.push_spell_card_cast(scid, my_uid, free=False)
-    try:
-        ability_guids = [x.lower() for x in _js.loads(ab_json)] if ab_json else []
-    except Exception:
-        ability_guids = []
+    ability_guids = [ability.ability_guid for ability in play_plan.abilities
+                     if not ability.is_triggered]
     inst_id = int(state.get("_next_instance_id", 1))
     state["_next_instance_id"] = inst_id + 1
     _be.stack_push(state, {
         "kind": "spell", "source_uid": int(played_card_uid),
         "ability_guids": ability_guids, "target_uid": target_uid,
         "instance_id": inst_id, "x_cost": x_cost,
+        "activations": {
+            guid: activation.as_dict()
+            for guid, activation in activations.items()
+        },
     })
     # Chain entry: must carry a VALID client ability template (the client's
     # OnAbilityPushedOnChain is gated on TemplateManager.Abilities.ContainsKey).
@@ -6101,6 +6151,137 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
         log_req(f"    PvP spell post-refresh error: {e}")
         traceback.print_exc()
     return True
+
+
+def _pvp_select_card_play_costs(handler, session, state, plan, source_uid,
+                                pid, selected_uids, champions):
+    """Bind the client TargetMap to the card's authored cost targets."""
+    from abilities.framework.targeting import legal_targets
+
+    selected_uids = [int(uid) for uid in (selected_uids or [])]
+    used = set()
+    selections = []
+    for spec in plan.cost_instances:
+        if spec["auto"]:
+            selections.append((spec, (int(source_uid),)))
+            continue
+        candidates = legal_targets(
+            _db, session.session_id, pid, spec["target_guid"],
+            int(source_uid), both_players=False, champions=champions,
+            battle_state=state)
+        candidate_set = {int(uid) for uid in candidates}
+        available = [uid for uid in selected_uids
+                     if uid in candidate_set and uid not in used]
+        minimum = int(spec["minimum"])
+        maximum = int(spec["maximum"])
+        if maximum < 0:
+            maximum = len(available)
+        if len(available) < minimum:
+            return None
+        chosen = tuple(available[:maximum])
+        used.update(chosen)
+        selections.append((spec, chosen))
+    return selections, used
+
+
+def _pvp_apply_card_play_costs(handler, game, session, state, pl_t, opp_t,
+                               selections, source_uid):
+    """Apply card-level CostInstances before the card enters the chain."""
+    from db import db_discard_card, db_randomly_insert_deck_cards
+    from abilities.framework.triggers import resolve_triggers
+
+    def push_zone(uid, owner_pid, location):
+        row = _db.execute(
+            "SELECT template_guid, card_type, card_state FROM game_cards "
+            "WHERE session_id=? AND card_uid=?", (session.session_id, uid)
+        ).fetchone()
+        if not row:
+            return
+        scid = _ge.SessionCardId(_ge.UID(int(uid)))
+        handler._card_full_data(game, scid, row[0])
+        owner = _ge.UID.make(244, int(owner_pid))
+        collection = {
+            "hand": _ge.ECardCollections.Hand,
+            "deck": _ge.ECardCollections.Deck,
+            "discard": _ge.ECardCollections.Discard,
+            "void": _ge.ECardCollections.Void,
+            "warzone": _ge.ECardCollections.Warzone,
+        }.get(location, _ge.ECardCollections.Warzone)
+        cdef = game.card_defs.get(scid)
+        game.push_card_updated(
+            scid, owner, collection, _ge.card_type_from_db(row[1]),
+            template_id=row[0], state=int(row[2] or 0),
+            cost=cdef.cost if cdef else 0,
+            attack=cdef.attack if cdef else 0,
+            defense=cdef.defense if cdef else 0,
+            nulling=location == "deck")
+        game.push_card_moved(
+            scid, owner, collection, _ge.ECardLocations.Top, 0)
+
+    for spec, selected in selections:
+        kind = spec["kind"]
+        for uid in selected:
+            uid = int(uid)
+            row = _db.execute(
+                "SELECT user_id, location FROM game_cards "
+                "WHERE session_id=? AND card_uid=?", (session.session_id, uid)
+            ).fetchone()
+            if not row:
+                continue
+            owner_pid = int(row[0] or 0)
+            if kind == "sacrifice":
+                handler._sacrifice_troop(game, session, pl_t, opp_t, uid)
+                continue
+            if kind == "exhaust":
+                _db.execute(
+                    "UPDATE game_cards SET card_state=card_state | ? "
+                    "WHERE session_id=? AND card_uid=?",
+                    (_ge.ECardStates.Tapped, session.session_id, uid))
+                _db.commit()
+                push_zone(uid, owner_pid, row[1])
+                continue
+            destination = {
+                "discard": "discard",
+                "void": "void",
+                "put_into_deck": "deck",
+                "shuffle_into_deck": "deck",
+                "put_into_hand": "hand",
+            }.get(kind)
+            if destination is None:
+                if kind == "reveal":
+                    scid = _ge.SessionCardId(_ge.UID(uid))
+                    owner = _ge.UID.make(244, owner_pid)
+                    event = game._make_event(
+                        _ge.CardsRevealedSessionEventArgs)
+                    event.player_id = owner
+                    event.session_card_ids = [scid]
+                    event.collections = [_ge.ECardCollections.Warzone]
+                    event.owning_players = [owner]
+                    event.positions = [0]
+                    game._push(event)
+                continue
+            if destination == "discard":
+                db_discard_card(session.session_id, uid, connection=_db)
+            elif destination == "hand":
+                _db.execute(
+                    "UPDATE game_cards SET location='hand', position=100 "
+                    "WHERE session_id=? AND card_uid=?",
+                    (session.session_id, uid))
+                _db.commit()
+            else:
+                _db.execute(
+                    "UPDATE game_cards SET location=?, position=0, "
+                    "card_state=0 WHERE session_id=? AND card_uid=?",
+                    (destination, session.session_id, uid))
+                _db.commit()
+                if destination == "deck":
+                    db_randomly_insert_deck_cards(
+                        session.session_id, owner_pid, [uid], connection=_db)
+            push_zone(uid, owner_pid, destination)
+            if destination in ("discard", "void"):
+                resolve_triggers(
+                    _db, handler, game, session, pl_t, opp_t, state,
+                    "CardEnteredZoneEvent", uid, owner_pid)
 
 
 def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):

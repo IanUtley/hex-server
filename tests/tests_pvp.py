@@ -7,6 +7,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -374,9 +375,20 @@ def test_pvp_activation_summoning_sickness_only_applies_to_troops():
 
     previous_db = tournament_game._db
     previous_pids = tournament_game.db_game_session_pids
+    previous_graph = tournament_game.ability_graph
     try:
         tournament_game._db = db
         tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        # This test deliberately uses a synthetic in-memory ability. Adapt it
+        # at the Records boundary so production code has no second SQLite
+        # rules-data path.
+        tournament_game.ability_graph = lambda _store, _guid: SimpleNamespace(
+            casting_behavior="QuickAction", manual=True,
+            costs=SimpleNamespace(
+                activation=0, uses_per_game=0, uses_per_turn=0,
+                exhausts_card_on_use=True),
+            targets=(), additional_cost_targets=(),
+            source=SimpleNamespace(to_dict=lambda: {}))
 
         class Session:
             session_id = 1
@@ -391,6 +403,7 @@ def test_pvp_activation_summoning_sickness_only_applies_to_troops():
     finally:
         tournament_game._db = previous_db
         tournament_game.db_game_session_pids = previous_pids
+        tournament_game.ability_graph = previous_graph
         db.close()
     print("PASS PvP artifact activation ignores troop summoning sickness")
 
