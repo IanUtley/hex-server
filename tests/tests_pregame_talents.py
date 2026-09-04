@@ -1,5 +1,6 @@
 """Regression tests for metadata-driven PreGame deck insertions."""
 
+import datetime
 import os
 import sqlite3
 import sys
@@ -28,6 +29,7 @@ def test_skylak_uses_original_deck_size_for_both_talents():
         os.environ["HEX_DB_PATH"] = path
         from tests.tests_combat import HandlerStub, SessionStub
         from abilities.framework.conditions import apply_pregame_abilities
+        from abilities.framework import condition_engine
         from db import db_backfill_ability_effect_meta
         import game_engine
 
@@ -42,6 +44,11 @@ def test_skylak_uses_original_deck_size_for_both_talents():
         player_uid = game_engine.UID.make(244, 5)
         ai_uid = game_engine.UID.make(3, 1000)
         abilities = [GREAT_SPORE_ABILITY, ZODIAC_ABILITY]
+
+        # Zodiac Sands is authored for July/August (effect index 3).  The
+        # month-scoped condition reads the real calendar, so pin the clock to a
+        # deterministic July 1 to keep the focused test order-independent.
+        condition_engine._FAKE_NOW = datetime.datetime(2026, 7, 1, 12, 0, 0)
 
         for session_id, initial_count, expected_count in (
                 (1, 99, 1), (2, 100, 2)):
@@ -76,6 +83,7 @@ def test_skylak_uses_original_deck_size_for_both_talents():
             assert all(name in ("Great Spore Beast", "Zodiac Sands")
                        for name, _ in rows), rows
     finally:
+        condition_engine._FAKE_NOW = None
         db.close()
         os.unlink(path)
 

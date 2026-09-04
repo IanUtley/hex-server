@@ -11,6 +11,16 @@ import json
 
 import game_engine
 
+# Injectable clock for date-driven conditions (RequiresDateTime evaluates the
+# real calendar, which makes month-scoped abilities like the Zodiac pregame
+# talent time-sensitive in focused tests).  Set / clear around a deterministic
+# window; when None the real wall clock is used.
+_FAKE_NOW = None
+
+
+def _now():
+    return _FAKE_NOW if _FAKE_NOW is not None else datetime.datetime.now()
+
 from .targeting import (
     evaluate_card_filter,
     ZONE_MAP,
@@ -485,7 +495,7 @@ def evaluate_condition(node, ctx):
                 count += 1
         return _compare(count, op, req)
     if t == "RequiresDateTime":
-        now = datetime.datetime.now()
+        now = _now()
         values = {
             "m_Year": now.year,
             "m_Month": now.month,

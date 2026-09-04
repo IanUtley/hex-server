@@ -287,6 +287,39 @@ class HandlerStub:
     def _next_resolve_counter(self, session):
         return 1
 
+    def _remove_one_shot_ability(self, session, card_uid, ability_guid,
+                                 game, pl_t, ai_t, bstate=None):
+        """Consume a one-shot ability on a card instance (mirror of the
+        production hconnect handler's method, without the client push).
+
+        ONE-SHOT is represented as uses_per_game=1; only those abilities are
+        consumed.  The ability GUID is removed from this card's working
+        ability list so the resolved power is not offered again.
+        """
+        import json as _json
+        meta = self._db.execute(
+            "SELECT uses_per_game FROM card_abilities_meta "
+            "WHERE ability_guid=?", (str(ability_guid).lower(),)).fetchone()
+        if not meta or int(meta[0] or 0) != 1:
+            return False
+        try:
+            abilities = _json.loads(self._db.execute(
+                "SELECT card_abilities FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (session.session_id, int(card_uid))).fetchone()[0] or "[]")
+        except (TypeError, ValueError):
+            return False
+        ag = str(ability_guid).lower()
+        if ag not in abilities:
+            return False
+        abilities.remove(ag)
+        self._db.execute(
+            "UPDATE game_cards SET card_abilities=? "
+            "WHERE session_id=? AND card_uid=?",
+            (_json.dumps(abilities), session.session_id, int(card_uid)))
+        self._db.commit()
+        return True
+
     @staticmethod
     def _thresholds_met(thresh_json, player_threshold):
         return True
