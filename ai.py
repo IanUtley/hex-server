@@ -803,6 +803,14 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 old_health = bstate.get(def_health, 20)
                 bstate[def_health] = max(0, old_health - remaining)
                 log_req(f"    Trample: {hex(u)} deals {remaining} leftover -> defender health {old_health}->{bstate[def_health]}")
+            # SpiritDrain heals for actual combat damage dealt, not the
+            # attacker's full power.  `remaining` is the damage left after
+            # assigning damage to blockers; Juggernaught carries that
+            # remainder through to the champion.
+            a_dealt_this_step = step_atk - remaining
+            if (a_attrs & game_engine.ECardAttributes.Juggernaught
+                    and remaining > 0):
+                a_dealt_this_step += remaining
             # Each blocker deals its full attack back to the attacker.
             if a_prevent:
                 log_req(f"    Blocked combat: {hex(u)} prevents combat damage")
@@ -832,10 +840,10 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 log_req(f"    Blocked combat: blockers ({total_block_atk}) vs attacker {hex(u)} (def {a_def}-{a_dmg}); attacker survives")
             elif not a_deals:
                 log_req(f"    Blocked combat: {hex(u)} does not deal damage this step")
-            # Lifelink (SpiritDrain): the attacker's controller heals for the
-            # combat damage the attacker dealt to its blockers.
-            if a_attrs & game_engine.ECardAttributes.SpiritDrain and step_atk:
-                att_lifegain += step_atk
+            # Lifelink (SpiritDrain): heal only for damage the attacker
+            # actually dealt to blockers (plus any trample damage).
+            if a_attrs & game_engine.ECardAttributes.SpiritDrain and a_dealt_this_step:
+                att_lifegain += a_dealt_this_step
         else:
             # Unblocked: the attacker hits the defender's champion.
             if a_deals:

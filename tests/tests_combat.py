@@ -1124,6 +1124,36 @@ def test_swiftstrike_kills_before_normal_damage(db):
     assert a_loc[0] == "warzone" and a_loc[1] == 0, a_loc
 
 
+def test_spiritdrain_heals_actual_blocker_damage(db):
+    """SpiritDrain heals for damage assigned to a blocker, not the
+    attacker's full power when excess damage is stopped by the block."""
+    attacker_tpl = "ffffffff-0000-0000-0000-00000000a001"
+    blocker_tpl = "ffffffff-0000-0000-0000-00000000a002"
+    for tpl, name, atk, defense, attrs in (
+            (attacker_tpl, "SpiritDrain Attacker", 5, 3,
+             int(game_engine.ECardAttributes.SpiritDrain)),
+            (blocker_tpl, "Small Blocker", 2, 2, 0)):
+        db.execute(
+            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "defense, attributes, abilities_json, threshold_json, subtype) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (tpl, name, "Troop", 2, atk, defense, attrs, "[]", "[]", ""))
+    add_card(db, 101, 0, attacker_tpl)
+    add_card(db, 102, 5, blocker_tpl)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {"player_health": 20, "ai_health": 10,
+              "player_max_health": 20, "ai_max_health": 20,
+              "turn_number": 1}
+    handler = HandlerStub(db)
+    ai._db = db
+    ai.resolve_combat(
+        handler, SessionStub(), pl_t, ai_t, bstate,
+        {101: 0}, {101: [102]}, ai_t, pl_t, "ai_attackers",
+        send_events=lambda *args: None)
+    assert bstate["ai_health"] == 12, bstate
+
+
 def test_ai_attacks_zero_attack_rage_troop_when_unblocked(db):
     """A ready 0-attack troop with printed Rage must still attack into an
     empty opposing warzone so its Rage trigger can apply."""
@@ -1286,6 +1316,8 @@ def main():
         ("AI X kills target", test_ai_x_kills_target),
         ("Swiftstrike kills before normal damage", test_swiftstrike_kills_before_normal_damage),
         ("AI attacks unblocked zero-attack Rage troop", test_ai_attacks_zero_attack_rage_troop_when_unblocked),
+        ("SpiritDrain heals actual blocker damage",
+         test_spiritdrain_heals_actual_blocker_damage),
     ]
     failed = 0
     for name, fn in tests:

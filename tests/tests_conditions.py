@@ -221,6 +221,33 @@ def test_ability_variable_condition_accepts_variable_rhs(db):
     assert evaluate_effect_condition(db, condition_id, sacrifice)
 
 
+def test_dead_card_persistent_modifiers_reported(db):
+    """Previous-state conditions retain persistent stat modifiers after a
+    troop moves from the warzone to the discard, while temporary buffs are
+    excluded because the death path clears them."""
+    add_card(db, 600, 5, "Troop")
+    db.execute(
+        "UPDATE game_cards SET card_defense_mod=2, "
+        "permanent_buffs='{\"def\": 2, \"atk\": 1}', "
+        "temporary_buffs='{\"def\": 9, \"atk\": 9}', card_damage=0 "
+        "WHERE card_uid=600")
+    db.execute(
+        "UPDATE game_cards SET location='discard', temporary_buffs='{}' "
+        "WHERE card_uid=600")
+    db.commit()
+    c = ctx(db, event_type="CardEnteredZoneEvent",
+            ability_source_uid=600, ability_source_owner_id=5,
+            trigger_uid=600,
+            event_source_collection="warzone",
+            event_destination_collection="discard",
+            event_previous_state=game_engine.ECardStates.Dead,
+            uses_previous_state=True)
+    data = c.card(600)
+    # Base 1 + card_defense_mod 2 + permanent_buffs def 2 = 5.  The
+    # temporary +9 must not be included after the move to the discard.
+    assert data["defense"] == 5, data
+
+
 def test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card(db):
     """A template-less legacy/fallback card entering Hand is not a Spider
     entering Warzone.  Missing card-template metadata must not turn the
@@ -280,5 +307,7 @@ if __name__ == "__main__":
     run("Source passes filter gates activation", test_source_passes_filter_condition)
     run("Ability variable condition accepts variable RHS",
         test_ability_variable_condition_accepts_variable_rhs)
+    run("Dead card persistent modifiers reported",
+        test_dead_card_persistent_modifiers_reported)
     run("Vilefang trigger fails closed for unknown hand card", test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card)
     run("Ridge Raider only triggers for dead warzone troops", test_ridge_raider_requires_dead_warzone_troop)
