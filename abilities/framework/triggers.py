@@ -975,6 +975,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                         if candidates:
                             extra_target = _ai_battle_target(
                                 db, session, cu, ag, candidates)
+                            resolution_target = extra_target
                         else:
                             logs.append(f"{event_type} {ag[:8]} -> no legal target")
                             continue
@@ -994,6 +995,11 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     extra_target = _ai_trigger_target(
                         db, session, ag, cu, ability_owner_id, bstate,
                         champ_pool or [])
+                    # Keep an event-supplied target (for example, the
+                    # champion that was dealt damage).  Only fill in the
+                    # resolution target when the event did not provide one.
+                    if resolution_target is None:
+                        resolution_target = extra_target
                 # Check if this ability ignores the chain (Deploy/Inspire/Deathcry
                 # have m_IgnoresChain=1 — execute immediately, no priority window)
                 ignores = graph.ignores_chain
