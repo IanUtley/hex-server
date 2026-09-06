@@ -121,6 +121,8 @@ from db import (player_id_from_name, player_id_from_steam, display_name_from_ide
                 db_complete_session_transaction, _record_session_events,
                 STARDUST_TEMPLATES, CHEST_TEMPLATE)
 from static import CRAYBURN_PACK_CARD_SEEDS
+from az1_pack import (CAMPAIGN_PACK_CONFIGS, STARDUST_REPLACEMENT_RATE,
+                      generate_campaign_pack)
 
 
 def _records_ability_graph(handler, ability_guid):
@@ -133,10 +135,10 @@ def _records_ability_graph(handler, ability_guid):
     resolver = getattr(handler, "_current_ability_graph", None)
     if callable(resolver):
         return resolver(ability_guid)
-    from gamedata import RecordStore, ability_graph
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
     store = getattr(handler, "_play_plan_store", None)
     if store is None:
-        store = RecordStore()
+        store = DEFAULT_RECORD_STORE
         try:
             handler._play_plan_store = store
         except AttributeError:
@@ -148,8 +150,9 @@ def _records_target_spec(handler, target_guid):
     resolver = getattr(handler, "_current_target_spec", None)
     if callable(resolver):
         return resolver(target_guid)
-    from gamedata import RecordStore
-    store = getattr(handler, "_play_plan_store", None) or RecordStore()
+    from gamedata import DEFAULT_RECORD_STORE
+    store = (getattr(handler, "_play_plan_store", None)
+             or DEFAULT_RECORD_STORE)
     target = store.get("AbilityTargetTemplate", str(target_guid).lower())
     return target.target_spec if target is not None else None
 
@@ -945,7 +948,8 @@ class HCPHandler:
                     reqs.add("any")
         return reqs
 
-    def _card_target_requirements_met(self, session, play_plan):
+    def _card_target_requirements_met(self, session, play_plan,
+                                      battle_state=None):
         """A hand card is only playable when every EXPLICIT target template of
         its non-manual abilities has at least one legal candidate.  This is
         what makes Countermagic ("Interrupt target card" — CollectionFlags
@@ -964,7 +968,8 @@ class HCPHandler:
                 if not target.requires_input or target.minimum < 1:
                     continue
                 candidates = self._valid_targets_for_template(
-                    session, None, None, target.guid)
+                    session, None, None, target.guid,
+                    battle_state=battle_state)
                 if not candidates:
                     log_req(f"    Playability: {target.guid[:8]} has no legal target")
                     return False
@@ -984,8 +989,8 @@ class HCPHandler:
             return None
         store = getattr(self, "_play_plan_store", None)
         if store is None:
-            from gamedata import RecordStore
-            store = RecordStore()
+            from gamedata import DEFAULT_RECORD_STORE
+            store = DEFAULT_RECORD_STORE
             self._play_plan_store = store
         cache = getattr(self, "_play_plan_cache", None)
         if cache is None:
@@ -1020,7 +1025,8 @@ class HCPHandler:
             maximum = max(1, minimum)
         return minimum, maximum
 
-    def _valid_targets_for_template(self, session, pl_t, ai_t, tid):
+    def _valid_targets_for_template(self, session, pl_t, ai_t, tid,
+                                    battle_state=None):
         """Compute the valid SessionCardId targets for an AbilityTargetTemplate,
         driven by the gamedata target template (kind + card filter): champions
         come from the filter's IsHero, troops from the filter, and
@@ -1028,8 +1034,8 @@ class HCPHandler:
         from abilities.framework.targeting import legal_targets
         store = getattr(self, "_play_plan_store", None)
         if store is None:
-            from gamedata import RecordStore
-            store = RecordStore()
+            from gamedata import DEFAULT_RECORD_STORE
+            store = DEFAULT_RECORD_STORE
             self._play_plan_store = store
         target = store.get("AbilityTargetTemplate", str(tid).lower())
         if target is None:
@@ -1043,15 +1049,22 @@ class HCPHandler:
         if kind == "PlayerTargetTemplate":
             champ = getattr(self, "_player_champ_scid", None)
             return [champ] if champ else []
-        if not spec.card_filter:
+        # RecordObject filters can implement a zero-length protocol object and
+        # therefore evaluate false even when a real filter is present.  Test
+        # for None explicitly; otherwise every metadata-targeted troop spell
+        # is incorrectly treated as having no legal target.
+        if spec.card_filter is None:
             return None
+        if battle_state is None:
+            battle_state = getattr(self, "_current_bstate", None)
         candidates = legal_targets(
             _db, session.session_id, self.user_profile["id"], tid, 0,
-            both_players=True, champions=self._champion_targets())
+            both_players=True, champions=self._champion_targets(),
+            battle_state=battle_state)
         return [game_engine.SessionCardId(game_engine.UID(int(u)))
                 for u in candidates]
 
-    def _play_ability_targets(self, session, play_plan):
+    def _play_ability_targets(self, session, play_plan, battle_state=None):
         """For a hand card's abilities return [(ability_guid, index, template_id,
         [SessionCardId])] for each targeting template with computable targets."""
         result = []
@@ -1066,7 +1079,8 @@ class HCPHandler:
                 if not target.requires_input:
                     continue
                 targets = self._valid_targets_for_template(
-                    session, None, None, target.guid)
+                    session, None, None, target.guid,
+                    battle_state=battle_state)
                 if targets is not None and targets:
                     result.append((ability.ability_guid, index, target.guid,
                                    targets))
@@ -1097,7 +1111,8 @@ class HCPHandler:
                                              self.user_profile["id"]
                                              if self.user_profile else 0)
             for ag, idx, tid, targets in self._play_ability_targets(
-                    session, play_plan):
+                    session, play_plan,
+                    battle_state=getattr(self, "_current_bstate", None)):
                 # Troop abilities are NOT playable from hand.  Only the
                 # card itself may be played (cost/threshold gate).
                 # Manual abilities activate from the warzone, not hand.
@@ -1340,11 +1355,11 @@ class HCPHandler:
     @staticmethod
     def _ability_x_cost_metadata(ability_guid):
         """Read variable activation cost fields from the current graph."""
-        from gamedata import RecordStore, ability_graph
+        from gamedata import DEFAULT_RECORD_STORE, ability_graph
         store = getattr(HCPHandler._ability_x_cost_metadata,
                         "_record_store", None)
         if store is None:
-            store = RecordStore()
+            store = DEFAULT_RECORD_STORE
             HCPHandler._ability_x_cost_metadata._record_store = store
         graph = ability_graph(store, str(ability_guid).lower())
         if graph is None:
@@ -1359,8 +1374,8 @@ class HCPHandler:
         Burn to the Ground "1X" = 1 base + X.  These cards must show the
         client's X-cost dialog and the chosen X is paid as extra resources.
         """
-        from gamedata import RecordStore
-        card = RecordStore().get("CardTemplate", str(tpl_guid).lower())
+        from gamedata import DEFAULT_RECORD_STORE
+        card = DEFAULT_RECORD_STORE.get("CardTemplate", str(tpl_guid).lower())
         return bool(card and card.variable_cost)
 
     def _resolve_gem_abilities(self, active_gems):
@@ -1627,7 +1642,9 @@ class HCPHandler:
             self.user_profile["id"] if self.user_profile else 0)
         # Zone-bound explicit targets (e.g. Countermagic's CastSpells-only
         # "Interrupt target card") must have a legal candidate to be playable.
-        if not self._card_target_requirements_met(session, play_plan):
+        if not self._card_target_requirements_met(
+                session, play_plan,
+                battle_state=getattr(self, "_current_bstate", None)):
             return False
         # Every non-automatic card-level cost must have enough legal targets
         # before the card is offered.  This mirrors the client's
@@ -3147,16 +3164,16 @@ class HCPHandler:
         from gamedata import ability_graph
         store = getattr(self, "_play_plan_store", None)
         if store is None:
-            from gamedata import RecordStore
-            store = RecordStore()
+            from gamedata import DEFAULT_RECORD_STORE
+            store = DEFAULT_RECORD_STORE
             self._play_plan_store = store
         return ability_graph(store, str(ability_guid).lower())
 
     def _current_target_spec(self, target_guid):
         store = getattr(self, "_play_plan_store", None)
         if store is None:
-            from gamedata import RecordStore
-            store = RecordStore()
+            from gamedata import DEFAULT_RECORD_STORE
+            store = DEFAULT_RECORD_STORE
             self._play_plan_store = store
         target = store.get("AbilityTargetTemplate", str(target_guid).lower())
         return target.target_spec if target is not None else None
@@ -4392,15 +4409,20 @@ class HCPHandler:
         """
         game.ai_health = bstate.get("ai_health", 10)
         game.player_health = bstate.get("player_health", 20)
+        champion_counters = bstate.get("champion_counters") or {}
         ai_champ = getattr(self, "_ai_champ_scid", None)
         if ai_champ:
-            game.card_defs[ai_champ] = game_engine.CardDef(
+            ai_cdef = game_engine.CardDef(
                 "AI", game_engine.ECardTypes.Champion, 0,
                 bstate.get("ai_health", 10), bstate.get("ai_health", 10),
                 [], [game_engine.ResourceId.from_str(g) for g in getattr(self, "_ai_champ_ability_guids", [])])
+            ai_cdef.counters = dict(champion_counters.get(
+                str(int(ai_champ.uid.uid64)), {}) or {})
+            game.card_defs[ai_champ] = ai_cdef
             game.push_card_updated(ai_champ, ai_t, game_engine.ECardCollections.Champions,
                                    game_engine.ECardTypes.Champion,
-                                   template_id=getattr(self, "_ai_champ_guid", None))
+                                   template_id=getattr(self, "_ai_champ_guid", None),
+                                   counters=ai_cdef.counters)
         pl_champ = getattr(self, "_player_champ_scid", None)
         if pl_champ:
             pl_abilities = getattr(self, "_player_champ_abilities", [])
@@ -4408,6 +4430,8 @@ class HCPHandler:
                 "Player", game_engine.ECardTypes.Champion, 0,
                 bstate.get("player_health", 17), bstate.get("player_health", 17),
                 [], list(pl_abilities))
+            cdef.counters = dict(champion_counters.get(
+                str(int(pl_champ.uid.uid64)), {}) or {})
             # Carry the persisted spell-power escalation (player_sp_uses) onto
             # the champion CardDef so the client's button shows the INCREASED
             # SP cost (e.g. Soothsaying 4->5 after one use) — a re-pushed
@@ -4418,7 +4442,8 @@ class HCPHandler:
             game.card_defs[pl_champ] = cdef
             game.push_card_updated(pl_champ, pl_t, game_engine.ECardCollections.Champions,
                                    game_engine.ECardTypes.Champion,
-                                   template_id=getattr(self, "_player_champ_guid", None))
+                                   template_id=getattr(self, "_player_champ_guid", None),
+                                   counters=cdef.counters)
 
     def _advance_to_priority(self, session, pl_t, ai_t, bstate):
         """Auto-advance the human's turn through non-stop phases.
@@ -5040,24 +5065,27 @@ class HCPHandler:
                     current = json.loads(inst_abilities_json or "[]")
                 except Exception:
                     current = []
-                merged = [str(g).lower() for g in current]
+                current = [str(g).lower() for g in current]
+                merged = list(current)
                 if not merged:
                     merged = list(ability_guids)
                 else:
                     for gem_guid in gem_guids:
                         if str(gem_guid).lower() not in merged:
                             merged.append(str(gem_guid).lower())
-                _db.execute(
-                    "UPDATE game_cards SET card_abilities=? "
-                    "WHERE session_id=? AND card_uid=?",
-                    (json.dumps(merged), game.session_id.uid64, scid.uid.uid64))
-                # _card_full_data() is also called immediately before the
-                # battle state is persisted.  That save uses the separate
-                # game_session connection, so leave the shared connection
-                # transaction closed or it can deadlock on its own write
-                # (especially during the opening hand when socketed cards
-                # are re-pushed).
-                _db.commit()
+                if merged != current:
+                    _db.execute(
+                        "UPDATE game_cards SET card_abilities=? "
+                        "WHERE session_id=? AND card_uid=?",
+                        (json.dumps(merged), game.session_id.uid64,
+                         scid.uid.uid64))
+                    # _card_full_data() is also called immediately before the
+                    # battle state is persisted.  That save uses the separate
+                    # game_session connection, so leave the shared connection
+                    # transaction closed or it can deadlock on its own write
+                    # (especially during the opening hand when socketed cards
+                    # are re-pushed).
+                    _db.commit()
         # Encounter scene statics are continuous effects. Apply them silently
         # when a card is materialized in the relevant zone, using the granted
         # ability's typed target filter. Beast Crossing therefore affects only
@@ -5366,6 +5394,42 @@ class HCPHandler:
             session.session_id, card_uid, ab_json, attrs, template_guid,
             commit=commit)
         return attrs
+
+    def _battle_setup_template_data(self, template_guid, cache):
+        """Return canonical setup data for a card template, using *cache*.
+
+        Battle deck construction creates many copies of the same templates.  A
+        fresh instance still needs the template's working ability/attribute
+        snapshot, but resolving that snapshot once per copy causes a SELECT and
+        an UPDATE for every card.  Keep the metadata local to one battle setup
+        (rather than on the handler, which serves multiple sessions) and reuse
+        it for every copy.
+
+        Returns ``(abilities_json, effective_attributes, ability_guids,
+        threshold_json)`` or ``None`` when the template is missing.
+        """
+        if not template_guid:
+            return None
+        key = str(template_guid).lower()
+        if key in cache:
+            return cache[key]
+        from db import db_card_template_thresholds
+        row = db_card_template_thresholds(template_guid)
+        if not row:
+            cache[key] = None
+            return None
+        threshold_json, abilities_json, attributes = row
+        abilities_json = abilities_json or "[]"
+        try:
+            ability_guids = [str(g).lower() for g in json.loads(abilities_json)]
+        except Exception:
+            ability_guids = []
+        effective_attributes = int(attributes or 0)
+        effective_attributes |= self._granted_attributes(ability_guids)
+        result = (abilities_json, effective_attributes, ability_guids,
+                  threshold_json)
+        cache[key] = result
+        return result
 
     def _card_uses(self, session, card_uid):
         """Return the per-ability usage dict for a card instance."""
@@ -6899,6 +6963,12 @@ class HCPHandler:
                     _db, self, game, session, pl_t, ai_t, bstate,
                     "GameStartedEvent", None, gs_owner,
                     zones=("hand", "warzone"))
+            # GameStarted abilities may change the DB-backed battle state.  In
+            # particular, encounter-scene battleboard cards such as Savage
+            # Lord's Resource Rich grant both current and permanent resources.
+            # Persist after resolving them so reconnects and the next phase
+            # load the same 1/1 state that was sent in the setup packet.
+            _be.save_state(session, bstate)
             # Send the StartGame packet (one phase per packet).
             if game.events:
                 pkt = game.make_network_packet(pl_t)
@@ -7976,8 +8046,23 @@ class HCPHandler:
                             not bstate.get("pending_discard_ability") and
                             _be.current_phase(bstate) in (
                                 game_engine.ETurnPhases.FirstMainPhase,
-                                game_engine.ETurnPhases.SecondMainPhase)):
-                        self._push_main_phase_options(session, pl_t, ai_t)
+                                game_engine.ETurnPhases.SecondMainPhase,
+                                game_engine.ETurnPhases.DeclareCombatPriorityWindow,
+                                game_engine.ETurnPhases.DeclareAttackPriorityWindow,
+                                game_engine.ETurnPhases.DeclareDefensePriorityWindow,
+                                game_engine.ETurnPhases.FirstStrikePriorityWindow)):
+                        # A manual troop ability can change the resources or
+                        # board targets available to a QuickAction.  Rebuild
+                        # the option list in the same priority window; leaving
+                        # the pre-activation list in place makes cards such as
+                        # Strength of the Redwood remain hidden after Howling
+                        # Brave generates a resource.
+                        phase = _be.current_phase(bstate)
+                        if phase in (game_engine.ETurnPhases.FirstMainPhase,
+                                     game_engine.ETurnPhases.SecondMainPhase):
+                            self._push_main_phase_options(session, pl_t, ai_t)
+                        else:
+                            self._push_phase_options_empty(session, pl_t, ai_t)
                     self._push_transaction_ack(session)
                     handled = True
 
@@ -10241,6 +10326,24 @@ class HCPHandler:
             player_deck_cards = []
             player_card_tpl_ids = []
             player_resolved_tpl_ids = []
+            # Resolve the active socket map before materializing rows so gem
+            # abilities can be included in the first card snapshot.
+            import json as _gemj
+            deck_gem_abilities = {}
+            if deck_db_id:
+                _ga_row = _db.execute(
+                    "SELECT active_gems FROM decks WHERE id=?",
+                    (deck_db_id,)).fetchone()
+                if _ga_row and _ga_row[0]:
+                    try:
+                        deck_gem_abilities = self._resolve_gem_abilities(
+                            _gemj.loads(_ga_row[0]) or {})
+                    except Exception:
+                        deck_gem_abilities = {}
+            player_setup_cache = {}
+            player_ref_cache = {}
+            player_card_data = []
+            player_insert_rows = []
             if deck_rows and deck_rows[0]:
                 card_ids = _json.loads(deck_rows[0])
                 random.shuffle(card_ids)
@@ -10254,32 +10357,44 @@ class HCPHandler:
                         card_tpl_id = card_ref
                     player_card_tpl_ids.append(card_tpl_id)
                     card_uid = cid.uid.to_uint64()
-                    _tpl, ctype, _n, _c, _a, _d = self._resolve_card_ref(
-                        card_tpl_id, self.user_profile["id"])
+                    ref_key = (("guid", str(card_tpl_id).lower())
+                               if isinstance(card_tpl_id, str)
+                               else ("instance", card_tpl_id))
+                    if ref_key not in player_ref_cache:
+                        player_ref_cache[ref_key] = self._resolve_card_ref(
+                            card_tpl_id, self.user_profile["id"])
+                    _tpl, ctype, _n, _c, _a, _d = player_ref_cache[ref_key]
                     player_resolved_tpl_ids.append(_tpl)
-                    _db.execute("INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, card_type, template_guid, location, position, owner_user_id, original_template_guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (self.user_profile["id"], session.session_id, card_uid, card_tpl_id, ctype or "Unknown", _tpl, 'deck', pos, self.user_profile["id"], _tpl))
-                    # Populate per-instance ability/attribute data from the template
-                    # (the canonical source) so hand/warzone abilities + icons work.
-                    self._sync_instance_card_data(
-                        session, card_uid, _tpl, commit=False)
+                    setup_data = self._battle_setup_template_data(
+                        _tpl, player_setup_cache)
+                    if setup_data:
+                        abilities_json, effective_attrs, _ags, _threshold = setup_data
+                    else:
+                        abilities_json, effective_attrs = "[]", 0
+                    player_insert_rows.append(
+                        (self.user_profile["id"], session.session_id, card_uid,
+                         card_tpl_id, ctype or "Unknown", _tpl, 'deck', pos,
+                         self.user_profile["id"], _tpl, abilities_json,
+                         effective_attrs, "{}"))
+                    player_card_data.append({
+                        "row": ((_tpl, ctype, _n, _c, _a, _d)
+                                if _tpl else None),
+                        "setup": setup_data,
+                    })
                     player_deck_cards.append(cid)
+            if player_insert_rows:
+                _db.executemany(
+                    "INSERT INTO game_cards (user_id, session_id, card_uid, "
+                    "card_template_id, card_type, template_guid, location, "
+                    "position, owner_user_id, original_template_guid, "
+                    "card_abilities, card_attributes, card_uses) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    player_insert_rows)
             _db.commit()
-            # Derive socketed-gem abilities from the current ActiveGems map.
-            # decks.gem_abilities is only a cache and may describe a previous
-            # socket (for example Rage left behind after changing to Speed).
-            import json as _gemj
-            deck_gem_abilities = {}
-            if deck_db_id:
-                _ga_row = _db.execute(
-                    "SELECT active_gems FROM decks WHERE id=?",
-                    (deck_db_id,)).fetchone()
-                if _ga_row and _ga_row[0]:
-                    try:
-                        deck_gem_abilities = self._resolve_gem_abilities(
-                            _gemj.loads(_ga_row[0]) or {})
-                    except Exception:
-                        deck_gem_abilities = {}
+            # Derive client definitions from the same prepared metadata used
+            # for insertion; only socketed-gem ability merges need a later
+            # update.
+            player_ability_updates = []
             for i, cid in enumerate(player_deck_cards):
                 # No opening hands yet — like PvP, both decks stay face-down
                 # through PreGame/PickGoesFirst; each player draws 7 only after
@@ -10295,23 +10410,9 @@ class HCPHandler:
                 ctype_name = "Troop"
                 cost, atk, def_ = 0, 0, 0
                 shards = []
-                row = None
-                if isinstance(instance_id, str) and "-" in instance_id:
-                    from db import db_get_card_type
-                    r = _db.execute(
-                        "SELECT ct.card_type, ct.name, ct.cost, ct.attack, ct.defense "
-                        "FROM card_templates ct WHERE ct.guid=?",
-                        (instance_id,)).fetchone()
-                    if r:
-                        # Normalize to the 6-col shape used below.
-                        row = (instance_id, r[0], r[1], r[2], r[3], r[4])
-                        tpl_guid = instance_id
-                else:
-                    row = _db.execute(
-                        "SELECT ci.template_guid, ct.card_type, ct.name, ct.cost, ct.attack, ct.defense "
-                        "FROM card_instances ci JOIN card_templates ct ON ci.template_guid=ct.guid "
-                        "WHERE ci.user_id=? AND ci.instance_id=?",
-                         (self.user_profile["id"], instance_id)).fetchone()
+                card_data = player_card_data[i]
+                row = card_data["row"]
+                setup_data = card_data["setup"]
                 if row:
                     tpl_guid = row[0]
                     ctype_name = row[1]
@@ -10319,9 +10420,8 @@ class HCPHandler:
                     cost, atk, def_ = row[3] or 0, row[4] or 0, row[5] or 0
                     # Fetch threshold data
                     import json as _json2
-                    shards = []
-                    from db import db_card_template_field
-                    trow_val = db_card_template_field(tpl_guid, "threshold_json")
+                    _base_ab_json, _base_attrs, _base_ags, trow_val = (
+                        setup_data if setup_data else ("[]", 0, [], None))
                     if trow_val:
                         try:
                             td = _json2.loads(trow_val)
@@ -10329,34 +10429,20 @@ class HCPHandler:
                             raw_list = td.get('list', [])
                             shards = [shard_flags.get(s, s) for s in raw_list]
                         except: pass
-                    # Fetch abilities
-                    abilities = []
-                    ab_guids = []
-                    ab_json_val = db_card_template_field(tpl_guid, "abilities_json")
-                    if ab_json_val:
-                        try:
-                            ab_guids = _json2.loads(ab_json_val)
-                            abilities = [game_engine.ResourceId.from_str(g) for g in ab_guids]
-                        except: pass
+                    # Fetch abilities from the setup cache.
+                    ab_guids = list(_base_ags)
                     # Gem-granted abilities (baked into the deck at save time)
                     # join the card's ability list from the very first push.
                     for _gem_ag in (deck_gem_abilities.get(str(instance_id)) or []):
                         if str(_gem_ag).lower() not in [str(g).lower() for g in ab_guids]:
                             ab_guids.append(str(_gem_ag).lower())
                     abilities = [game_engine.ResourceId.from_str(g) for g in ab_guids]
-                    _db.execute(
-                        "UPDATE game_cards SET card_abilities=? "
-                        "WHERE session_id=? AND card_uid=?",
-                        (_json2.dumps([str(g).lower() for g in ab_guids]),
-                         session.session_id, cid.uid.to_uint64()))
-                    # Fetch static attributes (e.g. Flight) so the initial-hand
-                    # CardUpdated renders the attribute icons immediately.
-                    attributes = game_engine.ECardAttributes.Unknown
-                    attrs_val = db_card_template_field(tpl_guid, "attributes")
-                    if attrs_val:
-                        try:
-                            attributes = int(attrs_val)
-                        except: pass
+                    # Fetch static/effective attributes from the setup cache.
+                    attributes = int(_base_attrs or 0)
+                    if len(ab_guids) != len(_base_ags):
+                        player_ability_updates.append(
+                            (_json2.dumps(ab_guids), session.session_id,
+                             cid.uid.to_uint64()))
                 else:
                     # Missing instance — insert a placeholder instance
                     fallback = _db.execute("SELECT guid FROM card_templates LIMIT 1").fetchone()
@@ -10370,7 +10456,10 @@ class HCPHandler:
                 # icons show in hand from the first CardUpdated.
                 cdef_attrs = game_engine.ECardAttributes.Unknown
                 if row:
-                    cdef_attrs = attributes | self._granted_attributes([a.lower() for a in ab_guids])
+                    cdef_attrs = attributes
+                    if len(ab_guids) > len(_base_ags):
+                        cdef_attrs |= self._granted_attributes(
+                            [a.lower() for a in ab_guids[len(_base_ags):]])
                 game.card_defs[cid] = game_engine.CardDef(row[2] if row else "Card", ct, cost, atk, def_, shards, abilities, cdef_attrs)
                 # Deck cards: minimal update so the client knows they exist.
                 # Both players' decks stay face-down (nulling=True) — you
@@ -10378,6 +10467,11 @@ class HCPHandler:
                 # deck sleeve and skips the examiner for Null cards.
                 game.push_card_updated(cid, pl_uid_t, game_engine.ECardCollections.Deck, ct,
                                       nulling=True)
+            if player_ability_updates:
+                _db.executemany(
+                    "UPDATE game_cards SET card_abilities=? "
+                    "WHERE session_id=? AND card_uid=?",
+                    player_ability_updates)
             if player_deck_cards:
                 game.push_deck_created_with_cards(pl_uid_t, player_deck_cards)
                 # Client-side workaround: a nulled deck card that carries
@@ -10505,14 +10599,17 @@ class HCPHandler:
                     scene_setup_card_guids = set()
 
                     def _has_game_started_grant(card_guid):
-                        """Whether a scene card grants a GameStarted ability.
+                        """Whether a scene card has a setup-time ability.
 
                         Untargeted encounter setup cards are authored as
                         scene modifiers, but their ``You`` and ``opposing
                         champion`` ownership is evaluated from the encounter
                         side that owns the hidden card.  Keep those cards in
                         the AI mod zone so the normal metadata/BOM resolver
-                        applies the opposing-champion target correctly.
+                        applies the opposing-champion target correctly.  The
+                        authored ability can either grant a GameStarted
+                        ability or be a direct non-manual BOM (such as Early
+                        Sprouts' resource grant).
                         """
                         card_row = _db.execute(
                             "SELECT abilities_json FROM card_templates "
@@ -10523,6 +10620,19 @@ class HCPHandler:
                         except (TypeError, ValueError):
                             ability_guids = []
                         for ability_guid in ability_guids:
+                            meta = _db.execute(
+                                "SELECT is_manual, trigger_event_type "
+                                "FROM card_abilities_meta "
+                                "WHERE ability_guid=?", (str(
+                                    ability_guid).lower(),)).fetchone()
+                            effect_exists = _db.execute(
+                                "SELECT 1 FROM ability_effects "
+                                "WHERE ability_guid=? LIMIT 1", (str(
+                                    ability_guid).lower(),)).fetchone()
+                            if (meta and effect_exists and not meta[0] and
+                                    ("GameStartedEvent" in (meta[1] or "") or
+                                     not (meta[1] or ""))):
+                                return True
                             for _eg, effect_type, raw_param in _db.execute(
                                     "SELECT effect_guid,effect_type,param "
                                     "FROM ability_effects WHERE ability_guid=?",
@@ -10648,15 +10758,23 @@ class HCPHandler:
                 # If we couldn't resolve an AI deck, fall back to FRA-style.
                 if ai_card_specs:
                     random.shuffle(ai_card_specs)
+                    ai_setup_cache = {}
+                    ai_template_rows = {}
+                    ai_materialized = []
+                    ai_insert_rows = []
                     for pos, (cg, gem_type, gem_ability_guids) in enumerate(
                             ai_card_specs):
                         cid = game._new_card_id()
                         _is_scene_mod = str(cg).lower() in scene_mod_card_guids
                         if not _is_scene_mod:
                             ai_deck_cards.append(cid)
-                        r = _db.execute(
-                            "SELECT card_type, name, cost, attack, defense FROM card_templates WHERE guid=?",
-                            (cg,)).fetchone()
+                        cg_key = str(cg).lower()
+                        if cg_key not in ai_template_rows:
+                            ai_template_rows[cg_key] = _db.execute(
+                                "SELECT card_type, name, cost, attack, defense "
+                                "FROM card_templates WHERE guid=?",
+                                (cg,)).fetchone()
+                        r = ai_template_rows[cg_key]
                         if r:
                             ct2 = game_engine.card_type_from_db(r[0])
                             game.card_defs[cid] = game_engine.CardDef(
@@ -10669,44 +10787,44 @@ class HCPHandler:
                         # normal encounter cards remain in the deck.
                         col = (game_engine.ECardCollections.Warzone
                                if _is_scene_mod else game_engine.ECardCollections.Deck)
-                        if not _is_scene_mod:
-                            game.push_card_updated(cid, ai_uid_t, col,
-                                                   game.card_defs[cid].card_type,
-                                                   nulling=True)
                         _ai_ct = r[0] if r else "Troop"
-                        _db.execute("INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, card_type, template_guid, location, position, owner_user_id, original_template_guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (0, session.session_id, cid.uid.to_uint64(), cg, _ai_ct, cg,
-                             'mod' if _is_scene_mod else 'deck', pos, 0, cg))
-                        self._sync_instance_card_data(
-                            session, cid.uid.to_uint64(), cg, commit=False)
-                        if gem_ability_guids:
-                            existing = _db.execute(
-                                "SELECT card_abilities FROM game_cards "
-                                "WHERE session_id=? AND card_uid=?",
-                                (session.session_id, cid.uid.to_uint64())
-                            ).fetchone()
-                            try:
-                                abilities = _aj.loads(existing[0] or "[]")
-                            except (TypeError, ValueError):
-                                abilities = []
-                            for gem_guid in gem_ability_guids:
-                                if gem_guid not in abilities:
-                                    abilities.append(gem_guid)
-                            _db.execute(
-                                "UPDATE game_cards SET card_abilities=?, gems=? "
-                                "WHERE session_id=? AND card_uid=?",
-                                (_aj.dumps(abilities), gem_type,
-                                 session.session_id, cid.uid.to_uint64()))
-                        elif gem_type:
-                            _db.execute(
-                                "UPDATE game_cards SET gems=? "
-                                "WHERE session_id=? AND card_uid=?",
-                                (gem_type, session.session_id,
-                                 cid.uid.to_uint64()))
-                        # Build the authoritative CardDef after persisting the
-                        # encounter gem. This makes the gem ability available
-                        # to CardCreated/enter-play triggers before the card is
-                        # drawn, and keeps later CardUpdated pushes consistent.
+                        setup_data = self._battle_setup_template_data(
+                            cg, ai_setup_cache)
+                        if setup_data:
+                            abilities_json, effective_attrs, base_ags, _threshold = setup_data
+                        else:
+                            abilities_json, effective_attrs, base_ags = "[]", 0, []
+                        abilities = list(base_ags)
+                        for gem_guid in gem_ability_guids or []:
+                            gem_guid = str(gem_guid).lower()
+                            if gem_guid not in abilities:
+                                abilities.append(gem_guid)
+                        if len(abilities) > len(base_ags):
+                            effective_attrs |= self._granted_attributes(
+                                abilities[len(base_ags):])
+                        ai_insert_rows.append(
+                            (0, session.session_id, cid.uid.to_uint64(), cg,
+                             _ai_ct, cg, 'mod' if _is_scene_mod else 'deck',
+                             pos, 0, cg, _aj.dumps(abilities),
+                             effective_attrs, "{}", gem_type or 0))
+                        ai_materialized.append((cid, cg, _is_scene_mod, col))
+                    if ai_insert_rows:
+                        _db.executemany(
+                            "INSERT INTO game_cards (user_id, session_id, card_uid, "
+                            "card_template_id, card_type, template_guid, location, "
+                            "position, owner_user_id, original_template_guid, "
+                            "card_abilities, card_attributes, card_uses, gems) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            ai_insert_rows)
+                    _db.commit()
+                    for cid, cg, _is_scene_mod, col in ai_materialized:
+                        if not _is_scene_mod:
+                            game.push_card_updated(
+                                cid, ai_uid_t, col,
+                                game.card_defs[cid].card_type, nulling=True)
+                        # Build the authoritative CardDef after the complete
+                        # batch is visible. This preserves gem and scene setup
+                        # behavior without a SELECT/UPDATE pair per card.
                         self._card_full_data(game, cid, cg)
                     _db.commit()
                     source = (f"encounter {ai_deck_guid}" if ai_deck_guid
@@ -10722,6 +10840,7 @@ class HCPHandler:
                 # itself has no usable card list.
                 ai_card_ids = list(range(60))
                 random.shuffle(ai_card_ids)
+                fallback_insert_rows = []
                 for pos, i in enumerate(ai_card_ids):
                     cid = game._new_card_id()
                     ai_deck_cards.append(cid)
@@ -10730,9 +10849,16 @@ class HCPHandler:
                     game.push_card_updated(cid, ai_uid_t, col,
                                            game_engine.ECardTypes.Troop,
                                            nulling=True)
-                    _db.execute("INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, card_type, template_guid, location, position, owner_user_id, original_template_guid) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (0, session.session_id, cid.uid.to_uint64(), 8000+i, "Troop", None, 'deck', pos, 0, None))
-                    self._sync_instance_card_data(session, cid.uid.to_uint64(), None)
+                    fallback_insert_rows.append(
+                        (0, session.session_id, cid.uid.to_uint64(), 8000+i,
+                         "Troop", None, 'deck', pos, 0, None))
+                if fallback_insert_rows:
+                    _db.executemany(
+                        "INSERT INTO game_cards (user_id, session_id, card_uid, "
+                        "card_template_id, card_type, template_guid, location, "
+                        "position, owner_user_id, original_template_guid) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        fallback_insert_rows)
             if ai_deck_cards:
                 game.push_deck_created_with_cards(ai_uid_t, ai_deck_cards)
             _db.commit()
@@ -11626,12 +11752,42 @@ class HCPHandler:
             ag_json = json.dumps(active_gems)
             gem_abilities = self._resolve_gem_abilities(active_gems)
             ga_json = json.dumps(gem_abilities)
-            deck_db_id = db_save_deck(self.user_profile["id"], deck_name, cards_json,
-                pve_champion_id=pve_champion_uid, pvp_champion_guid=pvp_champ_guid,
-                active_gems_json=ag_json, gem_abilities_json=ga_json,
-                deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+            user_id = self.user_profile["id"]
+            # Campaign saves arrive as AddNewDeck rather than UpdateDeck.  A
+            # campaign character still has one persistent deck, so reuse the
+            # newest campaign row for this character instead of creating a
+            # duplicate every time the player clicks Save Deck.  Normal decks
+            # continue through db_save_deck and may coexist as before.
+            existing_campaign = None
+            if pve_champion_uid:
+                existing_campaign = _db.execute(
+                    "SELECT id FROM decks WHERE user_id=? "
+                    "AND pve_champion_id=? "
+                    "AND LOWER(deck_name) LIKE '%campaign deck%' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (user_id, pve_champion_uid)).fetchone()
+            if existing_campaign:
+                deck_db_id = existing_campaign[0]
+                db_update_deck(
+                    deck_db_id, user_id, deck_name=deck_name,
+                    cards_json=cards_json, pve_champion_id=pve_champion_uid,
+                    pvp_champion_guid=pvp_champ_guid,
+                    active_gems_json=ag_json, gem_abilities_json=ga_json,
+                    deck_sleeve_guid=deck_sleeve_guid,
+                    gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+                log_req(f"    Updated campaign deck '{deck_name}' "
+                        f"id={deck_db_id} with {len(card_ids)} cards")
+            else:
+                deck_db_id = db_save_deck(
+                    user_id, deck_name, cards_json,
+                    pve_champion_id=pve_champion_uid,
+                    pvp_champion_guid=pvp_champ_guid,
+                    active_gems_json=ag_json, gem_abilities_json=ga_json,
+                    deck_sleeve_guid=deck_sleeve_guid,
+                    gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+                log_req(f"    Saved deck '{deck_name}' id={deck_db_id} "
+                        f"with {len(card_ids)} cards")
             deck_uid = deck_db_id
-            log_req(f"    Saved deck '{deck_name}' id={deck_db_id} with {len(card_ids)} cards")
             # Link this deck as the champion's last used deck (pve_champion_id is
             # the champion UID = (db_id << 8) | 12).
             if pve_champion_uid:
@@ -12162,8 +12318,34 @@ class HCPHandler:
             # Generate card instances for the pack
             card_templates = _load_card_templates()
             all_cards = []
+            pack_inventory_rewards = []
+            pack_inventory_updates = []
+            campaign_pack_config = CAMPAIGN_PACK_CONFIGS.get(pack_guid.lower())
             if not pack_error:
-                if is_full_set:
+                if campaign_pack_config:
+                    # Adventure Zone campaign packs are not normal PvP
+                    # boosters.  Each has two common PvP cards, one weighted
+                    # PvE card, and two equipment/Stardust slots from its
+                    # configured set range.
+                    from gamedata import DEFAULT_RECORD_STORE
+                    for _ in range(open_amount):
+                        reward = generate_campaign_pack(
+                            card_templates, DEFAULT_RECORD_STORE, random,
+                            pack_config=campaign_pack_config)
+                        all_cards.extend(reward.cards)
+                        pack_inventory_rewards.extend(
+                            (guid, "equipment")
+                            for guid in reward.equipment_guids)
+                        pack_inventory_rewards.extend(
+                            (STARDUST_TEMPLATES[rarity.lower()], "stardust")
+                            for rarity in reward.stardust_rarities)
+                    log_req(
+                        f"    Campaign pack: {len(all_cards)} cards, "
+                        f"{sum(kind == 'equipment' for _, kind in pack_inventory_rewards)} "
+                        f"equipment, "
+                        f"{sum(kind == 'stardust' for _, kind in pack_inventory_rewards)} "
+                        f"stardust (replacement rate={STARDUST_REPLACEMENT_RATE:.0%})")
+                elif is_full_set:
                     # Grant every PVP card from the set (4x each)
                     pool = card_templates.get(set_guid, [])
                     pool = _full_set_pool(pool)
@@ -12219,9 +12401,67 @@ class HCPHandler:
                 # Push these specific new cards to client via ProfileGenericUpdate (adds to CardList)
                 self.push_opened_cards_via_generic(new_card_data)
 
-                # Generate treasure chest for this pack opening
+                # Campaign equipment and Stardust are InventoryItemData, not
+                # card_instance_bits.  Persist them with stable per-player
+                # inventory IDs and push the same quantity update to the
+                # client.  Keeping the rewards in player_inventory also makes
+                # them survive a reconnect.
+                if pack_inventory_rewards:
+                    inventory_updates = {}
+                    inventory_kinds = {}
+                    next_uid = int(_db.execute(
+                        "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+                        "FROM player_inventory WHERE user_id=?",
+                        (self.user_profile["id"],)).fetchone()[0] or 1)
+                    for template_guid, _kind in pack_inventory_rewards:
+                        row = _db.execute(
+                            "SELECT id, quantity, client_item_uid "
+                            "FROM player_inventory WHERE user_id=? "
+                            "AND template_guid=? ORDER BY id LIMIT 1",
+                            (self.user_profile["id"], template_guid)).fetchone()
+                        if row:
+                            item_id, quantity, client_uid = row
+                            quantity = int(quantity or 0) + 1
+                            if not client_uid:
+                                client_uid = next_uid
+                                next_uid += 1
+                            _db.execute(
+                                "UPDATE player_inventory SET quantity=?, "
+                                "client_item_uid=? WHERE id=?",
+                                (quantity, client_uid, item_id))
+                        else:
+                            client_uid = next_uid
+                            next_uid += 1
+                            quantity = 1
+                            _db.execute(
+                                "INSERT INTO player_inventory "
+                                "(user_id, template_guid, quantity, client_item_uid) "
+                                "VALUES (?,?,?,?)",
+                                (self.user_profile["id"], template_guid,
+                                 quantity, client_uid))
+                        inventory_updates[template_guid] = (client_uid, quantity)
+                        inventory_kinds[template_guid] = _kind
+                        if template_guid in STARDUST_TEMPLATES.values():
+                            rarity = next(
+                                key for key, value in STARDUST_TEMPLATES.items()
+                                if value == template_guid)
+                            _db.execute(
+                                "INSERT INTO stardust (user_id, rarity, quantity) "
+                                "VALUES (?,?,1) ON CONFLICT(user_id, rarity) "
+                                "DO UPDATE SET quantity=quantity+1",
+                                (self.user_profile["id"], rarity))
+                    _db.commit()
+                    pack_inventory_updates = [
+                        (guid, inventory_kinds[guid], inventory_updates[guid][0],
+                         inventory_updates[guid][1])
+                        for guid in inventory_updates]
+
+                # Generate treasure chest for normal boosters.  Campaign
+                # packs already contain their two equipment/Stardust slots;
+                # they do not award the standard booster chest.
                 import random as _rand
-                probs = _db.execute("SELECT rarity, weight FROM chest_probabilities").fetchall()
+                probs = [] if campaign_pack_config else _db.execute(
+                    "SELECT rarity, weight FROM chest_probabilities").fetchall()
                 if probs:
                     total_weight = sum(p[1] for p in probs)
                     roll = _rand.randint(1, total_weight)
@@ -12282,6 +12522,10 @@ class HCPHandler:
                 "issuer": issuer_str, "target": target, "instance": instance,
                 "reqid": resp_reqid, "c": comp, "conh": conh, "sid": self.sid,
             }, dw_bytes)
+            for template_guid, _kind, item_uid, quantity in pack_inventory_updates:
+                self.push_inventory_to_client(
+                    qty=quantity, template_guid=template_guid,
+                    item_id=item_uid)
             log_req(f"    Sent OpenCardPack response ({len(all_cards)} cards, {len(dw_bytes)}b)")
     
         # DeleteChampion (2035)

@@ -460,6 +460,29 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
         return {"GreaterThanOrEqual": def_ >= val,
                 "LessThanOrEqual": def_ <= val,
                 "Equal": def_ == val}.get(op, True)
+    if t == "HasCountersValue":
+        # Counter values are keyed by the extracted counter-template GUID for
+        # champions and by name+GUID metadata for ordinary game cards.
+        wanted = str((filter_json.get("m_CounterType") or {}).get(
+            "m_Guid") or "").lower()
+        counters = card.get("counters") or {}
+        guids = card.get("counter_guids") or {}
+        value = 0
+        for name, count in counters.items():
+            if not wanted or str(name).lower() == wanted or \
+                    str(guids.get(name, "")).lower() == wanted:
+                try:
+                    value += int(count or 0)
+                except (TypeError, ValueError):
+                    continue
+        op = filter_json.get("m_ComparisonOp", "GreaterThanOrEqual")
+        target = int(filter_json.get("m_Amount", 0) or 0)
+        return {"GreaterThanOrEqual": value >= target,
+                "LessThanOrEqual": value <= target,
+                "Equal": value == target,
+                "Equals": value == target,
+                "GreaterThan": value > target,
+                "LessThan": value < target}.get(op, True)
     # Unmodelled filter types (IsSubType, IsColor, TACFilter, ...) don't exclude.
     return True
 
@@ -575,11 +598,18 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     for cu, ctype, loc, uid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs \
             in db.execute(sql, params):
         int_attrs = {}
+        counters = {}
+        counter_guids = {}
         try:
             saved = json.loads(raw_buffs or "{}")
             persisted = saved.get("int_attrs", {}) if isinstance(saved, dict) else {}
             if isinstance(persisted, dict):
                 int_attrs.update({str(k): int(v or 0) for k, v in persisted.items()})
+            if isinstance(saved, dict):
+                if isinstance(saved.get("counters"), dict):
+                    counters = dict(saved["counters"])
+                if isinstance(saved.get("counter_guids"), dict):
+                    counter_guids = dict(saved["counter_guids"])
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
         try:
@@ -613,6 +643,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 "src_owner_id": controller_uid,
                 "subtype": subtype or "",
                 "int_attrs": int_attrs,
+                "counters": counters,
+                "counter_guids": counter_guids,
                 "shards": shards_from_threshold(thresh)}
         if battle_state and battle_state.get("turn_player"):
             active = battle_state.get("turn_player")

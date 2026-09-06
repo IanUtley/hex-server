@@ -9,12 +9,12 @@ rules-data source.
 
 import json
 
-from gamedata.records import RecordStore
+from gamedata import DEFAULT_RECORD_STORE
 
 
 _EFFECT_TEMPLATES = None
 _ABILITY_TEMPLATES = None
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def _last_type(value):

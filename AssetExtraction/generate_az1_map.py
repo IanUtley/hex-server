@@ -43,6 +43,7 @@ class NodeDetails:
     post_conversations: tuple[str, ...] = ()
     quest_starts: tuple[str, ...] = ()
     quest_finishes: tuple[str, ...] = ()
+    quest_links: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,80 @@ def game_object(transform):
     return transform.m_GameObject.deref().read()
 
 
+def _parse_obj_geometry(raw: str):
+    """Convert UnityPy's OBJ mesh export into compact position/index data."""
+    vertices = []
+    indices = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "v" and len(parts) >= 4:
+            vertices.append(tuple(float(value) for value in parts[1:4]))
+        elif parts[0] == "f" and len(parts) >= 4:
+            face = []
+            for token in parts[1:]:
+                try:
+                    face.append(int(token.split("/", 1)[0]) - 1)
+                except (TypeError, ValueError):
+                    face = []
+                    break
+            for index in range(1, len(face) - 1):
+                indices.extend((face[0], face[index], face[index + 1]))
+    return vertices, indices
+
+
+def extract_terrain(env):
+    """Extract the AZ1 terrain chunks from the client map prefab.
+
+    The client background is a Unity prefab containing twelve terrain meshes.
+    We keep the geometry only; Three.js supplies a lightweight material so the
+    viewer does not need to ship the original Unity shader graph or bundles.
+    """
+    az_map = next(
+        (obj for obj in env.objects
+         if obj.type.name == "GameObject" and getattr(obj.read(), "m_Name", "") == "AZMap"),
+        None,
+    )
+    if az_map is None:
+        return []
+    root_go = az_map.read()
+    root_transform = transform_of(root_go)
+    root_world = local_transform(root_transform)
+    azm_transform = None
+    for child_ptr in root_transform.m_Children:
+        child_transform = child_ptr.deref().read()
+        if game_object(child_transform).m_Name == "AZM":
+            azm_transform = child_transform
+            break
+    if azm_transform is None:
+        return []
+    azm_world = world_transform(root_world, azm_transform)
+    chunks = []
+    for child_ptr in azm_transform.m_Children:
+        child_transform = child_ptr.deref().read()
+        child_go = game_object(child_transform)
+        if not str(child_go.m_Name).startswith("Mesh__"):
+            continue
+        mesh_filter = component(child_go, "MeshFilter")
+        if mesh_filter is None or mesh_filter.read().m_Mesh is None:
+            continue
+        mesh_ptr = mesh_filter.read().m_Mesh
+        mesh = mesh_ptr.deref().read()
+        vertices, indices = _parse_obj_geometry(mesh.export("obj"))
+        if not vertices or not indices:
+            continue
+        mesh_world = world_transform(azm_world, child_transform)
+        vertices = [combine(mesh_world, Transform(vertex, (0, 0, 0, 1), (1, 1, 1))).position
+                    for vertex in vertices]
+        chunks.append({
+            "id": str(child_go.m_Name),
+            "vertices": [value for vertex in vertices for value in vertex],
+            "indices": indices,
+        })
+    return sorted(chunks, key=lambda chunk: chunk["id"])
+
+
 def scene_labels(records_path: Path) -> dict[str, tuple[str, str]]:
     labels = {}
     for line_number, line in enumerate(records_path.open(encoding="utf-8"), 1):
@@ -206,10 +281,14 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
             "ORDER BY name"
         ).fetchall()
         conversation_rows = db.execute(
-            "SELECT node_id, conversation_name, trigger_json "
-            "FROM campaign_node_conversations "
-            "WHERE campaign_template='AZ1' AND enabled=1 "
-            "ORDER BY node_id, priority, conversation_guid"
+            "SELECT cnc.node_id, cnc.conversation_name, cnc.trigger_json, "
+            "       qc.quest_script, qc.role "
+            "FROM campaign_node_conversations cnc "
+            "LEFT JOIN quest_conversations qc "
+            "  ON qc.conversation_guid=cnc.conversation_guid "
+            " AND qc.campaign_template='AZ1' AND qc.enabled=1 "
+            "WHERE cnc.campaign_template='AZ1' AND cnc.enabled=1 "
+            "ORDER BY cnc.node_id, cnc.priority, cnc.conversation_guid"
         ).fetchall()
     except sqlite3.Error:
         return {}
@@ -227,7 +306,7 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
         entry = accumulated.setdefault(node_id, {
             "encounters": [], "champions": [], "conversations": [],
             "pre": [], "post": [],
-            "starts": [], "finishes": [],
+            "starts": [], "finishes": [], "quests": [],
         })
         encounter = str(scene_title or "").strip() or re.sub(
             r"^AZ\s*1\s*-\s*NODE\s*-?\s*[0-9A-Z]+\s*-\s*",
@@ -239,13 +318,17 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
         if champion and champion not in entry["champions"]:
             entry["champions"].append(champion)
 
-    for node_id, name, raw_trigger in conversation_rows:
+    for node_id, name, raw_trigger, quest_script, role in conversation_rows:
         entry = accumulated.setdefault(node_id, {
             "encounters": [], "champions": [], "conversations": [],
             "pre": [], "post": [],
-            "starts": [], "finishes": [],
+            "starts": [], "finishes": [], "quests": [],
         })
         label = conversation_label(name)
+        if quest_script:
+            quest_link = f"{quest_script} ({role or 'conversation'})"
+            if quest_link not in entry["quests"]:
+                entry["quests"].append(quest_link)
         lower = label.lower()
         try:
             trigger = json.loads(raw_trigger or "{}")
@@ -253,12 +336,15 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
             trigger = {}
         outcome = str((trigger or {}).get("outcome") or "").lower()
         if "quest start" in lower:
-            entry["starts"].append(label)
+            if label not in entry["starts"]:
+                entry["starts"].append(label)
         elif "quest end" in lower:
-            entry["finishes"].append(label)
+            if label not in entry["finishes"]:
+                entry["finishes"].append(label)
         elif "quest not complete" not in lower and "quest completed" not in lower:
             bucket = "post" if outcome in {"success", "fail"} else "pre"
-            entry[bucket].append(label)
+            if label not in entry[bucket]:
+                entry[bucket].append(label)
 
     return {
         node_id: NodeDetails(
@@ -271,13 +357,14 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
             post_conversations=tuple(values["post"]),
             quest_starts=tuple(values["starts"]),
             quest_finishes=tuple(values["finishes"]),
+            quest_links=tuple(values["quests"]),
         )
         for node_id, values in accumulated.items()
     }
 
 
-def extract(resources_path: Path, records_path: Path):
-    env = UnityPy.load(str(resources_path))
+def extract(resources_path: Path, records_path: Path, env=None):
+    env = env or UnityPy.load(str(resources_path))
     prefab = next((obj for obj in env.objects if obj.path_id == PREFAB_PATH_ID), None)
     if prefab is None or prefab.type.name != "GameObject":
         raise RuntimeError(f"Could not find AZ1 nodes prefab path ID {PREFAB_PATH_ID}")
@@ -525,18 +612,85 @@ def write_png(output: Path, nodes, paths, project):
     image.save(output)
 
 
+def _node_details_json(details: NodeDetails) -> dict[str, list[str]]:
+    return {
+        "encounters": list(details.encounters),
+        "champions": list(details.champions),
+        "conversations": list(details.conversations),
+        "pre_conversations": list(details.pre_conversations),
+        "post_conversations": list(details.post_conversations),
+        "quest_starts": list(details.quest_starts),
+        "quest_finishes": list(details.quest_finishes),
+        "quest_links": list(details.quest_links),
+    }
+
+
+def write_json(output: Path, nodes, paths, terrain_chunks=None):
+    """Write a browser-ready static map projection.
+
+    The JSON deliberately contains authored geometry and content only.  Per-
+    character visibility, completion, blocking, and quest markers are runtime
+    state and are overlaid by the Three.js viewer when supplied separately.
+    """
+    payload = {
+        "schema_version": 1,
+        "campaign": "AZ1",
+        "title": "Howling Plains",
+        "assets": {
+            "background_prefab": "campaign/azmap/azmap",
+            "nodes_prefab": "campaign/az01/nodes",
+            "source": "Hex_Data/resources.assets",
+        },
+        "nodes": [
+            {
+                "id": node.node_id,
+                "title": node.title,
+                "terrain": node.terrain,
+                "position": {
+                    "x": node.position[0],
+                    "y": node.position[1],
+                    "z": node.position[2],
+                },
+                "details": _node_details_json(node.details),
+            }
+            for node in sorted(nodes.values(), key=lambda item: natural_key(item.node_id))
+        ],
+        "paths": [
+            {
+                "id": path_name,
+                "from": start,
+                "to": end,
+                "points": [
+                    {"x": point[0], "y": point[1], "z": point[2]}
+                    for point in points
+                ],
+            }
+            for path_name, start, end, points in sorted(paths)
+        ],
+        "terrain": terrain_chunks or [],
+    }
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-root", type=Path, default=DEFAULT_CLIENT_ROOT)
     parser.add_argument("--records", type=Path, default=Path("Records/SceneData.jsonl"))
     parser.add_argument("--database", type=Path, default=Path("hconnect.db"))
     parser.add_argument("--output", type=Path, default=Path("docs/az1-node-map"))
+    parser.add_argument(
+        "--json-output", type=Path,
+        help="Optional browser-ready JSON output path",
+    )
     args = parser.parse_args()
     resources = args.client_root / "Hex_Data" / "resources.assets"
     if not resources.exists():
         raise SystemExit(f"Missing Unity resources file: {resources}")
     details = load_node_details(args.database, args.records)
-    nodes, paths = extract(resources, args.records)
+    env = UnityPy.load(str(resources))
+    nodes, paths = extract(resources, args.records, env=env)
+    terrain_chunks = extract_terrain(env)
     nodes = {
         node_id: Node(node.node_id, node.title, node.terrain, node.position,
                       details.get(node_id, NodeDetails()))
@@ -548,9 +702,15 @@ def main():
     project = make_projection(nodes, paths)
     write_svg(args.output.with_suffix(".svg"), nodes, paths, project)
     write_png(args.output.with_suffix(".png"), nodes, paths, project)
+    if args.json_output:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(args.json_output, nodes, paths, terrain_chunks)
     print(f"Generated {len(nodes)} nodes and {len(paths)} paths")
     print(args.output.with_suffix(".svg"))
     print(args.output.with_suffix(".png"))
+    if args.json_output:
+        print(args.json_output)
+        print(f"Extracted {len(terrain_chunks)} terrain chunks")
 
 
 if __name__ == "__main__":

@@ -47,11 +47,11 @@ from .framework.triggers import (
     resolve_stack_trigger,
 )
 from .framework._shared import _stat_delta
-from gamedata import (ActivationData, RecordStore, ability_graph)
+from gamedata import (ActivationData, DEFAULT_RECORD_STORE, ability_graph)
 from .registry import register_custom_ability, lookup, discover as _discover_cards
 
 
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def resolve_effect(ability_guid):

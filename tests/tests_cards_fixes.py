@@ -638,6 +638,189 @@ def test_crown_of_the_primals_buffs_target_troop(db):
     assert json.loads(target[2]).get("int_attrs", {}).get("Rage") == 3, target
 
 
+def test_strength_of_redwood_uses_each_typed_stat_value(db):
+    """Strength of the Redwood must resolve P1=1 and P3=3 independently."""
+    from abilities.framework.resolution import resolve_ability
+
+    redwood_tpl = "27e20321-3e24-4802-8ffe-b4579616ff5c"
+    redwood_ag = "90f5fcfe-aeff-13e1-0f8c-60d0f7b3b972"
+    troop_tpl = "d790e8b9-a000-475e-8350-d11be117d6bc"
+    _copy_card(db, redwood_tpl)
+    _copy_card(db, troop_tpl)
+    add_card(db, 9200, 5, redwood_tpl, loc="CastSpells")
+    add_card(db, 9201, 5, troop_tpl, loc="warzone")
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = HandlerStub(db)
+    game = game_engine.Game(1, pl_t, ai_t)
+    resolve_ability(
+        handler, game, SessionStub(), db, pl_t, ai_t,
+        {"player_health": 20, "ai_health": 20}, redwood_ag,
+        9200, 5, {0: 9201})
+    buffs = json.loads(db.execute(
+        "SELECT temporary_buffs FROM game_cards WHERE card_uid=9201"
+    ).fetchone()[0] or "{}")
+    assert buffs.get("atk") == 1 and buffs.get("def") == 3, buffs
+
+
+def test_primordial_caves_adds_entering_cost_secretly_and_chains_threshold(db):
+    """Roar accumulation is private; only the threshold follow-up uses chain."""
+    from abilities.framework.triggers import resolve_stack_trigger, resolve_triggers
+
+    caves_tpl = "c996eb73-4c0d-42a1-8313-4baaf12f36e0"
+    tyrannosaurus_tpl = "306051ab-e7df-48a4-ad59-015c38551f03"
+    caves_ag = "12cf8e9a-13d5-71de-c8e0-959db1c44aaa"
+    roar_guid = "b056a29b-b013-1915-86d0-fe1cab4f168b"
+    db.execute("CREATE TABLE card_counter_templates ("
+               "template_id TEXT PRIMARY KEY, name TEXT, description TEXT)")
+    db.execute("INSERT INTO card_counter_templates VALUES (?,?,?)",
+               (roar_guid, "Roar", ""))
+    # The production card_templates schema carries these random-pool fields;
+    # add them to this focused fixture so the typed Dinosaur filter can be
+    # exercised rather than falling back to the fixture's reduced schema.
+    for column, kind in (("rarity", "TEXT"), ("socket_count", "INTEGER"),
+                         ("is_pve", "INTEGER"), ("no_pvp", "INTEGER")):
+        db.execute(f"ALTER TABLE card_templates ADD COLUMN {column} {kind}")
+    _copy_card(db, caves_tpl)
+    _copy_card(db, tyrannosaurus_tpl)
+    for uid in (9300, 9301):
+        add_card(db, uid, 5, caves_tpl, loc="warzone")
+        db.execute("UPDATE game_cards SET card_abilities=? WHERE card_uid=?",
+                   (json.dumps([caves_ag]), uid))
+    add_card(db, 9302, 5, tyrannosaurus_tpl, loc="hand")
+    db.commit()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = HandlerStub(db)
+    session = SessionStub()
+    bstate = {"player_health": 20, "ai_health": 20,
+              "turn_number": 1, "stack": []}
+
+    game = game_engine.Game(1, pl_t, ai_t)
+    resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
+                     "CardEnteredZoneEvent", 9302, 5)
+    assert not bstate["stack"]
+    for uid in (9300, 9301):
+        data = json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0] or "{}")
+        assert data["counters"]["roar"] == 6, data
+    assert not any(isinstance(event,
+                               game_engine.AbilityPushedOnChainSessionEventArgs)
+                   for event in game.events)
+
+    add_card(db, 9303, 5, tyrannosaurus_tpl, loc="hand")
+    bstate["stack"] = []
+    game2 = game_engine.Game(1, pl_t, ai_t)
+    resolve_triggers(db, handler, game2, session, pl_t, ai_t, bstate,
+                     "CardEnteredZoneEvent", 9303, 5)
+    assert len(bstate["stack"]) == 2, bstate["stack"]
+    assert all(item["effect_groups"] == [2, 3]
+               for item in bstate["stack"]), bstate["stack"]
+    assert sum(isinstance(event,
+                          game_engine.AbilityPushedOnChainSessionEventArgs)
+               for event in game2.events) == 2
+    for item in list(bstate["stack"]):
+        bstate["stack"].remove(item)
+        resolve_stack_trigger(handler, game2, session, db, pl_t, ai_t,
+                              bstate, item)
+    for uid in (9300, 9301):
+        data = json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0] or "{}")
+        assert not data.get("counters"), data
+
+    # Repeat the threshold branch with AI-owned caves and an AI-owned
+    # entering troop. The random Dinosaur must be created for the AI, not
+    # interpreted as a player draw or silently dropped.
+    for uid in (9310, 9311):
+        add_card(db, uid, 0, caves_tpl, loc="warzone")
+        db.execute("UPDATE game_cards SET card_abilities=?, permanent_buffs=? "
+                   "WHERE card_uid=?", (json.dumps([caves_ag]),
+                   json.dumps({"counters": {"roar": 9}}), uid))
+    add_card(db, 9312, 0, tyrannosaurus_tpl, loc="hand")
+    bstate["stack"] = []
+    game3 = game_engine.Game(1, pl_t, ai_t)
+    resolve_triggers(db, handler, game3, session, pl_t, ai_t, bstate,
+                     "CardEnteredZoneEvent", 9312, 0)
+    assert len(bstate["stack"]) == 2, bstate["stack"]
+    for item in list(bstate["stack"]):
+        bstate["stack"].remove(item)
+        result = resolve_stack_trigger(handler, game3, session, db,
+                                       pl_t, ai_t, bstate, item)
+        assert "summon 1x" in result, result
+    summoned = db.execute(
+        "SELECT gc.user_id, gc.location, ct.subtype "
+        "FROM game_cards gc JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='warzone' "
+        "AND gc.card_uid NOT IN (9310,9311)",
+        (session.session_id,)).fetchall()
+    assert summoned and all("dinosaur" in (row[2] or "").lower()
+                            for row in summoned), summoned
+    assert not any(isinstance(event,
+                               game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs)
+                   for event in game3.events), game3.events
+
+    # The same threshold resolution in a PvP-shaped view must use the PvP
+    # legal random pool. Include an ineligible Dinosaur to catch regressions
+    # that accidentally use the full PvE pool, and resolve the trigger with
+    # the opponent as the source owner to verify ownership as well.
+    illegal_dinosaur_tpl = "04b650a2-a1bd-4c40-8b52-35a69b0f2838"
+    _copy_card(db, illegal_dinosaur_tpl)
+    db.execute("UPDATE card_templates SET is_pve=1, no_pvp=0 "
+               "WHERE guid=?", (illegal_dinosaur_tpl,))
+    for uid in (9320, 9321):
+        add_card(db, uid, 1000, caves_tpl, loc="warzone")
+        db.execute("UPDATE game_cards SET card_abilities=?, permanent_buffs=? "
+                   "WHERE card_uid=?", (json.dumps([caves_ag]),
+                   json.dumps({"counters": {"roar": 9}}), uid))
+    add_card(db, 9322, 1000, tyrannosaurus_tpl, loc="hand")
+    db.commit()
+    from abilities.framework.effects.tokens import _random_template_guids
+    from abilities.framework.fields import effect_template
+    dinosaur_filter = effect_template(
+        "27d51a25-61c8-ef69-8c8e-c09e5b447a5f")["m_CardFilter"]
+    pvp_pool = _random_template_guids(
+        db, dinosaur_filter, 9320, 1000, {"pvp": True})
+    assert pvp_pool and illegal_dinosaur_tpl not in pvp_pool, pvp_pool
+
+    pvp_bstate = {
+        "pvp": True, "pids": [5, 1000], "champ_map": {},
+        "player_health": 20, "ai_health": 20, "stack": [],
+        "turn_number": 1,
+    }
+    pvp_event_pl_t = game_engine.UID.make(244, 5)
+    pvp_event_ai_t = game_engine.UID.make(244, 1000)
+    pvp_event_game = game_engine.Game(1, pvp_event_pl_t, pvp_event_ai_t)
+    handler._current_bstate = pvp_bstate
+    resolve_triggers(db, handler, pvp_event_game, session,
+                     pvp_event_pl_t, pvp_event_ai_t, pvp_bstate,
+                     "CardEnteredZoneEvent", 9322, 1000)
+    assert len(pvp_bstate["stack"]) == 2, pvp_bstate["stack"]
+    pvp_pl_t = game_engine.UID.make(244, 1000)
+    pvp_ai_t = game_engine.UID.make(244, 5)
+    pvp_game = game_engine.Game(1, pvp_pl_t, pvp_ai_t)
+    for pvp_item in list(pvp_bstate["stack"]):
+        pvp_bstate["stack"].remove(pvp_item)
+        result = resolve_stack_trigger(
+            handler, pvp_game, session, db, pvp_pl_t, pvp_ai_t,
+            pvp_bstate, pvp_item)
+        assert "summon 1x" in result, result
+    pvp_summoned = db.execute(
+        "SELECT gc.user_id, gc.location, gc.template_guid, ct.subtype "
+        "FROM game_cards gc JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.user_id=1000 AND gc.location='warzone' "
+        "AND gc.card_uid NOT IN (9320,9321)",
+        (session.session_id,)).fetchall()
+    assert pvp_summoned, pvp_summoned
+    assert all(row[3] and "dinosaur" in row[3].lower()
+               for row in pvp_summoned), pvp_summoned
+    assert all(row[2] != illegal_dinosaur_tpl for row in pvp_summoned), \
+        pvp_summoned
+
+
 def test_spam_bot_charge_power_targets_one_robot_and_one_stat(db):
     """S.P.A.M. Bot's charge power must resolve its two random branches
     against one chosen Robot, not every Robot and not both stats."""
@@ -1011,6 +1194,52 @@ def test_resource_grant_columns_from_gamedata(db):
         hcs._db = old_hcs_db
 
 
+def test_hidden_scene_static_resource_grant_runs_at_game_start(db):
+    """Encounter-scene setup cards with direct start-of-game BOMs resolve.
+
+    Resource Rich is authored as the Early Sprouts battleboard card.  Its
+    ability is non-triggered (the card itself is the setup effect), so the
+    GameStarted dispatcher must execute it for the hidden ``mod`` card and
+    grant both champions their current and permanent resource.
+    """
+    from abilities.framework.triggers import resolve_triggers
+    from battle_engine import default_state
+
+    early_sprouts = "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+    early_sprouts_ability = "e80535ad-0f8c-832c-d042-0ea69068c638"
+    _copy_card(db, early_sprouts)
+    add_card(db, 777, 0, early_sprouts, loc="mod")
+    db.execute(
+        "UPDATE game_cards SET card_abilities=? WHERE card_uid=777",
+        (json.dumps([early_sprouts_ability]),))
+    db.commit()
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = default_state()
+    bstate.update({"player_health": 20, "ai_health": 10})
+    handler._current_bstate = bstate
+
+    resolve_triggers(
+        db, handler, game, SessionStub(), pl_t, ai_t, bstate,
+        "GameStartedEvent", None, 0, zones=("hand", "warzone"))
+
+    assert bstate["player_resources"] == 1
+    assert bstate["player_total_resources"] == 1
+    assert bstate["ai_resources"] == 1
+    assert bstate["ai_total_resources"] == 1
+    assert sum(
+        isinstance(event,
+                   game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs)
+        for event in game.events) == 2
+    assert sum(
+        isinstance(event,
+                   game_engine.PlayerTotalResourcePoolChangedSessionEventArgs)
+        for event in game.events) == 2
+
+
 def test_chlorophyllia_plays_wild_shard_from_deck(db):
     """The nested PlayCard effect selects the gamedata target, then applies
     the same resource/threshold/charge events as a normal Wild Shard play."""
@@ -1301,6 +1530,10 @@ def main():
          test_cosmic_transmogrifier_preserves_type_and_cost),
         ("Crown of the Primals buffs its target troop",
          test_crown_of_the_primals_buffs_target_troop),
+        ("Strength of the Redwood uses typed stat values",
+         test_strength_of_redwood_uses_each_typed_stat_value),
+        ("Primordial Caves cost counters and threshold chain",
+         test_primordial_caves_adds_entering_cost_secretly_and_chains_threshold),
         ("S.P.A.M. Bot charge power targets one Robot/stat",
          test_spam_bot_charge_power_targets_one_robot_and_one_stat),
         ("Jadiim triggers for a one-cost permanent",
@@ -1323,6 +1556,8 @@ def main():
          test_discard_positions_append_and_snapshot_order),
         ("Resource grant columns from gamedata",
          test_resource_grant_columns_from_gamedata),
+        ("Hidden scene static resource grant at game start",
+         test_hidden_scene_static_resource_grant_runs_at_game_start),
         ("Chlorophyllia plays a Wild Shard",
          test_chlorophyllia_plays_wild_shard_from_deck),
         ("Chlorophyllia PvP state projection",

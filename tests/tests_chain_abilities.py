@@ -51,6 +51,7 @@ TPL_TOMB_LORD = "dc748c9a-9b04-4279-93d6-19b06cbde108"
 TPL_INFILTRATOR = "cad6307e-bafc-492f-84f6-3b914071d5d3"
 TPL_INCANT_FEAR = "f8103511-772f-40ea-8599-04d520508bac"
 AG_INCANT_FEAR = "1026a613-0814-a633-0869-3d35aaa8dd72"
+TPL_STRENGTH_REDWOOD = "27e20321-3e24-4802-8ffe-b4579616ff5c"
 
 
 def _pl_ai():
@@ -316,6 +317,59 @@ def test_countermagic_offered_in_ai_chain_window(db):
         assert any(t[:8] == TID_INTERRUPT[:8] and
                    any(int(x.uid.uid64) == 202 for x in ts)
                    for _, _, t, ts in targets), targets
+    finally:
+        dbmod._db, hcs._db = old_db, old_hcs
+
+
+def test_strength_of_redwood_targets_combat_troop(db):
+    """A combat troop remains a legal Redwood target in a priority window.
+
+    This is the state after Howling Brave has generated a resource while the
+    player is paused after blockers: the QuickAction must be offered and its
+    TargetInstance must include the attacking troop.  The battle state is
+    passed through so transient combat filters remain available to the same
+    target evaluator used by the live option builder.
+    """
+    import hconnect_server as hcs
+    import db as dbmod
+    _copy_card(db, TPL_STRENGTH_REDWOOD)
+    _copy_card(db, TPL_SPAWN)
+    # UID 101 is the attacking troop; it is deliberately not the Redwood card.
+    add_card(db, 101, 5, TPL_STRENGTH_REDWOOD, loc="hand")
+    add_card(db, 102, 5, TPL_SPAWN, loc="warzone",
+             state=game_engine.ECardStates.Attacking |
+                   game_engine.ECardStates.HasAttacked)
+    pl_t, ai_t = _pl_ai()
+    old_db, old_hcs = dbmod._db, hcs._db
+    dbmod._db, hcs._db = db, db
+    try:
+        h = object.__new__(hcs.HCPHandler)
+        h._db = db
+        h.user_profile = {"id": 5}
+        h._player_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(244, 5))
+        h._ai_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(3, 1000))
+        h._current_bstate = {
+            "turn_player": "player",
+            "turn_number": 1,
+            "player_attackers": {"102": "0"},
+            "ai_blockers": {"102": ["103"]},
+        }
+        # The card's Wild threshold is met and Howling Brave has left two
+        # resources available.  This exercises the same predicate used by
+        # _push_phase_options_empty after a troop ability resolves.
+        assert h._hand_card_playable(
+            SessionStub(), 101, "QuickAction", 1,
+            '{"list": [4]}',
+            ["90f5fcfe-aeff-13e1-0f8c-60d0f7b3b972"],
+            2, {32: 2}, True, 1, 0)
+        plan = h._card_play_plan(TPL_STRENGTH_REDWOOD, 101, 5)
+        targets = h._play_ability_targets(
+            SessionStub(), plan, battle_state=h._current_bstate)
+        assert targets, "Strength of the Redwood needs a troop target"
+        assert any(102 in [int(x.uid.uid64) for x in candidate_uids]
+                   for _, _, _, candidate_uids in targets), targets
     finally:
         dbmod._db, hcs._db = old_db, old_hcs
 
@@ -804,6 +858,7 @@ def _main():
              test_hand_incantation_trigger_does_not_fire,
              test_countermagic_requires_castspells_target,
              test_countermagic_offered_in_ai_chain_window,
+             test_strength_of_redwood_targets_combat_troop,
              test_chronic_madness_buries_escalates_and_returns_to_deck,
              test_bunjitsu_void_cost_is_a_cost_instance,
              test_bunjitsu_voided_stats_sum_both_troops,

@@ -312,3 +312,10 @@ class RecordStore:
     @property
     def issues(self) -> tuple[RecordIssue, ...]:
         return tuple(self._issues)
+
+
+# Production code should share one Records snapshot across all client and game
+# session threads.  ``RecordStore`` remains constructible so tests and tools can
+# point at an alternate Records directory, but runtime modules use this store
+# instead of creating one copy per handler/module.
+DEFAULT_RECORD_STORE = RecordStore()

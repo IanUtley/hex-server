@@ -3,7 +3,7 @@
 import random, json, threading, re, time
 
 import game_engine as _ge
-from gamedata import CardPlayCost, RecordStore, ability_graph
+from gamedata import CardPlayCost, DEFAULT_RECORD_STORE, ability_graph
 from db import (_db, log_req, db_game_session_pids, db_game_champion,
                 db_game_deck_cards, db_game_draw_cards, db_game_card_type,
                 db_game_shuffle_deck, db_champion_template_health,
@@ -18,7 +18,7 @@ from gamemodes.tournament_engine import (
 _ECardCollections = _ge.ECardCollections
 _ECardTypes = _ge.ECardTypes
 _PVP_INACTIVITY_TIMEOUT_SECONDS = 5 * 60
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def _pvp_resource_charge_points(session, card_uid):
@@ -472,6 +472,11 @@ def _pvp_sync_view_to_state(state, view, player_pid, opponent_pid):
             view.get("damaged_opponent_turn") or 0)
     if "bonus_turn_pid" in view:
         state["bonus_turn_pid"] = int(view.get("bonus_turn_pid") or 0)
+    if "champion_counters" in view:
+        # Champion SessionCardIds have no game_cards row; the shared ability
+        # resolver stores their typed counters in this battle-state map.
+        state["champion_counters"] = dict(
+            view.get("champion_counters") or {})
 
 
 def _pvp_log_stack(state, label):
@@ -814,6 +819,11 @@ def _pvp_run_phase_start(session, state, phase):
                             (session.session_id, cu64)).fetchone()
                         if c_row:
                             turn_h._card_full_data(warm, c_scid, c_row[0])
+                            cdef = warm.card_defs.get(c_scid)
+                            if cdef is not None:
+                                cdef.counters = dict(
+                                    (state.get("champion_counters") or {}).get(
+                                        str(cu64), {}) or {})
                             # Champion re-push carries the CURRENT health as
                             # defense — otherwise the client's champion
                             # representation resets to the template's base
@@ -1725,7 +1735,7 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
     explicit target template of its non-manual abilities has a legal candidate
     (mirrors PvE _hand_card_playable + _card_target_requirements_met — makes
     Countermagic unplayable with nothing on the chain)."""
-    from gamedata import AbilityInstance, PlayPlan, RecordStore
+    from gamedata import AbilityInstance, PlayPlan
     from gamedata import ability_graph
     from abilities.framework.targeting import legal_targets
     pids = db_game_session_pids(session.session_id)
@@ -2050,10 +2060,15 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     # buttons render.
     if db_is_champion_template(tpl_guid):
         hp = int(state.get(f"hp_{pid}", 20))
+        cdef = g.card_defs.get(champ_scid)
+        counters = dict((state.get("champion_counters") or {}).get(
+            str(int(champ_scid.uid.uid64)), {}) or {})
+        if cdef is not None:
+            cdef.counters = counters
         g.push_card_updated(
             champ_scid, _ge.UID.make(244, pid),
             _ge.ECardCollections.Champions, _ge.ECardTypes.Champion,
-            template_id=tpl_guid, defense=hp)
+            template_id=tpl_guid, defense=hp, counters=counters)
     log_req(f"    PvP champion options added for {pid}: "
             f"{[str(a.guid)[:8] for a in all_rids]} (charges {charges}, "
             f"affordable {len(afford)})")
@@ -5674,6 +5689,7 @@ def _pvp_fra_view(state, attacker_pid, defender_pid):
         "ai_spell_points": int(state.get(f"sp_{defender_pid}", 0)),
         "briar_legions_entered": int(
             state.get("briar_legions_entered", 0)),
+        "champion_counters": state.setdefault("champion_counters", {}),
         # Chain/stack aliased to the persisted state so trigger pushes land in
         # the DB-persisted dict (pvp_save_state persists session.turn_order).
         "stack": state.setdefault("stack", []),

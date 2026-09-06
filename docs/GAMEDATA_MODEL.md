@@ -9,9 +9,9 @@ The `gamedata` package preserves that shape while providing typed semantic
 views:
 
 ```python
-from gamedata import RecordStore, ability_graph
+from gamedata import DEFAULT_RECORD_STORE, ability_graph
 
-store = RecordStore()
+store = DEFAULT_RECORD_STORE
 graph = ability_graph(store, "5a8783b0-e420-4f41-b2a1-96f70b0cd851")
 print(graph.costs)
 print(graph.targets)
@@ -23,6 +23,12 @@ concrete C# types remain usable as `RecordObject` instances, with their full
 fields and version map retained. Known mechanics contracts currently include
 `AbilityTemplate`, target templates, effect templates, conditions, card
 templates, effect-to-target mappings, and ability costs.
+
+Production modules share the process-wide `DEFAULT_RECORD_STORE`, so concurrent
+game sessions reuse one lazily loaded Records snapshot. Its per-instance
+`RLock` serializes first loads and protects the cache/index. Constructing a
+separate `RecordStore` remains supported for tests or alternate Records
+directories.
 
 The semantic graph is deliberately separate from state mutation. `AbilityInstance`
 and `PlayPlan` now provide the client-style activation boundary on top of it:

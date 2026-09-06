@@ -14,6 +14,32 @@ event_logger = None
 from domain.constants import PLAY_CARD_ABILITY_TEMPLATE_ID
 
 
+_SECRET_COUNTER_CACHE = {}
+
+
+def _guid_text(value):
+    guid = getattr(value, "guid", value)
+    return str(guid or "").lower()
+
+
+def _is_secret_counter_guid(value):
+    """Read CardCounterTemplate.m_Secret from the extracted client data."""
+    guid = _guid_text(value)
+    if not guid:
+        return False
+    if guid in _SECRET_COUNTER_CACHE:
+        return _SECRET_COUNTER_CACHE[guid]
+    secret = False
+    try:
+        from gamedata import DEFAULT_RECORD_STORE
+        record = DEFAULT_RECORD_STORE.get("CardCounterTemplate", guid)
+        secret = bool(record and int(record.field("m_Secret", 0) or 0))
+    except (AttributeError, TypeError, ValueError):
+        secret = False
+    _SECRET_COUNTER_CACHE[guid] = secret
+    return secret
+
+
 # ======================================================================
 #  CardDef
 # ======================================================================
@@ -270,6 +296,17 @@ class Game:
         counters = kwargs.get('counters', None)
         if counters is None and cdef and cdef.counters:
             counters = cdef.counters
+        secret_counter_guids = {
+            _guid_text(guid) for guid in
+            (getattr(cdef, "_secret_counter_guids", set()) or set())
+        }
+        secret_counter_guids.update(
+            _guid_text(guid) for guid in (counters or {})
+            if _is_secret_counter_guid(guid))
+        if secret_counter_guids:
+            ev._secret_counter_guids = secret_counter_guids
+            ev._secret_counter_owner_uid = kwargs.get(
+                'secret_counter_owner_uid') or player_uid
         if counters:
             ev.counter_templates = [ResourceId.from_str(g)
                                     for g in counters.keys()]
@@ -294,13 +331,16 @@ class Game:
 
     def push_card_counters_changed(self, cid: SessionCardId,
                                    counter_template: ResourceId,
-                                   new_value: int, old_value: int):
+                                   new_value: int, old_value: int,
+                                   private_player_uid: UID = None):
         """Push the class-54 UI refresh event used by the client counter renderer."""
         ev = self._make_event(CardCountersChangedSessionEventArgs)
         ev.session_card_id = cid
         ev.card_counter_template_id = counter_template
         ev.new_value = int(new_value)
         ev.old_value = int(old_value)
+        if private_player_uid is not None:
+            ev._private_player_uid = private_player_uid
         self._push(ev)
 
     def push_resource_card_played(self, cid: SessionCardId, player_uid: UID, free: bool = False):
@@ -823,12 +863,45 @@ class Game:
         pkt = NetworkPacketSessionEventArgs()
         pkt.session_id = self.session_id
         pkt.player_id = player_uid
-        for ev in self.events:
-            pkt.add_event(ev)
+        import copy
+        visible_events = []
+        player_value = getattr(player_uid, "uid64", player_uid)
+        for event in self.events:
+            private_to = getattr(event, "_private_player_uid", None)
+            if private_to is not None:
+                private_value = getattr(private_to, "uid64", private_to)
+                if int(player_value or 0) != int(private_value or 0):
+                    continue
+            secret_guids = getattr(event, "_secret_counter_guids", None)
+            secret_owner = getattr(event, "_secret_counter_owner_uid", None)
+            if (secret_guids and secret_owner is not None and
+                    int(player_value or 0) != int(
+                        getattr(secret_owner, "uid64", secret_owner) or 0)):
+                # CardUpdated is still needed by the opposing client for the
+                # card itself; strip only the secret counter entries. The
+                # separate class-54 value-change event is filtered entirely
+                # above, matching the client's private counter dispatch.
+                if isinstance(event, CardUpdatedSessionEventArgs):
+                    filtered = copy.copy(event)
+                    filtered.ser = Serializer()
+                    pairs = [
+                        (template, count)
+                        for template, count in zip(
+                            event.counter_templates or [],
+                            event.counter_counts or [])
+                        if _guid_text(template) not in secret_guids
+                    ]
+                    filtered.counter_templates = [p[0] for p in pairs]
+                    filtered.counter_counts = [p[1] for p in pairs]
+                    visible_events.append(filtered)
+                    continue
+            visible_events.append(event)
+        for event in visible_events:
+            pkt.add_event(event)
         if event_logger is not None:
             try:
                 event_logger(self.session_id, player_uid,
-                             [ev.to_byte_array() for ev in self.events])
+                             [ev.to_byte_array() for ev in visible_events])
             except Exception:
                 pass
         self.events = []

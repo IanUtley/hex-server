@@ -19,7 +19,8 @@ from .models import (
     RecordObject,
     TargetSpec,
 )
-from .records import RecordIssue, RecordStore, deserialize, deserialize_line
+from .records import (DEFAULT_RECORD_STORE, RecordIssue, RecordStore,
+                      deserialize, deserialize_line)
 from .semantics import (AbilityGraph, EffectSpec, ability_graph,
                          card_ability_graphs, runtime_effects)
 from .play_plan import (AbilityInstance, ActivationData, CardPlayCost,
@@ -44,6 +45,7 @@ __all__ = [
     "RecordIssue",
     "RecordObject",
     "RecordStore",
+    "DEFAULT_RECORD_STORE",
     "PlayPlan",
     "PromptSpec",
     "TargetSpec",

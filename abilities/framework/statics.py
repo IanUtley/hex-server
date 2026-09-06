@@ -14,6 +14,8 @@ Value rule (mirrors the client's ability variables):
 """
 
 import json
+import ast
+import math
 import re
 
 import game_engine
@@ -133,8 +135,66 @@ def _card_property_value(db, session_id, card_uid, prop):
     return value
 
 
+def _evaluate_numeric_expression(expression_text, resolve_name):
+    """Evaluate the numeric expression grammar used by the client data.
+
+    The original client uses NCalc for these values.  We intentionally expose
+    only numeric literals, named variables, unary +/- and arithmetic operators
+    here; expressions are data, not executable Python.  The extracted Records
+    currently use +, -, *, and /.
+
+    NCalc returns a numeric value and ``ExpressionAbilityVariable`` converts
+    it to an integer, so division is evaluated as a float and truncated toward
+    zero at the end, matching the client's cast behavior.
+    """
+    try:
+        tree = ast.parse(str(expression_text or ""), mode="eval")
+    except (SyntaxError, ValueError, TypeError):
+        return None
+
+    def visit(node):
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(
+                node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.Name):
+            value = resolve_name(node.id)
+            if value is None:
+                raise ValueError("unknown expression variable")
+            return value
+        if isinstance(node, ast.UnaryOp) and isinstance(
+                node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and isinstance(
+                node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if right == 0:
+                raise ValueError("division by zero")
+            return left / right
+        raise ValueError("unsupported expression syntax")
+
+    try:
+        value = visit(tree)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        if not math.isfinite(float(value)):
+            return None
+        return int(value)
+    except (ArithmeticError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
-                    stat_prop=None):
+                    stat_prop=None, _expression_stack=None):
     """Compute one named ability variable from raw_json m_Variables."""
     if not raw or not var_name:
         return None
@@ -179,7 +239,8 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
         if t == "SumVariableInListAttrCardsAbilityVariable":
             return _sum_list_attr_variable(db, session_id, bstate, owner,
                                             var, source_uid)
-        if t == "TriggerTargetPropertyVariable":
+        if t in ("TriggerTargetPropertyVariable",
+                 "TriggerSourcePropertyVariable"):
             target_uid = ((bstate or {}).get("resolving_trigger_target_uid")
                           or (bstate or {}).get("resolving_target_uid"))
             if target_uid is None:
@@ -233,33 +294,26 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
             except Exception:
                 return 0
         if t == "ExpressionAbilityVariable":
-            flat = str(var.get("m_ExpressionText") or "").replace(" ", "")
-            # Extracted expressions commonly add a fixed constant to a
-            # computed variable (for example, voided troop stats + 3), while
-            # a few older records use multiplication (ESC * 4).  Both are
-            # AbilityVariable expressions, not localized card-text values.
-            m = re.fullmatch(
-                r'([A-Za-z_]\w*)(?:\*(-?\d+)|([+-])(\d+))?', flat)
-            if m:
-                base = _variable_value(db, session_id, bstate, raw, m.group(1),
-                                       owner, source_uid, stat_prop)
-                if base is None:
-                    base = _constant_value(raw, m.group(1))
-                if base is None and m.group(1) == "ESC":
+            stack = set(_expression_stack or ())
+            if var_name in stack:
+                return None
+            stack.add(var_name)
+
+            def resolve_name(name):
+                value = _variable_value(
+                    db, session_id, bstate, raw, name, owner, source_uid,
+                    stat_prop, _expression_stack=stack)
+                if value is None:
+                    value = _constant_value(raw, name)
+                if value is None and name == "ESC":
                     # The client's ESC variable is SourceCard.EscalationCount,
-                    # which starts at 1 and increments with each Escalate —
-                    # so the first cast of "ESC * 4" buries 4, not 0.
+                    # which starts at 1 and increments with each Escalate.
                     side = ("ai" if owner == 0 else "player")
-                    base = int(bstate.get(f"{side}_escalation_uses", 0)) + 1
-                if base is None:
-                    return None
-                if m.group(2) is not None:
-                    return base * int(m.group(2))
-                if m.group(3) is not None:
-                    delta = int(m.group(4))
-                    return base + delta if m.group(3) == "+" else base - delta
-                return base
-            return None
+                    value = int(bstate.get(f"{side}_escalation_uses", 0)) + 1
+                return value
+
+            return _evaluate_numeric_expression(
+                var.get("m_ExpressionText"), resolve_name)
     return None
 
 
@@ -498,6 +552,7 @@ def _leaf_numeric_value(db, session_id, bstate, param, raw, owner, source_uid,
                 "CardCountAbilityVariable", "CountListAttrAbilityVariable",
                 "CounterVariable",
                 "TriggerTargetPropertyVariable",
+                "TriggerSourcePropertyVariable",
                 "SourcePlayerHealthVariable",
                 "SourcePlayerThresholdAbilityVariable",
                 "SourcePlayerBriarLegionVariable",
@@ -507,12 +562,25 @@ def _leaf_numeric_value(db, session_id, bstate, param, raw, owner, source_uid,
                 seen.add(n)
                 count_names.append(n)
     if amount == 0:
+        # Typed NumericModifier fields carry the authoritative variable name
+        # in the effect metadata. Several abilities have more than one
+        # AbilityConstant (Strength of the Redwood is P1=1 and P3=3); falling
+        # through to the first constant makes every typed stat modifier use
+        # the first value, turning +1/+3 into +1/+1.
+        input_variable = str(param.get("input_variable") or "")
+        if input_variable:
+            value = _variable_value(
+                db, session_id, bstate, raw, input_variable, owner,
+                source_uid, stat_prop=prop)
+            if value is not None:
+                return value
         # Dynamic: expression / sum / health / count variable directly.
         for var in variables:
             t = str(var.get("_t", "")).split(".")[-1]
             name = var.get("m_Name")
             if t in ("ExpressionAbilityVariable", "CardSumAbilityVariable",
                      "CounterVariable", "TriggerTargetPropertyVariable",
+                     "TriggerSourcePropertyVariable",
                      "SourcePlayerHealthVariable",
                      "SourcePlayerThresholdAbilityVariable",
                      "SourcePlayerBriarLegionVariable",

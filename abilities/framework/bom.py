@@ -21,14 +21,14 @@ from .effects.counters import card_counters
 from .effects import combat as _combat  # register combat effects
 from .effects import choices as _choices  # register card-choice effects
 from .effects import utility as _utility  # register generic client effects
-from gamedata import RecordStore, ability_graph, runtime_effects
+from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
 
 from .fields import (ability_record, effect_field, effect_template,
                      effect_template_value, modifier_metadata,
                      counter_template_name)
 
 
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def _walk_bom(db, ability_guid):
@@ -461,6 +461,8 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
     from .stat_mod import apply_card_stat_mod
     from .effects.counters import (
         add_card_counter, remove_card_counters, counter_name_from_text,
+        is_champion_target,
+        change_champion_counter, push_champion_counter,
     )
     from ._shared import (
         apply_attribute_grant,
@@ -480,6 +482,8 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
             pm.setdefault("property", typed_modifier["property"])
         if typed_modifier.get("input_value") and not pm.get("amount"):
             pm["amount"] = typed_modifier["input_value"]
+        if typed_modifier.get("input_variable"):
+            pm["input_variable"] = typed_modifier["input_variable"]
         if typed_modifier.get("attributeflags"):
             pm["attribute_flags"] = typed_modifier["attributeflags"]
         if typed_modifier.get("attribute"):
@@ -902,7 +906,50 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                 # activation state, while the extracted leaf amount is zero.
                 # Resolve that variable instead of falling through to the
                 # remove-counters path.
-                amount = int(_numeric("counter") or 0)
+                # The typed CounterModifier names its input variable.  Resolve
+                # that exact variable first; choosing the first AbilityConstant
+                # would incorrectly turn Squashing Pumpkins' +1 counter into
+                # the preceding +6 health constant.
+                input_variable = str(pm.get("input_variable") or "")
+                if input_variable:
+                    from .statics import ability_variable_value
+                    resolved = ability_variable_value(
+                        db, session.session_id, bstate,
+                        (bstate or {}).get("resolving_ability", ""),
+                        input_variable, src_owner,
+                        int(src_uid) if src_uid is not None else 0)
+                    if resolved is not None:
+                        amount = int(resolved)
+                if amount <= 0:
+                    amount = int(_numeric("counter") or 0)
+            if target_uid and is_champion_target(handler, bstate, target_uid):
+                # Live champions have SessionCardIds but no game_cards row, so
+                # their counters live in the persisted battle-state JSON.
+                # Keep the same typed GUID identity and event projection as
+                # ordinary card counters.
+                if is_set_counter:
+                    old_n, new_n = change_champion_counter(
+                        bstate, target_uid, counter_guid, amount, "set")
+                elif is_remove_counter:
+                    old_n, new_n = change_champion_counter(
+                        bstate, target_uid, counter_guid, amount, "remove")
+                elif is_add_counter:
+                    old_n, new_n = change_champion_counter(
+                        bstate, target_uid, counter_guid, amount, "add")
+                elif remove_all:
+                    old_n, new_n = change_champion_counter(
+                        bstate, target_uid, counter_guid, 0, "set")
+                else:
+                    old_n, new_n = change_champion_counter(
+                        bstate, target_uid, counter_guid, 0, "set")
+                if counter_guid:
+                    push_champion_counter(
+                        game, session, handler, pl_t, ai_t, bstate,
+                        target_uid, counter_guid, old_n, new_n)
+                op_text = (" set " if is_set_counter else
+                           ("-" if is_remove_counter else "+"))
+                return (f"counter {cname}{op_text}{amount} -> {new_n} "
+                        f"target={hex(int(target_uid))}")
             if amount > 0 and target_uid and is_remove_counter:
                 old_n = card_counters(db, session.session_id, target_uid).get(cname, 0)
                 remaining = max(0, old_n - amount)
@@ -3250,12 +3297,12 @@ def bom_leaf_prompt_data(db, ability_guid, leaf_type):
     used by follow-up client prompts (such as choose-and-discard) so protocol
     code does not need to know the GUID of a shared child ability.
     """
-    from gamedata import RecordStore, ability_graph
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from gamedata.records import reference_guid
 
     store = getattr(bom_leaf_prompt_data, "_record_store", None)
     if store is None:
-        store = RecordStore()
+        store = DEFAULT_RECORD_STORE
         bom_leaf_prompt_data._record_store = store
     seen = set()
 

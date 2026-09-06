@@ -387,6 +387,13 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     # others, such as Moqui's power, leave that GUID empty and provide a
     # typed m_CardFilter instead. Resolve the latter from card-template
     # metadata so the selected card remains random and data-driven.
+    # A filter-driven summon deliberately serializes an all-zero
+    # m_CardTemplateId. Treat that sentinel as unset so the typed CardFilter
+    # can choose the random template. Keeping the zero GUID truthy here made
+    # Primordial Caves skip its Dinosaur filter and produce no token.
+    if str(token_guid or "").lower() == \
+            "00000000-0000-0000-0000-000000000000":
+        token_guid = None
     if not token_guid:
         typed_filter = ((effect_template(effect_guid) or {}).get("m_CardFilter")
                         or param_filter)

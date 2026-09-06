@@ -33,11 +33,11 @@ from .fields import (ability_variables, effect_template,
 from .targeting import (legal_targets, evaluate_card_filter,
                          validate_target_selection)
 from ._shared import pvp_champion_uid, pvp_opponent_pid
-from gamedata import RecordStore, ability_graph, runtime_effects
+from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
 from gamedata.play_plan import AbilityInstance, ActivationData
 
 
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def _parse_param(param):
@@ -160,6 +160,49 @@ def _champion_uids(handler, bstate):
     pu = int(p.uid.uid64) if p is not None else None
     au = int(a.uid.uid64) if a is not None else None
     return pu, au
+
+
+def _champion_targets(handler, bstate):
+    """Return live champion cards for condition evaluation.
+
+    Most PvE handlers expose ``_champion_targets`` directly.  PvP resolves
+    against a FRA-shaped view instead, so construct the same tuples from its
+    persisted ``champ_map`` and health mapping when needed.
+    """
+    provider = getattr(handler, "_champion_targets", None)
+    if callable(provider) and not (bstate or {}).get("pvp"):
+        try:
+            return provider() or []
+        except Exception:
+            pass
+    if (bstate or {}).get("pvp"):
+        result = []
+        health_map = (bstate or {}).get("pvp_health_map") or {}
+        for pid, cuid in ((bstate or {}).get("champ_map") or {}).items():
+            try:
+                pid_i, cuid_i = int(pid), int(cuid)
+            except (TypeError, ValueError):
+                continue
+            key = health_map.get(pid_i)
+            if key is None:
+                key = health_map.get(str(pid_i))
+            if key:
+                hp = int(bstate.get(key, 20) or 0)
+            else:
+                hp = int(bstate.get(f"hp_{pid_i}", 20) or 0)
+            result.append((cuid_i, pid_i, "Champion", hp))
+        return result
+    pu, au = _champion_uids(handler, bstate)
+    result = []
+    if pu is not None:
+        profile = getattr(handler, "user_profile", None)
+        owner = profile.get("id", 0) if isinstance(profile, dict) else 0
+        result.append((pu, owner, "Player", int(
+            bstate.get("player_health", 20) or 0)))
+    if au is not None:
+        result.append((au, 0, "AI", int(
+            bstate.get("ai_health", 20) or 0)))
+    return result
 
 
 def _revealed_target_uids(db, session, bstate, owner_id, source_uid,
@@ -322,7 +365,8 @@ def _fallback_target_uid(bstate):
 def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     ability_guid, source_uid, owner_id, target_map=None,
                     variables=None, depth=0, root_ability_guid=None,
-                    resume_from_order=None, activation_data=None):
+                    resume_from_order=None, activation_data=None,
+                    effect_groups=None):
     """Resolve an ability's BOM data-driven, mirroring the client's
     authoritative AbilityInstance: effects run group-by-group in order, each
     gated by its gamedata condition and contingencies, with ability variables
@@ -376,6 +420,9 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             ability_guid, effect_rows, len(tids), source_uid=source_uid,
             owner_id=owner_id, activation=activation)
     target_map = dict(activation.target_map)
+    allowed_effect_groups = None
+    if effect_groups is not None:
+        allowed_effect_groups = {int(group) for group in effect_groups}
     logs = []
     # m_WasApplied per effect instance (contingencies test it), plus a
     # (ability_guid, effect_order) dedupe so duplicate rows (double-seeded
@@ -432,7 +479,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         ctx = ConditionContext(db, session, bstate,
                                ability_source_uid=source_uid,
                                ability_source_owner_id=owner_id,
-                               pl_t=pl_t, ai_t=ai_t)
+                               pl_t=pl_t, ai_t=ai_t,
+                               champions=_champion_targets(handler, bstate))
         ctx.ability_variables = variables
         ctx.applied_effects = applied
         return evaluate_effect_condition(db, cid, ctx)
@@ -778,6 +826,9 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
 
     for gid in order:
         for eff in groups[gid]:
+            if (allowed_effect_groups is not None and
+                    int(eff["effect_group_id"]) not in allowed_effect_groups):
+                continue
             key = (ability_guid, eff["effect_order"])
             if key in seen_orders:
                 continue

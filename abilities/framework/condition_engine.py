@@ -129,10 +129,11 @@ class ConditionContext:
         key = int(card_uid)
         if key in self._champ_by_uid:
             owner, name, hp = self._champ_by_uid[key]
+            counters = self._champion_counter_counts(key)
             return {
                 "card_uid": key,
                 "card_type": "Champion",
-                "location": "champion",
+                "location": "champions",
                 "user_id": owner,
                 "state": 0,
                 "attack": 0,
@@ -143,6 +144,8 @@ class ConditionContext:
                 "subtype": "",
                 "shards": [],
                 "attributes": 0,
+                "counters": counters,
+                "counter_guids": {guid: guid for guid in counters},
                 "damaged_opponent_this_turn": list(
                     (self.bstate or {}).get("damaged_opponent_this_turn") or []),
                 "src_owner_side": self._src_side,
@@ -175,6 +178,7 @@ class ConditionContext:
                        + int(permanent.get("atk", 0) or 0))
                 defense = (base_def + int(row[15] or 0)
                            + int(permanent.get("def", 0) or 0))
+                counters, counter_guids = self._game_card_counter_counts(key)
                 self._cards[key] = {
                     # Keep the event card visible even if its runtime template
                     # row is absent. Conditions such as IsSubType(Spider)
@@ -188,6 +192,8 @@ class ConditionContext:
                     "subtype": row[10] or "",
                     "shards": shards_from_threshold(row[11]),
                     "attributes": int(row[12] or 0) | int(row[13] or 0),
+                    "counters": counters,
+                    "counter_guids": counter_guids,
                     "damaged_opponent_this_turn": list(
                         (self.bstate or {}).get("damaged_opponent_this_turn") or []),
                     "src_owner_side": self._src_side,
@@ -195,6 +201,38 @@ class ConditionContext:
             else:
                 self._cards[key] = None
         return self._cards[key]
+
+    def _champion_counter_counts(self, card_uid):
+        """Read a champion's typed counters from persisted battle state."""
+        values = ((self.bstate or {}).get("champion_counters") or {}).get(
+            str(int(card_uid)), {})
+        if not isinstance(values, dict):
+            return {}
+        out = {}
+        for guid, count in values.items():
+            try:
+                if int(count or 0) > 0:
+                    out[str(guid).lower()] = int(count)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _game_card_counter_counts(self, card_uid):
+        """Return a game card's persisted counter names and GUIDs."""
+        try:
+            row = self.db.execute(
+                "SELECT permanent_buffs FROM game_cards WHERE session_id=? "
+                "AND card_uid=?", (self.session.session_id, int(card_uid))
+            ).fetchone()
+            data = json.loads((row[0] if row else "{}") or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        counters = data.get("counters")
+        guids = data.get("counter_guids")
+        return (counters if isinstance(counters, dict) else {},
+                guids if isinstance(guids, dict) else {})
 
     def _zones(self, flags):
         return {ZONE_MAP.get(z, z.lower())
@@ -214,6 +252,7 @@ class ConditionContext:
             params.append(user_id)
         out = []
         for r in self.db.execute(sql, params):
+            counters, counter_guids = self._game_card_counter_counts(r[0])
             out.append({"card_uid": int(r[0]), "card_type": r[1],
                         "location": r[2], "user_id": r[3],
                         "state": int(r[4] or 0), "attack": r[5],
@@ -222,15 +261,52 @@ class ConditionContext:
                         "subtype": r[9] or "",
                         "shards": shards_from_threshold(r[10]),
                         "attributes": int(r[11] or 0) | int(r[12] or 0),
+                        "counters": counters,
+                        "counter_guids": counter_guids,
                         "damaged_opponent_this_turn": list(
                             (self.bstate or {}).get("damaged_opponent_this_turn") or []),
                         "src_owner_side": self._src_side})
+        # Champions are session cards, not game_cards rows.  Include them for
+        # Conditions.RequiresCardsControlled(Champions), including typed
+        # HasCountersValue filters such as Squashing Pumpkins' win condition.
+        if "champions" in zones:
+            for c_uid, c_owner, c_name, c_hp in self.champions:
+                if user_id is not None and int(c_owner or 0) != int(user_id):
+                    continue
+                counters = self._champion_counter_counts(c_uid)
+                out.append({
+                    "card_uid": int(c_uid), "card_type": "Champion",
+                    "location": "champions", "user_id": c_owner,
+                    "state": 0, "attack": 0, "defense": int(c_hp or 0),
+                    "name": c_name or "Champion", "cost": 0,
+                    "subtype": "", "shards": [], "attributes": 0,
+                    "counters": counters,
+                    "counter_guids": {guid: guid for guid in counters},
+                    "damaged_opponent_this_turn": list(
+                        (self.bstate or {}).get(
+                            "damaged_opponent_this_turn") or []),
+                    "src_owner_side": self._src_side,
+                    "src_owner_id": self.ability_source_owner_id,
+                })
         return out
 
     def _counter_count(self, card, counter_guid):
         """Count a card's counters by its gamedata counter template GUID."""
         if not card:
             return 0
+        wanted = str(counter_guid or "").lower()
+        counters = card.get("counters") or {}
+        guids = card.get("counter_guids") or {}
+        if counters:
+            total = 0
+            for name, count in counters.items():
+                if str(name).lower() == wanted or \
+                        str(guids.get(name, "")).lower() == wanted:
+                    try:
+                        total += int(count or 0)
+                    except (TypeError, ValueError):
+                        pass
+            return total
         try:
             row = self.db.execute(
                 "SELECT name FROM card_counter_templates WHERE template_id=?",
@@ -473,11 +549,20 @@ def evaluate_condition(node, ctx):
         count = 0
         for card in ctx._cards_in_zones(zones):
             side = _side_of(card["user_id"])
-            if pfilter in ("Self", "You", "Controller") and side != src_side:
-                continue
-            if pfilter in ("Opposing", "Opponents", "MultipleOpponents") \
-                    and side == src_side:
-                continue
+            if pfilter in ("Self", "You", "Controller"):
+                if ctx.bstate.get("pvp"):
+                    if int(card.get("user_id", 0) or 0) != int(
+                            ctx.ability_source_owner_id or 0):
+                        continue
+                elif side != src_side:
+                    continue
+            if pfilter in ("Opposing", "Opponents", "MultipleOpponents"):
+                if ctx.bstate.get("pvp"):
+                    if int(card.get("user_id", 0) or 0) == int(
+                            ctx.ability_source_owner_id or 0):
+                        continue
+                elif side == src_side:
+                    continue
             if evaluate_card_filter(card, fjson, ctx.ability_source_uid):
                 count += 1
         return _compare(count, op, req)

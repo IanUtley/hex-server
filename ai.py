@@ -1937,6 +1937,8 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             for pm in attribute_grants)
         draws = [pm for t, pm in params
                  if t == "DrawNCardsAbilityEffectTemplate"]
+        moves = [pm for t, pm in params
+                 if t == "MoveCardToZoneEffectTemplate"]
         target_uid = None
         worth = False
         ai_health = int(battle_state.get("ai_health", 20))
@@ -1963,6 +1965,61 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                 "SELECT 1 FROM game_cards WHERE session_id=? AND user_id=0 "
                 "AND location='hand'", (session.session_id,)).fetchall()) <= 4:
             worth = True
+        if moves:
+            # A metadata-defined deck move is an actionable champion power in
+            # its own right.  Savage Lord's power is the canonical example:
+            # its BOM contains only MoveCardToZone and its target template is
+            # TopNOfDeck filtered to a Dinosaur troop.  The older classifier
+            # only recognized summon/buff/heal/damage/draw effects, so this
+            # kind of power was silently skipped by the AI even when a legal
+            # card was available.
+            target_row = _db.execute(
+                "SELECT target_template_ids FROM champion_abilities "
+                "WHERE ability_guid=? LIMIT 1", (ag,)).fetchone()
+            target_template_ids = []
+            if target_row and target_row[0]:
+                try:
+                    target_template_ids = [str(t).lower() for t in
+                                           (_j.loads(target_row[0]) or []) if t]
+                except (TypeError, ValueError):
+                    target_template_ids = []
+            if target_template_ids:
+                from abilities.framework.targeting import legal_targets
+                for target_template_id in target_template_ids:
+                    filter_row = _db.execute(
+                        "SELECT filter_json FROM target_templates "
+                        "WHERE template_id=?", (target_template_id,)
+                    ).fetchone()
+                    try:
+                        filter_json = _j.loads(filter_row[0] or "{}") \
+                            if filter_row else {}
+                    except (TypeError, ValueError):
+                        filter_json = {}
+
+                    def _has_filter(node, type_name):
+                        if isinstance(node, dict):
+                            if str(node.get("_t", "")).rsplit(".", 1)[-1] == type_name:
+                                return True
+                            return any(_has_filter(value, type_name)
+                                       for value in node.values())
+                        if isinstance(node, list):
+                            return any(_has_filter(value, type_name)
+                                       for value in node)
+                        return False
+
+                    if not _has_filter(filter_json, "TopNOfDeck"):
+                        continue
+                    candidates = legal_targets(
+                        _db, session.session_id, 0, target_template_id,
+                        ai_champ_scid.uid.uid64, both_players=False,
+                        champions=[], battle_state=battle_state)
+                    if candidates:
+                        worth = True
+                        # Supplying the selected card is harmless for an
+                        # auto-target and also supports older target metadata
+                        # that omitted the auto-target flag.
+                        target_uid = int(candidates[0])
+                        break
         if damages:
             # Direct-damage power: burn for lethal or kill a threat.
             for pm in damages:

@@ -19,7 +19,7 @@ import json
 import random
 
 import game_engine
-from gamedata import RecordStore, ability_graph
+from gamedata import DEFAULT_RECORD_STORE, ability_graph
 
 from ._shared import (
     _log,
@@ -33,7 +33,7 @@ from .effects.counters import (
 from .stat_mod import apply_card_stat_mod
 
 
-_RECORD_STORE = RecordStore()
+_RECORD_STORE = DEFAULT_RECORD_STORE
 
 
 def _card_uses_variable(db, session_id, card_uid, variable_type):
@@ -169,6 +169,90 @@ def ability_matches_keyword(db, ability_guid, keyword):
         return False
     if key == "momentum":
         return "CardInspiredEvent" in graph.trigger_event_type
+    return False
+
+
+def _ability_is_secret(graph):
+    """Read the client's ability-level Secret TAC flag.
+
+    ``secretly`` is parsed by the client into ``AbilityTemplate.tac`` rather
+    than into the localized game text or a CardModifier field. The extracted
+    Records retain that serialized TAC, so use the same flag here instead of
+    recognizing a card name or a phrase in card text.
+    """
+    try:
+        from .tac import _tac_attr_hash, decode_tac
+        serialized = graph.source.field("m_SerializedTAC")
+        data = (serialized.field("data", "")
+                if hasattr(serialized, "field") else
+                serialized.get("data", "")
+                if isinstance(serialized, dict) else "")
+        return bool(data and _tac_attr_hash("Secret") in decode_tac(data))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _secret_counter_effect_groups(graph):
+    """Return (private counter groups, public follow-up groups) if authored.
+
+    The Records graph expresses a secretly-added counter as an Add
+    CounterModifier group followed by the conditional visible follow-up
+    groups. Preserve that structure generically rather than recognizing a
+    particular card or localized text.
+    """
+    if not _ability_is_secret(graph):
+        return None
+    from .fields import modifier_metadata
+    private = set()
+    all_groups = set()
+    for effect in graph.effects:
+        group = int(effect.effect_group_id)
+        all_groups.add(group)
+        meta = modifier_metadata(effect.guid)
+        if (effect.concrete_type == "CardModifierAbilityEffectTemplate" and
+                meta.get("property") == "counter" and
+                str(meta.get("operation") or "").lower() == "add" and
+                not meta.get("removeallcounters")):
+            private.add(group)
+    public = all_groups - private
+    if not private or not public:
+        return None
+    return private, public
+
+
+def _public_effect_groups_ready(db, handler, session, pl_t, ai_t, bstate,
+                                graph, source_uid, source_owner_uid,
+                                public_groups, trigger_target_uid):
+    """Whether the first public group has an effect that can resolve now."""
+    from .condition_engine import ConditionContext, evaluate_effect_condition
+    champions = []
+    champ_fn = getattr(handler, "_champion_targets", None)
+    if callable(champ_fn):
+        try:
+            champions = champ_fn() or []
+        except Exception:
+            champions = []
+    first_group = min(int(group) for group in public_groups)
+    for effect in graph.effects:
+        if int(effect.effect_group_id) != first_group:
+            continue
+        # A contingent effect is not independently eligible; it follows the
+        # earlier public effect in its group/order.
+        if int(effect.contingent_effect_instance_id) >= 0:
+            continue
+        condition_id = str(effect.condition_guid or "")
+        if condition_id.lower() == "00000000-0000-0000-0000-000000000000":
+            condition_id = ""
+        if not condition_id:
+            return True
+        ctx = ConditionContext(
+            db, session, bstate, event_type=graph.trigger_event_type,
+            ability_source_uid=source_uid,
+            ability_source_owner_id=source_owner_uid,
+            trigger_uid=trigger_target_uid,
+            pl_t=pl_t, ai_t=ai_t, champions=champions)
+        if evaluate_effect_condition(db, condition_id, ctx):
+            return True
     return False
 
 
@@ -382,7 +466,8 @@ def _apply_health_gain(game, bstate, pl_t, ai_t, amount, source_owner_uid,
 
 def _resolve_ability_bom(db, handler, game, session, pl_t, ai_t, bstate,
                          ability_guid, source_uid, game_text, target_uid=None,
-                         source_owner_uid=None):
+                         source_owner_uid=None, trigger_target_uid=None,
+                         effect_groups=None):
     """Resolve one current-Records ability through the shared interpreter.
 
     Trigger dispatch and card-play resolution use the same client-style
@@ -417,7 +502,8 @@ def _resolve_ability_bom(db, handler, game, session, pl_t, ai_t, bstate,
                     "grant_target")
     }
     bstate["resolving_target_uid"] = target_uid
-    bstate["resolving_trigger_target_uid"] = target_uid
+    bstate["resolving_trigger_target_uid"] = (
+        target_uid if trigger_target_uid is None else trigger_target_uid)
     bstate["resolving_ability"] = ability_guid
     bstate["resolving_owner_id"] = source_owner_uid or 0
     bstate["resolving_source_uid"] = source_uid
@@ -431,7 +517,8 @@ def _resolve_ability_bom(db, handler, game, session, pl_t, ai_t, bstate,
             handler, game, session, db, pl_t, ai_t, bstate,
             ability_guid, source_uid, source_owner_uid or 0,
             target_map=target_map,
-            activation_data=ActivationData.from_values(target_map=target_map))
+            activation_data=ActivationData.from_values(target_map=target_map),
+            effect_groups=effect_groups)
     finally:
         for key, value in previous.items():
             if value is None:
@@ -750,10 +837,33 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             # GameStartedEvent so the granted ability is present in time.
             static_grant = False
             if event_type == "GameStartedEvent" and not trigger_type:
+                # Hidden encounter-scene cards are authored as battleboard
+                # setup effects.  Most of them grant a triggered ability
+                # (handled above), but some carry the start-of-game effect
+                # directly.  The client resolves those non-manual abilities
+                # when the battle starts; treating only GrantAbility as a
+                # setup effect omitted Resource Rich/Early Sprouts, whose
+                # direct BOM grants each champion a current and permanent
+                # resource.  Restrict the broader rule to the hidden ``mod``
+                # zone so ordinary non-triggered abilities in a hand/warzone
+                # are never activated automatically.
+                source_in_mod_zone = False
+                if cu is not None:
+                    try:
+                        source_row = db.execute(
+                            "SELECT location FROM game_cards "
+                            "WHERE session_id=? AND card_uid=?",
+                            (session.session_id, int(cu))).fetchone()
+                        source_in_mod_zone = bool(
+                            source_row and str(source_row[0]).lower() == "mod")
+                    except Exception:
+                        source_in_mod_zone = False
                 static_grant = any(
                     effect.concrete_type == "GrantAbilityEffectTemplate" and
                     str(effect.duration).lower() == "permanent"
                     for effect in graph.effects)
+                if source_in_mod_zone and not graph.manual:
+                    static_grant = True
             if event_type in trigger_type or static_grant:
                 gtext = graph.game_text or ""
                 raw = graph.source.to_dict()
@@ -845,6 +955,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 event_target = extra_target
                 if event_target is None and event_type == "CardCastEvent":
                     event_target = source_uid
+                resolution_target = (extra_target if extra_target is not None
+                                     else event_target)
                 # A triggered ability with EXPLICIT target templates (e.g.
                 # Solitary Exile's Deploy "Void another target card") must ask
                 # the controller to choose before it can resolve.
@@ -891,7 +1003,50 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     "ON ct.guid=gc.template_guid WHERE gc.session_id=? "
                     "AND gc.card_uid=? AND LOWER(COALESCE(ct.subtype,''))='battleboard' "
                     "LIMIT 1", (session.session_id, int(cu))).fetchone())
-                if ignores:
+                secret_groups = _secret_counter_effect_groups(graph)
+                if secret_groups:
+                    # The counter accumulation is a secret, immediate part of
+                    # this trigger. Resolve it first so the threshold test
+                    # sees the newly-added cost value, but only put the later
+                    # authored groups on the public chain when their first
+                    # condition is actually met.
+                    private_groups, public_groups = secret_groups
+                    res = _resolve_ability_bom(
+                        db, handler, game, session, pl_t, ai_t, bstate,
+                        ag, cu, gtext, target_uid=resolution_target,
+                        source_owner_uid=ability_owner_id,
+                        trigger_target_uid=source_uid,
+                        effect_groups=private_groups)
+                    logs.append(f"{event_type} {ag[:8]} -> secret {res}")
+                    if not _public_effect_groups_ready(
+                            db, handler, session, pl_t, ai_t, bstate, graph,
+                            cu, ability_owner_id, public_groups, source_uid):
+                        continue
+                    import battle_engine as _be
+                    inst_id = int(bstate.get("_next_instance_id", 1))
+                    bstate["_next_instance_id"] = inst_id + 1
+                    _be.stack_push(bstate, {
+                        "kind": "trigger", "ability_guid": ag,
+                        "source_uid": cu, "target_uid": resolution_target,
+                        "trigger_target_uid": source_uid,
+                        "effect_groups": sorted(public_groups),
+                        "source_owner_uid": ability_owner_id,
+                        "instance_id": inst_id,
+                        "activated_ability_guid": (
+                            bstate.get("activated_ability_guid")
+                            if event_type == "CardActivatedEvent" else None),
+                        "activated_source_uid": (
+                            bstate.get("activated_source_uid")
+                            if event_type == "CardActivatedEvent" else None),
+                        "activated_target_uid": (
+                            bstate.get("activated_target_uid")
+                            if event_type == "CardActivatedEvent" else None),
+                    })
+                    game.push_ability_on_chain(
+                        src_scid, game_engine.ResourceId.from_str(ag),
+                        ability_instance_id=inst_id, ignores_chain=False)
+                    logs.append(f"{event_type} {ag[:8]} -> chain")
+                elif ignores:
                     # Tell the client the ability fired so it plays the card's
                     # activation animation (UIBattle.OnAbilityPushedOnChain,
                     # BattleAnimationPlayCardEvent for IgnoresChain=true).
@@ -901,10 +1056,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                             ignores_chain=True)
                     res = _resolve_ability_bom(db, handler, game, session, pl_t, ai_t,
                                                bstate, ag, cu, gtext,
-                                               target_uid=(extra_target
-                                                           if extra_target is not None
-                                                           else event_target),
-                                               source_owner_uid=ability_owner_id)
+                                               target_uid=resolution_target,
+                                               source_owner_uid=ability_owner_id,
+                                               trigger_target_uid=source_uid)
                     logs.append(f"{event_type} {ag[:8]} -> {res}")
                 else:
                     # Push to chain stack for opponent priority window
@@ -913,9 +1067,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     bstate["_next_instance_id"] = inst_id + 1
                     _be.stack_push(bstate, {
                         "kind": "trigger", "ability_guid": ag,
-                        "source_uid": cu, "target_uid": (extra_target
-                                                           if extra_target is not None
-                                                           else event_target),
+                        "source_uid": cu, "target_uid": resolution_target,
+                        "trigger_target_uid": source_uid,
                         "source_owner_uid": ability_owner_id,
                         "instance_id": inst_id,
                         "activated_ability_guid": (
@@ -1007,7 +1160,10 @@ def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
     return _resolve_ability_bom(db, handler, game, session, pl_t, ai_t,
                                 bstate, ag, cu, gtext,
                                 target_uid=target_uid,
-                                source_owner_uid=src_owner)
+                                source_owner_uid=src_owner,
+                                trigger_target_uid=item.get(
+                                    "trigger_target_uid"),
+                                effect_groups=item.get("effect_groups"))
 
 
 def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
