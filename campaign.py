@@ -359,15 +359,55 @@ def _advance_quest_campaign(db, champ_id, quest_script=None, scene_guid=None):
         state["Flags"]["_quest_objective_idx"] = nxt
         state["ALoc"] = obj["id"]
         state["LastNode"] = obj["id"]
+    else:
+        # The conversation/encounter just completed the final objective. Keep
+        # the completed location in the journal, but close the QUEST campaign
+        # so the client no longer advertises it as active.
+        state["Flags"]["_quest_objective_idx"] = nxt
+        state["Finished"] = _now_utc()
+        state["FinishReason"] = "Complete"
+        state["ALoc"] = None
+        state["CurState"] = "EXPLORE"
     db.execute("UPDATE campaigns SET state_json=? WHERE id=?", (json.dumps(state), qid))
     db.commit()
     return state
 
 
+def _active_area_encounter_guid(db, champ_id):
+    """Return the scene currently being resolved by the champion's area map.
+
+    A few authored encounter objectives contain the all-zero encounter GUID.
+    The area campaign still persists the concrete scene in
+    ``ActiveEncounterGuid`` while the battle is resolving, so use that
+    authoritative active encounter as the compatibility link.
+    """
+    rows = db.execute(
+        "SELECT state_json FROM campaigns "
+        "WHERE champion_id=? AND campaign_type='AREA' "
+        "AND state_json IS NOT NULL ORDER BY id DESC",
+        (champ_id,)).fetchall()
+    for (raw_state,) in rows:
+        try:
+            state = json.loads(raw_state or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        scene_guid = state.get("ActiveEncounterGuid")
+        if scene_guid:
+            return str(scene_guid)
+    return None
+
+
 def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
-    """Advance any active non-taming quest whose current objective is *scene_guid*."""
+    """Advance active non-taming quests whose encounter just succeeded.
+
+    Normally the objective carries its authored encounter GUID.  When the
+    source data omitted that GUID, only an encounter objective on the
+    champion's currently active area battle may use the finished scene as its
+    link; ordinary victories cannot advance unrelated journal objectives.
+    """
     if not scene_guid:
         return []
+    active_area_scene = _active_area_encounter_guid(db, champ_id)
     rows = db.execute(
         "SELECT template_name FROM campaigns WHERE champion_id=? "
         "AND campaign_type='QUEST' AND template_name<>? AND state_json IS NOT NULL",
@@ -386,11 +426,96 @@ def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
             index = 0
         if index >= len(objectives):
             continue
-        expected = objectives[index].get("encounter")
+        objective = objectives[index]
+        expected = objective.get("encounter")
+        if (not expected and
+                str(objective.get("type") or "").lower() == "encounter" and
+                active_area_scene == str(scene_guid)):
+            expected = active_area_scene
         if expected and str(expected) == str(scene_guid):
             updated = _advance_quest_campaign(db, champ_id, script, scene_guid)
             if updated:
                 advanced.append(updated)
+    return advanced
+
+
+def _consume_pending_quest_progress(db, champ_id):
+    """Return one queued quest state that still needs a client refresh.
+
+    A repair performed outside the live request that completed the encounter
+    can fix SQLite without producing the normal ``quest_progress`` notify.
+    Keep that notify pending in the quest state until the champion next asks
+    for campaign state, then consume it after persisting the corrected state.
+    """
+    rows = db.execute(
+        "SELECT id, state_json FROM campaigns "
+        "WHERE champion_id=? AND campaign_type='QUEST' "
+        "AND state_json IS NOT NULL ORDER BY id",
+        (champ_id,)).fetchall()
+    for quest_id, raw_state in rows:
+        try:
+            state = json.loads(raw_state or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not state.pop("_quest_progress_notify_pending", False):
+            continue
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), quest_id))
+        db.commit()
+        state.setdefault("CampID", quest_id)
+        state.setdefault("ChampID", champ_id)
+        return state
+    return None
+
+
+def _advance_quest_conversation_objectives(db, champ_id, conversation_guid):
+    """Advance active quest objectives completed by a conversation.
+
+    QuestTemplate conversation IDs are the authoritative link.  A few older
+    extracts used a champion GUID for Warren's final conversation; the static
+    seed migration normalizes that value, while this matcher also accepts the
+    authored conversation as a compatibility fallback for existing saves.
+    """
+    if not champ_id or not conversation_guid:
+        return []
+    guid = str(conversation_guid)
+    rows = db.execute(
+        "SELECT template_name FROM campaigns "
+        "WHERE champion_id=? AND campaign_type='QUEST' "
+        "AND state_json IS NOT NULL", (champ_id,)).fetchall()
+    advanced = []
+    for (script,) in rows:
+        _qid, state = _quest_state_row(db, champ_id, script)
+        if not state or state.get("Finished"):
+            continue
+        flags = state.get("Flags") or {}
+        objectives = flags.get("_quest_objectives") or []
+        try:
+            index = int(flags.get("_quest_objective_idx", 0) or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if not (0 <= index < len(objectives)):
+            continue
+        objective = objectives[index]
+        if str(objective.get("type") or "").lower() not in {
+                "conversation", "convo"}:
+            continue
+        expected = {
+            str(value) for value in (objective.get("conversation_ids") or [])
+            if value
+        }
+        if objective.get("conversation"):
+            expected.add(str(objective["conversation"]))
+        # Compatibility for the original Cross Zodiac River extract, whose
+        # final objective accidentally contained Warren's champion GUID.
+        if (str(script) == "az01_q_cross_the_river_part2" and
+                "de519b67-1e3c-4fd1-96a1-909d2b6b3c67" in expected):
+            expected.add("08b9b8ab-2100-4f8d-87b0-18369eb4ecb4")
+        if guid not in expected:
+            continue
+        updated = _advance_quest_campaign(db, champ_id, script)
+        if updated:
+            advanced.append(updated)
     return advanced
 
 
@@ -628,9 +753,30 @@ def _gaal_camp_nodes(db, campaign_template):
     return {str(row[0]) for row in rows if row and row[0]}
 
 
-def _gaal_fortune_location(db, state, campaign_template):
-    """Return the active authored Gaal camp location, if present."""
+def _gaal_fortune_location(db, state, campaign_template, node=None):
+    """Return the authored Gaal camp location for the active operation.
+
+    AZ1 has more than one authored Gaal camp. Prefer the requested/current
+    node; otherwise a pending display can mutate the first camp in VisLocs
+    instead of the camp where the fortune was purchased.
+    """
     gaal_nodes = _gaal_camp_nodes(db, campaign_template)
+    requested = str(node or "")
+    if requested:
+        for loc in state.get("VisLocs", []):
+            data = loc.get("Data") or {}
+            if data.get("node") == requested and requested in gaal_nodes:
+                return data
+    active = str(state.get("ALoc") or "")
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") in gaal_nodes and (
+                data.get("node") == active or data.get("name") == active):
+            return data
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") in gaal_nodes and data.get("type") == "ModDisplay":
+            return data
     for loc in state.get("VisLocs", []):
         data = loc.get("Data") or {}
         if data.get("node") in gaal_nodes:
@@ -638,7 +784,7 @@ def _gaal_fortune_location(db, state, campaign_template):
     return None
 
 
-def _show_gaal_fortune(db, state, campaign_template):
+def _show_gaal_fortune(db, state, campaign_template, node=None):
     """Turn the active Gaal camp location into the authored card UI.
 
     UICampaignGaalCamp is exposed by the client's ``ModDisplay`` location
@@ -647,7 +793,7 @@ def _show_gaal_fortune(db, state, campaign_template):
     """
     data = ((state.get("PublicState") or {}).get("Data") or {})
     fortune_guid = str(data.get("gaal_fortune_guid") or "").lower()
-    location = _gaal_fortune_location(db, state, campaign_template)
+    location = _gaal_fortune_location(db, state, campaign_template, node=node)
     if not fortune_guid or location is None:
         return False
     location.update({
@@ -668,9 +814,9 @@ def _show_gaal_fortune(db, state, campaign_template):
     return True
 
 
-def _finish_gaal_fortune_display(db, state, campaign_template):
+def _finish_gaal_fortune_display(db, state, campaign_template, node=None):
     """Close Gaal Camp's card display and leave its conversation repeatable."""
-    location = _gaal_fortune_location(db, state, campaign_template)
+    location = _gaal_fortune_location(db, state, campaign_template, node=node)
     if location is None:
         return False
     data = ((state.get("PublicState") or {}).get("Data") or {})
@@ -1080,6 +1226,24 @@ def _az1_pre_encounter_conversation(db, node, champ_id=None):
     return scored[0][1]
 
 
+def _az1_outcome_conversation(db, node, won, champ_id=None):
+    """Select an authored encounter result conversation for an AZ1 node."""
+    outcome = "success" if won else "fail"
+    rows = [
+        row for row in _az1_node_conversation_rows(db, node)
+        if str(row[1].get("outcome") or "").lower() == outcome
+    ]
+    if not rows:
+        return None
+    faction = _quest_faction_for_champion(db, champ_id) if champ_id else None
+    if faction:
+        faction_rows = [row for row in rows
+                        if _conversation_matches_faction(row[3], faction)]
+        if faction_rows:
+            rows = faction_rows
+    return rows[0][0]
+
+
 def _az1_path_fork_ids(db):
     """Return authored AZ1 path-fork nodes from the persisted map topology."""
     try:
@@ -1179,6 +1343,8 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
         _az1_append_path_forks(
             db, locations, state.setdefault("LocNodes", []))
     gaal_nodes = _gaal_camp_nodes(db, "AZ1")
+    public_data = (((state or {}).get("PublicState") or {}).get("Data") or {})
+    blockade_cleared = bool(public_data.get("blockade_cleared"))
     for loc in locations or []:
         data = loc.get("Data") or {}
         node = data.get("node") or ""
@@ -1210,6 +1376,20 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                     "autostart": (not bool(data.get("completed")) and
                                   (visit_count <= 0 or is_node_r)),
                 })
+                # A quest-giver conversation is intentionally left actionable
+                # after the quest is accepted. The client uses the node's
+                # completion flag to lower bridges and unlock exits; the
+                # quest turn-in conversation is what should complete this
+                # node later.
+                if (data.get("quest_start_open") and
+                        not data.get("completed")):
+                    data["repeatable"] = True
+                # Closing Brink Ridge's ordinary blockade explanation does
+                # not clear the road.  Only the successful blockade encounter
+                # sets blockade_cleared, so repair older states that marked
+                # this conversation complete and keep the node actionable.
+                if (str(node) == "Node019" and not blockade_cleared):
+                    data["completed"] = False
             continue
         guid, name, rewards_json = scene
         upper_name = str(name or "").upper()
@@ -1273,6 +1453,9 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             else:
                 data["conversationId"] = data.get("conversationId")
             data["repeatable"] = _az1_node_is_repeatable(db, node)
+            if (data.get("quest_start_open") and
+                    not data.get("completed")):
+                data["repeatable"] = True
             # The map token starts a conversation when it reaches an
             # unfinished node. Without AutoStart the client only records the
             # path and leaves the player at the prior location. Repeatable
@@ -1292,6 +1475,23 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
         elif (str(data.get("type") or "").lower() in
               {"", "empty", "encounter"} or data.get("pre_encounter")):
             data["encounter"] = guid
+            # A completed encounter may have a one-shot authored result
+            # conversation queued by _apply_gameend. Preserve that state on
+            # every getcampstate/visit hydration; otherwise the pre-encounter
+            # completion marker below turns it back into an Encounter and the
+            # client offers the battle again instead of the result dialogue.
+            if (data.get("outcome_conversation") and
+                    data.get("conversationId")):
+                data.update({
+                    "type": "Convo",
+                    "encounter": None,
+                    "completed": False,
+                    "repeatable": False,
+                    "autostart": True,
+                    "enabled": True,
+                    "visible": True,
+                })
+                continue
             # Some battle scenes have an authored opening conversation but do
             # not carry ``DIALOG`` in their scene name (for example Node009's
             # Cockatwice prelude). Bind that conversation before exposing the
@@ -1504,8 +1704,67 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         for node in (pdata.get("quest_hidden_nodes") or [])
         if node
     }
+    # Brink Ridge's opening conversation explains that the northern road is
+    # closed by a blockade.  The authored graph stores those destinations as
+    # Node021, Node023, and Node077; the client map represents Node023 as its
+    # two authored variants, Node023A/Node023B.  Keep the connections hidden
+    # until a successful Brink Ridge encounter explicitly clears the blockade;
+    # merely closing its explanatory conversation is not enough.
+    blockade_data = next(
+        ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+         if (loc.get("Data") or {}).get("node") == "Node019"),
+        None,
+    )
+    blockade_cleared = bool(pdata.get("blockade_cleared"))
+    if blockade_data is not None and not blockade_cleared:
+        northbound = {
+            str(node) for node in _az1_neighbors(db, "Node019")
+            if str(node) != "Node016"
+        }
+        blocked.update(northbound)
+        for loc in state.get("VisLocs", []):
+            node = str((loc.get("Data") or {}).get("node") or "")
+            if node in northbound or ("Node023" in northbound and
+                                      node.startswith("Node023")):
+                forced_hidden.add(node)
+                # Persist the concrete client node IDs as well as the
+                # canonical graph ID so stale visit_node requests cannot
+                # bypass the blockade after the conversation closes.
+                if node not in blocked:
+                    blocked.add(node)
+        blocked_values = [str(value) for value in (pdata.get("blocked_nodes") or [])
+                          if value]
+        for node in blocked:
+            if node not in blocked_values:
+                blocked_values.append(node)
+        pdata["blocked_nodes"] = blocked_values
+    elif blockade_data is not None:
+        northbound = {
+            str(node) for node in _az1_neighbors(db, "Node019")
+            if str(node) != "Node016"
+        }
+        blocked = {
+            value for value in blocked
+            if value not in northbound and not (
+                "Node023" in northbound and str(value).startswith("Node023"))
+        }
+        pdata["blocked_nodes"] = [
+            str(value) for value in (pdata.get("blocked_nodes") or [])
+            if str(value) not in northbound and not (
+                "Node023" in northbound and str(value).startswith("Node023"))
+        ]
     path_forks = _az1_path_fork_ids(db)
     failed_nodes = _az1_failed_nodes(state)
+
+    def _node_set_contains(values, node):
+        if node in values:
+            return True
+        # Node023 is represented by two authored client locations in the
+        # current map data, so a canonical Node023 gate/reveal applies to
+        # both variants.
+        return ("Node023" in values and
+                str(node or "").startswith("Node023"))
+
     # A failed node keeps an unvisited destination closed only when that
     # destination has no alternate route from another safe visited node.  A
     # shared path (for example Node012 -> Fork001 -> Node014) remains usable
@@ -1543,12 +1802,15 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         # A quest gate can hide an authored neighbour even when the static
         # map graph says it is adjacent.  A previously visited node remains
         # visible so reconnects never erase discovered map space.
-        known = (node in path_forks or node in visited or
-                 bool(data.get("completed")) or node in reveal or
-                 node in forced_visible)
-        if node in blocked and node not in visited and node not in path_forks:
+        known = (node in path_forks or _node_set_contains(visited, node) or
+                 bool(data.get("completed")) or
+                 _node_set_contains(reveal, node) or
+                 _node_set_contains(forced_visible, node))
+        if (_node_set_contains(blocked, node) and
+                not _node_set_contains(visited, node) and
+                node not in path_forks):
             known = False
-        if node in forced_hidden and node not in path_forks:
+        if _node_set_contains(forced_hidden, node) and node not in path_forks:
             known = False
         data["visible"] = known
         data["enabled"] = False if node in path_forks else known
@@ -1670,6 +1932,28 @@ def _quest_hook_az1_tamed_start(db, champ_id, state):
     """Tamed quest: keep gated branches closed until their quests unlock."""
     before = json.dumps(state, sort_keys=True)
     _az1_set_node_gate(state, "Node005", True)
+    # Shadowgrove is the first objective of Cross the Zodiac River. Keep it
+    # hidden until Wallace actually starts that quest.
+    zodiac_row = db.execute(
+        "SELECT state_json FROM campaigns "
+        "WHERE champion_id=? AND campaign_type='QUEST' "
+        "AND template_name='az01_q_cross_the_river_part2' "
+        "AND is_started=1 ORDER BY id DESC LIMIT 1", (champ_id,)
+    ).fetchone()
+    try:
+        zodiac_active = bool(
+            zodiac_row and not json.loads(zodiac_row[0] or "{}").get("Finished")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        zodiac_active = False
+    if not zodiac_active:
+        _az1_set_node_gate(state, "Node018", True)
+        _az1_gate_zodiac_west_bridge(db, state, True)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        hidden = [str(value) for value in (pdata.get("quest_hidden_nodes") or [])
+                  if value and str(value) != "Node018"]
+        hidden.append("Node018")
+        pdata["quest_hidden_nodes"] = hidden
     # The west half of the Zila bridge is opened only after the Savage Lord
     # route is resolved; it must not appear on a fresh AZ1 map.
     _az1_set_node_gate(state, "Node015", True)
@@ -1690,7 +1974,8 @@ def _quest_hook_az1_tamed_start(db, champ_id, state):
     _az1_reveal_neighbors(db, state, state.get("LastNode"))
     for loc in state.get("VisLocs", []):
         data = loc.get("Data") or {}
-        if data.get("node") == "Node015":
+        if data.get("node") == "Node015" or (
+                data.get("node") == "Node018" and not zodiac_active):
             data.update({"visible": False, "enabled": False})
     return json.dumps(state, sort_keys=True) != before
 
@@ -1698,6 +1983,46 @@ def _quest_hook_az1_tamed_start(db, champ_id, state):
 def _az1_unlock_west_bridge(state):
     """Open the west Zila bridge after the Savage Lord resolution."""
     _az1_set_node_gate(state, "Node015", False)
+
+
+def _az1_gate_zodiac_west_bridge(db, state, blocked):
+    """Hide or reveal the AZ1 West Zodiac bridge behind Wallace's handoff.
+
+    Node038 is a normal graph neighbour of Node030, so ordinary cumulative
+    neighbour revealing would expose it before the Cross Zodiac quest reaches
+    its Wallace turn-in objective. Keep the gate explicit and remove stale
+    discovery/path state while it is closed.
+    """
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    node_id = "Node038"
+    unlocked = [str(value) for value in (pdata.get("unlocked_nodes") or [])
+                if str(value) != node_id]
+    pdata["unlocked_nodes"] = unlocked
+    _az1_set_node_gate(state, node_id, bool(blocked))
+    hidden = [str(value) for value in (pdata.get("quest_hidden_nodes") or [])
+              if str(value) != node_id]
+    if blocked:
+        hidden.append(node_id)
+        pdata["quest_hidden_nodes"] = hidden
+        pdata["visited_nodes"] = [
+            value for value in (pdata.get("visited_nodes") or [])
+            if str(value) not in {node_id, "Bridge over the Zodiac - West"}
+        ]
+        pdata["visited_paths"] = [
+            value for value in (pdata.get("visited_paths") or [])
+            if node_id not in str(value)
+        ]
+        if isinstance(pdata.get("conversation_visits"), dict):
+            pdata["conversation_visits"].pop(node_id, None)
+    else:
+        pdata["quest_hidden_nodes"] = hidden
+    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
+    if blocked:
+        for loc in state.get("VisLocs", []):
+            data = loc.get("Data") or {}
+            if data.get("node") == node_id:
+                data["visible"] = False
+                data["enabled"] = False
 
 
 def _quest_hook_az1_find_horwich_sea_start(db, champ_id, state):
@@ -1729,6 +2054,85 @@ def _quest_hook_az1_cross_the_river_start(db, champ_id, state):
     return json.dumps(state, sort_keys=True) != before
 
 
+def _quest_hook_az1_cross_zodiac_start(db, champ_id, state):
+    """Cross the Zodiac River: open Shadowgrove and mark its encounter."""
+    before = json.dumps(state, sort_keys=True)
+    _quest_id, quest_state = _quest_state_row(
+        db, champ_id, "az01_q_cross_the_river_part2")
+    flags = (quest_state or {}).get("Flags") or {}
+    try:
+        objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
+    except (TypeError, ValueError):
+        objective_index = 0
+    # Step 2 is Wallace's authored "Return to Wallace" conversation. West is
+    # not available until that objective is complete (Step 3 is active).
+    _az1_gate_zodiac_west_bridge(db, state, objective_index < 2)
+    _az1_set_node_gate(state, "Node018", False)
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    pdata["quest_hidden_nodes"] = [
+        str(value) for value in (pdata.get("quest_hidden_nodes") or [])
+        if str(value) != "Node018"
+    ]
+    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") == "Node018":
+            data.update({"visible": True, "enabled": True})
+    return json.dumps(state, sort_keys=True) != before
+
+
+def _quest_hook_az1_smoldering_dead_start(db, champ_id, state):
+    """Make Brink Ridge launch the active Smoldering Dead encounter.
+
+    The source quest records the first objective as a dungeon objective, while
+    the AZ1 map places the encounter behind the Brink Ridge conversation.  At
+    quest start, replace that conversation with the authored encounter scene;
+    the normal area game-end path then completes the location and advances the
+    journal objective.  Once the objective changes to the report conversation,
+    this hook leaves Brink Ridge alone so its normal map conversation is
+    restored by hydration.
+    """
+    before = json.dumps(state, sort_keys=True)
+    _quest_id, quest_state = _quest_state_row(db, champ_id, "q_smoldering_dead")
+    if not quest_state or quest_state.get("Finished"):
+        return False
+    flags = quest_state.get("Flags") or {}
+    objectives = flags.get("_quest_objectives") or []
+    try:
+        index = int(flags.get("_quest_objective_idx", 0) or 0)
+    except (TypeError, ValueError):
+        index = 0
+    if not (0 <= index < len(objectives)):
+        return False
+    objective = objectives[index]
+    if str(objective.get("type") or "").lower() not in {"dungeon", "encounter"}:
+        return False
+    encounter = str(objective.get("encounter") or "")
+    if not encounter:
+        return False
+
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") != "Node019":
+            continue
+        data.update({
+            "type": "Encounter",
+            "encounter": encounter,
+            "conversationId": None,
+            "completed": False,
+            "repeatable": False,
+            "pre_encounter": False,
+            "pre_encounter_completed": False,
+            "outcome_conversation": False,
+            "autostart": True,
+            "enabled": True,
+            "visible": True,
+        })
+        break
+    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
+    return json.dumps(state, sort_keys=True) != before
+
+
 def _quest_hook_az1_find_cave_in_start(db, champ_id, state):
     """Find the Cave-In: reveal Node017; hide the opposing route and grotto."""
     before = json.dumps(state, sort_keys=True)
@@ -1748,6 +2152,8 @@ def _quest_hook_az1_find_ambling_mesa_start(db, champ_id, state):
 _QUEST_START_HOOKS = {
     "az1_tamed_start": _quest_hook_az1_tamed_start,
     "az1_cross_the_river_start": _quest_hook_az1_cross_the_river_start,
+    "az1_cross_zodiac_start": _quest_hook_az1_cross_zodiac_start,
+    "az1_smoldering_dead_start": _quest_hook_az1_smoldering_dead_start,
     "az1_find_horwich_sea_start": _quest_hook_az1_find_horwich_sea_start,
     "az1_find_cave_in_start": _quest_hook_az1_find_cave_in_start,
     "az1_find_ambling_mesa_start": _quest_hook_az1_find_ambling_mesa_start,
@@ -1878,11 +2284,33 @@ def _apply_az1_quest_markers(db, champ_id, state):
         encounter = data.get("encounter")
         if encounter:
             encounter_nodes.setdefault(str(encounter), set()).add(str(node))
+        # Dialogue-backed encounter nodes intentionally omit the encounter
+        # field from the client location to avoid opening the champion panel.
+        # The authored node scene remains the objective link.
+        scene = _az1_scene_for_node(db, node)
+        if scene and scene[0]:
+            encounter_nodes.setdefault(str(scene[0]), set()).add(str(node))
         conversation = data.get("conversationId")
         if conversation:
             conversation_nodes.setdefault(str(conversation), set()).add(str(node))
+    # A location's currently selected conversation may be the generic first
+    # visit variant, while an active quest objective points at another
+    # authored conversation on the same node (for example Winston Step 3 at
+    # Node012).  Resolve every authored conversation GUID as well so quest
+    # markers and active-objective overrides use the source catalog.
+    try:
+        authored_rows = db.execute(
+            "SELECT node_id, conversation_guid FROM campaign_node_conversations "
+            "WHERE campaign_template='AZ1' AND enabled=1"
+        ).fetchall()
+    except Exception:
+        authored_rows = []
+    for node, conversation in authored_rows:
+        if node and conversation:
+            conversation_nodes.setdefault(str(conversation), set()).add(str(node))
 
     quest_nodes = set()
+    active_objective_conversations = set()
     quest_rows = db.execute(
         "SELECT template_name, state_json FROM campaigns "
         "WHERE champion_id=? AND campaign_type='QUEST' "
@@ -1898,6 +2326,20 @@ def _apply_az1_quest_markers(db, champ_id, state):
             continue
         flags = quest_state.get("Flags") or {}
         objectives = flags.get("_quest_objectives") or []
+        try:
+            objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
+        except (TypeError, ValueError):
+            objective_index = -1
+        if 0 <= objective_index < len(objectives):
+            current = objectives[objective_index]
+            if isinstance(current, dict):
+                active_objective_conversations.update(
+                    str(value) for value in current.get("conversation_ids") or []
+                    if value
+                )
+                if current.get("conversation"):
+                    active_objective_conversations.add(
+                        str(current["conversation"]))
         completed = {
             str((loc.get("Data") or {}).get("node") or
                 (loc.get("Data") or {}).get("name"))
@@ -1971,6 +2413,33 @@ def _apply_az1_quest_markers(db, champ_id, state):
             changed = True
         if bool(data.get("turninquest")) != turnin:
             data["turninquest"] = turnin
+            changed = True
+
+    # The active quest conversation wins over a generic first/repeat variant
+    # on the same map node.  This must run after the quest-giver selector
+    # above, since that selector may otherwise put the generic Step 1 dialog
+    # back onto a node hosting the current quest turn-in.
+    for loc in state.get("VisLocs", []):
+        data = loc.setdefault("Data", {})
+        node = str(data.get("node") or data.get("name") or "")
+        matching = sorted(
+            guid for guid in active_objective_conversations
+            if node in conversation_nodes.get(guid, set())
+        )
+        if not matching or data.get("completed"):
+            continue
+        conversation = matching[0]
+        if data.get("conversationId") != conversation:
+            data["conversationId"] = conversation
+            changed = True
+        if data.get("type") != "Convo":
+            data["type"] = "Convo"
+            changed = True
+        if data.get("autostart") is not True:
+            data["autostart"] = True
+            changed = True
+        if data.get("turninquest") is not True:
+            data["turninquest"] = True
             changed = True
     return changed
 
@@ -2187,6 +2656,71 @@ def _note_visited(state, node):
     visited = pdata.setdefault("visited_nodes", [])
     if node not in visited:
         visited.append(node)
+
+
+def _az1_activate_direct_path_destination(db, state, path_values, champ_id):
+    """Activate an AZ1 destination when the client omits its StartLoc event.
+
+    The map client normally reports ``visit_path`` followed by ``StartLoc``.
+    Some direct path animations only send the former, leaving the server on
+    the previous node and the client with no conversation to auto-start.  A
+    single authored path is unambiguous, so accept it as arrival only when
+    one endpoint is the persisted current node and the other endpoint is a
+    visible, unblocked, visitable adjacent location.
+    """
+    if not isinstance(path_values, (list, tuple)) or len(path_values) != 1:
+        return None
+    match = re.fullmatch(
+        r"Path_([^_]+)_([^_]+)", str(path_values[0] or ""))
+    if not match:
+        return None
+
+    current = _resolve_node(
+        state, state.get("ALoc") or state.get("LastNode") or "")
+    endpoints = [
+        _resolve_node(state, match.group(1)),
+        _resolve_node(state, match.group(2)),
+    ]
+    if current not in endpoints:
+        return None
+    destination = endpoints[1] if endpoints[0] == current else endpoints[0]
+    if destination == current or destination in _az1_path_fork_ids(db):
+        return None
+
+    location_data = next(
+        ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+         if (loc.get("Data") or {}).get("node") == destination),
+        None,
+    )
+    if not location_data or not location_data.get("visible", True):
+        return None
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    blocked = {
+        _resolve_node(state, str(value))
+        for value in (pdata.get("blocked_nodes") or []) if value
+    }
+    if destination in blocked or not _az1_is_adjacent(db, current, destination):
+        return None
+
+    state["LastNode"] = destination
+    state["ALoc"] = location_data.get("name") or destination
+    state["CurState"] = "EXPLORE"
+    _note_visited(state, destination)
+    location_data["visible"] = True
+    location_data["enabled"] = True
+
+    _hydrate_az1_area_scene_metadata(
+        db, state.get("VisLocs", []), champ_id=champ_id, state=state)
+    _apply_az1_quest_markers(db, champ_id, state)
+    destination_data = next(
+        ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+         if (loc.get("Data") or {}).get("node") == destination),
+        location_data,
+    )
+    if destination_data.get("type") == "Convo":
+        destination_data["autostart"] = True
+    _az1_reveal_neighbors(db, state, destination)
+    return destination
 
 def _set_crayburn_autostart(state, node):
     """Mark a VisLoc for auto-trigger (no force-move warp — the client's
@@ -3134,9 +3668,17 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
                     db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                                (json.dumps(a_state), a_cid))
                     db.commit()
+            pending_quest_progress = _consume_pending_quest_progress(db, champ_id)
             resp = _build_input_response(a_cid, a_state, success=True)
-            return _send_response(handler, json.dumps(resp), comp, session_id,
-                                  reqid, target, instance, conh, uid)
+            ret = _send_response(handler, json.dumps(resp), comp, session_id,
+                                 reqid, target, instance, conh, uid)
+            if pending_quest_progress:
+                push_campupdate(
+                    handler, db, pending_quest_progress.get("CampID") or 0,
+                    pending_quest_progress.get("ChampID") or champ_id,
+                    "quest_progress", "QUEST", False, pending_quest_progress,
+                    comp, session_id, target, instance, conh, uid)
+            return ret
 
     cid, inst_id, is_started, state = _find_campaign_for_champion(
         db, champ_id, "PANORAMA")
@@ -3250,6 +3792,9 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
                               reqid, target, instance, conh, uid)
 
     champ_id, is_started, state_json, ctype, template_name = row
+    pending_quest_progress = None
+    if (ctype or "").upper() == "AREA":
+        pending_quest_progress = _consume_pending_quest_progress(db, champ_id)
     if state_json:
         state = json.loads(state_json)
     else:
@@ -3275,8 +3820,15 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
     if (ctype or "").upper() == "DUNGEON":
         state = _prepare_dungeon_state(state, _race_name_for_campaign(db, camp_id))
     resp = _build_input_response(camp_id, state, success=True)
-    return _send_response(handler, json.dumps(resp), comp, session_id,
-                          reqid, target, instance, conh, uid)
+    ret = _send_response(handler, json.dumps(resp), comp, session_id,
+                         reqid, target, instance, conh, uid)
+    if pending_quest_progress:
+        push_campupdate(
+            handler, db, pending_quest_progress.get("CampID") or 0,
+            pending_quest_progress.get("ChampID") or champ_id,
+            "quest_progress", "QUEST", False, pending_quest_progress,
+            comp, session_id, target, instance, conh, uid)
+    return ret
 
 
 def _handle_startcamp(handler, db, env_json, comp, session_id,
@@ -3400,6 +3952,28 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
     pending_dungeon = None
     pending_area = None
     pending_quest_spawns = []
+    pending_quest_progress = []
+    conversation_applied = _empty_applied_updates()
+
+    # Conversation rewards are delivered in the same AppliedUpdates payload
+    # as battle/quest loot. Resolve the active map location before the normal
+    # conv_done state transition clears ALoc, and advance any matching journal
+    # objective while the conversation GUID is still available.
+    if (event_name == "conv_done" and
+            (ctype or "").upper() == "AREA"):
+        active_node = state.get("ALoc")
+        active_data = next(
+            ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+             if active_node in ((loc.get("Data") or {}).get("node"),
+                                (loc.get("Data") or {}).get("name"),
+                                (loc.get("Data") or {}).get("title"))),
+            {},
+        )
+        active_conversation = active_data.get("conversationId")
+        conversation_applied = _apply_conversation_rewards(
+            handler, db, camp_id, state, active_conversation)
+        pending_quest_progress = _advance_quest_conversation_objectives(
+            db, champ_id, active_conversation)
 
     if event_name == "choice_battle_yes":
         state.setdefault("PublicState", {}).setdefault("Data", {})[
@@ -3414,11 +3988,22 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         # StartLoc. Persist it so travelled paths remain lit after refresh.
         pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
         paths = pdata.setdefault("visited_paths", [])
-        values = o_params[0] if o_params and isinstance(o_params[0], list) else o_params
+        values = (o_params[0] if o_params and
+                  isinstance(o_params[0], list) else o_params)
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        new_values = []
         for path in values:
             path = str(path)
             if path and path not in paths:
                 paths.append(path)
+                new_values.append(path)
+        if ((ctype or "").upper() == "AREA" and
+                str(template_name or "").upper() == "AZ1"):
+            arrived_node = _az1_activate_direct_path_destination(
+                db, state, new_values, champ_id)
+            if arrived_node:
+                log(f"    Campaign direct path arrival: {arrived_node}")
     elif event_name == "visit_node":
         # UIDungeonZoneViewModel reports the node when the token reaches its
         # destination, immediately before issuing StartLoc.  Synchronize the
@@ -3484,7 +4069,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         if ((ctype or "").upper() == "AREA" and
                 str(template_name or "").upper() in {"AZ1", "AZ2"}):
             _finish_gaal_fortune_display(
-                db, state, str(template_name or "").upper())
+                db, state, str(template_name or "").upper(),
+                node=state.get("LastNode") or state.get("ALoc"))
             data = state.setdefault("PublicState", {}).setdefault("Data", {})
             data.pop("gaal_fortune_display_pending", None)
     elif (event_name == "conv_done" and
@@ -3591,8 +4177,37 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     current_template in {"AZ1", "AZ2"} and
                     current_data.get("type") == "Convo" and
                     bool(current_data.get("repeatable")))
+                outcome_convo = bool(current_data.get("outcome_conversation"))
                 pre_encounter_convo = bool(current_data.get("pre_encounter"))
-                if not repeatable_convo and not pre_encounter_convo:
+                quest_turnin_convo = bool(current_data.get("turninquest"))
+                blockade_convo = (
+                    current_template == "AZ1" and
+                    current_data.get("node") == "Node019" and
+                    current_data.get("type") == "Convo" and
+                    not outcome_convo and not pre_encounter_convo)
+                if outcome_convo:
+                    # A one-shot result dialogue follows a completed battle;
+                    # closing it completes the map node even though the
+                    # underlying location retains its pre-encounter marker.
+                    _mark_location_completed(state, current)
+                    current_data["autostart"] = False
+                elif blockade_convo:
+                    # The first Brink Ridge conversation only explains the
+                    # blockade. It must not complete the node or reveal its
+                    # northern neighbours; the successful encounter sets
+                    # blockade_cleared through the battle result path.
+                    current_data["completed"] = False
+                    current_data["autostart"] = False
+                elif quest_turnin_convo:
+                    # A quest-start conversation keeps its map node open so
+                    # accepting the quest does not lower a bridge. The
+                    # authored turn-in conversation is the point at which
+                    # this node is completed.
+                    _mark_location_completed(state, current)
+                    current_data.pop("quest_start_open", None)
+                    current_data["repeatable"] = False
+                    current_data["autostart"] = False
+                elif not repeatable_convo and not pre_encounter_convo:
                     _mark_location_completed(state, current)
                 else:
                     # A repeatable node must not auto-trigger again while the
@@ -3618,6 +4233,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                         str(current_data.get("conversationId") or "") ==
                         "0211e909-2945-4f84-b8c6-1e5d33169d6e"):
                     _az1_unlock_west_bridge(state)
+                outcome_conversation_guid = None
                 if (current_template == "AZ1" and
                         current_data.get("shroomhaus_convo")):
                     current_data.update({
@@ -3626,16 +4242,37 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                         "shroomhaus_ready": True,
                     })
                     current_data.pop("shroomhaus_convo", None)
+                if current_data.get("outcome_conversation"):
+                    outcome_conversation_guid = current_data.get(
+                        "conversationId")
+                    # The result dialogue has now been acknowledged. Restore
+                    # the underlying encounter on the next hydration without
+                    # reopening the result conversation.
+                    current_data.update({
+                        "outcome_conversation": False,
+                        "conversationId": None,
+                        "autostart": False,
+                    })
                 # Quest assignment is driven by the extracted conversation
                 # catalog.  One conversation may grant several quests (for
                 # example Tamed plus the faction Find quest).
                 if str(template_name or "").upper() in {"AZ1", "AZ2"}:
                     spawned, _hooks = _grant_quests_for_conversation(
                         db, champ_id, str(template_name).upper(),
-                        current_data.get("conversationId"))
+                        (outcome_conversation_guid if outcome_convo else
+                         current_data.get("conversationId")))
                     for quest_id, quest_script, quest_state in spawned:
                         pending_quest_spawns.append(
                             (quest_id, quest_script, quest_state))
+                    # A newly spawned quest is authoritative evidence that
+                    # this conversation was a quest start. Keep its map node
+                    # incomplete and repeatable until the quest's authored
+                    # turn-in row is selected by _apply_az1_quest_markers.
+                    if spawned and not quest_turnin_convo:
+                        current_data["completed"] = False
+                        current_data["repeatable"] = True
+                        current_data["autostart"] = False
+                        current_data["quest_start_open"] = True
                     _sync_az1_quest_gates(db, champ_id, state)
                     _apply_az1_quest_markers(db, champ_id, state)
                 data = state.setdefault("PublicState", {}).setdefault("Data", {})
@@ -3647,8 +4284,12 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     # The client has just closed Milosh's conversation.  Turn
                     # the same active location into ModDisplay so its
                     # UICampaignGaalCamp panel shows the selected Fortune.
-                    _show_gaal_fortune(db, state, current_template)
-                    data.pop("gaal_fortune_display_pending", None)
+                    _show_gaal_fortune(
+                        db, state, current_template,
+                        node=current_data.get("node"))
+                    # Keep this marker until display_done so a disconnect or
+                    # reconnect before the acknowledgement can recover the
+                    # already-paid Fortune display.
                     current_data["autostart"] = False
                     state["ALoc"] = current_data.get("name") or current_data.get("node")
                     state["CurState"] = "EXPLORE"
@@ -3660,9 +4301,10 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                                           session_id, reqid, target, instance,
                                           conh, uid)
                 # A pre-encounter conversation promotes its location back to
-                # the authored battle scene. Other conversations simply clear
-                # the active location after closing.
-                if current_data.get("pre_encounter"):
+                # the authored battle scene. A result conversation does the
+                # same promotion, but leaves the already-won node complete
+                # and clears ALoc so travel can continue.
+                if current_data.get("pre_encounter") and not outcome_convo:
                     current_data.update({
                         "type": "Encounter",
                         "conversationId": None,
@@ -3675,15 +4317,34 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     })
                     state["ALoc"] = (current_data.get("name") or
                                       current_data.get("node") or current)
+                elif current_data.get("pre_encounter") and outcome_convo:
+                    scene = _az1_scene_for_node(db, current_data.get("node"))
+                    current_data.update({
+                        "type": "Encounter",
+                        "conversationId": None,
+                        "completed": True,
+                        "pre_encounter_completed": True,
+                        "autostart": False,
+                    })
+                    if scene:
+                        current_data["encounter"] = scene[0]
+                    state["ALoc"] = None
                 elif not current_data.get("shroomhaus_ready"):
                     state["ALoc"] = None
             state["CurState"] = "EXPLORE"
             db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                        (json.dumps(state), camp_id))
             db.commit()
-            resp = _build_input_response(camp_id, state, success=True)
+            resp = _build_input_response(camp_id, state, success=True,
+                                         applied=conversation_applied)
             ret = _send_response(handler, json.dumps(resp), comp, session_id,
                                  reqid, target, instance, conh, uid)
+            for quest_state in pending_quest_progress:
+                push_campupdate(
+                    handler, db, quest_state.get("CampID") or 0,
+                    quest_state.get("ChampID") or champ_id, "quest_progress",
+                    "QUEST", False, quest_state, comp, session_id, target,
+                    instance, conh, uid)
             for quest_id, quest_script, quest_state in pending_quest_spawns:
                 push_campspawn(handler, quest_id, champ_id, quest_script,
                                quest_state, camp_id, "AZ1", comp, session_id,
@@ -3843,7 +4504,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
 
-    resp = _build_input_response(camp_id, state, success=True)
+    resp = _build_input_response(camp_id, state, success=True,
+                                 applied=conversation_applied)
     db.execute(
         "UPDATE campaigns SET state_json=? WHERE id=?",
         (json.dumps(state), camp_id)
@@ -3851,6 +4513,11 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
     db.commit()
     ret = _send_response(handler, json.dumps(resp), comp, session_id,
                          reqid, target, instance, conh, uid)
+    for quest_state in pending_quest_progress:
+        push_campupdate(
+            handler, db, quest_state.get("CampID") or 0,
+            quest_state.get("ChampID") or champ_id, "quest_progress", "QUEST",
+            False, quest_state, comp, session_id, target, instance, conh, uid)
     # Server-driven dungeon: after the quest-giver's conv_done response has
     # been delivered, start the castle chain by advancing one step from the
     # Entrance — which shows the first node's conversation (Watchtower). The
@@ -4000,6 +4667,7 @@ def _apply_gameend(db, camp_id, won):
     # AREA encounters are attached directly to map locations. Conditional
     # quest encounters remain retryable until their condition succeeds; a
     # normal victory completes the location and reveals the next map node.
+    outcome_pending = False
     if (ctype or "").upper() == "AREA":
         active_scene = str(state.get("ActiveEncounterGuid") or "")
         active_node = state.get("ALoc")
@@ -4066,13 +4734,44 @@ def _apply_gameend(db, camp_id, won):
         if (str(template_name or "").upper() == "AZ1" and
                 result_node):
             _az1_reveal_neighbors(db, state, result_node)
+            # Authored result conversations are part of the encounter flow,
+            # not ordinary map chatter. Queue success on a completed win and
+            # failure on any loss (including a player withdrawal) so the
+            # client can play the authored result immediately. Retryable/
+            # taming wins do not queue a result until their capture condition
+            # is met.
+            outcome_conv = None
+            if not won or not retryable:
+                outcome_conv = _az1_outcome_conversation(
+                    db, result_node, bool(won), champ_id=champ_id)
+            if outcome_conv and matched_index is not None:
+                result_data = state.get("VisLocs", [])[matched_index].get(
+                    "Data", {})
+                result_data.update({
+                    "type": "Convo",
+                    "conversationId": outcome_conv,
+                    "encounter": None,
+                    "completed": False,
+                    "repeatable": False,
+                    "outcome_conversation": True,
+                    "autostart": True,
+                    "enabled": True,
+                    "visible": True,
+                })
+                state["ALoc"] = (result_data.get("name") or
+                                  result_data.get("node") or result_node)
+                outcome_pending = True
+            if (result_node == "Node019" and won and not retryable):
+                state.setdefault("PublicState", {}).setdefault("Data", {})[
+                    "blockade_cleared"
+                ] = True
         state.pop("ActiveEncounterGuid", None)
 
     # Clear ALoc so the panorama doesn't auto-pop the encounter dialog when
     # the client returns from the battle. Use an empty string (not None) — the
     # client's ProcessStateChange won't match it to any node GameObject, and
     # portrait rendering resolves correctly because it's not a null ALoc.
-    if not is_dungeon:
+    if not is_dungeon and not outcome_pending:
         state["ALoc"] = ""
 
     db.execute(
@@ -4356,6 +5055,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     if not champ:
         return applied
     user_id = champ[1]
+    race_name = _RACE_NAMES.get(champ[2], "")
     # A campaign template can be replayed by several champions.  One-time
     # conversation rewards therefore belong to the champion, not the shared
     # conversation/campaign template.  Accept the legacy unscoped key so a
@@ -4418,6 +5118,14 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
             })
 
     card_specs = reward.get("cards") or []
+    # A single authored conversation can serve all eight race/faction
+    # variants.  Keep that mapping in the reward seed and resolve it from the
+    # champion's race at claim time rather than duplicating conversation rows.
+    race_card_guid = (reward.get("card_guid_by_race") or {}).get(race_name)
+    if race_card_guid:
+        card_specs = list(card_specs) + [{
+            "guid": race_card_guid, "quantity": reward.get("quantity", 1),
+        }]
     if reward.get("card_guid"):
         card_specs = list(card_specs) + [{
             "guid": reward.get("card_guid"),
@@ -4449,6 +5157,80 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
                 "ItemAction": "GRANT", "ItemTemplate": card["guid"],
                 "RCode": "CARD",
             })
+
+    # Equipment and other account-bound inventory rewards are represented by
+    # InventoryItemData GUIDs, not CardTemplate GUIDs.  Persist them in the
+    # shared player_inventory table and include the resulting quantity in the
+    # campaign Applied.Items payload so the client collection updates without
+    # requiring a reconnect.
+    item_specs = reward.get("items") or []
+    race_item_guid = (reward.get("item_guid_by_race") or {}).get(race_name)
+    if race_item_guid:
+        item_specs = list(item_specs) + [{
+            "guid": race_item_guid, "quantity": reward.get("quantity", 1),
+        }]
+    if reward.get("item_guid"):
+        item_specs = list(item_specs) + [{
+            "guid": reward.get("item_guid"),
+            "quantity": reward.get("quantity", 1),
+        }]
+    if isinstance(item_specs, dict):
+        item_specs = [item_specs]
+    for spec in item_specs:
+        if isinstance(spec, str):
+            spec = {"guid": spec}
+        if not isinstance(spec, dict):
+            continue
+        template_guid = (spec.get("guid") or spec.get("template") or
+                         spec.get("item_guid"))
+        if not template_guid:
+            continue
+        try:
+            quantity = max(1, int(spec.get("quantity", 1) or 1))
+        except (TypeError, ValueError):
+            quantity = 1
+        existing = db.execute(
+            "SELECT id, quantity, client_item_uid FROM player_inventory "
+            "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
+            (user_id, str(template_guid))).fetchone()
+        if existing:
+            item_row_id, old_quantity, item_uid = existing
+            new_quantity = int(old_quantity or 0) + quantity
+            if not item_uid:
+                item_uid = int(db.execute(
+                    "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+                    "FROM player_inventory WHERE user_id=?", (user_id,)
+                ).fetchone()[0] or 1)
+                db.execute(
+                    "UPDATE player_inventory SET quantity=?, client_item_uid=? "
+                    "WHERE id=?", (new_quantity, item_uid, item_row_id))
+            else:
+                db.execute("UPDATE player_inventory SET quantity=? WHERE id=?",
+                           (new_quantity, item_row_id))
+        else:
+            item_uid = int(db.execute(
+                "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+                "FROM player_inventory WHERE user_id=?", (user_id,)
+            ).fetchone()[0] or 1)
+            new_quantity = quantity
+            db.execute(
+                "INSERT INTO player_inventory "
+                "(user_id, template_guid, quantity, client_item_uid) "
+                "VALUES (?,?,?,?)",
+                (user_id, str(template_guid), new_quantity, item_uid))
+        applied["Items"].append({"Item": {
+            "Id": item_uid,
+            "TemplateID": str(template_guid),
+            "BoundToProfile": True,
+            "ItemQuantity": new_quantity,
+            "ClaimDate": "0001-01-01T00:00:00",
+            "EscrowStatus": "Clean",
+        }})
+        applied["Completed"].append({
+            "ItemKind": "BOAITEM", "ItemQuantity": quantity,
+            "ItemAction": "GRANT", "ItemTemplate": str(template_guid),
+            "RCode": "ITEM",
+        })
 
     # Promotional Crayburn rewards are real treasure chests, not merely a
     # display-only loot entry.  Persist the chest so it survives reconnects,
@@ -4640,8 +5422,8 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     generic profile reward events are not sufficient here.
     """
     result = {"applied": _empty_applied_updates(), "cards": [],
-              "gold": 0, "xp": 0, "condition_met": False,
-              "scene_guid": None}
+              "chests": [], "gold": 0, "xp": 0,
+              "condition_met": False, "scene_guid": None}
     if not won:
         return result
     row = db.execute("SELECT champion_id, state_json FROM campaigns WHERE id=?",
@@ -4728,11 +5510,27 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                 quantity = 1
             cards = _grant_card_reward(handler, db, player_user_id,
                                        template_guid, quantity, emit=False)
-        if not cards and not gold and not xp:
+        chest_guid = (reward_obj.get("chest_guid") or
+                      reward_obj.get("chest_template") or
+                      reward_obj.get("pack_guid"))
+        chest = None
+        if chest_guid and (not condition or context):
+            chest_guid = str(chest_guid)
+            chest_row = db.execute(
+                "INSERT INTO treasure_chests "
+                "(user_id, set_guid, chest_rarity, opened, template_guid) "
+                "VALUES (?, ?, 'Promo', 0, ?)",
+                (player_user_id,
+                 "00000000-0000-0000-0000-000000000000", chest_guid))
+            chest = {"id": int(chest_row.lastrowid),
+                     "template": chest_guid}
+        if not cards and not gold and not xp and not chest:
             continue
         granted.extend(cards)
         total_gold += gold
         total_xp += xp
+        if chest:
+            result["chests"].append(chest)
         claims[claim_key] = True
 
     success_counts[str(scene_guid)] = prior_successes + 1
@@ -4800,7 +5598,22 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
             "ItemAction": "GRANT", "ItemTemplate": card["guid"],
             "RCode": "CARD",
         })
-    if not granted and not total_gold and not total_xp:
+    for chest in result["chests"]:
+        applied["Items"].append({"Item": {
+            "Id": 9000 + int(chest["id"]),
+            "TemplateID": chest["template"],
+            "BoundToProfile": True,
+            "ItemQuantity": 1,
+            "ClaimDate": "0001-01-01T00:00:00",
+            "EscrowStatus": "Clean",
+        }})
+        applied["Completed"].append({
+            "ItemKind": "BOAITEM", "ItemQuantity": 1,
+            "ItemAction": "GRANT", "ItemTemplate": chest["template"],
+            "RCode": "CHEST",
+        })
+    if (not granted and not total_gold and not total_xp and
+            not result["chests"]):
         state["_last_encounter_condition_met"] = bool(result["condition_met"])
         db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                    (json.dumps(state), camp_id))
@@ -4813,7 +5626,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     result.update({"cards": granted, "gold": total_gold, "xp": total_xp})
     getattr(handler, "_log_req", print)(
         f"    Encounter reward: scene={scene_guid} cards={len(granted)} "
-        f"gold={total_gold} xp={total_xp}")
+        f"chests={len(result['chests'])} gold={total_gold} xp={total_xp}")
     return result
 
 
@@ -5634,10 +6447,13 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                 elif ((ctype or "").upper() == "AREA" and
                       str(template_name or "").upper() == "AZ1" and
                       previous_node and requested_node and
-                      not _az1_is_adjacent(db, previous_node, requested_node)):
-                    # The map prefab contains the real path graph; reject
-                    # arbitrary jumps even if a stale client sends a hidden
-                    # location name directly.
+                      not _az1_is_adjacent(db, previous_node, requested_node)
+                      and requested_node not in visited_nodes):
+                    # The client reports the destination after walking a
+                    # multi-edge return route, so a previously visited node
+                    # is a safe backtracking destination even when it is not
+                    # directly adjacent to the persisted current node. Keep
+                    # rejecting arbitrary jumps to new locations.
                     log(f"    Campaign movement rejected: {previous_node} -> "
                         f"{requested_node} is not adjacent")
                     node = previous_node or previous
@@ -5709,7 +6525,10 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                         else:
                             data["conversationId"] = _az1_node_conversation(
                                 db, node, state, champ_id=champ_id)
-                        data["repeatable"] = _az1_node_is_repeatable(db, node)
+                        data["repeatable"] = (
+                            True if (data.get("quest_start_open") and
+                                     not data.get("completed")) else
+                            _az1_node_is_repeatable(db, node))
                         data["autostart"] = True
                         break
                 _az1_reveal_neighbors(db, state, node)

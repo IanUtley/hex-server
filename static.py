@@ -1022,11 +1022,89 @@ REDEEM_CODES = [
     ("expiredcode", 0, 0, 0),
 ]
 
-# Crayburn Castle's race-specific report-success conversations.  The reward
-# payload is deliberately JSON so later campaign conversations can add cards,
-# platinum, or other reward types without another schema migration.  These
-# entries are one-time rewards; INSERT OR IGNORE preserves local adjustments.
+# Authored campaign conversation rewards.  The reward payload is deliberately
+# JSON so later conversations can add cards, chests, platinum, or other reward
+# types without another schema migration.  These entries are one-time rewards;
+# INSERT OR IGNORE preserves local adjustments.
+AZ1_FIND_QUEST_CARD_REWARDS = {
+    # Find The Ambling Mesa (Ardent)
+    "02977c4c-803a-465d-ae0c-b5896c3d4012": {
+        "Human": "e82bf676-2f7d-4f61-a3c4-51639a03b1b5",  # Experienced Masons
+        "Elf": "cbe436a8-f2e1-4b0f-ba0b-f6c03cada4f2",  # Ashwood Colossus
+        "Coyotle": "ccb1ff54-7ec8-40da-8fee-edb47088baa8",  # Dance of Dusk
+        "Orc": "57755e0a-2714-412f-bc77-1af48e5bdd55",  # Hunger of the Mountain God
+    },
+    # Find The Cave-In (Underworld)
+    "880690b0-0c54-4ab8-a4e2-911b8bf14f64": {
+        "Dwarf": "2d4a9914-91b8-46c2-a08d-4164b123befe",  # LZ-37 Targeting System
+        "Necrotic": "6c7da206-8693-4df8-993a-2f9aa5e0c349",  # Awaken
+        "Shin'hare": "87623711-9085-40fe-b656-c99026c87b7a",  # Uzume's Handmaiden
+        "Vennen": "d415df01-337e-465c-8409-92f8670f1ceb",  # Phenteo's Gift
+    },
+}
+
+AZ1_CROSS_ZILA_ITEM_REWARDS = {
+    "Human": "7bdee007-e1b9-4c9c-96a0-31d2a9f4c179",  # Slippers of Intellect
+    "Elf": "93ab440b-4cb8-4e33-84a2-6a703ff98ee7",  # Rotwood Sandals
+    "Coyotle": "d1799dff-0ed3-4661-826f-c256521a9f98",  # Nightsky Handlers
+    "Orc": "8ba3b68a-ed55-40a8-a30f-ae8b86400e11",  # Darkspire Armor
+    "Dwarf": "12bc0098-4711-470a-8e67-751cf8f8b522",  # Rose Circlet
+    "Necrotic": "f1418009-ae0f-49dc-bb9f-ec64426776c3",  # Reaper's Helm
+    "Shin'hare": "36e048f3-5f09-48ae-b99f-22b2f6768199",  # Elite Handwraps
+    "Vennen": "09303fe4-de67-4a0f-bf41-22b80983b504",  # Nursery Handlers
+}
+
+AZ1_CROSS_ZODIAC_CARD_REWARDS = {
+    "Human": "6b0637fe-cf0a-4d91-9954-06c55f40ad6d",  # Orders From High Command
+    "Elf": "7e67acb6-4cd3-4107-bb50-4c3b088a85b3",  # Master of Masks
+    "Coyotle": "ff2165e8-0396-4e68-a7ca-7d95ec1052a0",  # Prophet of the Sun
+    "Orc": "03ff50ca-1e2a-4190-9513-eab2e91e9194",  # Bloodlust
+    "Dwarf": "572be440-0f92-4152-8aa6-f09b2a76c5eb",  # Junk Repurposer
+    "Necrotic": "61b17836-5c7e-4092-a074-3dd27104291b",  # Grim Mandate
+    "Shin'hare": "043e8e48-ee7e-474d-8489-22f4eefb3208",  # Emperor Ito's Will
+    "Vennen": "75c26b27-66fe-4700-a584-967ab12b15e7",  # Nazhk Lookout
+}
+
+AZ1_DRYAD_ITEM_REWARDS = {
+    "Human": "7b955172-5670-4e89-a9dc-aa6c8867d077",  # Holy Beads
+    "Elf": "63e87fdf-6650-4861-90e5-7c8c840ec292",  # Sylvan Sounder
+    "Coyotle": "cd13fdb5-6d6f-4d8e-a413-589176b44935",  # Earthcaller's Robes
+    "Orc": "94ffd65d-8ecb-4bda-91bc-f091ef5461e2",  # Lightning Medallion
+    "Dwarf": "e6d194fb-29ec-4abe-b373-91f1e9c3624e",  # Winged Alloy Helm
+    "Necrotic": "a537d34b-ee48-42f2-8a8c-01aa1f927600",  # Gem Walkers
+    "Shin'hare": "f62a13c2-076d-4c90-9da0-66bae2b17cba",  # Thug Topper
+    "Vennen": "fd359679-6d40-496b-a83d-9d39e2c32dab",  # Vile Stompers
+}
+
+AZ1_HOWLING_PLAINS_PACK_GUID = "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
+AZ1_GNASH_BRIDGES_SCENE_GUID = "3cf073b0-47fd-4911-953a-d86902890459"
+AZ1_RAVENOUS_PIRANHA_CARD_GUID = "9ed0730b-e469-4c3d-ac7f-7b56c64b42ae"
+AZ1_CORRUPT_DRYAD_SCENE_GUID = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
+
 CONVERSATION_REWARD_SEEDS = [
+    # The Find quests complete at their faction-specific elder conversations;
+    # each race receives its AZ1 base card.
+    *[(guid, json.dumps({"card_guid_by_race": rewards}, sort_keys=True), 1)
+      for guid, rewards in AZ1_FIND_QUEST_CARD_REWARDS.items()],
+    # Cross Zila River completes at Weston's success conversation.  Equipment
+    # is inventory data rather than a card template, so it is selected by race
+    # at claim time and persisted in player_inventory.  The authored reward
+    # also includes one Howling Plains campaign pack for every race.
+    ("5e5ec1cd-c869-43e8-82d4-417021954440",
+     json.dumps({"chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
+                 "item_guid_by_race": AZ1_CROSS_ZILA_ITEM_REWARDS},
+                sort_keys=True), 1),
+    # The authored quest record stores Warren's champion GUID in its final
+    # objective.  The actual successful conversation is Warren Step 1a; it
+    # also awards the AZ1 Campaign Booster.
+    ("08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",
+     json.dumps({"card_guid_by_race": AZ1_CROSS_ZODIAC_CARD_REWARDS,
+                 "chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID},
+                sort_keys=True), 1),
+    # Shadowgrove's encounter success conversation grants the race-specific
+    # equipment reward after the Corrupt Dryad is defeated.
+    ("4000c850-c1f7-45e4-b254-3cb1b0e9bf2b",
+     json.dumps({"item_guid_by_race": AZ1_DRYAD_ITEM_REWARDS}, sort_keys=True), 1),
     ("9c139a1c-40a4-4ed7-b6ff-378c6f6bc1ea", '{"gold": 150, "xp": 500, "chest_guid": "c96a6213-69ac-44d2-8b35-32ad6d55b981"}', 1),  # Coyotle
     ("21c62741-49c8-4da5-8b8d-440247911027", '{"gold": 150, "xp": 500, "chest_guid": "8b145038-961b-4f1c-93f7-3d81dcb3d39b"}', 1),  # Dwarf
     ("bbc4460d-8452-4d49-a6e9-c64216f483b3", '{"gold": 150, "xp": 500, "chest_guid": "2780fa12-7cf5-41bb-a19c-7a8496a33fed"}', 1),  # Elf
@@ -1357,6 +1435,87 @@ def ensure_schema(db):
                    "WHERE script_name='az01_uw_find_cave_in' AND (start_hook IS NULL OR start_hook='')")
         db.execute("UPDATE quest_templates SET start_hook='az1_find_ambling_mesa_start' "
                    "WHERE script_name='az01_ar_find_ambling_mesa' AND (start_hook IS NULL OR start_hook='')")
+        db.execute("UPDATE quest_templates SET start_hook='az1_cross_zodiac_start' "
+                   "WHERE script_name='az01_q_cross_the_river_part2' "
+                   "AND (start_hook IS NULL OR start_hook='')")
+        db.execute("UPDATE quest_templates SET start_hook='az1_smoldering_dead_start' "
+                   "WHERE script_name='q_smoldering_dead' "
+                   "AND (start_hook IS NULL OR start_hook='')")
+        # The source stores Smoldering Dead's first objective as a dungeon
+        # template ID.  Link it to the AZ1 map's authored encounter so the
+        # quest can replace Brink Ridge's generic blockade conversation with
+        # the correct battle without embedding that decision in the area
+        # movement code.
+        db.execute(
+            "UPDATE quest_templates SET objectives_json=REPLACE("
+            "objectives_json, ?, ?) WHERE script_name=?",
+            ('"dungeon": "a8d2ad0e-306e-4d07-9cd1-e4d7c82cdf1c", '
+             '"id": "Step1"',
+             '"dungeon": "a8d2ad0e-306e-4d07-9cd1-e4d7c82cdf1c", '
+             '"encounter": "1d91ee6d-dd5b-4aaf-af58-7ace873b1a80", '
+             '"id": "Step1"',
+             "q_smoldering_dead"),
+        )
+        # Wallace's authored post-Dryad conversation starts Cross the Zodiac
+        # River. The extracted quest conversation catalog does not carry this
+        # handoff, so seed the metadata link idempotently for existing saves.
+        db.execute(
+            "INSERT OR IGNORE INTO quest_conversations "
+            "(quest_script,conversation_guid,campaign_template,node_id,npc,"
+            "role,faction,conversation_name,start_hook,conditions_json,priority,enabled) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("az01_q_cross_the_river_part2",
+             "1e9d1bd0-0967-4fe8-be79-d0cb068f973e", "AZ1", "Node030",
+             "Wallace", "start", "",
+             "AZ1 - Node 30 - Wallace - Step 3 player has beaten Dryad",
+             "az1_cross_zodiac_start", "{}", 0, 1),
+        )
+        # An earlier migration used a look-alike GUID that is not present in
+        # the authored ConversationTemplate. Repair it in existing databases
+        # as well as using the correct ID for fresh installs.
+        old_wallace_guid = "1e9d1bd0-0967-4fe3-be79-d0cb068f973e"
+        wallace_guid = "1e9d1bd0-0967-4fe8-be79-d0cb068f973e"
+        # Merge rather than blindly UPDATE: a partially applied earlier
+        # migration may already contain both rows under a unique key.
+        db.execute(
+            "DELETE FROM campaign_node_conversations "
+            "WHERE campaign_template='AZ1' AND node_id='Node030' "
+            "AND conversation_guid=? AND EXISTS (SELECT 1 FROM "
+            "campaign_node_conversations WHERE campaign_template='AZ1' "
+            "AND node_id='Node030' AND conversation_guid=?)",
+            (old_wallace_guid, wallace_guid),
+        )
+        db.execute(
+            "UPDATE campaign_node_conversations SET conversation_guid=? "
+            "WHERE campaign_template='AZ1' AND node_id='Node030' "
+            "AND conversation_guid=?",
+            (wallace_guid, old_wallace_guid),
+        )
+        db.execute(
+            "DELETE FROM quest_conversations "
+            "WHERE quest_script='az01_q_cross_the_river_part2' "
+            "AND conversation_guid=? AND EXISTS (SELECT 1 FROM "
+            "quest_conversations WHERE quest_script='az01_q_cross_the_river_part2' "
+            "AND conversation_guid=?)",
+            (old_wallace_guid, wallace_guid),
+        )
+        db.execute(
+            "UPDATE quest_conversations SET conversation_guid=? "
+            "WHERE quest_script='az01_q_cross_the_river_part2' "
+            "AND conversation_guid=?",
+            (wallace_guid, old_wallace_guid),
+        )
+        # The extracted Cross Zodiac River template historically stored
+        # Warren's ChampionTemplate GUID in its final conversation objective.
+        # Replace it with the authored Warren Step 1a conversation so newly
+        # created and existing quest journals can resolve and complete it.
+        db.execute(
+            "UPDATE quest_templates SET objectives_json=REPLACE("
+            "objectives_json, ?, ?) WHERE script_name=?",
+            ("de519b67-1e3c-4fd1-96a1-909d2b6b3c67",
+             "08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",
+             "az01_q_cross_the_river_part2"),
+        )
         # Add state qualifiers to existing node-conversation rows when a
         # database was seeded before the extractor recorded them.  The
         # conversation name is authored metadata; this is only an idempotent
@@ -1576,6 +1735,46 @@ def ensure_schema(db):
                      "card_guid": "$condition.template_guid",
                      "quantity": 1, "one_time": True},
                 ]
+            elif (str(ename or "").strip().upper() ==
+                  "AZ 1 - NODE 10 - SQUASHING PUMPKINS"):
+                # The pack is an additional encounter reward. Keep currency
+                # repeatable while the authored pack entry is one-time.
+                rewards.pop("gold", None)
+                rewards.pop("xp", None)
+                rewards.pop("one_time", None)
+                rewards.pop("chest_guid", None)
+                rewards.pop("chest_template", None)
+                rewards.pop("pack_guid", None)
+                rewards["end_of_game_rewards"] = [
+                    {"gold": amount, "xp": amount, "one_time": False},
+                    {"chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
+                     "one_time": True},
+                ]
+            elif str(eguid).lower() == AZ1_GNASH_BRIDGES_SCENE_GUID:
+                # Defeating Zila River's Gnash Bridges encounter awards the
+                # authored one-time Ravenous Piranha card in addition to the
+                # encounter's repeatable currency reward.
+                rewards["gold"] = amount
+                rewards["xp"] = amount
+                rewards["one_time"] = False
+                rewards["end_of_game_rewards"] = [
+                    {"gold": amount, "xp": amount, "one_time": False},
+                    {"card_guid": AZ1_RAVENOUS_PIRANHA_CARD_GUID,
+                     "quantity": 1, "one_time": True},
+                ]
+            elif str(eguid).lower() == AZ1_CORRUPT_DRYAD_SCENE_GUID:
+                # Defeating Shadowgrove's Corrupt Dryad awards the authored
+                # one-time AZ1 Campaign Booster in addition to repeatable
+                # encounter currency.  The success conversation separately
+                # grants the race-specific equipment.
+                rewards["gold"] = amount
+                rewards["xp"] = amount
+                rewards["one_time"] = False
+                rewards["end_of_game_rewards"] = [
+                    {"gold": amount, "xp": amount, "one_time": False},
+                    {"chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
+                     "one_time": True},
+                ]
             else:
                 rewards["gold"] = amount
                 rewards["xp"] = amount
@@ -1766,6 +1965,37 @@ def ensure_schema(db):
             db.execute(
                 "UPDATE conversation_rewards SET reward_json=? WHERE conversation_guid=?",
                 (reward_json, conversation_guid))
+    # Existing databases already contain the Cross Zila equipment reward and
+    # may have recorded its one-time claim.  Merge the newly authored pack
+    # into that row without replacing any local/race-specific item mapping.
+    pack_conversation_guids = {
+        "5e5ec1cd-c869-43e8-82d4-417021954440",  # Cross Zila River
+        "08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",  # Cross Zodiac River
+    }
+    for pack_conversation_guid in pack_conversation_guids:
+        cross_zila_row = db.execute(
+            "SELECT reward_json FROM conversation_rewards WHERE conversation_guid=?",
+            (pack_conversation_guid,)).fetchone()
+        if not cross_zila_row:
+            continue
+        try:
+            cross_zila_reward = json.loads(cross_zila_row[0] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            cross_zila_reward = {}
+        if (isinstance(cross_zila_reward, dict) and
+                not cross_zila_reward.get("chest_guid")):
+            cross_zila_reward["chest_guid"] = AZ1_HOWLING_PLAINS_PACK_GUID
+            db.execute(
+                "UPDATE conversation_rewards SET reward_json=? "
+                "WHERE conversation_guid=?",
+                (json.dumps(cross_zila_reward, sort_keys=True),
+                 pack_conversation_guid))
+    # Node 10's pack belongs to the encounter result now.  Remove the older
+    # conversation-reward seed so completing Snoodley's success dialogue
+    # cannot award a second pack.
+    db.execute(
+        "DELETE FROM conversation_rewards WHERE conversation_guid=?",
+        ("d6018886-03f1-42c4-9f78-0d1dd353380e",))
     db.commit()
 
     # Seed stardust for existing users who don't have any (idempotent backfill).
