@@ -1512,6 +1512,15 @@ def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         scid, owner, coll, ct, template_id=tpl, cost=cost,
         attack=atk, defense=def_, state=int(current_state[0] or 0)
         if current_state else 0, nulling=(loc == "deck"))
+    if loc == "warzone" and old_loc != "warzone":
+        # Moving a card into play through a BOM (including a one-shot
+        # Deathcry) is still an enters-play event.  The normal card-cast path
+        # dispatches Deploy/Inspire after its zone move; keep generic zone
+        # moves on that same shared, metadata-driven path.
+        from .triggers import resolve_enters_play_triggers
+        resolve_enters_play_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            int(target), int(owner_row[0]) if owner_row else 0, 0)
     # Zone entry is an event in its own right.  Draw helpers emit this for
     # normal draws, while generic BOM moves must emit it here so Hand|Discard
     # triggers (for example a Reginald buried into its controller's discard)

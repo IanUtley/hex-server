@@ -27,7 +27,7 @@ import game_engine
 import db as dbmod
 
 from tests.tests_combat import (
-    make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER,
+    make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER, TPL_GLADIATOR,
 )
 
 SRC = os.environ.get(
@@ -1576,6 +1576,59 @@ def test_blood_cauldron_ai_pays_sacrifice_cost(db):
         db_module._db, ai._db = old_db, old_ai_db
 
 
+def test_wind_whisperer_ai_exhausts_best_blocker(db):
+    """Wind Whisperer's manual TapCard power should remove the strongest
+    legal opposing blocker before the AI attacks, rather than being skipped
+    because the BOM has no numeric modifier."""
+    import ai
+
+    wind_whisperer = "c4293b34-24a8-4807-a62a-bcbeec0a2585"
+    ability_guid = "effdee6a-283c-082c-9366-bb50fad00c08"
+    _copy_card(db, wind_whisperer)
+    _copy_ability(db, ability_guid)
+    src = sqlite3.connect(SRC)
+    db.execute("""CREATE TABLE champion_abilities (
+        champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
+        ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
+        threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
+        thresholds_json TEXT, target_template_ids TEXT)""")
+    db.execute(
+        "INSERT INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        src.execute(
+            "SELECT * FROM champion_abilities WHERE ability_guid=?",
+            (ability_guid,)).fetchone())
+    src.close()
+    add_card(db, 101, 5, TPL_GLADIATOR,
+             state=game_engine.ECardStates.StartedATurnOnYourSide)
+    add_card(db, 102, 5, TPL_ENFORCER,
+             state=game_engine.ECardStates.StartedATurnOnYourSide)
+
+    handler = HandlerStub(db)
+    handler._ai_champ_ability_guids = [ability_guid]
+    handler._champion_thresholds_met = lambda _ag, _state: True
+    old_db, old_ai_db = dbmod._db, ai._db
+    dbmod._db = db
+    ai._db = db
+    try:
+        session = SessionStub()
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        bstate = {
+            "ai_charges": 3, "ai_health": 20, "player_health": 20,
+            "ai_threshold": {64: 1}, "turn_number": 1,
+        }
+        assert ai.ai_use_champion_ability(
+            handler, game, session, ai_t, pl_t, bstate)
+        item = bstate["stack"][-1]
+        assert item["ability_guid"] == ability_guid
+        assert item["target_uid"] == 102, item
+        assert bstate["ai_charges"] == 0, bstate
+    finally:
+        dbmod._db, ai._db = old_db, old_ai_db
+    print("PASS Wind Whisperer AI targets best blocker")
+
+
 def test_concubunny_exhausts_selected_ready_shinhare(db):
     """Concubunny pays its authored ExhaustTarget before resolving its BOM.
 
@@ -1724,6 +1777,8 @@ def main():
          test_bunjitsu_charge_power_summon_and_buff),
         ("Blood Cauldron AI sacrifice payment",
          test_blood_cauldron_ai_pays_sacrifice_cost),
+        ("Wind Whisperer AI targets best blocker",
+         test_wind_whisperer_ai_exhausts_best_blocker),
         ("Concubunny exhausts selected ready Shin'hare",
          test_concubunny_exhausts_selected_ready_shinhare),
         ("Discard positions survive reconnect ordering",

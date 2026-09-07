@@ -2921,19 +2921,48 @@ def _set_crayburn_autostart(state, node):
         if d.get("node") == node:
             d["autostart"] = True
 
-def _reveal_crayburn_node(state, node):
-    """Uncover a castle node + its immediate next neighbour on the map."""
-    chain = _CASTLE_CHAIN
+
+def _crayburn_first_incomplete(state):
+    """Return the first unfinished authored castle node, if any."""
+    return next(
+        (node for node in _CASTLE_CHAIN[1:]
+         if not _is_location_completed(state, node)),
+        None,
+    )
+
+
+def _crayburn_return_node(state, node):
+    """Return the latest completed map node before an encounter."""
     try:
-        idx = chain.index(node)
+        idx = _CASTLE_CHAIN.index(node)
     except ValueError:
-        return
-    for n in chain[idx:idx + 2]:
+        return "Entrance"
+    for candidate in reversed(_CASTLE_CHAIN[:idx]):
+        if _is_location_completed(state, candidate):
+            return candidate
+    return _CASTLE_CHAIN[max(0, idx - 1)]
+
+
+def _reveal_crayburn_node(state, node):
+    """Synchronize castle fog-of-war with the first unfinished node.
+
+    The client renders an enabled/visible node as a legal destination.  Keep
+    the next node hidden until the current encounter or conversation has been
+    completed, including after a failed encounter is restored for retry.
+    """
+    first_incomplete = _crayburn_first_incomplete(state)
+    frontier = (len(_CASTLE_CHAIN) - 1 if first_incomplete is None else
+                _CASTLE_CHAIN.index(first_incomplete))
+    for idx, n in enumerate(_CASTLE_CHAIN):
         for loc in state.get("VisLocs", []):
             d = loc.get("Data", {})
             if d.get("node") == n:
-                d["visible"] = True
-                d["enabled"] = True
+                allowed = idx <= frontier
+                d["visible"] = allowed
+                d["enabled"] = allowed
+                if not allowed:
+                    d["autostart"] = False
+                break
 
 def _advance_crayburn(state, race_name, from_node, won):
     """Advance the Castle Crayburn dungeon chain from `from_node`.
@@ -3392,6 +3421,20 @@ def _prepare_dungeon_state(state, race_name=None):
                  if l.get("Data", {}).get("completed")]
     non_entrance_done = [n for n in completed if n and n != "Entrance"]
     if non_entrance_done:
+        # A failed encounter returns to the preceding map tile with ALoc
+        # empty.  Preserve that position while still repairing stale fog of
+        # war from older states that exposed a later node.
+        first_incomplete = _crayburn_first_incomplete(state)
+        last_node = _resolve_node(state, state.get("LastNode") or "")
+        if (state.get("ALoc") in (None, "") and
+                last_node == first_incomplete and
+                _crayburn_node_is_encounter(race_name, first_incomplete)):
+            # Older saves recorded a failed encounter's restored node as the
+            # physical position.  Convert that shape to the current map
+            # contract so the player is returned to the completed predecessor.
+            state["LastNode"] = _crayburn_return_node(state, first_incomplete)
+        _reveal_crayburn_node(
+            state, state.get("ALoc") or state.get("LastNode") or "Entrance")
         return state  # mid-run dungeon — leave ALoc as-is
     # A deferred marker can be left behind by an interrupted transition.  If
     # the run has started, expose that node directly so rejoining the dungeon
@@ -3402,13 +3445,25 @@ def _prepare_dungeon_state(state, race_name=None):
         (node for node in _CASTLE_CHAIN[1:]
          if not _is_location_completed(state, node)), None)
     if state.get("Started") and first_pending:
-        node = pending if pending and not _is_location_completed(state, pending) \
-            else first_pending
-        state["ALoc"] = node
-        state["LastNode"] = node
-        state["CurState"] = "EXPLORE"
-        _reveal_crayburn_node(state, node)
-        _set_crayburn_autostart(state, node)
+        last_node = _resolve_node(state, state.get("LastNode") or "")
+        # A failed encounter has already returned the token to a completed
+        # predecessor.  Do not reactivate the pending encounter on reconnect;
+        # the player must explicitly travel back to it from the map.
+        returned_to_map = (
+            state.get("ALoc") in (None, "") and
+            last_node in _CASTLE_CHAIN[1:] and
+            _CASTLE_CHAIN.index(last_node) <
+            _CASTLE_CHAIN.index(first_pending))
+        if returned_to_map:
+            _reveal_crayburn_node(state, last_node)
+        else:
+            node = pending if pending and not _is_location_completed(state, pending) \
+                else first_pending
+            state["ALoc"] = node
+            state["LastNode"] = node
+            state["CurState"] = "EXPLORE"
+            _reveal_crayburn_node(state, node)
+            _set_crayburn_autostart(state, node)
     elif state.get("ALoc") in (None, ""):
         # Before StartCamp, keep the player at the physical entrance.  The
         # startcamp handler advances to the first conversation itself.
@@ -4009,7 +4064,12 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
                        (json.dumps(state), camp_id))
             db.commit()
     if (ctype or "").upper() == "DUNGEON":
+        before = json.dumps(state, sort_keys=True)
         state = _prepare_dungeon_state(state, _race_name_for_campaign(db, camp_id))
+        if json.dumps(state, sort_keys=True) != before:
+            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                       (json.dumps(state), camp_id))
+            db.commit()
     resp = _build_input_response(camp_id, state, success=True)
     ret = _send_response(handler, json.dumps(resp), comp, session_id,
                          reqid, target, instance, conh, uid)
@@ -4177,6 +4237,9 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
     elif event_name == "visit_path":
         # The map client reports the authored path identifier separately from
         # StartLoc. Persist it so travelled paths remain lit after refresh.
+        if (ctype or "").upper() == "DUNGEON":
+            state = _prepare_dungeon_state(
+                state, _race_name_for_campaign(db, camp_id))
         pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
         paths = pdata.setdefault("visited_paths", [])
         values = (o_params[0] if o_params and
@@ -4266,11 +4329,68 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             data.pop("gaal_fortune_display_pending", None)
     elif (event_name == "conv_done" and
           (ctype or "").upper() == "DUNGEON"):
-        # Server-driven Crayburn dungeon: a conversation-only node's
-        # conversation finished → mark it done and advance to the next node.
-        advance_crayburn_step(handler, db, camp_id, True, comp, session_id,
-                              target, instance, conh, uid,
-                              auto_activate=False)
+        # Server-driven Crayburn dungeon: ordinary conversations and authored
+        # victory conversations advance the chain.  A defeat conversation is
+        # different: it is the result of a lost encounter and must restore the
+        # same encounter as retryable.  Do not infer victory merely because a
+        # conversation closed.
+        current = _resolve_node(
+            state, state.get("ALoc") or state.get("LastNode") or "Entrance")
+        current_data = next(
+            ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+             if current in ((loc.get("Data") or {}).get("node"),
+                            (loc.get("Data") or {}).get("name"))),
+            {},
+        )
+        node_data = _crayburn_node_data(
+            _race_name_for_campaign(db, camp_id), current)
+        active_conversation = current_data.get("conversationId")
+        defeat_conversation = node_data.get("fail")
+        pending_success = (
+            state.get("_pending_encounter_success") == current)
+        active_conversation_node = (
+            current_data.get("type") == "Convo" and
+            bool(active_conversation))
+
+        if active_conversation_node and active_conversation == defeat_conversation:
+            # The defeat dialogue is acknowledgement of a loss, not a node
+            # completion.  Restore the authored encounter so a later StartLoc
+            # can retry it, and clear ALoc so the client returns to the map
+            # instead of immediately reopening either conversation or battle.
+            return_node = _crayburn_return_node(state, current)
+            current_data.update({
+                "type": "Encounter",
+                "conversationId": None,
+                "encounter": _crayburn_scene_for_node(
+                    _race_name_for_campaign(db, camp_id), current),
+                "completed": False,
+                "enabled": True,
+                "visible": True,
+                "autostart": False,
+            })
+            state.pop("_pending_encounter_success", None)
+            state["ALoc"] = ""
+            state["LastNode"] = return_node
+            state["CurState"] = "EXPLORE"
+            _reveal_crayburn_node(state, return_node)
+            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                       (json.dumps(state), camp_id))
+            db.commit()
+        elif active_conversation_node or pending_success:
+            # Ordinary dungeon conversations and the explicitly pending
+            # victory conversation are the only conversation completions that
+            # advance the Crayburn chain.
+            advance_crayburn_step(handler, db, camp_id, True, comp, session_id,
+                                  target, instance, conh, uid,
+                                  auto_activate=False)
+        else:
+            # Ignore a stale/duplicate conv_done after a defeat conversation
+            # has already restored the encounter.  In particular, do not use
+            # LastNode as evidence that an encounter was won.
+            state["CurState"] = "EXPLORE"
+            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                       (json.dumps(state), camp_id))
+            db.commit()
         # advance_crayburn_step already persisted the updated state; reload
         # it so we return the post-advance state, not the stale pre-advance
         # copy that would otherwise be saved back and undo the advance.
@@ -6621,22 +6741,36 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
 
     if ract == 0:
         if (ctype or "").upper() == "DUNGEON":
+            state = _prepare_dungeon_state(
+                state, _race_name_for_campaign(db, camp_id))
             requested_node = _resolve_node(state, location_name)
-            # Recover old states where the client clicked a later map marker
-            # while the first conversation was still pending.  Keep the chain
-            # ordered and activate the next uncompleted node instead of
-            # clearing ALoc and leaving the player at the drawbridge.
-            expected_node = next(
-                (node for node in _CASTLE_CHAIN[1:]
-                 if not _is_location_completed(state, node)), None)
-            node = expected_node or requested_node
-            if node and _is_location_completed(state, node):
+            expected_node = _crayburn_first_incomplete(state)
+            requested_idx = (_CASTLE_CHAIN.index(requested_node)
+                             if requested_node in _CASTLE_CHAIN else None)
+            expected_idx = (_CASTLE_CHAIN.index(expected_node)
+                            if expected_node else None)
+            movement_rejected = bool(
+                requested_idx is None or
+                (expected_idx is not None and requested_idx > expected_idx))
+            if movement_rejected:
+                # Do not silently turn a click on a future marker into
+                # StartLoc for the current encounter.  That made Tower of
+                # Penworth appear reachable while Tower Gatehouse was still
+                # unfinished, and could launch the wrong battle on `start`.
+                node = _crayburn_return_node(
+                    state, expected_node or requested_node or "Entrance")
+                log(f"    Campaign movement rejected: {requested_node} is "
+                    f"locked; expected {expected_node}")
+                state["ALoc"] = ""
+                state["LastNode"] = node
+                state["CurState"] = "EXPLORE"
+                _reveal_crayburn_node(state, node)
+            else:
                 node = requested_node
-            state.pop("_pending_travel", None)
-            state["ALoc"] = node
-            state["LastNode"] = node
-            state["CurState"] = "EXPLORE"
-            if node:
+                state.pop("_pending_travel", None)
+                state["ALoc"] = node
+                state["LastNode"] = node
+                state["CurState"] = "EXPLORE"
                 _reveal_crayburn_node(state, node)
                 _set_crayburn_autostart(state, node)
         else:

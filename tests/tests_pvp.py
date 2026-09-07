@@ -173,6 +173,49 @@ def test_parity():
     print("PASS PvP combat parity with FRA")
 
 
+def test_pvp_combat_trigger_stays_on_authoritative_stack():
+    """PvP combat must leave chain triggers for the PvP resolve loop.
+
+    The shared combat resolver may discover a triggered ability, but it must
+    not pop it internally.  The PvP chain resolver is responsible for sending
+    RemovedTopOfChain, which is the client event that removes the chain card.
+    """
+    db = make_db(1001, 1002)
+    ai._db = db
+    bstate = {
+        "pvp": True, "pids": [1001, 1002],
+        "champ_map": {"1001": 9001, "1002": 9002},
+        "pvp_health_map": {1001: "player_health", 1002: "ai_health"},
+        "player_health": 20, "ai_health": 20,
+        "player_max_health": 20, "ai_max_health": 20,
+        "stack": [{
+            "kind": "trigger", "ability_guid": "wind-whisperer-trigger",
+            "source_uid": 9001, "instance_id": 17,
+        }],
+    }
+    captured = {}
+
+    def _capture(game, pl_t, ai_t, state):
+        captured["game"] = game
+
+    try:
+        ai.resolve_combat(
+            HandlerStub(db), SessionStub(),
+            game_engine.UID.make(244, 1001),
+            game_engine.UID.make(244, 1002),
+            bstate, {101: 9002}, {},
+            game_engine.UID.make(244, 1001),
+            game_engine.UID.make(244, 1002), "pvp_attackers",
+            send_events=_capture)
+        assert len(bstate["stack"]) == 1, bstate
+        assert not any(
+            isinstance(event, game_engine.ChainEmptySessionEventArgs)
+            for event in captured["game"].events)
+    finally:
+        db.close()
+    print("PASS PvP combat trigger remains on chain")
+
+
 def test_phase_selection_after_blockers():
     """PVP chooses combat phases after the blocker response window closes."""
     db = make_db(1001, 1002)
@@ -340,6 +383,115 @@ def test_pvp_main_options_offer_resource_until_turn_played():
         game_engine.Game.make_network_packet = previous["packet"]
         db.close()
     print("PASS PvP resource option visibility")
+
+
+def test_pvp_champion_options_exclude_triggers_and_basic_on_chain():
+    """Triggered champion abilities never become clickable options.
+
+    Wind Whisperer's Channelling is a zero-cost triggered ability. A pending
+    chain must also hide BasicAction champion powers even when the current
+    phase is a main phase, because the client retains the latest option list
+    while the chain animation is resolving.
+    """
+    db = make_db(1001, 1002)
+    champion_tpl = "77777777-7777-7777-7777-777777777777"
+    triggered = "88888888-8888-8888-8888-888888888888"
+    manual = "99999999-9999-9999-9999-999999999999"
+    db.execute(
+        "CREATE TABLE champion_templates_extended ("
+        "guid TEXT PRIMARY KEY, name TEXT, race TEXT, champion_class TEXT, "
+        "gender TEXT, is_selectable INTEGER, starting_health INTEGER, "
+        "faction TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE champion_templates (guid TEXT PRIMARY KEY)"
+    )
+    db.execute(
+        "CREATE TABLE champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER, "
+        "threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER, "
+        "thresholds_json TEXT, target_template_ids TEXT)"
+    )
+    db.execute(
+        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (champion_tpl, "Wind Whisperer", "Troop", 0, 0, 0, 0,
+         "[]", "[]", "")
+    )
+    db.execute(
+        "INSERT INTO champion_templates_extended VALUES (?,?,?,?,?,?,?,?)",
+        (champion_tpl, "Wind Whisperer", "Elf", "Cleric", "", 1, 20,
+         "Diamond")
+    )
+    db.executemany(
+        "INSERT INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        [(champion_tpl, "Wind Whisperer", triggered, "Channelling", 0, 0,
+          "", "When a troop deals damage, gain a charge.", 64, "[]", "[]"),
+         (champion_tpl, "Wind Whisperer", manual, "Exhaust target troop", 1,
+          0, "", "Exhaust target troop.", 8, "[]", "[]")]
+    )
+    db.execute(
+        "INSERT INTO game_cards (session_id,user_id,card_uid,template_guid,"
+        "card_template_id,location,position,card_state,card_abilities,"
+        "card_type,card_attributes) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (1, 1001, 9001, champion_tpl, champion_tpl, "champion", 0, 0,
+         "[]", "Champion", 0)
+    )
+    db.commit()
+
+    previous = (
+        tournament_game._db, dbmod._db, tournament_game.ability_graph)
+    try:
+        tournament_game._db = db
+        dbmod._db = db
+        tournament_game.ability_graph = lambda _store, guid: SimpleNamespace(
+            manual=str(guid).lower() == manual, targets=())
+
+        state = {
+            "pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+            "phase": game_engine.ETurnPhases.FirstMainPhase,
+            "champ_map": {"1001": 9001}, "chg_1001": 1,
+        }
+        pl_t = game_engine.UID.make(244, 1001)
+        opp_t = game_engine.UID.make(244, 1002)
+
+        game = game_engine.Game(1, pl_t, opp_t)
+        game.push_options(pl_t, [])
+        tournament_game._pvp_add_champion_options(
+            game, SessionStub(), state, 1001, pl_t)
+        option_list = next(
+            event for event in game.events
+            if isinstance(event, game_engine.PlayerOptionListSessionEventArgs)
+        )
+        champion_options = [
+            option for option in option_list.options
+            if int(option.card.uid.uid64) == 9001]
+        assert len(champion_options) == 1
+        assert [str(instance.opt_id.guid) for instance in
+                champion_options[0].instances] == [manual]
+        champion_def = next(definition for card, definition in
+                            game.card_defs.items()
+                            if int(card.uid.uid64) == 9001)
+        assert {str(ability.guid) for ability in champion_def.abilities} == {
+            triggered, manual}
+
+        state["stack"] = [{"kind": "trigger", "ability_guid": triggered}]
+        game = game_engine.Game(1, pl_t, opp_t)
+        game.push_options(pl_t, [])
+        tournament_game._pvp_add_champion_options(
+            game, SessionStub(), state, 1001, pl_t)
+        option_list = next(
+            event for event in game.events
+            if isinstance(event, game_engine.PlayerOptionListSessionEventArgs)
+        )
+        champion_options = [
+            option for option in option_list.options
+            if int(option.card.uid.uid64) == 9001]
+        assert champion_options and champion_options[0].instances == []
+    finally:
+        tournament_game._db, dbmod._db, tournament_game.ability_graph = previous
+        db.close()
+    print("PASS PvP champion options exclude triggers/on-chain BasicActions")
 
 
 def test_pvp_activation_summoning_sickness_only_applies_to_troops():
@@ -727,10 +879,12 @@ def test_pvp_steadfast_attacker_stays_untapped():
 
 if __name__ == "__main__":
     test_parity()
+    test_pvp_combat_trigger_stays_on_authoritative_stack()
     test_constant_is_not_offered_as_pvp_attacker()
     test_phase_selection_after_blockers()
     test_pvp_state_view_preserves_escalation_and_charges()
     test_pvp_main_options_offer_resource_until_turn_played()
+    test_pvp_champion_options_exclude_triggers_and_basic_on_chain()
     test_pvp_activation_summoning_sickness_only_applies_to_troops()
     test_pvp_hand_refresh_pushes_current_dynamic_cost()
     test_mulligan_priority_is_sent_to_both_clients()

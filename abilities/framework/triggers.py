@@ -475,10 +475,12 @@ def _apply_health_gain(game, bstate, pl_t, ai_t, amount, source_owner_uid,
     # no champion gains health (continuous static flag from the statics layer).
     if db is not None and handler is not None and session is not None:
         try:
-            from .statics import global_flags
+            from .statics import global_flags, health_gain_bonus
             if "cant_gain_health" in global_flags(
                     db, session.session_id, bstate):
                 return "prevented: champions can't gain health"
+            amount += health_gain_bonus(
+                db, session.session_id, bstate, source_owner_uid)
         except Exception:
             pass
     new_val = cur + amount

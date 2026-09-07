@@ -3006,6 +3006,15 @@ class HCPHandler:
         from db import db_talent_ability_costs
         afford = []
         for aid in (abilities or []):
+            # Champion ability lists contain both player-activated powers and
+            # automatic talent triggers.  The latter must remain available to
+            # the trigger dispatcher, but they are not client-activatable
+            # abilities and must not light up the champion card in an option
+            # packet.  Use the typed Records graph as the authority so this
+            # stays data-driven for talents and signature powers alike.
+            graph = _records_ability_graph(self, str(aid.guid))
+            if graph is not None and not graph.manual:
+                continue
             row = db_talent_ability_costs(str(aid.guid))
             if row is None:
                 # Champion signature charge powers (champion_abilities) aren't
@@ -8967,7 +8976,9 @@ class HCPHandler:
                 log_req(f"    Ignored stale pass (client phase {pass_turn_phase} != {_be.current_phase(bstate)})")
                 self._push_transaction_ack(session)
                 handled = True
-            elif bstate.get("turn_player") == _be.AI or bstate.get("ai_turn_phase_idx") is not None:
+            elif (_be.stack_empty(bstate) and
+                  (bstate.get("turn_player") == _be.AI or
+                   bstate.get("ai_turn_phase_idx") is not None)):
                 # The human passed during the AI's turn (an opponent-stop
                 # phase). Resume the AI turn from the next phase.
                 start_idx = bstate.get("ai_turn_phase_idx", 0)
@@ -9046,38 +9057,53 @@ class HCPHandler:
                                 not bstate.get("pending_trigger") and
                                 not bstate.get("pending_deck_search")):
                             gs.push_chain_empty()
-                        # Priority to the active player for the next item
-                        # (or the next phase). ResolveTopOfChain keeps the
-                        # pass button labelled "Resolve <Card>".
                         cur_phase = _be.current_phase(bstate)
-                        if (_be.stack_empty(bstate) and
-                                not bstate.get("pending_choice") and
-                                not bstate.get("pending_trigger") and
-                                not bstate.get("pending_deck_search") and
-                                bstate.get("turn_player") == _be.PLAYER):
-                            if cur_phase == game_engine.ETurnPhases.FirstMainPhase:
-                                # A troop may have entered during this chain
-                                # (notably a Speed troop). Recompute before
-                                # rebuilding the green light so the next
-                                # prompt immediately offers ProceedToCombat.
-                                bstate["player_has_ready_troop"] = self._player_can_attack_troops(session)
-                                bstate["turn_phases"] = _be.build_turn_phases(bstate)
-                                _be.save_state(session, bstate)
-                            # The chain fully emptied on the player's turn:
-                            # re-announce the current phase with the player as
-                            # priority player so the client pushes a FRESH state.
-                            # Without this the prior state's cached button tail
-                            # (the resolved card's name, set only under
-                            # ResolveTopOfChain) lingers — the pass button shows
-                            # "Continue to Second Main Phase <CardName>".
-                            gs.push_turn_phase(cur_phase, pl_t, pl_t)
-                            self._push_phase_options(session, pl_t, ai_t, cur_phase)
-                        if not (bstate.get("pending_choice") or
-                                bstate.get("pending_trigger") or
-                                bstate.get("pending_deck_search")):
-                            gs.push_green_light(pl_t, self._priority_context_for(
-                                cur_phase, bstate))
-                        self._send_battle_events(session, gs, pl_t)
+                        pending_input = (bstate.get("pending_choice") or
+                                         bstate.get("pending_trigger") or
+                                         bstate.get("pending_deck_search"))
+                        paused_ai_idx = (
+                            bstate.get("ai_turn_phase_idx")
+                            if (_be.stack_empty(bstate) and not pending_input and
+                                bstate.get("turn_player") == _be.AI)
+                            else None)
+                        if paused_ai_idx is not None:
+                            # The chain interrupted an AI phase. Once the
+                            # human resolves the item, continue the AI from
+                            # its saved cursor; granting another human
+                            # greenlight here strands the turn between phases.
+                            bstate.pop("ai_turn_phase_idx", None)
+                            _be.save_state(session, bstate)
+                            self._send_battle_events(session, gs, pl_t)
+                            self._run_ai_turn(
+                                session, pl_t, ai_t, bstate,
+                                start_idx=int(paused_ai_idx))
+                        else:
+                            # Priority to the active player for the next item
+                            # (or the next phase). ResolveTopOfChain keeps the
+                            # pass button labelled "Resolve <Card>".
+                            if (_be.stack_empty(bstate) and not pending_input and
+                                    bstate.get("turn_player") == _be.PLAYER):
+                                if cur_phase == game_engine.ETurnPhases.FirstMainPhase:
+                                    # A troop may have entered during this chain
+                                    # (notably a Speed troop). Recompute before
+                                    # rebuilding the green light so the next
+                                    # prompt immediately offers ProceedToCombat.
+                                    bstate["player_has_ready_troop"] = self._player_can_attack_troops(session)
+                                    bstate["turn_phases"] = _be.build_turn_phases(bstate)
+                                    _be.save_state(session, bstate)
+                                # The chain fully emptied on the player's turn:
+                                # re-announce the current phase with the player as
+                                # priority player so the client pushes a FRESH state.
+                                # Without this the prior state's cached button tail
+                                # (the resolved card's name, set only under
+                                # ResolveTopOfChain) lingers — the pass button shows
+                                # "Continue to Second Main Phase <CardName>".
+                                gs.push_turn_phase(cur_phase, pl_t, pl_t)
+                                self._push_phase_options(session, pl_t, ai_t, cur_phase)
+                            if not pending_input:
+                                gs.push_green_light(pl_t, self._priority_context_for(
+                                    cur_phase, bstate))
+                            self._send_battle_events(session, gs, pl_t)
                         log_req(f"    Resolved chain item {item.get('kind')} "
                                 f"({item.get('ability_guid', '')[:8] or hex(item.get('source_uid') or 0)})")
                     else:

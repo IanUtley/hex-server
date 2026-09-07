@@ -978,10 +978,19 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 scid, owner_uid, game_engine.ECardCollections.Warzone,
                 ct, template_id=tpl,
                 state=int(st or 0))
-        # Combat deaths (a blocker/attacker that died) fired Deathcries onto the
-        # chain; drain them now — a player-facing discard prompt persists via
-        # pending_discard_* in bstate and resolves when the player answers it.
-        if not _be.stack_empty(bstate):
+        # PvP combat-triggered abilities belong to the authoritative PvP
+        # priority loop.  Do not drain them here: this resolver can emit the
+        # trigger's AbilityPushedOnChain event, but only
+        # tournament_game._pvp_resolve_chain emits the matching
+        # TopOfChainResolved/RemovedTopOfChain pair that removes the client
+        # chain visual.  Draining here leaves the server stack empty while
+        # the client's champion/ability remains displayed on the chain.
+        #
+        # The legacy PvE path still drains its combat stack here so existing
+        # discard-prompt and AI combat behavior remains unchanged.  Combat
+        # Deathcries are deferred below and therefore do not rely on this
+        # drain.
+        if not _be.stack_empty(bstate) and not bstate.get("pvp"):
             _be.stack_set_pass(bstate, _be.PLAYER, True)
             _be.stack_set_pass(bstate, _be.AI, True)
             while not _be.stack_empty(bstate):
@@ -1978,6 +1987,8 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                            if t == "CardModifierAbilityEffectTemplate"
                            and (pm.get("property") or "").lower()
                            in ("attribute", "attack", "defense")]
+        tap_effects = [pm for t, pm in params
+                       if t == "TapCardAbilityEffectTemplate"]
         ready_lock = any(
             (pm.get("property") or "").lower() == "attribute"
             and pm.get("duration") == "AfterCardsReadyOnPlayersTurn"
@@ -1990,6 +2001,82 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
         worth = False
         ai_health = int(battle_state.get("ai_health", 20))
         player_health = int(battle_state.get("player_health", 20))
+        if tap_effects:
+            # A pure TapCard power is removal even though it has no numeric
+            # modifier for the classifier above. Resolve its authored target
+            # template first, then choose the strongest legal opposing troop
+            # that can actually block: exhausting a tapped or summoning-sick
+            # troop does not remove a blocker from the upcoming combat.
+            target_row = _db.execute(
+                "SELECT target_template_ids FROM champion_abilities "
+                "WHERE ability_guid=? LIMIT 1", (ag,)).fetchone()
+            try:
+                target_template_ids = [str(t).lower() for t in
+                                       (_j.loads(target_row[0]) or [])
+                                       if t] if target_row and target_row[0] else []
+            except (TypeError, ValueError, _j.JSONDecodeError):
+                target_template_ids = []
+            if target_template_ids:
+                from abilities.framework.targeting import (
+                    legal_targets, target_uses_both_players)
+                candidate_uids = set()
+                for target_template_id in target_template_ids:
+                    candidate_uids.update(int(uid) for uid in legal_targets(
+                        _db, session.session_id, 0, target_template_id,
+                        ai_champ_scid.uid.uid64,
+                        both_players=target_uses_both_players(
+                            _db, target_template_id),
+                        champions=handler._champion_targets(),
+                        battle_state=battle_state))
+                opponent_id = int(pl_t.uid64) >> 8
+                marks = ",".join("?" for _ in candidate_uids)
+                if marks:
+                    blocker_rows = _db.execute(
+                        "SELECT gc.card_uid, gc.card_state "
+                        "FROM game_cards gc "
+                        "WHERE gc.session_id=? AND gc.user_id=? "
+                        "AND gc.location='warzone' "
+                        "AND gc.card_type LIKE '%Troop%' "
+                        f"AND gc.card_uid IN ({marks})",
+                        [session.session_id, opponent_id] +
+                        [int(uid) for uid in candidate_uids]).fetchall()
+                    try:
+                        import ai_eval as _aieval
+                        value_eval = _aieval.build_evaluator(
+                            handler, session, battle_state, ai_t, pl_t)
+                        value_by_uid = {
+                            int(card.card_uid): value_eval.get_card_value(card)
+                            for card in value_eval.player_warzone}
+                    except Exception:
+                        value_by_uid = {}
+                    from abilities.framework.statics import effective_stats
+                    best_blocker = None
+                    for blocker_uid, blocker_state in blocker_rows:
+                        blocker_uid = int(blocker_uid)
+                        blocker_state = int(blocker_state or 0)
+                        if blocker_state & game_engine.ECardStates.Tapped:
+                            continue
+                        atk, defense, attrs, _flags, _rage = effective_stats(
+                            _db, session.session_id, battle_state,
+                            blocker_uid)
+                        if attrs & game_engine.ECardAttributes.SpellShield:
+                            continue
+                        if not (blocker_state &
+                                game_engine.ECardStates.StartedATurnOnYourSide) \
+                                and not (attrs & game_engine.ECardAttributes.Speed):
+                            continue
+                        # Match AIFunctions.OrderTroopsByValue's useful-target
+                        # gate: tiny troops are not worth spending a charge on
+                        # merely to remove a blocker.
+                        if atk <= 1 and defense <= 2:
+                            continue
+                        score = (value_by_uid.get(blocker_uid, 0.0),
+                                 int(atk), int(defense), -blocker_uid)
+                        if best_blocker is None or score > best_blocker[0]:
+                            best_blocker = (score, blocker_uid)
+                    if best_blocker is not None:
+                        worth = True
+                        target_uid = best_blocker[1]
         if summons:
             # Summon a token: worth it when we have no troop advantage and
             # aren't about to die (Poca's Blaze Elemental, Bun'jitsu's

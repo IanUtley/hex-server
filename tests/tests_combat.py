@@ -480,7 +480,7 @@ def test_champion_collection_updates_are_suppressed(db):
 
 
 def test_basic_champion_power_is_not_activatable_on_chain(db):
-    """BasicAction champion powers are not offered while a chain is pending."""
+    """Only manual champion powers are offered while a chain is pending."""
     import battle_engine as be
     import db as dbmod
     from hconnect_server import HCPHandler
@@ -488,13 +488,24 @@ def test_basic_champion_power_is_not_activatable_on_chain(db):
     class Ability:
         guid = "basic-champion-power"
 
+    class TriggeredAbility:
+        guid = "triggered-champion-talent"
+
     handler = object.__new__(HCPHandler)
     handler._champion_thresholds_met = lambda _guid, _state: True
     old_db = dbmod._db
     dbmod._db = object()
     try:
-        with mock.patch("db.db_talent_ability_costs", return_value=(
-                2, 0, 1 << game_engine.ETurnPhases.FirstMainPhase, 8)), \
+        def graph_for(_handler, guid):
+            return mock.Mock(manual=(guid == "basic-champion-power"),
+                             trigger_event_type=(
+                                 "" if guid == "basic-champion-power"
+                                 else "Game.Shared.Mechanics.CardCastEvent"))
+
+        with mock.patch("hconnect_server._records_ability_graph",
+                        side_effect=graph_for), \
+                mock.patch("db.db_talent_ability_costs", return_value=(
+                    2, 0, 1 << game_engine.ETurnPhases.FirstMainPhase, 8)), \
                 mock.patch("db.db_champion_ability_costs", return_value=None):
             bstate = {
                 "player_charges": 2,
@@ -510,6 +521,9 @@ def test_basic_champion_power_is_not_activatable_on_chain(db):
                 handler, [Ability()], bstate,
                 game_engine.ETurnPhases.FirstMainPhase)[0].guid == \
                 "basic-champion-power"
+            assert HCPHandler._filter_affordable_abilities(
+                handler, [TriggeredAbility()], bstate,
+                game_engine.ETurnPhases.FirstMainPhase) == []
     finally:
         dbmod._db = old_db
 
@@ -538,6 +552,41 @@ def test_game_started_chain_is_auto_passed(db):
         session, pl_t, ai_t, bstate, game) == 2
     assert resolved == [2, 1]
     assert be.stack_empty(bstate)
+
+
+def test_ai_turn_chain_pass_resolves_before_resuming_ai(db):
+    """A trigger raised during an AI phase must resolve before the AI resumes."""
+    import battle_engine as be
+    from hconnect_server import HCPHandler
+
+    handler = object.__new__(HCPHandler)
+    handler.client_reck_id = 5
+    handler.user_profile = {"id": 5}
+    session = SessionStub()
+    phase_idx = be.COMBAT_TURN_PHASES.index(
+        game_engine.ETurnPhases.AssignDamage)
+    bstate = be.default_state(turn_player=be.AI)
+    bstate["turn_phases"] = list(be.COMBAT_TURN_PHASES)
+    bstate["phase_idx"] = phase_idx
+    bstate["ai_turn_phase_idx"] = phase_idx + 1
+    bstate["stack"] = [{"kind": "trigger", "ability_guid": "channel"}]
+    session.turn_order = bstate
+
+    handler._resolve_stack_item = mock.Mock()
+    handler._run_ai_turn = mock.Mock()
+    handler._send_battle_events = mock.Mock()
+
+    transaction = mock.Mock(
+        inner_bytes=b"",
+        pass_turn_phase=game_engine.ETurnPhases.AssignDamage)
+    handler._handle_pass_priority_transaction(session, transaction)
+
+    handler._resolve_stack_item.assert_called_once()
+    handler._run_ai_turn.assert_called_once_with(
+        session, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        bstate, start_idx=phase_idx + 1)
+    assert be.stack_empty(bstate)
+    assert "ai_turn_phase_idx" not in bstate
 
 
 def test_completed_game_started_chain_events_are_not_rendered(db):
@@ -1483,6 +1532,8 @@ def main():
         ("Basic champion power not activatable on chain",
          test_basic_champion_power_is_not_activatable_on_chain),
         ("GameStarted chain auto-pass", test_game_started_chain_is_auto_passed),
+        ("AI chain pass resumes AI",
+         test_ai_turn_chain_pass_resolves_before_resuming_ai),
         ("Completed GameStarted chain is hidden",
          test_completed_game_started_chain_events_are_not_rendered),
         ("CardUpdated carries Rage", test_card_updated_carries_rage),

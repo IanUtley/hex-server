@@ -384,6 +384,148 @@ def test_az1_opening_uses_the_underworld_route_and_fog_gates():
         os.unlink(path)
 
 
+def test_crayburn_defeat_conversation_keeps_encounter_retryable():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        state = campaign._build_initial_gameplay_state(
+            15, 7, "DUNGEON", "Shin'hare")
+        state.update({
+            "Started": "2026-09-07T00:00:00Z",
+            "ALoc": "TowerGate",
+            "LastNode": "TowerGate",
+        })
+        for node in campaign._CASTLE_CHAIN[1:5]:
+            campaign._mark_location_completed(state, node)
+        tower_gate = next(
+            item["Data"] for item in state["VisLocs"]
+            if item["Data"].get("node") == "TowerGate")
+        tower_gate_fail = campaign._crayburn_node_data(
+            "Shin'hare", "TowerGate")["fail"]
+        tower_gate.update({
+            "type": "Convo",
+            "conversationId": tower_gate_fail,
+            "encounter": None,
+            "completed": False,
+            "autostart": True,
+        })
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), 15))
+        db.commit()
+
+        # This handler path normally writes a protocol response and pushes a
+        # campaign update.  The state transition is all this regression test
+        # needs to observe.
+        campaign._send_response = lambda *args, **kwargs: None
+        campaign.push_campupdate = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        event = {"CampID": 15, "Event": "conv_done", "OParms": None}
+        campaign._handle_sendevent(
+            handler, db, event, 0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        raw = db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0]
+        after = json.loads(raw)
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in after["VisLocs"]
+        }
+        assert locations["TowerGate"]["completed"] is False
+        assert locations["TowerGate"]["type"] == "Encounter"
+        assert locations["TowerGate"]["conversationId"] is None
+        assert locations["TowerGate"]["encounter"] == \
+            "c5cbbc95-a4ba-461e-9d42-1c592f120b1a"
+        assert locations["PenworthTower"]["completed"] is False
+        assert locations["PenworthTower"]["visible"] is False
+        assert locations["PenworthTower"]["enabled"] is False
+        assert after["ALoc"] == ""
+        assert after["LastNode"] == "InnerBailey"
+
+        # A duplicate/stale acknowledgement must not use LastNode to turn the
+        # failed encounter into a win.
+        campaign._handle_sendevent(
+            handler, db, event, 0, "", 0, "ServiceCampaign", "253", 0, 0)
+        raw = db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0]
+        duplicate = json.loads(raw)
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in duplicate["VisLocs"]
+        }
+        assert locations["TowerGate"]["completed"] is False
+        assert locations["PenworthTower"]["completed"] is False
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_crayburn_locked_future_node_does_not_replace_tower_gate_start():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_launch_encounter = campaign._launch_encounter
+    try:
+        state = campaign._build_initial_gameplay_state(
+            15, 7, "DUNGEON", "Shin'hare")
+        state.update({
+            "Started": "2026-09-07T00:00:00Z",
+            "ALoc": "",
+            "LastNode": "InnerBailey",
+        })
+        for node in campaign._CASTLE_CHAIN[1:5]:
+            campaign._mark_location_completed(state, node)
+        # Simulate an old save that leaked the future marker to the client.
+        penworth = next(
+            item["Data"] for item in state["VisLocs"]
+            if item["Data"].get("node") == "PenworthTower")
+        penworth.update({"visible": True, "enabled": True})
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), 15))
+        db.commit()
+
+        campaign._send_response = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_locaction(
+            handler, db,
+            {"CampID": 15, "RAct": 0, "Loc": "PenworthTower"},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        after_reject = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0])
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in after_reject["VisLocs"]
+        }
+        assert after_reject["ALoc"] == ""
+        assert after_reject["LastNode"] == "InnerBailey"
+        assert locations["PenworthTower"]["visible"] is False
+        assert locations["PenworthTower"]["enabled"] is False
+
+        # The legal destination remains Tower Gatehouse, and its authored
+        # encounter is the one launched by the subsequent start event.
+        campaign._handle_locaction(
+            handler, db,
+            {"CampID": 15, "RAct": 0, "Loc": "TowerGate"},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        active = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0])
+        assert active["ALoc"] == "TowerGate"
+
+        launched = []
+        campaign._launch_encounter = lambda *args, **kwargs: launched.append(args[4])
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": 15, "Event": "start", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        assert launched == ["c5cbbc95-a4ba-461e-9d42-1c592f120b1a"]
+    finally:
+        campaign._send_response = original_send_response
+        campaign._launch_encounter = original_launch_encounter
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     tests = [
         test_cross_zila_objective_is_linked_to_savage_lord,
@@ -394,6 +536,8 @@ if __name__ == "__main__":
         test_az1_scene_lookup_keeps_authored_node_variants_distinct,
         test_az1_objectives_use_faction_specific_conversations,
         test_az1_opening_uses_the_underworld_route_and_fog_gates,
+        test_crayburn_defeat_conversation_keeps_encounter_retryable,
+        test_crayburn_locked_future_node_does_not_replace_tower_gate_start,
     ]
     for test in tests:
         test()

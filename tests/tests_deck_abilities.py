@@ -44,6 +44,7 @@ TPL = {
     "burn": "609a5ce4-24a4-4470-98d1-e64b8a8a4531",
     "gladiator": "33f03766-e38e-4a77-ac1e-bbc78a55ddbb",
     "wretched_wrangler": "638e079b-7d0a-4c9e-a81f-ca29e918731c",
+    "lifeweaver": "410c66bb-243b-489f-b2d2-c3a96089a717",
 }
 
 ABILITIES = [
@@ -62,6 +63,7 @@ ABILITIES = [
     "615f9a45-325b-7b84-22c0-7721bfa68ded",  # Prairie Scout target attacking
     "81712882-30ed-c365-1d90-211966640219",  # Burn champion-or-troop
     "b95fdd81-2eca-f2cb-b28b-c5ec70307ca0",  # Shamed Gladiator deploy "you"
+    "7ad2af0a-7e18-ee3d-e8e0-7c050844770d",  # Lifeweaver Shaman health gain
 ]
 
 
@@ -345,6 +347,26 @@ def test_lifesteal_heal_fires_healed_trigger(db):
     pal = db.execute(
         "SELECT permanent_buffs FROM game_cards WHERE card_uid=101").fetchone()[0]
     assert '"atk": 1' in pal and '"def": 1' in pal, pal
+
+
+def test_lifeweaver_shamans_stack_on_each_health_gain(db):
+    """Each Lifeweaver Shaman modifies every gain, including later gains."""
+    add_card(db, 103, 5, "lifeweaver", "warzone")
+    add_card(db, 104, 5, "lifeweaver", "warzone")
+    pl_t, ai_t, game, bstate = new_game(db)
+    session = SessionStub()
+    handler = HandlerStub()
+    handler._db = db
+    from abilities.framework.triggers import _apply_health_gain
+
+    # Harvest Moon's base gain: 4 + 1 per Shaman.
+    _apply_health_gain(game, bstate, pl_t, ai_t, 4, 5,
+                       db=db, handler=handler, session=session)
+    assert bstate["player_health"] == 26, bstate["player_health"]
+    # Whispering Breeze's Foretelling gain: 3 + 1 per Shaman.
+    _apply_health_gain(game, bstate, pl_t, ai_t, 3, 5,
+                       db=db, handler=handler, session=session)
+    assert bstate["player_health"] == 31, bstate["player_health"]
 
 
 def test_dimmid_starting_health(db):
@@ -770,6 +792,69 @@ def test_consumed_one_shot_stays_off_card_updated(db):
     assert game.events[-1].abilities == [], game.events[-1].abilities
 
 
+def test_move_into_play_fires_deploy(db):
+    """A one-shot Deathcry return must run the returned troop's Deploy."""
+    from abilities.framework.bom import _LEAFS
+
+    moon_tpl = "7970c0c9-cae4-41f2-8f56-8cb64f9e3e4d"
+    deploy = "dfc60750-4bb5-8218-770e-7d3a37be8da7"
+    one_shot = "89285cf9-97ba-5b40-3a91-ba14ecfccd2a"
+    move_effect = "e162c350-9df1-f4d8-cbce-2563eab4f05f"
+    src = sqlite3.connect(SRC)
+    row = src.execute(
+        "SELECT guid, name, card_type, cost, attack, defense, attributes, "
+        "abilities_json, threshold_json, subtype FROM card_templates "
+        "WHERE guid=?", (moon_tpl,)).fetchone()
+    db.execute("INSERT OR REPLACE INTO card_templates VALUES "
+               "(?,?,?,?,?,?,?,?,?,?)", row)
+    src.close()
+    for ability_guid in (deploy, one_shot):
+        src = sqlite3.connect(SRC)
+        meta = src.execute(
+            "SELECT ability_guid, is_triggered, trigger_event_type, game_text, "
+            "raw_json, casting_behavior, is_manual, activation_cost, "
+            "uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use "
+            "FROM card_abilities_meta WHERE ability_guid=?", (ability_guid,)
+        ).fetchone()
+        db.execute("INSERT OR REPLACE INTO card_abilities_meta VALUES "
+                   "(?,?,?,?,?,?,?,?,?,?,?,?)", meta)
+        for effect in src.execute(
+                "SELECT ability_guid, effect_guid, effect_order, effect_type, "
+                "param, effect_group_id, condition_id, target_index, "
+                "effect_instance_id, contingent_effect_instance_id, "
+                "secondary_target_index, recalculate_targets, is_optional, "
+                "effect_duration, output_variables FROM ability_effects "
+                "WHERE ability_guid=?", (ability_guid,)):
+            db.execute("INSERT OR REPLACE INTO ability_effects VALUES "
+                       "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", effect)
+        src.close()
+    add_card(db, 101, 5, moon_tpl, "discard")
+    db.execute(
+        "UPDATE game_cards SET card_abilities=? WHERE card_uid=101",
+        (json.dumps([deploy, one_shot]),))
+    db.commit()
+
+    pl_t, ai_t, game, bstate = new_game(db)
+    session = SessionStub()
+    handler = HandlerStub()
+    handler._db = db
+    bstate.update({
+        "resolving_source_uid": 101,
+        "resolving_target_uid": 101,
+        "resolving_ability": one_shot,
+    })
+    _LEAFS["MoveCardToZoneEffectTemplate"](
+        game, session, db, handler, pl_t, ai_t, bstate, move_effect,
+        json.dumps({"destination": "Warzone", "name": "PutThisIntoPlay"}))
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0] == \
+        "warzone"
+    assert any(
+        isinstance(event, game_engine.AbilityPushedOnChainSessionEventArgs)
+        and str(event.ability_template_id.guid).lower() == deploy
+        for event in game.events), game.events
+
+
 def test_poca_ability_no_picker(db):
     """Poca's 'Summon a Blaze Elemental' has a 'You' auto target — it must NOT
     attach a champion-ability target picker."""
@@ -1003,6 +1088,8 @@ def test_voiding_exile_returns_voided_cards(db):
 if __name__ == "__main__":
     run("heal chain (Scrivener -> Paladin/Incantation)", test_heal_chain)
     run("lifesteal heal fires healed triggers", test_lifesteal_heal_fires_healed_trigger)
+    run("Lifeweaver Shamans stack on each health gain",
+        test_lifeweaver_shamans_stack_on_each_health_gain)
     run("Dimmid starts at 19 from champion table", test_dimmid_starting_health)
     run("Prairie Scout gated to combat + attacking troop", test_prairie_scout_activation_gating)
     run("PreGame health counts only heal leaves", test_pregame_health_counts_only_heals)
@@ -1017,6 +1104,7 @@ if __name__ == "__main__":
     run("Auto targets never show a picker", test_auto_target_no_picker)
     run("Gem survives instance-less re-push", test_gem_survives_repush)
     run("Consumed one-shot leaves CardUpdated", test_consumed_one_shot_stays_off_card_updated)
+    run("Move into play fires Deploy", test_move_into_play_fires_deploy)
     run("Poca auto target never shows a picker", test_poca_ability_no_picker)
     run("Incantation transforms at 5 counters", test_incantation_transform)
     run("Incantation gate blocks premature transform",

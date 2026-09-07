@@ -1118,6 +1118,42 @@ def global_flags(db, session_id, bstate):
     return flags
 
 
+def health_gain_bonus(db, session_id, bstate, owner):
+    """Return the controller's continuous bonus to each health gain.
+
+    The client represents effects such as Lifeweaver Shaman's
+    ``LifeGainModifier`` as a static typed ``IntAttrModifier``.  It is not a
+    triggered ability, so it must be folded into the amount before the shared
+    health-gain event is emitted.  Iterate over card instances so identical
+    copies stack independently.
+    """
+    total = 0
+    rows = db.execute(
+        "SELECT card_uid FROM game_cards "
+        "WHERE session_id=? AND user_id=? AND location='warzone'",
+        (session_id, owner)).fetchall()
+    for (card_uid,) in rows:
+        for ability_guid, _raw in _card_static_abilities(
+                db, session_id, int(card_uid)):
+            for param, raw in _static_leaves(db, ability_guid):
+                if (param.get("property") != "intattr" or
+                        str(param.get("attribute") or "") !=
+                        "LifeGainModifier"):
+                    continue
+                if not _gate_condition(
+                        db, session_id, bstate, param.get("condition_id"),
+                        int(card_uid), owner):
+                    continue
+                try:
+                    value = int(param.get("amount") or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                operation = str(param.get("operation") or "Add").lower()
+                if operation == "add":
+                    total += value
+    return total
+
+
 def can_block(db, session_id, bstate, attacker_uid, blocker_uid):
     """Is ``blocker_uid`` allowed to block ``attacker_uid``?  Enforces Flight
     (needs a Flight/SkyGuard blocker) and "can't be blocked except by artifact

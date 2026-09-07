@@ -1997,10 +1997,19 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     afford = []
     all_rids = []
     for ag in all_guids:
+        all_rids.append(_ge.ResourceId.from_str(ag))
+        # Champion ability lists contain both player-activated powers and
+        # automatic talents/signature triggers. Keep every ability in the
+        # CardDef so the HUD can display it, but only a metadata-marked manual
+        # ability may become a PlayerOption. In particular, Wind Whisperer's
+        # Channelling trigger is zero-cost and would otherwise make the
+        # champion appear activatable whenever it fires on the chain.
+        graph = ability_graph(_RECORD_STORE, str(ag).lower())
+        if graph is not None and not graph.manual:
+            continue
         row = db_champion_ability_costs(str(ag))
         if row is None:
             row = db_talent_ability_costs(str(ag))
-        all_rids.append(_ge.ResourceId.from_str(ag))
         # Keep unknown abilities in CardDef so the HUD can display them, but
         # never make an ability with missing cost metadata playable.
         if row is None:
@@ -2012,6 +2021,13 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
         activatable_phases = int(row[2] or 0) if len(row) > 2 else 0
         casting = int(row[3] or 0) if len(row) > 3 else 64
         if charges < cc or spell_points < effective_sc:
+            continue
+        # BasicAction powers are legal only in the controller's own main
+        # phase, and never while a chain item is waiting to resolve. The
+        # client keeps reading the most recent PlayerOptionList after a
+        # chain animation, so rechecking this here prevents a stale/refresh
+        # packet from making the champion clickable on the stack.
+        if state.get("stack") and casting != 64:
             continue
         # BasicAction powers require the controller's own turn.  The phase
         # bitmask comes from gamedata (do not hardcode First/Second Main).
@@ -6531,8 +6547,13 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     state["priority_pid"] = my_pid
     pvp_save_state(session, state)
     _state_refresh = pvp_load_state(session) or {}
-    if _state_refresh.get("phase") in (_ge.ETurnPhases.FirstMainPhase,
-                                       _ge.ETurnPhases.SecondMainPhase):
+    if _state_refresh.get("stack"):
+        # The charge power is still on the chain. Publish only the legal
+        # response-window options; rebuilding main-phase options here leaves
+        # the client with a clickable champion/card while the chain waits.
+        pvp_push_phase_options(session, _state_refresh, pid=my_pid)
+    elif _state_refresh.get("phase") in (_ge.ETurnPhases.FirstMainPhase,
+                                         _ge.ETurnPhases.SecondMainPhase):
         pvp_push_main_phase_options(session, _state_refresh)
     return True
 
