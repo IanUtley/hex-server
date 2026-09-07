@@ -3166,6 +3166,14 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                         resolve_gain_charge_triggers(
                             db, handler, game, session, pl_t, ai_t, bstate,
                             owner_id)
+                        from .resources import (
+                            resolve_granted_resource_abilities)
+                        resource_logs = resolve_granted_resource_abilities(
+                            game, session, db, handler, pl_t, ai_t, bstate,
+                            selected_uid, owner_id)
+                        if resource_logs:
+                            _log("    Resource granted abilities: " +
+                                 "; ".join(resource_logs))
                         return (f"played free resource {selected_uid} "
                                 f"(+{current_grant} current/+{max_grant} total, "
                                 f"thresholds={threshold_flags}, charge={charge_grant})")

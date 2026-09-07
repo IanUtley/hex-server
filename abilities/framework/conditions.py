@@ -100,13 +100,18 @@ def evaluate_condition(condition, db, session, user_id):
         return True
 
 
-def _effect_params(db, ability_guid):
-    """Return decoded CardModifier parameters for an ability's direct BOM."""
-    rows = db.execute(
-        "SELECT effect_type, param FROM ability_effects "
+def _effect_rows(db, ability_guid):
+    """Return direct BOM rows for an ability in authored effect order."""
+    return db.execute(
+        "SELECT effect_guid, effect_type, param FROM ability_effects "
         "WHERE ability_guid=? ORDER BY effect_order",
         (ability_guid,)).fetchall()
-    for effect_type, raw_param in rows:
+
+
+def _effect_params(db, ability_guid):
+    """Return decoded CardModifier parameters for an ability's direct BOM."""
+    rows = _effect_rows(db, ability_guid)
+    for _effect_guid, effect_type, raw_param in rows:
         if effect_type != "CardModifierAbilityEffectTemplate":
             continue
         try:
@@ -117,8 +122,94 @@ def _effect_params(db, ability_guid):
             yield param
 
 
-def _target_template_flags(db, ability_guid):
-    """Return card-type and exact-zone filters from a talent target."""
+def _target_filter_flags(value):
+    """Return the typed card-type and exact-zone predicates in a filter."""
+    card_types, zones = set(), set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            template_type = str(node.get("_t") or "")
+            if template_type.endswith("IsType"):
+                card_types.update(part for part in str(
+                    node.get("m_CardType") or "").split("|") if part)
+            elif template_type.endswith("IsTroop"):
+                card_types.add("Troop")
+            elif template_type.endswith("InZone"):
+                collection = node.get("m_Collection")
+                if collection:
+                    zones.add(str(collection))
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return card_types, zones
+
+
+def _target_template_flags_for_id(db, target_id):
+    row = db.execute(
+        "SELECT filter_json FROM target_templates WHERE template_id=?",
+        (str(target_id),)).fetchone()
+    if not row:
+        return set(), set()
+    try:
+        value = json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return set(), set()
+    return _target_filter_flags(value)
+
+
+def _effect_target_flags(db, ability_guid, effect_guid, effect_order):
+    """Return the target filter attached to one direct BOM effect.
+
+    Talent ability rows historically did not store parent effect wiring in
+    SQLite.  Read the target index from the authoritative Records graph first
+    so existing databases still resolve a target index of zero correctly.
+    """
+    row = db.execute(
+        "SELECT target_template_ids FROM talent_abilities "
+        "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
+    if not row:
+        return set(), set()
+    try:
+        target_ids = json.loads(row[0] or "[]")
+    except (TypeError, ValueError):
+        target_ids = []
+    if not isinstance(target_ids, list):
+        return set(), set()
+
+    target_index = None
+    try:
+        from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
+        graph = ability_graph(DEFAULT_RECORD_STORE, str(ability_guid).lower())
+        effects = runtime_effects(graph) if graph else []
+        for index, effect in enumerate(effects):
+            if (index == int(effect_order) or
+                    str(effect.get("effect_guid") or "").lower()
+                    == str(effect_guid).lower()):
+                target_index = int(effect.get("target_index", -1))
+                break
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        target_index = None
+    if target_index is None:
+        db_row = db.execute(
+            "SELECT target_index FROM ability_effects WHERE ability_guid=? "
+            "AND effect_guid=? AND effect_order=?",
+            (ability_guid, effect_guid, effect_order)).fetchone()
+        if db_row:
+            try:
+                target_index = int(db_row[0])
+            except (TypeError, ValueError):
+                target_index = -1
+    if target_index is None or target_index < 0 or target_index >= len(target_ids):
+        return set(), set()
+    return _target_template_flags_for_id(db, target_ids[target_index])
+
+
+def _legacy_target_template_flags(db, ability_guid):
+    """Return aggregate target flags for older callers."""
     row = db.execute(
         "SELECT target_template_ids FROM talent_abilities WHERE ability_guid=? "
         "LIMIT 1", (ability_guid,)).fetchone()
@@ -128,38 +219,17 @@ def _target_template_flags(db, ability_guid):
         target_guids = json.loads(row[0] or "[]")
     except (TypeError, ValueError):
         target_guids = []
-    if not isinstance(target_guids, list):
-        return set(), set()
-
     card_types, zones = set(), set()
-
-    def visit(value):
-        if isinstance(value, dict):
-            template_type = str(value.get("_t") or "")
-            if template_type.endswith("IsType"):
-                card_types.update(part for part in str(
-                    value.get("m_CardType") or "").split("|") if part)
-            elif template_type.endswith("InZone"):
-                collection = value.get("m_Collection")
-                if collection:
-                    zones.add(str(collection))
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
-    for target_guid in target_guids:
-        target = db.execute(
-            "SELECT filter_json FROM target_templates WHERE template_id=?",
-            (str(target_guid),)).fetchone()
-        if not target:
-            continue
-        try:
-            visit(json.loads(target[0] or "{}"))
-        except (TypeError, ValueError):
-            continue
+    for target_guid in target_guids if isinstance(target_guids, list) else []:
+        types, target_zones = _target_template_flags_for_id(db, target_guid)
+        card_types.update(types)
+        zones.update(target_zones)
     return card_types, zones
+
+
+def _target_template_flags(db, ability_guid):
+    """Return aggregate card-type and exact-zone filters for a talent."""
+    return _legacy_target_template_flags(db, ability_guid)
 
 
 def _card_cost_delta(param):

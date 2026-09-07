@@ -2365,6 +2365,20 @@ def db_card_template_thresholds(template_guid):
     return row
 
 
+def db_card_template_lethal(template_guid):
+    """Return the client TAC-derived base Lethal flag for a card template."""
+    try:
+        row = _db.execute(
+            "SELECT lethal FROM card_templates WHERE guid=?",
+            (template_guid,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Older test fixtures/databases may not have received the additive
+        # schema migration yet; those templates simply have no base flag.
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
 def db_card_info_joined(session_id, card_uid):
     """Return (template_guid, card_type, name, cost, attack, defense) for a card
     joined with its template, or None. Resolves instances through card_instances."""
@@ -2381,7 +2395,7 @@ def db_card_info_joined(session_id, card_uid):
 def db_card_template_field(template_guid, field):
     """Return a single column value from card_templates by guid, or None."""
     valid = {"abilities_json", "attributes", "card_type", "sacrifice_target",
-             "cost", "attack", "defense", "name", "threshold_json"}
+             "cost", "attack", "defense", "name", "threshold_json", "lethal"}
     if field not in valid:
         return None
     row = _db.execute(

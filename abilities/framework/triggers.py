@@ -313,12 +313,50 @@ def _champion_ability_holders(db, handler, controller_uid):
             "AND cam.trigger_event_type != '' ORDER BY ca.ability_guid",
             (str(guid),)).fetchall()
         abilities.extend(str(row[0]).lower() for row in rows)
+    # Player champion abilities include both signature powers and the
+    # selected talent abilities. Talent abilities are indexed in
+    # ``talent_abilities`` rather than ``champion_abilities`` and therefore
+    # do not have a row in ``card_abilities_meta``. Use the handler's
+    # authoritative champion ability list and the Records graph to discover
+    # triggered abilities, preserving the same path for campaign and PvP.
+    configured = (getattr(handler, "_ai_champ_ability_guids", [])
+                  if controller_uid == 0 else
+                  getattr(handler, "_player_champ_abilities", []))
+    for value in configured or []:
+        value = getattr(value, "guid", value)
+        ability_guid = str(value).lower()
+        graph = ability_graph(_RECORD_STORE, ability_guid)
+        if graph is not None and graph.trigger_event_type:
+            abilities.append(ability_guid)
     dynamic = getattr(handler, "_champion_granted_ability_guids", {}) or {}
     abilities.extend(str(ag).lower() for ag in dynamic.get(
         int(scid.uid.uid64), []) if str(ag).lower() not in abilities)
+    abilities = list(dict.fromkeys(abilities))
     if not abilities:
         return {}
     return {int(scid.uid.uid64): abilities}
+
+
+def _chance_to_happen(graph):
+    """Return the authored triggered-ability chance from its TAC.
+
+    The client checks ``IntAttrs.ChanceToHappen`` when it gathers triggered
+    abilities. The extracted Records keep that value in the serialized TAC,
+    not in the localized game text or the compact SQLite ability index.
+    """
+    try:
+        from .tac import _tac_attr_hash, decode_tac
+        serialized = graph.source.field("m_SerializedTAC")
+        data = (serialized.field("data", "")
+                if hasattr(serialized, "field") else
+                serialized.get("data", "")
+                if isinstance(serialized, dict) else "")
+        value = decode_tac(data).get(_tac_attr_hash("ChanceToHappen"))
+        if value is None:
+            return 100
+        return max(0, min(100, int(value)))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return 100
 
 
 def _entering_card_is_troop(db, session_id, card_uid):
@@ -946,6 +984,11 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     event_previous_state=event_previous_state,
                     uses_previous_state=uses_previous_state)
                 if not trigger_condition_met(raw, cond_ctx):
+                    continue
+                chance = _chance_to_happen(graph)
+                if chance < 100 and random.randrange(100) >= chance:
+                    _log(f"    {event_type} {ag[:8]} -> chance failed "
+                         f"({chance}%)")
                     continue
                 # For CardCastEvent the event's trigger target is the card
                 # being cast (the caller passes it as source_uid).  Preserve

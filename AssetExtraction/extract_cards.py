@@ -10,7 +10,7 @@ Materializes two seed lists directly into ``static.py`` (between the
 
     - CARD_TEMPLATES — (guid, set_guid, name, rarity, cost, attack, defense,
       card_type, socket_count, no_pvp, is_pve, threshold_json,
-      abilities_json, attributes)
+      abilities_json, attributes, lethal)
     - CARD_ABILITY_EFFECTS — complete ``ability_effects`` rows for the
       transitive leaf-effect chain for EVERY card ability, merged with the
       talent BOM in the ``ability_effects`` table so champion AND card
@@ -34,10 +34,13 @@ Run from the repo root:
 Paths default to the standard install location; override with GAMEDATA=.
 """
 
+import base64
 import gzip
+import hashlib
 import json
 import os
 import re
+import struct
 
 GAMEDATA = os.environ.get(
     "GAMEDATA",
@@ -172,6 +175,42 @@ def _attributes_to_int(flags):
     for name in str(flags or "Unknown").split("|"):
         value |= ATTRIBUTE_BITS.get(name.strip(), 0)
     return value
+
+
+def _tac_attribute_hash(name):
+    """Return the client AttributeName hash used by serialized TAC data."""
+    digest = bytearray(hashlib.md5(name.encode("ascii")).digest()[:4])
+    # Match AttributeName.CreateHash in the original client.
+    if digest[0] == 0:
+        digest[0] = 1
+    if digest[3] == 0:
+        digest[3] = 1
+    # TAC writes the Int32 hash with BinaryWriter, which is little-endian.
+    return bytes(reversed(digest))
+
+
+_LETHAL_TAC_HASH = _tac_attribute_hash("Lethal")
+
+
+def _card_template_has_lethal(rec):
+    """Read the base Lethal IntAttr from CardTemplate serialized TAC."""
+    match = re.search(
+        r'"m_SerializedTAC"\s*:\s*\{\s*"data"\s*:\s*"([^"]+)"',
+        rec,
+    )
+    if not match:
+        return 0
+    try:
+        payload = base64.b64decode(match.group(1), validate=True)
+    except (ValueError, TypeError):
+        return 0
+    offset = payload.find(_LETHAL_TAC_HASH)
+    if offset < 0 or offset + 8 > len(payload):
+        return 0
+    try:
+        return int(struct.unpack_from("<i", payload, offset + 4)[0] != 0)
+    except struct.error:
+        return 0
 
 
 def _threshold_to_json(rec):
@@ -595,7 +634,7 @@ def main():
                           card_type, socket_count, no_pvp, is_pve,
                           threshold_json, abilities_json, attributes,
                           sacrifice_target, variable_cost, variable_cost_minimum,
-                          rage_value))
+                          rage_value, _card_template_has_lethal(rec)))
         for g in re.findall(
                 r'"m_CardAbilityId"\s*:\s*\{\s*"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"',
                 rec):
@@ -617,17 +656,17 @@ def main():
                  "AssetExtraction/extract_cards.py — do not edit by hand.")
     lines.append("# CARD_TEMPLATES rows: (guid, set_guid, name, rarity, cost, attack, defense, "
                  "card_type, socket_count, no_pvp, is_pve, threshold_json, abilities_json, "
-                 "attributes, sacrifice_target, variable_cost, variable_cost_minimum, rage_value)")
+                 "attributes, sacrifice_target, variable_cost, variable_cost_minimum, rage_value, lethal)")
     lines.append("CARD_TEMPLATES = [")
     for (guid, set_guid, name, rarity, cost, attack, defense, card_type,
          socket_count, no_pvp, is_pve, threshold_json, abilities_json, attributes,
          sacrifice_target, variable_cost, variable_cost_minimum,
-         rage_value) in card_rows:
+         rage_value, lethal) in card_rows:
         lines.append(
             f"    ({guid!r}, {set_guid!r}, {name!r}, {rarity!r}, {cost}, {attack}, {defense}, "
             f"{card_type!r}, {socket_count}, {no_pvp}, {is_pve}, {threshold_json!r}, "
             f"{abilities_json!r}, {attributes}, {sacrifice_target!r}, "
-            f"{variable_cost}, {variable_cost_minimum}, {rage_value}),")
+            f"{variable_cost}, {variable_cost_minimum}, {rage_value}, {lethal}),")
     lines.append("]")
     lines.append("")
     lines.append("# card ability BOM rows: (ability_guid, effect_guid, effect_order, effect_type, param, effect_group_id, condition_id, target_index, effect_instance_id, contingent_effect_instance_id, secondary_target_index, recalculate_targets, is_optional, effect_duration, output_variables)")

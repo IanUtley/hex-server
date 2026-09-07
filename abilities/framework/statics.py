@@ -17,6 +17,7 @@ import json
 import ast
 import math
 import re
+import sqlite3
 
 import game_engine
 
@@ -982,7 +983,13 @@ def effective_deltas(db, session_id, bstate, card_uid):
 def effective_stats(db, session_id, bstate, card_uid):
     """(atk, def_, attrs, flags, rage) for a card including base stats,
     instance modifiers and continuous static abilities — used by combat
-    resolution so the fought numbers match the displayed card."""
+    resolution so the fought numbers match the displayed card.
+
+    ``flags`` also carries the card template's base Lethal keyword. Lethal is
+    an IntAttr in the client card model rather than an ECardAttributes bit, so
+    it must be kept alongside the other combat flags for authoritative
+    resolution.
+    """
     row = db.execute(
         "SELECT gc.card_attack_mod, gc.card_defense_mod, gc.card_damage, "
         "gc.card_attributes, ct.attack, ct.defense, ct.attributes, "
@@ -1034,6 +1041,19 @@ def effective_stats(db, session_id, bstate, card_uid):
         d["flags"].add("prevent_combat_damage")
     elif attrs & game_engine.ECardAttributes.PreventNonCombatDamage:
         d["flags"].add("prevent_noncombat_damage")
+    # Base Lethal is stored from the client TAC metadata on card_templates.
+    # Keep this query additive so older focused test fixtures without the
+    # migrated column continue to resolve as cards without Lethal.
+    try:
+        lethal_row = db.execute(
+            "SELECT ct.lethal FROM game_cards gc "
+            "JOIN card_templates ct ON ct.guid=gc.template_guid "
+            "WHERE gc.session_id=? AND gc.card_uid=?",
+            (session_id, int(card_uid))).fetchone()
+    except sqlite3.OperationalError:
+        lethal_row = None
+    if lethal_row and lethal_row[0]:
+        d["flags"].add("lethal")
     return atk, max(0, def_ - dmg), attrs, d["flags"], d["rage"]
 
 

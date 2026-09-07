@@ -906,6 +906,62 @@ def test_jadiim_triggers_for_a_one_cost_permanent(db):
     assert buffs.get("atk", 0) == 1 and buffs.get("def", 0) == 1, buffs
 
 
+def test_fertility_magic_talent_triggers_on_shinhare_play(db):
+    """A champion talent trigger must gather and resolve from CardCastEvent.
+
+    Fertility Magic is stored in talent_abilities, not champion_abilities or
+    card_abilities_meta. Its 25% ChanceToHappen is also encoded in the
+    ability TAC and must be rolled before the Battle Hopper summon is put on
+    the chain.
+    """
+    from abilities.framework.triggers import (
+        resolve_stack_trigger, resolve_triggers,
+    )
+
+    fertility_ag = "e4767a62-5a39-7e17-42e9-5d174b39539c"
+    player_champion_guid = "e5fe174b-9e5c-44db-b22b-a273cc6e05ad"
+    hopper_tpl = "fe2472ed-4ff8-455b-8b18-b7e0033cd896"
+    shinhare_tpl = "11111111-1111-1111-1111-111111111111"
+
+    db.execute("""CREATE TABLE champion_abilities (
+        champion_guid TEXT, ability_guid TEXT)""")
+    db.execute(
+        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (shinhare_tpl, "Shin'hare Test Troop", "Troop", 1, 1, 1, 0,
+         "[]", "[]", "Shin'hare", 0, 0, 0))
+    _copy_card(db, hopper_tpl)
+    add_card(db, 720, 5, shinhare_tpl, loc="warzone")
+    db.commit()
+
+    handler = HandlerStub(db)
+    handler._player_champ_guid = player_champion_guid
+    handler._player_champ_abilities = [
+        game_engine.ResourceId.from_str(fertility_ag)]
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    session = SessionStub()
+    game = game_engine.Game(1, pl_t, ai_t)
+
+    # The client uses a 0..99 roll and succeeds when roll < chance.
+    for roll, expected in ((25, 0), (24, 1)):
+        bstate = {"player_health": 20, "ai_health": 20,
+                  "stack": [], "_next_instance_id": 1}
+        with mock.patch("abilities.framework.triggers.random.randrange",
+                        return_value=roll):
+            resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
+                             "CardCastEvent", 720, 5)
+        assert len(bstate["stack"]) == expected, bstate
+        if expected:
+            item = bstate["stack"].pop()
+            resolve_stack_trigger(handler, game, session, db, pl_t, ai_t,
+                                  bstate, item)
+            count = db.execute(
+                "SELECT COUNT(*) FROM game_cards WHERE session_id=1 "
+                "AND user_id=5 AND template_guid=? AND location='warzone'",
+                (hopper_tpl,)).fetchone()[0]
+            assert count == 1, count
+
+
 def test_verdant_wyldeboar_deck_move_clears_battle_state(db):
     """A Wyldeboar returned to deck is hidden and cannot redraw tapped."""
     from abilities.framework.triggers import resolve_stack_trigger, resolve_triggers
@@ -1194,6 +1250,51 @@ def test_resource_grant_columns_from_gamedata(db):
         hcs._db = old_hcs_db
 
 
+def test_granted_resource_ability_adds_fruitful_forsight_resources(db):
+    """A resource granted Gain [L1][R1] keeps the extra resource pool grant."""
+    from abilities.framework.resources import (
+        resolve_granted_resource_abilities)
+
+    shard = "8554b2c8-cf48-467d-bf55-ab45e306ce43"
+    gain = "14108f14-0eaf-d6f4-ecb1-030f0bb55e0a"
+    _copy_card(db, shard)
+    _copy_ability(db, gain)
+    add_card(db, 901, 0, shard, loc="PlayedResources")
+    printed = json.loads(db.execute(
+        "SELECT abilities_json FROM card_templates WHERE guid=?",
+        (shard,)).fetchone()[0])
+    db.execute(
+        "UPDATE game_cards SET card_abilities=? WHERE card_uid=?",
+        (json.dumps(printed + [gain]), 901))
+    db.commit()
+
+    handler = HandlerStub(db)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {
+        "pvp": False,
+        "player_resources": 0, "player_total_resources": 0,
+        "ai_resources": 1, "ai_total_resources": 1,
+        "player_threshold": {}, "ai_threshold": {},
+        "player_charges": 0, "ai_charges": 1,
+    }
+    logs = resolve_granted_resource_abilities(
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, 901, 0)
+
+    assert logs, logs
+    assert bstate["ai_resources"] == 2, bstate
+    assert bstate["ai_total_resources"] == 2, bstate
+    assert any(isinstance(
+        event, game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs)
+        and event.player_id == ai_t and event.delta == 1
+        for event in game.events)
+    assert any(isinstance(
+        event, game_engine.PlayerTotalResourcePoolChangedSessionEventArgs)
+        and event.player_id == ai_t and event.delta == 1
+        for event in game.events)
+
+
 def test_hidden_scene_static_resource_grant_runs_at_game_start(db):
     """Encounter-scene setup cards with direct start-of-game BOMs resolve.
 
@@ -1475,6 +1576,75 @@ def test_blood_cauldron_ai_pays_sacrifice_cost(db):
         db_module._db, ai._db = old_db, old_ai_db
 
 
+def test_concubunny_exhausts_selected_ready_shinhare(db):
+    """Concubunny pays its authored ExhaustTarget before resolving its BOM.
+
+    The target must be a ready Shin'hare at activation time.  This exercises
+    the production PvE activation path, rather than only the target picker,
+    because the old path discarded the selected payment UID and exhausted
+    only Concubunny itself.
+    """
+    import battle_engine
+    import gamedata
+    import hconnect_server as hcs
+
+    concubunny = "bfce3e26-1d85-4d9f-a72a-f4cead4c93c1"
+    ability_guid = "e1049250-013d-3149-bcc4-ad06199c8b92"
+    source_uid = int(game_engine.UID.make(1, 101).uid64)
+    target_uid = int(game_engine.UID.make(1, 102).uid64)
+    _copy_card(db, concubunny)
+    add_card(db, source_uid, 5, concubunny,
+             state=game_engine.ECardStates.StartedATurnOnYourSide)
+    add_card(db, target_uid, 5, concubunny)  # ready Shin'hare payment target
+    db.execute("UPDATE game_cards SET card_abilities=? WHERE card_uid=?",
+               (json.dumps([ability_guid]), source_uid))
+    db.commit()
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = battle_engine.default_state()
+    bstate.update({
+        "phase_idx": 4,  # FirstMainPhase in BASE_TURN_PHASES
+        "player_resources": 1,
+        "player_health": 20,
+        "ai_health": 20,
+    })
+    session = SessionStub()
+    session.turn_order = bstate
+
+    # Use the production handler implementation with the test DB, while
+    # suppressing network output and the unrelated Battle Hopper BOM leaf.
+    handler = object.__new__(hcs.HCPHandler)
+    handler._db = db
+    handler.user_profile = {"id": 5}
+    handler.client_reck_id = 5
+    handler._player_champ_scid = game_engine.SessionCardId(
+        game_engine.UID.make(244, 5))
+    handler._ai_champ_scid = game_engine.SessionCardId(
+        game_engine.UID.make(3, 1000))
+    handler._current_bstate = bstate
+    handler._send_battle_events = lambda *args: None
+    handler._play_plan_store = gamedata.DEFAULT_RECORD_STORE
+
+    old_hcs_db, old_db = hcs._db, dbmod._db
+    hcs._db = dbmod._db = db
+    try:
+        # UID 102 is 0x6601 on the wire (little-endian uint64).
+        inner = b"m_UID64;;;;0166000000000000;"
+        with mock.patch("ability.resolve_effect", return_value=lambda *args: ""):
+            handler._activate_troop_ability(
+                session, pl_t, ai_t, bstate, source_uid, ability_guid, inner)
+
+        states = dict(db.execute(
+            "SELECT card_uid, card_state FROM game_cards "
+            "WHERE card_uid IN (?, ?)", (source_uid, target_uid)))
+        assert states[target_uid] & game_engine.ECardStates.Tapped, states
+        assert states[source_uid] & game_engine.ECardStates.Tapped, states
+        assert bstate["player_resources"] == 0, bstate
+    finally:
+        hcs._db, dbmod._db = old_hcs_db, old_db
+
+
 def test_discard_positions_append_and_snapshot_order(db):
     """Discard entries get a stable per-player append position used by reconnects."""
     import db as db_module
@@ -1538,6 +1708,8 @@ def main():
          test_spam_bot_charge_power_targets_one_robot_and_one_stat),
         ("Jadiim triggers for a one-cost permanent",
          test_jadiim_triggers_for_a_one_cost_permanent),
+        ("Fertility Magic triggers on Shin'hare play",
+         test_fertility_magic_talent_triggers_on_shinhare_play),
         ("Verdant Wyldeboar deck state reset",
          test_verdant_wyldeboar_deck_move_clears_battle_state),
         ("Cocoon transform attributes",
@@ -1552,10 +1724,14 @@ def main():
          test_bunjitsu_charge_power_summon_and_buff),
         ("Blood Cauldron AI sacrifice payment",
          test_blood_cauldron_ai_pays_sacrifice_cost),
+        ("Concubunny exhausts selected ready Shin'hare",
+         test_concubunny_exhausts_selected_ready_shinhare),
         ("Discard positions survive reconnect ordering",
          test_discard_positions_append_and_snapshot_order),
         ("Resource grant columns from gamedata",
          test_resource_grant_columns_from_gamedata),
+        ("Granted resource Fruitful Foresight bonus",
+         test_granted_resource_ability_adds_fruitful_forsight_resources),
         ("Hidden scene static resource grant at game start",
          test_hidden_scene_static_resource_grant_runs_at_game_start),
         ("Chlorophyllia plays a Wild Shard",

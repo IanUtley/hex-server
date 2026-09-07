@@ -104,7 +104,7 @@ def _talent_ability_guid(talent_guid: str) -> str | None:
 from db import _db, log, log_req, hexdump
 from db import (db_template_by_guid, db_card_ability_list, db_card_uses,
                 db_bump_card_use, db_card_state, db_warzone_troop_count,
-                db_card_stat_mods)
+                db_card_stat_mods, db_card_template_lethal)
 from db import (player_id_from_name, player_id_from_steam, display_name_from_identity,
                 db_tournament_by_id, db_tournament_signup_by_player,
                 db_tournament_signups_by_tournament,
@@ -2998,6 +2998,7 @@ class HCPHandler:
         charges = bstate.get("player_charges", 0)
         sp = bstate.get("player_spell_points", 0)
         phase_bit = (1 << phase) if phase is not None else 0
+        chain_pending = bool(bstate.get("stack"))
         # Spell-power escalation: each use permanently bumps that spell's SP cost
         # by +1 (mirrors Session.cs:1154 IncrementSpellPointCostModifier).
         # Only spell powers (spell_cost > 0) escalate; charge powers don't.
@@ -3014,6 +3015,12 @@ class HCPHandler:
             if row:
                 cc, sc, aphases, casting = row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0
                 if casting != 64:
+                    # BasicAction abilities cannot be activated while a chain
+                    # item is resolving. The source champion still appears on
+                    # the chain, but its BasicAction button must not remain
+                    # clickable from the previous option list.
+                    if chain_pending:
+                        continue
                     # BasicAction etc.: only on the PLAYER's own main phases.
                     # During the opponent's turn there is no player main phase,
                     # so a BasicAction charge power must not be offered even if
@@ -4005,6 +4012,80 @@ class HCPHandler:
         log_req(f"    Champion void targets: {voided} voided "
                 f"(stats={stats})")
 
+    def _autopass_game_started_chain(self, session, pl_t, ai_t, bstate,
+                                     game):
+        """Resolve the mandatory chain created by ``GameStartedEvent``.
+
+        Opening setup must not expose a ResolveTopOfChain pass button.  Use
+        the same stack resolver as an ordinary pass, so nested triggers and
+        generated cards retain normal ordering and event serialization.  If a
+        setup ability genuinely needs player input, leave its pending state in
+        place and let the regular prompt path take over.
+        """
+        import battle_engine as _be
+
+        resolved = 0
+        had_chain = not _be.stack_empty(bstate)
+        # A malformed/cyclic setup effect must not hang the game-start
+        # transaction forever.  Normal authored setup chains are much smaller
+        # than this, including generated follow-up triggers.
+        max_items = 256
+        while (not _be.stack_empty(bstate) and
+               resolved < max_items):
+            if (bstate.get("pending_choice") or
+                    bstate.get("pending_deck_search") or
+                    bstate.get("pending_trigger") or
+                    bstate.get("pending_discard_ability")):
+                break
+            item = _be.stack_pop(bstate)
+            _be.stack_reset_passes(bstate)
+            self._resolve_stack_item(
+                session, pl_t, ai_t, bstate, item, game)
+            resolved += 1
+
+        if resolved >= max_items and not _be.stack_empty(bstate):
+            log_req("    GameStarted chain exceeded 256 items; leaving "
+                    "remaining items for normal priority")
+        elif resolved:
+            log_req(f"    Auto-passed {resolved} GameStarted chain item(s)")
+
+        if (had_chain and _be.stack_empty(bstate) and
+                not bstate.get("pending_choice") and
+                not bstate.get("pending_deck_search") and
+                not bstate.get("pending_trigger") and
+                not bstate.get("pending_discard_ability")):
+            game.push_chain_empty()
+        return resolved
+
+    def _suppress_completed_game_started_chain_events(self, game,
+                                                       event_start):
+        """Hide a fully auto-passed setup chain from the client animation UI.
+
+        GameStarted abilities are resolved before their initial network packet
+        is sent.  Sending their push/pop pair in that same packet makes the
+        client move a source champion into the chain while it is still
+        building the opening board; the remove animation can then be applied
+        before the corresponding chain card is registered and leave the
+        champion displayed at the bottom of the chain.  The ability's effect
+        events remain in the packet; only the transient chain presentation is
+        removed.
+
+        ``event_start`` scopes this to events created by GameStarted setup and
+        preserves any earlier events in the transaction.
+        """
+        chain_event_types = (
+            game_engine.AbilityPushedOnChainSessionEventArgs,
+            game_engine.TopOfChainResolvedSessionEventArgs,
+            game_engine.RemovedTopOfChainSessionEventArgs,
+            game_engine.ChainEmptySessionEventArgs,
+        )
+        prefix = game.events[:event_start]
+        setup_events = game.events[event_start:]
+        game.events = prefix + [
+            event for event in setup_events
+            if not isinstance(event, chain_event_types)
+        ]
+
     def _resolve_stack_item(self, session, pl_t, ai_t, bstate, item, game):
         """Execute the top of the chain (`item`, already popped) and push the
         resolve chain events onto `game` (TopOfChainResolved + RemovedTopOfChain).
@@ -4395,17 +4476,20 @@ class HCPHandler:
                                    state=int(cstate or 0), related_cards=related)
 
     def _push_champions_warm(self, session, pl_t, ai_t, bstate, game):
-        """Re-push both champion CardUpdateds onto `game` so the client's
-        State.Cards cache has both ChampionSessionCardIds warm.
+        """Rebuild both champion CardDefs for the next packet.
 
         UIBattle.OnTurnPhaseUpdated reads State.Cards[State.Players[p].ChampionSessionCardId]
         for the OPPONENT at StartTurn (and for combat phases). If the AI champion
         isn't in the cache, the client throws KeyNotFoundException, desyncs
-        priority and sends RequestPrioritySyncTransaction. Must re-register the
-        CardDefs on this fresh Game first, or the CardUpdated carries zero
-        abilities and wipes the champion charge/spell buttons. Also carry the
-        persisted health into the Game so any PlayerUpdated from this object
-        reports the live health (not the 20 default).
+        priority and sends RequestPrioritySyncTransaction. The initial battle
+        packet already seeds both entries with CardUpdated(None) before
+        ChampionCardPlayed moves them into the champion HUD. Sending another
+        CardUpdated with collection Champions here makes the client run its
+        normal card-location animation on the champion card, which can leave a
+        full-size card on the battlefield. Re-register the CardDefs for any
+        later PlayerUpdated/option work, but do not emit another CardUpdated.
+        Also carry the persisted health into the Game so any PlayerUpdated from
+        this object reports the live health (not the 20 default).
         """
         game.ai_health = bstate.get("ai_health", 10)
         game.player_health = bstate.get("player_health", 20)
@@ -4419,10 +4503,6 @@ class HCPHandler:
             ai_cdef.counters = dict(champion_counters.get(
                 str(int(ai_champ.uid.uid64)), {}) or {})
             game.card_defs[ai_champ] = ai_cdef
-            game.push_card_updated(ai_champ, ai_t, game_engine.ECardCollections.Champions,
-                                   game_engine.ECardTypes.Champion,
-                                   template_id=getattr(self, "_ai_champ_guid", None),
-                                   counters=ai_cdef.counters)
         pl_champ = getattr(self, "_player_champ_scid", None)
         if pl_champ:
             pl_abilities = getattr(self, "_player_champ_abilities", [])
@@ -4440,10 +4520,6 @@ class HCPHandler:
                 if int(uses) > 0:
                     cdef.spell_point_cost_mods[game_engine.ResourceId.from_str(ag)] = int(uses)
             game.card_defs[pl_champ] = cdef
-            game.push_card_updated(pl_champ, pl_t, game_engine.ECardCollections.Champions,
-                                   game_engine.ECardTypes.Champion,
-                                   template_id=getattr(self, "_player_champ_guid", None),
-                                   counters=cdef.counters)
 
     def _advance_to_priority(self, session, pl_t, ai_t, bstate):
         """Auto-advance the human's turn through non-stop phases.
@@ -4929,6 +5005,7 @@ class HCPHandler:
                 ct, name, cost, atk, def_ = game_engine.ECardTypes.Troop, "Card", 0, 0, 0
         shards = []
         attributes = game_engine.ECardAttributes.Unknown
+        lethal = False
         srow = None
         # Instance-persisted abilities + power/toughness buffs (Shift /
         # PowerShiftedEvent). A bare template read would drop them on every
@@ -4999,6 +5076,7 @@ class HCPHandler:
                 pass
         from db import db_card_template_thresholds
         if tpl_guid != "00000000-0000-0000-0000-000000000000":
+            lethal = bool(db_card_template_lethal(tpl_guid))
             srow = db_card_template_thresholds(tpl_guid)
             if srow:
                 if srow[0]:
@@ -5020,14 +5098,15 @@ class HCPHandler:
                 if carow:
                     srow = (None, json.dumps(carow), None)
         # Ability list: the instance's persisted list wins (Shift moves
-        # abilities between cards); empty instance list falls back to the
-        # template's printed list.  NOTE: `'[]'` (an empty JSON array) must
-        # ALSO count as empty — champions' game_cards.card_abilities is seeded
-        # as '[]', and treating it as authoritative would wipe the champion's
-        # signature charge powers (db_champion_ability_guids) on every re-push,
-        # leaving PvP champions with no charge buttons.
+        # abilities between cards).  An empty list is authoritative for
+        # ordinary cards: a consumed ONE-SHOT must stay gone when the card is
+        # rebuilt for CardUpdated.  Champions are the exception because their
+        # game_cards rows are seeded with [] while their signature powers live
+        # in champion_abilities rather than card_templates.
         ab_src = inst_abilities_json
-        if not ab_src or str(ab_src).strip() in ("[]", "null", "{}"):
+        if (not ab_src or str(ab_src).strip() in ("null", "{}")
+                or (str(ab_src).strip() == "[]"
+                    and ct == game_engine.ECardTypes.Champion)):
             ab_src = srow[1] if srow else None
         ability_guids = []
         abilities = []
@@ -5223,7 +5302,8 @@ class HCPHandler:
         # (the client colors values below the template base red). The troop
         # "heals" when card_damage is cleared at its controller's Prep.
         def_ = max(0, def_ - dmg)
-        game.card_defs[scid] = game_engine.CardDef(name, ct, cost, atk, def_, shards, abilities, attributes)
+        game.card_defs[scid] = game_engine.CardDef(
+            name, ct, cost, atk, def_, shards, abilities, attributes, lethal)
         # IntAttr modifiers are transmitted separately from keyword
         # attributes. Preserve metadata-defined Untamed on the final card
         # definition (the definition above replaces any earlier placeholder)
@@ -5694,10 +5774,12 @@ class HCPHandler:
                 or not _be.stack_empty(bstate)):
             log_req(f"    Troop ability {ability_guid[:8]}: basic action not legal now")
             return
-        # Extract the selected card target from the transaction.  Do not assume
-        # it is friendly: metadata such as Taming Sphere's ``SinglePlayer``
-        # target deliberately permits an Untamed troop on either side.
-        target_uid = None
+        # Extract every selected card from the transaction. A manual ability
+        # can carry both payment targets (Concubunny's ready Shin'hare) and a
+        # separate effect target, so the selected cards must be split by their
+        # metadata target templates instead of treating the last UID as the
+        # effect target.
+        selected_uids = []
         if isinstance(inner_bytes, bytes):
             for m_du in re.finditer(rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});', inner_bytes):
                 try:
@@ -5705,18 +5787,65 @@ class HCPHandler:
                     if (uid64 & 0xFF) == 1:
                         uid64 = int(uid64)
                         if uid64 != source_uid:
-                            target_uid = uid64
+                            selected_uids.append(uid64)
                 except Exception:
                     continue
+
+        # Validate and split metadata-declared card payment targets first.
+        # This is the same distinction used by the PvP activation path: an
+        # ExhaustTarget is a cost, not an effect target, and must be paid
+        # before the BOM resolves.  The live target filter is re-evaluated so
+        # a stale transaction cannot exhaust a troop that became tapped after
+        # the option list was sent.
+        from abilities.framework.targeting import (
+            legal_targets as _legal_targets, target_uses_both_players,
+        )
+        cost_selections = []
+        cost_target_uids = []
+        used_cost_uids = set()
+        cost_templates = set()
+        graph_costs = _records_ability_cost_templates(self, ability_guid)
+        for cost_guid, _cost_type in graph_costs:
+            cost_templates.add(str(cost_guid).lower())
+        for kind, cost_guid in graph.additional_cost_targets:
+            cost_spec = _records_target_spec(self, cost_guid)
+            if cost_spec is None:
+                log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
+                        f"missing payment target template {cost_guid}")
+                return
+            minimum = max(0, int(cost_spec.minimum or 0))
+            maximum = int(cost_spec.maximum or 0)
+            if maximum <= 0:
+                maximum = -1
+            auto_source = (not cost_spec.requires_input and
+                           cost_spec.target_kind ==
+                           "AbilitySourceCardTargetTemplate")
+            if auto_source:
+                candidates = [int(source_uid)]
+            else:
+                candidates = _legal_targets(
+                    _db, session.session_id, self.user_profile["id"],
+                    cost_guid, int(source_uid), both_players=False,
+                    champions=self._champion_targets(), battle_state=bstate)
+            candidate_set = {int(uid) for uid in candidates}
+            available = ([int(source_uid)] if auto_source else
+                         [int(uid) for uid in selected_uids
+                          if int(uid) in candidate_set and
+                          int(uid) not in used_cost_uids])
+            if len(available) < minimum:
+                log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
+                        f"missing/illegal payment target for {cost_guid}")
+                return
+            chosen = available if maximum < 0 else available[:maximum]
+            used_cost_uids.update(chosen)
+            cost_target_uids.extend(chosen)
+            cost_selections.append(({"kind": kind}, tuple(chosen)))
+
         # Work out which target templates are effect targets (as opposed to
         # automatic source/player targets or card-cost targets), then validate
         # the transaction against the same gamedata filter used to build the
-        # picker.  This keeps activation data-driven and prevents an invalid or
+        # picker. This keeps activation data-driven and prevents an invalid or
         # missing target from silently resolving against the source card.
-        cost_templates = {
-            str(tid).lower() for tid, _ctype in
-            _records_ability_cost_templates(self, ability_guid)
-        }
         explicit_templates = []
         for target in graph.targets:
             tid = str(target.guid).lower()
@@ -5727,22 +5856,26 @@ class HCPHandler:
             from abilities.framework.targeting import (
                 legal_targets as _legal_targets, target_uses_both_players,
             )
-            # Taming Sphere has one required explicit target.  For abilities
-            # with several templates, accepting the selected card if it is
-            # legal for any effect target preserves the existing last-target
-            # transaction convention while still enforcing every filter.
-            valid_target = False
-            if target_uid is not None:
-                for tid, _minimum in explicit_templates:
-                    candidates = _legal_targets(
-                        _db, session.session_id, self.user_profile["id"],
-                        tid, int(source_uid),
-                        both_players=target_uses_both_players(_db, tid),
-                        champions=self._champion_targets(),
-                        battle_state=bstate)
-                    if int(target_uid) in {int(c) for c in candidates}:
-                        valid_target = True
+            # Taming Sphere has one required explicit target. For abilities
+            # with several templates, accept the selected card if it is legal
+            # for any effect target, while excluding cards already consumed as
+            # payment targets.
+            target_uid = None
+            for tid, _minimum in explicit_templates:
+                candidates = _legal_targets(
+                    _db, session.session_id, self.user_profile["id"],
+                    tid, int(source_uid),
+                    both_players=target_uses_both_players(_db, tid),
+                    champions=self._champion_targets(),
+                    battle_state=bstate)
+                for candidate in selected_uids:
+                    if (int(candidate) not in used_cost_uids and
+                            int(candidate) in {int(c) for c in candidates}):
+                        target_uid = int(candidate)
                         break
+                if target_uid is not None:
+                    break
+            valid_target = target_uid is not None
             if not valid_target:
                 log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
                         f"missing/illegal metadata target {target_uid}")
@@ -5751,6 +5884,14 @@ class HCPHandler:
             # Any card UIDs in a cost TargetMap (sacrifice/void/etc.) are not
             # effect targets consumed by the BOM resolver.
             target_uid = None
+
+        # Expose payment selections to metadata-driven variables such as
+        # Construction Plans, then pay them before resolving the ability.
+        if cost_target_uids:
+            bstate.setdefault("ability_lists", {})["ExhaustedCards"] = [
+                int(uid) for uid in cost_target_uids
+                if any(spec["kind"] == "exhaust" and int(uid) in selected
+                       for spec, selected in cost_selections)]
 
         # Pay the resource cost only after target validation succeeds.
         bstate["player_resources"] = resources - cost - x_cost
@@ -5772,6 +5913,9 @@ class HCPHandler:
         # Resolve the BOM.
         import ability as _ability_mod
         game = self._fresh_game(session, pl_t, ai_t, bstate)
+        if cost_selections:
+            self._apply_card_play_costs(
+                game, session, bstate, pl_t, ai_t, cost_selections)
         fn = _ability_mod.resolve_effect(ability_guid)
         log = ""
         if fn:
@@ -6958,11 +7102,27 @@ class HCPHandler:
             # "At the start of the game" triggers for both players'
             # opening-hand / warzone cards (e.g. Princess Victoria).
             import ability as _abil_gs
+            game_started_event_start = len(game.events)
             for gs_owner in (self.user_profile["id"], 0):
                 _abil_gs.resolve_triggers(
                     _db, self, game, session, pl_t, ai_t, bstate,
                     "GameStartedEvent", None, gs_owner,
                     zones=("hand", "warzone"))
+            # GameStarted triggers are mandatory setup work, not a priority
+            # window.  Drain their normal chain in LIFO order before the
+            # StartGame packet is sent; otherwise _advance_to_priority leaves
+            # the client waiting for a manual pass during the opening flow.
+            # A real choice (target, revealed card, or discard) still pauses
+            # here and is sent to the client normally.
+            self._autopass_game_started_chain(
+                session, pl_t, ai_t, bstate, game)
+            if (_be.stack_empty(bstate) and
+                    not bstate.get("pending_choice") and
+                    not bstate.get("pending_deck_search") and
+                    not bstate.get("pending_trigger") and
+                    not bstate.get("pending_discard_ability")):
+                self._suppress_completed_game_started_chain_events(
+                    game, game_started_event_start)
             # GameStarted abilities may change the DB-backed battle state.  In
             # particular, encounter-scene battleboard cards such as Savage
             # Lord's Resource Rich grant both current and permanent resources.
@@ -7488,6 +7648,26 @@ class HCPHandler:
                 resolve_gain_charge_triggers(
                     _db, self, g3, session, pl_t, ai_t, bstate,
                     self.user_profile["id"] if self.user_profile else 0)
+                # A resource can carry an instance-only, non-triggered
+                # ability granted while it was in the deck (for example
+                # Fruitful Foresight's Gain [L1][R1]).  Resolve those
+                # metadata-defined additions after the normal resource grant.
+                from abilities.framework.resources import (
+                    resolve_granted_resource_abilities)
+                resource_owner = (self.user_profile["id"]
+                                  if self.user_profile else 0)
+                resource_logs = resolve_granted_resource_abilities(
+                    g3, session, _db, self, pl_t, ai_t, bstate,
+                    int(played_card_uid), resource_owner)
+                if resource_logs:
+                    log_req("    Resource granted abilities: " +
+                            "; ".join(resource_logs))
+                # Resource-triggered abilities are added to the authoritative
+                # chain in ``bstate``. Persist that mutation before the later
+                # option/packet helpers reload the session; otherwise the
+                # client sees the trigger animation, but the next pass loads
+                # an empty stack and advances FirstMain into combat.
+                _be.save_state(session, bstate)
 
             if not is_troop_play:
                 g3.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
@@ -7593,10 +7773,10 @@ class HCPHandler:
                 g3.push_card_moved(scid_played, pl_t, game_engine.ECardCollections.CastSpells,
                                   game_engine.ECardLocations.Top, 0)
                 g3.push_troop_card_played(scid_played, pl_t)
-                # Opponent (AI) gets priority — it auto-passes, then the
-                # human's Resolve pass completes the both-pass and the
-                # item resolves via _resolve_stack_item.
-                g3.push_green_light(ai_t, game_engine.EPriorityContext.ResolveTopOfChain)
+                # Opponent (AI) gets priority after the card has been
+                # registered on the client chain.  The chain animation must
+                # precede GreenLight; otherwise the client can enter the
+                # response window while ChainView is still empty.
                 perm = game_engine.card_type_from_db(played_card_type) & (
                     game_engine.ECardTypes.Troop |
                     game_engine.ECardTypes.Artifact |
@@ -7616,11 +7796,13 @@ class HCPHandler:
                     })
                     # The troop's presence on the chain is driven by the
                     # CastSpells CardMove/UpdateCard of the actual card
-                    # above; AbilityTemplateId is only a targeting/cost
-                    # hint and does not gate whether the card is shown.
+                    # above. The chain event still needs a real client
+                    # AbilityTemplate; a card-template GUID is not one and
+                    # makes UIBattle silently skip the chain picture.
                     g3.push_ability_on_chain(
                         scid_played,
-                        game_engine.ResourceId.from_str(crow[0]))
+                        game_engine.ResourceId.from_str(
+                            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
                     _be.save_state(session, bstate)
                     log_req(f"    Troop {crow[2]} on the stack — "
                             f"resolves on both-pass (AI auto-passes)")
@@ -7638,8 +7820,7 @@ class HCPHandler:
                             f"costs={[hex(t) for t in cost_uids]} "
                             f"target={hex(target_uid) if target_uid else None}")
                     ability_guids = [ability.ability_guid
-                                     for ability in play_plan.abilities
-                                     if not ability.is_triggered]
+                                     for ability in play_plan.cast_abilities]
                     _be.stack_push(bstate, {
                         "kind": "spell", "source_uid": int(tid),
                         "ability_guids": ability_guids, "target_uid": target_uid,
@@ -7651,8 +7832,12 @@ class HCPHandler:
                     })
                     g3.push_ability_on_chain(
                         scid_played,
-                        game_engine.ResourceId.from_str(crow[0]))
+                        game_engine.ResourceId.from_str(
+                            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
                     _be.save_state(session, bstate)
+                # Both card-play branches now have a visible chain item.
+                g3.push_green_light(
+                    ai_t, game_engine.EPriorityContext.ResolveTopOfChain)
                 _be.save_state(session, bstate)
                 g3.player_resources = bstate["player_resources"]
                 ec = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
@@ -8208,9 +8393,11 @@ class HCPHandler:
                     ev_sp = game_engine.ChampionSpellPointsChangedSessionEventArgs()
                     ev_sp.player_id = pl_t; ev_sp.operation = 2; ev_sp.delta = eff_sc
                     ev_sp.new_value = bstate["player_spell_points"]; g._push(ev_sp)
-                # Reflect the escalated SP cost on the champion card so the
-                # client's button cost display updates (CardUpdated
-                # SpellPointCostModifiers).
+                # Keep the escalated SP cost in the authoritative state and
+                # CardDef.  Do not emit CardUpdated for the champion here:
+                # the client treats a Champions collection update as a
+                # location change and can leave a giant copy of the champion
+                # behind when this ability is also pushed onto the chain.
                 player_champ_scid = getattr(self, "_player_champ_scid", None)
                 if player_champ_scid and sp_uses.get(ability_guid):
                     cdef = g.card_defs.get(player_champ_scid)
@@ -8218,10 +8405,6 @@ class HCPHandler:
                         for ag2, uses2 in sp_uses.items():
                             if int(uses2) > 0:
                                 cdef.spell_point_cost_mods[game_engine.ResourceId.from_str(ag2)] = int(uses2)
-                        g.push_card_updated(player_champ_scid, pl_t,
-                                            game_engine.ECardCollections.Champions,
-                                            game_engine.ECardTypes.Champion,
-                                            template_id=getattr(self, "_player_champ_guid", None))
                 # Push the ability onto the CHAIN (the client's stack). The
                 # BOM (draw / discard / etc.) executes when the chain
                 # resolves (both players pass). One chain item per top-level
@@ -8262,6 +8445,10 @@ class HCPHandler:
                     # their stats for the summoned-token buffs.
                     bstate["champion_void_uids"] = all_target_uids
                 bstate["player_mod_target"] = target_uid
+                # Clear the previous PlayerOptionList before the chain event
+                # reaches the client. AbilityPushedOnChain renders the
+                # champion; CanActivateAbility reads the cached options.
+                g.push_options(pl_t, [])
                 _be.stack_push(bstate, {
                     "kind": "ability", "ability_guid": str(ability_guid),
                     "source_uid": champ_scid.uid.to_uint64() if hasattr(champ_scid, 'uid') else 0,
@@ -8285,13 +8472,20 @@ class HCPHandler:
                 g.ai_spell_points = bstate.get("ai_spell_points", 0)
                 g.push_player_updated(pl_t, champ_id=player_champ_scid)
                 g.push_player_updated(ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
-                # The chain is non-empty -> ResolveTopOfChain makes the client
-                # show "Resolve <Card>" as the pass button.
-                g.push_green_light(pl_t, self._priority_context_for(
-                    _be.current_phase(bstate), bstate))
+                # The chain card is added by a client animation queued from
+                # AbilityPushedOnChain.  If ResolveTopOfChain is sent in this
+                # same packet, UIBattle.CheckForMissingPriorityWindowState()
+                # runs before that animation registers the card and pushes an
+                # inactive priority state.  The client then displays Zuba on
+                # the chain but has no usable priority.  Normal is still the
+                # correct priority handoff; the server's pass handler resolves
+                # the pending chain item, and avoids that client-side race.
+                g.push_green_light(pl_t, game_engine.EPriorityContext.Normal)
                 self._send_battle_events(session, g, pl_t)
-                # Push fresh playability so used ability un-lights
-                self._push_main_phase_options(session, pl_t, ai_t)
+                # While the chain is non-empty expose only instant-speed
+                # responses. Main-phase cards and BasicAction champion powers
+                # return after the chain empties.
+                self._push_phase_options_empty(session, pl_t, ai_t)
                 log_req(f"    Ability activated on chain: charges {charges}->{bstate['player_charges']}, SP {sp}->{bstate['player_spell_points']}")
             else:
                 log_req(f"    Cannot afford ability: need {cc} charges/{sc} SP, have {charges}/{sp}")

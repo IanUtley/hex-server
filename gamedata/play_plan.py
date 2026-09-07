@@ -535,11 +535,10 @@ class PlayPlan:
                 offset += len(selected)
 
         slots = []
-        # Card-play activations are the non-triggered graphs.  ``manual`` is
-        # the client flag for a separately activated warzone ability, so it
-        # must not exclude a spell's ordinary on-cast graph here.
-        play_abilities = tuple(ability for ability in self.abilities
-                               if not ability.is_triggered)
+        # Card-play activations are non-triggered, non-manual graphs.
+        # ``m_Manual=1`` is a separately activated warzone ability and must
+        # not be validated or prompted while the card is being cast.
+        play_abilities = self.cast_abilities
         for ability in play_abilities:
             for index in ability.referenced_target_indexes:
                 if index >= len(ability.targets):
@@ -585,16 +584,23 @@ class PlayPlan:
         return activations, cost_target_map
 
     @property
-    def manual_abilities(self) -> tuple[AbilityInstance, ...]:
-        """Abilities activated while this card is being played.
+    def cast_abilities(self) -> tuple[AbilityInstance, ...]:
+        """Non-triggered abilities that execute as part of casting the card.
 
-        ``m_Manual`` describes a warzone power, not whether an ability is part
-        of the card-cast activation.  A card's ordinary on-play graph is often
-        non-manual, so excluding it here would omit its target and option
-        prompts from the play plan.
+        ``m_Manual=1`` describes a warzone power. It is not part of the card's
+        cast activation and must not be validated or prompted while the card
+        is being played (for example, Concubunny's exhaust-another-Shin'hare
+        power). Ordinary on-cast graphs are non-manual and remain included.
         """
-        return tuple(ability for ability in self.abilities
-                     if not ability.is_triggered)
+        return tuple(
+            ability for ability in self.abilities
+            if not ability.is_triggered and
+            not (ability.graph is not None and ability.graph.manual))
+
+    @property
+    def manual_abilities(self) -> tuple[AbilityInstance, ...]:
+        """Compatibility alias for the card's non-triggered cast abilities."""
+        return self.cast_abilities
 
     @property
     def triggered_abilities(self) -> tuple[AbilityInstance, ...]:
@@ -606,7 +612,7 @@ class PlayPlan:
         activations = {str(key).lower(): value
                        for key, value in (activations or {}).items()}
         prompts = []
-        for ability in self.manual_abilities:
+        for ability in self.cast_abilities:
             bound = activations.get(ability.ability_guid.lower())
             if bound is None:
                 bound = ability.activation
@@ -674,7 +680,7 @@ class PlayPlan:
                 errors.append(
                     f"additional cost {index} has {len(selected)} selections; "
                     f"maximum is {maximum}")
-        for ability in self.manual_abilities:
+        for ability in self.cast_abilities:
             bound = activation_map.get(ability.ability_guid.lower())
             if bound is None:
                 bound = ability.activation

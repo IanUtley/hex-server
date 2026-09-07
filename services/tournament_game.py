@@ -479,6 +479,48 @@ def _pvp_sync_view_to_state(state, view, player_pid, opponent_pid):
             view.get("champion_counters") or {})
 
 
+def _pvp_resolve_granted_resource_abilities(handler, session, state,
+                                            card_uid, owner_pid):
+    """Resolve instance-only resource abilities on a shared PvP event view."""
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        return []
+    owner_pid = int(owner_pid)
+    opponent_pid = next(pid for pid in pids if int(pid) != owner_pid)
+    owner_handler = player_handlers.get(owner_pid) or handler
+    pl_uid = _ge.UID.make(244, owner_pid)
+    opp_uid = _ge.UID.make(244, opponent_pid)
+    view = dict(state)
+    view.update({
+        "pvp": True,
+        "player_resources": int(state.get(f"res_{owner_pid}", 0)),
+        "player_total_resources": int(
+            state.get(f"res_total_{owner_pid}", 0)),
+        "player_charges": int(state.get(f"chg_{owner_pid}", 0)),
+        "player_threshold": dict(
+            state.get(f"thresh_{owner_pid}") or {}),
+        "ai_resources": int(state.get(f"res_{opponent_pid}", 0)),
+        "ai_total_resources": int(
+            state.get(f"res_total_{opponent_pid}", 0)),
+        "ai_charges": int(state.get(f"chg_{opponent_pid}", 0)),
+        "ai_threshold": dict(
+            state.get(f"thresh_{opponent_pid}") or {}),
+    })
+    owner_handler._current_bstate = view
+    game = _ge.Game(int(session.session_id), pl_uid, opp_uid)
+    _pvp_populate_game_state(game, state, owner_pid, opponent_pid)
+    from abilities.framework.resources import (
+        resolve_granted_resource_abilities)
+    logs = resolve_granted_resource_abilities(
+        game, session, _db, owner_handler, pl_uid, opp_uid, view,
+        int(card_uid), owner_pid)
+    _pvp_sync_view_to_state(state, view, owner_pid, opponent_pid)
+    pvp_save_state(session, state)
+    if logs:
+        log_req("    PvP resource granted abilities: " + "; ".join(logs))
+    return game.events
+
+
 def _pvp_log_stack(state, label):
     """Log the current chain/stack size + which players have passed it, so the
     server log can be correlated with the CLIENT's resolve requests:
@@ -4297,6 +4339,8 @@ def pvp_handle_transaction(handler, session, inner_bytes):
         thresh[shard_color] = int(cur or 0) + 1
     state[thresh_key] = thresh
     pvp_save_state(session, state)
+    resource_ability_events = _pvp_resolve_granted_resource_abilities(
+        handler, session, state, int(played_card_uid), my_pid)
     # The resource is now played — refresh the turn player's options so the
     # second shard no longer highlights.
     if (not is_shards_of_fate and not state.get("stack") and
@@ -4373,6 +4417,8 @@ def pvp_handle_transaction(handler, session, inner_bytes):
         if charge_trigger_game:
             for trigger_event in charge_trigger_game.events:
                 g._push(trigger_event)
+        for resource_event in resource_ability_events:
+            g._push(resource_event)
         # PlayerUpdated for both — health / charges / resources.
         for target_pid in pids:
             target_uid = _ge.UID.make(244, target_pid)

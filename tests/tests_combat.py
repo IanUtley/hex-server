@@ -426,6 +426,145 @@ def test_push_card_updated_gem_fallback(db):
     assert g.events[-1].gems == 3, g.events[-1].gems
 
 
+def test_champion_warm_rebuild_does_not_emit_card_updated(db):
+    """The phase-start champion cache rebuild must not create a battlefield
+    card update.  The initial CardUpdated(None) seeds State.Cards; the later
+    ChampionCardPlayed event owns the HUD placement.
+    """
+    import hconnect_server as hcs
+    from domain import game as gmod
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler._player_champ_scid = game_engine.SessionCardId(
+        game_engine.UID.make(244, 5))
+    handler._ai_champ_scid = game_engine.SessionCardId(
+        game_engine.UID.make(3, 1000))
+    handler._player_champ_abilities = []
+    handler._ai_champ_ability_guids = []
+    game = gmod.Game(1, game_engine.UID.make(244, 5),
+                     game_engine.UID.make(3, 1000))
+
+    handler._push_champions_warm(
+        SessionStub(), game.player_uid, game.ai_uid,
+        {"player_health": 20, "ai_health": 10}, game)
+
+    assert game.events == []
+    assert game.card_defs[handler._player_champ_scid].card_type == \
+        game_engine.ECardTypes.Champion
+    assert game.card_defs[handler._ai_champ_scid].card_type == \
+        game_engine.ECardTypes.Champion
+
+
+def test_champion_collection_updates_are_suppressed(db):
+    """Only the initial CardUpdated(None) may seed a champion representation.
+
+    A later CardUpdated(Champions) makes the client treat a chain clone as a
+    real battlefield card, leaving a giant champion view after resolution.
+    """
+    from domain import game as gmod
+
+    pl_t = game_engine.UID.make(244, 5)
+    cid = game_engine.SessionCardId(game_engine.UID.make(244, 5))
+    game = gmod.Game(1, pl_t, game_engine.UID.make(3, 1000))
+    game.card_defs[cid] = gmod.CardDef(
+        "Zuba", game_engine.ECardTypes.Champion, 0, 20, 20, [], [])
+
+    assert game.push_card_updated(
+        cid, pl_t, game_engine.ECardCollections.Champions,
+        game_engine.ECardTypes.Champion) is False
+    assert game.events == []
+    game.push_card_updated(
+        cid, pl_t, game_engine.ECardCollections.None_,
+        game_engine.ECardTypes.Champion)
+    assert len(game.events) == 1
+
+
+def test_basic_champion_power_is_not_activatable_on_chain(db):
+    """BasicAction champion powers are not offered while a chain is pending."""
+    import battle_engine as be
+    import db as dbmod
+    from hconnect_server import HCPHandler
+
+    class Ability:
+        guid = "basic-champion-power"
+
+    handler = object.__new__(HCPHandler)
+    handler._champion_thresholds_met = lambda _guid, _state: True
+    old_db = dbmod._db
+    dbmod._db = object()
+    try:
+        with mock.patch("db.db_talent_ability_costs", return_value=(
+                2, 0, 1 << game_engine.ETurnPhases.FirstMainPhase, 8)), \
+                mock.patch("db.db_champion_ability_costs", return_value=None):
+            bstate = {
+                "player_charges": 2,
+                "player_spell_points": 0,
+                "turn_player": be.PLAYER,
+                "stack": [{"kind": "ability"}],
+            }
+            assert HCPHandler._filter_affordable_abilities(
+                handler, [Ability()], bstate,
+                game_engine.ETurnPhases.FirstMainPhase) == []
+            bstate["stack"] = []
+            assert HCPHandler._filter_affordable_abilities(
+                handler, [Ability()], bstate,
+                game_engine.ETurnPhases.FirstMainPhase)[0].guid == \
+                "basic-champion-power"
+    finally:
+        dbmod._db = old_db
+
+
+def test_game_started_chain_is_auto_passed(db):
+    """GameStarted trigger items resolve without opening chain priority."""
+    import battle_engine as be
+    from hconnect_server import HCPHandler
+
+    handler = object.__new__(HCPHandler)
+    resolved = []
+
+    def resolve_item(_session, _pl_t, _ai_t, _bstate, item, _game):
+        resolved.append(item["id"])
+
+    handler._resolve_stack_item = resolve_item
+    session = mock.Mock(session_id=1)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"stack": [{"id": 1}, {"id": 2}],
+              "stack_player_passed": True,
+              "stack_ai_passed": True}
+
+    assert handler._autopass_game_started_chain(
+        session, pl_t, ai_t, bstate, game) == 2
+    assert resolved == [2, 1]
+    assert be.stack_empty(bstate)
+
+
+def test_completed_game_started_chain_events_are_not_rendered(db):
+    """A completed setup chain must not strand its source card in the UI."""
+    from hconnect_server import HCPHandler
+
+    handler = object.__new__(HCPHandler)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    game.push_turn_phase(game_engine.ETurnPhases.StartGame, pl_t, pl_t)
+    event_start = len(game.events)
+    game.push_ability_on_chain(game_engine.SessionCardId(),
+                               game_engine.ResourceId.invalid(), 7)
+    game.push_top_of_chain_resolved(7)
+    game.push_removed_top_of_chain(7)
+    game.push_chain_empty()
+    game.push_card_drawn(game_engine.SessionCardId(), pl_t, 0)
+
+    handler._suppress_completed_game_started_chain_events(game, event_start)
+
+    assert len(game.events) == event_start + 1
+    assert isinstance(game.events[-1], game_engine.CardDrawnSessionEventArgs)
+    assert isinstance(game.events[0],
+                      game_engine.TurnPhaseUpdatedSessionEventArgs)
+
+
 def test_card_updated_carries_rage(db):
     """CardUpdated.rage drives the client's Rage icon and was never populated
     (always 0).  It must come from the CardDef (set by _card_full_data from
@@ -1154,6 +1293,44 @@ def test_spiritdrain_heals_actual_blocker_damage(db):
     assert bstate["ai_health"] == 12, bstate
 
 
+def test_lethal_kills_high_defense_blocker(db):
+    """A Lethal attacker kills a troop it damages even when one damage is
+    less than that blocker's remaining defense."""
+    lethal_tpl = "ffffffff-0000-0000-0000-00000000a003"
+    blocker_tpl = "ffffffff-0000-0000-0000-00000000a004"
+    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (lethal_tpl, "Lethal Attacker", "Troop", 1, 1, 3, 0, "[]", "[]", "", 1))
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (blocker_tpl, "Large Blocker", "Troop", 4, 2, 5, 0, "[]", "[]", "", 0))
+    add_card(db, 101, 0, lethal_tpl)
+    add_card(db, 102, 5, blocker_tpl)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+    handler = HandlerStub(db)
+    ai._db = db
+    ai.resolve_combat(
+        handler, SessionStub(), pl_t, ai_t, bstate,
+        {101: 0}, {101: [102]}, ai_t, pl_t, "ai_attackers",
+        send_events=lambda *args: None)
+    blocker = db.execute(
+        "SELECT location, card_state FROM game_cards WHERE card_uid=102"
+    ).fetchone()
+    attacker = db.execute(
+        "SELECT location, card_damage FROM game_cards WHERE card_uid=101"
+    ).fetchone()
+    assert blocker[0] == "discard", blocker
+    assert blocker[1] & game_engine.ECardStates.Dead, blocker
+    assert attacker == ("warzone", 2), attacker
+
+
 def test_ai_attacks_zero_attack_rage_troop_when_unblocked(db):
     """A ready 0-attack troop with printed Rage must still attack into an
     empty opposing warzone so its Rage trigger can apply."""
@@ -1299,6 +1476,15 @@ def main():
         ("Deploy never fires as Deathcry", test_deploy_never_fires_as_deathcry),
         ("Two-Ruby threshold counts", test_threshold_count_two_ruby),
         ("CardUpdated gem fallback", test_push_card_updated_gem_fallback),
+        ("Champion warm omits CardUpdated",
+         test_champion_warm_rebuild_does_not_emit_card_updated),
+        ("Champion collection updates suppressed",
+         test_champion_collection_updates_are_suppressed),
+        ("Basic champion power not activatable on chain",
+         test_basic_champion_power_is_not_activatable_on_chain),
+        ("GameStarted chain auto-pass", test_game_started_chain_is_auto_passed),
+        ("Completed GameStarted chain is hidden",
+         test_completed_game_started_chain_events_are_not_rendered),
         ("CardUpdated carries Rage", test_card_updated_carries_rage),
         ("Priestess Deathcry human picker", test_priestess_deathcry_human_picker),
         ("Blocker options exclude CantBlock", test_player_can_block_excludes_cantblock),
@@ -1318,6 +1504,8 @@ def main():
         ("AI attacks unblocked zero-attack Rage troop", test_ai_attacks_zero_attack_rage_troop_when_unblocked),
         ("SpiritDrain heals actual blocker damage",
          test_spiritdrain_heals_actual_blocker_damage),
+        ("Lethal kills high-defense blocker",
+         test_lethal_kills_high_defense_blocker),
     ]
     failed = 0
     for name, fn in tests:

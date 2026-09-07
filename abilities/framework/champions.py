@@ -75,7 +75,9 @@ def apply_ability_cost(db, session, game, pl_t, player_uid, ability_guid,
         ev.player_id = pl_t; ev.operation = 2; ev.delta = eff_sc
         ev.new_value = bstate["player_spell_points"]; game._push(ev)
 
-    # Reflect escalated SP cost on champion card
+    # Keep the escalation on the authoritative CardDef.  ChampionCardPlayed
+    # owns the HUD view; a later CardUpdated(Champions) is interpreted by the
+    # client as a card-location change and can leave a giant chain clone.
     if player_champ_scid and sp_uses.get(ability_guid):
         cdef = game.card_defs.get(player_champ_scid)
         if cdef is not None:
@@ -83,11 +85,6 @@ def apply_ability_cost(db, session, game, pl_t, player_uid, ability_guid,
                 if int(uses) > 0:
                     cdef.spell_point_cost_mods[
                         game_engine.ResourceId.from_str(ag)] = int(uses)
-            game.push_card_updated(
-                player_champ_scid, pl_t,
-                game_engine.ECardCollections.Champions,
-                game_engine.ECardTypes.Champion,
-                template_id=player_champ_guid)
 
     return True
 

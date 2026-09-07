@@ -43,6 +43,7 @@ TPL = {
     "prairie": "6e54f6f0-e630-40f9-9df3-e567b31605ea",
     "burn": "609a5ce4-24a4-4470-98d1-e64b8a8a4531",
     "gladiator": "33f03766-e38e-4a77-ac1e-bbc78a55ddbb",
+    "wretched_wrangler": "638e079b-7d0a-4c9e-a81f-ca29e918731c",
 }
 
 ABILITIES = [
@@ -726,6 +727,49 @@ def test_gem_survives_repush(db):
     assert gem == 5, gem
 
 
+def test_consumed_one_shot_stays_off_card_updated(db):
+    """An empty instance ability list must not fall back to printed powers.
+
+    Wretched Wrangler's ONE-SHOT is removed from game_cards after resolving.
+    The subsequent CardUpdated must therefore carry no abilities, or the
+    client will continue to display the spent power.
+    """
+    import db as dbmod
+    import hconnect_server as hmod
+    from hconnect_server import HCPHandler
+    dbmod._db = db
+    hmod._db = db
+    add_card(db, 101, 0, "wretched_wrangler", "warzone")
+    db.execute(
+        "UPDATE game_cards SET card_abilities='[]' WHERE session_id=1 "
+        "AND card_uid=101")
+    db.commit()
+
+    class EH:
+        user_profile = {"id": 5}
+        _current_bstate = {}
+
+        def _template_by_guid(self, tg):
+            return db.execute(
+                "SELECT guid, card_type, name, cost, attack, defense "
+                "FROM card_templates WHERE guid=?", (tg,)).fetchone()
+
+        def _granted_attributes(self, ags):
+            return 0
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    scid = game_engine.SessionCardId(game_engine.UID(101))
+    _tpl, ct, _name, _cost, _atk, _def, _gem = HCPHandler._card_full_data(
+        EH(), game, scid, TPL["wretched_wrangler"])
+    assert game.card_defs[scid].abilities == [], game.card_defs[scid].abilities
+    game.push_card_updated(
+        scid, ai_t, game_engine.ECardCollections.Warzone, ct,
+        template_id=TPL["wretched_wrangler"])
+    assert game.events[-1].abilities == [], game.events[-1].abilities
+
+
 def test_poca_ability_no_picker(db):
     """Poca's 'Summon a Blaze Elemental' has a 'You' auto target — it must NOT
     attach a champion-ability target picker."""
@@ -972,6 +1016,7 @@ if __name__ == "__main__":
     run("'You' damage hits the champion", test_you_damage_targets_champion)
     run("Auto targets never show a picker", test_auto_target_no_picker)
     run("Gem survives instance-less re-push", test_gem_survives_repush)
+    run("Consumed one-shot leaves CardUpdated", test_consumed_one_shot_stays_off_card_updated)
     run("Poca auto target never shows a picker", test_poca_ability_no_picker)
     run("Incantation transforms at 5 counters", test_incantation_transform)
     run("Incantation gate blocks premature transform",

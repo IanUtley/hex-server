@@ -175,6 +175,154 @@ def _quest_template_from_row(row):
     }
 
 
+def _quest_objective_conversation_guids(db, champ_id, quest_script,
+                                        objective):
+    """Return the valid completion conversations for one quest objective.
+
+    A number of shared AZ1 QuestTemplate records contain the Ardent
+    conversation ID even for Underworld champions.  The authored
+    ``quest_conversations`` catalog has the faction-specific completion rows,
+    so use those as the authoritative fallback while retaining any
+    conversation IDs that are faction-neutral.
+    """
+    if not isinstance(objective, dict):
+        return []
+    explicit = []
+    for value in objective.get("conversation_ids") or []:
+        if value and str(value) not in explicit:
+            explicit.append(str(value))
+    if objective.get("conversation") and str(objective["conversation"]) not in explicit:
+        explicit.append(str(objective["conversation"]))
+    try:
+        faction = _quest_faction_for_champion(db, champ_id)
+    except Exception:
+        faction = "Ardent"
+    champion = _get_champion(db, champ_id)
+    race = _RACE_NAMES.get(champion[2]) if champion else None
+    race_key = re.sub(r"[^a-z0-9]", "", str(race or "").lower())
+    rows = db.execute(
+        "SELECT conversation_guid, role, faction, conversation_name "
+        "FROM quest_conversations WHERE quest_script=? AND enabled=1 "
+        "ORDER BY priority, conversation_guid",
+        (str(quest_script),),
+    ).fetchall()
+    faction_neutral = {str(guid) for guid, _role, row_faction, _name in rows
+                       if not row_faction}
+    matching_complete = [
+        row for row in rows
+        if row[1] == "complete" and _quest_row_matches_faction(row[2], faction)
+    ]
+    # A few AZ1 faction quests have one completion conversation per race.
+    # Prefer the exact authored race variant whenever one exists; otherwise
+    # use the faction-level completion record.
+    race_rows = [
+        row for row in matching_complete
+        if race_key and race_key in re.sub(
+            r"[^a-z0-9]", "", str(row[3] or "").lower())
+    ]
+    selected_complete = race_rows or matching_complete
+    faction_rows = {str(row[0]) for row in selected_complete}
+    # Preserve authored neutral IDs. For explicit faction-specific IDs,
+    # replace a mismatching faction with the matching completion variant.
+    valid_explicit = set(explicit) & faction_neutral
+    for guid in explicit:
+        matching_rows = [row for row in rows if str(row[0]) == guid]
+        if not matching_rows:
+            valid_explicit.add(guid)
+            continue
+        if any(not row[2] for row in matching_rows):
+            valid_explicit.add(guid)
+            continue
+        if any(_quest_row_matches_faction(row[2], faction)
+               for row in matching_rows):
+            # Do not retain an explicit faction ID for the wrong race when
+            # this quest has authored race-specific completion variants.
+            if not race_rows or any(row[0] == guid for row in race_rows):
+                valid_explicit.add(guid)
+    result = sorted(valid_explicit | faction_rows)
+    return result or explicit
+
+
+def _quest_objective_scene_guid(db, quest_script, objective):
+    """Resolve an AZ1 encounter/dungeon objective to its authored scene.
+
+    Older QuestTemplate data stores a dungeon template GUID or an empty
+    encounter GUID for several AZ1 objectives.  The quest script/title and
+    the AZ1 encounter scene name are the remaining authored link.  Resolve it
+    once when a quest state is materialized so normal encounter progression
+    remains GUID-based.
+    """
+    if not isinstance(objective, dict):
+        return None
+    explicit = str(objective.get("encounter") or "").strip()
+    if explicit and explicit != "00000000-0000-0000-0000-000000000000":
+        if db.execute("SELECT 1 FROM encounter_scenes WHERE guid=?", (explicit,)).fetchone():
+            return explicit
+    objective_type = str(objective.get("type") or "").lower()
+    if objective_type not in {"encounter", "dungeon"}:
+        return None
+    rows = db.execute(
+        "SELECT guid, name, title FROM encounter_scenes "
+        "WHERE name LIKE 'AZ 1 - NODE %' ORDER BY name"
+    ).fetchall()
+    if not rows:
+        return None
+    script_tokens = set(re.findall(r"[a-z0-9]+", str(quest_script or "").lower()))
+    title_tokens = set(re.findall(
+        r"[a-z0-9]+", str(objective.get("title") or "").lower()))
+    ignored = {
+        "az", "area", "quest", "step", "find", "go", "to", "the",
+        "and", "of", "in", "from", "at", "return", "defeat", "kill",
+        "win", "match", "with", "investigate", "source", "get", "all",
+        "one", "your", "back", "for", "on", "a",
+    }
+    script_tokens -= ignored
+    title_tokens -= ignored
+    best = None
+    for guid, name, title in rows:
+        scene_text = f"{name or ''} {title or ''}".lower()
+        scene_tokens = set(re.findall(r"[a-z0-9]+", scene_text)) - ignored
+        overlap = len(script_tokens & scene_tokens)
+        title_overlap = len(title_tokens & scene_tokens)
+        score = overlap * 12 + title_overlap * 4
+        normalized_title = re.sub(r"[^a-z0-9]+", "", str(title or "").lower())
+        normalized_objective = re.sub(
+            r"[^a-z0-9]+", "", str(objective.get("title") or "").lower())
+        if normalized_title and normalized_title in normalized_objective:
+            score += 100
+        if objective_type == "dungeon" and "dungeon" in str(name or "").lower():
+            score += 8
+        if score <= 0:
+            continue
+        candidate = (score, int("dungeon" in str(name or "").lower()), guid)
+        if best is None or candidate > best[0]:
+            best = (candidate, guid)
+    return best[1] if best else None
+
+
+def _materialize_quest_objectives(db, champ_id, quest_script, objectives):
+    """Add faction-correct, runtime-resolvable links to quest objectives."""
+    try:
+        materialized = json.loads(json.dumps(objectives or []))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        materialized = []
+    for objective in materialized:
+        if not isinstance(objective, dict):
+            continue
+        resolved_scene = _quest_objective_scene_guid(
+            db, quest_script, objective)
+        if resolved_scene:
+            objective["encounter"] = resolved_scene
+        if str(objective.get("type") or "").lower() in {
+                "conversation", "convo"}:
+            conversations = _quest_objective_conversation_guids(
+                db, champ_id, quest_script, objective)
+            if conversations:
+                objective["conversation_ids"] = conversations
+                objective["conversation"] = conversations[0]
+    return materialized
+
+
 def _quest_template(db, quest_script=None, campaign_group=None):
     """Select a QuestTemplate from the server-owned metadata table."""
     sql = ("SELECT script_name, title, objectives_json, campaign_group, "
@@ -210,6 +358,11 @@ def _ensure_quest_campaign(db, champ_id, campaign_group, quest_script=None):
     if not quest:
         return None
     script_name, q = quest
+    # QuestTemplate is shared by the two AZ1 factions. Materialize the
+    # faction-correct completion conversation and resolve legacy empty
+    # encounter links before copying objectives into persistent quest state.
+    q["objectives"] = _materialize_quest_objectives(
+        db, champ_id, script_name, q.get("objectives"))
     row = db.execute(
         "SELECT id FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
         "AND template_name=?", (champ_id, script_name)).fetchone()
@@ -310,7 +463,13 @@ def _advance_quest_campaign(db, champ_id, quest_script=None, scene_guid=None):
     state = json.loads(state_json) if state_json else None
     if not state:
         return None
-    objectives = state.get("Flags", {}).get("_quest_objectives") or []
+    flags = state.setdefault("Flags", {})
+    objectives = flags.get("_quest_objectives") or []
+    materialized = _materialize_quest_objectives(
+        db, champ_id, quest_script, objectives)
+    if materialized != objectives:
+        objectives = materialized
+        flags["_quest_objectives"] = objectives
     idx = int(state.get("Flags", {}).get("_quest_objective_idx", 0))
     if scene_guid and idx < len(objectives):
         expected = objectives[idx].get("encounter")
@@ -419,7 +578,15 @@ def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
         if not state or state.get("Finished"):
             continue
         flags = state.get("Flags") or {}
-        objectives = flags.get("_quest_objectives") or []
+        objectives = _materialize_quest_objectives(
+            db, champ_id, script, flags.get("_quest_objectives") or [])
+        if objectives != (flags.get("_quest_objectives") or []):
+            flags["_quest_objectives"] = objectives
+            db.execute(
+                "UPDATE campaigns SET state_json=? WHERE id=?",
+                (json.dumps(state), _qid),
+            )
+            db.commit()
         try:
             index = int(flags.get("_quest_objective_idx", 0))
         except (TypeError, ValueError):
@@ -428,6 +595,8 @@ def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
             continue
         objective = objectives[index]
         expected = objective.get("encounter")
+        if not expected:
+            expected = _quest_objective_scene_guid(db, script, objective)
         if (not expected and
                 str(objective.get("type") or "").lower() == "encounter" and
                 active_area_scene == str(scene_guid)):
@@ -489,7 +658,15 @@ def _advance_quest_conversation_objectives(db, champ_id, conversation_guid):
         if not state or state.get("Finished"):
             continue
         flags = state.get("Flags") or {}
-        objectives = flags.get("_quest_objectives") or []
+        objectives = _materialize_quest_objectives(
+            db, champ_id, script, flags.get("_quest_objectives") or [])
+        if objectives != (flags.get("_quest_objectives") or []):
+            flags["_quest_objectives"] = objectives
+            db.execute(
+                "UPDATE campaigns SET state_json=? WHERE id=?",
+                (json.dumps(state), _qid),
+            )
+            db.commit()
         try:
             index = int(flags.get("_quest_objective_idx", 0) or 0)
         except (TypeError, ValueError):
@@ -500,12 +677,8 @@ def _advance_quest_conversation_objectives(db, champ_id, conversation_guid):
         if str(objective.get("type") or "").lower() not in {
                 "conversation", "convo"}:
             continue
-        expected = {
-            str(value) for value in (objective.get("conversation_ids") or [])
-            if value
-        }
-        if objective.get("conversation"):
-            expected.add(str(objective["conversation"]))
+        expected = set(_quest_objective_conversation_guids(
+            db, champ_id, script, objective))
         # Compatibility for the original Cross Zodiac River extract, whose
         # final objective accidentally contained Warren's champion GUID.
         if (str(script) == "az01_q_cross_the_river_part2" and
@@ -1015,17 +1188,29 @@ def _az1_scene_for_node(db, node):
     the same node identifier, so this lookup is shared by newly-created and
     older persisted area campaigns.
     """
-    match = re.search(r"NODE[_ ]?0*(\d+)", str(node or ""), re.I)
-    if not match:
+    def node_key(value):
+        text = re.sub(r"[^0-9A-Z_]", "", str(value or "").upper())
+        text = re.sub(r"^NODE", "", text)
+        match = re.fullmatch(r"0*(\d+)([A-Z_][0-9A-Z_]*)?", text)
+        if not match:
+            return text
+        number, suffix = match.groups()
+        return f"{int(number)}{suffix or ''}"
+
+    wanted = node_key(node)
+    if not wanted:
         return None
-    number = int(match.group(1))
     rows = db.execute(
         "SELECT guid, name, rewards_json FROM encounter_scenes "
         "WHERE name LIKE 'AZ 1 - NODE %'"
     ).fetchall()
-    return next((row for row in rows
-                 if re.search(r"NODE[_ ]?0*%d\b" % number,
-                              row[1] or "", re.I)), None)
+    for row in rows:
+        match = re.search(
+            r"\bNODE\s*-?\s*([0-9A-Z_]+(?:\s+[A-Z0-9_]+)?)\s*-",
+            row[1] or "", re.I)
+        if match and node_key(match.group(1)) == wanted:
+            return row
+    return None
 
 
 def _az1_node_conversation_rows(db, node, campaign_template="AZ1"):
@@ -2324,8 +2509,18 @@ def _apply_az1_quest_markers(db, champ_id, state):
             continue
         if not isinstance(quest_state, dict) or quest_state.get("Finished"):
             continue
-        flags = quest_state.get("Flags") or {}
-        objectives = flags.get("_quest_objectives") or []
+        flags = quest_state.setdefault("Flags", {})
+        old_objectives = flags.get("_quest_objectives") or []
+        objectives = _materialize_quest_objectives(
+            db, champ_id, quest_script, old_objectives)
+        if objectives != old_objectives:
+            flags["_quest_objectives"] = objectives
+            db.execute(
+                "UPDATE campaigns SET state_json=? WHERE template_name=? "
+                "AND champion_id=? AND campaign_type='QUEST'",
+                (json.dumps(quest_state), quest_script, champ_id),
+            )
+            db.commit()
         try:
             objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
         except (TypeError, ValueError):
@@ -2334,12 +2529,8 @@ def _apply_az1_quest_markers(db, champ_id, state):
             current = objectives[objective_index]
             if isinstance(current, dict):
                 active_objective_conversations.update(
-                    str(value) for value in current.get("conversation_ids") or []
-                    if value
-                )
-                if current.get("conversation"):
-                    active_objective_conversations.add(
-                        str(current["conversation"]))
+                    _quest_objective_conversation_guids(
+                        db, champ_id, quest_script, current))
         completed = {
             str((loc.get("Data") or {}).get("node") or
                 (loc.get("Data") or {}).get("name"))
@@ -2352,13 +2543,13 @@ def _apply_az1_quest_markers(db, champ_id, state):
             objective_id = str(objective.get("id") or "")
             if objective_id and objective_id in completed:
                 continue
-            encounter = objective.get("encounter")
+            encounter = objective.get("encounter") or _quest_objective_scene_guid(
+                db, quest_script, objective)
             if encounter:
                 quest_nodes.update(encounter_nodes.get(str(encounter), set()))
-            for conversation in objective.get("conversation_ids") or []:
-                quest_nodes.update(conversation_nodes.get(str(conversation), set()))
-            conversation = objective.get("conversation")
-            if conversation:
+            conversations = _quest_objective_conversation_guids(
+                db, champ_id, quest_script, objective)
+            for conversation in conversations:
                 quest_nodes.update(conversation_nodes.get(str(conversation), set()))
 
     pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
@@ -5422,7 +5613,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     generic profile reward events are not sufficient here.
     """
     result = {"applied": _empty_applied_updates(), "cards": [],
-              "chests": [], "gold": 0, "xp": 0,
+              "items": [], "chests": [], "gold": 0, "xp": 0,
               "condition_met": False, "scene_guid": None}
     if not won:
         return result
@@ -5524,11 +5715,72 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                  "00000000-0000-0000-0000-000000000000", chest_guid))
             chest = {"id": int(chest_row.lastrowid),
                      "template": chest_guid}
-        if not cards and not gold and not xp and not chest:
+        items = []
+        item_specs = reward_obj.get("items") or []
+        champ_race = _RACE_NAMES.get(champ[2], "") if champ else ""
+        race_item_guid = (reward_obj.get("item_guid_by_race") or {}).get(champ_race)
+        if race_item_guid:
+            item_specs = list(item_specs) + [{
+                "guid": race_item_guid, "quantity": reward_obj.get("quantity", 1),
+            }]
+        if reward_obj.get("item_guid"):
+            item_specs = list(item_specs) + [{
+                "guid": reward_obj.get("item_guid"),
+                "quantity": reward_obj.get("quantity", 1),
+            }]
+        if isinstance(item_specs, dict):
+            item_specs = [item_specs]
+        if not condition or context:
+            for spec in item_specs:
+                if isinstance(spec, str):
+                    spec = {"guid": spec}
+                if not isinstance(spec, dict):
+                    continue
+                template_guid = (spec.get("guid") or spec.get("template") or
+                                 spec.get("item_guid"))
+                if not template_guid:
+                    continue
+                try:
+                    quantity = max(1, int(spec.get("quantity", 1) or 1))
+                except (TypeError, ValueError):
+                    quantity = 1
+                existing = db.execute(
+                    "SELECT id, quantity, client_item_uid FROM player_inventory "
+                    "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
+                    (player_user_id, str(template_guid))).fetchone()
+                if existing:
+                    item_row_id, old_quantity, item_uid = existing
+                    new_quantity = int(old_quantity or 0) + quantity
+                    if not item_uid:
+                        item_uid = int(db.execute(
+                            "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+                            "FROM player_inventory WHERE user_id=?",
+                            (player_user_id,)).fetchone()[0] or 1)
+                        db.execute(
+                            "UPDATE player_inventory SET quantity=?, client_item_uid=? "
+                            "WHERE id=?", (new_quantity, item_uid, item_row_id))
+                    else:
+                        db.execute("UPDATE player_inventory SET quantity=? WHERE id=?",
+                                   (new_quantity, item_row_id))
+                else:
+                    item_uid = int(db.execute(
+                        "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+                        "FROM player_inventory WHERE user_id=?",
+                        (player_user_id,)).fetchone()[0] or 1)
+                    new_quantity = quantity
+                    db.execute(
+                        "INSERT INTO player_inventory "
+                        "(user_id, template_guid, quantity, client_item_uid) "
+                        "VALUES (?,?,?,?)",
+                        (player_user_id, str(template_guid), new_quantity, item_uid))
+                items.append({"id": item_uid, "template": str(template_guid),
+                              "quantity": new_quantity, "granted": quantity})
+        if not cards and not gold and not xp and not chest and not items:
             continue
         granted.extend(cards)
         total_gold += gold
         total_xp += xp
+        result["items"].extend(items)
         if chest:
             result["chests"].append(chest)
         claims[claim_key] = True
@@ -5612,8 +5864,22 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
             "ItemAction": "GRANT", "ItemTemplate": chest["template"],
             "RCode": "CHEST",
         })
+    for item in result["items"]:
+        applied["Items"].append({"Item": {
+            "Id": int(item["id"]),
+            "TemplateID": item["template"],
+            "BoundToProfile": True,
+            "ItemQuantity": int(item["quantity"]),
+            "ClaimDate": "0001-01-01T00:00:00",
+            "EscrowStatus": "Clean",
+        }})
+        applied["Completed"].append({
+            "ItemKind": "BOAITEM", "ItemQuantity": int(item["granted"]),
+            "ItemAction": "GRANT", "ItemTemplate": item["template"],
+            "RCode": "ITEM",
+        })
     if (not granted and not total_gold and not total_xp and
-            not result["chests"]):
+            not result["chests"] and not result["items"]):
         state["_last_encounter_condition_met"] = bool(result["condition_met"])
         db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                    (json.dumps(state), camp_id))
@@ -6018,7 +6284,13 @@ def resolve_opening_hand_config(db, session, player_id, race_name, cls_name,
 
 
 def apply_starting_hand_talents(handler, db, session, game, pl_t, effects):
-    """Apply campaign opening-hand effects from typed talent metadata."""
+    """Apply campaign opening-hand stat effects from talent metadata.
+
+    Triggered GrantAbility talents are resolved by the normal
+    ``GameStartedEvent`` dispatcher.  This helper is intentionally limited to
+    modifiers that have no event/BOM target, so a talent cannot be applied in
+    both this setup pass and the trigger dispatcher.
+    """
     if not effects:
         return False
     changed = False

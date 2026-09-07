@@ -34,6 +34,23 @@ DEFAULT_GAMEDATA = "/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Data
 DEFAULT_RECORDS = Path(__file__).resolve().parents[1] / "Records"
 ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 
+# These AZ1 payouts are not present in SceneData/RewardTemplate records. They
+# are retained here so a fresh database receives the same verified encounter
+# rewards as an existing database repaired by static.ensure_schema().
+AZ1_HOWLING_PLAINS_PACK_GUID = "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
+AZ1_CORRUPT_DRYAD_SCENE_GUID = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
+AZ1_SAVAGE_LORD_SCENE_GUID = "ab77df1e-5f13-471b-80e7-b7b4824ca280"
+AZ1_DRYAD_ITEM_REWARDS = {
+    "Human": "7b955172-5670-4e89-a9dc-aa6c8867d077",
+    "Elf": "63e87fdf-6650-4861-90e5-7c8c840ec292",
+    "Coyotle": "cd13fdb5-6d6f-4d8e-a413-589176b44935",
+    "Orc": "94ffd65d-8ecb-4bda-91bc-f091ef5461e2",
+    "Dwarf": "e6d194fb-29ec-4abe-b373-91f1e9c3624e",
+    "Necrotic": "a537d34b-ee48-42f2-8a8c-01aa1f927600",
+    "Shin'hare": "f62a13c2-076d-4c90-9da0-66bae2b17cba",
+    "Vennen": "fd359679-6d40-496b-a83d-9d39e2c32dab",
+}
+
 # These are the client-derived sections needed by the server schema.  Records
 # is a JSONL representation of the same gamedata sections. A local checkout
 # may provide it as a fallback; Docker creates it at first startup when a
@@ -216,6 +233,7 @@ def _card_helpers():
             _threshold_to_json,
             _ability_meta,
             _target_templates,
+            _card_template_has_lethal,
         )
     except ImportError:  # direct execution from AssetExtraction/
         from extract_cards import (  # type: ignore
@@ -228,6 +246,7 @@ def _card_helpers():
             _threshold_to_json,
             _ability_meta,
             _target_templates,
+            _card_template_has_lethal,
         )
     return {
         "abilities_to_json": _abilities_to_json,
@@ -239,6 +258,7 @@ def _card_helpers():
         "threshold_to_json": _threshold_to_json,
         "ability_meta": _ability_meta,
         "target_templates": _target_templates,
+        "card_template_has_lethal": _card_template_has_lethal,
     }
 
 
@@ -322,6 +342,7 @@ def _extract_cards(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ..
             helpers["int_field"](raw, "m_VariableCostMinimum"),
             rage,
             subtype,
+            helpers["card_template_has_lethal"](raw),
         )
         cards.append(row)
         ability_guids.update(
@@ -766,7 +787,8 @@ def _extract_encounters(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[An
         # fixed card name. Keep the reward declaration on every encounter
         # referenced by the AZ01 Tamed quest so a win without capture remains
         # retryable and a later capture awards that troop once.
-        if nested_guid(record, "m_Id") in tamed_scene_guids:
+        scene_guid = nested_guid(record, "m_Id")
+        if scene_guid in tamed_scene_guids:
             rewards.pop("gold", None)
             rewards.pop("xp", None)
             rewards.pop("one_time", None)
@@ -780,6 +802,16 @@ def _extract_encounters(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[An
                  "card_guid": "$condition.template_guid",
                  "quantity": 1, "one_time": True},
             ]
+        if scene_guid == AZ1_SAVAGE_LORD_SCENE_GUID:
+            rewards = {"gold": 300, "xp": 200, "one_time": False}
+        elif scene_guid == AZ1_CORRUPT_DRYAD_SCENE_GUID:
+            rewards = {"end_of_game_rewards": [
+                {"xp": 250, "one_time": False},
+                {"chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
+                 "one_time": True},
+                {"item_guid_by_race": AZ1_DRYAD_ITEM_REWARDS,
+                 "one_time": True},
+            ]}
         scenes.append((nested_guid(record, "m_Id"), name, record.get("m_Title") or "", record.get("m_Gameboard") or "", ai_deck, ai_champion, json_text(scene_mods, []), json_text(rewards, {})))
         for card in (encounter_decks.get(ai_deck) or {}).get("cards", []):
             if isinstance(card, dict) and card.get("m_idTemplate"):
@@ -1262,7 +1294,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
 
 
 TABLE_COLUMNS = {
-    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_minimum", "rage_value", "subtype"),
+    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_minimum", "rage_value", "subtype", "lethal"),
     "card_abilities_meta": ("ability_guid", "casting_behavior", "is_manual", "activation_cost", "uses_per_game", "uses_per_turn", "cooldown", "exhausts_on_use", "is_triggered", "target_template_ids", "trigger_event_type", "game_text", "raw_json"),
     "ability_effects": (
         "ability_guid", "effect_guid", "effect_order", "effect_type", "param",

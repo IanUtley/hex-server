@@ -244,19 +244,25 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
                 total += b["atk"]
                 if total >= a["def"]:
                     break
-            if not pile:
+            # Do not commit an incomplete dogpile.  If the combined attack
+            # cannot kill the attacker, spending multiple blockers only gives
+            # away card advantage; the lethal-block fallback below may still
+            # choose one chump when the incoming attack would kill the AI.
+            if pile and total >= a["def"]:
+                assignment[u] = pile
+                for bid in pile:
+                    used.add(bid)
+                    blocker_dmg[bid] += a["atk"]
                 continue
-            assignment[u] = pile
-            for bid in pile:
-                used.add(bid)
-                blocker_dmg[bid] += a["atk"]
-            continue
         # If this attack cannot be profitably traded but the overall attack
         # would kill the champion, a chump block is still the correct play.
         # Attackers are processed largest-first, so this protects the most
         # incoming damage with the least valuable available blocker.
         if defending_lethal and free:
-            pick = min(free, key=lambda b: (b["def"], b["atk"]))
+            # A non-lethal block is damage prevention only.  Sacrifice the
+            # least aggressive legal blocker, preserving the higher-attack
+            # troop for a future turn.
+            pick = min(free, key=lambda b: (b["atk"], b["def"], b["uid"]))
             assignment[u] = [pick["uid"]]
             used.add(pick["uid"])
             blocker_dmg[pick["uid"]] += a["atk"]
@@ -621,7 +627,8 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
     `blockers_map` = {attacker_uid: [blocker_uids]} (the defender's troops).
     Blocked attackers fight each of their blockers (attacker deals its attack
     to each; each blocker deals its attack back — troops with defense <= damage
-    taken die, firing Deathcry). Unblocked attackers hit the defender's
+    taken die, firing Deathcry). A combatant with Lethal kills a troop it
+    damages. Unblocked attackers hit the defender's
     champion. Lifelink (SpiritDrain) heals each controller for the damage their
     side dealt. Combat events are wrapped in Begin/EndCombatResolution, and
     combat-death Deathcries are drained. Returns the updated bstate.
@@ -700,6 +707,7 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
             or bool(a_attrs & game_engine.ECardAttributes.DualStrike))
         step_atk = atk if a_deals else 0
         a_prevent = "prevent_combat_damage" in a_flags
+        a_lethal = "lethal" in a_flags
         combat_id = game_engine.CombatId(attacker_uid, int(u) & 0xFFFF)
         blockers = [game_engine.SessionCardId(game_engine.UID(b))
                     for b in blockers_map.get(int(u), [])]
@@ -732,6 +740,7 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 ordered = sorted(b_uids, key=lambda b: eff[b])
             remaining = step_atk
             total_block_atk = 0
+            lethal_blocker_hit = False
             for b in ordered:
                 bloc = _db.execute(
                     "SELECT location FROM game_cards "
@@ -757,6 +766,7 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                     or bool(b_attrs & game_engine.ECardAttributes.DualStrike))
                 step_b_atk = b_atk if b_deals else 0
                 b_prevent = "prevent_combat_damage" in b_flags
+                b_lethal = "lethal" in b_flags
                 total_block_atk += step_b_atk
                 if b_prevent:
                     log_req(f"    Blocked combat: {hex(b)} prevents combat damage")
@@ -764,6 +774,11 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 # The attacker assigns its remaining damage to this blocker: it
                 # needs `b_def - b_dmg` to die; leftover carries to the next.
                 b_need = max(0, b_def - b_dmg)
+                if a_lethal and b_need > 0:
+                    # The client only assigns one damage to a non-Immortal
+                    # blocker when the attacker has Lethal, preserving the
+                    # rest for another blocker or Juggernaught overflow.
+                    b_need = 1
                 dealt = min(remaining, b_need) if remaining > 0 else 0
                 remaining = max(0, remaining - dealt)
                 if b_need > 0 and dealt >= b_need:
@@ -773,6 +788,17 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                                      deferred=deferred_deaths)
                     dmg_targets.append(int(b))
                     log_req(f"    Blocked combat: {hex(u)} assigns {dealt} -> kills blocker {hex(b)} (def {b_def}-{b_dmg}); {remaining} leftover")
+                elif dealt > 0 and a_lethal:
+                    # Lethal is a combat-damage property, not an attribute
+                    # bit. Any non-prevented damage from a Lethal troop is
+                    # lethal to the troop it damaged, even when below that
+                    # troop's remaining defense.
+                    _abil.kill_troop(game, session, _db, handler, pl_t, ai_t, b,
+                                     bstate, cause="damage",
+                                     defer_deathcry=True,
+                                     deferred=deferred_deaths)
+                    dmg_targets.append(int(b))
+                    log_req(f"    Blocked combat: {hex(u)} assigns {dealt} -> lethal kills blocker {hex(b)} (def {b_def}-{b_dmg}); {remaining} leftover")
                 elif dealt > 0:
                     # The blocker survives: mark the damage dealt so the client
                     # shows the reduced defense in red. PRESERVE its current
@@ -796,6 +822,8 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 # damage the blocker dealt to the attacker.
                 if b_attrs & game_engine.ECardAttributes.SpiritDrain and step_b_atk:
                     def_lifegain += step_b_atk
+                if b_lethal and step_b_atk > 0:
+                    lethal_blocker_hit = True
             # Trample / Crush (Juggernaught): after assigning enough damage to
             # kill the blockers, any remaining damage breaks through to the
             # defender's champion.
@@ -814,12 +842,15 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
             # Each blocker deals its full attack back to the attacker.
             if a_prevent:
                 log_req(f"    Blocked combat: {hex(u)} prevents combat damage")
-            elif a_def - a_dmg <= total_block_atk:
+            elif ((a_def - a_dmg <= total_block_atk) or lethal_blocker_hit):
                 _abil.kill_troop(game, session, _db, handler, pl_t, ai_t, u,
                                  bstate, cause="damage",
                                  defer_deathcry=True,
                                  deferred=deferred_deaths)
-                log_req(f"    Blocked combat: blockers ({total_block_atk}) kill attacker {hex(u)} (def {a_def}-{a_dmg})")
+                if lethal_blocker_hit and a_def - a_dmg > total_block_atk:
+                    log_req(f"    Blocked combat: a Lethal blocker kills attacker {hex(u)} (def {a_def}-{a_dmg})")
+                else:
+                    log_req(f"    Blocked combat: blockers ({total_block_atk}) kill attacker {hex(u)} (def {a_def}-{a_dmg})")
             elif total_block_atk > 0:
                 # The attacker survives: mark temporary damage on it. PRESERVE
                 # its current combat state (Attacking|HasAttacked|Tapped) and
@@ -1568,6 +1599,14 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
         handler._resolve_shards_of_fate(
             game, session, pl_t, ai_t, battle_state, card_uid,
             shard_ability, shard_tpl, 0)
+        from abilities.framework.resources import (
+            resolve_granted_resource_abilities)
+        resource_logs = resolve_granted_resource_abilities(
+            game, session, _db, handler, pl_t, ai_t, battle_state,
+            int(card_uid), 0)
+        if resource_logs:
+            log_req("    AI resource granted abilities: " +
+                    "; ".join(resource_logs))
         import battle_engine as _be
         _be.save_state(session, battle_state)
         log_req(f"    AI played Shards of Fate {card_uid} "
@@ -1616,6 +1655,14 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
     from abilities.framework.triggers import resolve_gain_charge_triggers
     resolve_gain_charge_triggers(
         _db, handler, game, session, pl_t, ai_t, battle_state, 0)
+    from abilities.framework.resources import (
+        resolve_granted_resource_abilities)
+    resource_logs = resolve_granted_resource_abilities(
+        game, session, _db, handler, pl_t, ai_t, battle_state,
+        int(card_uid), 0)
+    if resource_logs:
+        log_req("    AI resource granted abilities: " +
+                "; ".join(resource_logs))
     _be.save_state(session, battle_state)
     log_req(f"    AI played resource {card_uid} (charge={battle_state['ai_charges']})")
 

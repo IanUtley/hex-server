@@ -16,6 +16,7 @@ from gamedata import (AbilityCost, AbilityGraph, AbilityInstance,
 
 PLAY_CARD_ABILITY = "5a8783b0-e420-4f41-b2a1-96f70b0cd851"
 CARD_CHOOSE_BLOOD = "a32092b7-b469-4e2a-84da-f5e3687a93e7"
+CARD_CONCUBUNNY = "bfce3e26-1d85-4d9f-a72a-f4cead4c93c1"
 CONDITION_100_DECK = "eea0c082-9b19-0c74-36c0-64090413f6fc"
 
 
@@ -73,6 +74,18 @@ def test_play_plan_tracks_card_cost_and_separates_triggered_abilities():
     assert plan.cost.resource == 0
     assert len(plan.abilities) == 1
     assert not plan.abilities[0].is_triggered
+    assert plan.required_prompts == ()
+    assert plan.validate() == ()
+
+
+def test_play_plan_does_not_cast_manual_warzone_ability():
+    """Concubunny's exhaust power is not an additional cast cost."""
+    plan = PlayPlan.from_card(RecordStore(), CARD_CONCUBUNNY)
+    assert len(plan.abilities) == 1
+    assert plan.abilities[0].graph.manual
+    assert plan.cast_abilities == ()
+    assert plan.manual_abilities == ()
+    assert plan.activation_bundle([])[0] == {}
     assert plan.required_prompts == ()
     assert plan.validate() == ()
 
@@ -207,6 +220,7 @@ def main():
         test_condition_keeps_nested_typed_objects,
         test_scalar_text_is_not_parsed_as_json,
         test_play_plan_tracks_card_cost_and_separates_triggered_abilities,
+        test_play_plan_does_not_cast_manual_warzone_ability,
         test_play_plan_binds_card_target_to_authored_index,
         test_play_plan_exposes_authored_card_cost_instance,
         test_activation_data_validates_client_style_prompts,

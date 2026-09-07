@@ -207,7 +207,9 @@ def p_play_troop(handler, session, pl_t, ai_t, bstate, game):
             scid, pl_t, ECol.CastSpells, game_engine.card_type_from_db(row[4]),
             template_id=row[2], cost=c2, attack=atk2, defense=def2, gems=gem2)
         game.push_card_moved(scid, pl_t, ECol.CastSpells, ELoc.Top, 0)
-        game.push_ability_on_chain(scid, game_engine.ResourceId.from_str(row[2]))
+        game.push_ability_on_chain(
+            scid, game_engine.ResourceId.from_str(
+                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
         be.stack_push(bstate, {"kind": "troop", "source_uid": tid,
                                "instance_id": 1})
         return
@@ -248,7 +250,9 @@ def p_play_spell(handler, session, pl_t, ai_t, bstate, game):
             scid, pl_t, ECol.CastSpells, game_engine.card_type_from_db(row[4]),
             template_id=row[2], cost=c2, attack=atk2, defense=def2, gems=gem2)
         game.push_card_moved(scid, pl_t, ECol.CastSpells, ELoc.Top, 0)
-        game.push_ability_on_chain(scid, game_engine.ResourceId.from_str(row[2]))
+        game.push_ability_on_chain(
+            scid, game_engine.ResourceId.from_str(
+                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
         ab_row = _db.execute(
             "SELECT abilities_json FROM card_templates WHERE guid=?",
             (row[2],)).fetchone()

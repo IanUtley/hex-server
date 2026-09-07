@@ -49,7 +49,7 @@ class CardDef:
     def __init__(self, name: str, card_type: int = ECardTypes.Troop,
                  cost: int = 0, attack: int = 0, defense: int = 0,
                  shards: List[int] = None, abilities: List[ResourceId] = None,
-                 attributes: int = ECardAttributes.Unknown):
+                 attributes: int = ECardAttributes.Unknown, lethal: bool = False):
         self.name = name
         self.card_type = card_type
         self.cost = cost
@@ -58,6 +58,7 @@ class CardDef:
         self.shards = shards or []
         self.abilities = abilities or []
         self.attributes = attributes
+        self.lethal = bool(lethal)
         self.escalation = 0
         self.spell_point_cost_mods: Dict[ResourceId, int] = {}
         self.uses_per_game_counts: Dict[ResourceId, int] = {}
@@ -267,17 +268,31 @@ class Game:
                           state: int = ECardStates.None_,
                           **kwargs):
         cdef = self.card_defs.get(cid)
+        effective_card_type = card_type or (
+            cdef.card_type if cdef else ECardTypes.Unknown)
+        # The original client uses CardUpdated.Collection to choose the
+        # card's visual home.  A champion already has a HUD view created by
+        # ChampionCardPlayed; changing its collection to Champions while an
+        # ability is on the chain makes UIBattle clone that view and leave a
+        # full-size champion card on the board when the chain item is removed.
+        # The initial CardUpdated(None) cache seed remains valid and is still
+        # allowed.  Suppress only later location-changing champion updates.
+        if (isinstance(effective_card_type, int) and
+                effective_card_type & ECardTypes.Champion and
+                collection == ECardCollections.Champions):
+            return False
         ev = self._make_event(CardUpdatedSessionEventArgs)
         ev.player_id = player_uid
         ev.session_card_id = cid
         ev.collection = collection
-        ev.card_type = card_type or (cdef.card_type if cdef else ECardTypes.Unknown)
+        ev.card_type = effective_card_type
         ev.state = state
         ev.attack = kwargs.get('attack', cdef.attack if cdef else 0)
         ev.defense = kwargs.get('defense', cdef.defense if cdef else 0)
         ev.cost = kwargs.get('cost', cdef.cost if cdef else 0)
         ev.controller = player_uid
         ev.attributes = kwargs.get('attributes', cdef.attributes if cdef else ECardAttributes.Unknown)
+        ev.lethal = kwargs.get('lethal', getattr(cdef, 'lethal', False) if cdef else False)
         ev.int_attrs = dict(kwargs.get('int_attrs', getattr(cdef, 'int_attrs', {}) or {}))
         template_id = kwargs.get('template_id', None)
         if template_id:

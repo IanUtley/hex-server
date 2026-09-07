@@ -160,6 +160,34 @@ New quest campaigns are sent with `CampSpawnNotify` (`campspawn`). A normal
 `cmpupdate` updates an existing cached campaign but does not create a new quest
 entry in the client's journal.
 
+### AZ1 observed quest state machine
+
+The AZ1 route reviewed against both the Ardent and Underworld playthroughs is
+represented by the same persisted node/quest state rather than by a separate
+client map model. Faction- and race-specific authored conversation variants
+are selected from `quest_conversations` for the champion that owns the quest:
+
+| State transition | Server result |
+|---|---|
+| Node012/Winston starts `Cross the Zila River` | reveal and mark Node013/Node014; keep the west Zila bridge gated |
+| Node014 prelude → Savage Lord → success | complete the encounter, advance Step1 (`Razortooth Forest`), then expose the Winston objective |
+| Winston objective → Weston objective | select the authored conversation on the existing node and keep the node open until its turn-in completes |
+| Node019 blockade conversation | leave Brink Ridge incomplete and hide its northbound destinations |
+| `q_smoldering_dead` starts | replace the Brink Ridge explanation with its authored encounter; only a successful result clears the blockade |
+| Wallace starts `Cross the Zodiac River` | reveal Shadowgrove and mark it; keep the west Zodiac bridge hidden |
+| Corrupt Dryad success → Wallace turn-in | advance the quest and unlock the west Zodiac bridge |
+| Warren completion | finish the Cross Zodiac quest and grant its authored card and pack |
+
+The legacy Cross-Zila objective omitted its encounter GUID in the source
+`QuestTemplate`. `static.ensure_schema` repairs it to the Node014 Savage Lord
+scene (`ab77df1e-5f13-471b-80e7-b7b4824ca280`) so quest markers, retry rules,
+journal advancement, and battle rewards share one identity. Encounter and
+conversation rewards remain in their authored `rewards_json` and
+`conversation_rewards` records; for example, Gnash Bridges grants the
+Ravenous Piranha card, Shadowgrove grants the Howling Plains pack plus its
+success-conversation equipment, and the Zila/Zodiac turn-ins grant their pack,
+equipment, or card rewards.
+
 ## DUNGEON
 
 Crayburn Castle is represented as a `DUNGEON` campaign with the real castle

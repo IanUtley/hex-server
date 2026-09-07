@@ -44,27 +44,42 @@ def _resolve_deathcry_effect(game, session, db, handler, pl_t, ai_t, bstate,
 def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid, bstate=None):
     """When a troop dies, resolve any Deathcry abilities.
 
-    Looks up the card's abilities from card_templates.abilities_json, filters to
-    those marked as CardEnteredZone triggers whose gamedata trigger condition
-    actually holds for a death (source Warzone -> destination Discard), so a
-    Deploy (enters-play) trigger never fires as a Deathcry, and resolves each.
+    Uses the card instance's current ability list (including temporary grants),
+    with the printed template list as a fallback for older instances. Filters
+    to abilities marked as CardEnteredZone triggers whose gamedata trigger
+    condition actually holds for a death (source Warzone -> destination
+    Discard), so a Deploy (enters-play) trigger never fires as a Deathcry.
     """
     from .condition_engine import ConditionContext, trigger_condition_met
 
     trow = db.execute(
         "SELECT abilities_json FROM card_templates WHERE guid=?",
         (tpl_guid,)).fetchone()
-    if not trow or not trow[0]:
+    irow = db.execute(
+        "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session.session_id, int(card_uid))).fetchone()
+    if not trow and not irow:
         return
     row2 = db.execute(
         "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
         (session.session_id, int(card_uid))).fetchone()
     owner_id = row2[0] if row2 else 0
     import json as _json
-    try:
-        aguids = _json.loads(trow[0])
-    except (ValueError, TypeError):
-        return
+    ability_lists = []
+    for raw_list in ((trow[0] if trow else "[]"),
+                     (irow[0] if irow else "[]")):
+        try:
+            parsed = _json.loads(raw_list or "[]")
+        except (ValueError, TypeError, _json.JSONDecodeError):
+            parsed = []
+        if isinstance(parsed, list):
+            ability_lists.append(parsed)
+    aguids = []
+    for ability_list in ability_lists:
+        for ability_guid in ability_list:
+            ability_guid = str(ability_guid).lower()
+            if ability_guid not in aguids:
+                aguids.append(ability_guid)
     trigger_guids = []
     for ag in aguids:
         mrow = db.execute(
@@ -101,3 +116,30 @@ def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid,
     for ag, gtext in trigger_guids:
         _resolve_deathcry_effect(game, session, db, handler, pl_t, ai_t, bstate,
                                  card_uid, tpl_guid, owner_id, ag, gtext)
+        # ONE-SHOT is an instance property.  Consume it after the Deathcry
+        # resolves so the client loses the granted power together with the
+        # server-side card ability list.
+        consume = getattr(handler, "_remove_one_shot_ability", None)
+        if callable(consume):
+            try:
+                consume(session, card_uid, ag, game, pl_t, ai_t, bstate)
+            except Exception as exc:
+                from ._shared import _log
+                _log(f"    One-shot Deathcry cleanup failed for {ag[:8]}: {exc}")
+        else:
+            meta = db.execute(
+                "SELECT uses_per_game FROM card_abilities_meta "
+                "WHERE ability_guid=?", (ag,)).fetchone()
+            if meta and int(meta[0] or 0) == 1 and irow:
+                current = []
+                try:
+                    current = _json.loads(irow[0] or "[]")
+                except (ValueError, TypeError, _json.JSONDecodeError):
+                    pass
+                current = [value for value in current
+                           if str(value).lower() != ag]
+                db.execute(
+                    "UPDATE game_cards SET card_abilities=? "
+                    "WHERE session_id=? AND card_uid=?",
+                    (_json.dumps(current), session.session_id, int(card_uid)))
+                db.commit()

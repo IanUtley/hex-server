@@ -1,5 +1,6 @@
 """Regression tests for metadata-driven PreGame deck insertions."""
 
+import json
 import os
 import sqlite3
 import sys
@@ -22,6 +23,9 @@ ZODIAC_BY_MONTH = {
     9: "Zodiac Observer", 10: "Zodiac Observer",
     11: "Zodiac Sister Midnight", 12: "Zodiac Sister Midnight",
 }
+
+EXPENDABLE_ABILITY = "280285bb-378b-3c88-9d85-11dc25ae8ad7"
+EXPENDABLE_GRANT = "89285cf9-97ba-5b40-3a91-ba14ecfccd2a"
 
 
 def _database_copy():
@@ -92,6 +96,70 @@ def test_skylak_uses_original_deck_size_for_both_talents():
         os.unlink(path)
 
 
+def test_expendable_lives_grants_and_resolves_one_shot_deathcry():
+    """Shin'hare's Expendable Lives resolves through one GameStarted path."""
+    db, path = _database_copy()
+    try:
+        from abilities.framework.triggers import (
+            resolve_stack_trigger, resolve_triggers)
+        from abilities.framework.kill_troop import kill_troop
+        from tests.tests_combat import HandlerStub, SessionStub
+        import game_engine
+
+        db.execute("DELETE FROM game_cards WHERE session_id=1")
+        template_guid, card_type = db.execute(
+            "SELECT guid, card_type FROM card_templates "
+            "WHERE card_type='Troop' LIMIT 1").fetchone()
+        db.execute(
+            "INSERT INTO game_cards "
+            "(user_id,session_id,card_uid,card_template_id,location,position,"
+            "card_type,template_guid,card_state,card_abilities,card_attributes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (5, 1, 10001, template_guid, "hand", 0, card_type,
+             template_guid, 0, "[]", 0))
+        db.commit()
+
+        session = SessionStub()
+        handler = HandlerStub(db)
+        handler._player_champ_abilities = [EXPENDABLE_ABILITY]
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        bstate = {"player_health": 20, "ai_health": 20,
+                  "_next_instance_id": 1}
+        handler._current_bstate = bstate
+
+        # The typed GrantAbility is discovered from the champion's configured
+        # ability list and its authored random-hand target.  It must be
+        # pushed exactly once by the normal GameStarted dispatcher.  The
+        # random target is resolved when this chain item resolves, matching
+        # the client's target-instance timing.
+        resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "GameStartedEvent", None, 5, zones=("hand", "warzone"))
+        stack = list(bstate.get("stack") or [])
+        assert len(stack) == 1, stack
+        resolve_stack_trigger(
+            handler, game, session, db, pl_t, ai_t, bstate, stack[0])
+        current = db.execute(
+            "SELECT card_abilities FROM game_cards WHERE card_uid=10001"
+        ).fetchone()[0]
+        assert EXPENDABLE_GRANT in json.loads(current), current
+
+        kill_troop(
+            game, session, db, handler, pl_t, ai_t, 10001, bstate,
+            cause="damage")
+        location, current = db.execute(
+            "SELECT location, card_abilities FROM game_cards "
+            "WHERE card_uid=10001").fetchone()
+        assert location == "warzone", location
+        assert EXPENDABLE_GRANT not in json.loads(current), current
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     test_skylak_uses_original_deck_size_for_both_talents()
+    test_expendable_lives_grants_and_resolves_one_shot_deathcry()
     print("PASS Skylak PreGame deck insertions")

@@ -107,7 +107,8 @@ DDL = [
         rage_value INTEGER DEFAULT 0,
         subtype TEXT DEFAULT '',
         current_resources_granted INTEGER DEFAULT 0,
-        max_resources_granted INTEGER DEFAULT 0
+        max_resources_granted INTEGER DEFAULT 0,
+        lethal INTEGER DEFAULT 0
     )
     """,
     """
@@ -1080,6 +1081,16 @@ AZ1_HOWLING_PLAINS_PACK_GUID = "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
 AZ1_GNASH_BRIDGES_SCENE_GUID = "3cf073b0-47fd-4911-953a-d86902890459"
 AZ1_RAVENOUS_PIRANHA_CARD_GUID = "9ed0730b-e469-4c3d-ac7f-7b56c64b42ae"
 AZ1_CORRUPT_DRYAD_SCENE_GUID = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
+AZ1_SAVAGE_LORD_SCENE_GUID = "ab77df1e-5f13-471b-80e7-b7b4824ca280"
+
+# A legacy QuestTemplate record omitted the encounter GUID for the first
+# Cross the Zila River objective.  The authored objective text and AZ1 map
+# scene identify the intended encounter, so keep this compatibility link in
+# the server-owned campaign metadata rather than teaching the runtime quest
+# engine about a particular journal string.
+QUEST_OBJECTIVE_ENCOUNTER_LINKS = {
+    ("az01_q_cross_the_river", "Step1"): AZ1_SAVAGE_LORD_SCENE_GUID,
+}
 
 CONVERSATION_REWARD_SEEDS = [
     # The Find quests complete at their faction-specific elder conversations;
@@ -1101,10 +1112,11 @@ CONVERSATION_REWARD_SEEDS = [
      json.dumps({"card_guid_by_race": AZ1_CROSS_ZODIAC_CARD_REWARDS,
                  "chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID},
                 sort_keys=True), 1),
-    # Shadowgrove's encounter success conversation grants the race-specific
-    # equipment reward after the Corrupt Dryad is defeated.
+    # Shadowgrove's equipment is shown on the encounter reward panel. The
+    # follow-up conversation only advances the Dryad quest and must not grant
+    # the equipment a second time.
     ("4000c850-c1f7-45e4-b254-3cb1b0e9bf2b",
-     json.dumps({"item_guid_by_race": AZ1_DRYAD_ITEM_REWARDS}, sort_keys=True), 1),
+     json.dumps({}, sort_keys=True), 1),
     ("9c139a1c-40a4-4ed7-b6ff-378c6f6bc1ea", '{"gold": 150, "xp": 500, "chest_guid": "c96a6213-69ac-44d2-8b35-32ad6d55b981"}', 1),  # Coyotle
     ("21c62741-49c8-4da5-8b8d-440247911027", '{"gold": 150, "xp": 500, "chest_guid": "8b145038-961b-4f1c-93f7-3d81dcb3d39b"}', 1),  # Dwarf
     ("bbc4460d-8452-4d49-a6e9-c64216f483b3", '{"gold": 150, "xp": 500, "chest_guid": "2780fa12-7cf5-41bb-a19c-7a8496a33fed"}', 1),  # Elf
@@ -1516,6 +1528,38 @@ def ensure_schema(db):
              "08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",
              "az01_q_cross_the_river_part2"),
         )
+        # Normalize legacy encounter objectives whose source record contains
+        # an all-zero GUID.  This keeps quest markers, encounter retry rules,
+        # reward claims, and journal advancement on the same authored scene.
+        for (quest_script, objective_id), encounter_guid in \
+                QUEST_OBJECTIVE_ENCOUNTER_LINKS.items():
+            row = db.execute(
+                "SELECT objectives_json FROM quest_templates "
+                "WHERE script_name=?", (quest_script,)).fetchone()
+            if not row:
+                continue
+            try:
+                objectives = json.loads(row[0] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(objectives, list):
+                continue
+            changed = False
+            for objective in objectives:
+                if not isinstance(objective, dict):
+                    continue
+                if (str(objective.get("id") or "") == objective_id and
+                        str(objective.get("type") or "").lower() in
+                        {"encounter", "dungeon"} and
+                        not objective.get("encounter")):
+                    objective["encounter"] = encounter_guid
+                    changed = True
+            if changed:
+                db.execute(
+                    "UPDATE quest_templates SET objectives_json=? "
+                    "WHERE script_name=?",
+                    (json.dumps(objectives, sort_keys=True), quest_script),
+                )
         # Add state qualifiers to existing node-conversation rows when a
         # database was seeded before the extractor recorded them.  The
         # conversation name is authored metadata; this is only an idempotent
@@ -1578,6 +1622,10 @@ def ensure_schema(db):
         cols = {r[1] for r in db.execute("PRAGMA table_info(game_cards)")}
         dcols = {r[1] for r in db.execute("PRAGMA table_info(decks)")}
         ecols = {r[1] for r in db.execute("PRAGMA table_info(ability_effects)")}
+        tcols = {r[1] for r in db.execute("PRAGMA table_info(card_templates)")}
+        added_lethal = "lethal" not in tcols
+        if added_lethal:
+            db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
         if "gem_abilities" not in dcols:
             db.execute("ALTER TABLE decks ADD COLUMN gem_abilities TEXT DEFAULT '{}'")
         if "effect_group_id" not in ecols:
@@ -1615,6 +1663,23 @@ def ensure_schema(db):
         if "gems" not in cols:
             db.execute("ALTER TABLE game_cards ADD COLUMN gems INTEGER DEFAULT 0")
         db.commit()
+
+        # Existing databases were seeded before the client TAC-derived Lethal
+        # field was normalized into card_templates. Backfill from the same
+        # Records/gamedata extractor used for fresh databases, keyed by GUID;
+        # never infer this keyword from display text or card names.
+        if added_lethal:
+            from AssetExtraction.gamedata_seed import extract
+            lethal_rows = [
+                (int(row[-1] or 0), row[0])
+                for row in extract()["tables"].get("card_templates", [])
+                if len(row) >= 20
+            ]
+            db.executemany(
+                "UPDATE card_templates SET lethal=? WHERE guid=?",
+                lethal_rows,
+            )
+            db.commit()
     except Exception:
         pass
 
@@ -1763,18 +1828,24 @@ def ensure_schema(db):
                      "quantity": 1, "one_time": True},
                 ]
             elif str(eguid).lower() == AZ1_CORRUPT_DRYAD_SCENE_GUID:
-                # Defeating Shadowgrove's Corrupt Dryad awards the authored
-                # one-time AZ1 Campaign Booster in addition to repeatable
-                # encounter currency.  The success conversation separately
-                # grants the race-specific equipment.
-                rewards["gold"] = amount
-                rewards["xp"] = amount
-                rewards["one_time"] = False
+                # Verified from the AZ1 reward panel: 250 XP, one Howling
+                # Plains pack, and one race-specific equipment item. There
+                # is no gold payout.
+                rewards.pop("gold", None)
+                rewards.pop("xp", None)
+                rewards.pop("one_time", None)
                 rewards["end_of_game_rewards"] = [
-                    {"gold": amount, "xp": amount, "one_time": False},
+                    {"xp": 250, "one_time": False},
                     {"chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
                      "one_time": True},
+                    {"item_guid_by_race": AZ1_DRYAD_ITEM_REWARDS,
+                     "one_time": True},
                 ]
+            elif str(eguid).lower() == AZ1_SAVAGE_LORD_SCENE_GUID:
+                # Verified from the AZ1 reward panel: 300 gold and 200 XP.
+                rewards["gold"] = 300
+                rewards["xp"] = 200
+                rewards["one_time"] = False
             else:
                 rewards["gold"] = amount
                 rewards["xp"] = amount
@@ -1996,6 +2067,13 @@ def ensure_schema(db):
     db.execute(
         "DELETE FROM conversation_rewards WHERE conversation_guid=?",
         ("d6018886-03f1-42c4-9f78-0d1dd353380e",))
+    # The Dryad equipment is delivered by the encounter reward panel. Remove
+    # the older follow-up-conversation grant from existing databases so the
+    # repaired reward cannot be claimed twice.
+    db.execute(
+        "UPDATE conversation_rewards SET reward_json=? "
+        "WHERE conversation_guid=?",
+        (json.dumps({}), "4000c850-c1f7-45e4-b254-3cb1b0e9bf2b"))
     db.commit()
 
     # Seed stardust for existing users who don't have any (idempotent backfill).
