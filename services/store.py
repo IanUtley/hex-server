@@ -2,10 +2,14 @@
 
 import json, gzip, os
 
-import db as _db_module
-from db import _db, log_req, db_get_store_items
-from db import (db_update_resources, db_record_purchase, db_add_inventory,
-                db_save_deck, db_redeem_code, db_send_email)
+from db import log_req
+from profile_db import (db_get_store_items, db_update_resources,
+                        db_record_purchase, db_add_inventory, db_save_deck,
+                        db_redeem_code, db_send_email,
+                        db_next_card_instance_for_user, db_insert_card_instance,
+                        db_add_collection, db_get_store_item,
+                        db_get_user_currency, db_set_user_currency,
+                        db_set_inventory_client_uid)
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, encode_store_response
 
 # Store deck data — loaded from JSON files in Hex root
@@ -30,30 +34,13 @@ def _grant_deck_to_player(user_id, cards, deck_name, handler=None, conn=None):
     The deck's cards column stores instance IDs (integer), not template GUIDs,
     so the client's deck loader can resolve all 23 fields of card_instance_bits.
     """
-    connection = conn or _db
-    max_id = connection.execute(
-        "SELECT COALESCE(MAX(instance_id), 5000) + 1 FROM card_instances "
-        "WHERE user_id=?", (user_id,)).fetchone()[0]
-    cid = max_id if max_id else 5001
+    connection = conn
+    cid = db_next_card_instance_for_user(user_id, conn=connection)
     instance_ids = []
     for card_guid, count in cards:
-        existing = connection.execute(
-            "SELECT quantity FROM collections WHERE user_id=? AND card_template_id=?",
-            (user_id, card_guid)).fetchone()
-        if existing:
-            connection.execute(
-                "UPDATE collections SET quantity=quantity+? "
-                "WHERE user_id=? AND card_template_id=?",
-                (count, user_id, card_guid))
-        else:
-            connection.execute(
-                "INSERT INTO collections (user_id, card_template_id, quantity) "
-                "VALUES (?,?,?)", (user_id, card_guid, count))
+        db_add_collection(user_id, card_guid, count, conn=connection)
         for _ in range(count):
-            _db.execute(
-                "INSERT OR IGNORE INTO card_instances "
-                "(user_id, instance_id, template_guid) VALUES (?,?,?)",
-                (user_id, cid, card_guid))
+            db_insert_card_instance(user_id, cid, card_guid, conn=connection)
             instance_ids.append(cid)
             cid += 1
     cards_json = json.dumps(instance_ids)
@@ -61,29 +48,21 @@ def _grant_deck_to_player(user_id, cards, deck_name, handler=None, conn=None):
     log_req(f"    Granted {deck_name}: {len(instance_ids)} cards, deck_id={deck_db_id}")
     if handler is not None:
         handler.push_cards_to_client()
-    if conn is None:
-        connection.commit()
     return deck_db_id
 
 
 def apply_purchase(conn, user_id, item_id, quantity):
     """Apply a store purchase using the caller-owned transaction."""
-    row = conn.execute(
-        "SELECT name, price, currency, template_guid, store_tab "
-        "FROM store_items WHERE id=?", (int(item_id),)).fetchone()
+    row = db_get_store_item(item_id, conn=conn)
     if not row:
         item_name, cost, currency_type, template_guid, store_tab = (
             "Unknown", 100, "Gold", "", "")
     else:
         item_name, cost, currency_type, template_guid, store_tab = row
     balance_column = "platinum" if currency_type == "Platinum" else "gold"
-    balance = conn.execute(
-        f"SELECT {balance_column} FROM users WHERE id=?", (user_id,)
-    ).fetchone()[0]
+    balance = db_get_user_currency(user_id, balance_column, conn=conn)
     remaining = balance - (int(cost) * int(quantity))
-    conn.execute(
-        f"UPDATE users SET {balance_column}=? WHERE id=?",
-        (remaining, user_id))
+    db_set_user_currency(user_id, balance_column, remaining, conn=conn)
 
     granted_list = []
     deck_granted = False
@@ -109,10 +88,8 @@ def apply_purchase(conn, user_id, item_id, quantity):
         currency_type, conn=conn)
     if template_guid:
         db_add_inventory(user_id, template_guid, int(quantity), conn=conn)
-        conn.execute(
-            "UPDATE player_inventory SET client_item_uid=? "
-            "WHERE user_id=? AND template_guid=? AND client_item_uid=0",
-            (1000 + int(item_id), user_id, template_guid))
+        db_set_inventory_client_uid(
+            user_id, template_guid, 1000 + int(item_id), conn=conn)
     return {
         "remaining": remaining,
         "currency": currency_type,
@@ -130,10 +107,9 @@ def apply_redeem(conn, user_id, redeem_code):
     result = db_redeem_code(redeem_code, conn=conn)
     if result is None:
         return {"gold": 0, "platinum": 0, "redeemed": False}
-    row = conn.execute(
-        "SELECT gold, platinum FROM users WHERE id=?", (user_id,)).fetchone()
-    new_gold = row[0] + result["gold"]
-    new_platinum = row[1] + result["platinum"]
+    new_gold = db_get_user_currency(user_id, "gold", conn=conn) + result["gold"]
+    new_platinum = (db_get_user_currency(user_id, "platinum", conn=conn)
+                    + result["platinum"])
     db_update_resources(
         user_id, gold=new_gold, platinum=new_platinum, conn=conn)
     parts = []

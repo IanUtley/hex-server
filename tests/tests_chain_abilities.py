@@ -667,7 +667,11 @@ def test_ai_incubate_uses_play_card_ability_on_chain(db):
     pl_t, ai_t = _pl_ai()
     game = game_engine.Game(1, pl_t, ai_t)
     handler = HandlerStub(db)
-    bstate = {"ai_resources": 1, "ai_threshold": {}, "turn_number": 1}
+    # The first chain id is not necessarily 1: setup triggers and previous
+    # actions consume ids.  The client must receive the same id as the stack
+    # item so its chain view can remove the item when it resolves.
+    bstate = {"ai_resources": 1, "ai_threshold": {}, "turn_number": 1,
+              "_next_instance_id": 9}
     old_ai_db = ai_mod._db
     ai_mod._db = db
     try:
@@ -679,6 +683,8 @@ def test_ai_incubate_uses_play_card_ability_on_chain(db):
         ev for ev in game.events
         if isinstance(ev, AbilityPushedOnChainSessionEventArgs)]
     assert len(chain_events) == 1, chain_events
+    assert chain_events[0].ability_instance_id == 9, chain_events[0]
+    assert bstate["stack"][-1]["instance_id"] == 9, bstate["stack"]
     assert (str(chain_events[0].ability_template_id.guid) ==
             game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID), chain_events[0]
 

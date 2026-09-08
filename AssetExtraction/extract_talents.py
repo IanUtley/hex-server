@@ -294,7 +294,8 @@ def main():
         card_abilities = [g.lower() for g in card_abilities]
 
         has_ability = 1 if card_abilities else 0
-        # talent_data carries the FIRST granted ability (as talent_map did).
+        # talent_data carries the FIRST granted ability; this replaces the old
+        # standalone legacy talent snapshot.
         first_ab = card_abilities[0] if card_abilities else None
         acc = asc = 0
         if first_ab and first_ab in abilities:

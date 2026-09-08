@@ -8,13 +8,15 @@ import json, gzip, time, threading, struct
 from datetime import datetime, timezone
 from binascii import unhexlify
 
-from db import _db, log_req
-from db import (db_tournament_by_id, db_tournament_players_name_map,
-                db_tournament_signups_by_tournament,
-                db_tournament_completed_for_player,
-                db_tournament_signup_by_player, db_tournament_matches,
-                db_tournament_match_start, db_tournament_match_result,
-                db_tournament_set_status)
+from db import _db, log_req  # _db retained for legacy fixture injection
+from profile_db import db_get_deck_by_id
+from tournament_db import (
+    db_tournament_by_id, db_tournament_players_name_map,
+    db_tournament_signups_by_tournament, db_tournament_completed_for_player,
+    db_tournament_signup_by_player, db_tournament_matches,
+    db_tournament_match_start, db_tournament_match_result,
+    db_tournament_set_status, db_tournament_room_for_game,
+    db_seed_tournament_game_deck, db_insert_tournament_champion_card)
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, client_session_guid
 import gamemodes.tournament_server as tournament_server
 
@@ -43,23 +45,12 @@ def _encode_enter_tournament_error(comp, session_id, tournament_id, error_name):
 
 def _make_deck_data(deck_id):
     """Return (did, dname, did_val, champ_did, card_guids) for deckbits encoding."""
-    row = _db.execute(
-        "SELECT cards, pvp_champion_guid FROM decks WHERE id=?",
-        (int(deck_id) if deck_id else 0,)).fetchone()
-    if not row:
+    deck = db_get_deck_by_id(int(deck_id) if deck_id else 0)
+    if not deck:
         return (f"d{deck_id}", "Unknown Deck", int(deck_id) if deck_id else 0, 0, [])
-    cards_json, champ_guid = row
-    dname = f"Deck #{deck_id}"
-    # Look up a real deck name
-    name_row = _db.execute(
-        "SELECT d.deck_name, d.pve_champion_id FROM decks d WHERE d.id=?",
-        (int(deck_id) if deck_id else 0,)).fetchone()
-    if name_row:
-        dname = name_row[0] or dname
-        champ_did = name_row[1] or 0
-    else:
-        champ_did = 0
-    return (f"d{deck_id}", dname, int(deck_id) if deck_id else 0, int(champ_did), [])
+    return (f"d{deck_id}", deck.get("deck_name") or f"Deck #{deck_id}",
+            int(deck_id) if deck_id else 0,
+            int(deck.get("pve_champion_id") or 0), [])
 
 
 def _tournament_format_bitmask(room):
@@ -637,20 +628,10 @@ def start_waiting_room_game(room_id, handler_overrides=None):
     """
     import game_session as gs
     import encoder
-    import random as _random
-
-    row = _db.execute(
-        "SELECT t.*, tt.name AS type_name, tt.style, tt.format, "
-        "tt.min_players, tt.max_players, tt.games_count, tt.set_id "
-        "FROM tournaments t JOIN tournament_types tt ON t.type_id = tt.id "
-        "WHERE t.id=? LIMIT 1", (room_id,)).fetchone()
-    if not row:
+    room = db_tournament_room_for_game(room_id)
+    if not room:
         log_req(f"  Room {room_id}: not found")
         return
-    col_names = ["id", "type_id", "status", "players_json", "session_id",
-                 "created_at", "type_name", "style", "format",
-                 "min_players", "max_players", "games_count", "set_id"]
-    room = dict(zip(col_names, row))
     players = json.loads(room.get("players_json", "{}"))
     pids = list(players.keys())
     room_handlers = dict(handler_overrides or {})
@@ -688,125 +669,18 @@ def start_waiting_room_game(room_id, handler_overrides=None):
         if not deck_db_id:
             log_req(f"    WARN: No deck for player {puid} in room {room_id} — skipping")
             continue
-        deck_row = _db.execute(
-            "SELECT cards, pvp_champion_guid, user_id, active_gems FROM decks WHERE id=?",
-            (deck_db_id,)).fetchone()
-        if not deck_row:
-            continue
-        cards_json = deck_row[0] or "[]"
-        champ_guid = deck_row[1] or ""
-        deck_owner_uid = deck_row[2]
-        active_gems = {}
-        try:
-            active_gems = json.loads(deck_row[3]) if deck_row[3] else {}
-        except Exception:
-            active_gems = {}
-        card_guids = json.loads(cards_json) if isinstance(cards_json, str) else cards_json
-        _random.shuffle(card_guids)
-        # Resolve the deck's socketed-gem abilities keyed by instance id -> [guids]
-        # (e.g. Shamed Gladiator's Minor Blood Orb -> Rage), so those gem abilities
-        # bake into the card's card_abilities and show on the drawn/played card.
-        gem_ability_by_inst = {}
-        for _inst_str, _gem in (active_gems or {}).items():
-            try:
-                _gem_i = int(_gem)
-            except (TypeError, ValueError):
-                continue
-            if _gem_i <= 0:
-                continue
-            _grow = _db.execute(
-                "SELECT abilities_json FROM gem_templates WHERE gem_type=?",
-                (_gem_i,)).fetchone()
-            if _grow and _grow[0]:
-                try:
-                    _gabs = json.loads(_grow[0])
-                except Exception:
-                    _gabs = []
-                if _gabs:
-                    gem_ability_by_inst[str(_inst_str)] = [str(a).lower() for a in _gabs]
-        inserted = 0; skipped_int = 0; skipped_invalid = 0; skipped_other = 0
-        for pos, tguid in enumerate(card_guids):
-            orig_tguid = tguid
-            inst_id_str = None
-            # Resolve integer instance IDs to template GUIDs (uses deck owner's user_id)
-            if isinstance(tguid, (int, float)):
-                inst_id_str = str(int(tguid))
-                resolved = _db.execute(
-                    "SELECT template_guid FROM card_instances "
-                    "WHERE instance_id=? AND user_id=?",
-                    (int(tguid), deck_owner_uid)).fetchone()
-                if resolved:
-                    tguid = resolved[0]
-                else:
-                    skipped_int += 1
-                    continue
-            if not isinstance(tguid, str) or len(str(tguid)) != 36:
-                skipped_invalid += 1
-                continue
-            max_cuid = _db.execute(
-                "SELECT COALESCE(MAX(card_uid), 0) FROM game_cards "
-                "WHERE session_id=?", (session.session_id,)).fetchone()[0]
-            # Store as proper UID: (instance << 8) | 1 (type=1, Card)
-            card_uid = (max_cuid + 256) if max_cuid > 0 else 257
-            try:
-                _db.execute(
-                    "INSERT INTO game_cards (session_id, user_id, card_uid, "
-                    "template_guid, card_template_id, location, position) "
-                    "VALUES (?, ?, ?, ?, ?, 'deck', ?)",
-                    # active_gems is keyed by the original FRA instance id;
-                    # retain it while using template_guid for card lookups.
-                    (session.session_id, puid, card_uid, tguid, orig_tguid, pos))
-                # Backfill per-instance data from the card template so the
-                # card is immediately valid (card_type, abilities, attributes,
-                # original_template_guid).  Otherwise cards have card_type="Unknown"
-                # and can't be offered for attack / ability activation.
-                trow = _db.execute(
-                    "SELECT card_type, abilities_json, attributes FROM card_templates WHERE guid=?",
-                    (tguid,)).fetchone()
-                if trow:
-                    ct = trow[0] or "Unknown"
-                    ab = trow[1] or "[]"
-                    attrs = int(trow[2] or 0)
-                    try:
-                        ab_list = json.loads(ab) if ab else []
-                    except Exception:
-                        ab_list = []
-                    # Append the deck's socketed-gem abilities for this instance
-                    # so the card shows its gem power (e.g. Shamed Gladiator Rage).
-                    if inst_id_str and inst_id_str in gem_ability_by_inst:
-                        for g_a in gem_ability_by_inst[inst_id_str]:
-                            if g_a not in ab_list:
-                                ab_list.append(g_a)
-                        ab = json.dumps(ab_list)
-                    _db.execute(
-                        "UPDATE game_cards SET card_type=?, card_abilities=?, "
-                        "card_attributes=?, gems=?, original_template_guid = CASE "
-                        "WHEN COALESCE(original_template_guid,'')='' THEN ? "
-                        "ELSE original_template_guid END "
-                        "WHERE session_id=? AND card_uid=?",
-                        (ct, ab, attrs,
-                         int(active_gems.get(inst_id_str, 0) or 0)
-                         if inst_id_str else 0,
-                         tguid, session.session_id, card_uid))
-                inserted += 1
-            except Exception as e:
-                log_req(f"    INSERT failed for card pos={pos} orig={orig_tguid!r} guid={tguid!r}: {e}")
-                skipped_other += 1
-        _db.commit()
-        log_req(f"    Seeded {inserted} cards (skipped: int={skipped_int} invalid={skipped_invalid} err={skipped_other}) from deck {deck_db_id} for player {puid}")
-        if champ_guid:
-            max_cuid = _db.execute(
-                "SELECT COALESCE(MAX(card_uid), 0) FROM game_cards "
-                "WHERE session_id=?", (session.session_id,)).fetchone()[0]
-            card_uid = (max_cuid + 256) if max_cuid > 0 else 257
-            _db.execute(
-                "INSERT INTO game_cards (session_id, user_id, card_uid, "
-                "template_guid, card_template_id, card_type, location, "
-                "position, is_champion) "
-                "VALUES (?, ?, ?, ?, ?, 'Champion', 'champion', 0, 1)",
-                (session.session_id, puid, card_uid, champ_guid, champ_guid))
-            _db.commit()
-            log_req(f"    Created champion {champ_guid[:8]} for player {puid}")
+        seed = db_seed_tournament_game_deck(
+            session.session_id, puid, deck_db_id)
+        log_req(
+            f"    Seeded {seed['inserted']} cards "
+            f"(skipped: int={seed['skipped_int']} "
+            f"invalid={seed['skipped_invalid']} err={seed['skipped_error']}) "
+            f"from deck {deck_db_id} for player {puid}")
+        if seed["champion_guid"]:
+            db_insert_tournament_champion_card(
+                session.session_id, puid, seed["champion_guid"])
+            log_req(f"    Created champion {seed['champion_guid'][:8]} "
+                    f"for player {puid}")
 
     log_req(f"  Room {room_id}: game started as {session_name}")
 

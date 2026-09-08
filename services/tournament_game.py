@@ -4,11 +4,12 @@ import random, json, threading, re, time
 
 import game_engine as _ge
 from gamedata import CardPlayCost, DEFAULT_RECORD_STORE, ability_graph
-from db import (_db, log_req, db_game_session_pids, db_game_champion,
-                db_game_deck_cards, db_game_draw_cards, db_game_card_type,
-                db_game_shuffle_deck, db_champion_template_health,
-                db_discard_card, db_delete_game_session,
-                db_tournament_by_id)
+from db import _db, log_req
+from pvp_db import (db_game_session_pids, db_game_champion,
+                    db_game_deck_cards, db_game_draw_cards, db_game_card_type,
+                    db_game_shuffle_deck, db_champion_template_health,
+                    db_discard_card, db_delete_game_session)
+from tournament_db import db_tournament_by_id
 from encoder import encode_datawrapper, encode_sync_event, compress_gzip, encode_objfmt_response, client_session_guid
 from gamemodes.tournament_engine import (
     player_handlers, player_handler_lock, record_tournament_game_result,

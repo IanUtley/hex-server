@@ -31,7 +31,11 @@ from gamedata import DEFAULT_RECORD_STORE
 
 
 def card_data_from_db():
-    db_path = os.environ.get(
+    # ``tests/run_all.py`` gives each test process an isolated in-memory
+    # runtime DB, while this test reads the seeded card catalogue directly.
+    # Prefer the suite's immutable snapshot so this read does not point at a
+    # separate empty ``:memory:`` database.
+    db_path = os.environ.get("HEX_TEST_SOURCE_DB") or os.environ.get(
         "HEX_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "hconnect.db"))
     con = sqlite3.connect(db_path)
     try:

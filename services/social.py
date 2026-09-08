@@ -26,11 +26,12 @@ Event pushes (server → client):
 import io, struct, time, traceback, sys
 from binascii import hexlify
 
-from db import _db, log_req
-from db import (db_get_friends, db_get_pending_friend_requests,
-                db_get_ignored_list, db_send_friend_request,
-                db_accept_friend_request, db_ignore_friend_request,
-                db_remove_friend, db_ignore_player, db_unignore_player)
+from db import log_req
+from profile_db import (db_get_friends, db_get_pending_friend_requests,
+                         db_get_ignored_list, db_send_friend_request,
+                         db_accept_friend_request, db_ignore_friend_request,
+                         db_remove_friend, db_ignore_player,
+                         db_unignore_player)
 from encoder import compress_gzip, encode_datawrapper, make_uid
 from objfmt_builder import ObjFmtBuilder
 

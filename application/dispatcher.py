@@ -10,6 +10,7 @@ from collections.abc import Callable
 
 import db
 import game_session
+import profile_db
 
 from .commands import (JoinSessionCommand, RemoveSessionCommand,
                        ClaimMailCommand, DeleteMailCommand,
@@ -141,38 +142,24 @@ class ApplicationCommandDispatcher:
 
     @staticmethod
     def _mark_mail_read(tx, command):
-        tx.execute(
-            "UPDATE emails SET read_at=datetime('now') "
-            "WHERE user_id=? AND read_at IS NULL",
-            (command.user_id,))
+        profile_db.db_mark_mail_read(command.user_id, conn=tx)
         return CommandResult(events=(MailChanged(
             user_id=command.user_id, operation="mark_read"),))
 
     @staticmethod
     def _delete_mail(tx, command):
-        tx.execute("DELETE FROM emails WHERE user_id=?", (command.user_id,))
+        profile_db.db_delete_mail(command.user_id, conn=tx)
         return CommandResult(events=(MailChanged(
             user_id=command.user_id, operation="delete"),))
 
     @staticmethod
     def _claim_mail(tx, command):
-        row = tx.execute(
-            "SELECT gold_delivered, platinum_delivered, claimed_at "
-            "FROM emails WHERE id=? AND user_id=?",
-            (command.email_id, command.user_id)).fetchone()
-        if not row or row[2]:
+        value = profile_db.db_claim_mail_for_user(
+            command.user_id, command.email_id, conn=tx)
+        if value is None:
             return CommandResult(value={"gold": 0, "platinum": 0})
-
-        gold = row[0] or 0
-        platinum = row[1] or 0
-        tx.execute(
-            "UPDATE users SET gold=gold+?, platinum=platinum+? WHERE id=?",
-            (gold, platinum, command.user_id))
-        tx.execute(
-            "UPDATE emails SET claimed_at=datetime('now') WHERE id=?",
-            (command.email_id,))
         return CommandResult(
-            value={"gold": gold, "platinum": platinum},
+            value=value,
             events=(MailChanged(
                 user_id=command.user_id,
                 operation="claim",

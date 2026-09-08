@@ -46,7 +46,7 @@ polled by the client.
 | Flag | Client effect | Server status |
 |------|---------------|---------------|
 | `allowcon` | Enables the backtick developer console. | Enabled by the local server compatibility default; Docker requires explicit opt-in. The server also rejects `!` commands unless this flag is present. |
-| `allowreplay` | Enables the replay entry point in the tournament lobby. | Opt-in profile flag; replay list/download services remain separate work. |
+| `allowreplay` | Enables the replay entry point in the tournament lobby. | Opt-in profile flag; replay list/download are handled by `replay.py`. |
 | `showcardversions` | Allows the client to display card-version information. | Pass-through supported; use only for client investigation. |
 | `timedplat` | Enables the client's timed-platinum profile behavior. | Pass-through supported; not otherwise implemented as a server feature. |
 

@@ -1,20 +1,21 @@
 """Frost Ring Arena campaign service handlers.
 
-The handlers in this module own client-facing Arena protocol responses.  FRA
-run selection rules live in :mod:`gamemodes.arena`, and the reusable SQL
-helpers remain in :mod:`db`.
+The handlers in this module own client-facing Arena protocol responses. FRA
+run selection rules live in :mod:`gamemodes.arena`, and persistence is exposed
+through :mod:`pve_db` and :mod:`profile_db`.
 """
 
 import json
 
-from db import (_db, db_clear_fra_challengers, db_create_fra_challengers,
+from pve_db import (db_clear_fra_challengers, db_create_fra_challengers,
                 db_get_arena_fight_history, db_get_arena_state,
                 db_get_active_fra_challenges, db_get_fra_challenge,
                 db_get_fra_challengers,
                 db_get_fra_public_base_encounter,
                 db_champion_template_health,
-                db_roll_fra_start_challenge, db_update_arena_state,
-                log_req as _log_req)
+                db_roll_fra_start_challenge, db_update_arena_state)
+from profile_db import db_user_owns_deck
+from db import log_req as _log_req
 from encoder import (compress_gzip, encode_datawrapper,
                      encode_get_challengers_response,
                      encode_objfmt_response)
@@ -188,9 +189,7 @@ def _join(handler, target, instance, reqid, comp, session_id, conh,
     user_id = handler.user_profile["id"]
     arena = db_get_arena_state(user_id)
     deck_id = arena["deck_id"]
-    if (not deck_id or not _db.execute(
-            "SELECT 1 FROM decks WHERE id=? AND user_id=?", (deck_id, user_id)
-    ).fetchone()):
+    if not deck_id or not db_user_owns_deck(deck_id, user_id):
         _log_req(f">>> JoinCampaignArena (dt=10001): no valid deck")
         resp_inner = encode_objfmt_response(
             ["Game.Client.Network.Campaign.JoinCampaignArenaResponse",

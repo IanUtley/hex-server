@@ -1709,6 +1709,12 @@ def ai_play_troop(handler, game, session, ai_t, battle_state):
                 # _card_full_data fills game.card_defs with thresholds/abilities/gems
                 tpl_g, ct_n, nm, cost2, atk2, def2, gem2 = handler._card_full_data(
                     game, scid, row[2], row[0])
+                # Allocate the same instance id that is stored in the
+                # authoritative stack item.  The client keys its chain view
+                # by this id and uses it again for TopOfChainResolved and
+                # RemovedTopOfChain.
+                inst_id = int(battle_state.get("_next_instance_id", 1))
+                battle_state["_next_instance_id"] = inst_id + 1
                 # Push chain events
                 game.push_card_updated(scid, ai_t, game_engine.ECardCollections.CastSpells,
                                       game_engine.card_type_from_db(ct),
@@ -1721,11 +1727,10 @@ def ai_play_troop(handler, game, session, ai_t, battle_state):
                 # ability and leaves AI plays invisible in the chain view.
                 game.push_ability_on_chain(
                     scid, game_engine.ResourceId.from_str(
-                        game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
+                        game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
+                    ability_instance_id=inst_id)
                 # Hold the troop on the chain: the stack item resolves to the
                 # warzone (with Deploy/Inspire triggers) when both pass.
-                inst_id = int(battle_state.get("_next_instance_id", 1))
-                battle_state["_next_instance_id"] = inst_id + 1
                 _be.stack_push(battle_state, {
                     "kind": "troop", "source_uid": int(tid),
                     "instance_id": inst_id,
@@ -1789,11 +1794,12 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
         gems=gem2)
     game.push_card_moved(scid, ai_t, game_engine.ECardCollections.CastSpells,
                          game_engine.ECardLocations.Top, 0)
-    game.push_ability_on_chain(
-        scid, game_engine.ResourceId.from_str(
-            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
     inst_id = int(battle_state.get("_next_instance_id", 1))
     battle_state["_next_instance_id"] = inst_id + 1
+    game.push_ability_on_chain(
+        scid, game_engine.ResourceId.from_str(
+            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
+        ability_instance_id=inst_id)
     # Troops and other permanents resolve to the warzone.  Constants such as
     # Daybreak are not actions: treating them as ``spell`` items sends them to
     # the discard after resolution and silently loses their ongoing trigger.
@@ -2317,7 +2323,8 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             "instance_id": inst_id,
         })
         game.push_ability_on_chain(
-            ai_champ_scid, game_engine.ResourceId.from_str(ag))
+            ai_champ_scid, game_engine.ResourceId.from_str(ag),
+            ability_instance_id=inst_id)
         _be.save_state(session, battle_state)
         log_req(f"    AI champion ability {ag[:8]} on chain "
                 f"(charges {charges}->{battle_state['ai_charges']}, "
@@ -2889,13 +2896,14 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
         # Render the spell on the chain (GoChainView) during the response
         # window — without AbilityPushedOnChain the client shows an empty
         # chain with the Resolve button.
-        game.push_ability_on_chain(
-            scid, game_engine.ResourceId.from_str(
-                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
-        # Hold the spell on the chain: the stack item resolves its BOM (and
-        # sends it to the graveyard) when both players pass.
         inst_id = int(battle_state.get("_next_instance_id", 1))
         battle_state["_next_instance_id"] = inst_id + 1
+        game.push_ability_on_chain(
+            scid, game_engine.ResourceId.from_str(
+                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
+            ability_instance_id=inst_id)
+        # Hold the spell on the chain: the stack item resolves its BOM (and
+        # sends it to the graveyard) when both players pass.
         _be.stack_push(battle_state, {
             "kind": "spell", "source_uid": int(tid),
             "ability_guids": ability_guids, "target_uid": int(target_uid),

@@ -19,8 +19,11 @@ Frost Ring Arena implementation details are in
 - [x] ObjFmt request/response encoding for profile, store, mail, load-balancer,
   tournament, and related services.
 - [x] Custom binary session-event encoder and typed event dispatch to clients.
-- [x] SQLite schema and reusable database helpers for users, profiles,
-  inventory, currencies, decks, sessions, cards, mail, chat, and tournaments.
+- [x] SQLite schema and reusable domain persistence APIs for profiles, PVE,
+  PVP sessions/cards, tournaments, replays, inventory, mail, chat, and stores.
+  `db.py` remains the connection/compatibility facade while
+  `profile_db.py`, `pve_db.py`, `pvp_db.py`, `tournament_db.py`, and
+  `replay_db.py` define the migration boundaries.
 - [x] Persistent authoritative battle state, including card positions and
   discard/graveyard ordering across reconnects.
 - [x] Session-event recording used by debugging and replay capture.

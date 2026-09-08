@@ -636,6 +636,45 @@ def db_update_resources(user_id, gold=None, platinum=None, conn=None):
         connection.commit()
 
 
+def db_get_user_currency(user_id, currency, conn=None):
+    """Return one supported user currency balance."""
+    if currency not in {"gold", "platinum"}:
+        raise ValueError(f"unsupported currency: {currency}")
+    connection = conn or _db
+    row = connection.execute(
+        f"SELECT {currency} FROM users WHERE id=?", (user_id,)).fetchone()
+    return row[0] if row else 0
+
+
+def db_set_user_currency(user_id, currency, value, conn=None):
+    """Set one supported user currency balance."""
+    if currency not in {"gold", "platinum"}:
+        raise ValueError(f"unsupported currency: {currency}")
+    connection = conn or _db
+    connection.execute(
+        f"UPDATE users SET {currency}=? WHERE id=?", (value, user_id))
+    if conn is None:
+        connection.commit()
+
+
+def db_add_collection(user_id, template_guid, quantity=1, conn=None):
+    """Add card copies to a collection in the caller's transaction."""
+    connection = conn or _db
+    existing = connection.execute(
+        "SELECT id FROM collections WHERE user_id=? AND card_template_id=?",
+        (user_id, template_guid)).fetchone()
+    if existing:
+        connection.execute(
+            "UPDATE collections SET quantity=quantity+? WHERE id=?",
+            (quantity, existing[0]))
+    else:
+        connection.execute(
+            "INSERT INTO collections (user_id, card_template_id, quantity) "
+            "VALUES (?, ?, ?)", (user_id, template_guid, quantity))
+    if conn is None:
+        connection.commit()
+
+
 def db_add_card(user_id, template_id):
     existing = _db.execute("SELECT id, quantity FROM collections WHERE user_id=? AND card_template_id=?", (user_id, template_id)).fetchone()
     if existing:
@@ -1010,6 +1049,14 @@ def db_get_store_items():
              "template_guid": r[0], "t": r[5]} for r in rows]
 
 
+def db_get_store_item(item_id, conn=None):
+    """Return one store item row by its numeric client ID."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT name, price, currency, template_guid, store_tab "
+        "FROM store_items WHERE id=?", (int(item_id),)).fetchone()
+
+
 def db_primal_pack_for(pack_guid):
     """Return the Primal pack GUID for the same set as *pack_guid*, or None.
 
@@ -1042,6 +1089,15 @@ def db_find_mail_recipient(name):
         "THEN substr(name, 1, instr(name, '#') - 1) ELSE name END)=LOWER(?) "
         "LIMIT 1", (name, name)).fetchone()
     return {"id": row[0], "name": row[1]} if row else None
+
+
+def db_find_user_by_name(name):
+    """Return ``(id, name)`` for a case-insensitive full user name lookup."""
+    if not name:
+        return None
+    return _db.execute(
+        "SELECT id, name FROM users WHERE LOWER(name)=LOWER(?) LIMIT 1",
+        (str(name).strip(),)).fetchone()
 
 def db_send_email(user_id, subject, body, sender="SYSTEM", gold_delivered=0, platinum_delivered=0, conn=None):
     connection = conn or _db
@@ -1979,6 +2035,14 @@ def db_get_deck(deck_id, user_id):
         "WHERE id=? AND user_id=?", (deck_id, user_id)).fetchone()
 
 
+def db_user_owns_deck(deck_id, user_id, conn=None):
+    """Return whether *user_id* owns the selected deck."""
+    connection = conn or _db
+    return bool(connection.execute(
+        "SELECT 1 FROM decks WHERE id=? AND user_id=? LIMIT 1",
+        (deck_id, user_id)).fetchone())
+
+
 def db_get_last_deck(user_id):
     """Return the player's last-saved deck."""
     return _db.execute(
@@ -2661,6 +2725,42 @@ def db_mark_all_mail_read(user_id):
     _db.commit()
 
 
+def db_mark_mail_read(user_id, conn=None):
+    """Mark a user's unread mail as read in the caller's transaction."""
+    connection = conn or _db
+    connection.execute(
+        "UPDATE emails SET read_at=datetime('now') "
+        "WHERE user_id=? AND read_at IS NULL", (user_id,))
+
+
+def db_delete_mail(user_id, conn=None):
+    """Delete all mail owned by a user in the caller's transaction."""
+    connection = conn or _db
+    connection.execute("DELETE FROM emails WHERE user_id=?", (user_id,))
+
+
+def db_claim_mail_for_user(user_id, email_id, conn=None):
+    """Credit and claim one user's mail atomically.
+
+    Return the delivered currency, or ``None`` when the mail is missing or
+    was already claimed. The optional connection keeps application commands
+    inside their existing transaction boundary.
+    """
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT gold_delivered, platinum_delivered, claimed_at "
+        "FROM emails WHERE id=? AND user_id=?", (email_id, user_id)).fetchone()
+    if not row or row[2]:
+        return None
+    gold, platinum = row[0] or 0, row[1] or 0
+    connection.execute(
+        "UPDATE users SET gold=gold+?, platinum=platinum+? WHERE id=?",
+        (gold, platinum, user_id))
+    connection.execute(
+        "UPDATE emails SET claimed_at=datetime('now') WHERE id=?", (email_id,))
+    return {"gold": gold, "platinum": platinum}
+
+
 def db_delete_all_mail(user_id):
     """Delete all emails for a user."""
     _db.execute("DELETE FROM emails WHERE user_id=?", (user_id,))
@@ -2679,6 +2779,167 @@ def db_claim_mail(eid):
     """Mark a mail as claimed."""
     _db.execute("UPDATE emails SET claimed_at=datetime('now') WHERE id=?", (eid,))
     _db.commit()
+
+
+# === Game sessions ==========================================================
+
+def db_next_session_instance(conn=None):
+    """Atomically allocate the next session instance number."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT value FROM meta WHERE key='next_session_inst'").fetchone()
+    nxt = (row[0] + 1) if row else 1
+    connection.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('next_session_inst', ?)",
+        (nxt,))
+    return nxt
+
+
+def db_save_session(session, conn=None):
+    """Persist a game-session object using the caller's transaction."""
+    connection = conn or _db
+    connection.execute(
+        "INSERT OR REPLACE INTO game_sessions "
+        "(session_id, server_id, session_name, owner_uid, state, "
+        " encounter_data, players_json, turn_order_json, seed_z, seed_w, "
+        " deck_template_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?, COALESCE(("
+        " SELECT created_at FROM game_sessions WHERE session_id=?), datetime('now')))",
+        (str(session.session_id), str(session.server_id), session.session_name,
+         str(session.owner_uid), session.state, json.dumps(session.encounter_data),
+         json.dumps(session.players), json.dumps(session.turn_order), session.seed_z,
+         session.seed_w, session.deck_template_id, str(session.session_id)))
+
+
+def db_get_session(session_id, conn=None):
+    """Return one persisted session row by its protocol UID."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT * FROM game_sessions WHERE session_id=?", (str(session_id),)
+    ).fetchone()
+
+
+def db_get_session_by_name(session_name, conn=None):
+    """Return one persisted session row by its client-visible name."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT * FROM game_sessions WHERE session_name=?", (session_name,)
+    ).fetchone()
+
+
+def db_get_sessions(conn=None):
+    """Return sessions newest first for player-membership lookup."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT * FROM game_sessions ORDER BY created_at DESC").fetchall()
+
+
+def db_remove_session(session_name, conn=None):
+    """Remove a session by name in the caller's transaction."""
+    connection = conn or _db
+    connection.execute("DELETE FROM game_sessions WHERE session_name=?", (session_name,))
+
+
+def db_cleanup_ended_sessions(conn=None):
+    """Remove all sessions that have reached the terminal state."""
+    connection = conn or _db
+    connection.execute("DELETE FROM game_sessions WHERE state='ended'")
+
+
+# === Replay persistence =====================================================
+
+def db_get_replay_candidates(conn=None):
+    """Return completed sessions whose event stream can produce a replay."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT gs.session_id, gs.session_name, gs.server_id, gs.state, "
+        "gs.players_json, gs.created_at FROM game_sessions gs "
+        "JOIN session_events se ON se.session_id=gs.session_id "
+        "WHERE (gs.session_name LIKE 'tourney-%' OR "
+        "gs.session_name LIKE 'pvp-%' OR gs.session_name LIKE 'Challenge_%') "
+        "AND (gs.state='ended' OR se.event_class=2) GROUP BY gs.session_id "
+        "UNION SELECT gr.session_id, gr.session_name, gr.server_id, 'ended', "
+        "gr.players_json, gr.start_time FROM game_replays gr "
+        "JOIN session_events se ON se.session_id=gr.session_id "
+        "WHERE gr.status IN ('stale', 'error') AND "
+        "(gr.session_name LIKE 'tourney-%' OR gr.session_name LIKE 'pvp-%' "
+        "OR gr.session_name LIKE 'Challenge_%') GROUP BY gr.session_id"
+    ).fetchall()
+
+
+def db_get_replay_events(session_id, conn=None):
+    """Return the durable event stream for a session in replay order."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT id, target_player_uid, seq, event_class, event_bytes "
+        "FROM session_events WHERE session_id=? ORDER BY seq, id", (session_id,)
+    ).fetchall()
+
+
+def db_get_replay_source(session_id, conn=None):
+    """Return the indexed replay's source watermark and status."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT source_event_max_id, status FROM game_replays WHERE session_id=?",
+        (session_id,)).fetchone()
+
+
+def db_get_replay_match(session_id, conn=None):
+    """Return tournament identity and winner metadata for a session."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT tournament_id, round_id, player1_uid, player2_uid, game1_winner "
+        "FROM tournament_matches WHERE session_id=? LIMIT 1", (session_id,)
+    ).fetchone()
+
+
+def db_get_tournament_signup_names(tournament_id, conn=None):
+    """Return signup UID/name rows for replay player-name resolution."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT player_uid, player_name FROM tournament_signups "
+        "WHERE tournament_id=?", (tournament_id,)).fetchall()
+
+
+def db_upsert_replay(values, conn=None):
+    """Insert or refresh one generated replay index row."""
+    connection = conn or _db
+    connection.execute(
+        "INSERT INTO game_replays "
+        "(session_id,session_name,server_id,session_flags,start_time,end_time,"
+        "tournament_round,is_public,series_format,series_points,series_template,"
+        "players_json,winners_json,replay_path,generation_count,event_count,"
+        "source_event_max_id,status,error,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now')) "
+        "ON CONFLICT(session_id) DO UPDATE SET session_name=excluded.session_name,"
+        "server_id=excluded.server_id,session_flags=excluded.session_flags,"
+        "start_time=excluded.start_time,end_time=excluded.end_time,"
+        "tournament_round=excluded.tournament_round,is_public=excluded.is_public,"
+        "series_format=excluded.series_format,series_points=excluded.series_points,"
+        "series_template=excluded.series_template,players_json=excluded.players_json,"
+        "winners_json=excluded.winners_json,replay_path=excluded.replay_path,"
+        "generation_count=excluded.generation_count,event_count=excluded.event_count,"
+        "source_event_max_id=excluded.source_event_max_id,status=excluded.status,"
+        "error=excluded.error,updated_at=datetime('now')", values)
+
+
+def db_get_replay_list_rows(filters, conn=None):
+    """Return ready replay rows for the legacy browser API."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT session_name,server_id,start_time,end_time,series_format,"
+        "series_points,series_template,is_public,players_json,tournament_round "
+        "FROM game_replays WHERE status='ready' AND session_name LIKE ? "
+        "AND series_format LIKE ? AND series_template LIKE ? "
+        "ORDER BY end_time DESC LIMIT ? OFFSET ?", filters).fetchall()
+
+
+def db_get_replay_path(session_name, conn=None):
+    """Return the path of a ready replay with the requested session name."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT replay_path FROM game_replays "
+        "WHERE session_name=? AND status='ready'", (session_name,)
+    ).fetchone()
 
 
 def db_get_chest_by_id(chest_db_id, user_id):
@@ -2702,6 +2963,26 @@ def db_create_card_instance(user_id, instance_id, template_guid):
         "INSERT OR IGNORE INTO card_instances (user_id, instance_id, template_guid) "
         "VALUES (?,?,?)", (user_id, instance_id, template_guid))
     _db.commit()
+
+
+def db_next_card_instance_for_user(user_id, conn=None):
+    """Return the next card-instance ID for a user's starter deck grant."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT COALESCE(MAX(instance_id), 5000) + 1 FROM card_instances "
+        "WHERE user_id=?", (user_id,)).fetchone()
+    return row[0] if row else 5001
+
+
+def db_insert_card_instance(user_id, instance_id, template_guid, conn=None):
+    """Insert one card instance without committing an outer transaction."""
+    connection = conn or _db
+    connection.execute(
+        "INSERT OR IGNORE INTO card_instances "
+        "(user_id, instance_id, template_guid) VALUES (?,?,?)",
+        (user_id, instance_id, template_guid))
+    if conn is None:
+        connection.commit()
 
 
 def db_open_chest(chest_db_id):
@@ -2733,13 +3014,15 @@ def db_get_champion_deck_match(user_id):
         (user_id,)).fetchall()
 
 
-def db_set_inventory_client_uid(user_id, template_guid, item_id):
+def db_set_inventory_client_uid(user_id, template_guid, item_id, conn=None):
     """Assign a client_item_uid to an inventory row that doesn't have one yet."""
-    _db.execute(
+    connection = conn or _db
+    connection.execute(
         "UPDATE player_inventory SET client_item_uid=? "
         "WHERE user_id=? AND template_guid=? AND client_item_uid=0",
         (item_id, user_id, template_guid))
-    _db.commit()
+    if conn is None:
+        connection.commit()
 
 
 # Champion template lookup — tries extended table first, then standard.

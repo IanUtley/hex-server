@@ -52,7 +52,7 @@ The `arena_state` table in [`static.py`](../static.py) contains:
 | `chests_earned` | Treasure-chest total for the current run |
 | `sacks_earned` | Reserved for other reward types; currently unused |
 
-`db_record_arena_fight()` in [`db.py`](../db.py) records the result and
+`db_record_arena_fight()` in [`pve_db.py`](../pve_db.py) records the result and
 advances the challenger index. On a win it checks the saved challenger's boss
 flag:
 
@@ -122,11 +122,12 @@ separately from the run-counter logic.
 After FRA changes, run focused checks before testing with the client:
 
 ```bash
-python3 -m py_compile db.py services/arena.py gamemodes/arena.py
+python3 -m py_compile pve_db.py services/arena.py gamemodes/arena.py
 git diff --check
 ```
 
 For live behavior, inspect `/tmp/hconnect_log.txt` for the FRA result and
 confirm the next `RefreshArenaInfo` or lobby response contains the expected
-`GoldPacks` and `EquipmentPacks` values. Changes to `db.py` require a server
-restart before the running process uses the new result-accounting code.
+`GoldPacks` and `EquipmentPacks` values. Changes to the PVE persistence API
+require a server restart before the running process uses the new
+result-accounting code.

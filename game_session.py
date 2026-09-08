@@ -35,6 +35,8 @@ import os
 import time
 from binascii import hexlify
 
+import pvp_db as db_layer
+
 # UID type codes (must match hconnect_server.py)
 UID_TYPE = {
     "ServicePlayer": 244,
@@ -104,7 +106,6 @@ def _db():
     # Session state is written from HConnect while the separate tournament
     # scheduler may be updating the same WAL database.  Use the same wait
     # policy as db.py so a transient writer collision does not abort a turn.
-    import db as db_layer
     return db_layer.connect(_DB_PATH)
 
 
@@ -117,12 +118,7 @@ def _next_instance(conn=None):
     owns_connection = conn is None
     conn = conn or _db()
     try:
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key='next_session_inst'").fetchone()
-        nxt = (row[0] + 1) if row else 1
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('next_session_inst', ?)",
-            (nxt,))
+        nxt = db_layer.db_next_session_instance(conn=conn)
         if owns_connection:
             conn.commit()
         return nxt
@@ -151,22 +147,7 @@ def _save(session, conn=None):
     try:
         # session_id/server_id/owner_uid are unsigned 64-bit UIDs which can
         # exceed SQLite's signed 64-bit INTEGER range, so store them as TEXT.
-        conn.execute(
-            "INSERT OR REPLACE INTO game_sessions "
-            "(session_id, server_id, session_name, owner_uid, state, "
-            " encounter_data, players_json, turn_order_json, seed_z, seed_w, "
-            " deck_template_id, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?, COALESCE(("
-            "  SELECT created_at FROM game_sessions WHERE session_id=?), "
-            " datetime('now')))",
-            (str(session.session_id), str(session.server_id), session.session_name,
-             str(session.owner_uid), session.state,
-             json.dumps(session.encounter_data),
-             json.dumps(session.players),
-             json.dumps(session.turn_order),
-             session.seed_z, session.seed_w,
-             session.deck_template_id,
-             str(session.session_id)))
+        db_layer.db_save_session(session, conn=conn)
         if owns_connection:
             conn.commit()
     finally:
@@ -204,9 +185,7 @@ def _load(row):
 def get_session(session_name):
     conn = _db()
     try:
-        row = conn.execute(
-            "SELECT * FROM game_sessions WHERE session_name=?",
-            (session_name,)).fetchone()
+        row = db_layer.db_get_session_by_name(session_name, conn=conn)
         return _load(row) if row else None
     finally:
         conn.close()
@@ -216,9 +195,7 @@ def find_session_by_id(session_id, conn=None):
     owns_connection = conn is None
     conn = conn or _db()
     try:
-        row = conn.execute(
-            "SELECT * FROM game_sessions WHERE session_id=?",
-            (str(session_id),)).fetchone()
+        row = db_layer.db_get_session(session_id, conn=conn)
         return _load(row) if row else None
     finally:
         if owns_connection:
@@ -241,8 +218,7 @@ def find_session_by_player(player_uid, conn=None):
                          else player_uid)
         player_ids = {raw_player_id,
                       make_uid(UID_TYPE["ServicePlayer"], raw_player_id)}
-        rows = conn.execute(
-            "SELECT * FROM game_sessions ORDER BY created_at DESC").fetchall()
+        rows = db_layer.db_get_sessions(conn=conn)
         for row in rows:
             try:
                 players = json.loads(row["players_json"] or "[]")
@@ -263,7 +239,7 @@ def remove_session(session_name, conn=None):
     owns_connection = conn is None
     conn = conn or _db()
     try:
-        conn.execute("DELETE FROM game_sessions WHERE session_name=?", (session_name,))
+        db_layer.db_remove_session(session_name, conn=conn)
         if owns_connection:
             conn.commit()
     finally:
@@ -275,7 +251,7 @@ def cleanup_ended_sessions():
     """Remove sessions that have ended."""
     conn = _db()
     try:
-        conn.execute("DELETE FROM game_sessions WHERE state='ended'")
+        db_layer.db_cleanup_ended_sessions(conn=conn)
         conn.commit()
     finally:
         conn.close()

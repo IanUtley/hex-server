@@ -8,7 +8,8 @@ import io, struct, uuid, threading, sys
 from binascii import hexlify, unhexlify
 
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, make_uid
-from db import _db, log_req
+from db import log_req
+from profile_db import db_find_user_by_name
 from objfmt_builder import ObjFmtBuilder
 
 _queue = {}       # ladderId → list of (handler, player_uid, player_name)
@@ -314,9 +315,7 @@ def handle_send_quick_match_challenge(handler, target, instance, reqid, comp,
             f" deckFormat={deck_format} deckID={challenger_deck_id}")
 
     # Look up opponent in DB
-    opp_row = _db.execute(
-        "SELECT id, name FROM users WHERE LOWER(name)=LOWER(?) LIMIT 1",
-        (opponent_name,)).fetchone()
+    opp_row = db_find_user_by_name(opponent_name)
 
     if not opp_row:
         log_req(f"    Opponent {opponent_name} not found")

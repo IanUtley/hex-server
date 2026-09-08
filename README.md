@@ -19,8 +19,10 @@ Start with:
   implemented/missing feature checklist.
 - [docs/CLIENT_SERVER_PROTOCOL.md](docs/CLIENT_SERVER_PROTOCOL.md) for the
   protocol, card zones, event ordering, and gamedata pipeline.
-- [HOWTO.md](HOWTO.md) for operational and reverse-engineering notes.
-- [RULES.md](RULES.md) for the server's gameplay decisions.
+- [HOWTO.md](HOWTO.md) for the compact implementation, protocol, database,
+  and operations specification.
+- [RULES.md](RULES.md) for the canonical gameplay contract and known parity
+  gaps.
 - [docs/COMMANDS.md](docs/COMMANDS.md) for the supported in-game debug
   commands.
 - [docs/FEATURE-FLAGS.md](docs/FEATURE-FLAGS.md) for server-configured client
@@ -154,10 +156,11 @@ authentication itself is the behavior under test.
 
 `hconnect_server.py` serves the TCP HConnect protocol on port 9933.
 `proxy.py` serves HTTP compatibility/auth and news endpoints on port 8081.
-`db.py` owns the shared SQLite connection and reusable database helpers;
-`static.py` owns schema creation and server-owned seeds; `battle_engine.py` owns
-turn/priority rules; `game_engine.py` serializes session events; and the
-`abilities/` framework resolves gamedata-driven effects.
+`db.py` owns the shared SQLite connection while `profile_db.py`, `pve_db.py`,
+`pvp_db.py`, `tournament_db.py`, and `replay_db.py` expose domain persistence
+APIs. `static.py` owns schema creation and server-owned seeds;
+`battle_engine.py` owns turn/priority rules; `game_engine.py` serializes session
+events; and the `abilities/` framework resolves gamedata-driven effects.
 
 ## Database capacity note
 

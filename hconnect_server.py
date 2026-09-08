@@ -38,6 +38,7 @@ from application.commands import (JoinSessionCommand, RemoveSessionCommand,
                                   StartEncounterCommand, StartSessionCommand)
 from application.player_transactions import classify_player_transaction
 import gamemodes.tournament_server as tournament_server
+from services import dispatch as service_dispatch
 from gamemodes.tournament_engine import (
     _encode_enter_tournament_error, _make_deck_data,
     _tournament_format_bitmask, _tournament_session_flags,
@@ -383,7 +384,7 @@ def _load_card_templates():
         return _CARD_CACHE
     rows = _db.execute("SELECT guid, set_guid, name, rarity, cost, attack, defense, is_pve, no_pvp, card_type FROM card_templates").fetchall()
     if not rows:
-        log("No card_templates in DB — run import_cards.py first")
+        log("No card_templates in DB — run the normal database bootstrap")
         return _CARD_CACHE
     for guid, sid, name, rarity, cost, attack, defense, is_pve, no_pvp, card_type in rows:
         _CARD_CACHE.setdefault(sid, []).append((guid, name, rarity, cost, attack, defense, is_pve, no_pvp, card_type))
@@ -678,58 +679,11 @@ _PVE_CHAMPION_GUIDS = {
 }
 
 
-# === Service dispatch registry (Layer 2: extract logic to services/gamemodes) ===
-# Each entry maps a data_type to (module_name, function_name, extra_kwargs).
-# At dispatch time the module is lazily imported and the handler called with
-# (handler, target, instance, reqid, comp, session_id, conh,
-#  inner_obj, inner_bytes, **extra_kwargs).
-_SERVICE_DISPATCH = {
-    # --- Mail service (1000 block) ---
-    60001: ("services.mail", "handle_send_mail", {}),
-    60002: ("services.mail", "handle_receive", {}),
-    60003: ("services.mail", "handle_delete", {}),   # Claim attachment
-    60004: ("services.mail", "handle_send", {}),      # MarkRead
-    60005: ("services.mail", "handle_mark_read", {}),   # Delivered
-    60006: ("services.mail", "handle_claim", {}),     # MarkDelete
-    60007: ("services.mail", "handle_get_unread", {}),
-    60008: ("services.mail", "handle_mark_sent_delete", {}),
-    # --- Social service ---
-    2149: ("services.social", "handle_add_friend", {}),
-    2157: ("services.social", "handle_accept_friend_request", {}),
-    2159: ("services.social", "handle_ignore_friend_request", {}),
-    2161: ("services.social", "handle_remove_friend", {}),
-    2163: ("services.social", "handle_ignore_player", {}),
-    2165: ("services.social", "handle_unignore_player", {}),
-    # --- Matchmaking ---
-    4001: ("services.matchmaking", "handle_ping_matchmaking", {}),
-    4013: ("services.matchmaking", "handle_send_quick_match_challenge", {}),
-    4017: ("services.matchmaking", "handle_send_challenge_response", {}),
-    # --- Tournament PvP (already extracted) ---
-    22023: ("services.tournament_game", "handle_join_disconnected_game", {}),
-    22025: ("services.tournament_game", "handle_ready_to_continue_game", {}),
-    # --- Store / Escrow ---
-    6009: ("services.store", "handle_get_items", {}),
-    6011: ("services.store", "handle_purchase", {}),
-    6013: ("services.store", "handle_redeem", {}),
-    # --- Frost Ring Arena campaign service ---
-    10001: ("services.arena", "handle_request", {"data_type": 10001}),
-    10003: ("services.arena", "handle_request", {"data_type": 10003}),
-    10005: ("services.arena", "handle_request", {"data_type": 10005}),
-    10007: ("services.arena", "handle_request", {"data_type": 10007}),
-    10009: ("services.arena", "handle_request", {"data_type": 10009}),
-    10011: ("services.arena", "handle_request", {"data_type": 10011}),
-    10013: ("services.arena", "handle_request", {"data_type": 10013}),
-    10019: ("services.arena", "handle_request", {"data_type": 10019}),
-    10027: ("services.arena", "handle_request", {"data_type": 10027}),
-    10029: ("services.arena", "handle_request", {"data_type": 10029}),
-    10033: ("services.arena", "handle_request", {"data_type": 10033}),
-}
-
-# Lazy dispatch: import and call the handler function.
+# Lazy dispatch: import and call the handler function from the package registry.
 def _dispatch_service(handler, data_type, target, instance, reqid, comp,
                        session_id, conh, inner_obj, inner_bytes):
     import importlib
-    entry = _SERVICE_DISPATCH.get(data_type)
+    entry = service_dispatch(data_type)
     if not entry:
         return False  # unhandled
     mod_name, fn_name, extra_kw = entry
@@ -9532,7 +9486,7 @@ class HCPHandler:
             except (TypeError, ValueError, UnicodeDecodeError):
                 env_json = {}
             if isinstance(env_json, dict) and env_json.get("action") == "qreplaylst":
-                from services.replay import replay_list
+                from replay import replay_list
                 resp_envelope = json.dumps(
                     replay_list(env_json), separators=(",", ":")
                 ).encode("utf-8")
@@ -9564,7 +9518,7 @@ class HCPHandler:
             except (TypeError, ValueError, UnicodeDecodeError):
                 env_json = {}
             if isinstance(env_json, dict) and env_json.get("action") == "replayfetch":
-                from services.replay import replay_fetch
+                from replay import replay_fetch
                 resp_envelope = replay_fetch(env_json)
                 log_req(
                     f">>> ReplayFetch session={env_json.get('Session', '')} "

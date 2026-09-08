@@ -3,7 +3,9 @@
 This document is a compact map of the protocol used by the fixed 32-bit Mono
 Hex client and the Python private server. It is an orientation document; the
 source, `HOWTO.md`, `RULES.md`, `encoder.py`, and the client disassembly remain
-the authoritative references for individual fields.
+the authoritative references for individual fields. Durable implementation
+and ownership rules are kept in `HOWTO.md`; this file retains protocol and
+gamedata detail only.
 
 ## Authority and transport
 

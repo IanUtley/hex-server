@@ -2,7 +2,8 @@
 # ---------------------------------------------------------------------------
 # Hex TCG private server restart script.
 #
-# Reliably stops any previously running hconnect server / auth proxy / bridge
+# Reliably stops any previously running HConnect, auth proxy, tournament and
+# replay worker processes.
 # processes, validates all Python sources, starts the services fresh, and
 # verifies each port is actually listening before exiting.
 #
@@ -41,7 +42,7 @@ SOURCES=(
     "$BASE_DIR/gamemodes/tournament_server.py"
     "$BASE_DIR/services/__init__.py"
     "$BASE_DIR/services/social.py"
-    "$BASE_DIR/services/replay.py"
+    "$BASE_DIR/replay.py"
     "$BASE_DIR/replay_server.py"
 )
 # Also validate every .py file under these packages compiles.
@@ -57,16 +58,14 @@ case "$ACTION" in
 esac
 
 stop_services() {
-    log "Stopping previous processes (hconnect_server, proxy, bridge)..."
+    log "Stopping previous processes (hconnect_server, proxy, tournament, replay)..."
     pkill -9 -f "$BASE_DIR/hconnect_server.py" 2>/dev/null || true
     pkill -9 -f "$BASE_DIR/proxy.py" 2>/dev/null || true
-    pkill -9 -f "$BASE_DIR/bridge.py" 2>/dev/null || true
     pkill -9 -f "$BASE_DIR/gamemodes/tournament_server.py" 2>/dev/null || true
     pkill -9 -f "$BASE_DIR/replay_server.py" 2>/dev/null || true
     # Also catch plain command-line forms (e.g. launched from another CWD).
     pkill -9 -f "hconnect_server.py" 2>/dev/null || true
     pkill -9 -f "proxy.py 8081" 2>/dev/null || true
-    pkill -9 -f "bridge.py" 2>/dev/null || true
     pkill -9 -f "tournament_server.py" 2>/dev/null || true
     pkill -9 -f "replay_server.py" 2>/dev/null || true
 

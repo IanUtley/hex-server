@@ -15,14 +15,15 @@ python3 tests/tests_conditions.py
 python3 tests/tests_leaves.py
 python3 tests/tests_store.py
 python3 tests/tests_card_coverage.py
+python3 tests/run_all.py
 git diff --check
 ```
 
-The current focused release checks pass. The broader
-`tests/tests_cards_fixes.py` script still reports two known failures
-(Incubation Slave egg summoning and Bun'jitsu charge-power stat transfer); it
-is not currently part of the GHCR publish gate and should be repaired before
-claiming full regression coverage.
+Run the complete serial test suite before claiming a release. The focused
+golden checks and the broader `tests/run_all.py` suite are the current release
+evidence; if a focused script or the aggregate suite fails, record the failure
+in `docs/PRIVATE_SERVER_FEATURES.md` and do not describe the affected behavior
+as implemented.
 
 Review the complete diff for credentials, local accounts, runtime databases,
 client binaries, extracted client assets, and generated artifacts. In

@@ -3,10 +3,12 @@
 import io, struct, sys, time
 from binascii import hexlify
 
-import db as _db_mod
-from db import _db, db_get_unread_mail_count, log_req
-from db import (db_delete_sent_mail, db_find_mail_recipient,
-                db_get_sent_mail_list, db_send_email, display_name_from_identity)
+from profile_db import (
+    db_delete_sent_mail, db_find_mail_recipient, db_get_mail_list,
+    db_get_sent_mail_list, db_get_unread_mail_count, db_send_email,
+    display_name_from_identity,
+)
+from db import log_req
 from application.commands import (ClaimMailCommand, DeleteMailCommand,
                                   MarkMailReadCommand)
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper
@@ -74,9 +76,7 @@ def handle_get_unread(handler, target, instance, reqid, comp, session_id,
                       conh, SERVICE_MAIL_UID, **_kw):
     """GetUnreadMailCount (60007)."""
     if handler.user_profile:
-        count = _db.execute(
-            "SELECT COUNT(*) FROM emails WHERE user_id=? AND read_at IS NULL",
-            (handler.user_profile["id"],)).fetchone()[0]
+        count = db_get_unread_mail_count(handler.user_profile["id"])
     else:
         count = 0
     # First mail check after login = client is ready
@@ -241,11 +241,7 @@ def handle_receive(handler, target, instance, reqid, comp, session_id,
     if not handler.user_profile:
         db_emails = []
     else:
-        db_emails = _db.execute(
-            "SELECT id, sender, subject, body, sent_at, gold_delivered, "
-            "platinum_delivered, claimed_at FROM emails WHERE user_id=? "
-            "ORDER BY id DESC",
-            (handler.user_profile["id"],)).fetchall()
+        db_emails = db_get_mail_list(handler.user_profile["id"])
     log_req(f">>> Respond Mail.Receive -> {len(db_emails)} emails")
     now = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
 
