@@ -80,6 +80,117 @@ def test_node00r_uses_authored_node_r_conversation_fallback():
         os.unlink(path)
 
 
+def test_node00r_faction_quest_branch_opens_lena_grotto_and_stays_retryable():
+    db, path = cloned_db()
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
+            "AND template_name IN (?, ?)",
+            (6, "az01_q_fort_romor", "az01_q_usurper"),
+        )
+        db.commit()
+        assert campaign._ensure_quest_campaign(
+            db, 6, "AREA", "az01_q_usurper")
+        _area_id, state = area_state(db)
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node00R"].update({
+            "completed": True, "repeatable": False,
+            "visible": True, "enabled": True,
+        })
+        locations["Node025"].update({
+            "completed": False, "visible": False, "enabled": False,
+        })
+        state["LastNode"] = "Node00R"
+        state["ALoc"] = "Vale of Oberon"
+        pdata = state["PublicState"]["Data"]
+        pdata["quest_hidden_nodes"] = ["Node025"]
+        pdata["blocked_nodes"] = ["Node025"]
+
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=6, state=state)
+
+        assert campaign._az1_node_conversation(
+            db, "Node00R", state, champ_id=6) == \
+            "8433f72e-bd47-4978-bc02-360e34ddce57"
+        assert locations["Node00R"]["completed"] is False
+        assert locations["Node00R"]["repeatable"] is True
+        assert locations["Node025"]["visible"] is True
+        assert locations["Node025"]["enabled"] is True
+        assert "Node025" not in pdata["blocked_nodes"]
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_node00r_finished_faction_quest_uses_terminal_conversation():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campspawn = campaign.push_campspawn
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
+            "AND template_name IN (?, ?)",
+            (6, "az01_q_fort_romor", "az01_q_usurper"),
+        )
+        db.commit()
+        assert campaign._ensure_quest_campaign(
+            db, 6, "AREA", "az01_q_usurper")
+        quest_id, quest_state = campaign._quest_state_row(
+            db, 6, "az01_q_usurper")
+        quest_state["Finished"] = "2026-09-09T00:00:00Z"
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(quest_state), quest_id))
+        db.commit()
+
+        area_id, state = area_state(db)
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node00R"].update({
+            "type": "Convo", "completed": True, "repeatable": False,
+            "visible": True, "enabled": True,
+        })
+        state["LastNode"] = "Node00R"
+        state["ALoc"] = "Vale of Oberon"
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=6, state=state)
+        assert locations["Node00R"]["conversationId"] == \
+            "617819c9-bc9b-4788-a469-8117af28a613"
+        assert locations["Node00R"]["completed"] is False
+        assert locations["Node00R"]["repeatable"] is True
+        assert locations["Node00R"]["quest_variant_terminal"] is True
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        campaign._send_response = lambda *args, **kwargs: None
+        campaign.push_campspawn = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        after = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        after_node = next(
+            item["Data"] for item in after["VisLocs"]
+            if item["Data"].get("node") == "Node00R"
+        )
+        assert after_node["completed"] is True
+        assert not after_node.get("quest_variant_terminal")
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campspawn = original_push_campspawn
+        db.close()
+        os.unlink(path)
+
+
 def test_cross_zila_and_zodiac_gates_follow_quest_progress():
     db, path = cloned_db()
     try:
@@ -126,6 +237,10 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
                           if x["Data"].get("node") == "Node014")
         assert razortooth["visible"] is True
         assert "Node014" in pdata["quest_nodes"]
+        campaign._az1_reveal_neighbors(db, state, "Node012")
+        assert "Path_Fork001_Node012" not in pdata["locked_paths"]
+        assert "Path_Fork001_Node013" not in pdata["locked_paths"]
+        assert "Path_Fork001_Node014" not in pdata["locked_paths"]
 
         # Cross the Zodiac is initially allowed to show Shadowgrove, but its
         # west bridge remains gated until Wallace's turn-in advances Step 2.
@@ -172,6 +287,252 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
             if data.get("node") in northbound:
                 assert data["visible"] is False
     finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_unfinished_encounter_does_not_reveal_outgoing_paths():
+    db, path = cloned_db()
+    try:
+        area_id, state = area_state(db)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.update({
+            "visited_nodes": ["Node001", "Node002", "Node003"],
+            "visited_paths": ["Path_Node001_Node002", "Path_Node002_Node003"],
+            "blocked_nodes": [],
+            "quest_reveal_nodes": [],
+            "quest_hidden_nodes": [],
+            "failed_nodes": [],
+        })
+        state["LastNode"] = "Node003"
+        state["ALoc"] = "Dunnwood"
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node002"].update({
+            "completed": True, "autostart": False,
+        })
+        locations["Node003"].update({
+            "type": "Encounter", "completed": False,
+            "repeatable": False, "autostart": True,
+            "pre_encounter_completed": True,
+        })
+        locations["Node004"].update({"visible": False, "enabled": False})
+        locations["Node007"].update({"visible": False, "enabled": False})
+
+        campaign._az1_reveal_neighbors(db, state, "Node003")
+        assert locations["Node003"]["visible"] is True
+        assert locations["Node004"]["visible"] is False
+        assert locations["Node007"]["visible"] is False
+        assert "Path_Node003_Node004" in pdata["locked_paths"]
+        assert "Path_Node003_Node007" in pdata["locked_paths"]
+
+        # A destination revealed by another route must not make the
+        # unfinished node's own incoming path appear.
+        pdata["unlocked_nodes"] = ["Node004"]
+        campaign._az1_reveal_neighbors(db, state, "Node003")
+        assert locations["Node004"]["visible"] is True
+        assert "Path_Node003_Node004" in pdata["locked_paths"]
+
+        # A normal victory opens the same outgoing paths.
+        locations["Node003"].update({
+            "completed": True, "autostart": False,
+        })
+        campaign._az1_reveal_neighbors(db, state, "Node003")
+        assert locations["Node004"]["visible"] is True
+        assert locations["Node007"]["visible"] is True
+        assert "Path_Node003_Node004" not in pdata["locked_paths"]
+        assert "Path_Node003_Node007" not in pdata["locked_paths"]
+
+        # A failed/conditional result is retryable and also opens the paths.
+        locations["Node003"].update({
+            "completed": False, "repeatable": True, "autostart": False,
+        })
+        pdata["failed_nodes"] = ["Node003"]
+        campaign._az1_reveal_neighbors(db, state, "Node003")
+        assert locations["Node004"]["visible"] is True
+        assert locations["Node007"]["visible"] is True
+        assert "Path_Node003_Node004" not in pdata["locked_paths"]
+        assert "Path_Node003_Node007" not in pdata["locked_paths"]
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_unvisited_repeatable_conversations_are_not_blue():
+    db, path = cloned_db()
+    try:
+        _area_id, state = area_state(db)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata["conversation_visits"] = {}
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        for node in ("Node012", "Node016"):
+            locations[node].update({
+                "completed": False, "repeatable": True,
+                "autostart": True, "visible": True, "enabled": True,
+            })
+
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=6, state=state)
+        assert locations["Node012"]["repeatable"] is False
+        assert locations["Node016"]["repeatable"] is False
+
+        # Once the authored conversation has actually closed, the same
+        # repeatable content becomes the blue retryable state.
+        pdata["conversation_visits"]["Node012"] = 1
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=6, state=state)
+        assert locations["Node012"]["repeatable"] is True
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_direct_node00r_route_is_not_replaced_by_fork_path():
+    db, path = cloned_db()
+    try:
+        _area_id, state = area_state(db)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.update({
+            "visited_nodes": ["Node00R"],
+            "visited_paths": ["Path_Node007_Node00R"],
+            "blocked_nodes": [],
+            "quest_reveal_nodes": [],
+            "quest_hidden_nodes": [],
+            "failed_nodes": [],
+        })
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node00R"].update({
+            "completed": True, "repeatable": False,
+            "autostart": False, "visible": True, "enabled": True,
+        })
+        locations["Node012"].update({
+            "completed": False, "repeatable": False,
+            "autostart": True, "visible": False, "enabled": False,
+        })
+        locations["Fork001"].update({
+            "visible": True, "enabled": False,
+        })
+
+        campaign._az1_reveal_neighbors(db, state, "Node00R")
+        assert locations["Node012"]["visible"] is True
+        assert "Path_Node00R_Node012" not in pdata["locked_paths"]
+        assert "Path_Fork001_Node012" in pdata["locked_paths"]
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_alternate_reveal_does_not_unlock_incomplete_path():
+    db, path = cloned_db()
+    try:
+        _area_id, state = area_state(db)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.update({
+            "visited_nodes": ["Node009", "Node00R"],
+            "visited_paths": [],
+            "blocked_nodes": [],
+            "quest_reveal_nodes": [],
+            "quest_hidden_nodes": [],
+            "unlocked_nodes": [],
+            "failed_nodes": [],
+        })
+        state["LastNode"] = "Node009"
+        state["ALoc"] = "Node009"
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node009"].update({
+            "completed": False, "repeatable": False, "autostart": True,
+        })
+        locations["Node00R"].update({
+            "completed": True, "repeatable": False, "autostart": False,
+        })
+        locations["Node012"].update({"visible": False, "enabled": False})
+
+        # Node012 is revealed from completed Node00R, but the direct
+        # Node009 -> Node012 path still belongs to the unfinished Node009
+        # branch and must remain locked.
+        campaign._az1_reveal_neighbors(db, state, "Node009")
+        assert locations["Node012"]["visible"] is True
+        assert "Path_Node009_Node012" in pdata["locked_paths"]
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_conv_done_recomputes_repeatable_node_paths():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campspawn = campaign.push_campspawn
+    try:
+        area_id, state = area_state(db)
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.update({
+            "visited_nodes": ["Node001", "Node002", "Node003", "Node007"],
+            "visited_paths": [
+                "Path_Node001_Node002", "Path_Node002_Node003",
+                "Path_Node003_Node007",
+            ],
+            "locked_paths": [
+                "Path_Node007_Node009", "Path_Node007_Node00R",
+            ],
+            "blocked_nodes": [],
+            "quest_reveal_nodes": [],
+            "quest_hidden_nodes": [],
+            "unlocked_nodes": [],
+            "failed_nodes": [],
+        })
+        state["LastNode"] = "Node007"
+        state["ALoc"] = "The Road of Oaks"
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node003"].update({
+            "completed": True, "repeatable": False, "autostart": False,
+        })
+        locations["Node007"].update({
+            "type": "Convo", "completed": False, "repeatable": True,
+            "autostart": True, "visible": True, "enabled": True,
+        })
+        locations["Node009"].update({"visible": False, "enabled": False})
+        locations["Node00R"].update({"visible": False, "enabled": False})
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        campaign._send_response = lambda *args, **kwargs: None
+        campaign.push_campspawn = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        after = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        after_data = after["PublicState"]["Data"]
+        after_locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in after["VisLocs"]
+        }
+        assert after_locations["Node009"]["visible"] is True
+        assert after_locations["Node00R"]["visible"] is True
+        assert "Path_Node007_Node009" not in after_data["locked_paths"]
+        assert "Path_Node007_Node00R" not in after_data["locked_paths"]
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campspawn = original_push_campspawn
         db.close()
         os.unlink(path)
 
@@ -530,7 +891,14 @@ if __name__ == "__main__":
     tests = [
         test_cross_zila_objective_is_linked_to_savage_lord,
         test_node00r_uses_authored_node_r_conversation_fallback,
+        test_node00r_faction_quest_branch_opens_lena_grotto_and_stays_retryable,
+        test_node00r_finished_faction_quest_uses_terminal_conversation,
         test_cross_zila_and_zodiac_gates_follow_quest_progress,
+        test_az1_unfinished_encounter_does_not_reveal_outgoing_paths,
+        test_az1_unvisited_repeatable_conversations_are_not_blue,
+        test_az1_direct_node00r_route_is_not_replaced_by_fork_path,
+        test_az1_alternate_reveal_does_not_unlock_incomplete_path,
+        test_az1_conv_done_recomputes_repeatable_node_paths,
         test_savage_lord_advances_cross_zila_and_node_rewards_are_authored,
         test_corrupt_dryad_encounter_grants_pack_and_faction_equipment,
         test_az1_scene_lookup_keeps_authored_node_variants_distinct,

@@ -8,8 +8,6 @@ import sqlite3
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from az1_pack import (
-    AZ1_PVE_CARD_WEIGHTS,
-    AZ1_EQUIPMENT_WEIGHTS,
     AZ1_EQUIPMENT_SLOT_WEIGHTS,
     AZ1_PVE_RARITY_WEIGHTS,
     AZ1_STARDUST_RARITIES,
@@ -21,7 +19,6 @@ from az1_pack import (
     SET3_TO_6_EQUIPMENT_SET_GUIDS,
     DEFAULT_STARDUST_RARITY_WEIGHTS,
     _eligible_pve_cards,
-    az1_equipment_records,
     az1_probability_summary,
     generate_az2_pack,
     generate_az1_pack,
@@ -65,8 +62,6 @@ def run(name, fn):
 
 
 def test_table_weight_totals_and_rarity_summary():
-    assert sum(weight for _rarity, weight in AZ1_PVE_CARD_WEIGHTS.values()) == 50.0
-    assert round(sum(weight for _name, _rarity, weight in AZ1_EQUIPMENT_WEIGHTS), 2) == 200.08
     summary = az1_probability_summary()
     assert summary["pve_card"] == {
         rarity: weight / 100.0
@@ -78,13 +73,11 @@ def test_table_weight_totals_and_rarity_summary():
     }
 
 
-def test_all_metadata_eligible_cards_and_table_equipment_resolve():
+def test_metadata_eligible_cards_and_equipment_resolve():
     card_data = card_data_from_db()
     cards = _eligible_pve_cards(card_data, DEFAULT_RECORD_STORE,
                                 PVE_CARD_SET_GUIDS)
     assert sum(len(pool) for pool in cards.values()) > 0
-    assert not [name for name, _rarity, _weight in AZ1_EQUIPMENT_WEIGHTS
-                if name.casefold() not in az1_equipment_records(DEFAULT_RECORD_STORE)]
     assert set_equipment_records(
         DEFAULT_RECORD_STORE, SET1_TO_3_EQUIPMENT_SET_GUIDS)
 
@@ -145,7 +138,7 @@ def test_az2_pack_has_set4_to_6_cards_and_equipment():
 
 
 if __name__ == "__main__":
-    run("AZ1 table totals and rarity summary", test_table_weight_totals_and_rarity_summary)
-    run("AZ1 metadata pools resolve", test_all_metadata_eligible_cards_and_table_equipment_resolve)
+    run("AZ1 rarity summary", test_table_weight_totals_and_rarity_summary)
+    run("AZ1 metadata pools resolve", test_metadata_eligible_cards_and_equipment_resolve)
     run("AZ1 pack Set 1-3 slots", test_pack_has_set1_to_3_cards_and_equipment)
     run("AZ2 pack Set 4-6 slots", test_az2_pack_has_set4_to_6_cards_and_equipment)

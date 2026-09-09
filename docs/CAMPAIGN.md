@@ -100,13 +100,19 @@ terrain types, and node artwork. The server converts those records into
 server-side `campaign_node_edges` table stores their adjacency for movement
 validation and visibility. Visibility and enabled flags control which
 locations are selectable; `PublicState.Data.visited_paths` records the path
-identifiers reported by the client. Fog of war is therefore a client rendering
-effect driven by the server's visible nodes and visited paths.
+identifiers reported by the client, while `locked_paths` suppresses an
+individual path even when both endpoint nodes are visible. Fog of war is
+therefore a client rendering effect driven by the server's visible nodes,
+visited paths, and locked paths.
 
 For AZ1, the initial state exposes `Node001` and its adjacent `Node002`.
-Completing or arriving at a node reveals its graph neighbours. The opening
-topology includes the direct `Node003` → `Node007` route (Dunnwood to The Road
-of Oaks), which is not represented by `SceneData` list order:
+Completing a node, or returning from its encounter in a retryable state,
+reveals its graph neighbours. Arrival at an unfinished encounter does not
+draw its outgoing paths. An alternate route may reveal a destination node, but
+the path from an unfinished node to an unvisited destination remains locked
+with `PublicState.Data.locked_paths`. The opening topology includes the direct `Node003`
+→ `Node007` route (Dunnwood to The Road of Oaks), which is not represented by
+`SceneData` list order:
 
 ```text
 Node001  Into The Woods
@@ -177,6 +183,7 @@ are selected from `quest_conversations` for the champion that owns the quest:
 | Wallace starts `Cross the Zodiac River` | reveal Shadowgrove and mark it; keep the west Zodiac bridge hidden |
 | Corrupt Dryad success → Wallace turn-in | advance the quest and unlock the west Zodiac bridge |
 | Warren completion | finish the Cross Zodiac quest and grant its authored card and pack |
+| Vale of Oberon with Fort Romor/Usurper | select the authored faction-quest conversation, keep Node00R retryable, and reveal/enable Lena Grotto; the finished-quest branch completes Node00R when closed |
 
 The legacy Cross-Zila objective omitted its encounter GUID in the source
 `QuestTemplate`. `static.ensure_schema` repairs it to the Node014 Savage Lord

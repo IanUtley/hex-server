@@ -1273,6 +1273,45 @@ def _has_faction_variants(rows):
     )
 
 
+_AZ1_MASKED_ARMY_QUESTS = (
+    ("az01_q_fort_romor", "Underworld"),
+    ("az01_q_usurper", "Ardent"),
+)
+
+
+def _az1_masked_army_variant(db, champ_id, node="Node00R"):
+    """Return the authored Node R branch for a faction quest state.
+
+    The source conversation names carry the predicates, while the quest
+    campaign rows carry the state.  Keep those two pieces separate: the
+    selection remains driven by authored conversation labels and does not
+    depend on the GUID ordering of the extracted records.
+
+    The third value says that the faction quest is finished.  That branch is
+    still retryable before it is entered, but closing it is the terminal
+    conversation for Vale of Oberon and may complete the node.
+    """
+    if champ_id is None:
+        return None
+    rows = _az1_node_conversation_rows(db, node)
+    for quest_script, faction in _AZ1_MASKED_ARMY_QUESTS:
+        if not _quest_row_matches_faction(
+                faction, _quest_faction_for_champion(db, champ_id)):
+            continue
+        _quest_id, quest_state = _quest_state_row(
+            db, champ_id, quest_script)
+        if not isinstance(quest_state, dict):
+            continue
+        finished = bool(quest_state.get("Finished"))
+        wanted = ("finished faction quest" if finished else
+                  "has faction quest")
+        for guid, trigger, priority, name in rows:
+            label = str(trigger.get("label") or name or "").lower()
+            if wanted in label:
+                return guid, quest_script, finished
+    return None
+
+
 def _az1_node_conversation(db, node, state=None, campaign_template="AZ1",
                            champ_id=None):
     """Select the authored conversation for the node's current visit.
@@ -1285,6 +1324,11 @@ def _az1_node_conversation(db, node, state=None, campaign_template="AZ1",
     rows = _az1_node_conversation_rows(db, node, campaign_template)
     if not rows:
         return None
+    if (str(campaign_template or "").upper() == "AZ1" and
+            str(node or "").lower() in {"noder", "node00r"}):
+        variant = _az1_masked_army_variant(db, champ_id, node=node)
+        if variant:
+            return variant[0]
     faction = _quest_faction_for_champion(db, champ_id) if champ_id else None
     if faction:
         faction_rows = [
@@ -1554,10 +1598,26 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                 # still incomplete, revisiting it must start its authored
                 # conversation even when an earlier visit was recorded.
                 is_node_r = str(node).lower() in {"noder", "node00r"}
+                masked_army_variant = (
+                    _az1_masked_army_variant(db, champ_id, node=node)
+                    if is_node_r else None
+                )
+                if (masked_army_variant and
+                        not data.get("quest_variant_completed")):
+                    data["completed"] = False
+                retryable_visit = visit_count > 0
                 data.update({
                     "type": "Convo",
                     "conversationId": authored_conversation,
-                    "repeatable": _az1_node_is_repeatable(db, node),
+                    "repeatable": (
+                        retryable_visit and
+                        (_az1_node_is_repeatable(db, node) or
+                         bool(masked_army_variant and
+                              not data.get("quest_variant_completed")))
+                    ),
+                    "quest_variant_terminal": bool(
+                        masked_army_variant and masked_army_variant[2] and
+                        not data.get("quest_variant_completed")),
                     "autostart": (not bool(data.get("completed")) and
                                   (visit_count <= 0 or is_node_r)),
                 })
@@ -1637,9 +1697,28 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                 data["conversationId"] = authored_conversation
             else:
                 data["conversationId"] = data.get("conversationId")
-            data["repeatable"] = _az1_node_is_repeatable(db, node)
+            visits = (((state or {}).get("PublicState", {}) or {}).get(
+                "Data", {}) or {}).get("conversation_visits", {})
+            try:
+                visit_count = int(visits.get(str(node), 0) or 0)
+            except (TypeError, ValueError):
+                visit_count = 0
+            data["repeatable"] = (
+                visit_count > 0 and _az1_node_is_repeatable(db, node))
+            masked_army_variant = (
+                _az1_masked_army_variant(db, champ_id, node=node)
+                if str(node).lower() in {"noder", "node00r"} else None
+            )
+            if (masked_army_variant and
+                    not data.get("quest_variant_completed") and
+                    visit_count > 0):
+                data["completed"] = False
+                data["repeatable"] = True
+            data["quest_variant_terminal"] = bool(
+                masked_army_variant and masked_army_variant[2] and
+                not data.get("quest_variant_completed"))
             if (data.get("quest_start_open") and
-                    not data.get("completed")):
+                        not data.get("completed")):
                 data["repeatable"] = True
             # The map token starts a conversation when it reaches an
             # unfinished node. Without AutoStart the client only records the
@@ -1649,8 +1728,6 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             # flag when the player deliberately returns to this node; keeping
             # it off here prevents the client from reopening the conversation
             # immediately after conv_done (or after a reconnect).
-            visits = (((state or {}).get("PublicState", {}) or {}).get("Data", {})
-                      or {}).get("conversation_visits", {})
             try:
                 visit_count = int(visits.get(str(node), 0) or 0)
             except (TypeError, ValueError):
@@ -1786,6 +1863,133 @@ def _az1_failed_nodes(state):
     }
 
 
+def _az1_node_opens_neighbors(state, node, failed_nodes=None):
+    """Whether an already visited AZ1 node may expose its outgoing paths.
+
+    Arrival alone is not completion for an action node.  In particular, an
+    encounter's prelude or active battle must not draw the paths beyond it;
+    the client should get those paths only after the node completes or is
+    returned to the map as retryable.  ``repeatable`` with AutoStart cleared
+    is the persisted retryable/re-enterable state used by AZ1 encounters and
+    repeatable conversations.  Plain map locations retain the historical
+    arrival-based reveal behaviour.
+    """
+    canonical = _resolve_node(state, str(node or ""))
+    failed_nodes = failed_nodes if failed_nodes is not None else _az1_failed_nodes(state)
+    if canonical in failed_nodes:
+        return True
+    data = next(
+        ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+         if _resolve_node(state, str((loc.get("Data") or {}).get("node") or
+                                     (loc.get("Data") or {}).get("name") or ""))
+         == canonical),
+        None,
+    )
+    if data is None:
+        return True
+    if data.get("completed"):
+        return True
+    # A retryable encounter or a repeatable conversation is left incomplete,
+    # but it is no longer auto-starting after its result/conversation closes.
+    return bool(data.get("repeatable") and not data.get("autostart"))
+
+
+def _az1_path_name(from_node, to_node, stored_name=""):
+    """Return the client prefab path name for an authored AZ1 edge.
+
+    Older databases may contain the opening edges with an empty ``path_name``
+    because the seed was added before those rows were populated.  The client
+    path objects use the stable ``Path_<start>_<end>`` convention, so derive
+    that name when no stored name is available.
+    """
+    if stored_name:
+        return str(stored_name)
+    left, right = sorted((str(from_node), str(to_node)))
+    return f"Path_{left}_{right}"
+
+
+def _az1_locked_paths(db, state, visited=None):
+    """Return AZ1 paths that must stay hidden behind unfinished locations.
+
+    Node visibility is cumulative, so an unvisited destination can become
+    visible through a completed alternate route.  The Unity client otherwise
+    renders every path whose endpoints are visible.  Lock only the individual
+    path joining an incomplete real location to an unvisited real location;
+    already travelled paths and prefab-only forks are never locked here.
+    """
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    if visited is None:
+        visited = {
+            _resolve_node(state, str(node))
+            for node in (pdata.get("visited_nodes") or [])
+            if node
+        }
+    visited_paths = {
+        str(path) for path in (pdata.get("visited_paths") or []) if path
+    }
+    path_forks = _az1_path_fork_ids(db)
+    failed_nodes = _az1_failed_nodes(state)
+    location_data = {}
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        node = data.get("node") or data.get("name")
+        if node:
+            location_data[_resolve_node(state, str(node))] = data
+
+    def incomplete(node):
+        data = location_data.get(node)
+        return (node not in path_forks and data is not None and
+                not _az1_node_opens_neighbors(state, node, failed_nodes))
+
+    def unvisited(node):
+        return node not in path_forks and node not in visited
+
+    rows = db.execute(
+        "SELECT from_node, to_node, path_name FROM campaign_node_edges "
+        "WHERE campaign_template='AZ1'"
+    ).fetchall()
+    # A path is represented by two directed rows.  Evaluate it once so a
+    # blank legacy row cannot produce a different lock name from its reverse.
+    grouped = {}
+    for from_node, to_node, stored_name in rows:
+        start = _resolve_node(state, str(from_node))
+        end = _resolve_node(state, str(to_node))
+        path = _az1_path_name(start, end, stored_name)
+        grouped.setdefault(path, set()).add((start, end))
+
+    locked = set()
+    for path, endpoints in grouped.items():
+        if path in visited_paths:
+            continue
+        if any((incomplete(start) and unvisited(end)) or
+               (incomplete(end) and unvisited(start))
+               for start, end in endpoints):
+            locked.add(path)
+            continue
+        # A client-only fork is always present for map geometry, but its
+        # connecting segment should not appear as an alternate route to an
+        # unvisited real node when that node already has an open ordinary
+        # neighbour.  For example, Node012 is reached directly from the
+        # completed/retryable Node00R route; keep Fork001 -> Node012 hidden
+        # until the bridge itself has been visited, while allowing the direct
+        # Node00R -> Node012 path to draw.
+        real_endpoints = {
+            node for pair in endpoints for node in pair
+            if node not in path_forks
+        }
+        if len(real_endpoints) != 1:
+            continue
+        real_node = next(iter(real_endpoints))
+        if real_node in visited:
+            continue
+        if any(
+                neighbour not in path_forks and neighbour in visited and
+                _az1_node_opens_neighbors(state, neighbour, failed_nodes)
+                for neighbour in _az1_neighbors(db, real_node)):
+            locked.add(path)
+    return sorted(locked)
+
+
 def _az1_is_adjacent(db, start_node, end_node):
     """Whether two AZ1 locations are joined by an authored map path.
 
@@ -1821,12 +2025,12 @@ def _az1_is_adjacent(db, start_node, end_node):
 def _az1_has_safe_visited_route(db, state, destination, visited=None):
     """Whether *destination* is adjacent to a previously visited safe node.
 
-    A failed encounter only blocks a destination that can be reached solely
-    through that failed node.  A destination with an alternate path from any
-    other visited node remains travelable (for example Node014 is reachable
-    from both Node013 and the already-visited Node012 bridge).  Failed nodes
-    are deliberately excluded from the alternate-route set so their own
-    downstream neighbours stay closed until the encounter is won.
+    A failed encounter only blocks travel to a destination that can be reached
+    solely through that failed node. A destination with an alternate path from
+    any other visited node remains travelable (for example Node014 is
+    reachable from both Node013 and the already-visited Node012 bridge).
+    Retryable nodes may still draw their outgoing paths; this helper controls
+    whether a new destination may be entered through a failed route.
     """
     destination = _resolve_node(state, str(destination or ""))
     if not destination:
@@ -1846,12 +2050,12 @@ def _az1_has_safe_visited_route(db, state, destination, visited=None):
 
 
 def _az1_reveal_neighbors(db, state, current_node=None):
-    """Reveal the current AZ1 node and its graph neighbours.
+    """Reveal the current AZ1 node and eligible graph neighbours.
 
     The client owns the static NodesPrefab (positions, paths, and FOW
     visuals), while this state controls which of those nodes are known. Keep
-    every visited/completed node visible and reveal only the current node's
-    actual adjacent locations for new exploration.
+    every visited node visible, but do not reveal paths beyond an active or
+    unfinished action node until it is completed or retryable.
     """
     if not isinstance(state, dict):
         return
@@ -1865,15 +2069,17 @@ def _az1_reveal_neighbors(db, state, current_node=None):
     }
     if current:
         visited.add(current)
-    # Revealed map space is cumulative.  Keep the neighbours of every node
-    # the champion has visited, not only the node occupied on the latest
+    failed_nodes = _az1_failed_nodes(state)
+    pdata["locked_paths"] = _az1_locked_paths(db, state, visited)
+    # Revealed map space is cumulative. Keep neighbours of every completed or
+    # retryable visited node, not only the node occupied on the latest
     # response; otherwise travelling from Dunnwood to a side location would
-    # hide the still-discovered Node007 branch again.
+    # hide the still-discovered Node007 branch again. An unfinished encounter
+    # is intentionally visible itself but does not open its outgoing paths.
     reveal = set(visited)
     for node in visited:
-        reveal.update(_az1_neighbors(db, node))
-    if current:
-        reveal.update(_az1_neighbors(db, current))
+        if _az1_node_opens_neighbors(state, node, failed_nodes):
+            reveal.update(_az1_neighbors(db, node))
     blocked = {
         _resolve_node(state, str(node))
         for node in (pdata.get("blocked_nodes") or [])
@@ -1881,7 +2087,8 @@ def _az1_reveal_neighbors(db, state, current_node=None):
     }
     forced_visible = {
         _resolve_node(state, str(node))
-        for node in (pdata.get("quest_reveal_nodes") or [])
+        for node in ((pdata.get("quest_reveal_nodes") or []) +
+                     (pdata.get("unlocked_nodes") or []))
         if node
     }
     forced_hidden = {
@@ -1939,7 +2146,6 @@ def _az1_reveal_neighbors(db, state, current_node=None):
                 "Node023" in northbound and str(value).startswith("Node023"))
         ]
     path_forks = _az1_path_fork_ids(db)
-    failed_nodes = _az1_failed_nodes(state)
 
     def _node_set_contains(values, node):
         if node in values:
@@ -1950,35 +2156,6 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         return ("Node023" in values and
                 str(node or "").startswith("Node023"))
 
-    # A failed node keeps an unvisited destination closed only when that
-    # destination has no alternate route from another safe visited node.  A
-    # shared path (for example Node012 -> Fork001 -> Node014) remains usable
-    # even when Node013, another neighbour, was failed.
-    for failed_node in failed_nodes:
-        failed_neighbors = set(_az1_neighbors(db, failed_node))
-        for fork in failed_neighbors & path_forks:
-            failed_neighbors.update(_az1_neighbors(db, fork))
-        blocked.update(
-            neighbor for neighbor in failed_neighbors
-            if (neighbor not in visited and neighbor not in path_forks and
-                not _az1_has_safe_visited_route(
-                    db, state, neighbor, visited=visited))
-        )
-    # While standing on a failed encounter, preserve any unvisited
-    # destination that is reachable from another safe visited node.  This
-    # allows backtracking through the bridge and then taking its alternate
-    # branch without allowing a failed node to open its own downstream path.
-    if current in failed_nodes:
-        blocked.update(
-            str((loc.get("Data") or {}).get("node"))
-            for loc in state.get("VisLocs", [])
-            if ((loc.get("Data") or {}).get("node") and
-                (loc.get("Data") or {}).get("node") not in visited and
-                (loc.get("Data") or {}).get("node") not in path_forks and
-                not _az1_has_safe_visited_route(
-                    db, state, (loc.get("Data") or {}).get("node"),
-                    visited=visited))
-        )
     for loc in state.get("VisLocs", []):
         data = loc.get("Data") or {}
         node = data.get("node")
@@ -2334,6 +2511,57 @@ def _quest_hook_az1_find_ambling_mesa_start(db, champ_id, state):
     return json.dumps(state, sort_keys=True) != before
 
 
+def _az1_apply_masked_army_branch(db, champ_id, state):
+    """Open Lena Grotto and keep Vale retryable for its faction branch."""
+    variant = _az1_masked_army_variant(db, champ_id)
+    if not variant:
+        return False
+    before = json.dumps(state, sort_keys=True)
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+
+    # Find Cave-In/Ambling Mesa use the same map gate for their opposing
+    # route.  Once the faction quest has supplied the Masked Army branch,
+    # Lena Grotto is an authored destination in its own right.
+    _az1_set_node_gate(state, "Node025", False)
+    for key in ("quest_hidden_nodes", "blocked_nodes"):
+        pdata[key] = [
+            str(value) for value in (pdata.get(key) or [])
+            if str(value) != "Node025"
+        ]
+    unlocked = [str(value) for value in (pdata.get("unlocked_nodes") or [])
+                if value]
+    if "Node025" not in unlocked:
+        unlocked.append("Node025")
+    pdata["unlocked_nodes"] = unlocked
+
+    # A previous generic Vale conversation must not remain terminal after a
+    # faction quest changes the available authored conversation.
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        node = str(data.get("node") or "")
+        if node == "Node00R":
+            terminal_consumed = bool(
+                variant[2] and data.get("quest_variant_completed"))
+            data.update({
+                "completed": terminal_consumed,
+                "repeatable": not terminal_consumed,
+                "quest_variant_terminal": bool(
+                    variant[2] and not terminal_consumed),
+                "visible": True,
+                "enabled": True,
+            })
+        elif node == "Node025":
+            data.update({"visible": True, "enabled": True})
+    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
+    # The explicit quest destination must remain visible even when the latest
+    # location is not adjacent to it.
+    for loc in state.get("VisLocs", []):
+        data = loc.get("Data") or {}
+        if data.get("node") == "Node025":
+            data.update({"visible": True, "enabled": True})
+    return json.dumps(state, sort_keys=True) != before
+
+
 _QUEST_START_HOOKS = {
     "az1_tamed_start": _quest_hook_az1_tamed_start,
     "az1_cross_the_river_start": _quest_hook_az1_cross_the_river_start,
@@ -2401,6 +2629,7 @@ def _sync_az1_quest_gates(db, champ_id, state):
         hook = _QUEST_START_HOOKS.get(str(hook_name or ""))
         if hook:
             hook(db, champ_id, state)
+    _az1_apply_masked_army_branch(db, champ_id, state)
     _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
     return json.dumps(state, sort_keys=True) != before
 
@@ -4484,10 +4713,13 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                                     (loc.get("Data") or {}).get("name"))),
                     {})
                 current_template = str(template_name or "").upper()
+                quest_variant_terminal = bool(
+                    current_data.get("quest_variant_terminal"))
                 repeatable_convo = (
                     current_template in {"AZ1", "AZ2"} and
                     current_data.get("type") == "Convo" and
-                    bool(current_data.get("repeatable")))
+                    bool(current_data.get("repeatable")) and
+                    not quest_variant_terminal)
                 outcome_convo = bool(current_data.get("outcome_conversation"))
                 pre_encounter_convo = bool(current_data.get("pre_encounter"))
                 quest_turnin_convo = bool(current_data.get("turninquest"))
@@ -4520,6 +4752,9 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     current_data["autostart"] = False
                 elif not repeatable_convo and not pre_encounter_convo:
                     _mark_location_completed(state, current)
+                    if quest_variant_terminal:
+                        current_data["quest_variant_completed"] = True
+                    current_data.pop("quest_variant_terminal", None)
                 else:
                     # A repeatable node must not auto-trigger again while the
                     # client is still parked on it after the conversation
@@ -4642,6 +4877,15 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     state["ALoc"] = None
                 elif not current_data.get("shroomhaus_ready"):
                     state["ALoc"] = None
+                # Conversation completion can change a repeatable node from
+                # an active prelude into its retryable map state. Recompute
+                # both node and edge visibility now; otherwise the newly
+                # visible destinations can retain stale locked_paths from
+                # before this node was completed/re-enterable.
+                if (current_template == "AZ1" and
+                        current_data.get("node")):
+                    _az1_reveal_neighbors(
+                        db, state, current_data.get("node"))
             state["CurState"] = "EXPLORE"
             db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                        (json.dumps(state), camp_id))
@@ -6931,10 +7175,33 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                         else:
                             data["conversationId"] = _az1_node_conversation(
                                 db, node, state, champ_id=champ_id)
+                        masked_army_variant = (
+                            _az1_masked_army_variant(db, champ_id, node=node)
+                            if str(node).lower() in {"noder", "node00r"}
+                            else None
+                        )
+                        if (masked_army_variant and
+                                not data.get("quest_variant_completed")):
+                            data["completed"] = False
+                            data["quest_variant_terminal"] = bool(
+                                masked_army_variant[2])
+                        conversation_visits = (
+                            (((state.get("PublicState") or {}).get("Data") or {})
+                             .get("conversation_visits") or {})
+                        )
+                        try:
+                            prior_visit_count = int(
+                                conversation_visits.get(str(node), 0) or 0)
+                        except (TypeError, ValueError):
+                            prior_visit_count = 0
                         data["repeatable"] = (
-                            True if (data.get("quest_start_open") and
-                                     not data.get("completed")) else
-                            _az1_node_is_repeatable(db, node))
+                            True if ((masked_army_variant and
+                                     prior_visit_count > 0 and
+                                     not data.get("quest_variant_completed")) or
+                                     (data.get("quest_start_open") and
+                                      not data.get("completed"))) else
+                            (prior_visit_count > 0 and
+                             _az1_node_is_repeatable(db, node)))
                         data["autostart"] = True
                         break
                 _az1_reveal_neighbors(db, state, node)
