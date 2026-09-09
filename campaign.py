@@ -108,7 +108,8 @@ def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
         public_data = (existing_state.get("PublicState", {}) or {}).get("Data", {}) or {}
         stale_panorama = (
             existing_state.get("TempType") != "PANORAMA"
-            or public_data.get("CampaignGroup") != "PANORAMA"
+            or (public_data.get("CampaignGroup") != "PANORAMA" and
+                not existing_state.get("PanoramaSceneGuid"))
             or public_data.get("IsStarterDungeon")
         )
         if stale_panorama:
@@ -891,13 +892,13 @@ def _az0_config(champion_race):
 
 
 def _convo_location(name, conversation_id, *, givequest=False,
-                    turninquest=False):
+                    turninquest=False, repeatable=False):
     return {
         "Data": {
             "name": name, "node": name, "type": "Convo",
             "autostart": False, "autopan": False, "autotrigger": False,
             "battle": None, "completed": False, "enabled": True, "visible": True,
-            "repeatable": False, "givequest": bool(givequest),
+            "repeatable": bool(repeatable), "givequest": bool(givequest),
             "turninquest": bool(turninquest),
             "impassable": False, "unknown": False, "encounter": None,
             "encounter_desc": None, "allow_cancel": False,
@@ -1128,6 +1129,16 @@ def _activate_az1_area(db, champ_id):
                    "champion_name,template_name,campaign_type,is_started,state_json) "
                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (cid,lo,hi,champ_id,user_id,champ_name,"AZ1","AREA",1,"{}"))
+    previous_state = state if row and isinstance(state, dict) else {}
+    previous_locations = {
+        (item.get("Data") or {}).get("node"): item.get("Data") or {}
+        for item in previous_state.get("VisLocs", [])
+        if (item.get("Data") or {}).get("node")
+    }
+    previous_public = (
+        (previous_state.get("PublicState") or {}).get("Data") or {}
+    )
+    previous_last_node = previous_state.get("LastNode") or "Node001"
     champ = _get_champion(db, champ_id)
     area_locs, area_nodes = _az1_area_scene_state(
         champ[2] if champ else None, db=db)
@@ -1141,6 +1152,28 @@ def _activate_az1_area(db, champ_id):
     _hydrate_az1_area_scene_metadata(db, area_locs, champ_id=champ_id,
                                      state={"VisLocs": area_locs,
                                             "PublicState": {"Data": {}}})
+    # Returning from an authored panorama must resume the existing map, not
+    # reset the player's visited nodes and path progress to Node001. Keep
+    # authored fields from the fresh scene and merge persisted gameplay state.
+    preserved_location_fields = (
+        "completed", "visible", "enabled", "repeatable", "givequest",
+        "turninquest", "conversationId", "autostart", "autopan",
+        "autotrigger", "quest_variant_terminal", "quest_variant_completed",
+        "pre_encounter_completed", "shroomhaus_ready", "quest_start_open",
+        "quest_start_script",
+    )
+    for loc in area_locs:
+        data = loc.get("Data") or {}
+        old_data = previous_locations.get(data.get("node"))
+        if old_data:
+            for field in preserved_location_fields:
+                if field in old_data:
+                    data[field] = old_data[field]
+        # Returning from a panorama must leave its source node selectable.
+        # Older saves often marked the node completed after the first
+        # StartLoc/conv_done sequence, which hides the current-node action
+        # button and makes the player unable to travel back in.
+        _normalize_az1_panorama_location(db, data)
     # Location.Encounter is a name/reference; the client then looks it up in
     # GameplayState.Encounters to obtain the scene GUID. Keep this catalog
     # derived from the authored node references and encounter_scenes table.
@@ -1156,29 +1189,300 @@ def _activate_az1_area(db, champ_id):
                   # ALoc is reserved for an active location.  Keeping it
                   # empty at map entry lets the client select/move from the
                   # starting node; LastNode identifies the starting tile.
-                  "ALoc": None, "LastNode": "Node001",
+                  "ALoc": None, "LastNode": previous_last_node,
                   "CurState": "EXPLORE", "Finished": None,
-                  "PublicState": {"Data": {"CampaignGroup": "AREA",
-                                             "visited_nodes": ["Node001"],
-                                             "visited_paths": [],
-                                             # Filled from active quest
-                                             # objectives below.  Do not bake
-                                             # a node number into the area
-                                             # campaign; quest encounter GUIDs
-                                             # are the source of truth.
-                                             "quest_nodes": []}},
+                  "PublicState": {"Data": dict(previous_public)},
                   "PayGroups": [], "CSlide": None,
                   "Encounters": area_encounters,
                   "Champions": [],
                   "Started": _now_utc(), "FinishReason": None, "Wins": 0, "Losses": 0,
                   "Score": 0, "HealthAdj": 0, "DungeonLifeAdj": 0, "Flags": {},
                   "VisLocs": area_locs, "LocNodes": area_nodes})
+    state["PublicState"]["Data"]["CampaignGroup"] = "AREA"
+    state["PublicState"]["Data"].setdefault("visited_nodes", ["Node001"])
+    state["PublicState"]["Data"].setdefault("visited_paths", [])
+    # Filled from active quest objectives below; quest encounter GUIDs remain
+    # the source of truth rather than a baked-in node number.
+    state["PublicState"]["Data"].setdefault("quest_nodes", [])
     _sync_az1_quest_gates(db, champ_id, state)
     _apply_az1_quest_markers(db, champ_id, state)
     _az1_reveal_neighbors(db, state, state.get("LastNode") or "Node001")
     db.execute("UPDATE campaigns SET is_started=1,state_json=? WHERE id=?",
-               (json.dumps(state), cid)); db.commit()
+               (json.dumps(state), cid))
+    # LastCampaignID is the client's reconnect entry point. Returning from a
+    # panorama must move it back to the AREA campaign; otherwise a later
+    # qcur4champ query can reopen the panorama the player just left.
+    db.execute("UPDATE champions SET last_campaign_id=? WHERE id=?",
+               (cid, champ_id))
+    db.commit()
     return cid, state
+
+
+def _panorama_npc_for_conversation(db, conversation_guid, node):
+    """Return the authored NPC for a quest conversation at an area node."""
+    row = db.execute(
+        "SELECT npc, role FROM quest_conversations "
+        "WHERE campaign_template='AZ1' AND node_id=? "
+        "AND conversation_guid=? AND enabled=1 "
+        "ORDER BY priority, rowid LIMIT 1",
+        (node, str(conversation_guid or "")),
+    ).fetchone()
+    return (row[0], row[1]) if row and row[0] else (None, None)
+
+
+def _panorama_champion_guid(db, npc):
+    """Resolve a panorama NPC's client portrait from authored champion data."""
+    if not npc:
+        return None
+    row = db.execute(
+        "SELECT guid FROM champion_templates_extended "
+        "WHERE lower(name)=lower(?) LIMIT 1", (npc,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _panorama_npc_from_conversation_name(conversation_name):
+    """Extract an NPC from an authored AZ1 panorama conversation label."""
+    parts = [part.strip() for part in str(conversation_name or "").split("-")]
+    if len(parts) < 3:
+        return None
+    # The extracted AZ1 labels use ``AZ1 - Node NN - NPC - ...``.  Keep this
+    # parser limited to that authored shape; non-NPC labels such as
+    # ``Tranquil Dream`` are filtered later by champion_templates_extended.
+    if parts[0].upper() != "AZ1" or not parts[1].lower().startswith("node"):
+        return None
+    return parts[2] or None
+
+
+def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
+                              area_state):
+    """Build client state for an authored AZ1 panorama scene.
+
+    The area scene remains the source of truth for the destination. Panorama
+    NPCs are selected from the authored quest conversation catalog, so every
+    eligible quest giver/turn-in at the destination is rendered rather than
+    only the conversation that happened to be selected on the map node.
+    """
+    area_data = next(
+        ((loc.get("Data") or {}) for loc in area_state.get("VisLocs", [])
+         if (loc.get("Data") or {}).get("node") == node),
+        {},
+    )
+    faction = _quest_faction_for_champion(db, champion_id)
+    candidates = {}
+    rows = db.execute(
+        "SELECT qc.quest_script, qc.conversation_guid, qc.role, qc.faction, "
+        "qc.npc, qc.priority, COALESCE(NULLIF(qc.start_hook, ''), "
+        "NULLIF(qt.start_hook, ''), '') "
+        "FROM quest_conversations qc "
+        "LEFT JOIN quest_templates qt ON qt.script_name=qc.quest_script "
+        "WHERE qc.campaign_template='AZ1' AND qc.node_id=? "
+        "AND qc.enabled=1 ORDER BY qc.priority, qc.rowid",
+        (str(node),),
+    ).fetchall()
+    for (script, conversation_guid, role, row_faction, npc, priority,
+         start_hook) in rows:
+        if not npc or not conversation_guid or not _quest_row_matches_faction(
+                row_faction, faction):
+            continue
+        _quest_id, quest_state = _quest_state_row(
+            db, champion_id, script) if script else (None, None)
+        role = str(role or "").lower()
+        active_objective = False
+        flags = quest_state.get("Flags") or {} if quest_state else {}
+        objectives = flags.get("_quest_objectives") or []
+        try:
+            objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
+        except (TypeError, ValueError):
+            objective_index = -1
+        current_objective = (
+            objectives[objective_index]
+            if (isinstance(objectives, list) and
+                0 <= objective_index < len(objectives) and
+                isinstance(objectives[objective_index], dict))
+            else {}
+        )
+        objective_is_conversation = (
+            str(current_objective.get("type") or "").lower()
+            in {"conversation", "convo"}
+        )
+        if (script and quest_state and not quest_state.get("Finished") and
+                objective_is_conversation):
+            active_objective = str(conversation_guid) in {
+                str(value) for value in _quest_objective_conversation_guids(
+                    db, champion_id, script, current_objective)
+            }
+        if active_objective:
+            eligible = True
+            rank = 0
+        elif role == "start":
+            # A missing QUEST row is not enough to make every authored start
+            # conversation available.  The catalog contains later AZ1 quest
+            # starts at the same panorama; only rows with an explicit unlock
+            # hook may introduce a new quest here.  Once introduced, the
+            # normal not_complete/complete rows control that NPC.
+            eligible = (
+                quest_state is None and bool(start_hook) and
+                _quest_start_prerequisites_met(db, champion_id, script))
+            rank = 2
+        elif role == "complete":
+            eligible = _quest_is_turnin_ready(quest_state)
+            rank = 1
+        elif role == "not_complete":
+            eligible = bool(quest_state and not quest_state.get("Finished"))
+            rank = 3
+        else:
+            eligible = False
+            rank = 9
+        if not eligible:
+            continue
+        candidate = (rank, int(priority or 0), str(conversation_guid),
+                     str(conversation_guid), role, quest_state,
+                     active_objective)
+        previous = candidates.get(str(npc))
+        if previous is None or candidate[:3] < previous[:3]:
+            candidates[str(npc)] = candidate
+
+    # Some authored panorama dialogue is intentionally not attached to a
+    # quest row.  In particular, the completed-quest repeating conversations
+    # provide the animal-taming hints and the faction-specific Sea Hag/other
+    # NPC follow-ups.  Include one authored repeat conversation when no more
+    # specific quest conversation currently owns that NPC.
+    generic_rows = db.execute(
+        "SELECT conversation_guid, trigger_json, conversation_name, priority "
+        "FROM campaign_node_conversations "
+        "WHERE campaign_template='AZ1' AND node_id=? AND enabled=1 "
+        "ORDER BY priority, conversation_guid",
+        (str(node),),
+    ).fetchall()
+    for conversation_guid, raw_trigger, conversation_name, priority in generic_rows:
+        try:
+            trigger = json.loads(raw_trigger or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trigger = {}
+        if (not isinstance(trigger, dict) or
+                str(trigger.get("visit") or "").lower() != "repeat" or
+                not _conversation_matches_faction(conversation_name, faction)):
+            continue
+        npc = _panorama_npc_from_conversation_name(conversation_name)
+        if not npc or not _panorama_champion_guid(db, npc):
+            continue
+        # The generic repeat catalog contains later NPC hint conversations
+        # even before their quest has been introduced.  Associate the NPC
+        # with its authored quest rows and expose the repeat only after one
+        # of those quest campaigns exists (active or finished).
+        npc_quest_scripts = db.execute(
+            "SELECT DISTINCT quest_script FROM quest_conversations "
+            "WHERE campaign_template='AZ1' AND node_id=? AND npc=? "
+            "AND enabled=1",
+            (str(node), str(npc)),
+        ).fetchall()
+        if (npc_quest_scripts and not any(
+                _quest_state_row(db, champion_id, script)[1] is not None
+                for (script,) in npc_quest_scripts)):
+            continue
+        if str(npc) in candidates:
+            continue
+        candidates[str(npc)] = (
+            4, int(priority or 0), str(conversation_guid),
+            str(conversation_guid), "repeat", None, False)
+
+    # Keep a conversation-only authored location as a compatibility fallback
+    # for older saves whose quest metadata predates the AZ1 catalog migration.
+    if not candidates:
+        conversation_guid = area_data.get("conversationId")
+        npc, role = _panorama_npc_for_conversation(
+            db, conversation_guid, node)
+        if npc and conversation_guid:
+            candidates[str(npc)] = (
+                2, 0, str(conversation_guid), str(conversation_guid),
+                str(role or ""), None, False)
+
+    locations = []
+    nodes = []
+    for npc, candidate in candidates.items():
+        (_rank, _priority, _sort_guid, conversation_guid, role, quest_state,
+         active_objective) = candidate
+        locations.append(_convo_location(
+            npc, conversation_guid,
+            givequest=(role == "start" and
+                       (quest_state is None or active_objective)),
+            turninquest=(role == "complete" and
+                         (_quest_is_turnin_ready(quest_state) or
+                          active_objective)),
+            repeatable=(role in {"repeat", "not_complete"})))
+        nodes.append({
+            "Name": npc,
+            "Data": {
+                "id": npc,
+                "type": "DEFAULT",
+                "championId": _panorama_champion_guid(db, npc),
+            },
+        })
+
+    campaign_group = (((area_state.get("PublicState") or {}).get("Data") or {})
+                       .get("CampaignGroup") or "AREA")
+
+    return {
+        "CampID": cid,
+        "ChampID": champion_id,
+        "TempType": "PANORAMA",
+        "PayGroups": [],
+        "CSlide": None,
+        # Do not select the NPC on scene entry.  The panorama VM treats an
+        # ALoc matching a visible conversation as an active location and
+        # immediately launches it.  Keep the NPC in VisLocs so its portrait
+        # and quest indicators are visible; the player starts the conversation
+        # by interacting with that portrait.
+        "ALoc": None,
+        "VisLocs": locations,
+        "LocNodes": nodes,
+        "Encounters": [],
+        "Champions": [],
+        "CurState": "EXPLORE",
+        "LastNode": npc,
+        "PublicState": {"Data": {
+            # QuestTracker filters the client's cached quests by this value.
+            # Authored AZ1 quests use the AREA campaign group even while the
+            # player is temporarily in the destination panorama.
+            "CampaignGroup": campaign_group,
+            # UIPanoramaZoneViewModel defaults this flag to hidden when it is
+            # absent.  Authored AZ1 panoramas contain their NPC interactables
+            # in the scene, so explicitly keep their portraits actionable.
+            "HideQuickNavigation": False,
+            "PanoramaSceneGuid": str(scene_guid),
+            "PanoramaNode": node,
+        }},
+        "PanoramaSceneGuid": str(scene_guid),
+        "PanoramaNode": node,
+        "Started": _now_utc(),
+        "Finished": None,
+        "FinishReason": None,
+        "Wins": 0,
+        "Losses": 0,
+        "Score": 0,
+        "HealthAdj": 0,
+        "DungeonLifeAdj": 0,
+        "Flags": {},
+    }
+
+
+def _activate_az1_panorama(db, champion_id, scene_guid, node, area_state):
+    """Activate the panorama represented by an authored AZ1 scene."""
+    pano_id, _inst, _started, _existing = _find_campaign_for_champion(
+        db, champion_id, "PANORAMA")
+    state = _build_az1_panorama_state(
+        db, pano_id, champion_id, scene_guid, node, area_state)
+    db.execute(
+        "UPDATE campaigns SET is_started=1, state_json=? WHERE id=?",
+        (json.dumps(state), pano_id),
+    )
+    db.execute(
+        "UPDATE champions SET last_campaign_id=? WHERE id=?",
+        (pano_id, champion_id),
+    )
+    db.commit()
+    return pano_id, state
 
 
 def _az1_scene_for_node(db, node):
@@ -1211,6 +1515,30 @@ def _az1_scene_for_node(db, node):
         if match and node_key(match.group(1)) == wanted:
             return row
     return None
+
+
+def _normalize_az1_panorama_location(db, data):
+    """Make an authored AZ1 panorama node a reusable map portal.
+
+    The Unity map hides the current-node action when ``completed`` is true and
+    treats an auto-starting location as already in progress.  A panorama node
+    is neither one-shot content nor a conversation on the AREA map: it is a
+    reusable Travel/Explore portal into the authored panorama scene.
+    """
+    if not isinstance(data, dict):
+        return False
+    scene = _az1_scene_for_node(db, data.get("node") or data.get("name"))
+    if not scene or "PANORAMA" not in str(scene[1] or "").upper():
+        return False
+    data.update({
+        "type": "Panorama",
+        "encounter": scene[0],
+        "conversationId": None,
+        "completed": False,
+        "repeatable": True,
+        "autostart": False,
+    })
+    return True
 
 
 def _az1_node_conversation_rows(db, node, campaign_template="AZ1"):
@@ -1638,7 +1966,12 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             continue
         guid, name, rewards_json = scene
         upper_name = str(name or "").upper()
-        if "SHROOM HAUS" in upper_name:
+        if "PANORAMA" in upper_name:
+            # PANORAMA scenes are reusable map portals. They must remain
+            # actionable after returning from the scene instead of becoming a
+            # completed Encounter/Convo location on the AREA map.
+            _normalize_az1_panorama_location(db, data)
+        elif "SHROOM HAUS" in upper_name:
             # Kooo's introductory conversation precedes the card-choice
             # window. Keep the authored Shroom Haus choices attached, but
             # expose the conversation on the first visit.
@@ -1927,6 +2260,11 @@ def _az1_locked_paths(db, state, visited=None):
     visited_paths = {
         str(path) for path in (pdata.get("visited_paths") or []) if path
     }
+    explicitly_unlocked = {
+        _resolve_node(state, str(node))
+        for node in (pdata.get("unlocked_nodes") or [])
+        if node
+    }
     path_forks = _az1_path_fork_ids(db)
     failed_nodes = _az1_failed_nodes(state)
     location_data = {}
@@ -1964,8 +2302,21 @@ def _az1_locked_paths(db, state, visited=None):
         if any((incomplete(start) and unvisited(end)) or
                (incomplete(end) and unvisited(start))
                for start, end in endpoints):
-            locked.add(path)
-            continue
+            # An explicit quest unlock opens the edge from a visited node
+            # that is already allowed to expose neighbours.  Do not treat an
+            # unlocked source as an unlock for its own unfinished exits:
+            # Node013 -> Node016 and Node015 -> Node016 must remain closed
+            # until those nodes open their neighbours.
+            forced_open = any(
+                (end in explicitly_unlocked and start in visited and
+                 _az1_node_opens_neighbors(state, start, failed_nodes)) or
+                (start in explicitly_unlocked and end in visited and
+                 _az1_node_opens_neighbors(state, end, failed_nodes))
+                for start, end in endpoints
+            )
+            if not forced_open:
+                locked.add(path)
+                continue
         # A client-only fork is always present for map geometry, but its
         # connecting segment should not appear as an alternate route to an
         # unvisited real node when that node already has an open ordinary
@@ -1981,6 +2332,8 @@ def _az1_locked_paths(db, state, visited=None):
             continue
         real_node = next(iter(real_endpoints))
         if real_node in visited:
+            continue
+        if real_node in explicitly_unlocked:
             continue
         if any(
                 neighbour not in path_forks and neighbour in visited and
@@ -2288,6 +2641,24 @@ def _quest_row_matches_faction(row_faction, champion_faction):
     return not row_faction or str(row_faction).lower() in {
         str(champion_faction).lower(), "all"
     }
+
+
+# Later AZ1 quest starts share the Cave-In/Mesa panorama with the first
+# faction quests, but are unlocked by the preceding authored quest chain.
+# Keep the prerequisite in campaign metadata logic so a missing QUEST row does
+# not accidentally turn every catalogued conversation into a quest giver.
+_AZ1_QUEST_START_PREREQUISITES = {
+    "q_smoldering_dead": ("q_army_of_myth",),
+}
+
+
+def _quest_start_prerequisites_met(db, champ_id, quest_script):
+    for prerequisite in _AZ1_QUEST_START_PREREQUISITES.get(
+            str(quest_script or ""), ()):
+        _qid, state = _quest_state_row(db, champ_id, prerequisite)
+        if not state or not state.get("Finished"):
+            return False
+    return True
 
 
 def _quest_hook_az1_tamed_start(db, champ_id, state):
@@ -2842,6 +3213,13 @@ def _apply_az1_quest_markers(db, champ_id, state):
     for loc in state.get("VisLocs", []):
         data = loc.setdefault("Data", {})
         node = str(data.get("node") or data.get("name") or "")
+        # Quest conversations at PANORAMA destinations are rendered by the
+        # panorama NPC bundle, not as an AREA map conversation. Do not turn
+        # the reusable portal back into an auto-starting Convo location.
+        panorama_scene = _az1_scene_for_node(db, node)
+        if (panorama_scene and
+                "PANORAMA" in str(panorama_scene[1] or "").upper()):
+            continue
         matching = sorted(
             guid for guid in active_objective_conversations
             if node in conversation_nodes.get(guid, set())
@@ -2873,6 +3251,12 @@ def _normalize_starter_panorama_state(state, cfg):
     has become an encounter) and the latter for the quest marker, so repair
     those fields whenever an older state is returned.
     """
+    # A non-starter panorama is authored by an AREA panorama scene.  Its
+    # locations must not be repaired as though they were the AZ0 tutorial
+    # NPCs; the scene-specific state was deliberately built by the area
+    # transition helper.
+    if state.get("PanoramaSceneGuid"):
+        return False
     # A completed dungeon hands off to the panorama with a report NPC.  Do
     # not rebuild that intentionally post-dungeon state as a fresh tutorial.
     if state.get("PostCrayburnReport"):
@@ -3083,27 +3467,33 @@ def _az1_activate_direct_path_destination(db, state, path_values, champ_id):
 
     The map client normally reports ``visit_path`` followed by ``StartLoc``.
     Some direct path animations only send the former, leaving the server on
-    the previous node and the client with no conversation to auto-start.  A
-    single authored path is unambiguous, so accept it as arrival only when
-    one endpoint is the persisted current node and the other endpoint is a
-    visible, unblocked, visitable adjacent location.
+    the previous node and the client with no conversation to auto-start.  The
+    path list is ordered along the travelled route, so resolve its final
+    endpoint by walking each edge from the persisted current node and accept
+    it only when every step is a visible, unblocked, visitable adjacent
+    location.
     """
-    if not isinstance(path_values, (list, tuple)) or len(path_values) != 1:
+    if not isinstance(path_values, (list, tuple)) or not path_values:
         return None
-    match = re.fullmatch(
-        r"Path_([^_]+)_([^_]+)", str(path_values[0] or ""))
-    if not match:
-        return None
-
     current = _resolve_node(
         state, state.get("ALoc") or state.get("LastNode") or "")
-    endpoints = [
-        _resolve_node(state, match.group(1)),
-        _resolve_node(state, match.group(2)),
-    ]
-    if current not in endpoints:
-        return None
-    destination = endpoints[1] if endpoints[0] == current else endpoints[0]
+    destination = current
+    for path_value in path_values:
+        match = re.fullmatch(
+            r"Path_([^_]+)_([^_]+)", str(path_value or ""))
+        if not match:
+            return None
+        endpoints = [
+            _resolve_node(state, match.group(1)),
+            _resolve_node(state, match.group(2)),
+        ]
+        if destination not in endpoints:
+            return None
+        next_node = (endpoints[1] if endpoints[0] == destination
+                     else endpoints[0])
+        if not _az1_is_adjacent(db, destination, next_node):
+            return None
+        destination = next_node
     if destination == current or destination in _az1_path_fork_ids(db):
         return None
 
@@ -3119,7 +3509,7 @@ def _az1_activate_direct_path_destination(db, state, path_values, champ_id):
         _resolve_node(state, str(value))
         for value in (pdata.get("blocked_nodes") or []) if value
     }
-    if destination in blocked or not _az1_is_adjacent(db, current, destination):
+    if destination in blocked:
         return None
 
     state["LastNode"] = destination
@@ -3725,6 +4115,26 @@ _RACE_BUNDLE_MAP = {
     8: ("adventurezone01/p_vnnn_thehatchery", "p_vnnn_thehatchery"),    # Vennen
 }
 
+# AZ1 AREA handoffs select their destination by authored map node, not by the
+# race of the champion travelling there. A Shin'hare can reach Cave-In, for
+# example, but that node must still load the Dwarf Cave-In panorama.
+_AZ1_PANORAMA_BUNDLE_MAP = {
+    "Node017": ("adventurezone01/p_dwrf_cavein", "p_dwrf_cavein"),
+    "Node034": ("adventurezone01/p_cytl_amblingmesa", "p_cytl_amblingmesa"),
+    "Node049": ("adventurezone01/p_cytl_thunderfield", "p_cytl_thunderfield"),
+}
+
+
+def _az1_panorama_assets(panorama_node, champion_race=None):
+    """Return the authored panorama assets for an AZ1 handoff node."""
+    assets = _AZ1_PANORAMA_BUNDLE_MAP.get(str(panorama_node or ""))
+    if assets:
+        return assets
+    # Preserve compatibility with older panorama states that predate the node
+    # marker. New authored AZ1 handoffs must be added above instead of relying
+    # on the travelling champion's race.
+    return _RACE_BUNDLE_MAP.get(champion_race, ("", ""))
+
 # When _launch_encounter pushes a gamestarted, the scene GUID is stored
 # here keyed by session_name so the battle session setup can resolve the
 # correct AI deck/name (resolve_encounter uses this to override
@@ -3816,11 +4226,16 @@ def _normalize_crayburn_encounters(state, race_name):
         changed = True
     return changed
 
-def _build_camp_summary(cid, inst_id, campaign_type="PANORAMA", template_name="AZ1", champion_race=None):
+def _build_camp_summary(cid, inst_id, campaign_type="PANORAMA", template_name="AZ1", champion_race=None, panorama_scene=None, panorama_node=None):
     """Build a CampSummary JSON dict."""
     bundle, prefab = "", ""
     cfg = _az0_config(champion_race)
-    if cfg:
+    if ((campaign_type or "").upper() == "PANORAMA" and
+            panorama_scene):
+        # AZ1 handoffs use the authored node destination (for example
+        # Node017 -> p_dwrf_cavein), not the travelling champion's race.
+        bundle, prefab = _az1_panorama_assets(panorama_node, champion_race)
+    elif cfg:
         bundle, prefab = cfg["bundle"], cfg["prefab"]
     elif champion_race and champion_race in _RACE_BUNDLE_MAP:
         bundle, prefab = _RACE_BUNDLE_MAP[champion_race]
@@ -4056,6 +4471,32 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
             return _send_response(handler, json.dumps(resp), comp, session_id,
                                   reqid, target, instance, conh, uid)
 
+    # Authored AZ1 panoramas are the active campaign while the player is in
+    # Cave-In/Ambling Mesa/etc.  The AREA row remains persisted underneath so
+    # return_parent can resume it, but reconnect must follow LastCampaignID
+    # back into the panorama rather than reopening the map.
+    authored_panorama = _get_existing_campaign_for_champion(
+        db, champ_id, "PANORAMA")
+    last_campaign = db.execute(
+        "SELECT last_campaign_id FROM champions WHERE id=?", (champ_id,)
+    ).fetchone()
+    if (authored_panorama and last_campaign and
+            last_campaign[0] == authored_panorama[0] and
+            authored_panorama[4] and
+            authored_panorama[4].get("PanoramaSceneGuid")):
+        area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
+        if area and area[4]:
+            p_cid, _p_lo, _p_hi, _p_started, p_state = authored_panorama
+            p_state = _build_az1_panorama_state(
+                db, p_cid, champ_id, p_state.get("PanoramaSceneGuid"),
+                p_state.get("PanoramaNode"), area[4])
+            db.execute("UPDATE campaigns SET is_started=1,state_json=? WHERE id=?",
+                       (json.dumps(p_state), p_cid))
+            db.commit()
+            resp = _build_input_response(p_cid, p_state, success=True)
+            return _send_response(handler, json.dumps(resp), comp, session_id,
+                                  reqid, target, instance, conh, uid)
+
     # Repair saves created before the post-dungeon report marker was added.
     # Such saves have a completed Crayburn dungeon and an active next journal
     # objective, but the panorama would otherwise be treated as the old quest
@@ -4281,6 +4722,20 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
             db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                        (json.dumps(state), camp_id))
             db.commit()
+        # Rebuild authored AZ1 panoramas from the source AREA state whenever
+        # they are queried. Older handoffs contain only one NPC, use the wrong
+        # campaign group, or leave ALoc pointing at an NPC; all three shapes
+        # prevent the client from showing the full quest/NPC panorama.
+        if state.get("PanoramaSceneGuid"):
+            area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
+            if area and area[4]:
+                repaired = _build_az1_panorama_state(
+                    db, camp_id, champ_id, state.get("PanoramaSceneGuid"),
+                    state.get("PanoramaNode"), area[4])
+                state = repaired
+                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                           (json.dumps(state), camp_id))
+                db.commit()
     if ((ctype or "").upper() == "AREA" and
             str(template_name or "").upper() == "AZ1"):
         before = json.dumps(state, sort_keys=True)
@@ -4371,12 +4826,26 @@ def _handle_getcampsum(handler, db, env_json, comp, session_id,
     summaries = []
     for cid in camp_ids:
         row = db.execute(
-            "SELECT c.camp_uid_lo, c.campaign_type, c.template_name, ch.race "
+            "SELECT c.camp_uid_lo, c.campaign_type, c.template_name, ch.race, "
+            "c.state_json "
             "FROM campaigns c JOIN champions ch ON c.champion_id = ch.id WHERE c.id=?",
             (cid,)
         ).fetchone()
         if row:
-            summaries.append(_build_camp_summary(cid, row[0], row[1] or "DUNGEON", row[2] or "Crayburn Castle", row[3]))
+            panorama_scene = None
+            panorama_node = None
+            if (row[1] or "").upper() == "PANORAMA":
+                try:
+                    panorama_state = json.loads(row[4] or "{}") or {}
+                    panorama_scene = panorama_state.get("PanoramaSceneGuid")
+                    panorama_node = panorama_state.get("PanoramaNode")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    panorama_scene = None
+                    panorama_node = None
+            summaries.append(_build_camp_summary(
+                cid, row[0], row[1] or "DUNGEON",
+                row[2] or "Crayburn Castle", row[3], panorama_scene,
+                panorama_node))
 
     return _send_response(handler, json.dumps(summaries), comp, session_id,
                           reqid, target, instance, conh, uid)
@@ -4431,6 +4900,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
 
     pending_dungeon = None
     pending_area = None
+    pending_panorama = None
     pending_quest_spawns = []
     pending_quest_progress = []
     conversation_applied = _empty_applied_updates()
@@ -4454,6 +4924,75 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             handler, db, camp_id, state, active_conversation)
         pending_quest_progress = _advance_quest_conversation_objectives(
             db, champ_id, active_conversation)
+
+    if (event_name == "conv_done" and
+            (ctype or "").upper() == "PANORAMA" and
+            state.get("PanoramaSceneGuid")):
+        # Authored AREA panorama scenes use the same conversation protocol as
+        # the starter panorama, but do not belong to its tutorial chain.
+        current = state.get("ALoc")
+        current_data = next(
+            ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+             if current in ((loc.get("Data") or {}).get("node"),
+                            (loc.get("Data") or {}).get("name"))),
+            {},
+        )
+        active_conversation = current_data.get("conversationId")
+        conversation_applied = _apply_conversation_rewards(
+            handler, db, camp_id, state, active_conversation)
+        pending_quest_progress = _advance_quest_conversation_objectives(
+            db, champ_id, active_conversation)
+        previous_flags = state.get("Flags")
+        if not isinstance(previous_flags, dict):
+            previous_flags = {}
+        pending_quest_spawns = []
+        if active_conversation:
+            spawned, _hooks = _grant_quests_for_conversation(
+                db, champ_id, str(template_name or "AZ1").upper(),
+                active_conversation)
+            pending_quest_spawns.extend(spawned)
+        if current:
+            if current_data.get("repeatable"):
+                # Panorama repeat/hint and active-quest conversations are
+                # reusable NPC interactions.  They must close without
+                # completing the scene location, otherwise the client hides
+                # the NPC on the next state refresh.
+                current_data["completed"] = False
+                current_data["autostart"] = False
+            else:
+                _mark_location_completed(state, current)
+        state["ALoc"] = None
+        state["CurState"] = "EXPLORE"
+        _sync_az1_quest_gates(db, champ_id, state)
+        # Quest acceptance can change the conversation variant immediately
+        # (for example Ennis start -> Sea Witch not-complete). Rebuild the
+        # panorama from the AREA source so the response keeps the right NPCs
+        # and no stale completed flags from the just-closed conversation.
+        area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
+        if area and area[4]:
+            rebuilt = _build_az1_panorama_state(
+                db, camp_id, champ_id, state.get("PanoramaSceneGuid"),
+                state.get("PanoramaNode"), area[4])
+            rebuilt["Flags"] = previous_flags
+            state = rebuilt
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), camp_id))
+        db.commit()
+        resp = _build_input_response(camp_id, state, success=True,
+                                     applied=conversation_applied)
+        ret = _send_response(handler, json.dumps(resp), comp, session_id,
+                             reqid, target, instance, conh, uid)
+        for quest_state in pending_quest_progress:
+            push_campupdate(
+                handler, db, quest_state.get("CampID") or 0,
+                quest_state.get("ChampID") or champ_id, "quest_progress",
+                "QUEST", False, quest_state, comp, session_id, target,
+                instance, conh, uid)
+        for quest_id, quest_script, quest_state in pending_quest_spawns:
+            push_campspawn(handler, quest_id, champ_id, quest_script,
+                           quest_state, camp_id, "AZ1", comp, session_id,
+                           target, instance, conh, uid)
+        return ret
 
     if event_name == "choice_battle_yes":
         state.setdefault("PublicState", {}).setdefault("Data", {})[
@@ -4483,10 +5022,62 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 new_values.append(path)
         if ((ctype or "").upper() == "AREA" and
                 str(template_name or "").upper() == "AZ1"):
+            recovery_node = _resolve_node(
+                state, state.get("ALoc") or state.get("LastNode") or "")
+            # The client can retry the same travel animation after a
+            # reconnect.  In that case the path is already in
+            # ``visited_paths`` and ``new_values`` is empty, but the retry is
+            # still the signal that the player has reached the destination.
+            # Resolve the complete ordered path list so an already-persisted
+            # path can still finish an AREA -> PANORAMA handoff.
             arrived_node = _az1_activate_direct_path_destination(
-                db, state, new_values, champ_id)
+                db, state, values, champ_id)
+            # If the area save already advanced to a completed panorama node
+            # before the cmpupdate was delivered, the client may only resend
+            # the edge containing that node.  Recover the pending handoff
+            # instead of leaving the player in the map.  A healthy handoff
+            # would already have switched the campaign out of AREA mode, so a
+            # completed authored panorama node is an unambiguous recovery
+            # marker here even when the path resolver sees the opposite edge
+            # direction.
+            current_node = recovery_node
+            current_data = next(
+                ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+                 if (loc.get("Data") or {}).get("node") == current_node),
+                {},
+            )
+            path_mentions_current = any(
+                current_node in {
+                    _resolve_node(state, part)
+                    for part in re.fullmatch(
+                        r"Path_([^_]+)_([^_]+)", str(path or "")
+                    ).groups()
+                }
+                for path in values
+                if re.fullmatch(r"Path_([^_]+)_([^_]+)", str(path or ""))
+            )
+            current_scene = _az1_scene_for_node(db, current_node)
+            if (arrived_node is None and current_data.get("completed") and
+                    path_mentions_current and
+                    current_scene and
+                    "PANORAMA" in str(current_scene[1] or "").upper()):
+                arrived_node = current_node
             if arrived_node:
                 log(f"    Campaign direct path arrival: {arrived_node}")
+                location_data = next(
+                    ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
+                     if (loc.get("Data") or {}).get("node") == arrived_node),
+                    {},
+                )
+                scene = _az1_scene_for_node(db, arrived_node)
+                if (scene and
+                        "PANORAMA" in str(scene[1] or "").upper()):
+                    log(f"    Campaign panorama transition: node={arrived_node} "
+                        f"scene={scene[0]} name={scene[1]}")
+                    pending_panorama = _activate_az1_panorama(
+                        db, champ_id, scene[0], arrived_node, state)
+                    state["ALoc"] = None
+                    state["CurState"] = "EXPLORE"
     elif event_name == "visit_node":
         # UIDungeonZoneViewModel reports the node when the token reaches its
         # destination, immediately before issuing StartLoc.  Synchronize the
@@ -4522,6 +5113,19 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 state["LastNode"] = requested_node
                 _note_visited(state, requested_node)
                 _az1_reveal_neighbors(db, state, requested_node)
+                # A completed panorama node has no StartLoc follow-up: the
+                # client shows the Travel button, moves the token, reports
+                # visit_node, and considers the node finished. Transition at
+                # arrival so the button loads the authored panorama level.
+                scene = _az1_scene_for_node(db, requested_node)
+                if (scene and
+                        "PANORAMA" in str(scene[1] or "").upper()):
+                    log(f"    Campaign panorama transition: node={requested_node} "
+                        f"scene={scene[0]} name={scene[1]}")
+                    pending_panorama = _activate_az1_panorama(
+                        db, champ_id, scene[0], requested_node, state)
+                    state["ALoc"] = None
+                    state["CurState"] = "EXPLORE"
     elif event_name in ("choice_go", "choice_stay"):
         # The authored AZ0 transition conversation is already hosted by the
         # AZ1 panorama.  The choice is recorded for the client conversation
@@ -4532,6 +5136,15 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             state["CurState"] = "EXPLORE"
             if event_name == "choice_go":
                 pending_area = _activate_az1_area(db, champ_id)
+    elif event_name == "return_parent":
+        # UIPanoramaZoneViewModel sends this after the player confirms the
+        # leave prompt. Authored AZ1 panoramas return to the existing AREA
+        # campaign and must push a transition back to the map.
+        if ((ctype or "").upper() == "PANORAMA" and
+                state.get("PanoramaSceneGuid")):
+            pending_area = _activate_az1_area(db, champ_id)
+            state["ALoc"] = None
+            state["CurState"] = "EXPLORE"
     elif event_name == "gaal_camp_accept":
         # Authored Milosh conversations emit this server-script event after
         # the player pays for a reading.  Persist the state marker used by the
@@ -5090,6 +5703,11 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         push_campupdate(handler, db, area_id, champ_id, "feralroot_travel",
                         "AREA", True, area_state, comp, session_id, target,
                         instance, conh, uid)
+    if pending_panorama:
+        panorama_id, panorama_state = pending_panorama
+        push_campupdate(handler, db, panorama_id, champ_id, "area_panorama",
+                        "PANORAMA", True, panorama_state, comp, session_id,
+                        target, instance, conh, uid)
     return ret
 
 
@@ -6961,6 +7579,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
     ract = env_json.get("RAct", 0)  # 0=Start, 1=FinishLoc
     location_name = env_json.get("Loc", "")
     params = env_json.get("Params", [])
+    pending_panorama = None
 
     log = getattr(handler, "_log_req", print)
     action = "StartLoc" if ract == 0 else "FinishLoc"
@@ -7204,7 +7823,29 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                              _az1_node_is_repeatable(db, node)))
                         data["autostart"] = True
                         break
+                # The generic first/repeat selector above is needed for an
+                # ordinary return to a conversation node, but an active quest
+                # objective is authoritative.  Reapply its marker after that
+                # selector so a newly unlocked turn-in (such as Weston) keeps
+                # its authored quest conversation on the first visit.
+                _apply_az1_quest_markers(db, champ_id, state)
                 _az1_reveal_neighbors(db, state, node)
+                # A PANORAMA scene is a campaign handoff, not a battle.  Use
+                # the authored AZ1 node scene as the source of truth rather
+                # than the transient location ``encounter`` field: older
+                # saves and conversation-backed nodes can omit that field.
+                # This also runs when StartLoc is retried on the already
+                # arrived node (LastNode == requested node), which is how the
+                # client resumes an area-to-panorama handoff after reconnect.
+                scene = _az1_scene_for_node(db, node)
+                if (not blocked_encounter and not movement_rejected and
+                        scene and "PANORAMA" in str(scene[1] or "").upper()):
+                    log(f"    Campaign panorama transition: node={node} "
+                        f"scene={scene[0]} name={scene[1]}")
+                    pending_panorama = _activate_az1_panorama(
+                        db, champ_id, scene[0], node, state)
+                    state["ALoc"] = None
+                    state["CurState"] = "EXPLORE"
         state["CurState"] = "EXPLORE"
     else:
         state["CurState"] = "EXPLORE"
@@ -7227,8 +7868,15 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
     db.commit()
 
     resp = _build_input_response(camp_id, state, success=True)
-    return _send_response(handler, json.dumps(resp), comp, session_id,
-                          reqid, target, instance, conh, uid)
+    ret = _send_response(handler, json.dumps(resp), comp, session_id,
+                         reqid, target, instance, conh, uid)
+    if pending_panorama:
+        panorama_id, panorama_state = pending_panorama
+        push_campupdate(
+            handler, db, panorama_id, champ_id, "area_panorama",
+            "PANORAMA", True, panorama_state, comp, session_id,
+            target, instance, conh, uid)
+    return ret
 
 
 def _handle_forfeit(handler, db, env_json, comp, session_id,

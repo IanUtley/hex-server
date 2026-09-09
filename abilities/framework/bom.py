@@ -6,7 +6,6 @@ maps to an executor registered via ``@leaf_register``.
 """
 
 import json
-import inspect
 import struct
 import random
 
@@ -15,9 +14,8 @@ import game_engine
 from ._shared import (_log, next_game_card_uid, owner_uid, pvp_champion_uid,
                       pvp_opponent_pid, state_after_zone_exit)
 from .effects.damage import deal_damage
-from .effects.registry import _LEAFS, leaf_register
-from .effects.tokens import summon_token, conscript_cards, load_player_deck
-from .effects.counters import card_counters
+from .context import EffectContext
+from .effects.registry import _LEAFS, effect, leaf_register
 from .effects import combat as _combat  # register combat effects
 from .effects import choices as _choices  # register card-choice effects
 from .effects import utility as _utility  # register generic client effects
@@ -74,124 +72,20 @@ def _deck_owner_for_target(db, handler, session, bstate, target):
 #  Leaf executors
 # ---------------------------------------------------------------------------
 
-@leaf_register("DrawNCardsAbilityEffectTemplate")
-def _leaf_draw(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Draw for the resolved target (Oracle Song: "Target champion draws 2
-    cards") or the caster when there is no target."""
-    import re as _re
-    # The client calls m_InputValue.GetValue(effectInstance), including when
-    # that value is zero.  Do not use the displayed ability text as the
-    # primary source: dynamic abilities intentionally have no literal number
-    # in their localized text.
-    template = effect_template(effect_guid) or {}
-    count = None
-    if "m_InputValue" in template:
-        count = effect_field(
-            db, bstate, effect_guid, "m_InputValue", default=0)
-    if param:
-        try:
-            d = json.loads(param)
-            if count is None:
-                count = int(d.get("count", 1))
-        except Exception:
-            pass
-    if count is None:
-        # Synthetic leaves may provide their own compact count in the test
-        # adapter; production Records always provide the typed field.
-        count = 1
-        text = _ability_text(db, bstate) or ""
-        m = _re.search(r'draw[s]?\s+(\w+)\s+card', text.lower())
-        if m:
-            g = m.group(1)
-            words = {"one": 1, "two": 2, "three": 3, "four": 4,
-                     "five": 5, "six": 6, "seven": 7, "eight": 8,
-                     "nine": 9, "ten": 10}
-            count = words.get(g, int(g) if g.isdigit() else count)
-    count = max(0, int(count))
-    target = (bstate or {}).get("player_spell_target")
-    owner = None
-    if target is not None:
-        owner = _deck_owner_for_target(db, handler, session, bstate, target)
-    for _ in range(count):
-        if owner == 0:
-            import ai as _ai
-            _ai.ai_draw_card(handler, game, session, ai_t, bstate)
-        else:
-            draw_uid = (pl_t if owner is None
-                        else owner_uid(owner, pl_t, ai_t, bstate))
-            # Older focused harnesses expose the three-argument Practice
-            # helper; the live/PvP handler also accepts the deck owner.  Keep
-            # the leaf independent of that adapter detail.
-            draw_fn = handler._player_draw_card
-            try:
-                accepts_owner = len(inspect.signature(draw_fn).parameters) >= 4
-            except (TypeError, ValueError):
-                accepts_owner = True
-            if accepts_owner:
-                draw_fn(game, session, draw_uid, owner)
-            else:
-                draw_fn(game, session, draw_uid)
-    return f"draw {count} for owner {owner}"
+@effect("DrawNCardsAbilityEffectTemplate")
+def _leaf_draw(effect):
+    """Draw the typed count for the resolved target or caster."""
+    return effect.draw_effect()
 
 
-@leaf_register("PutTopOfDeckIntoHandAbilityEffectTemplate")
-def _leaf_put_top_into_hand(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Put the top card(s) of the target champion's deck into the caster's
-    hand (c3d824ce: "Put the top ESC:1 card of target opposing champion's deck
-    into your hand")."""
-    count = 1
-    ability_guid = (bstate or {}).get("resolving_ability", "")
-    if ability_guid:
-        raw_row = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if raw_row and raw_row[0]:
-            from .statics import _variable_value
-            src = (bstate or {}).get("resolving_source_uid")
-            v = _variable_value(
-                db, session.session_id, bstate, raw_row[0], "amount",
-                (bstate or {}).get("resolving_owner_id", 0),
-                int(src) if src else 0)
-            if v is not None:
-                count = int(v)
-    target = (bstate or {}).get("player_spell_target")
-    deck_owner = None
-    if target is not None:
-        deck_owner = _deck_owner_for_target(db, handler, session, bstate, target)
-    if deck_owner is None:
-        deck_owner = 0
-    moved = 0
-    for _ in range(max(0, count)):
-        rows = db.execute(
-            "SELECT id, card_uid, card_template_id, template_guid FROM game_cards "
-            "WHERE session_id=? AND user_id=? AND location='deck' ORDER BY position LIMIT 1",
-            (session.session_id, deck_owner)).fetchall()
-        if not rows:
-            break
-        row = rows[0]
-        scid = game_engine.SessionCardId(game_engine.UID(row[1]))
-        hand_owner = (int(pl_t.uid64) >> 8
-                      if (bstate or {}).get("pvp")
-                      else handler.user_profile["id"])
-        db.execute(
-            "UPDATE game_cards SET user_id=?, location='hand', position=100 "
-            "WHERE id=?",
-            (hand_owner, row[0]))
-        db.commit()
-        tpl_guid, ct, name, cost, atk, def_, gem = handler._card_full_data(
-            game, scid, row[3], row[2])
-        game.push_card_moved(scid, pl_t, game_engine.ECardCollections.Hand,
-                             game_engine.ECardLocations.Top, 1)
-        game.push_card_drawn(scid, pl_t, 1)
-        game.push_card_updated(scid, pl_t, game_engine.ECardCollections.Hand,
-                               ct, attack=atk, defense=def_, cost=cost,
-                               template_id=tpl_guid, gems=gem)
-        moved += 1
-    return f"put {moved} deck card(s) into hand"
+@effect("PutTopOfDeckIntoHandAbilityEffectTemplate")
+def _leaf_put_top_into_hand(effect):
+    """Put typed-count deck cards into the caster's hand."""
+    return effect.put_top_into_hand()
 
 
-@leaf_register("DiscardCardAbilityEffectTemplate")
-def _leaf_discard(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("DiscardCardAbilityEffectTemplate")
+def _leaf_discard(effect):
     """Discard the card selected by the ability target instance.
 
     ``DiscardCardAbilityEffectTemplate`` is also used for random and
@@ -200,48 +94,24 @@ def _leaf_discard(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, p
     from the ability's display text.  The same path is used for PvP, PvE, and
     champion/talent abilities.
     """
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "discard: no target"
-    row = db.execute(
-        "SELECT template_guid, card_template_id, user_id, location, "
-        "card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    if not row:
-        return f"discard: target {hex(int(target))} not found"
-    # The client discard operation is only meaningful for a card in a card
-    # collection such as hand/choosing.  A stale target must not silently
-    # discard a troop from play.
-    if str(row[3]).lower() not in ("hand", "choosing"):
-        return f"discard: target {hex(int(target))} is in {row[3]}"
-    from ._shared import owner_uid, card_collection_for_location
-    from db import db_discard_card
-    owner_id = db_discard_card(
-        session.session_id, int(target), connection=db,
-        extra_set="card_state=0, card_damage=0, temporary_buffs=?, "
-                   "temporary_attributes=0",
-        extra_params=["{}"])
-    if owner_id is None:
-        return f"discard: target {hex(int(target))} disappeared"
-    scid = game_engine.SessionCardId(game_engine.UID(int(target)))
-    owner = owner_uid(owner_id, pl_t, ai_t, bstate)
-    tpl_guid, ct, name, cost, atk, defense, gem = handler._card_full_data(
-        game, scid, row[0], row[1])
-    game.push_card_discarded(scid, owner)
-    game.push_card_moved(
-        scid, owner, game_engine.ECardCollections.Discard,
-        game_engine.ECardLocations.Top, 0)
-    game.push_card_updated(
-        scid, owner, game_engine.ECardCollections.Discard, ct,
-        template_id=tpl_guid, attack=atk, defense=defense, cost=cost,
-        gems=gem, state=0, nulling=(row[3] == "deck"))
-    return f"discarded {hex(int(target))}"
+    return effect.discard()
 
 
-@leaf_register("RandomizeVariableAbilityEffectTemplate")
-def _leaf_randomize(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    from .cards.replenish_spell_power import replenish_spell_power
-    return replenish_spell_power(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, None)
+@effect("RandomizeVariableEffectTemplate")
+def _leaf_randomize(effect):
+    """Roll the typed random-variable effect into the active builder state."""
+    return effect.randomize_variable()
+
+
+@effect("RandomizeVariableAbilityEffectTemplate")
+def _legacy_randomize(effect):
+    """Retain the historical custom alias for old direct callers."""
+    from abilities.cards.replenish_spell_power import replenish_spell_power
+
+    return replenish_spell_power(
+        effect.game, effect.session, effect.db, effect.handler,
+        effect.player_uid, effect.ai_uid, effect.bstate,
+        effect.effect_guid, None)
 
 
 def _champion_target_uid(handler, bstate, db, session):
@@ -449,20 +319,19 @@ def _apply_resource_property(game, session, db, handler, pl_t, ai_t, bstate,
     return "; ".join(logs)
 
 
-@leaf_register("CardModifierAbilityEffectTemplate")
-def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                          effect_guid, param):
     """CardModifier handles heal, damage, stat changes for champion powers.
 
     Parses the AbilityEffectTemplate name to determine the modifier type
     (e.g. 'Gain5Health' → heal 5 HP, 'M1Atk' → -1 ATK, 'YouLose4Health' → damage 4).
     """
     import re as _re
+    effect_ctx = EffectContext.from_legacy(
+        game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param)
     from .champions import heal_self, damage_self
-    from .stat_mod import apply_card_stat_mod
     from .effects.counters import (
-        add_card_counter, remove_card_counters, counter_name_from_text,
-        is_champion_target,
-        change_champion_counter, push_champion_counter,
+        remove_card_counters, counter_name_from_text, is_champion_target,
     )
     from ._shared import (
         apply_attribute_grant,
@@ -807,71 +676,7 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                     attribute_flags=pm.get("attribute_flags"))
             return f"attribute grant +{bits:b} target={hex(int(target_uid)) if target_uid else 'none'}"
         if pm.get("property") == "damage":
-            if target_uid is None:
-                # Deploy "This deals N damage to you" — the 'You' target
-                # template means the controller's champion, not the source.
-                target_uid = _champion_target_uid(handler, bstate, db, session)
-            if target_uid is None:
-                # "This deals N damage to each opposing champion" — from the
-                # effect's gamedata target template (MultiplePlayers).
-                target_uid = _opposing_champion_uid(handler, bstate, db, session)
-            if target_uid is None:
-                return "damage: no target"
-            import re as _re
-            from .statics import _leaf_numeric_value
-            raw_row = db.execute(
-                "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-                ((bstate or {}).get("resolving_ability", ""),)).fetchone()
-            raw = raw_row[0] if raw_row else ""
-            if not raw:
-                raw = json.dumps(ability_record(
-                    db, (bstate or {}).get("resolving_ability", "")))
-            src_uid = (bstate or {}).get("resolving_source_uid")
-            src_owner = (bstate or {}).get("resolving_owner_id", 0)
-            esc_handled = False
-            # Escalation ("Deal ESC:N damage") takes precedence: N × (1 +
-            # escalation cards cast this game) — e.g. Ragefire deals 2, then 4.
-            # The gamedata variable for the base N must NOT win here, or the
-            # multiplier never applies.
-            m_esc = _re.search(r'esc:(\d+)', (pm.get("text") or "").lower())
-            if m_esc:
-                base = int(m_esc.group(1))
-                uses_key = ("ai_escalation_uses"
-                            if (bstate or {}).get("resolving_owner_id") == 0
-                            else "player_escalation_uses")
-                uses = int((bstate or {}).get(uses_key, 0))
-                amount = base * (uses + 1)
-                # Advance the escalation counter exactly once per resolution:
-                # the sibling "Escalation" TAC leaf (Chronic Madness, Ragefire)
-                # also fires and must not double-count the same cast.
-                if not (bstate or {}).get("_esc_counted_this_resolution"):
-                    (bstate or {})[uses_key] = uses + 1
-                    (bstate or {})["_esc_counted_this_resolution"] = True
-                esc_handled = True
-            elif "x damage" in (pm.get("text") or "").lower():
-                # "Deal X damage" — X was chosen in the client's X-cost dialog
-                # and paid as extra resources when the spell was played.
-                amount = int((bstate or {}).get("x_cost", 0) or 0)
-                esc_handled = True
-            else:
-                amount = _leaf_numeric_value(
-                    db, session.session_id, bstate, pm, raw, src_owner,
-                    int(src_uid) if src_uid else 0, "damage")
-            if not esc_handled and amount <= 0:
-                m_dmg = _re.search(r'deal\s+(\d+)\s+damage',
-                                   (pm.get("text") or "").lower())
-                if m_dmg:
-                    amount = int(m_dmg.group(1))
-            if amount > 0:
-                if not esc_handled and (
-                        "esc:" in (pm.get("text") or "").lower() or
-                        "esc " in (pm.get("text") or "").lower()):
-                    bstate["player_escalation_uses"] = int(
-                        bstate.get("player_escalation_uses", 0)) + 1
-                from .bom import _deal_damage
-                return _deal_damage(game, session, db, handler, pl_t, ai_t,
-                                    bstate, int(target_uid), amount)
-            return "damage: amount 0"
+            return effect_ctx.damage_modifier(pm, typed_modifier)
         if pm.get("property") == "counter":
             cname = ""
             counter_guid = pm.get("counter_template_guid")
@@ -928,58 +733,33 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                 # Keep the same typed GUID identity and event projection as
                 # ordinary card counters.
                 if is_set_counter:
-                    old_n, new_n = change_champion_counter(
-                        bstate, target_uid, counter_guid, amount, "set")
+                    operation_name = "set"
                 elif is_remove_counter:
-                    old_n, new_n = change_champion_counter(
-                        bstate, target_uid, counter_guid, amount, "remove")
+                    operation_name = "remove"
                 elif is_add_counter:
-                    old_n, new_n = change_champion_counter(
-                        bstate, target_uid, counter_guid, amount, "add")
+                    operation_name = "add"
                 elif remove_all:
-                    old_n, new_n = change_champion_counter(
-                        bstate, target_uid, counter_guid, 0, "set")
+                    operation_name = "clear"
                 else:
-                    old_n, new_n = change_champion_counter(
-                        bstate, target_uid, counter_guid, 0, "set")
-                if counter_guid:
-                    push_champion_counter(
-                        game, session, handler, pl_t, ai_t, bstate,
-                        target_uid, counter_guid, old_n, new_n)
+                    operation_name = "clear"
+                old_n, new_n = effect_ctx.counter(
+                    target_uid, cname, counter_guid, amount,
+                    operation_name)
                 op_text = (" set " if is_set_counter else
                            ("-" if is_remove_counter else "+"))
                 return (f"counter {cname}{op_text}{amount} -> {new_n} "
                         f"target={hex(int(target_uid))}")
             if amount > 0 and target_uid and is_remove_counter:
-                old_n = card_counters(db, session.session_id, target_uid).get(cname, 0)
-                remaining = max(0, old_n - amount)
-                remove_card_counters(db, session.session_id, target_uid, cname)
-                if remaining:
-                    add_card_counter(db, session.session_id, target_uid, cname,
-                                     remaining)
-                from .effects.counters import push_card_counters
-                push_card_counters(game, session, db, handler, pl_t, ai_t,
-                                   target_uid, bstate=bstate,
-                                   changed_counter=cname, old_value=old_n)
+                old_n, _new_n = effect_ctx.counter(
+                    target_uid, cname, counter_guid, amount, "remove")
                 return f"counter {cname}-{amount} target={hex(int(target_uid))}"
             if is_set_counter and target_uid:
-                old_n = card_counters(db, session.session_id, target_uid).get(cname, 0)
-                remove_card_counters(db, session.session_id, target_uid, cname)
-                if amount > 0:
-                    add_card_counter(db, session.session_id, target_uid, cname,
-                                     amount)
-                from .effects.counters import push_card_counters
-                push_card_counters(game, session, db, handler, pl_t, ai_t,
-                                   target_uid, bstate=bstate,
-                                   changed_counter=cname, old_value=old_n)
+                old_n, _new_n = effect_ctx.counter(
+                    target_uid, cname, counter_guid, amount, "set")
                 return f"counter {cname} set {amount} target={hex(int(target_uid))}"
             if amount > 0 and target_uid and is_add_counter:
-                old_n = card_counters(db, session.session_id, target_uid).get(cname, 0)
-                n = add_card_counter(db, session.session_id, target_uid, cname, amount)
-                from .effects.counters import push_card_counters
-                push_card_counters(game, session, db, handler, pl_t, ai_t,
-                                   target_uid, bstate=bstate,
-                                   changed_counter=cname, old_value=old_n)
+                old_n, n = effect_ctx.counter(
+                    target_uid, cname, counter_guid, amount, "add")
                 return f"counter {cname}+{amount} -> {n} target={hex(int(target_uid))}"
             if remove_all or (amount <= 0 and target_uid is None) or (
                     "remove all" in low_text and "all your" in low_text):
@@ -1011,61 +791,11 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
                 return (f"removed {cname} counters from {len(cleared)} cards "
                         f"(transform {len(pending)})")
             if target_uid:
-                old_n = card_counters(db, session.session_id, target_uid).get(cname, 0)
-                remove_card_counters(db, session.session_id, target_uid, cname)
-                from .effects.counters import push_card_counters
-                push_card_counters(game, session, db, handler, pl_t, ai_t,
-                                   target_uid, changed_counter=cname,
-                                   old_value=old_n)
+                effect_ctx.counter(
+                    target_uid, cname, counter_guid, 0, "clear")
                 return f"counter {cname} cleared on {hex(int(target_uid))}"
             return f"counter {cname}: no target"
-        this_turn = pm.get("duration") in ("EndOfTurn", "BeginningOfOwnersTurn",
-                                           "AfterCardsReadyOnPlayersTurn")
-        if pm.get("property") == "attack":
-            atk_d, def_d = _numeric("attack"), 0
-        else:
-            atk_d, def_d = 0, _numeric("defense")
-        if atk_d == 0 and def_d == 0 and "equal to this troop's [def]" in (
-                (pm.get("text") or "").lower()):
-            # Dynamic stat: "+[ATK] equal to this troop's [DEF]" (Chimera
-            # Guard Outrider) — the amount comes from the source card's
-            # current defense.
-            src_uid = (bstate or {}).get("resolving_source_uid")
-            if src_uid is not None:
-                srow = db.execute(
-                    "SELECT ct.defense, gc.card_defense_mod FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid = gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.card_uid=?",
-                    (session.session_id, int(src_uid))).fetchone()
-                if srow:
-                    src_def = (srow[0] or 0) + (srow[1] or 0)
-                    if pm.get("property") == "attack":
-                        atk_d, def_d = src_def, 0
-                    else:
-                        atk_d, def_d = 0, src_def
-        if atk_d == 0 and def_d == 0 and "voided troop's" in (
-                (pm.get("text") or "").lower()):
-            # Champion powers that void a troop then summon a token with its
-            # stats ("+[ATK] equal to the voided troop's [ATK] plus 3", e.g.
-            # Bun'jitsu): the buff lands on the created token and the amount
-            # comes from the voided troop's remembered stats.
-            stats = (bstate or {}).get("champion_voided_stats") or {}
-            m_plus = _re.search(r'plus\s+(\d+)',
-                                (pm.get("text") or "").lower())
-            plus = int(m_plus.group(1)) if m_plus else 0
-            if pm.get("property") == "attack":
-                atk_d = int(stats.get("atk", 0) or 0) + plus
-            else:
-                def_d = int(stats.get("def", 0) or 0) + plus
-            created = (bstate or {}).get("created_token_uids") or []
-            if created:
-                target_uid = int(created[0])
-                (bstate or {})["player_mod_target"] = target_uid
-        if target_uid:
-            apply_card_stat_mod(game, session, db, handler, pl_t, ai_t,
-                                int(target_uid), atk_d, def_d, this_turn=this_turn)
-            return f"mod {hex(int(target_uid))} {atk_d:+}/{def_d:+}"
-        return f"stat mod: {pm.get('property')} {atk_d if atk_d else def_d:+}"
+        return effect_ctx.stat_modifier(pm, typed_modifier)
 
     name = db.execute(
         "SELECT effect_type FROM ability_effects WHERE effect_guid=? LIMIT 1",
@@ -1089,7 +819,8 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
     if ability_guid:
         var_row = db.execute(
             "SELECT param FROM ability_effects WHERE ability_guid=? "
-            "AND effect_type='RandomizeVariableAbilityEffectTemplate'",
+            "AND effect_type IN ('RandomizeVariableEffectTemplate', "
+            "'RandomizeVariableAbilityEffectTemplate')",
             (ability_guid,)).fetchone()
         if var_row:
             val = _parse_constant(var_row[0])
@@ -1118,12 +849,17 @@ def _leaf_card_modifier(game, session, db, handler, pl_t, ai_t, bstate, effect_g
         if target_uid:
             atk_d = _parse_stat(game_text, 'ATK')
             def_d = _parse_stat(game_text, 'DEF')
-            apply_card_stat_mod(game, session, db, handler, pl_t, ai_t,
-                               int(target_uid), atk_d, def_d)
+            effect_ctx.stat_mod(int(target_uid), atk_d, def_d)
             return f"mod {hex(int(target_uid))} {atk_d:+}/{def_d:+}"
         return f"stat mod: {game_text}"
     else:
         return f"card modifier: {game_text}"
+
+
+@effect("CardModifierAbilityEffectTemplate")
+def _leaf_card_modifier(effect):
+    """Apply the broad typed modifier operation through ``EffectContext``."""
+    return effect.card_modifier()
 
 
 def _parse_constant(param_str):
@@ -1295,44 +1031,33 @@ def _controller_id_for_target(db, session, handler, bstate, target_uid):
             return int(owner)
     return None
 
-@leaf_register("SummonTokenTroopAbilityEffectTemplate")
-def _leaf_summon(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Compatibility leaf delegating token creation to effects.tokens."""
-    return summon_token(game, session, db, handler, pl_t, ai_t, bstate,
-                        effect_guid, param)
+@effect("SummonTokenTroopAbilityEffectTemplate")
+def _leaf_summon(effect):
+    """Create authored tokens through the context operation boundary."""
+    return effect.summon_token()
 
 
-@leaf_register("ConscriptAbilityEffectTemplate")
-def _leaf_conscript(game, session, db, handler, pl_t, ai_t, bstate,
-                    effect_guid, param):
-    return conscript_cards(game, session, db, handler, pl_t, ai_t, bstate,
-                           effect_guid, param)
+@effect("ConscriptAbilityEffectTemplate")
+def _leaf_conscript(effect):
+    """Create conscripted cards through the context operation boundary."""
+    return effect.conscript()
 
 
-@leaf_register("LoadPlayerDeckAbilityEffectTemplate")
-def _leaf_load_player_deck(game, session, db, handler, pl_t, ai_t, bstate,
-                           effect_guid, param):
-    return load_player_deck(game, session, db, handler, pl_t, ai_t, bstate,
-                            effect_guid, param)
+@effect("LoadPlayerDeckAbilityEffectTemplate")
+def _leaf_load_player_deck(effect):
+    """Load the authored player deck through the context boundary."""
+    return effect.load_player_deck()
 
 
-@leaf_register("ActivateTriggeredAbilityEffectTemplate")
-def _leaf_activate_triggered(game, session, db, handler, pl_t, ai_t, bstate,
-                             effect_guid, param):
-    from .triggers import manually_trigger_abilities
-    keyword = effect_template_value(db, bstate, effect_guid, "m_Keyword", "")
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "activate triggered: no target"
-    result = manually_trigger_abilities(
-        db, handler, game, session, pl_t, ai_t, bstate, int(target), keyword)
-    return (f"activated {keyword} on {hex(int(target))}: {result}"
-            if result else f"activated {keyword}: no matching ability")
+@effect("ActivateTriggeredAbilityEffectTemplate")
+def _leaf_activate_triggered(effect):
+    """Activate a typed keyword trigger through the context boundary."""
+    return effect.activate_triggered()
 
 
 
-@leaf_register("MoveCardToZoneEffectTemplate")
-def _leaf_move_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                               effect_guid, param):
     """Move a card from one zone to another, data-driven from the effect's
     gamedata param (destination/location) — e.g. Eternal Youth's Escalation
     "PutThisIntoYourDeck" (destination Deck), or hand/void/warzone destinations
@@ -1604,257 +1329,80 @@ def _return_voided_cards(game, session, db, handler, pl_t, ai_t, bstate,
         vby[str(int(src_uid))] = []
     return f"returned {returned} voided cards"
 
-@leaf_register("BuryCardAbilityEffectTemplate")
-def _leaf_bury(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Bury (mill) the top N cards of a deck (Chronic Madness: "Bury the top
-    ESC:4 cards of target champion's deck")."""
-    count = 1
-    try:
-        if param:
-            d = json.loads(param)
-            count = d.get("count", 1)
-    except:
-        pass
-    ability_guid = (bstate or {}).get("resolving_ability", "")
-    if ability_guid:
-        raw_row = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if raw_row and raw_row[0]:
-            from .statics import _variable_value
-            src = (bstate or {}).get("resolving_source_uid")
-            v = _variable_value(
-                db, session.session_id, bstate, raw_row[0], "amount",
-                (bstate or {}).get("resolving_owner_id", 0),
-                int(src) if src else 0)
-            if v is not None:
-                count = int(v)
-    # The target champion's deck (or the AI deck when no champion target).
-    deck_owner = None
-    target = (bstate or {}).get("player_spell_target")
-    if target is not None:
-        deck_owner = _deck_owner_for_target(db, handler, session, bstate, target)
-    if deck_owner is None:
-        deck_owner = 0
-    discard_owner = owner_uid(deck_owner, pl_t, ai_t, bstate)
-    total = 0
-    for _ in range(max(0, count)):
-        row = db.execute(
-            "SELECT id, card_uid, template_guid FROM game_cards "
-            "WHERE session_id=? AND user_id=? AND location='deck' "
-            "ORDER BY position LIMIT 1",
-            (session.session_id, deck_owner)).fetchone()
-        if not row:
-            break
-        scid = game_engine.SessionCardId(game_engine.UID(row[1]))
-        from db import db_discard_card
-        db_discard_card(session.session_id, row[1], connection=db)
-        # Face-up in the discard: a bare CardMoved leaves the client's crypt
-        # empty — push a full CardUpdated so the buried card renders (the
-        # DB move alone is invisible, which read as "not burying").
-        _tpl2, ct2, _n2, _c2, atk2, def2, _g2 = handler._card_full_data(
-            game, scid, row[2])
-        game.push_card_updated(scid, discard_owner,
-                               game_engine.ECardCollections.Discard, ct2,
-                               template_id=row[2], attack=atk2, defense=def2)
-        game.push_card_moved(scid, discard_owner, game_engine.ECardCollections.Discard,
-                             game_engine.ECardLocations.Top, 1)
-        total += 1
-        # The buried card entered the crypt — "when a card enters an opposing
-        # crypt" triggers (Incantation of Fear) fire here.
-        from .triggers import resolve_triggers
-        resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
-                         "CardEnteredZoneEvent", int(row[1]),
-                         source_owner_uid=deck_owner,
-                         event_source_collection="deck",
-                         event_destination_collection="discard",
-                         event_previous_state=0)
-    return f"bury {total} cards"
 
-@leaf_register("CounterSpellAbilityEffectTemplate")
-def _leaf_counter_spell(game, session, db, handler, pl_t, ai_t, bstate,
-                        effect_guid, param):
-    """CounterSpell leaf — interrupt a target card on the chain (Countermagic
-    "Interrupt target card").  The resolution engine sets
-    bstate['player_spell_target'] to the chosen CastSpells card; the shared
-    helper moves it to the graveyard so its BOM never resolves."""
-    from .triggers import _resolve_counter_spell
-    return _resolve_counter_spell(db, handler, game, session, pl_t, ai_t,
-                                  bstate, effect_guid, param, "")
+@effect("MoveCardToZoneEffectTemplate")
+def _leaf_move_card(effect):
+    """Move a card through the context zone/event contract."""
+    return effect.move_card_to_zone()
 
-@leaf_register("VoidCardAbilityEffectTemplate")
-def _leaf_void(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Exile (void) a card: move the target to the Void and remember it under
-    the resolving source card so a "when this leaves play, put each card voided
-    by it into play" ability can return it."""
-    import re as _re
-    # The trigger's chosen target (Solitary Exile's Deploy "Void another target
-    # card") is the authoritative target — it must win over the generic
-    # player_spell_target / player_mod_target fields, which can hold STALE
-    # values from an earlier spell or champion-power activation.
-    target_uid = (bstate or {}).get("resolving_target_uid")
-    if target_uid is None:
-        target_uid = ((bstate or {}).get("player_spell_target")
-                      or (bstate or {}).get("player_mod_target"))
-    if target_uid is None:
-        return "void: no target"
-    row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
-    if not row:
-        return "void: target not found"
-    owner = pl_t if row[0] != 0 else ai_t
-    db.execute(
-        "UPDATE game_cards SET location='void', position=0 "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid)))
-    db.commit()
-    scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
-    tpl_row = db.execute(
-        "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
-    tpl_guid = tpl_row[0] if tpl_row else None
-    _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, tpl_guid)
-    game.push_card_moved(scid, owner, game_engine.ECardCollections.Void,
-                         game_engine.ECardLocations.Top, 0)
-    game.push_card_updated(scid, owner, game_engine.ECardCollections.Void, ct,
-                           template_id=tpl_guid, attack=atk, defense=def_)
-    # The card LEFT its zone — fire CardExitedZoneEvent so "when this leaves
-    # play" triggers resolve (e.g. a Solitary Exile that was voided returns the
-    # cards it exiled — the client fires the same event for zone exits).
-    from .triggers import resolve_triggers
-    resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
-                     "CardExitedZoneEvent", int(target_uid),
-                     source_owner_uid=row[0])
-    src_uid = (bstate or {}).get("resolving_source_uid")
-    if src_uid is not None:
-        bstate.setdefault("voided_by", {}).setdefault(str(int(src_uid)), []).append(int(target_uid))
-        # Push the source card's CardUpdated with RelatedCards so the client
-        # draws the voided-card relationship (examine panel / border link).
-        srow = db.execute(
-            "SELECT template_guid, user_id, location FROM game_cards "
-            "WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
-        if srow and srow[2] == "warzone":
-            sscid = game_engine.SessionCardId(game_engine.UID(int(src_uid)))
-            _tpl2, ct2, _n2, _c2, atk2, def2, _g2 = handler._card_full_data(
-                game, sscid, srow[0])
-            sowner = pl_t if (srow[1] or 0) != 0 else ai_t
-            game.push_card_updated(sscid, sowner, game_engine.ECardCollections.Warzone,
-                                   ct2, template_id=srow[0], attack=atk2,
-                                   defense=def2,
-                                   related_cards=[game_engine.SessionCardId(
-                                       game_engine.UID(int(target_uid)))])
-    return f"voided {hex(int(target_uid))}"
 
-@leaf_register("UntapCardAbilityEffectTemplate")
-def _leaf_untap(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("BuryCardAbilityEffectTemplate")
+def _leaf_bury(effect):
+    """Bury the typed number of cards from the resolved deck."""
+    return effect.bury()
+
+@effect("CounterSpellAbilityEffectTemplate")
+def _leaf_counter_spell(effect):
+    """Interrupt a chain card through the shared counter-spell boundary."""
+    return effect.counter_spell()
+
+@effect("VoidCardAbilityEffectTemplate")
+def _leaf_void(effect):
+    """Void the resolved target through the shared zone operation."""
+    return effect.void_card()
+
+@effect("UntapCardAbilityEffectTemplate")
+def _leaf_untap(effect):
     """Ready (untap) the target troop, or every friendly warzone troop for
     "ready each ... you control" effects."""
-    text = _ability_text(db, bstate)
-    target = _resolve_leaf_target(bstate)
+    text = _ability_text(effect.db, effect.bstate)
+    target = effect.resolved_target()
     if target is not None:
         uids = [int(target)]
     elif "each" in (text or "").lower():
-        owner = int((bstate or {}).get("resolving_owner_id", 0))
-        uids = [r[0] for r in db.execute(
+        owner = int((effect.bstate or {}).get("resolving_owner_id", 0))
+        uids = [r[0] for r in effect.db.execute(
             "SELECT card_uid FROM game_cards WHERE session_id=? "
             "AND location='warzone' AND card_type LIKE '%Troop%' AND user_id=?",
-            (session.session_id, owner)).fetchall()]
+            (effect.session.session_id, owner)).fetchall()]
     else:
         return "untap: no target"
     for u in uids:
-        db.execute(
-            "UPDATE game_cards SET card_state = card_state & ~? "
-            "WHERE session_id=? AND card_uid=?",
-            (game_engine.ECardStates.Tapped, session.session_id, u))
-        row = db.execute(
-            "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, u)).fetchone()
-        _push_card_state(game, session, db, handler, pl_t, ai_t, u,
-                         int(row[0]) if row else 0)
-    db.commit()
+        effect.update_card_state(
+            u, remove=game_engine.ECardStates.Tapped, commit=False)
+    effect.db.commit()
     return f"readied {len(uids)}"
 
-@leaf_register("TapCardAbilityEffectTemplate")
-def _leaf_tap(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("TapCardAbilityEffectTemplate")
+def _leaf_tap(effect):
     """Exhaust (tap) the target troop, or every opposing warzone troop for
     "exhaust each opposing troop" effects."""
-    text = _ability_text(db, bstate)
-    target = _resolve_leaf_target(bstate)
+    text = _ability_text(effect.db, effect.bstate)
+    target = effect.resolved_target()
     if target is not None:
         uids = [int(target)]
     elif "each" in (text or "").lower():
-        owner = int((bstate or {}).get("resolving_owner_id", 0))
-        uids = [r[0] for r in db.execute(
+        owner = int((effect.bstate or {}).get("resolving_owner_id", 0))
+        uids = [r[0] for r in effect.db.execute(
             "SELECT card_uid FROM game_cards WHERE session_id=? "
             "AND location='warzone' AND card_type LIKE '%Troop%' AND user_id!=?",
-            (session.session_id, owner)).fetchall()]
+            (effect.session.session_id, owner)).fetchall()]
     else:
         return "tap: no target"
     for u in uids:
-        db.execute(
-            "UPDATE game_cards SET card_state = card_state | ? "
-            "WHERE session_id=? AND card_uid=?",
-            (game_engine.ECardStates.Tapped, session.session_id, u))
-        row = db.execute(
-            "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, u)).fetchone()
-        _push_card_state(game, session, db, handler, pl_t, ai_t, u,
-                         int(row[0]) if row else game_engine.ECardStates.Tapped)
-        owner_row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(u))).fetchone()
-        from .triggers import resolve_triggers
-        resolve_triggers(
-            db, handler, game, session, pl_t, ai_t, bstate,
-            "CardTappedEvent", int(u), owner_row[0] if owner_row else 0)
-    db.commit()
+        effect.update_card_state(
+            u, add=game_engine.ECardStates.Tapped,
+            trigger="CardTappedEvent", commit=False)
+    effect.db.commit()
     return f"tapped {len(uids)}"
 
-@leaf_register("DestroyCardAbilityEffectTemplate")
-def _leaf_destroy(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
-    """Destroy the resolved target (or the source card) — kill to graveyard,
-    firing Deathcry, via the shared kill_troop path."""
-    from .kill_troop import kill_troop
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "destroy: no target"
-    # Champions are session targets, not game_cards rows.  "Destroy you"
-    # effects (such as a card entering its controller's hand after an
-    # opponent's effect) therefore need to end the battle directly rather
-    # than falling through the troop graveyard helper.
-    card_row = db.execute(
-        "SELECT 1 FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    if not card_row:
-        target_owner = _controller_id_for_target(
-            db, session, handler, bstate, int(target))
-        if target_owner is not None:
-            if (bstate or {}).get("pvp"):
-                from services.tournament_game import _pvp_end_game
-                pids = [int(pid) for pid in (bstate.get("pids") or [])]
-                winner = next((pid for pid in pids if pid != target_owner), None)
-                if winner is not None:
-                    _pvp_end_game(session, bstate, winner, int(target_owner),
-                                  "champion destroyed by card effect")
-                    return f"destroyed champion {hex(int(target))}"
-            else:
-                import commands as _cmd
-                winner_uid = pl_t if int(target_owner) == 0 else ai_t
-                loser_uid = ai_t if int(target_owner) == 0 else pl_t
-                _cmd.push_battle_game_end(
-                    handler=handler, session=session,
-                    winners=[winner_uid], losers=[loser_uid])
-                if hasattr(handler, "_campaign_gameend"):
-                    handler._campaign_gameend(session, won=(int(target_owner) == 0))
-                return f"destroyed champion {hex(int(target))}"
-    kill_troop(game, session, db, handler, pl_t, ai_t, int(target),
-               bstate, cause="effect")
-    return f"destroyed {hex(int(target))}"
+@effect("DestroyCardAbilityEffectTemplate")
+def _leaf_destroy(effect):
+    """Destroy the resolved target through the shared death boundary."""
+    return effect.destroy()
 
-@leaf_register("RevealCardsAbilityEffectTemplate")
-def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                         effect_guid, param):
     """Reveal cards described by the effect's target-template metadata."""
     count = 1
     target_kind = ""
@@ -2035,23 +1583,22 @@ def _leaf_reveal(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
             game._push(ev)
     return f"revealed {len(uids)}"
 
-@leaf_register("StoreTargetsAbilityEffectTemplate")
-def _leaf_store_targets(game, session, db, handler, pl_t, ai_t, bstate,
-                        effect_guid, param):
+
+@effect("RevealCardsAbilityEffectTemplate")
+def _leaf_reveal(effect):
+    """Reveal cards through the context prompt/event contract."""
+    return effect.reveal_cards()
+
+
+@effect("StoreTargetsAbilityEffectTemplate")
+def _leaf_store_targets(effect):
     """Remember the resolved target so later effects in the same ability can
     reference it (e.g. "Target that troop. It gets +2/+2")."""
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "store targets: none"
-    ag = (bstate or {}).get("resolving_ability", "")
-    stored = (bstate or {}).setdefault("stored_targets", {})
-    stored.setdefault(ag, []).append(int(target))
-    return f"stored {hex(int(target))}"
+    return effect.store_target()
 
 
-@leaf_register("StoreListAttrAbilityEffectTemplate")
-def _leaf_store_list_attr(game, session, db, handler, pl_t, ai_t, bstate,
-                          effect_guid, param):
+@effect("StoreListAttrAbilityEffectTemplate")
+def _leaf_store_list_attr(effect):
     """Persist one typed TAC list entry for later effects in this ability.
 
     The Python battle state is the server-side equivalent of the client's
@@ -2059,41 +1606,25 @@ def _leaf_store_list_attr(game, session, db, handler, pl_t, ai_t, bstate,
     is enough for shard selectors and list-based EffectFields without
     leaking transient choices into the card instance.
     """
-    template = effect_template(effect_guid) or {}
+    template = effect_template(effect.effect_guid) or {}
     list_name = str(template.get("m_ListAttrName") or "")
     attr_name = str(template.get("m_IntAttrName") or "")
-    if not list_name:
-        return "store list: no list name"
-    ag = (bstate or {}).get("resolving_ability", "")
-    lists = (bstate or {}).setdefault("list_attrs", {}).setdefault(ag, {})
-    if template.get("m_Set"):
-        lists[list_name] = []
-    lists.setdefault(list_name, []).append({
-        "name": attr_name,
-        "value": int(template.get("m_IntAttrValue") or 0),
-        "until_end_of_turn": bool(template.get("m_OnlyUntilEndOfTurn")),
-    })
-    return f"stored {attr_name} in {list_name}"
+    return effect.store_list_attr(
+        list_name, attr_name, int(template.get("m_IntAttrValue") or 0),
+        set_list=bool(template.get("m_Set")),
+        until_end_of_turn=bool(template.get("m_OnlyUntilEndOfTurn")))
 
 
-@leaf_register("RememberKeywordPowersEffectTemplate")
-def _leaf_remember_keyword_powers(game, session, db, handler, pl_t, ai_t,
-                                  bstate, effect_guid, param):
+@effect("StoreNameAbilityEffectTemplate")
+def _leaf_store_name(effect):
+    """Remember the resolved target's card name for later effects."""
+    return effect.store_name()
+
+
+@effect("RememberKeywordPowersEffectTemplate")
+def _leaf_remember_keyword_powers(effect):
     """Remember matching current ability GUIDs for a later GrantAbility leaf."""
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "remember powers: no target"
-    template = effect_template(effect_guid) or {}
-    keyword = template.get("m_Keyword") or ""
-    all_powers = bool(template.get("m_AllPowers"))
-    from .triggers import ability_matches_keyword, _card_ability_guids
-    remembered = (bstate or {}).setdefault("remembered_powers", {}).setdefault(
-        (bstate or {}).get("resolving_ability", ""), [])
-    for ag in _card_ability_guids(db, session.session_id, int(target)):
-        if all_powers or ability_matches_keyword(db, ag, keyword):
-            if ag not in remembered:
-                remembered.append(ag)
-    return f"remembered {len(remembered)} {keyword} power(s)"
+    return effect.remember_keyword_powers()
 
 
 def _card_atk(db, session, uid, bstate=None):
@@ -2112,38 +1643,15 @@ def _deal_damage(game, session, db, handler, pl_t, ai_t, bstate, uid, amount):
 
 
 
-@leaf_register("RevertPermanentModificationsAbilityEffectTemplate")
-def _leaf_revert_mods(game, session, db, handler, pl_t, ai_t, bstate,
-                      effect_guid, param):
+@effect("RevertPermanentModificationsAbilityEffectTemplate")
+def _leaf_revert_mods(effect):
     """Revert the target's permanent modifications: attack/defense/cost mods
     and permanent atk/def buffs (counters are kept)."""
-    import json as _json
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "revert: no target"
-    prow = db.execute(
-        "SELECT permanent_buffs FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    try:
-        data = _json.loads((prow[0] if prow else "{}") or "{}")
-    except Exception:
-        data = {}
-    if "atk" in data:
-        data["atk"] = 0
-    if "def" in data:
-        data["def"] = 0
-    db.execute(
-        "UPDATE game_cards SET card_attack_mod=0, card_defense_mod=0, "
-        "card_cost_mod=0, permanent_buffs=? WHERE session_id=? AND card_uid=?",
-        (_json.dumps(data), session.session_id, int(target)))
-    db.commit()
-    _push_card_state(game, session, db, handler, pl_t, ai_t, int(target),
-                     _state_of(db, session, int(target)))
-    return f"reverted {hex(int(target))}"
+    return effect.revert_modifications()
 
 
-@leaf_register("Battle2CardsAbilityEffectTemplate")
-def _leaf_battle(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+def _battle_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                         effect_guid, param):
     """Battle2Cards: the source (and/or a remembered target) deals its ATK to
     the resolved target.  "battles" -> both deal; "deals damage equal to its
     [ATK]" -> only the source deals."""
@@ -2208,80 +1716,32 @@ def _leaf_battle(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, pa
     return "; ".join(logs)
 
 
-@leaf_register("GiveBonusTurnAbilityEffectTemplate")
-def _leaf_bonus_turn(game, session, db, handler, pl_t, ai_t, bstate,
-                     effect_guid, param):
+@effect("Battle2CardsAbilityEffectTemplate")
+def _leaf_battle(effect):
+    """Resolve a metadata battle through the shared damage contract."""
+    return effect.battle_cards()
+
+
+@effect("GiveBonusTurnAbilityEffectTemplate")
+def _leaf_bonus_turn(effect):
     """Take an additional turn after this one."""
-    owner = int((bstate or {}).get("resolving_owner_id", 0))
-    side = "player" if owner else "ai"
-    bstate["bonus_turn"] = side
-    # PvP consumes the owning player id at the turn boundary.  Keep the
-    # existing side marker for the Practice engine, where player/AI is the
-    # authoritative ownership model.
-    bstate["bonus_turn_pid"] = owner
-    return f"bonus turn queued for {side}"
+    return effect.queue_bonus_turn()
 
 
-@leaf_register("SacrificeCardAbilityEffectTemplate")
-def _leaf_sacrifice(game, session, db, handler, pl_t, ai_t, bstate,
-                    effect_guid, param):
+@effect("SacrificeCardAbilityEffectTemplate")
+def _leaf_sacrifice(effect):
     """Sacrifice the resolved target (or the source card)."""
-    from .kill_troop import kill_troop
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "sacrifice: no target"
-    kill_troop(game, session, db, handler, pl_t, ai_t, int(target),
-               bstate, cause="sacrifice")
-    _record_ability_list_target(db, bstate, int(target))
-    return f"sacrificed {hex(int(target))}"
+    return effect.sacrifice()
 
 
-@leaf_register("TransformSelfAbilityEffectTemplate")
-def _leaf_transform_self(game, session, db, handler, pl_t, ai_t, bstate,
-                         effect_guid, param):
-    """Transform the source into a metadata-linked card template."""
-    from .transform import transform_card
-    source = (bstate or {}).get("resolving_source_uid")
-    if source is None:
-        return "transform self: no source"
-    # TransformSelf is intrinsically anchored to the resolving source.  Do
-    # not reuse a stale player_mod_target/player_spell_target from an earlier
-    # ability; doing so can replace a Plant Garden with the champion template
-    # instead of one of its metadata-linked plant choices.
-    new_tpl = None
-    linked = _linked_template_guids_from_metadata(db, bstate)
-    if linked:
-        # The extracted record does not expose the printed probability as a
-        # structured variable.  Choose among the linked templates rather than
-        # silently selecting the first one every time.
-        new_tpl = random.choice(linked)
-    if not new_tpl:
-        return "transform self: no template"
-    transform_card(handler, game, session, pl_t, ai_t, int(source), new_tpl,
-                   bstate=bstate)
-    return f"transformed self -> {new_tpl[:8]}"
+@effect("TransformSelfAbilityEffectTemplate")
+def _leaf_transform_self(effect):
+    """Transform the source through the metadata context operation."""
+    return effect.transform_self()
 
 
-@leaf_register("StoreNameAbilityEffectTemplate")
-def _leaf_store_name(game, session, db, handler, pl_t, ai_t, bstate,
-                     effect_guid, param):
-    """Remember the resolved target's card name for later effects."""
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "store name: no target"
-    trow = db.execute(
-        "SELECT ct.name FROM game_cards gc JOIN card_templates ct "
-        "ON ct.guid = gc.template_guid WHERE gc.session_id=? AND gc.card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    name = trow[0] if trow else ""
-    ag = (bstate or {}).get("resolving_ability", "")
-    (bstate or {}).setdefault("stored_names", {}).setdefault(ag, []).append(name)
-    return f"stored name '{name}'"
-
-
-@leaf_register("CreateTokenCopyAbilityEffectTemplate")
-def _leaf_create_token_copy(game, session, db, handler, pl_t, ai_t, bstate,
-                            effect_guid, param):
+def _create_token_copy_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                              effect_guid, param):
     """Create a replica of the resolved target troop (into hand per the text
     "put it into your hand", else the warzone)."""
     import re as _re
@@ -2341,42 +1801,20 @@ def _leaf_create_token_copy(game, session, db, handler, pl_t, ai_t, bstate,
     return f"copied {created}x {tpl[:8]} {'to hand' if into_hand else 'to warzone'}"
 
 
-@leaf_register("RevokeAbilityEffectTemplate")
-def _leaf_revoke(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("CreateTokenCopyAbilityEffectTemplate")
+def _leaf_create_token_copy(effect):
+    """Create a metadata-defined token copy through the context boundary."""
+    return effect.create_token_copy()
+
+
+@effect("RevokeAbilityEffectTemplate")
+def _leaf_revoke(effect):
     """Remove a granted ability from the resolved target card."""
-    import json as _json
-    target = _resolve_leaf_target(bstate)
-    if target is None:
-        return "revoke: no target"
-    # RevokeAbilityEffectTemplate stores no parameter for the normal
-    # "This loses this power" form.  The active BOM ability is the power to
-    # remove; an explicit parameter remains supported for generated effects.
-    revoked = (param or (bstate or {}).get("resolving_ability") or "").strip().lower()
-    if not revoked:
-        return "revoke: no ability guid in param"
-    row = db.execute(
-        "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    if not row:
-        return "revoke: target not found"
-    try:
-        ab = _json.loads(row[0] or "[]")
-    except Exception:
-        ab = []
-    if revoked in ab:
-        ab.remove(revoked)
-        db.execute(
-            "UPDATE game_cards SET card_abilities=? WHERE session_id=? AND card_uid=?",
-            (_json.dumps(ab), session.session_id, int(target)))
-        db.commit()
-    _push_card_state(game, session, db, handler, pl_t, ai_t, int(target),
-                     _state_of(db, session, int(target)))
-    return f"revoked {revoked[:8]} from {hex(int(target))}"
+    return effect.revoke_ability()
 
 
-@leaf_register("CreateAndCastSpellAbilityEffectTemplate")
-def _leaf_create_cast_spell(game, session, db, handler, pl_t, ai_t, bstate,
-                            effect_guid, param):
+def _create_and_cast_spell_legacy(game, session, db, handler, pl_t, ai_t,
+                                  bstate, effect_guid, param):
     """Copy the resolved spell and cast it (e.g. Chimes of the Zodiac
     "When you play an action, copy it.")."""
     import json as _json
@@ -2427,35 +1865,20 @@ def _leaf_create_cast_spell(game, session, db, handler, pl_t, ai_t, bstate,
     return f"copied+cast {tpl[:8]}: {logs}"
 
 
-@leaf_register("DestroyCardByDefenseAbilityEffectTemplate")
-def _leaf_destroy_by_defense(game, session, db, handler, pl_t, ai_t, bstate,
-                             effect_guid, param):
-    """Tectonic Break: each warzone troop is destroyed unless it beats its
-    survival roll (10% chance to survive per point of DEF)."""
-    import random as _rnd
-    from .kill_troop import kill_troop
-    rows = db.execute(
-        "SELECT card_uid FROM game_cards WHERE session_id=? "
-        "AND location='warzone' AND card_type LIKE '%Troop%'",
-        (session.session_id,)).fetchall()
-    destroyed = 0
-    for (uid,) in rows:
-        trow = db.execute(
-            "SELECT ct.defense, gc.card_defense_mod FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session.session_id, int(uid))).fetchone()
-        def_ = (trow[0] or 0) + (trow[1] or 0) if trow else 0
-        if _rnd.random() > 0.10 * def_:
-            kill_troop(game, session, db, handler, pl_t, ai_t, int(uid),
-                       bstate, cause="effect")
-            destroyed += 1
-    return f"destroyed {destroyed}/{len(rows)}"
+@effect("CreateAndCastSpellAbilityEffectTemplate")
+def _leaf_create_cast_spell(effect):
+    """Create and cast through the named orchestration boundary."""
+    return effect.create_and_cast_spell()
 
 
-@leaf_register("TransformCardAtRandomAbilityEffectTemplate")
-def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
-                           effect_guid, param):
+@effect("DestroyCardByDefenseAbilityEffectTemplate")
+def _leaf_destroy_by_defense(effect):
+    """Destroy troops through the shared batch-death operation."""
+    return effect.destroy_by_defense()
+
+
+def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
+                                     bstate, effect_guid, param):
     """Transform the target into a random card matching its typed filter.
 
     ``m_Filter`` is the authoritative candidate pool.  Inferring only
@@ -2597,8 +2020,14 @@ def _leaf_transform_random(game, session, db, handler, pl_t, ai_t, bstate,
                    bstate=bstate)
     return f"transformed {hex(int(target))} -> random {new_tpl[:8]}"
 
-@leaf_register("TransformCardAbilityEffectTemplate")
-def _leaf_transform(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("TransformCardAtRandomAbilityEffectTemplate")
+def _leaf_transform_random(effect):
+    """Transform through the authored random-filter operation."""
+    return effect.transform_card_random()
+
+
+def _transform_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                           effect_guid, param):
     """Transform a card into another card."""
     from .transform import transform_card
     import re as _re
@@ -2654,13 +2083,26 @@ def _leaf_transform(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         return f"transformed {hex(int(target_uid))} -> {new_tpl[:8]}"
     return "transform: no target"
 
-@leaf_register("VerdictAbilityEffectTemplate")
-def _leaf_verdict(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("TransformCardAbilityEffectTemplate")
+def _leaf_transform(effect):
+    """Transform through the authored direct-template operation."""
+    return effect.transform_card()
+
+
+def _verdict_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                    effect_guid, param):
     """Apply a verdict effect."""
     return "verdict effect"
 
-@leaf_register("GrantAbilityEffectTemplate")
-def _leaf_grant_ability(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+
+@effect("VerdictAbilityEffectTemplate")
+def _leaf_verdict(effect):
+    """Apply a verdict through the named orchestration boundary."""
+    return effect.verdict()
+
+
+def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                          effect_guid, param):
     """Grant an ability to a card — append the ability GUID to the target
     card's game_cards.card_abilities list and push a CardUpdated."""
     import json as _json
@@ -2778,9 +2220,14 @@ def _leaf_grant_ability(game, session, db, handler, pl_t, ai_t, bstate, effect_g
     return f"granted {len(added)} ability(s) to {hex(int(target_uid))}"
 
 
-@leaf_register("RegisterTriggerAbilityEffectTemplate")
-def _leaf_register_trigger(game, session, db, handler, pl_t, ai_t, bstate,
-                           effect_guid, param):
+@effect("GrantAbilityEffectTemplate")
+def _leaf_grant_ability(effect):
+    """Grant an ability through the named orchestration boundary."""
+    return effect.grant_ability()
+
+
+@effect("RegisterTriggerAbilityEffectTemplate")
+def _leaf_register_trigger(effect):
     """Register a dynamic trigger on a card for this battle instance.
 
     Registered ability templates are kept separately from the card's printed
@@ -2788,21 +2235,11 @@ def _leaf_register_trigger(game, session, db, handler, pl_t, ai_t, bstate,
     data.  The trigger dispatcher consumes this list when its metadata is
     available in the extracted seed.
     """
-    target = _resolve_leaf_target(bstate)
-    template_id = effect_template_value(
-        db, bstate, effect_guid, "m_TriggerAbilityTemplateId", "")
-    if target is None or not template_id:
-        return "register trigger: missing target or template"
-    registered = (bstate or {}).setdefault("registered_triggers", {})
-    values = registered.setdefault(str(int(target)), [])
-    if template_id not in values:
-        values.append(template_id)
-    return f"registered trigger {template_id[:8]} on {hex(int(target))}"
+    return effect.register_trigger()
 
 
-@leaf_register("CopyAbilityEffectTemplate")
-def _leaf_copy_ability(game, session, db, handler, pl_t, ai_t, bstate,
-                       effect_guid, param):
+def _copy_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                         effect_guid, param):
     """Put a copy of the CardActivatedEvent ability back on the chain."""
     original = (bstate or {}).get("card_activated_item")
     if not original or not original.get("ability_guid"):
@@ -2824,6 +2261,12 @@ def _leaf_copy_ability(game, session, db, handler, pl_t, ai_t, bstate,
             game_engine.ResourceId.from_str(str(original["ability_guid"])),
             ability_instance_id=instance_id)
     return f"copied ability {str(original['ability_guid'])[:8]}"
+
+
+@effect("CopyAbilityEffectTemplate")
+def _leaf_copy_ability(effect):
+    """Copy an ability through the named chain orchestration boundary."""
+    return effect.copy_ability()
 
 
 def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
@@ -2902,8 +2345,8 @@ def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
     return f"queued {kind} {card_uid} for free (chain={instance_id})"
 
 
-@leaf_register("PlayCardAbilityEffectTemplate")
-def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                      effect_guid, param):
     """Play a card for free using the effect's gamedata target.
 
     The target template for Chlorophyllia/its nested ability is a random
@@ -3219,25 +2662,46 @@ def _leaf_play_card(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         game, session, db, handler, pl_t, ai_t, bstate,
         int(src_uid), owner_id, tpl_guid, ctype)
 
-@leaf_register("FireEventEffectTemplate")
-def _leaf_fire_event(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+
+@effect("PlayCardAbilityEffectTemplate")
+def _leaf_play_card(effect):
+    """Play a card through the named orchestration boundary."""
+    return effect.play_card()
+
+
+def _fire_event_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                       effect_guid, param):
     """Fire a game event."""
     return "fire event"
 
-@leaf_register("ActivateAbilityEffectTemplate")
-def _leaf_invoke(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+
+@effect("FireEventEffectTemplate")
+def _leaf_fire_event(effect):
+    """Fire an event through the named orchestration boundary."""
+    return effect.fire_event()
+
+
+def _activate_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                             effect_guid, param):
     logs = []
     if param:
         for sub in _walk_bom(db, param):
             fn = _LEAFS.get(sub["effect_type"])
             if fn:
-                logs.append(fn(game, session, db, handler, pl_t, ai_t, bstate,
-                               sub["effect_guid"], sub["param"]))
+                logs.append(fn(EffectContext.from_legacy(
+                    game, session, db, handler, pl_t, ai_t, bstate,
+                    sub["effect_guid"], sub["param"])))
     return "invoke: " + "; ".join(str(l) for l in logs if l)
 
 
-@leaf_register("TACAbilityEffectTemplate")
-def _leaf_tac(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param):
+@effect("ActivateAbilityEffectTemplate")
+def _leaf_invoke(effect):
+    """Activate an ability through the named orchestration boundary."""
+    return effect.activate_ability()
+
+
+def _tac_legacy(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
+                param):
     from .tac import tac_function, tac_guid
 
     if not param:
@@ -3264,6 +2728,12 @@ def _leaf_tac(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param
         (bstate or {})["_esc_counted_this_resolution"] = True
         return f"escalate {side} (uses={bstate[key]})"
     return f"tac: {func or '?'}"
+
+
+@effect("TACAbilityEffectTemplate")
+def _leaf_tac(effect):
+    """Run a TAC operation through the named orchestration boundary."""
+    return effect.tac()
 
 
 def _shift_power(game, session, db, handler, pl_t, ai_t, bstate, ability_guid):

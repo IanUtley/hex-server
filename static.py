@@ -1094,8 +1094,11 @@ QUEST_OBJECTIVE_ENCOUNTER_LINKS = {
 
 CONVERSATION_REWARD_SEEDS = [
     # The Find quests complete at their faction-specific elder conversations;
-    # each race receives its AZ1 base card.
-    *[(guid, json.dumps({"card_guid_by_race": rewards}, sort_keys=True), 1)
+    # each race receives its AZ1 base card and one Howling Plains pack.
+    *[(guid, json.dumps({
+        "card_guid_by_race": rewards,
+        "chest_guid": AZ1_HOWLING_PLAINS_PACK_GUID,
+    }, sort_keys=True), 1)
       for guid, rewards in AZ1_FIND_QUEST_CARD_REWARDS.items()],
     # Cross Zila River completes at Weston's success conversation.  Equipment
     # is inventory data rather than a card template, so it is selected by race
@@ -2061,6 +2064,28 @@ def ensure_schema(db):
                 "WHERE conversation_guid=?",
                 (json.dumps(cross_zila_reward, sort_keys=True),
                  pack_conversation_guid))
+    # Existing databases already contain the race-specific Find quest card
+    # reward.  Merge the newly authored Howling Plains pack into those rows
+    # without replacing the card mapping or changing their claim state.
+    for find_conversation_guid in AZ1_FIND_QUEST_CARD_REWARDS:
+        find_row = db.execute(
+            "SELECT reward_json FROM conversation_rewards "
+            "WHERE conversation_guid=?",
+            (find_conversation_guid,)).fetchone()
+        if not find_row:
+            continue
+        try:
+            find_reward = json.loads(find_row[0] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            find_reward = {}
+        if (isinstance(find_reward, dict)
+                and not find_reward.get("chest_guid")):
+            find_reward["chest_guid"] = AZ1_HOWLING_PLAINS_PACK_GUID
+            db.execute(
+                "UPDATE conversation_rewards SET reward_json=? "
+                "WHERE conversation_guid=?",
+                (json.dumps(find_reward, sort_keys=True),
+                 find_conversation_guid))
     # Node 10's pack belongs to the encounter result now.  Remove the older
     # conversation-reward seed so completing Snoodley's success dialogue
     # cannot award a second pack.

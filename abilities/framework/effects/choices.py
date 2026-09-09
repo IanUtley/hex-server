@@ -16,7 +16,7 @@ import game_engine
 
 from .._shared import next_game_card_uid, owner_uid
 from ..fields import effect_field, effect_template, effect_template_value
-from .registry import leaf_register
+from .registry import effect
 
 
 CHOOSE_AND_PLAY_ABILITY = "7db268ea-c960-68ba-be49-712d760d7ba4"
@@ -147,9 +147,8 @@ def _pending_choice(bstate, owner_id, source_uid, ability_guid,
     }
 
 
-@leaf_register("DoubleChoiceAbilityEffectTemplate")
-def double_choice(game, session, db, handler, pl_t, ai_t, bstate,
-                  effect_guid, param):
+def _double_choice_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                          effect_guid, param):
     """Create a random first choice or the remaining second choice."""
     typed = effect_template(effect_guid) or {}
     second = bool(typed.get("m_SecondChoice"))
@@ -205,6 +204,12 @@ def double_choice(game, session, db, handler, pl_t, ai_t, bstate,
     if callable(prompt):
         prompt(game, session, pl_t, ai_t, bstate, pending)
     return f"double choice: awaiting {len(choice_uids)} choices"
+
+
+@effect("DoubleChoiceAbilityEffectTemplate")
+def double_choice(effect):
+    """Run the prompt/continuation flow through the context boundary."""
+    return effect.double_choice()
 
 
 def play_choice_card(game, session, db, handler, pl_t, ai_t, bstate,

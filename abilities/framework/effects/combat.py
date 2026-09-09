@@ -2,7 +2,7 @@
 
 import game_engine
 
-from .registry import leaf_register
+from .registry import effect
 from ..statics import can_block
 
 
@@ -62,9 +62,8 @@ def _combat_defender_id(handler, bstate, attackers, attacker_uid):
     return None
 
 
-@leaf_register("BlockEffectTemplate")
-def _leaf_block(game, session, db, handler, pl_t, ai_t, bstate,
-                effect_guid, param):
+def _block_legacy(game, session, db, handler, pl_t, ai_t, bstate,
+                  effect_guid, param):
     """Assign the metadata-selected created troop as a combat blocker.
 
     The original client receives the attacking troop as this effect's target
@@ -156,3 +155,9 @@ def _leaf_block(game, session, db, handler, pl_t, ai_t, bstate,
                          "CardWasBlockedEvent", attacker_uid,
                          attacker_owner)
     return f"blocked {hex(attacker_uid)} with {hex(blocker_uid)}"
+
+
+@effect("BlockEffectTemplate")
+def _leaf_block(effect):
+    """Assign a blocker through the named combat orchestration boundary."""
+    return effect.block()

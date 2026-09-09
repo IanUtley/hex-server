@@ -724,6 +724,25 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     return out
 
 
+def legal_targets_for(db, session_id, controller_uid, target, source_uid,
+                      *, both_players=None, champions=None,
+                      battle_state=None):
+    """Evaluate one ``AbilityBuilder`` target through the shared predicate.
+
+    Callers in PvE and PvP used to repeat the same conversion from a typed
+    target object to ``legal_targets`` arguments.  This helper centralizes
+    that boundary while keeping the actual filter evaluator above as the
+    single source of target legality.
+    """
+    template_id = getattr(target, "guid", target)
+    if both_players is None:
+        both_players = target_uses_both_players(db, template_id)
+    return legal_targets(
+        db, session_id, controller_uid, template_id, source_uid,
+        both_players=bool(both_players), champions=champions,
+        battle_state=battle_state)
+
+
 def validate_target_selection(db, session_id, controller_uid, template_id,
                               source_uid, selected, both_players=False,
                               champions=None, battle_state=None):

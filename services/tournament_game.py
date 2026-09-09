@@ -3,7 +3,8 @@
 import random, json, threading, re, time
 
 import game_engine as _ge
-from gamedata import CardPlayCost, DEFAULT_RECORD_STORE, ability_graph
+from battle_engine import persistence_state
+from gamedata import DEFAULT_RECORD_STORE, ability_graph
 from db import _db, log_req
 from pvp_db import (db_game_session_pids, db_game_champion,
                     db_game_deck_cards, db_game_draw_cards, db_game_card_type,
@@ -288,8 +289,11 @@ def pvp_load_state(session):
 
 def pvp_save_state(session, state):
     _pvp_flush_priority_clock(state)
-    session.turn_order = state
-    session._persist()
+    session.turn_order = persistence_state(state)
+    try:
+        session._persist()
+    finally:
+        session.turn_order = state
 
 
 def _pvp_flush_priority_clock(state, now_ns=None):
@@ -1778,9 +1782,9 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
     explicit target template of its non-manual abilities has a legal candidate
     (mirrors PvE _hand_card_playable + _card_target_requirements_met — makes
     Countermagic unplayable with nothing on the chain)."""
-    from gamedata import AbilityInstance, PlayPlan
+    from gamedata import PlayPlan
     from gamedata import ability_graph
-    from abilities.framework.targeting import legal_targets
+    from abilities.framework.builder import AbilityBuilder
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return True
@@ -1798,15 +1802,14 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
                                        owner_id=turn_pid)
     except KeyError:
         return False
-    for cost_spec in play_plan.cost_instances:
-        if cost_spec["auto"]:
-            continue
-        candidates = legal_targets(
-            _db, session.session_id, turn_pid, cost_spec["target_guid"],
-            int(card_uid), both_players=False, champions=champ_targets,
-            battle_state=state)
-        if len(candidates) < int(cost_spec["minimum"]):
-            return False
+    if play_plan.cost_instances:
+        plan_builder = AbilityBuilder.from_play_plan(play_plan)
+        for cost_spec, candidates in plan_builder.card_cost_candidates(
+                _db, session.session_id, turn_pid, int(card_uid),
+                champions=champ_targets, battle_state=state):
+            if not cost_spec["auto"] and len(candidates) < int(
+                    cost_spec["minimum"]):
+                return False
     for ag in (ability_guids or []):
         graph = ability_graph(store, str(ag).lower())
         if graph is None:
@@ -1815,35 +1818,28 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
             return False
         if graph.manual or graph.trigger_event_type:
             continue
-        instance = AbilityInstance.from_graph(graph)
+        instance = next((ability for ability in play_plan.abilities
+                         if ability.ability_guid.lower() == str(ag).lower()),
+                        None)
+        if instance is None:
+            return False
+        builder = AbilityBuilder.from_plan(play_plan, ag)
         for index in instance.referenced_target_indexes:
-            if index >= len(graph.targets):
+            try:
+                target = builder.target(index)
+            except KeyError:
                 continue
-            target = graph.targets[index]
             if not target.requires_input or target.minimum < 1:
                 continue
-            tid = target.guid
-            trow = _db.execute(
-                "SELECT filter_json, target_kind, is_auto_target, "
-                "collection_flags, min_target_count FROM target_templates "
-                "WHERE template_id=?", (tid,)).fetchone()
-            if not trow:
-                continue
-            kind = trow[1] or ""
-            auto = int(trow[2] or 0)
-            if auto:
-                continue
-            if kind == "PlayerTargetTemplate":
-                continue
             try:
-                candidates = legal_targets(
-                    _db, session.session_id, turn_pid, tid, 0,
+                candidates = builder.target_candidates(
+                    _db, session.session_id, turn_pid, target, 0,
                     both_players=True, champions=champ_targets)
             except Exception:
                 continue
             if not candidates:
                 log_req(f"    PvP options: {ct_name} not playable "
-                        f"(target template {tid[:8]} "
+                        f"(target template {target.guid[:8]} "
                         f"has no legal target)")
                 return False
     return True
@@ -2068,7 +2064,7 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     # client's target picker shows candidates — mirrors PvE
     # _champion_ability_targets.  Without this CanUseAbility is false and the
     # button is dead.
-    from abilities.framework.targeting import legal_targets as _lt
+    from abilities.framework.builder import AbilityBuilder
     champ_map = state.get("champ_map") or {}
     champ_targets = []
     for cpid in (state.get("pids") or []):
@@ -2079,25 +2075,20 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
     target_data = {}
     for rid in all_rids:
         ag = str(rid.guid)
-        target_guids = _pvp_ability_target_guids(ag)
-        if not target_guids:
+        graph = ability_graph(_RECORD_STORE, ag.lower())
+        if graph is None:
             continue
+        builder = AbilityBuilder.from_graph(graph, store=_RECORD_STORE)
         entries = []
-        for tid in target_guids:
-            tid = str(tid)
-            trow = _db.execute(
-                "SELECT target_kind, is_auto_target, min_target_count, "
-                "max_target_count FROM target_templates WHERE template_id=?",
-                (tid,)).fetchone()
-            if not trow:
-                continue
-            kind = trow[0] or ""
-            auto = int(trow[1] or 0)
-            if auto or kind == "PlayerTargetTemplate":
+        for target in builder.targets(requires_input=True,
+                                      include_costs=False):
+            tid = target.guid
+            if target.is_auto or target.target_kind == "PlayerTargetTemplate":
                 continue
             try:
-                cands = _lt(_db, session.session_id, pid, tid, int(cu),
-                            both_players=False, champions=champ_targets)
+                cands = builder.target_candidates(
+                    _db, session.session_id, pid, target, int(cu),
+                    both_players=False, champions=champ_targets)
             except Exception:
                 cands = []
             if not cands:
@@ -2107,8 +2098,8 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
                     "SELECT card_uid FROM game_cards WHERE session_id=? "
                     "AND user_id=? AND location='warzone' ORDER BY position",
                     (session.session_id, pid)).fetchall()]
-            entries.append((tid, cands,
-                            int(trow[2] or 1), int(trow[3] or 1)))
+            entries.append((tid, cands, target.minimum or 1,
+                            target.maximum if target.maximum > 0 else 1))
         if entries:
             target_data[ag] = entries
     g.add_champion_to_options(pl_t, champ_scid, afford,
@@ -2241,17 +2232,17 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
         # Card-level target costs use the same CostInstance contract as
         # activated abilities.  Preserve their authored order so the client
         # assigns them into the matching XCostData collection.
-        for cost_spec in plan.cost_instances:
+        try:
+            plan_builder = AbilityBuilder.from_play_plan(plan)
+            cost_candidates = plan_builder.card_cost_candidates(
+                _db, session.session_id, turn_pid, int(card_uid),
+                champions=champ_targets, battle_state=state)
+        except ValueError:
+            cost_candidates = ()
+        for cost_spec, cost_uids in cost_candidates:
             if cost_spec["auto"]:
                 continue
             cost_guid = cost_spec["target_guid"]
-            try:
-                cost_uids = _lt(
-                    _db, session.session_id, turn_pid, cost_guid,
-                    int(card_uid), both_players=False,
-                    champions=champ_targets, battle_state=state)
-            except Exception:
-                cost_uids = []
             if not cost_uids:
                 continue
             minimum = int(cost_spec["minimum"])
@@ -2293,8 +2284,7 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
     exhaust-as-cost, legal targets, ability condition)."""
     import json as _js
     from db import db_card_uses
-    from abilities.framework.targeting import (
-        legal_targets as _lt, target_uses_both_players as _both_players)
+    from abilities.framework.builder import AbilityBuilder
     from abilities.framework.condition_engine import (
         ConditionContext, trigger_condition_met)
     pids = db_game_session_pids(session.session_id)
@@ -2353,6 +2343,8 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
             casting = 64 if graph.casting_behavior == "QuickAction" else 8
             if not graph.manual:
                 continue
+            builder = AbilityBuilder.from_graph(
+                graph, store=_RECORD_STORE)
             cost = graph.costs.activation
             upg = graph.costs.uses_per_game
             upt = graph.costs.uses_per_turn
@@ -2362,30 +2354,27 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
                 ability_source_owner_id=ability_pid)
             if not trigger_condition_met(graph.source.to_dict(), cond_ctx):
                 continue
-            tids = [target.guid for target in graph.targets]
-            if tids:
+            target_refs = builder.targets(include_costs=False)
+            if target_refs:
                 wants_attacking = False
                 has_target = False
                 import battle_engine as _be
-                for tid in tids:
-                    tid = str(tid)
-                    tt = _db.execute(
-                        "SELECT filter_json, target_kind, is_auto_target "
-                        "FROM target_templates WHERE template_id=?",
-                        (tid,)).fetchone()
-                    if tt and tt[0] and "IsAttacking" in tt[0]:
+                for target in target_refs:
+                    target_filter = target.filter
+                    if hasattr(target_filter, "to_dict"):
+                        target_filter = target_filter.to_dict()
+                    if "IsAttacking" in json.dumps(target_filter or {}):
                         wants_attacking = True
-                    kind = (tt[1] if tt else "") or ""
-                    auto = int(tt[2] or 0) if tt else 0
-                    if auto or kind in ("PlayerTargetTemplate",
-                                        "AbilitySourceCardTargetTemplate",
-                                        "AbilityCreatedTargetTemplate"):
+                    if target.is_auto or target.target_kind in (
+                            "PlayerTargetTemplate",
+                            "AbilitySourceCardTargetTemplate",
+                            "AbilityCreatedTargetTemplate"):
                         has_target = True
                         continue
-                    cands = _lt(_db, session.session_id, ability_pid, tid,
-                                int(card_uid),
-                                both_players=_both_players(_db, tid),
-                                champions=champ_targets, battle_state=state)
+                    cands = builder.target_candidates(
+                        _db, session.session_id, ability_pid, target,
+                        int(card_uid), champions=champ_targets,
+                        battle_state=state)
                     if cands:
                         has_target = True
                 if wants_attacking and phase not in _be.COMBAT_STEPS:
@@ -2432,56 +2421,37 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
     return result
 
 
-def _pvp_ability_cost_templates(ability_guid):
-    """Return authored payment targets from the current AbilityTemplate."""
-    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
-    if graph is None:
-        return []
-    return [(guid, CardPlayCost.cost_type(kind))
-            for kind, guid in graph.additional_cost_targets]
-
-
-def _pvp_ability_target_guids(ability_guid):
-    """Return target-template GUIDs from the current AbilityTemplate."""
-    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
-    return [target.guid for target in graph.targets] if graph is not None else []
-
-
 def _pvp_ability_cost_targets(session, state, pid, source_uid,
                               ability_guid, champ_targets):
     """Return legal cost cards, or None when a required cost is unpayable."""
-    from abilities.framework.targeting import legal_targets as _lt
-    costs = _pvp_ability_cost_templates(ability_guid)
+    from abilities.framework.builder import AbilityBuilder
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is None:
+        return None
+    builder = AbilityBuilder.from_graph(graph, store=_RECORD_STORE)
+    costs = builder.cost_targets
     if not costs:
         return []
     out = []
-    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
-    target_store = _RECORD_STORE
-    for tid, cost_type in costs:
-        target_record = target_store.get(
-            "AbilityTargetTemplate", str(tid).lower())
-        target = target_record.target_spec if target_record is not None else None
+    for cost in costs:
+        tid, cost_type = cost.guid, cost.cost_type
+        target = cost.target
         if target is None:
             return None
-        minimum = max(0, int(target.minimum))
-        maximum = int(target.maximum)
-        target_kind = target.target_kind
-        is_auto = bool(target.is_auto)
-        if maximum <= 0:
-            maximum = -1
+        minimum = cost.minimum
+        maximum = cost.maximum
         # Gamedata represents "sacrifice this" as an automatic source-card
         # target.  It is a payment target for the option contract, but the
         # client does not repeat the source UID in the submitted TargetMap.
         # Advertise the source as the sole legal candidate and let activation
         # satisfy this automatic payment without requiring it in the wire
         # transaction.
-        if is_auto and target_kind == "AbilitySourceCardTargetTemplate":
+        if cost.is_source_auto_target:
             out.append((tid, cost_type, [int(source_uid)], minimum, maximum))
             continue
-        candidates = _lt(
-            _db, session.session_id, pid, tid, int(source_uid),
-            both_players=False, champions=champ_targets,
-            battle_state=state)
+        candidates = builder.target_candidates(
+            _db, session.session_id, pid, cost.target, int(source_uid),
+            both_players=False, champions=champ_targets, battle_state=state)
         if len(candidates) < minimum:
             return None
         # Gamedata uses Int32.MaxValue for an open-ended "one or more"
@@ -2497,11 +2467,11 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
                                             ability_guid, selected_uids,
                                             champ_targets):
     """Split a champion activation's payment cards from its effect target."""
-    from abilities.framework.targeting import (
-        legal_targets as _lt, target_uses_both_players)
+    from abilities.framework.builder import AbilityBuilder
     graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
     if graph is None:
         return None
+    builder = AbilityBuilder.from_graph(graph, store=_RECORD_STORE)
     selected_uids = [int(uid) for uid in (selected_uids or [])]
     cost_targets = _pvp_ability_cost_targets(
         session, state, pid, source_uid, ability_guid, champ_targets)
@@ -2509,13 +2479,15 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
         return None
     used = set()
     sacrifices = []
-    for tid, cost_type, candidates, minimum, maximum in cost_targets:
-        target_record = _RECORD_STORE.get(
-            "AbilityTargetTemplate", str(tid).lower())
-        target = target_record.target_spec if target_record is not None else None
-        auto_source = bool(target and not target.requires_input) and \
-            (target.target_kind == "AbilitySourceCardTargetTemplate")
-        available = ([int(source_uid)] if auto_source else
+    for cost in builder.cost_targets:
+        tid, cost_type = cost.guid, cost.cost_type
+        candidates, minimum, maximum = next(
+            ((values, low, high) for cost_id, _wire, values, low, high
+             in cost_targets if str(cost_id).lower() == tid.lower()),
+            (None, cost.minimum, cost.maximum))
+        if candidates is None:
+            return None
+        available = ([int(source_uid)] if cost.is_source_auto_target else
                      [uid for uid in selected_uids
                       if uid in {int(c) for c in candidates}
                       and uid not in used])
@@ -2527,21 +2499,12 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
         if int(cost_type) == 2:
             sacrifices.extend(chosen)
 
-    target_templates = graph.targets
-    cost_ids = {str(tid).lower() for tid, _ctype in
-                _pvp_ability_cost_templates(ability_guid)}
     legal_effects = set()
     explicit_required = False
-    for target in target_templates:
-        tid = str(target.guid).lower()
-        if tid in cost_ids:
-            continue
-        if not target.requires_input:
-            continue
-        explicit_required = explicit_required or int(target.minimum or 0) > 0
-        legal_effects.update(_lt(
-            _db, session.session_id, pid, tid, int(source_uid),
-            both_players=target_uses_both_players(_db, tid),
+    for target in builder.targets(requires_input=True, include_costs=False):
+        explicit_required = explicit_required or target.minimum > 0
+        legal_effects.update(builder.target_candidates(
+            _db, session.session_id, pid, target, int(source_uid),
             champions=champ_targets, battle_state=state))
     effect_selected = [uid for uid in selected_uids
                        if uid not in used and uid in legal_effects]
@@ -2577,8 +2540,7 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
          if isinstance(event, _ge.PlayerOptionListSessionEventArgs)), None)
     if last_ev is None:
         return
-    from abilities.framework.targeting import (
-        legal_targets as _lt, target_uses_both_players as _both_players)
+    from abilities.framework.builder import AbilityBuilder
     champ_map = state.get("champ_map") or {}
     champ_targets = []
     for cpid in (state.get("pids") or []):
@@ -2594,33 +2556,31 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
         for ag in abilities:
             inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
             inst.opt_id = _ge.ResourceId.from_str(ag)
-            tpls = _pvp_ability_target_guids(ag)
-            if tpls:
+            graph = ability_graph(_RECORD_STORE, str(ag).lower())
+            builder = (AbilityBuilder.from_graph(
+                graph, store=_RECORD_STORE) if graph is not None else None)
+            target_refs = (builder.targets(
+                requires_input=True, include_costs=False)
+                           if builder is not None else ())
+            if target_refs:
                 built = []
-                for i, tid in enumerate(tpls):
-                    tid = str(tid)
-                    tt = _db.execute(
-                        "SELECT target_kind, is_auto_target "
-                        "FROM target_templates WHERE template_id=?",
-                        (tid,)).fetchone()
-                    kind = (tt[0] if tt else "") or ""
-                    auto = int(tt[1] or 0) if tt else 0
-                    if auto or kind in ("PlayerTargetTemplate",
-                                        "AbilitySourceCardTargetTemplate",
-                                        "AbilityCreatedTargetTemplate"):
+                for target in target_refs:
+                    i, tid = target.index, target.guid
+                    if target.is_auto or target.target_kind in (
+                            "PlayerTargetTemplate",
+                            "AbilitySourceCardTargetTemplate",
+                            "AbilityCreatedTargetTemplate"):
                         continue
                     built.append(i)
-                    others = _lt(_db, session.session_id, pid, tid,
-                                 int(card_uid),
-                                 both_players=_both_players(_db, tid),
-                                 champions=champ_targets,
-                                 battle_state=state)
+                    others = builder.target_candidates(
+                        _db, session.session_id, pid, target,
+                        int(card_uid), champions=champ_targets,
+                        battle_state=state)
                     if not others:
-                        tt2 = _db.execute(
-                            "SELECT filter_json FROM target_templates "
-                            "WHERE template_id=?", (tid,)).fetchone()
-                        filt = (tt2[0] if tt2 else "") or ""
-                        if filt.strip() in ("", "{}"):
+                        filt = target.filter
+                        if hasattr(filt, "to_dict"):
+                            filt = filt.to_dict()
+                        if not filt:
                             others = [r[0] for r in _db.execute(
                                 "SELECT card_uid FROM game_cards WHERE session_id=? "
                                 "AND user_id=? AND location='warzone' ORDER BY position",
@@ -2958,13 +2918,16 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     exhausted_target_uids = []
     deck_target_uids = []
     sacrifice_target_uids = set()
+    from abilities.framework.builder import AbilityBuilder
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    builder = (AbilityBuilder.from_graph(
+        graph, store=_RECORD_STORE) if graph is not None else None)
     for _tid, _cost_type, candidates, minimum, maximum in cost_targets:
         candidate_set = set(candidates)
-        tt = _db.execute(
-            "SELECT target_kind, is_auto_target FROM target_templates "
-            "WHERE template_id=?", (str(_tid),)).fetchone()
-        auto_source = bool(tt and int(tt[1] or 0)) and \
-            (tt[0] or "") == "AbilitySourceCardTargetTemplate"
+        cost_ref = next(
+            (cost for cost in (builder.cost_targets if builder else ())
+             if cost.guid.lower() == str(_tid).lower()), None)
+        auto_source = bool(cost_ref and cost_ref.is_source_auto_target)
         available = ([int(source_uid)] if auto_source else
                      [uid for uid in selected_uids
                       if int(uid) in candidate_set
@@ -2973,7 +2936,7 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
             log_req(f"    PvP troop ability {ability_guid[:8]}: selected "
                     "payment is incomplete — rejected")
             return True
-        selected = available[:maximum]
+        selected = (available if maximum < 0 else available[:maximum])
         cost_target_uids.extend(selected)
         if int(_cost_type) == 32:  # metadata m_PutIntoDeckTarget
             deck_target_uids.extend(selected)
@@ -2986,28 +2949,22 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     # not consider source/auto target templates here; those are resolved by
     # the BOM from the source card and must not consume the payment target.
     target_uid = None
-    from abilities.framework.targeting import legal_targets as _legal_targets
-    target_templates = _pvp_ability_target_guids(ability_guid)
+    target_refs = (builder.targets(include_costs=False)
+                   if builder is not None else ())
     legal_effect_targets = set()
-    for tid in target_templates:
-        tt = _db.execute(
-            "SELECT target_kind, is_auto_target FROM target_templates "
-            "WHERE template_id=?", (str(tid),)).fetchone()
-        kind = (tt[0] if tt else "") or ""
-        auto = int(tt[1] or 0) if tt else 0
-        if auto or kind in ("PlayerTargetTemplate",
-                            "AbilitySourceCardTargetTemplate",
-                            "AbilityCreatedTargetTemplate"):
+    for target in target_refs:
+        if target.is_auto or target.target_kind in (
+                "PlayerTargetTemplate", "AbilitySourceCardTargetTemplate",
+                "AbilityCreatedTargetTemplate"):
             continue
-        legal_effect_targets.update(_legal_targets(
-            _db, session.session_id, my_pid, str(tid), int(source_uid),
-            both_players=True, champions=champ_targets,
-            battle_state=state))
+        legal_effect_targets.update(builder.target_candidates(
+            _db, session.session_id, my_pid, target, int(source_uid),
+            both_players=True, champions=champ_targets, battle_state=state))
     for uid in selected_uids:
         if int(uid) not in cost_target_uids and int(uid) in legal_effect_targets:
             target_uid = int(uid)
             break
-    if target_uid is None and selected_uids and target_templates:
+    if target_uid is None and selected_uids and target_refs:
         log_req(f"    PvP troop ability {ability_guid[:8]}: no legal "
                 "effect target selected — rejected")
         return True
@@ -3115,11 +3072,12 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
         log_req(f"    PvP troop ability {ability_guid[:8]}: put "
                 f"{hex(move_uid)} into deck (pos {pos})")
     try:
-        from abilities import resolve_effect as _re_eff
-        fn = _re_eff(ability_guid)
-        if fn:
-            fn(g, session, _db, handler, my_uid, opp_uid, view,
-               ability_guid, None)
+        from abilities import EffectContext, resolve_ability_context
+        resolve_ability_context(
+            EffectContext.from_legacy(
+                g, session, _db, handler, my_uid, opp_uid, view,
+                ability_guid, ""),
+            ability_guid, source_uid=int(source_uid), owner_id=my_pid)
     except Exception as e:
         import traceback
         log_req(f"    PvP troop ability resolve error: {e}")
@@ -5536,7 +5494,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
         ag = str(item.get("ability_guid") or "")
         if ag:
             try:
-                from abilities import resolve_effect as _re_eff
+                from abilities import EffectContext, resolve_ability_context
                 view["player_mod_target"] = item.get("target_uid")
                 view["player_spell_target"] = item.get("target_uid")
                 view["resolving_ability"] = ag
@@ -5545,12 +5503,10 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
                 ability_event_start = len(g.events)
                 ability_player_health_before = int(view.get("player_health", 20))
                 ability_ai_health_before = int(view.get("ai_health", 20))
-                fn = _re_eff(ag)
-                if fn:
-                    fn(g, session, _db, handler, pl_t, ai_t, view, ag, None)
-                else:
-                    log_req(f"    PvP chain ability {ag[:8]}: "
-                            f"no BOM resolver, skipped")
+                resolve_ability_context(
+                    EffectContext.from_legacy(
+                        g, session, _db, handler, pl_t, ai_t, view, ag, ""),
+                    ag, source_uid=src_uid, owner_id=owner_id)
                 ability_player_health_after = int(
                     view.get("player_health", ability_player_health_before))
                 ability_ai_health_after = int(
@@ -6235,19 +6191,20 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes):
 def _pvp_select_card_play_costs(handler, session, state, plan, source_uid,
                                 pid, selected_uids, champions):
     """Bind the client TargetMap to the card's authored cost targets."""
-    from abilities.framework.targeting import legal_targets
+    from abilities.framework.builder import AbilityBuilder
 
     selected_uids = [int(uid) for uid in (selected_uids or [])]
     used = set()
     selections = []
-    for spec in plan.cost_instances:
+    if not plan.cost_instances:
+        return selections, used
+    builder = AbilityBuilder.from_play_plan(plan)
+    for spec, candidates in builder.card_cost_candidates(
+            _db, session.session_id, pid, int(source_uid),
+            champions=champions, battle_state=state):
         if spec["auto"]:
-            selections.append((spec, (int(source_uid),)))
+            selections.append((spec, candidates))
             continue
-        candidates = legal_targets(
-            _db, session.session_id, pid, spec["target_guid"],
-            int(source_uid), both_players=False, champions=champions,
-            battle_state=state)
         candidate_set = {int(uid) for uid in candidates}
         available = [uid for uid in selected_uids
                      if uid in candidate_set and uid not in used]

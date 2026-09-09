@@ -2593,9 +2593,11 @@ def ai_use_warzone_ability(handler, game, session, ai_t, pl_t, battle_state,
             game2 = handler._fresh_game(session, pl_t, ai_t, bstate)
             if discard_required:
                 ai_discard_card(handler, game2, session, pl_t, ai_t)
-            fn = _ability_mod.resolve_effect(ag)
-            if fn:
-                fn(game2, session, _db, handler, pl_t, ai_t, bstate, ag, None)
+            from abilities import EffectContext, resolve_ability_context
+            resolve_ability_context(
+                EffectContext.from_legacy(
+                    game2, session, _db, handler, pl_t, ai_t, bstate, ag, ""),
+                ag, source_uid=int(uid), owner_id=0)
             handler._remove_one_shot_ability(
                 session, int(uid), ag, game2, pl_t, ai_t, bstate)
             # State-based effects are checked after every resolved ability,

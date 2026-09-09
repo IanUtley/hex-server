@@ -9,6 +9,7 @@ To add a custom card ability, create a file in ``abilities/cards/`` and use
 
 from abilities import (
     resolve_effect,
+    resolve_ability_context,
     resolve_played_spell,
     discover_abilities,
     kill_troop,

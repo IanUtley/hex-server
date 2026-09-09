@@ -7,7 +7,9 @@ New card abilities (`abilities/cards/`) import from here as needed.
 
 | File | Purpose |
 |------|---------|
-| `bom.py` | BOM (bill-of-materials) walking + built-in leaf executors. The `_LEAFS` dict maps `AbilityEffectTemplate` class names to executor functions. Register new leaves with `@leaf_register`. |
+| `bom.py` | BOM (bill-of-materials) walking + built-in leaf executors. The `_LEAFS` dict maps `AbilityEffectTemplate` class names to executor functions. All current production leaves use `@effect`; retain `@leaf_register` only as a compatibility API for future compatibility-heavy leaves. |
+| `builder.py` | Metadata-backed `AbilityBuilder`, `TargetRef`, `CostRef`, and `EffectRef` views over `AbilityGraph`/`AbilityInstance`, including typed values and effect conditions/continuations; no parallel card-rules source. |
+| `context.py` | `EffectContext` adapter for typed values, targets, ownership, counters, stats, damage, draws, and client event/persistence operations. |
 | `resolution.py` | Shared target, condition, variable, and effect-resolution helpers used by the BOM path. |
 | `effects/` | Operation-specific effect implementations and leaf registry, including damage, token, search, counter, and utility effects. |
 | `tac.py` | TAC v2 binary decoder. `tac_guid(b64)` extracts the ability GUID from a serialized TAC. `tac_function(b64)` extracts the operation key (e.g. `"ShiftAbility"`). |
@@ -21,7 +23,19 @@ New card abilities (`abilities/cards/`) import from here as needed.
 
 ## Adding a new BOM leaf executor
 
-In `bom.py`, decorate a function with `@leaf_register("EffectTemplateClassName")`:
+For a simple effect, use the context adapter:
+
+```python
+from abilities import effect
+
+@effect("MyNewEffectTemplate")
+def my_new_effect(effect):
+    return effect.damage(effect.target(), effect.value("m_InputValue"))
+```
+
+The adapter preserves the old resolver ABI while giving the implementation a
+single context. For an effect that still needs the full compatibility surface,
+`@leaf_register` remains available:
 
 ```python
 @leaf_register("MyNewEffectTemplate")
@@ -30,4 +44,4 @@ def _leaf_my_new_effect(game, session, db, handler, pl_t, ai_t, bstate, effect_g
     return "log message"
 ```
 
-The function signature must match `(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param) -> str`.
+The legacy function signature must match `(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param) -> str`.

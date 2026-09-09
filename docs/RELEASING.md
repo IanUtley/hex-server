@@ -3,12 +3,12 @@
 This project uses a `VERSION` file for the current source release and a
 `v<version>` Git tag to publish a matching container image.
 
-## 0.1.0 release procedure
+## 0.2.0 release procedure
 
 Run the checks from a clean or intentionally reviewed worktree:
 
 ```bash
-test "$(tr -d '\n' < VERSION)" = "0.1.0"
+test "$(tr -d '\n' < VERSION)" = "0.2.0"
 python3 -m py_compile commands.py hconnect_server.py abilities/__init__.py
 python3 tests/verify_goldens.py
 python3 tests/tests_conditions.py
@@ -35,21 +35,21 @@ rewrite before a public first push if sensitive state has ever been committed.
 Create and publish the release tag after the release commit has been reviewed:
 
 ```bash
-git tag -a v0.1.0 -m "Release 0.1.0"
+git tag -a v0.2.0 -m "Release 0.2.0"
 git push origin master
-git push origin v0.1.0
+git push origin v0.2.0
 ```
 
 The GitHub Actions workflow runs the protocol golden checks and publishes the
 Docker image to:
 
 ```text
-ghcr.io/ianutley/hex-server:0.1.0
+ghcr.io/ianutley/hex-server:0.2.0
 ```
 
-The tag is deliberately `v0.1.0` for Git release conventions; the workflow's
+The tag is deliberately `v0.2.0` for Git release conventions; the workflow's
 semver metadata emits the container tag without the `v` prefix. It also emits
-`v0.1.0`, a commit-SHA tag, and `latest` for default-branch builds.
+`v0.2.0`, a commit-SHA tag, and `latest` for default-branch builds.
 
 ## Container deployment
 

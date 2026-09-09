@@ -137,7 +137,7 @@ logs and database state.
 | `battle_engine.py` | turn phases, priority, auto-pass, chain state, and phase persistence |
 | `game_session.py` | session lifecycle and DB-backed session state |
 | `ai.py` | AI turn, card-choice, and combat decisions |
-| `abilities/` | metadata-driven ability parsing, targeting, conditions, and effect leaves |
+| `abilities/` | metadata-driven ability parsing, targeting, conditions, effect leaves, and the shared `EffectContext`/`AbilityBuilder` adapters |
 | `ability.py` | compatibility facade for the `abilities/` package |
 | `campaign.py` | campaign protocol and authored campaign state; campaign SQL migration into `pve_db` remains work in progress |
 | `gamemodes/` | mode-specific orchestration (PVP, FRA, tournament) |
@@ -165,6 +165,14 @@ handler is extracted. New service types belong in the registry and a service
 module; do not grow another dispatch dictionary in `hconnect_server.py`.
 Several older extracted handlers still contain direct SQL; that is migration
 debt covered by the same rule in the database section below.
+
+Ability leaves have a compatibility boundary while the framework is being
+refactored. Existing leaves may keep the historical positional ABI, but new
+simple leaves should use `abilities.framework.context.EffectContext` through
+the `@effect` decorator. `AbilityBuilder` must wrap the authoritative
+`AbilityGraph`/`AbilityInstance` and reuse its costs, target templates, typed
+fields, ordering, conditions, and continuation behavior; it must not introduce
+a parallel card-rules source.
 
 ## 5. Database contract
 

@@ -111,8 +111,28 @@ docker run --rm `
   -v "${ClientData}:/client-data:ro" `
   -e HEX_DB_PATH='/hex/state/hconnect.db' `
   -e HEX_GAMEDATA='/client-data/gamedata' `
-  ghcr.io/ianutley/hex-server:latest
+  ghcr.io/ianutley/hex-server:0.2.0
 ```
+
+```bash
+HEX_STATE=$HOME/HexServer
+CLIENT_DATA='location of Hex Client Data directory'
+
+mkdir -p $HEX_STATE
+chmod 666 $HEX_STATE
+
+docker run --rm `
+  -p 9933:9933 -p 8081:8081 `
+  -v "${HEX_STATE}:/hex/state" `
+  -v "${CLIENT_DATA}:/client-data:ro" `
+  -e HEX_DB_PATH='/hex/state/hconnect.db' `
+  -e HEX_GAMEDATA='/client-data/gamedata' `
+  ghcr.io/ianutley/hex-server:0.2.0
+```
+
+You can try using the `latest` tag to be on the bleeding edge. But you may
+need to occasionally rebuild the database (and lose all progress). You can to this
+by stopping the docker container, and deleting the files in the $HEX_STATE folder
 
 After starting the container, configure the Hex client to connect to the
 computer running the server.

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import campaign
+from campaign_fixtures import seed_campaign_fixtures
 
 
 SRC = os.environ.get(
@@ -36,6 +37,7 @@ def cloned_db():
         source.backup(db)
     finally:
         source.close()
+    seed_campaign_fixtures(db)
     return db, path
 
 
@@ -46,6 +48,24 @@ def area_state(db, champion_id=6):
         "ORDER BY id DESC LIMIT 1", (champion_id,)).fetchone()
     assert raw, "the metadata database needs an AZ1 area campaign fixture"
     return raw[0], json.loads(raw[1])
+
+
+def dungeon_fixture(db, champion_id=7):
+    """Create a disposable Crayburn dungeon row and return its campaign ID."""
+    camp_id = campaign._new_camp_id(db)
+    state = campaign._build_initial_gameplay_state(
+        camp_id, champion_id, "DUNGEON", "Shin'hare")
+    db.execute(
+        "INSERT INTO campaigns "
+        "(id,camp_uid_lo,camp_uid_hi,champion_id,user_id,champion_name,"
+        "template_name,campaign_type,is_started,state_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (camp_id, campaign._generate_inst_id(), 0, champion_id, 1,
+         "test-shinhare", "Crayburn Castle", "DUNGEON", 1,
+         json.dumps(state)),
+    )
+    db.commit()
+    return camp_id
 
 
 def test_cross_zila_objective_is_linked_to_savage_lord():
@@ -537,6 +557,113 @@ def test_az1_conv_done_recomputes_repeatable_node_paths():
         os.unlink(path)
 
 
+def test_cross_zila_turnin_refreshes_bridge_path_and_weston_conversation():
+    """A Winston turn-in must immediately open and activate Weston."""
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    original_push_campspawn = campaign.push_campspawn
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
+            "AND template_name='az01_q_cross_the_river'", (6,))
+        db.commit()
+        assert campaign._ensure_quest_campaign(
+            db, 6, "AREA", "az01_q_cross_the_river")
+        area_id, state = area_state(db)
+        state["LastNode"] = "Node012"
+        state["ALoc"] = "Bridge over the Zila - East"
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.update({
+            "visited_nodes": ["Node012"],
+            "visited_paths": [],
+            "blocked_nodes": [],
+            "unlocked_nodes": ["Node015"],
+            "quest_reveal_nodes": ["Node013", "Node014"],
+            "quest_hidden_nodes": [],
+            "failed_nodes": [],
+            "conversation_visits": {"Node012": 1},
+        })
+        locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in state["VisLocs"]
+        }
+        locations["Node012"].update({
+            "type": "Convo", "completed": False, "repeatable": True,
+            "autostart": True, "conversationId":
+            "ca7be3ef-66e8-4b08-bad2-9e1f36751573",
+            "visible": True, "enabled": True,
+        })
+        locations["Node015"].update({
+            "type": "Convo", "completed": False, "visible": True,
+            "enabled": True,
+        })
+
+        # Put Cross the River at its Winston turn-in objective (Step 2).
+        state["ActiveEncounterGuid"] = SAVAGE_LORD
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+        assert campaign._advance_quest_encounter_objectives(
+            db, 6, SAVAGE_LORD)
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=6, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        campaign._send_response = lambda *args, **kwargs: None
+        campaign.push_campupdate = lambda *args, **kwargs: None
+        campaign.push_campspawn = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        after = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        after_data = after["PublicState"]["Data"]
+        after_locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in after["VisLocs"]
+        }
+        _quest_id, quest_state = campaign._quest_state_row(
+            db, 6, "az01_q_cross_the_river")
+        assert quest_state["Flags"]["_quest_objective_idx"] == 2
+        assert "Path_Node012_Node015" not in after_data["locked_paths"]
+        assert after_locations["Node015"]["visible"] is True
+        assert after_locations["Node015"]["enabled"] is True
+        assert after_locations["Node015"]["conversationId"] == \
+            "5e5ec1cd-c869-43e8-82d4-417021954440"
+        assert after_locations["Node015"]["turninquest"] is True
+
+        # Entering the newly opened destination must preserve the active
+        # quest conversation instead of replacing it with Weston Step 1b.
+        campaign._handle_locaction(
+            handler, db,
+            {"CampID": area_id, "RAct": 0,
+             "Loc": "Bridge over the Zila - West", "Params": []},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        entered = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        entered_weston = next(
+            item["Data"] for item in entered["VisLocs"]
+            if item["Data"].get("node") == "Node015")
+        assert entered_weston["conversationId"] == \
+            "5e5ec1cd-c869-43e8-82d4-417021954440"
+        assert entered_weston["turninquest"] is True
+        assert entered_weston["autostart"] is True
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        campaign.push_campspawn = original_push_campspawn
+        db.close()
+        os.unlink(path)
+
+
 def test_savage_lord_advances_cross_zila_and_node_rewards_are_authored():
     db, path = cloned_db()
     try:
@@ -591,10 +718,12 @@ def test_savage_lord_advances_cross_zila_and_node_rewards_are_authored():
         )
         conversation_rewards = dict(db.execute(
             "SELECT conversation_guid, reward_json FROM conversation_rewards "
-            "WHERE conversation_guid IN (?, ?, ?)",
+            "WHERE conversation_guid IN (?, ?, ?, ?, ?)",
             ("5e5ec1cd-c869-43e8-82d4-417021954440",
              "08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",
-             "4000c850-c1f7-45e4-b254-3cb1b0e9bf2b"),
+             "4000c850-c1f7-45e4-b254-3cb1b0e9bf2b",
+             "02977c4c-803a-465d-ae0c-b5896c3d4012",
+             "880690b0-0c54-4ab8-a4e2-911b8bf14f64"),
         ).fetchall())
         assert json.loads(
             conversation_rewards["5e5ec1cd-c869-43e8-82d4-417021954440"]
@@ -602,6 +731,12 @@ def test_savage_lord_advances_cross_zila_and_node_rewards_are_authored():
         assert json.loads(
             conversation_rewards["08b9b8ab-2100-4f8d-87b0-18369eb4ecb4"]
         )["chest_guid"] == HOWLING_PLAINS_PACK
+        for find_guid in (
+            "02977c4c-803a-465d-ae0c-b5896c3d4012",
+            "880690b0-0c54-4ab8-a4e2-911b8bf14f64",
+        ):
+            assert json.loads(conversation_rewards[find_guid])["chest_guid"] \
+                == HOWLING_PLAINS_PACK
         assert json.loads(
             conversation_rewards["4000c850-c1f7-45e4-b254-3cb1b0e9bf2b"]
         ) == {}
@@ -745,13 +880,464 @@ def test_az1_opening_uses_the_underworld_route_and_fog_gates():
         os.unlink(path)
 
 
+def test_az1_panorama_scene_transitions_out_of_area_on_startloc():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA', 'QUEST') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, state = campaign._activate_az1_area(db, 4)
+
+        # Put the player at the authored predecessor and expose Node017 as a
+        # reachable destination, matching the map state immediately before
+        # the client sends StartLoc for Cave-In.
+        for loc in state["VisLocs"]:
+            data = loc["Data"]
+            if data.get("node") in {"Node016", "Node017"}:
+                data.update({"visible": True, "enabled": True})
+            if data.get("node") == "Node016":
+                data["completed"] = True
+        state.update({"LastNode": "Node016", "ALoc": None})
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=4, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_locaction(
+            handler, db,
+            {"CampID": area_id, "RAct": 0,
+             "Loc": "Cave-In", "Params": []},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        area_state = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        assert area_state["ALoc"] is None
+
+        panorama_push = next(
+            args for args in pushes if args[4] == "area_panorama")
+        panorama_id, panorama_state = panorama_push[2], panorama_push[7]
+        assert panorama_push[5] == "PANORAMA"
+        assert panorama_push[6] is True
+        assert panorama_state["PanoramaSceneGuid"] == \
+            "c99b4f8d-e24d-4896-9342-6ac2562a2364"
+        assert panorama_state["PublicState"]["Data"]["CampaignGroup"] == "AREA"
+        assert panorama_state["PublicState"]["Data"]["HideQuickNavigation"] is False
+        panorama_npcs = {
+            item["Data"]["name"] for item in panorama_state["VisLocs"]
+        }
+        assert {"Ennis", "Takumi"}.issubset(panorama_npcs)
+        assert not ({"Fahrny", "Myaa", "Vincent", "Wyatt", "Rizzix"}
+                    & panorama_npcs)
+        assert panorama_state["ALoc"] is None
+        ennis = next(
+            item["Data"] for item in panorama_state["VisLocs"]
+            if item["Data"]["name"] == "Ennis")
+        assert ennis["conversationId"] == \
+            "4210aef3-52b5-40a1-a29a-b2e866579dcf"
+        assert db.execute(
+            "SELECT campaign_type FROM campaigns WHERE id=?",
+            (panorama_id,)).fetchone()[0] == "PANORAMA"
+        summary = campaign._build_camp_summary(
+            panorama_id, 0, "PANORAMA", "AZ1", 6,
+            panorama_state["PanoramaSceneGuid"], panorama_state["PanoramaNode"])
+        assert summary["TypeInfo"]["AssetBundle"] == \
+            "adventurezone01/p_dwrf_cavein"
+        assert summary["TypeInfo"]["LevelPrefab"] == "p_dwrf_cavein"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_panorama_uses_authored_repeat_hint_when_taming_is_in_progress():
+    db, path = cloned_db()
+    try:
+        row = db.execute(
+            "SELECT id, state_json FROM campaigns "
+            "WHERE champion_id=7 AND campaign_type='AREA' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        assert row
+        panorama = campaign._build_az1_panorama_state(
+            db, 14, 7,
+            "c99b4f8d-e24d-4896-9342-6ac2562a2364", "Node017",
+            json.loads(row[1]))
+        locations = {
+            item["Data"]["name"]: item["Data"]
+            for item in panorama["VisLocs"]
+        }
+        assert locations["Takumi"]["conversationId"] == \
+            "5b385410-6ca5-41ca-b4bb-63efc8f0a57d"
+        assert locations["Takumi"]["turninquest"] is False
+        assert locations["Takumi"]["repeatable"] is True
+        assert locations["Ennis"]["conversationId"] == \
+            "4210aef3-52b5-40a1-a29a-b2e866579dcf"
+
+        campaign._ensure_quest_campaign(db, 6, "AREA", "az01_tamed")
+        mesa = campaign._build_az1_panorama_state(
+            db, 15, 6,
+            "11e30dc4-542e-45a9-8b9d-2fddc48700b9", "Node034",
+            json.loads(row[1]))
+        mesa_locations = {
+            item["Data"]["name"]: item["Data"]
+            for item in mesa["VisLocs"]
+        }
+        assert mesa_locations["Belarius"]["conversationId"] == \
+            "b8f1b954-1461-4374-b41a-77401f0a4eb6"
+        assert mesa_locations["Kian"]["conversationId"] == \
+            "aae342a7-3840-4b59-9291-6720ca9bc782"
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_panorama_conversations_stay_visible_and_grant_new_quests():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campspawn = campaign.push_campspawn
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name IN ('az01_tamed', 'az01_uw_find_cave_in', "
+            "'q_seawitch'))", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(db, 4, "AREA", "az01_tamed")
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, area_state = campaign._activate_az1_area(db, 4)
+        panorama_id, panorama_state = campaign._activate_az1_panorama(
+            db, 4, "c99b4f8d-e24d-4896-9342-6ac2562a2364", "Node017",
+            area_state)
+
+        # Closing the authored repeat/hint conversation must not make the
+        # client hide Takumi.
+        panorama_state["ALoc"] = "Takumi"
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(panorama_state), panorama_id))
+        db.commit()
+        campaign._send_response = lambda *args, **kwargs: None
+        campaign.push_campspawn = lambda *args, **kwargs: None
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": panorama_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        after_takumi = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (panorama_id,)
+        ).fetchone()[0])
+        takumi = next(
+            item["Data"] for item in after_takumi["VisLocs"]
+            if item["Data"].get("name") == "Takumi")
+        assert takumi["completed"] is False
+        assert takumi["repeatable"] is True
+
+        # Ennis is an explicit quest-start row. Closing it must create the
+        # quest and immediately replace the start conversation with its
+        # not-complete conversation instead of hiding the NPC.
+        after_takumi["ALoc"] = "Ennis"
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(after_takumi), panorama_id))
+        db.commit()
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": panorama_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        _quest_id, sea_state = campaign._quest_state_row(db, 4, "q_seawitch")
+        assert sea_state is not None
+        after_ennis = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (panorama_id,)
+        ).fetchone()[0])
+        ennis = next(
+            item["Data"] for item in after_ennis["VisLocs"]
+            if item["Data"].get("name") == "Ennis")
+        assert ennis["completed"] is False
+        assert ennis["repeatable"] is True
+        assert ennis["conversationId"] == \
+            "a2eeb695-1ae8-49ce-b57a-3b7198a1ef92"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campspawn = original_push_campspawn
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_panorama_handoff_retries_on_arrived_node_without_encounter_field():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, state = campaign._activate_az1_area(db, 4)
+        for loc in state["VisLocs"]:
+            data = loc["Data"]
+            if data.get("node") == "Node017":
+                data.update({
+                    "visible": True,
+                    "enabled": True,
+                    "completed": True,
+                    "encounter": None,
+                })
+        state.update({"LastNode": "Node017", "ALoc": None})
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=4, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_locaction(
+            handler, db,
+            {"CampID": area_id, "RAct": 0,
+             "Loc": "Cave-In", "Params": []},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        panorama_push = next(
+            args for args in pushes if args[4] == "area_panorama")
+        assert panorama_push[5] == "PANORAMA"
+        assert panorama_push[6] is True
+        assert panorama_push[7]["PanoramaSceneGuid"] == \
+            "c99b4f8d-e24d-4896-9342-6ac2562a2364"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_ambling_mesa_uses_its_authored_panorama_asset():
+    assert campaign._az1_panorama_assets("Node034", 6) == (
+        "adventurezone01/p_cytl_amblingmesa", "p_cytl_amblingmesa")
+
+
+def test_az1_panorama_return_parent_resumes_area_progress():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, area_state = campaign._activate_az1_area(db, 4)
+        area_state["LastNode"] = "Node016"
+        area_state["ALoc"] = None
+        area_state["PublicState"]["Data"].update({
+            "visited_nodes": ["Node001", "Node016"],
+            "visited_paths": ["Path_Node015_Node016"],
+        })
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(area_state), area_id))
+        db.commit()
+        panorama_id, _panorama_state = campaign._activate_az1_panorama(
+            db, 4, "c99b4f8d-e24d-4896-9342-6ac2562a2364", "Node017",
+            area_state)
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": panorama_id, "Event": "return_parent",
+             "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        area_push = next(
+            args for args in pushes if args[4] == "feralroot_travel")
+        assert area_push[5] == "AREA"
+        assert area_push[6] is True
+        assert area_push[7]["LastNode"] == "Node016"
+        assert area_push[7]["PublicState"]["Data"]["visited_paths"] == \
+            ["Path_Node015_Node016"]
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_travel_button_transitions_completed_cave_in_on_visit_node():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, state = campaign._activate_az1_area(db, 4)
+        for loc in state["VisLocs"]:
+            data = loc["Data"]
+            if data.get("node") in {"Node016", "Node017"}:
+                data.update({"visible": True, "enabled": True})
+            if data.get("node") in {"Node016", "Node017"}:
+                data["completed"] = True
+        state.update({"LastNode": "Node016", "ALoc": None})
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=4, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "visit_node",
+             "OParms": ["Node017"]},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        panorama_push = next(
+            args for args in pushes if args[4] == "area_panorama")
+        assert panorama_push[5] == "PANORAMA"
+        assert panorama_push[6] is True
+        assert panorama_push[7]["PanoramaNode"] == "Node017"
+        assert panorama_push[7]["PanoramaSceneGuid"] == \
+            "c99b4f8d-e24d-4896-9342-6ac2562a2364"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_multi_edge_travel_path_transitions_completed_cave_in():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, state = campaign._activate_az1_area(db, 4)
+        for loc in state["VisLocs"]:
+            data = loc["Data"]
+            if data.get("node") in {"Node015", "Node016", "Node017"}:
+                data.update({"visible": True, "enabled": True})
+            if data.get("node") == "Node017":
+                data["completed"] = True
+        state.update({"LastNode": "Node015", "ALoc": None})
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=4, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "visit_path",
+             "OParms": [["Path_Node015_Node016",
+                         "Path_Node016_Node017"]]},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        panorama_push = next(
+            args for args in pushes if args[4] == "area_panorama")
+        assert panorama_push[7]["PanoramaNode"] == "Node017"
+        assert panorama_push[7]["PanoramaSceneGuid"] == \
+            "c99b4f8d-e24d-4896-9342-6ac2562a2364"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
+def test_az1_repeated_path_from_cave_in_does_not_reopen_panorama():
+    db, path = cloned_db()
+    original_send_response = campaign._send_response
+    original_push_campupdate = campaign.push_campupdate
+    try:
+        db.execute(
+            "DELETE FROM campaigns WHERE champion_id=? AND "
+            "(campaign_type IN ('AREA', 'PANORAMA') OR "
+            "template_name='az01_uw_find_cave_in')", (4,))
+        db.commit()
+        campaign._ensure_quest_campaign(
+            db, 4, "AREA", "az01_uw_find_cave_in")
+        area_id, state = campaign._activate_az1_area(db, 4)
+        for loc in state["VisLocs"]:
+            data = loc["Data"]
+            if data.get("node") in {"Node016", "Node017"}:
+                data.update({
+                    "visible": True, "enabled": True, "completed": True,
+                })
+        state.update({"LastNode": "Node017", "ALoc": "Cave-In"})
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        pdata.setdefault("visited_paths", []).append("Path_Node016_Node017")
+        campaign._hydrate_az1_area_scene_metadata(
+            db, state["VisLocs"], champ_id=4, state=state)
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        pushes = []
+        campaign._send_response = lambda *args, **kwargs: "response"
+        campaign.push_campupdate = lambda *args, **kwargs: pushes.append(args)
+        handler = SimpleNamespace(_log_req=lambda *_args: None)
+        campaign._handle_sendevent(
+            handler, db,
+            {"CampID": area_id, "Event": "visit_path",
+             "OParms": [["Path_Node016_Node017"]]},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        assert not any(args[4] == "area_panorama" for args in pushes)
+        after = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])
+        assert after["LastNode"] == "Node016"
+    finally:
+        campaign._send_response = original_send_response
+        campaign.push_campupdate = original_push_campupdate
+        db.close()
+        os.unlink(path)
+
+
 def test_crayburn_defeat_conversation_keeps_encounter_retryable():
     db, path = cloned_db()
     original_send_response = campaign._send_response
     original_push_campupdate = campaign.push_campupdate
     try:
+        camp_id = dungeon_fixture(db)
         state = campaign._build_initial_gameplay_state(
-            15, 7, "DUNGEON", "Shin'hare")
+            camp_id, 7, "DUNGEON", "Shin'hare")
         state.update({
             "Started": "2026-09-07T00:00:00Z",
             "ALoc": "TowerGate",
@@ -772,7 +1358,7 @@ def test_crayburn_defeat_conversation_keeps_encounter_retryable():
             "autostart": True,
         })
         db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), 15))
+                   (json.dumps(state), camp_id))
         db.commit()
 
         # This handler path normally writes a protocol response and pushes a
@@ -781,12 +1367,13 @@ def test_crayburn_defeat_conversation_keeps_encounter_retryable():
         campaign._send_response = lambda *args, **kwargs: None
         campaign.push_campupdate = lambda *args, **kwargs: None
         handler = SimpleNamespace(_log_req=lambda *_args: None)
-        event = {"CampID": 15, "Event": "conv_done", "OParms": None}
+        event = {"CampID": camp_id, "Event": "conv_done", "OParms": None}
         campaign._handle_sendevent(
             handler, db, event, 0, "", 0, "ServiceCampaign", "253", 0, 0)
 
         raw = db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0]
+            "SELECT state_json FROM campaigns WHERE id=?",
+            (camp_id,)).fetchone()[0]
         after = json.loads(raw)
         locations = {
             item["Data"].get("node"): item["Data"]
@@ -808,7 +1395,8 @@ def test_crayburn_defeat_conversation_keeps_encounter_retryable():
         campaign._handle_sendevent(
             handler, db, event, 0, "", 0, "ServiceCampaign", "253", 0, 0)
         raw = db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0]
+            "SELECT state_json FROM campaigns WHERE id=?",
+            (camp_id,)).fetchone()[0]
         duplicate = json.loads(raw)
         locations = {
             item["Data"].get("node"): item["Data"]
@@ -828,8 +1416,9 @@ def test_crayburn_locked_future_node_does_not_replace_tower_gate_start():
     original_send_response = campaign._send_response
     original_launch_encounter = campaign._launch_encounter
     try:
+        camp_id = dungeon_fixture(db)
         state = campaign._build_initial_gameplay_state(
-            15, 7, "DUNGEON", "Shin'hare")
+            camp_id, 7, "DUNGEON", "Shin'hare")
         state.update({
             "Started": "2026-09-07T00:00:00Z",
             "ALoc": "",
@@ -843,17 +1432,18 @@ def test_crayburn_locked_future_node_does_not_replace_tower_gate_start():
             if item["Data"].get("node") == "PenworthTower")
         penworth.update({"visible": True, "enabled": True})
         db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), 15))
+                   (json.dumps(state), camp_id))
         db.commit()
 
         campaign._send_response = lambda *args, **kwargs: None
         handler = SimpleNamespace(_log_req=lambda *_args: None)
         campaign._handle_locaction(
             handler, db,
-            {"CampID": 15, "RAct": 0, "Loc": "PenworthTower"},
+            {"CampID": camp_id, "RAct": 0, "Loc": "PenworthTower"},
             0, "", 0, "ServiceCampaign", "253", 0, 0)
         after_reject = json.loads(db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0])
+            "SELECT state_json FROM campaigns WHERE id=?",
+            (camp_id,)).fetchone()[0])
         locations = {
             item["Data"].get("node"): item["Data"]
             for item in after_reject["VisLocs"]
@@ -867,17 +1457,18 @@ def test_crayburn_locked_future_node_does_not_replace_tower_gate_start():
         # encounter is the one launched by the subsequent start event.
         campaign._handle_locaction(
             handler, db,
-            {"CampID": 15, "RAct": 0, "Loc": "TowerGate"},
+            {"CampID": camp_id, "RAct": 0, "Loc": "TowerGate"},
             0, "", 0, "ServiceCampaign", "253", 0, 0)
         active = json.loads(db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (15,)).fetchone()[0])
+            "SELECT state_json FROM campaigns WHERE id=?",
+            (camp_id,)).fetchone()[0])
         assert active["ALoc"] == "TowerGate"
 
         launched = []
         campaign._launch_encounter = lambda *args, **kwargs: launched.append(args[4])
         campaign._handle_sendevent(
             handler, db,
-            {"CampID": 15, "Event": "start", "OParms": None},
+            {"CampID": camp_id, "Event": "start", "OParms": None},
             0, "", 0, "ServiceCampaign", "253", 0, 0)
         assert launched == ["c5cbbc95-a4ba-461e-9d42-1c592f120b1a"]
     finally:
@@ -899,11 +1490,20 @@ if __name__ == "__main__":
         test_az1_direct_node00r_route_is_not_replaced_by_fork_path,
         test_az1_alternate_reveal_does_not_unlock_incomplete_path,
         test_az1_conv_done_recomputes_repeatable_node_paths,
+        test_cross_zila_turnin_refreshes_bridge_path_and_weston_conversation,
         test_savage_lord_advances_cross_zila_and_node_rewards_are_authored,
         test_corrupt_dryad_encounter_grants_pack_and_faction_equipment,
         test_az1_scene_lookup_keeps_authored_node_variants_distinct,
         test_az1_objectives_use_faction_specific_conversations,
         test_az1_opening_uses_the_underworld_route_and_fog_gates,
+        test_az1_panorama_scene_transitions_out_of_area_on_startloc,
+        test_az1_panorama_uses_authored_repeat_hint_when_taming_is_in_progress,
+        test_az1_panorama_conversations_stay_visible_and_grant_new_quests,
+        test_az1_panorama_handoff_retries_on_arrived_node_without_encounter_field,
+        test_az1_panorama_return_parent_resumes_area_progress,
+        test_az1_travel_button_transitions_completed_cave_in_on_visit_node,
+        test_az1_multi_edge_travel_path_transitions_completed_cave_in,
+        test_az1_repeated_path_from_cave_in_does_not_reopen_panorama,
         test_crayburn_defeat_conversation_keeps_encounter_retryable,
         test_crayburn_locked_future_node_does_not_replace_tower_gate_start,
     ]

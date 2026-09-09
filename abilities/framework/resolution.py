@@ -33,8 +33,10 @@ from .fields import (ability_variables, effect_template,
 from .targeting import (legal_targets, evaluate_card_filter,
                          validate_target_selection)
 from ._shared import pvp_champion_uid, pvp_opponent_pid
+from .builder import AbilityBuilder
+from .context import EffectContext
 from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
-from gamedata.play_plan import AbilityInstance, ActivationData
+from gamedata.play_plan import ActivationData
 
 
 _RECORD_STORE = DEFAULT_RECORD_STORE
@@ -409,14 +411,13 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     activation = incoming_activation or ActivationData.from_values(
         target_map=target_map, variables=supplied_variables)
     if graph is not None:
-        ability_instance = AbilityInstance.from_graph(
+        ability_builder = AbilityBuilder.from_graph(
             graph, source_uid=source_uid, owner_id=owner_id,
-            responsible_player_id=owner_id, activation=activation,
-            store=_RECORD_STORE)
+            activation=activation, store=_RECORD_STORE)
     else:
         # Explicit test adapters only; live resolution never reaches this
         # branch because the current Records graph is required.
-        ability_instance = AbilityInstance.from_runtime(
+        ability_builder = AbilityBuilder.from_runtime(
             ability_guid, effect_rows, len(tids), source_uid=source_uid,
             owner_id=owner_id, activation=activation)
     target_map = dict(activation.target_map)
@@ -440,6 +441,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     prev_source = bstate.get("resolving_source_uid")
     prev_effect = bstate.get("resolving_effect_guid")
     prev_effect_order = bstate.get("resolving_effect_order")
+    prev_ability_builder = bstate.get("_ability_builder")
     previous_target_map = bstate.get("ability_target_map")
     prev_grant_target = bstate.get("grant_target")
     prev_skip_transform = bstate.get("_skip_transform")
@@ -451,6 +453,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     bstate["session_id"] = session.session_id
     bstate["resolving_owner_id"] = owner_id if owner_id is not None else 0
     bstate["resolving_source_uid"] = source_uid
+    bstate["_ability_builder"] = ability_builder
     bstate["_ability_damage_dealt"] = 0
     previous_variables = bstate.get("ability_variables")
     bstate["ability_variables"] = variables
@@ -459,7 +462,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     # Group the effect list by m_EffectGroupId, preserving effect order.
     groups = {}
     order = []
-    for eff in ability_instance.ordered_effects:
+    for eff in ability_builder.effects:
         gid = eff["effect_group_id"]
         if gid not in groups:
             groups[gid] = []
@@ -467,8 +470,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         groups[gid].append(eff)
 
     def _target_at(index):
-        if graph is not None and 0 <= index < len(ability_instance.targets):
-            return _target_template_from_spec(ability_instance.targets[index])
+        if graph is not None and 0 <= index < len(ability_builder.instance.targets):
+            return _target_template_from_spec(ability_builder.target(index).spec)
         return _target_template(
             db, tids[index] if 0 <= index < len(tids) else "")
 
@@ -1085,8 +1088,9 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                         # granted trigger survives a zone transfer such as
                         # Reginald moving into the opponent's deck.
                         bstate["grant_target"] = target_uid
-                logs.append(fn(game, session, db, handler, pl_t, ai_t, bstate,
-                               eff["effect_guid"], eff["param"]))
+                logs.append(fn(EffectContext.from_legacy(
+                    game, session, db, handler, pl_t, ai_t, bstate,
+                    eff["effect_guid"], eff["param"])))
             if previous_secondary_uid is None:
                 bstate.pop("resolving_secondary_target_uid", None)
             else:
@@ -1121,6 +1125,10 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         bstate.pop("resolving_effect_order", None)
     else:
         bstate["resolving_effect_order"] = prev_effect_order
+    if prev_ability_builder is None:
+        bstate.pop("_ability_builder", None)
+    else:
+        bstate["_ability_builder"] = prev_ability_builder
     if previous_target_map is None:
         bstate.pop("ability_target_map", None)
     else:

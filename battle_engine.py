@@ -119,6 +119,25 @@ OPP_DEFAULT_STOPS = {
     game_engine.ETurnPhases.DeclareDefensePriorityWindow,
 }
 
+# Runtime ability resolution attaches the active metadata builder to the
+# in-memory battle state so nested effects can reuse it.  It is deliberately
+# not part of the JSON session contract: the builder contains graph/store
+# objects and must be reconstructed when a later transaction resumes.
+_RUNTIME_STATE_KEYS = frozenset({"_ability_builder"})
+
+
+def persistence_state(state):
+    """Return the JSON-safe view of a live battle state.
+
+    Resolution may persist from inside an effect (for example, while drawing
+    a card).  Keep runtime-only objects in the live dict, but omit them from
+    the session snapshot written to ``turn_order_json``.
+    """
+    if not isinstance(state, dict):
+        return state
+    return {key: value for key, value in state.items()
+            if key not in _RUNTIME_STATE_KEYS}
+
 
 def build_turn_phases(state):
     """The per-turn phase list: combat phases only when the CURRENT turn player
@@ -188,8 +207,12 @@ def load_state(session):
 
 def save_state(session, state):
     """Persist battle state into the session's turn_order_json column."""
-    session.turn_order = state
-    session._persist()
+    session.turn_order = persistence_state(state)
+    try:
+        session._persist()
+    finally:
+        # The active resolver still needs its builder after a nested save.
+        session.turn_order = state
 
 
 # --- Chain / stack ----------------------------------------------------------

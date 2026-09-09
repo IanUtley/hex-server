@@ -35,6 +35,9 @@ Adding a new card ability::
 
 from .framework.bom import (_LEAFS, _walk_bom, leaf_register, bom_has_leaf,
                             bom_has_discard, bom_leaf_prompt_data)
+from .framework.builder import AbilityBuilder, CostRef, EffectRef, TargetRef
+from .framework.context import EffectContext
+from .framework.effects.registry import effect
 from .framework.tac import decode_tac, tac_guid, tac_function
 from .framework.conditions import register_condition, evaluate_condition, apply_pregame_abilities
 from .framework.kill_troop import kill_troop, state_based_deaths
@@ -87,6 +90,39 @@ def resolve_effect(ability_guid):
     if ability_graph(_RECORD_STORE, str(ability_guid).lower()) is None:
         return None
     return _bom_effect
+
+
+def resolve_ability_context(context, ability_guid=None, source_uid=None,
+                            owner_id=None, target_map=None, variables=None,
+                            activation_data=None):
+    """Resolve one ability from an :class:`EffectContext`.
+
+    Metadata-backed abilities go directly to the authoritative builder-based
+    resolver.  A registered custom ability is the only remaining compatibility
+    case; it is invoked here with its historical callable ABI so callers do
+    not need to know about that implementation detail.
+    """
+    from .framework.resolution import resolve_ability
+
+    ability_guid = str(ability_guid or context.ability_guid or
+                       context.effect_guid or "")
+    if not ability_guid:
+        return ""
+    source_uid = (context.bstate.get("resolving_source_uid")
+                  if source_uid is None else source_uid)
+    owner_id = (context.bstate.get("resolving_owner_id", 0)
+                if owner_id is None else owner_id)
+    custom = lookup(ability_guid)
+    if custom:
+        return custom(
+            context.game, context.session, context.db, context.handler,
+            context.player_uid, context.ai_uid, context.bstate,
+            ability_guid, source_uid)
+    return resolve_ability(
+        context.handler, context.game, context.session, context.db,
+        context.player_uid, context.ai_uid, context.bstate, ability_guid,
+        source_uid, owner_id, target_map or {}, variables=variables,
+        activation_data=activation_data)
 
 
 def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,

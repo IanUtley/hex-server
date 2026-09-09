@@ -325,8 +325,9 @@ unknown `_t` values as "needs a new leaf executor".
   (EffectField). Sibling: `PutTopOfDeckIntoHandAbilityEffectTemplate`.
 - **`RandomizeVariableEffectTemplate`** (75) — roll a value into a variable.
   Fields: `m_MinValue`, `m_MaxValue`, `m_MaxValueField` (EffectField), `m_SecondValue`.
-  (Our `bom.py` registers this as `RandomizeVariableAbilityEffectTemplate`, a
-  stale name — see §14.)
+  The authoritative name is registered directly; the older
+  `RandomizeVariableAbilityEffectTemplate` spelling remains only as a legacy
+  direct-call alias (see §14).
 - **`StoreTargetsAbilityEffectTemplate`** (102) — remember targets for later
   (e.g. "this turn, that troop …"). Fields: `m_TargetIndex`, `m_OnlyUntilEndOfTurn`, `m_SetTargets`.
 - **`BuryCardAbilityEffectTemplate`** (61) — mill. Fields: `m_Amount`
@@ -683,13 +684,13 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 | `effect_type` (class name) | Status | Notes |
 |----------------------------|--------|-------|
 | `DrawNCardsAbilityEffectTemplate` | implemented | Uses the typed `m_InputValue` field, including dynamic ability variables. |
-| `PutTopOfDeckIntoHandAbilityEffectTemplate` | implemented | Moves AI deck-top to hand. |
+| `PutTopOfDeckIntoHandAbilityEffectTemplate` | implemented | Uses typed count/target metadata and the shared `EffectContext` zone operation. |
 | `DiscardCardAbilityEffectTemplate` | implemented | Moves the metadata-selected hand/choosing card to its owner's discard pile and emits the discard, move, and updated-card events. |
-| `CardModifierAbilityEffectTemplate` | implemented (text-derived) | Amount/property read from `param` JSON when present, else parsed from game text (`+N[ATK]`/`+N[DEF]`, "gain/lose health"). |
+| `CardModifierAbilityEffectTemplate` | implemented (metadata-driven) | Typed modifier metadata selects the property and operand; damage, stat, and counter mutations use `EffectContext`, with game-text parsing retained only as a compatibility fallback. |
 | `SummonTokenTroopAbilityEffectTemplate` | implemented | Uses typed token GUID, amount/amount field, collection/location, exhausted/attacking, filter, and copy-gems fields. |
 | `MoveCardToZoneEffectTemplate` | implemented | Reads the typed `m_DestinationCollection`; selected revealed cards are reinserted into the deck. |
-| `BuryCardAbilityEffectTemplate` | implemented | Count from `param` JSON, else 1. |
-| `VoidCardAbilityEffectTemplate` | implemented | Moves the resolved target to Void, emits the client zone events, records the source/voided relationship, and fires exit triggers. |
+| `BuryCardAbilityEffectTemplate` | implemented | Uses typed `m_Amount` and the shared `EffectContext` discard/trigger operation. |
+| `VoidCardAbilityEffectTemplate` | implemented | Uses the shared `EffectContext` zone operation to move the resolved target to Void, emit client events, record the source/voided relationship, and fire exit triggers. |
 | `UntapCardAbilityEffectTemplate` / `TapCardAbilityEffectTemplate` | implemented | Changes the resolved card state and supports metadata auto-target lists. |
 | `AnimationTriggerEffectTemplate` | implemented | Reads the typed `m_AnimationTrigger` enum and emits the client class-76 session event. |
 | `BlockEffectTemplate` | implemented | Uses the authored secondary target as the blocker, validates the active combat assignment, updates PvE/PvP blocker state, emits class-28 `BlockersAssigned`, and runs blocked-card triggers. |
@@ -697,8 +698,19 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 | `TransformCardAbilityEffectTemplate` | implemented | Target from bstate; template GUID from game-text link or `effect_guid`. |
 | `ActivateAbilityEffectTemplate` | implemented | Recurses via `param` (m_AbilityToInvoke). |
 | `TACAbilityEffectTemplate` | partial | Decodes operation + GUID; only `ShiftAbility` handled. |
-| `RandomizeVariableEffectTemplate` | partial | Registered under stale name `RandomizeVariableAbilityEffectTemplate`; delegates to `replenish_spell_power`. |
-| `GrantAbilityEffectTemplate`, `PlayCardAbilityEffectTemplate`, `FireEventEffectTemplate`, `RevertPermanentModificationsAbilityEffectTemplate`, `RevealCardsAbilityEffectTemplate`, `StoreTargetsAbilityEffectTemplate`, `VerdictAbilityEffectTemplate` | stubs | Log-only placeholders. |
+| `RandomizeVariableEffectTemplate` | implemented | Uses typed min/max fields (including dynamic max fields) and stores the result in the active ability-variable map; the stale historical alias remains only for direct legacy callers. |
+| `GrantAbilityEffectTemplate`, `PlayCardAbilityEffectTemplate`, `RevertPermanentModificationsAbilityEffectTemplate`, `RevealCardsAbilityEffectTemplate`, `StoreTargetsAbilityEffectTemplate` | implemented | Metadata-driven state/event paths; simple state effects use `EffectContext`, while play/reveal/grant retain their required orchestration. |
+
+The context-backed simple-operation set also includes discard-or-sacrifice,
+swap-health, replica/self transforms, defense-based batch destruction,
+matching-token creation, and tunnel. Their registered leaves are intentionally
+short adapters; the context owns the database/event boundary while the
+resolver continues to own ordering, conditions, prompts, and continuations.
+The same adapter boundary now covers the prompt- and combat-heavy
+`DoubleChoiceAbilityEffectTemplate` and `BlockEffectTemplate`; their
+continuation and combat contracts remain in named context operations rather
+than being compressed into artificial simple leaves.
+| `FireEventEffectTemplate`, `VerdictAbilityEffectTemplate` | partial | Registered compatibility leaves; still require their authored event/verdict contracts before they can be treated as complete. |
 
 `RepeatingAbilityEffectTemplate` is resolved by the main resolver because it
 contains a nested typed ability and loop-count field rather than a normal
@@ -761,10 +773,10 @@ Records is invalid installation data, not an alternate rules version.
 1. **Do not hardcode per-card logic.** Prefer fields in the record. The current
    execution path has no alternate gamedata version; `m_GameText` is display
    data and must not select rules behavior.
-2. **Effect class names change.** `RandomizeVariableEffectTemplate` vs the stale
-   `RandomizeVariableAbilityEffectTemplate` registered in `bom.py` is one
-   example. Derive the dispatch key from the record's `_t` (last segment), not
-   from memory.
+2. **Effect class names change.** `RandomizeVariableEffectTemplate` is the
+   authoritative Records name; the older `RandomizeVariableAbilityEffectTemplate`
+   alias is retained only for compatibility. Derive the dispatch key from the
+   record's `_t` (last segment), not from memory.
 3. **Enum values are strings** in the records (`"Instant"`, `"QuickAction"`,
    `"Self"`, `"UseDefault"`). Convert to ints only when mirroring client bit
    math (e.g. `ECardCollections` flags, `EAbilityCastingBehavior` values).

@@ -15,6 +15,33 @@ BOM leaves (for example, Replenish Spell Power's random 3–5 result). These
 live in `cards/` and are discovered when `discover_abilities()` runs during
 server startup.
 
+## Context-style effects
+
+The resolver still accepts the historical leaf ABI for compatibility, but new
+simple leaves should use the context adapter:
+
+```python
+from abilities import effect
+
+@effect("DrawNCardsAbilityEffectTemplate")
+def draw(effect):
+    return effect.draw(effect.value("m_InputValue"))
+```
+
+`EffectContext` provides typed field values, current and secondary targets,
+target ownership, and shared state-changing operations. When resolution has an
+active `AbilityBuilder`, typed reads are delegated through that builder so
+effect code has one metadata hand-off. The adapter translates the old
+positional resolver call into one context, so leaves can migrate one at a time
+without creating a second execution path.
+
+`AbilityBuilder` compiles an authoritative `AbilityGraph` into the existing
+`AbilityInstance` hand-off. It exposes authored costs, target filters, typed
+values, effect-local conditions, continuation dependencies, prompt
+requirements, activation validation, and client effect ordering/groups. It
+must not become a second card-data source: Records and the resulting
+`AbilityGraph` remain authoritative.
+
 ## Adding a new card ability
 
 1. Create a file in `abilities/cards/` named after the ability, e.g.

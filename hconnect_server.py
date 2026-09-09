@@ -158,16 +158,6 @@ def _records_target_spec(handler, target_guid):
     return target.target_spec if target is not None else None
 
 
-def _records_ability_cost_templates(handler, ability_guid):
-    resolver = getattr(handler, "_ability_cost_templates", None)
-    if callable(resolver):
-        return resolver(ability_guid)
-    from gamedata import CardPlayCost
-    graph = _records_ability_graph(handler, ability_guid)
-    return ([(guid, CardPlayCost.cost_type(kind))
-             for kind, guid in graph.additional_cost_targets]
-            if graph is not None else [])
-
 import domain.constants as _dc
 _dc.event_logger = _record_session_events
 # Game imported ``event_logger`` by value, so updating domain.constants alone
@@ -912,13 +902,16 @@ class HCPHandler:
         not offered.  Auto targets and player-champion targets never gate.
         """
         for ability in play_plan.abilities:
-            graph = ability.graph
-            if graph is None or graph.manual or ability.is_triggered:
+            if (ability.graph is None or ability.graph.manual or
+                    ability.is_triggered):
                 continue
+            from abilities.framework.builder import AbilityBuilder
+            builder = AbilityBuilder.from_instance(ability)
             for index in ability.referenced_target_indexes:
-                if index >= len(graph.targets):
+                try:
+                    target = builder.target(index)
+                except KeyError:
                     continue
-                target = graph.targets[index]
                 if not target.requires_input or target.minimum < 1:
                     continue
                 candidates = self._valid_targets_for_template(
@@ -1109,18 +1102,26 @@ class HCPHandler:
             # PlayCard instance so the client's BattleStateAssignXCost prompts for
             # the sacrificed troop BEFORE the effect target. Without it the client
             # skips the cost and only asks for the single effect target.
-            for cost_spec in play_plan.cost_instances:
+            from abilities.framework.builder import AbilityBuilder
+            try:
+                plan_builder = AbilityBuilder.from_play_plan(play_plan)
+                cost_candidates = plan_builder.card_cost_candidates(
+                    _db, session.session_id,
+                    self.user_profile["id"] if self.user_profile else 0,
+                    card_uid, champions=self._champion_targets(),
+                    battle_state=getattr(self, "_current_bstate", None))
+            except ValueError:
+                cost_candidates = ()
+            for cost_spec, cost_uids in cost_candidates:
                 if cost_spec["auto"]:
                     continue
                 cost_guid = cost_spec["target_guid"]
-                cost_targets = self._valid_targets_for_template(
-                    session, pl_t, ai_t, cost_guid)
-                if not cost_targets:
+                if not cost_uids:
                     continue
                 minimum = int(cost_spec["minimum"])
                 maximum = int(cost_spec["maximum"])
                 if maximum < 0:
-                    maximum = len(cost_targets)
+                    maximum = len(cost_uids)
                 # Find the PlayCard instance — its opt_id MUST match the
                 # client's built-in PlayCard ability, or it cannot see this
                 # CostInstance.
@@ -1134,7 +1135,8 @@ class HCPHandler:
                         ci.cost_type = int(cost_spec["cost_type"])
                         ci.target_template_id = game_engine.ResourceId.from_str(
                             cost_guid)
-                        ci.targets = list(cost_targets)
+                        ci.targets = [game_engine.SessionCardId(
+                            game_engine.UID(int(uid))) for uid in cost_uids]
                         inst.target_instances.append(ci)
                         break
             # Variable X cost (e.g. Burn to the Ground "Deal X damage"): attach
@@ -1173,18 +1175,24 @@ class HCPHandler:
     def _card_play_cost_selections(self, session, play_plan, source_uid,
                                    selected_uids):
         """Bind a card-play TargetMap to its authored CostInstances."""
+        from abilities.framework.builder import AbilityBuilder
         selected_uids = [int(uid) for uid in (selected_uids or [])]
         used = set()
         selections = []
-        for spec in play_plan.cost_instances:
+        if not play_plan.cost_instances:
+            return selections, used
+        builder = AbilityBuilder.from_play_plan(play_plan)
+        for spec, candidates in builder.card_cost_candidates(
+                _db, session.session_id,
+                self.user_profile["id"] if self.user_profile else 0,
+                source_uid, champions=self._champion_targets(),
+                battle_state=getattr(self, "_current_bstate", None)):
             if spec["auto"]:
-                selections.append((spec, (int(source_uid),)))
+                selections.append((spec, candidates))
                 continue
-            candidates = self._valid_targets_for_template(
-                session, None, None, spec["target_guid"])
             if not candidates:
                 return None
-            candidate_set = {int(card.uid.uid64) for card in candidates}
+            candidate_set = {int(uid) for uid in candidates}
             available = [uid for uid in selected_uids
                          if uid in candidate_set and uid not in used]
             minimum = int(spec["minimum"])
@@ -1603,13 +1611,17 @@ class HCPHandler:
         # Every non-automatic card-level cost must have enough legal targets
         # before the card is offered.  This mirrors the client's
         # GetPotentialCostsForAbility/AreXCostsComplete gates.
-        for cost_spec in play_plan.cost_instances:
-            if cost_spec["auto"]:
-                continue
-            cost_targets = self._valid_targets_for_template(
-                session, None, None, cost_spec["target_guid"])
-            if len(cost_targets or ()) < int(cost_spec["minimum"]):
-                return False
+        from abilities.framework.builder import AbilityBuilder
+        if play_plan.cost_instances:
+            builder = AbilityBuilder.from_play_plan(play_plan)
+            for cost_spec, cost_targets in builder.card_cost_candidates(
+                    _db, session.session_id,
+                    self.user_profile["id"] if self.user_profile else 0,
+                    card_uid, champions=self._champion_targets(),
+                    battle_state=getattr(self, "_current_bstate", None)):
+                if not cost_spec["auto"] and len(cost_targets) < int(
+                        cost_spec["minimum"]):
+                    return False
         return True
 
     def _push_main_phase_options(self, session, pl_t, ai_t):
@@ -1765,21 +1777,16 @@ class HCPHandler:
                 # (Prairie Scout's "target attacking troop") are only
                 # activatable during combat steps — after attackers were
                 # declared, until the second main phase.
-                tids = [target.guid for target in graph.targets]
-                if tids:
-                    from abilities.framework.targeting import (
-                        legal_targets as _lt, target_uses_both_players,
-                    )
+                from abilities.framework.builder import AbilityBuilder
+                builder = AbilityBuilder.from_graph(
+                    graph, store=getattr(self, "_play_plan_store", None))
+                target_refs = builder.targets(include_costs=False)
+                if target_refs:
                     wants_attacking = False
                     has_target = False
                     explicit_target_missing = False
-                    cost_ids = {str(tid).lower() for tid, _ in
-                                _records_ability_cost_templates(self, ag)}
-                    for target in graph.targets:
-                        tid = target.guid
-                        if tid.lower() in cost_ids:
-                            continue
-                        target_filter = target.card_filter
+                    for target in target_refs:
+                        target_filter = target.filter
                         if hasattr(target_filter, "to_dict"):
                             target_filter = target_filter.to_dict()
                         if "IsAttacking" in json.dumps(target_filter or {}):
@@ -1791,10 +1798,9 @@ class HCPHandler:
                             # available.
                             has_target = True
                             continue
-                        cands = _lt(
+                        cands = builder.target_candidates(
                             _db, session.session_id, self.user_profile["id"],
-                            tid, card_uid,
-                            both_players=target_uses_both_players(_db, tid),
+                            target, card_uid,
                             champions=self._champion_targets(),
                             battle_state=bstate)
                         if cands:
@@ -1843,19 +1849,16 @@ class HCPHandler:
                         graph.costs.variable_minimum or 0):
                     continue
                 payment_unavailable = False
-                from abilities.framework.targeting import legal_targets as _lt
-                for cost_tid, _cost_type in _records_ability_cost_templates(self, ag):
-                    cost_target = _records_target_spec(self, cost_tid)
-                    if cost_target is None:
+                for cost, payment_candidates in builder.cost_candidates(
+                        _db, session.session_id, self.user_profile["id"],
+                        card_uid, champions=self._champion_targets(),
+                        battle_state=bstate):
+                    if cost.target is None:
                         payment_unavailable = True
                         break
-                    if not cost_target.requires_input:
+                    if not cost.requires_input:
                         continue
-                    payment_candidates = _lt(
-                        _db, session.session_id, self.user_profile["id"],
-                        cost_target.guid, card_uid, both_players=False,
-                        champions=self._champion_targets(), battle_state=bstate)
-                    if len(payment_candidates) < int(cost_target.minimum or 0):
+                    if len(payment_candidates) < cost.minimum:
                         payment_unavailable = True
                         break
                 if payment_unavailable:
@@ -1892,9 +1895,7 @@ class HCPHandler:
             # Default candidate pool: the player's warzone troops.  Abilities
             # with explicit target templates get the pool filtered through the
             # gamedata card filter (e.g. Prairie Scout's IsAttacking+IsTroop).
-            from abilities.framework.targeting import (
-                legal_targets as _legal_targets, target_uses_both_players,
-            )
+            from abilities.framework.builder import AbilityBuilder
             opt = game._make_event(game_engine.PlayerOptionSessionEventArgs)
             opt.card = scid
             opt.state = game_engine.ECardUsage.Activate
@@ -1902,25 +1903,25 @@ class HCPHandler:
                 inst = game._make_event(game_engine.OptionInstanceSessionEventArgs)
                 inst.opt_id = game_engine.ResourceId.from_str(ag)
                 graph = _records_ability_graph(self, ag)
-                if graph is not None and graph.targets:
+                builder = (AbilityBuilder.from_graph(
+                    graph, store=getattr(self, "_play_plan_store", None))
+                           if graph is not None else None)
+                if builder is not None and builder.targets(
+                        requires_input=True, include_costs=False):
                     built = []
                     min_counts = []
                     max_counts = []
-                    for i, target in enumerate(graph.targets):
+                    for target in builder.targets(
+                            requires_input=True, include_costs=False):
+                        i = target.index
                         tid = target.guid
-                        if not target.requires_input:
-                            # Auto targets resolve server-side — never attach a
-                            # picker (the client's target cursor appears when a
-                            # TargetInstance is present).
-                            continue
                         built.append(i)
-                        min_counts.append(max(0, int(target.minimum)))
-                        maximum = int(target.maximum)
-                        max_counts.append(max(0, maximum) if maximum > 0 else 0)
-                        others = _legal_targets(
+                        min_counts.append(target.minimum)
+                        max_counts.append(max(0, target.maximum)
+                                           if target.maximum > 0 else 0)
+                        others = builder.target_candidates(
                             _db, session.session_id, self.user_profile["id"],
-                            tid, int(card_uid),
-                            both_players=target_uses_both_players(_db, tid),
+                            target, int(card_uid),
                             champions=self._champion_targets(),
                             battle_state=bstate)
                         if not others:
@@ -1929,7 +1930,7 @@ class HCPHandler:
                             # friendly pool; restricting filters (e.g. Prairie
                             # Scout's IsAttacking) keep their empty pool so the
                             # ability is never offered without a valid target.
-                            filt = target.card_filter
+                            filt = target.filter
                             if hasattr(filt, "to_dict"):
                                 filt = filt.to_dict()
                             if not filt:
@@ -1944,30 +1945,30 @@ class HCPHandler:
                         inst.target_instances.append(tgt)
                     inst.min_target_counts = min_counts if built else []
                     inst.max_target_counts = max_counts if built else []
-                if graph is not None:
-                    for kind, cost_guid in graph.additional_cost_targets:
-                        cost_target = _records_target_spec(self, cost_guid)
-                        if cost_target is None or not cost_target.requires_input:
+                if builder is not None:
+                    for cost in builder.cost_targets:
+                        if not cost.requires_input:
                             continue
-                        candidates = _legal_targets(
+                        candidates = builder.target_candidates(
                             _db, session.session_id, self.user_profile["id"],
-                            cost_guid, int(card_uid), both_players=False,
+                            cost.target or cost.guid, int(card_uid),
+                            both_players=False,
                             champions=self._champion_targets(),
                             battle_state=bstate)
-                        if len(candidates) < int(cost_target.minimum or 0):
+                        if len(candidates) < cost.minimum:
                             continue
                         ci = game._make_event(
                             game_engine.CostInstanceSessionEventArgs)
-                        minimum = max(0, int(cost_target.minimum))
-                        maximum = int(cost_target.maximum)
-                        if maximum <= 0:
+                        minimum = cost.minimum
+                        maximum = cost.maximum
+                        if maximum < 0:
                             maximum = len(candidates)
                         HCPHandler._set_cost_instance_bounds(
                             ci, minimum, maximum)
                         from gamedata import CardPlayCost
-                        ci.cost_type = CardPlayCost.cost_type(kind)
+                        ci.cost_type = cost.cost_type
                         ci.target_template_id = game_engine.ResourceId.from_str(
-                            cost_guid)
+                            cost.guid)
                         ci.targets = [game_engine.SessionCardId(
                             game_engine.UID(int(uid))) for uid in candidates]
                         inst.target_instances.append(ci)
@@ -3045,9 +3046,12 @@ class HCPHandler:
         graph = _records_ability_graph(self, ability_guid)
         if graph is None:
             return None
-        for kind, target_guid in graph.additional_cost_targets:
-            if kind == "discard":
-                return str(ability_guid).lower(), target_guid
+        from abilities.framework.builder import AbilityBuilder
+        builder = AbilityBuilder.from_graph(
+            graph, store=getattr(self, "_play_plan_store", None))
+        for cost in builder.cost_targets:
+            if cost.kind == "discard":
+                return str(ability_guid).lower(), cost.guid
         return None
 
     def _ability_requires_discard(self, ability_guid):
@@ -3088,47 +3092,45 @@ class HCPHandler:
         target template (collection + card filter)."""
         if not ability_ids:
             return {}
-        from abilities.framework.targeting import (
-            legal_targets as _lt, target_uses_both_players)
+        from abilities.framework.builder import AbilityBuilder
         out = {}
         for aid in ability_ids:
             ag = str(aid.guid)
             graph = _records_ability_graph(self, ag)
             if graph is None:
                 continue
-            cost_tids = {str(t).lower() for t, _ in
-                         _records_ability_cost_templates(self, ag)}
-            for target_index, target in enumerate(graph.targets):
+            builder = AbilityBuilder.from_graph(
+                graph, store=getattr(self, "_play_plan_store", None))
+            cost_tids = {cost.guid.lower() for cost in builder.cost_targets}
+            for target in builder.targets(requires_input=True,
+                                          include_costs=False):
+                target_index = target.index
                 tid = target.guid
                 # Card costs (void/sacrifice/exhaust...) are paid via the
                 # client's X-cost dialog (CostInstance events) — never as
                 # effect targets.
                 if tid.lower() in cost_tids:
                     continue
-                if not target.requires_input:
-                    # Auto targets (e.g. Poca's 'You' — "Summon a Blaze
-                    # Elemental") resolve automatically: never attach a picker.
-                    continue
-                cands = _lt(_db, session.session_id, self.user_profile["id"],
-                            tid, int(champ_uid or 0),
-                            both_players=target_uses_both_players(_db, tid),
-                            champions=self._champion_targets())
-                mn = max(0, int(target.minimum))
-                mx = int(target.maximum)
-                if mx <= 0:
-                    mx = -1
+                cands = builder.target_candidates(
+                    _db, session.session_id, self.user_profile["id"],
+                    target, int(champ_uid or 0),
+                    champions=self._champion_targets())
+                mn = target.minimum
+                mx = target.maximum
                 out.setdefault(ag, []).append(
                     (tid, cands, mn, mx, target_index))
         return out
 
     def _ability_cost_templates(self, ability_guid):
         """Return payment targets from the current typed AbilityGraph."""
-        from gamedata import CardPlayCost
+        from abilities.framework.builder import AbilityBuilder
         graph = _records_ability_graph(self, ability_guid)
         if graph is None:
             return []
-        return [(guid, CardPlayCost.cost_type(kind))
-                for kind, guid in graph.additional_cost_targets]
+        return [(cost.guid, cost.cost_type)
+                for cost in AbilityBuilder.from_graph(
+                    graph, store=getattr(self, "_play_plan_store", None)
+                ).cost_targets]
 
     def _current_ability_graph(self, ability_guid):
         from gamedata import ability_graph
@@ -3153,21 +3155,23 @@ class HCPHandler:
         card uids], min, max)]} for the champion ability's CARD costs — the
         client's BattleStateAssignXCost prompts for these (e.g. Bun'jitsu's
         "Void two ready troops you control")."""
-        from abilities.framework.targeting import legal_targets as _lt
+        from abilities.framework.builder import AbilityBuilder
         out = {}
         for aid in (ability_ids or []):
             ag = str(aid.guid)
             graph = _records_ability_graph(self, ag)
-            for tid, ctype in _records_ability_cost_templates(self, ag):
-                target = _records_target_spec(self, tid)
-                mn = max(0, int(target.minimum)) if target else 1
-                mx = int(target.maximum) if target else 1
-                if mx <= 0:
-                    mx = -1
-                cands = _lt(_db, session.session_id, self.user_profile["id"],
-                            tid, int(champ_uid or 0), both_players=False,
-                            champions=self._champion_targets())
-                out.setdefault(ag, []).append((tid, ctype, cands, mn, mx))
+            if graph is None:
+                continue
+            builder = AbilityBuilder.from_graph(
+                graph, store=getattr(self, "_play_plan_store", None))
+            for cost in builder.cost_targets:
+                cands = builder.target_candidates(
+                    _db, session.session_id, self.user_profile["id"],
+                    cost.target or cost.guid, int(champ_uid or 0),
+                    both_players=False, champions=self._champion_targets())
+                out.setdefault(ag, []).append(
+                    (cost.guid, cost.cost_type, cands,
+                     cost.minimum, cost.maximum))
         return out
 
     def _select_champion_activation_targets(self, session, bstate,
@@ -3180,29 +3184,27 @@ class HCPHandler:
         so a sacrifice target must be removed from the effect-target pool
         before the chain item is created.
         """
-        from abilities.framework.targeting import (
-            legal_targets as _lt, target_uses_both_players)
+        from abilities.framework.builder import AbilityBuilder
         graph = _records_ability_graph(self, ability_guid)
         if graph is None:
             return None
+        builder = AbilityBuilder.from_graph(
+            graph, store=getattr(self, "_play_plan_store", None))
         selected_uids = [int(uid) for uid in (selected_uids or [])]
         used = set()
         sacrifices = []
-        cost_templates = _records_ability_cost_templates(self, ability_guid)
-        for tid, cost_type in cost_templates:
-            target = _records_target_spec(self, tid)
+        for cost in builder.cost_targets:
+            tid, cost_type = cost.guid, cost.cost_type
+            target = cost.target
             if target is None:
                 return None
-            minimum = max(0, int(target.minimum))
-            maximum = int(target.maximum)
-            if maximum <= 0:
-                maximum = -1
-            if not target.requires_input and target.target_kind == \
-                    "AbilitySourceCardTargetTemplate":
+            minimum = cost.minimum
+            maximum = cost.maximum
+            if cost.is_source_auto_target:
                 candidates = [int(champ_uid)]
                 available = candidates
             else:
-                candidates = _lt(
+                candidates = builder.target_candidates(
                     _db, session.session_id, self.user_profile["id"], tid,
                     int(champ_uid), both_players=False,
                     champions=self._champion_targets(), battle_state=bstate)
@@ -3211,27 +3213,22 @@ class HCPHandler:
                              and uid not in used]
             if len(available) < minimum:
                 return None
-            chosen = available[:maximum]
+            limit = len(available) if maximum < 0 else maximum
+            chosen = available[:limit]
             used.update(chosen)
             if int(cost_type) == 2:
                 sacrifices.extend(chosen)
 
         effect_candidates = []
         explicit_required = False
-        cost_ids = {str(tid).lower() for tid, _ in cost_templates}
-        for target in graph.targets:
-            tid = str(target.guid).lower()
-            if any(tid == cost_tid for cost_tid, _ in cost_templates):
-                continue
-            if not target.requires_input:
-                continue
+        for target in builder.targets(requires_input=True,
+                                      include_costs=False):
             explicit_required = explicit_required or bool(
-                int(target.minimum) if target.minimum is not None else 1)
-            effect_candidates.extend(int(uid) for uid in _lt(
-                _db, session.session_id, self.user_profile["id"], tid,
-                int(champ_uid),
-                both_players=target_uses_both_players(_db, tid),
-                champions=self._champion_targets(), battle_state=bstate))
+                target.minimum if target.minimum is not None else 1)
+            effect_candidates.extend(int(uid) for uid in builder.target_candidates(
+                _db, session.session_id, self.user_profile["id"], target,
+                int(champ_uid), champions=self._champion_targets(),
+                battle_state=bstate))
         legal_effects = set(effect_candidates)
         effect_selected = [uid for uid in selected_uids
                            if uid not in used and uid in legal_effects]
@@ -4272,22 +4269,12 @@ class HCPHandler:
                     bstate.get("ai_health", game.ai_health))
                 self._resolve_champion_void_targets(
                     game, session, pl_t, ai_t, bstate, str(ag))
-                fn = _abil.resolve_effect(ag)
-                ability_log = ""
-                if fn:
-                    ability_log = fn(
-                        game, session, _db, self, pl_t, ai_t, bstate, ag, None)
-                else:
-                    # Keep the authoritative BOM path available even when the
-                    # compatibility resolver was loaded before a runtime
-                    # metadata refresh. Champion powers must not silently
-                    # consume their charge and resolve to no effect merely
-                    # because the registry lookup missed the GUID.
-                    from abilities.framework.resolution import resolve_ability
-                    ability_log = resolve_ability(
-                        self, game, session, _db, pl_t, ai_t, bstate, ag,
-                        bstate.get("resolving_source_uid"),
-                        bstate.get("resolving_owner_id", 0), {})
+                from abilities import EffectContext
+                ability_log = _abil.resolve_ability_context(
+                    EffectContext.from_legacy(
+                        game, session, _db, self, pl_t, ai_t, bstate, ag, ""),
+                    ag, source_uid=bstate.get("resolving_source_uid"),
+                    owner_id=bstate.get("resolving_owner_id", 0))
                 # Damage/heal leaves normally emit class 38.  Add a fallback
                 # for ability implementations that update the battle state
                 # directly, so the champion HUD changes immediately rather
@@ -5760,35 +5747,26 @@ class HCPHandler:
         # before the BOM resolves.  The live target filter is re-evaluated so
         # a stale transaction cannot exhaust a troop that became tapped after
         # the option list was sent.
-        from abilities.framework.targeting import (
-            legal_targets as _legal_targets, target_uses_both_players,
-        )
+        from abilities.framework.builder import AbilityBuilder
+        builder = AbilityBuilder.from_graph(
+            graph, store=getattr(self, "_play_plan_store", None))
         cost_selections = []
         cost_target_uids = []
         used_cost_uids = set()
-        cost_templates = set()
-        graph_costs = _records_ability_cost_templates(self, ability_guid)
-        for cost_guid, _cost_type in graph_costs:
-            cost_templates.add(str(cost_guid).lower())
-        for kind, cost_guid in graph.additional_cost_targets:
-            cost_spec = _records_target_spec(self, cost_guid)
-            if cost_spec is None:
+        for cost_ref in builder.cost_targets:
+            if cost_ref.target is None:
                 log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
-                        f"missing payment target template {cost_guid}")
+                        f"missing payment target template {cost_ref.guid}")
                 return
-            minimum = max(0, int(cost_spec.minimum or 0))
-            maximum = int(cost_spec.maximum or 0)
-            if maximum <= 0:
-                maximum = -1
-            auto_source = (not cost_spec.requires_input and
-                           cost_spec.target_kind ==
-                           "AbilitySourceCardTargetTemplate")
+            minimum = cost_ref.minimum
+            maximum = cost_ref.maximum
+            auto_source = cost_ref.is_source_auto_target
             if auto_source:
                 candidates = [int(source_uid)]
             else:
-                candidates = _legal_targets(
+                candidates = builder.target_candidates(
                     _db, session.session_id, self.user_profile["id"],
-                    cost_guid, int(source_uid), both_players=False,
+                    cost_ref.target, int(source_uid), both_players=False,
                     champions=self._champion_targets(), battle_state=bstate)
             candidate_set = {int(uid) for uid in candidates}
             available = ([int(source_uid)] if auto_source else
@@ -5797,38 +5775,30 @@ class HCPHandler:
                           int(uid) not in used_cost_uids])
             if len(available) < minimum:
                 log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
-                        f"missing/illegal payment target for {cost_guid}")
+                        f"missing/illegal payment target for {cost_ref.guid}")
                 return
             chosen = available if maximum < 0 else available[:maximum]
             used_cost_uids.update(chosen)
             cost_target_uids.extend(chosen)
-            cost_selections.append(({"kind": kind}, tuple(chosen)))
+            cost_selections.append(({"kind": cost_ref.kind}, tuple(chosen)))
 
         # Work out which target templates are effect targets (as opposed to
         # automatic source/player targets or card-cost targets), then validate
         # the transaction against the same gamedata filter used to build the
         # picker. This keeps activation data-driven and prevents an invalid or
         # missing target from silently resolving against the source card.
-        explicit_templates = []
-        for target in graph.targets:
-            tid = str(target.guid).lower()
-            if tid in cost_templates or not target.requires_input:
-                continue
-            explicit_templates.append((tid, int(target.minimum or 0)))
+        explicit_templates = builder.targets(
+            requires_input=True, include_costs=False)
         if explicit_templates:
-            from abilities.framework.targeting import (
-                legal_targets as _legal_targets, target_uses_both_players,
-            )
             # Taming Sphere has one required explicit target. For abilities
             # with several templates, accept the selected card if it is legal
             # for any effect target, while excluding cards already consumed as
             # payment targets.
             target_uid = None
-            for tid, _minimum in explicit_templates:
-                candidates = _legal_targets(
+            for target in explicit_templates:
+                candidates = builder.target_candidates(
                     _db, session.session_id, self.user_profile["id"],
-                    tid, int(source_uid),
-                    both_players=target_uses_both_players(_db, tid),
+                    target, int(source_uid),
                     champions=self._champion_targets(),
                     battle_state=bstate)
                 for candidate in selected_uids:
@@ -5879,10 +5849,13 @@ class HCPHandler:
         if cost_selections:
             self._apply_card_play_costs(
                 game, session, bstate, pl_t, ai_t, cost_selections)
-        fn = _ability_mod.resolve_effect(ability_guid)
-        log = ""
-        if fn:
-            log = fn(game, session, _db, self, pl_t, ai_t, bstate, ability_guid, None)
+        from abilities import EffectContext, resolve_ability_context
+        log = resolve_ability_context(
+            EffectContext.from_legacy(
+                game, session, _db, self, pl_t, ai_t, bstate,
+                ability_guid, ""),
+            ability_guid, source_uid=source_uid,
+            owner_id=bstate.get("resolving_owner_id", 0))
         self._remove_one_shot_ability(
             session, source_uid, ability_guid, game, pl_t, ai_t, bstate)
         # Manual troop abilities resolve directly rather than as stack items.
