@@ -1061,6 +1061,14 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
     if not first_strike:
         bstate[attacker_key] = {}
         bstate.pop("ai_blockers", None)
+        # CombatEndedEvent is a distinct client lifecycle event.  It has no
+        # source card, so the shared dispatcher gathers persistent triggers
+        # from both controllers after the combat state has been removed.
+        from abilities.framework.triggers import resolve_triggers
+        resolve_triggers(
+            _db, handler, game, session, pl_t, ai_t, bstate,
+            "CombatEndedEvent", None,
+            source_owner_uid=_owner_of(attacker_uid))
     _be.save_state(session, bstate)
     if game.events:
         if send_events is not None:

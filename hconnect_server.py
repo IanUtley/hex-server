@@ -3653,6 +3653,28 @@ class HCPHandler:
         import commands as _cmd
         ph = int(bstate.get("player_health", 20))
         ah = int(bstate.get("ai_health", 20))
+        # Give metadata-defined survival abilities their client-equivalent
+        # replacement event before publishing GameEnded.  These abilities
+        # resolve immediately (ChampionWouldLose is authored as an
+        # ignores-chain event), so re-read health after each dispatch.
+        from abilities.framework.triggers import resolve_champion_would_lose
+        if ph <= 0:
+            loss_game = self._fresh_game(session, pl_t, ai_t, bstate)
+            resolve_champion_would_lose(
+                _db, self, loss_game,
+                session, pl_t, ai_t, bstate,
+                self.user_profile["id"])
+            if loss_game.events:
+                self._send_battle_events(session, loss_game, pl_t)
+            ph = int(bstate.get("player_health", 20))
+        if ah <= 0:
+            loss_game = self._fresh_game(session, pl_t, ai_t, bstate)
+            resolve_champion_would_lose(
+                _db, self, loss_game,
+                session, pl_t, ai_t, bstate, 0)
+            if loss_game.events:
+                self._send_battle_events(session, loss_game, pl_t)
+            ah = int(bstate.get("ai_health", 20))
         if ph <= 0:
             _cmd.push_battle_game_end(handler=self, session=session,
                                       winners=[ai_t], losers=[pl_t])

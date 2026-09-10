@@ -5392,6 +5392,31 @@ def _pvp_check_game_end(session, state):
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return False
+    # ChampionWouldLoseEvent is a replacement event, not a post-game hook.
+    # Resolve it before publishing the match result so authored survival
+    # abilities get the same chance in PvP as in the campaign battle path.
+    from abilities.framework.triggers import resolve_champion_would_lose
+    for pid in pids:
+        if int(state.get(f"hp_{pid}", 20)) > 0:
+            continue
+        other = pids[1] if pid == pids[0] else pids[0]
+        event_handler = player_handlers.get(pid) or player_handlers.get(other)
+        if not event_handler:
+            continue
+        pl_uid = _ge.UID.make(244, pid)
+        opp_uid = _ge.UID.make(244, other)
+        game = _ge.Game(int(session.session_id), pl_uid, opp_uid)
+        game.player_health = int(state.get(f"hp_{pid}", 20))
+        game.ai_health = int(state.get(f"hp_{other}", 20))
+        view = _pvp_fra_view(state, pid, other)
+        resolve_champion_would_lose(
+            _db, event_handler, game, session, pl_uid, opp_uid, view, pid)
+        if game.events:
+            _pvp_send_same_events(session, game, pl_uid, opp_uid)
+        _pvp_sync_view_to_state(state, view, pid, other)
+        if view.get("stack"):
+            state["stack"] = view["stack"]
+        pvp_save_state(session, state)
     for pid in pids:
         if int(state.get(f"hp_{pid}", 20)) <= 0:
             other = pids[1] if pid == pids[0] else pids[0]

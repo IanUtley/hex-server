@@ -900,6 +900,14 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 other = 0 if (owner_id or 0) != 0 else (
                     handler.user_profile["id"] if handler.user_profile else 0)
             sides.append(other)
+        if event_type == "CombatEndedEvent":
+            # Combat-ended triggers have no source card.  The client gathers
+            # persistent triggers from both controllers after the combat
+            # object is removed, so scan both sides here rather than dropping
+            # the event because source_uid is None.
+            other = _opposing_owner(owner_id)
+            if other is not None:
+                sides.append(other)
         for h in sides:
             for zs in zone_sets:
                 for cu, ags in _warzone_ability_holders(
@@ -1267,6 +1275,39 @@ def resolve_gain_threshold_triggers(db, handler, game, session, pl_t, ai_t,
             bstate.pop("gain_threshold_color", None)
         else:
             bstate["gain_threshold_color"] = old
+
+
+def resolve_champion_would_lose(db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id):
+    """Fire the metadata replacement event before ending a game.
+
+    ``ChampionWouldLoseEvent`` is a champion-source event, not a game-card
+    event.  Keeping it behind this helper gives PvE and PvP the same source
+    UID/owner semantics and prevents repeated health checks from retriggering
+    a one-shot survival ability.
+    """
+    try:
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    seen = bstate.setdefault("_champion_would_lose_seen", [])
+    if owner_id in seen:
+        return ""
+    if owner_id == 0:
+        champion = getattr(handler, "_ai_champ_scid", None)
+    elif (bstate or {}).get("pvp"):
+        champion_uid = ((bstate.get("champ_map") or {}).get(str(owner_id)) or
+                        (bstate.get("champ_map") or {}).get(owner_id))
+        champion = (game_engine.SessionCardId(game_engine.UID(int(champion_uid)))
+                    if champion_uid is not None else None)
+    else:
+        champion = getattr(handler, "_player_champ_scid", None)
+    if champion is None:
+        return ""
+    seen.append(owner_id)
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "ChampionWouldLoseEvent", int(champion.uid.uid64), owner_id)
 
 
 def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
