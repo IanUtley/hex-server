@@ -36,7 +36,8 @@ from application.commands import (JoinSessionCommand, RemoveSessionCommand,
                                   ServiceRequestCommand,
                                   SetSessionStateCommand,
                                   StartEncounterCommand, StartSessionCommand)
-from application.player_transactions import classify_player_transaction
+from application.player_transactions import (classify_player_transaction,
+                                              extract_resource_guid)
 import gamemodes.tournament_server as tournament_server
 from services import dispatch as service_dispatch
 from gamemodes.tournament_engine import (
@@ -2203,6 +2204,150 @@ class HCPHandler:
         log_req(f"    Trigger target prompt: {ability_guid[:8]} source={hex(source_uid)} "
                 f"candidates={len(candidates or [])} inst={inst_id}")
 
+    def _queue_conversation_prompt(self, game, session, pl_t, ai_t, bstate,
+                                   conversation_id):
+        """Publish class-55 conversation UI and persist its BOM continuation.
+
+        The client implementation of ConversationAbilityEffectTemplate does
+        not resolve the next effect immediately.  It queues an encounter mod,
+        enters WaitForConversationAction, and resumes only after the client
+        submits EncounterModDialogTransaction.  Keep that same boundary in
+        both battle modes; the PvP state is copied to its tournament-owned
+        JSON by the existing prompt pattern.
+        """
+        import battle_engine as _be
+
+        parent = bstate.get("_choice_parent") or {}
+        ability_guid = str(parent.get("ability_guid") or
+                           bstate.get("resolving_ability") or "").lower()
+        source_uid = bstate.get("resolving_source_uid")
+        owner_id = int(parent.get(
+            "owner_id", bstate.get("resolving_owner_id", 0)) or 0)
+        # The original client always applies an encounter conversation to its
+        # UserPlayer.  In PvE the source can be an AI encounter card, so keep
+        # the ability owner for resumption but route the answer to the human
+        # controller.
+        answer_owner_id = owner_id
+        if not bstate.get("pvp"):
+            answer_owner_id = int(
+                self.user_profile["id"] if self.user_profile else owner_id)
+        resume_order = int(parent.get(
+            "resume_effect_order",
+            int(bstate.get("resolving_effect_order", 0)) + 1))
+        pending = {
+            "kind": "conversation",
+            "conversation_id": str(conversation_id).lower(),
+            "ability_guid": ability_guid,
+            "source_uid": int(source_uid) if source_uid is not None else 0,
+            "owner_id": answer_owner_id,
+            "ability_owner_id": owner_id,
+            "resume_effect_order": resume_order,
+            "target_map": {
+                str(key): value for key, value in
+                (parent.get("target_map") or
+                 bstate.get("ability_target_map") or {}).items()
+            },
+            "variables": dict(parent.get("variables") or
+                              bstate.get("ability_variables") or {}),
+        }
+        event_player = pl_t
+        if bstate.get("pvp"):
+            from services.tournament_game import pvp_load_state, pvp_save_state
+            state = pvp_load_state(session) or {}
+            state["pending_conversation"] = pending
+            state["resolution_paused"] = True
+            state["conversation_resume_priority_pid"] = int(
+                state.get("priority_pid", answer_owner_id) or answer_owner_id)
+            pvp_save_state(session, state)
+            event_player = game_engine.UID.make(244, owner_id)
+        else:
+            bstate["pending_conversation"] = pending
+            bstate["resolution_paused"] = True
+            _be.save_state(session, bstate)
+
+        event = game._make_event(
+            game_engine.EncounterModDialogSessionEventArgs)
+        event.player_id = event_player
+        event.conversation_template_id = game_engine.ResourceId.from_str(
+            str(conversation_id))
+        # Conversation UI is controller-private in PvP.  PvE has one human
+        # controller, so leaving this unset preserves the normal event path.
+        if bstate.get("pvp"):
+            event._private_player_uid = event_player
+        game._push(event)
+        log_req(f"    Conversation queued: {str(conversation_id)[:8]} "
+                f"ability={ability_guid[:8]} owner={answer_owner_id}")
+        return f"conversation: awaiting {str(conversation_id).lower()}"
+
+    def _resolve_pending_conversation(self, session, transaction):
+        """Resume a BOM after the client closes class-55 conversation UI."""
+        import battle_engine as _be
+        pending_state = _be.load_state(session)
+        pending = pending_state.get("pending_conversation")
+        if not pending:
+            self._push_transaction_ack(session)
+            return True
+        conversation_id = extract_resource_guid(
+            transaction.inner_bytes, "ConversationId")
+        if (conversation_id and conversation_id != str(
+                pending.get("conversation_id", "")).lower()):
+            log_req(f"    Conversation answer rejected: got {conversation_id}, "
+                    f"expected {pending.get('conversation_id')}")
+            self._push_transaction_ack(session)
+            return True
+        owner_id = int(pending.get("owner_id", 0) or 0)
+        if owner_id != int(self.user_profile["id"] if self.user_profile else 0):
+            log_req(f"    Conversation answer rejected for owner {owner_id}")
+            self._push_transaction_ack(session)
+            return True
+
+        pl_t = game_engine.UID.make(244, int(self.client_reck_id))
+        ai_t = game_engine.UID.make(3, 1000)
+        pending_state.pop("pending_conversation", None)
+        pending_state.pop("resolution_paused", None)
+        game = self._fresh_game(session, pl_t, ai_t, pending_state)
+        from abilities.framework.resolution import resolve_ability
+        ability_owner_id = int(pending.get(
+            "ability_owner_id", owner_id) or owner_id)
+        resolve_ability(
+            self, game, session, _db, pl_t, ai_t, pending_state,
+            pending.get("ability_guid", ""), pending.get("source_uid"),
+            ability_owner_id, target_map={int(k): v for k, v in
+                                  (pending.get("target_map") or {}).items()},
+            variables=pending.get("variables") or {},
+            resume_from_order=int(pending.get("resume_effect_order", 0)),
+        )
+        _be.save_state(session, pending_state)
+
+        pending_input = (pending_state.get("pending_conversation") or
+                         pending_state.get("pending_choice") or
+                         pending_state.get("pending_trigger") or
+                         pending_state.get("pending_deck_search") or
+                         pending_state.get("pending_discard_ability"))
+        if pending_input:
+            # The prompt helper owns any replacement picker.  The current
+            # packet still carries public mutations and/or class 55 itself.
+            self._send_battle_events(session, game, pl_t)
+            return True
+
+        if _be.stack_empty(pending_state):
+            game.push_chain_empty()
+            phase = _be.current_phase(pending_state)
+            game.push_green_light(
+                pl_t, self._priority_context_for(phase, pending_state))
+            self._send_battle_events(session, game, pl_t)
+            if phase in (game_engine.ETurnPhases.FirstMainPhase,
+                         game_engine.ETurnPhases.SecondMainPhase):
+                self._push_main_phase_options(session, pl_t, ai_t)
+        else:
+            game.push_green_light(
+                pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
+            self._send_battle_events(session, game, pl_t)
+        self._push_transaction_ack(session)
+        log_req(f"    Conversation resolved: "
+                f"{pending.get('conversation_id', '')[:8]}")
+        return True
+
     def _prompt_deck_search(self, game, session, pl_t, ai_t, bstate,
                             ability_guid, source_uid, owner_id, candidates,
                             kind="search"):
@@ -4059,7 +4204,8 @@ class HCPHandler:
             if (bstate.get("pending_choice") or
                     bstate.get("pending_deck_search") or
                     bstate.get("pending_trigger") or
-                    bstate.get("pending_discard_ability")):
+                    bstate.get("pending_discard_ability") or
+                    bstate.get("pending_conversation")):
                 break
             item = _be.stack_pop(bstate)
             _be.stack_reset_passes(bstate)
@@ -4077,7 +4223,8 @@ class HCPHandler:
                 not bstate.get("pending_choice") and
                 not bstate.get("pending_deck_search") and
                 not bstate.get("pending_trigger") and
-                not bstate.get("pending_discard_ability")):
+                not bstate.get("pending_discard_ability") and
+                not bstate.get("pending_conversation")):
             game.push_chain_empty()
         return resolved
 
@@ -5980,7 +6127,8 @@ class HCPHandler:
         if (not discard_prompted and
                 not bstate.get("pending_choice") and
                 not bstate.get("pending_deck_search") and
-                not bstate.get("pending_trigger")):
+                not bstate.get("pending_trigger") and
+                not bstate.get("pending_conversation")):
             game.push_green_light(pl_t, self._priority_context_for(
                 __import__("battle_engine").current_phase(bstate), bstate))
         if game.events:
@@ -7124,7 +7272,8 @@ class HCPHandler:
                     not bstate.get("pending_choice") and
                     not bstate.get("pending_deck_search") and
                     not bstate.get("pending_trigger") and
-                    not bstate.get("pending_discard_ability")):
+                    not bstate.get("pending_discard_ability") and
+                    not bstate.get("pending_conversation")):
                 self._suppress_completed_game_started_chain_events(
                     game, game_started_event_start)
             # GameStarted abilities may change the DB-backed battle state.  In
@@ -7920,8 +8069,9 @@ class HCPHandler:
                                             bstate.get("player_resource_played_this_turn", False),
                                             fc3, ec3):
                     playable3.append(s)
-            if not bstate.get("pending_trigger") and \
-                    not bstate.get("pending_deck_search"):
+            if (not bstate.get("pending_trigger") and
+                    not bstate.get("pending_deck_search") and
+                    not bstate.get("pending_conversation")):
                 # A class-39 trigger target prompt is pending — the
                 # prompt packet already carries the picker + priority;
                 # pushing the normal post-play options would clobber it.
@@ -7991,7 +8141,8 @@ class HCPHandler:
                             "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
                         }, dw3)
                         log_req(f"    Pushed fresh GreenLight + options ({len(dw3)}b)")
-            elif bstate.get("pending_deck_search") and g3.events:
+            elif (bstate.get("pending_deck_search") or
+                  bstate.get("pending_conversation")) and g3.events:
                 # Shards of Fate prompt pending: send only the resource
                 # card played + PlayerUpdated events — the prompt packet
                 # already carried the picker and priority.
@@ -8025,6 +8176,17 @@ class HCPHandler:
         if handled:
             self._push_transaction_ack(session)
         return True
+
+    def _handle_encounter_mod_dialog_transaction(self, session, transaction):
+        """Route the class-55 conversation acknowledgement to its owner."""
+        if (session.session_name or "").startswith("tourney-"):
+            from services.tournament_game import pvp_handle_transaction
+            handled = pvp_handle_transaction(self, session,
+                                              transaction.inner_bytes)
+            if not handled:
+                self._push_transaction_ack(session)
+            return True
+        return self._resolve_pending_conversation(session, transaction)
 
     def _handle_set_ability_data_transaction(self, session, transaction):
         """Resolve target data supplied for a pending ability prompt."""
@@ -9058,12 +9220,14 @@ class HCPHandler:
                         if (_be.stack_empty(bstate) and
                                 not bstate.get("pending_choice") and
                                 not bstate.get("pending_trigger") and
-                                not bstate.get("pending_deck_search")):
+                                not bstate.get("pending_deck_search") and
+                                not bstate.get("pending_conversation")):
                             gs.push_chain_empty()
                         cur_phase = _be.current_phase(bstate)
                         pending_input = (bstate.get("pending_choice") or
                                          bstate.get("pending_trigger") or
-                                         bstate.get("pending_deck_search"))
+                                         bstate.get("pending_deck_search") or
+                                         bstate.get("pending_conversation"))
                         paused_ai_idx = (
                             bstate.get("ai_turn_phase_idx")
                             if (_be.stack_empty(bstate) and not pending_input and
@@ -13444,6 +13608,7 @@ class HCPHandler:
             # falling through to the card-play handler re-pushes MAIN-phase options
             # (making hand cards playable mid-combat) and clobbers attack options.
             is_priority_sync = transaction.is_priority_sync
+            is_encounter_mod_dialog = transaction.is_encounter_mod_dialog
 
             # Preserve the inbound action before any resolver branch mutates
             # the authoritative session. This is intentionally separate from
@@ -13468,6 +13633,7 @@ class HCPHandler:
                     "is_cancel_auto_pass": is_cancel_auto_pass,
                     "is_assign_damage": is_assign_damage,
                     "is_priority_sync": is_priority_sync,
+                    "is_encounter_mod_dialog": is_encounter_mod_dialog,
                 }
                 try:
                     transaction_capture_id = db_record_session_transaction(
@@ -13485,6 +13651,12 @@ class HCPHandler:
             
             # Handle mulligan keep — push AcceptedStartingHand + phase sequence
             handled = False
+            if is_encounter_mod_dialog and session and not handled:
+                handled = self._application.dispatch_player_transaction(
+                    transaction,
+                    lambda command: self._handle_encounter_mod_dialog_transaction(
+                        session, command),
+                )
             if is_priority_sync and session:
                 self._application.dispatch_player_transaction(
                     transaction,

@@ -97,6 +97,29 @@ class GameEndedSessionEventArgs(SessionEventArgs):
         return self.end_write()
 
 
+class EncounterModDialogSessionEventArgs(SessionEventArgs):
+    """Game.Shared.EncounterModDialogSessionEventArgs (class 55).
+
+    The client opens the campaign conversation identified by
+    ``conversation_template_id`` and answers with an
+    ``EncounterModDialogTransaction``.  This is deliberately a session event
+    rather than a card-specific UI shortcut: ConversationAbilityEffectTemplate
+    uses the same wire contract for every authored ability.
+    """
+    CLASS_ID = 55
+
+    def __init__(self):
+        super().__init__()
+        self.player_id = UID.invalid()
+        self.conversation_template_id = ResourceId.invalid()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_uid(self.player_id)
+        self.ser.add_resource_id(self.conversation_template_id)
+        return self.end_write()
+
+
 class TurnPhaseUpdatedSessionEventArgs(SessionEventArgs):
     CLASS_ID = 3
 

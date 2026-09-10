@@ -1,6 +1,7 @@
 """Classification of GameSession PlayerTransaction payloads."""
 
 from dataclasses import dataclass
+import re
 
 
 def _transaction_fields(inner_bytes):
@@ -40,6 +41,27 @@ def _extract_enum_int(inner_bytes, field):
         return None
 
 
+def extract_resource_guid(inner_bytes, field):
+    """Extract a GUID-backed ResourceId field from an ObjFmt transaction.
+
+    The generic ObjFmt decoder intentionally skips nested ResourceId values,
+    but conversation acknowledgements carry the only authoritative value in
+    ``ConversationId``.  Keep this parser narrowly scoped to a named field;
+    it does not infer rules from display text or from arbitrary GUIDs.
+    """
+    if not isinstance(inner_bytes, bytes):
+        return None
+    start = inner_bytes.find(str(field).encode())
+    if start < 0:
+        return None
+    match = re.search(
+        rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        inner_bytes[start:start + 512],
+    )
+    return match.group(0).decode().lower() if match else None
+
+
 @dataclass(frozen=True)
 class PlayerTransactionCommand:
     """Typed classification of a client PlayerTransaction request."""
@@ -64,6 +86,7 @@ class PlayerTransactionCommand:
     is_cancel_auto_pass: bool
     is_assign_damage: bool
     is_priority_sync: bool
+    is_encounter_mod_dialog: bool
 
 
 def classify_player_transaction(inner_bytes):
@@ -100,4 +123,5 @@ def classify_player_transaction(inner_bytes):
         is_cancel_auto_pass=b"CancelAutoPassTransaction" in raw,
         is_assign_damage=b"AssignDamageOrderTransaction" in raw,
         is_priority_sync=b"RequestPrioritySyncTransaction" in raw,
+        is_encounter_mod_dialog=b"EncounterModDialogTransaction" in raw,
     )

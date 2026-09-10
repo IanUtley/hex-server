@@ -241,6 +241,41 @@ class EffectContext:
         return self.draw(
             count, owner=self.target_owner(default=None))
 
+    def conversation(self) -> str:
+        """Queue the typed encounter conversation and pause this BOM.
+
+        ConversationAbilityEffectTemplate is a protocol boundary: the
+        original client opens a UI animation and sends a transaction before
+        the remaining effects may resolve.  The battle handler owns the
+        persisted continuation and wire event; this context only supplies the
+        typed conversation ID and current ability state.
+        """
+        conversation_id = self.template_value("m_ConversationId", "")
+        if isinstance(conversation_id, dict):
+            conversation_id = conversation_id.get("m_Guid", "")
+        conversation_id = str(conversation_id or "").lower()
+        if not conversation_id or conversation_id == "0" * 8 + "-" + "0" * 4 + "-" + "0" * 4 + "-" + "0" * 4 + "-" + "0" * 12:
+            return "conversation: invalid id"
+        queue = getattr(self.handler, "_queue_conversation_prompt", None)
+        if callable(queue):
+            return queue(
+                self.game, self.session, self.player_uid, self.ai_uid,
+                self.bstate, conversation_id,
+            )
+        # Headless adapters may not expose a wire handler. Preserve the same
+        # continuation marker so tests can assert that the effect pauses
+        # instead of silently succeeding.
+        self.bstate["pending_conversation"] = {
+            "conversation_id": conversation_id,
+            "ability_guid": self.ability_guid,
+            "source_uid": self.bstate.get("resolving_source_uid"),
+            "owner_id": self.bstate.get("resolving_owner_id", 0),
+            "resume_effect_order": int(
+                self.bstate.get("resolving_effect_order", 0)) + 1,
+        }
+        self.bstate["resolution_paused"] = True
+        return f"conversation: awaiting {conversation_id}"
+
     def put_top_into_hand(self) -> str:
         """Put typed-count deck cards into the caster's hand."""
         import game_engine

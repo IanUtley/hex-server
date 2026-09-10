@@ -78,6 +78,12 @@ def _leaf_draw(effect):
     return effect.draw_effect()
 
 
+@effect("ConversationAbilityEffectTemplate")
+def _leaf_conversation(effect):
+    """Open the authored encounter conversation and suspend the BOM."""
+    return effect.conversation()
+
+
 @effect("PutTopOfDeckIntoHandAbilityEffectTemplate")
 def _leaf_put_top_into_hand(effect):
     """Put typed-count deck cards into the caster's hand."""

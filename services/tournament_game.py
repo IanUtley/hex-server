@@ -4126,6 +4126,8 @@ def pvp_handle_transaction(handler, session, inner_bytes):
     if len(pids) < 2:
         return False
     my_pid = int(handler.client_reck_id) if hasattr(handler, 'client_reck_id') else 0
+    if b"EncounterModDialogTransaction" in inner_bytes:
+        return _pvp_resolve_conversation(handler, session, inner_bytes, my_pid)
     # A class-39 answer (deck search, revealed-card choice, or Shards of
     # Fate) is named SetAbilityActivationDataTransaction in the client model,
     # but the serialized transaction contains only AbilityActivationData.
@@ -4653,6 +4655,110 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
         pvp_push_main_phase_options(session, state)
     log_req(f"    PvP choice selected: {hex(int(chosen_uid))}; "
             "choice sequence complete")
+    return True
+
+
+def _pvp_resolve_conversation(handler, session, inner_bytes, my_pid):
+    """Resume a metadata BOM after a class-55 encounter conversation."""
+    from application.player_transactions import extract_resource_guid
+    import battle_engine as _be
+
+    state = pvp_load_state(session) or {}
+    pending = state.get("pending_conversation")
+    if not pending:
+        handler._push_transaction_ack(session)
+        return True
+    conversation_id = extract_resource_guid(inner_bytes, "ConversationId")
+    expected = str(pending.get("conversation_id", "")).lower()
+    if conversation_id and conversation_id != expected:
+        log_req(f"    PvP conversation answer rejected: got {conversation_id}, expected {expected}")
+        handler._push_transaction_ack(session)
+        return True
+    owner_id = int(pending.get("owner_id", 0) or 0)
+    if int(my_pid) != owner_id:
+        log_req(f"    PvP conversation answer rejected: pid {my_pid} is not owner {owner_id}")
+        handler._push_transaction_ack(session)
+        return True
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        handler._push_transaction_ack(session)
+        return True
+    opp_pid = pids[0] if pids[1] == owner_id else pids[1]
+    state.pop("pending_conversation", None)
+    state.pop("resolution_paused", None)
+    pl_t = _ge.UID.make(244, owner_id)
+    ai_t = _ge.UID.make(244, opp_pid)
+    view = _pvp_fra_view(state, owner_id, opp_pid)
+    view.pop("pending_conversation", None)
+    view.pop("resolution_paused", None)
+    game = _ge.Game(int(session.session_id), pl_t, ai_t)
+    _pvp_populate_game_state(game, state, owner_id, opp_pid)
+    from abilities.framework.resolution import resolve_ability
+    ability_owner_id = int(pending.get(
+        "ability_owner_id", owner_id) or owner_id)
+    resolve_ability(
+        handler, game, session, _db, pl_t, ai_t, view,
+        pending.get("ability_guid", ""), pending.get("source_uid"),
+        ability_owner_id,
+        target_map={int(k): v for k, v in
+                    (pending.get("target_map") or {}).items()},
+        variables=pending.get("variables") or {},
+        resume_from_order=int(pending.get("resume_effect_order", 0)),
+    )
+    state["stack"] = view.get("stack") or []
+    state["stack_player_passed"] = False
+    state["stack_ai_passed"] = False
+    state["stack_passed"] = []
+    _pvp_sync_view_to_state(state, view, owner_id, opp_pid)
+    persisted = pvp_load_state(session) or {}
+    for key in ("pending_trigger", "pending_deck_search", "pending_choice",
+                "pending_conversation"):
+        if persisted.get(key):
+            state[key] = persisted[key]
+    pvp_save_state(session, state)
+    _pvp_send_same_events(session, game, pl_t, ai_t)
+
+    pending_input = (state.get("pending_conversation") or
+                     state.get("pending_choice") or
+                     state.get("pending_trigger") or
+                     state.get("pending_deck_search"))
+    if pending_input:
+        log_req("    PvP conversation resumed into another pending input")
+        return True
+
+    if _be.stack_empty(state):
+        turn_pid = int(state.get("turn_pid") or owner_id)
+        state["priority_pid"] = turn_pid
+        pvp_save_state(session, state)
+        turn_h = player_handlers.get(turn_pid)
+        if turn_h:
+            turn_uid = _ge.UID.make(244, turn_pid)
+            other_uid = _ge.UID.make(244, pids[1] if turn_pid == pids[0] else pids[0])
+            resume = _ge.Game(int(session.session_id), turn_uid, other_uid)
+            resume.push_chain_empty()
+            resume.push_green_light(turn_uid, _ge.EPriorityContext.Normal)
+            _send_pvp_packet(turn_h, session, resume, turn_uid,
+                             "conversation-chain-empty")
+        phase = int(state.get("phase", 0))
+        if phase in (_ge.ETurnPhases.FirstMainPhase,
+                     _ge.ETurnPhases.SecondMainPhase):
+            pvp_push_main_phase_options(session, state)
+    else:
+        resume_pid = int(state.get("conversation_resume_priority_pid", owner_id) or owner_id)
+        next_pid = pids[1] if resume_pid == pids[0] else pids[0]
+        state["priority_pid"] = next_pid
+        pvp_save_state(session, state)
+        next_h = player_handlers.get(next_pid)
+        if next_h:
+            next_uid = _ge.UID.make(244, next_pid)
+            other_uid = _ge.UID.make(244, pids[1] if next_pid == pids[0] else pids[0])
+            resume = _ge.Game(int(session.session_id), next_uid, other_uid)
+            resume.push_green_light(next_uid,
+                                    _ge.EPriorityContext.ResolveTopOfChain)
+            _send_pvp_packet(next_h, session, resume, next_uid,
+                             "conversation-chain-next")
+    handler._push_transaction_ack(session)
+    log_req(f"    PvP conversation resolved: {expected[:8]}")
     return True
 
 
@@ -5676,7 +5782,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
     # the ordinary chain-empty/priority packet over the picker.
     persisted = pvp_load_state(session) or {}
     for _pending_key in ("pending_trigger", "pending_deck_search",
-                         "pending_choice"):
+                         "pending_choice", "pending_conversation"):
         if persisted.get(_pending_key):
             state[_pending_key] = persisted[_pending_key]
     chain_empty = _be.stack_empty(state)
@@ -5685,6 +5791,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
         == "revealed_troop")
     pending_trigger = bool(state.get("pending_trigger"))
     pending_choice = bool(state.get("pending_choice"))
+    pending_conversation = bool(state.get("pending_conversation"))
     # Shards of Fate / Adaptable Infusion Device sends a private class-39
     # deck picker to the controller.  Its picker packet already owns the
     # next green-light; sending the normal chain-empty/options packet here
@@ -5692,7 +5799,8 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
     pending_deck_search = bool(state.get("pending_deck_search"))
     _pvp_log_stack(state, "resolve")
     if chain_empty and not (pending_revealed_choice or pending_deck_search
-                            or pending_trigger or pending_choice):
+                            or pending_trigger or pending_choice or
+                            pending_conversation):
         g.push_chain_empty()
     pvp_save_state(session, state)
     # State-based deaths: when the stack empties, troops at <=0 effective
@@ -5742,6 +5850,13 @@ def _pvp_resolve_chain(session, state, handler, my_pid):
         # replace it with a chain-empty/normal-priority packet.
         pvp_save_state(session, state)
         log_req("    PvP chain paused for card choice")
+        return True
+    if chain_empty and pending_conversation:
+        # Class 55 was sent privately to the controller by the conversation
+        # effect.  Do not replace it with chain-empty/priority events until
+        # EncounterModDialogTransaction resumes the BOM.
+        pvp_save_state(session, state)
+        log_req("    PvP chain paused for encounter conversation")
         return True
     # Chain damage can kill a champion (e.g. burn / Lifedrain) — end the game
     # properly instead of continuing into the next priority handoff.

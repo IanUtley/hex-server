@@ -1003,6 +1003,9 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     bstate["_choice_parent"] = {
                         "ability_guid": ability_guid,
                         "resume_effect_order": int(eff["effect_order"]) + 1,
+                        "owner_id": int(owner_id),
+                        "target_map": dict(target_map or {}),
+                        "variables": dict(variables or {}),
                     }
                     try:
                         logs.append(resolve_ability(

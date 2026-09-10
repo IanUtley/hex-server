@@ -21,6 +21,7 @@ from domain.events import (
     SessionEventArgs,
     GameStartedSessionEventArgs,
     GameEndedSessionEventArgs,
+    EncounterModDialogSessionEventArgs,
     TurnPhaseUpdatedSessionEventArgs,
     ChessTimerUpdatedSessionEventArgs,
     PlayerMulliganedHandSessionEventArgs,

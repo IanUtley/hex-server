@@ -48,6 +48,13 @@ class _Game:
         self.events.append(event)
 
 
+class _ConversationHandler:
+    def queue(self, game, session, player_uid, ai_uid, bstate, conversation_id):
+        bstate["queued_conversation"] = conversation_id
+        bstate["resolution_paused"] = True
+        return "queued"
+
+
 def test_context_decorator_adapts_legacy_leaf_arguments():
     seen = {}
 
@@ -177,6 +184,25 @@ def test_context_draw_preserves_owner_and_handler_boundary():
     assert context.draw(2) == "draw 2 for owner 5"
     assert len(handler.calls) == 2
     assert all(call[-1] == 5 for call in handler.calls)
+
+
+def test_context_conversation_uses_typed_id_and_pauses_at_handler_boundary():
+    handler = _ConversationHandler()
+    context = EffectContext.from_legacy(
+        _Game(), _Session(), _DB(), handler, "player", "ai",
+        {"resolving_ability": "ability-guid",
+         "resolving_source_uid": 123,
+         "resolving_effect_order": 4},
+        "conversation-effect", "")
+    with mock.patch.object(
+            handler, "_queue_conversation_prompt", handler.queue, create=True), \
+         mock.patch.object(
+             context, "template_value",
+             return_value="11111111-2222-3333-4444-555555555555"):
+        assert context.conversation() == "queued"
+    assert context.bstate["queued_conversation"] == \
+        "11111111-2222-3333-4444-555555555555"
+    assert context.bstate["resolution_paused"] is True
 
 
 def test_tac_decoder_preserves_append_to_list_metadata():

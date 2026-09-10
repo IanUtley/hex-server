@@ -16,8 +16,18 @@ from application.commands import (ClaimMailCommand, DeleteMailCommand,
                                   SetSessionStateCommand,
                                   StartEncounterCommand, StartSessionCommand)
 from application.results import SessionRemoved
-from application.player_transactions import classify_player_transaction
+from application.player_transactions import (classify_player_transaction,
+                                              extract_resource_guid)
 import db
+
+
+def test_conversation_transaction_is_classified_and_guid_is_extractable():
+    raw = (b"EncounterModDialogTransaction;ConversationId;m_Guid;"
+           b"11111111-2222-3333-4444-555555555555")
+    command = classify_player_transaction(raw)
+    assert command.is_encounter_mod_dialog is True
+    assert extract_resource_guid(raw, "ConversationId") == \
+        "11111111-2222-3333-4444-555555555555"
 
 
 def _make_db():

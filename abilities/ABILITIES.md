@@ -718,11 +718,12 @@ per-target leaf. Random target templates are likewise resolved from their
 metadata filter and count, even when the template is not marked as an
 auto-target in the extracted record.
 
-`ConversationAbilityEffectTemplate` is the remaining unregistered effect
-family. It is deliberately left for human guidance because it starts authored
-campaign/UI conversations rather than changing card state; implementing it
-requires deciding which campaign conversation and client presentation each
-record should invoke.
+`ConversationAbilityEffectTemplate` has an explicit continuation path. Its
+typed `ConversationId` is emitted as the client's class-55 conversation dialog
+event; the ability remains paused until the matching
+`EncounterModDialogTransaction` resumes the same effect chain. This keeps
+campaign/UI conversations separate from ordinary card-state effects while
+allowing metadata-defined records to invoke them in both game modes.
 
 ### Triggered-ability handling (`abilities/framework/triggers.py`, `deathcry.py`)
 `resolve_triggers` fires abilities whose `card_abilities_meta.trigger_event_type`
