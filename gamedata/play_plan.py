@@ -216,7 +216,15 @@ class AbilityInstance:
     @property
     def is_triggered(self) -> bool:
         return bool(self.graph and self.graph.trigger_event_type
-                    or self.graph and self.graph.trigger_condition)
+            or self.graph and self.graph.trigger_condition)
+
+    @property
+    def is_scrounge(self) -> bool:
+        """Whether this graph is the authored Scrounge card ability."""
+        if self.graph is None:
+            return False
+        from abilities.framework.tac import tac_int
+        return bool(tac_int(self.graph.serialized_tac, "Scrounge", 0))
 
     @property
     def costs(self) -> AbilityCost:

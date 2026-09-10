@@ -3436,6 +3436,22 @@ def push_pvp_game_start(handler, session, log_req=log_req):
         player_t = pl_t if is_me else opp_t
         game2.push_deck_created(player_t)
 
+    # The stock client emits PreGameEvent after both decks have been created,
+    # before PickGoesFirst. Run the same metadata trigger dispatcher for both
+    # deck owners and persist the resulting state, guarded so reconnects do
+    # not apply deck abilities twice.
+    if not state.get("pvp_pregame_done"):
+        from abilities.framework.triggers import resolve_triggers
+        for owner_pid in pids:
+            owner_handler = player_handlers.get(int(owner_pid)) or handler
+            owner_handler._current_bstate = state
+            resolve_triggers(
+                _db, owner_handler, game2, session, pl_t, opp_t, state,
+                "PreGameEvent", None, source_owner_uid=int(owner_pid),
+                zones=("deck",))
+        state["pvp_pregame_done"] = True
+        pvp_save_state(session, state)
+
     # PickGoesFirst with correct turn player.  GreenLight must precede the
     # phase in the same packet for the winner, otherwise UIBattle sees local
     # priority before HasPriority is set and immediately requests a resync.

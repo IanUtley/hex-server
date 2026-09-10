@@ -1207,7 +1207,7 @@ class HCPHandler:
         return selections, used
 
     def _apply_card_play_costs(self, game, session, bstate, pl_t, ai_t,
-                               selections):
+                               selections, source_uid=None, scrounge=False):
         """Apply card-level CostInstances before a card enters the chain."""
         from db import db_discard_card, db_randomly_insert_deck_cards
         from abilities.framework.triggers import resolve_triggers
@@ -1239,6 +1239,15 @@ class HCPHandler:
                 nulling=location == "deck")
             game.push_card_moved(
                 scid, owner, collection, game_engine.ECardLocations.Top, 0)
+
+        voided_uids = []
+        source_owner_id = None
+        if source_uid is not None:
+            source_row = _db.execute(
+                "SELECT user_id FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (session.session_id, int(source_uid))).fetchone()
+            source_owner_id = int(source_row[0] or 0) if source_row else 0
 
         for spec, selected in selections:
             kind = spec["kind"]
@@ -1295,6 +1304,8 @@ class HCPHandler:
                         "card_state=0 WHERE session_id=? AND card_uid=?",
                         (destination, session.session_id, uid))
                     _db.commit()
+                    if destination == "void":
+                        voided_uids.append(uid)
                     if destination == "deck":
                         db_randomly_insert_deck_cards(
                             session.session_id, owner_id, [uid], connection=_db)
@@ -1309,6 +1320,18 @@ class HCPHandler:
                         "CardDiscardedEvent", uid, owner_id,
                         event_source_collection=row[1],
                         event_destination_collection="discard")
+
+        # Scrounge fires after the void costs have been paid. The client also
+        # exposes those exact instances through the active ability's
+        # VoidedCards list, so downstream metadata effects can use them.
+        if scrounge and voided_uids and source_uid is not None:
+            bstate.setdefault("ability_lists", {})["VoidedCards"] = list(
+                voided_uids)
+            resolve_triggers(
+                _db, self, game, session, pl_t, ai_t, bstate,
+                "CardScroungedEvent", int(source_uid),
+                source_owner_uid=source_owner_id,
+                event_tac={"voided_cards": list(voided_uids)})
 
     @staticmethod
     def _set_cost_instance_bounds(cost_instance, minimum, maximum):
@@ -7730,7 +7753,10 @@ class HCPHandler:
                 db_set_card_played_to_zone(session.session_id, tid, 'CastSpells')
                 # Push chain events
                 self._apply_card_play_costs(
-                    g3, session, bstate, pl_t, ai_t, cost_selections)
+                    g3, session, bstate, pl_t, ai_t, cost_selections,
+                    source_uid=tid,
+                    scrounge=any(getattr(ability, "is_scrounge", False)
+                                 for ability in play_plan.cast_abilities))
                 g3.push_card_updated(scid_played, pl_t, game_engine.ECardCollections.CastSpells,
                                     game_engine.card_type_from_db(played_card_type),
                                     template_id=crow[0], cost=cost, attack=atk, defense=def_, gems=gem)
@@ -10937,6 +10963,7 @@ class HCPHandler:
                     ai_template_rows = {}
                     ai_materialized = []
                     ai_insert_rows = []
+                    hidden_bstate = {}
                     for pos, (cg, gem_type, gem_ability_guids) in enumerate(
                             ai_card_specs):
                         cid = game._new_card_id()
@@ -11001,6 +11028,32 @@ class HCPHandler:
                         # batch is visible. This preserves gem and scene setup
                         # behavior without a SELECT/UPDATE pair per card.
                         self._card_full_data(game, cid, cg)
+                        if _is_scene_mod:
+                            # Scene setup cards are hidden battleboard cards.
+                            # The client emits both zone-entry events when a
+                            # hidden permanent is placed into the warzone;
+                            # keep DeployHidden on the same generic trigger
+                            # dispatcher instead of treating setup cards as a
+                            # special list of encounter names.
+                            _abil_cc.resolve_triggers(
+                                _db, self, game, session, pl_uid_t, ai_uid_t,
+                                hidden_bstate, "HiddenCardEnteredZoneEvent",
+                                cid.uid.to_uint64(), 0, zones=("mod",),
+                                event_source_collection="mod",
+                                event_destination_collection="warzone")
+                            # Setup happens before the persistent battle-state
+                            # stack exists. Hidden deploy abilities are not
+                            # universally marked IgnoresChain in the source
+                            # metadata, so drain their local setup chain here
+                            # using the same authoritative resolver.
+                            _hidden_resolved = 0
+                            while (hidden_bstate.get("stack") and
+                                   _hidden_resolved < 256):
+                                _hidden_item = hidden_bstate["stack"].pop()
+                                _abil_cc.resolve_stack_trigger(
+                                    self, game, session, _db, pl_uid_t,
+                                    ai_uid_t, hidden_bstate, _hidden_item)
+                                _hidden_resolved += 1
                     _db.commit()
                     source = (f"encounter {ai_deck_guid}" if ai_deck_guid
                               else "player mirror" if is_practice
@@ -11053,6 +11106,38 @@ class HCPHandler:
                 _abil_cc.resolve_triggers(
                     _db, self, game, session, pl_uid_t, ai_uid_t, cc_bstate,
                     "CardCreatedEvent", cid.uid.to_uint64(), 0, zones=())
+
+            # PreGameState enqueues one metadata event for each champion after
+            # the decks exist, so deck-held PreGame abilities must be resolved
+            # from the live card ability lists before the opening hand is
+            # dealt.  This is intentionally one shared event path for PVE
+            # player and encounter decks; champion talent setup below remains
+            # the separate champion-source compatibility path.
+            import ability as _abil_pregame
+            pregame_bstate = {
+                "stack": [],
+                "ability_lists": {},
+                "player_health": int(game.player_health),
+                "ai_health": int(game.ai_health),
+                "player_resources": int(getattr(game, "player_resources", 0)),
+                "ai_resources": int(getattr(game, "ai_resources", 0)),
+            }
+            _abil_pregame.resolve_triggers(
+                _db, self, game, session, pl_uid_t, ai_uid_t,
+                pregame_bstate, "PreGameEvent", None,
+                source_owner_uid=self.user_profile["id"], zones=("deck",))
+            _abil_pregame.resolve_triggers(
+                _db, self, game, session, pl_uid_t, ai_uid_t,
+                pregame_bstate, "PreGameEvent", None,
+                source_owner_uid=0, zones=("deck",))
+            game.player_health = int(pregame_bstate.get(
+                "player_health", game.player_health))
+            game.ai_health = int(pregame_bstate.get(
+                "ai_health", game.ai_health))
+            game.player_resources = int(pregame_bstate.get(
+                "player_resources", getattr(game, "player_resources", 0)))
+            game.ai_resources = int(pregame_bstate.get(
+                "ai_resources", getattr(game, "ai_resources", 0)))
             # NOTE: the AI's mulligan decision is NOT made here. It happens as
             # part of the Mulligan phase, resolved after the human acts (keep or
             # redraw) — see the 3029 handler's _resolve_ai_mulligan.

@@ -38,7 +38,7 @@ from .framework.bom import (_LEAFS, _walk_bom, leaf_register, bom_has_leaf,
 from .framework.builder import AbilityBuilder, CostRef, EffectRef, TargetRef
 from .framework.context import EffectContext
 from .framework.effects.registry import effect
-from .framework.tac import decode_tac, tac_guid, tac_function
+from .framework.tac import decode_tac, tac_guid, tac_function, tac_int
 from .framework.conditions import register_condition, evaluate_condition, apply_pregame_abilities
 from .framework.kill_troop import kill_troop, state_based_deaths
 from .framework.transform import transform_card
@@ -170,6 +170,15 @@ def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
                 raise RuntimeError(
                     f"played ability {ag.lower()} is missing from current Records")
             activation = activation_map.get(ag.lower())
+            # A Scrounge graph is part of the card's normal ability list, but
+            # only fires when this play paid a void-card Scrounge cost.  The
+            # client stores that distinction in the ability TAC; it is not a
+            # separate card-specific rule.
+            from .framework.tac import tac_int
+            if (tac_int(graph.serialized_tac, "Scrounge", 0) and
+                    not ((bstate.get("ability_lists") or {}).get(
+                        "VoidedCards") or [])):
+                continue
             target_map = (dict(activation.target_map)
                           if activation is not None else {})
             if not target_map and target_uid is not None:

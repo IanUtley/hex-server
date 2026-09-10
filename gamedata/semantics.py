@@ -72,6 +72,7 @@ class AbilityGraph:
     effects: tuple[EffectSpec, ...]
     variables: tuple[RecordObject, ...]
     source: AbilityTemplate
+    serialized_tac: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +216,8 @@ def ability_graph(store: RecordStore, ability_guid: str) -> AbilityGraph | None:
         variables=tuple(value for value in ability.variables
                         if isinstance(value, RecordObject)),
         source=ability,
+        serialized_tac=str(_field(ability.field("m_SerializedTAC", {}),
+                                  "data", "") or ""),
     )
 
 
