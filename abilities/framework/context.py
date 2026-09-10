@@ -1620,11 +1620,22 @@ class EffectContext:
                     "UPDATE collections SET quantity=quantity-1 "
                     "WHERE user_id=? AND card_template_id=? AND quantity>0",
                     (user_id, original))
-            self.db.execute(
-                "INSERT INTO collections(user_id, card_template_id, quantity) "
-                "VALUES (?, ?, 1) ON CONFLICT(user_id, card_template_id) "
-                "DO UPDATE SET quantity=quantity+1",
-                (user_id, new_template))
+            # ``collections`` deliberately has a surrogate primary key and
+            # only a non-unique lookup index.  Use the same merge semantics as
+            # db_add_collection instead of relying on an UPSERT target that
+            # the schema does not declare unique.
+            existing = self.db.execute(
+                "SELECT id FROM collections WHERE user_id=? "
+                "AND card_template_id=? ORDER BY id LIMIT 1",
+                (user_id, new_template)).fetchone()
+            if existing:
+                self.db.execute(
+                    "UPDATE collections SET quantity=quantity+1 WHERE id=?",
+                    (existing[0],))
+            else:
+                self.db.execute(
+                    "INSERT INTO collections(user_id, card_template_id, quantity) "
+                    "VALUES (?, ?, 1)", (user_id, new_template))
             self.db.commit()
             return f"replaced collection card with {new_template[:8]}"
 

@@ -967,7 +967,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     applied[inst_id] = False
                     continue
                 child = (eff["param"] or "").lower()
-                if not child:
+                if not child or child == "00000000-0000-0000-0000-000000000000":
                     applied[inst_id] = False
                     continue
                 for t_uid in uids:
