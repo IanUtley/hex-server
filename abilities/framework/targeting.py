@@ -33,6 +33,9 @@ ZONE_MAP = {
 ALL_TARGET_ZONES = tuple(ZONE_MAP.values())
 
 _TEMPLATE_FACTIONS = None
+_RECORD_GUIDS = {}
+_EQUIPMENT_CARD_INFO = None
+_EQUIPMENT_TYPES = None
 
 
 def template_faction(template_guid):
@@ -71,6 +74,114 @@ def template_faction(template_guid):
         except OSError:
             pass
     return _TEMPLATE_FACTIONS.get(guid, "")
+
+
+def template_is_mercenary(template_guid):
+    """Match IsMercenaryFilter against the extracted champion templates."""
+    guid = str(template_guid or "").lower()
+    if not guid:
+        return False
+    values = _RECORD_GUIDS.get("MercenaryTemplate")
+    if values is None:
+        values = set()
+        path = Path(__file__).resolve().parents[2] / "Records" / \
+            "MercenaryTemplate.jsonl"
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        value = json.loads(line)
+                        if isinstance(value, str):
+                            value = json.loads(
+                                re.sub(r",\s*([}\]])", r"\1", value))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    ident = value.get("m_Id") or {}
+                    if ident.get("m_Guid"):
+                        values.add(str(ident["m_Guid"]).lower())
+        except OSError:
+            pass
+        _RECORD_GUIDS["MercenaryTemplate"] = values
+    return guid in values
+
+
+def template_equipment_match(template_guid, equipment_type="None"):
+    """Match the client's IsEquippedCardFilter from CardTemplate TAC data."""
+    global _EQUIPMENT_CARD_INFO, _EQUIPMENT_TYPES
+    guid = str(template_guid or "").lower()
+    if not guid:
+        return False
+    if _EQUIPMENT_CARD_INFO is None:
+        from .tac import _tac_attr_hash, decode_tac_tree
+        _EQUIPMENT_CARD_INFO = {}
+        path = Path(__file__).resolve().parents[2] / "Records" / \
+            "CardTemplate.jsonl"
+        required_hash = _tac_attr_hash("RequiredEquipment")
+        guid_hash = _tac_attr_hash("Guid")
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        value = json.loads(line)
+                        if isinstance(value, str):
+                            value = json.loads(
+                                re.sub(r",\s*([}\]])", r"\1", value))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    ident = value.get("m_Id") or {}
+                    card_guid = str(ident.get("m_Guid") or "").lower()
+                    if not card_guid:
+                        continue
+                    if not value.get("m_EquipmentModifiedCard"):
+                        continue
+                    tac = value.get("m_SerializedTAC") or {}
+                    data = tac.get("data", "") if isinstance(tac, dict) else ""
+                    tree = decode_tac_tree(data)
+                    required = set()
+                    for entry in tree.get(required_hash, []) if isinstance(
+                            tree.get(required_hash), list) else []:
+                        if isinstance(entry, dict) and isinstance(
+                                entry.get(guid_hash), str):
+                            required.add(entry[guid_hash].lower())
+                    _EQUIPMENT_CARD_INFO[card_guid] = required
+        except OSError:
+            pass
+    required = _EQUIPMENT_CARD_INFO.get(guid)
+    if required is None:
+        return False
+    if str(equipment_type or "None").lower() == "none":
+        return True
+    if _EQUIPMENT_TYPES is None:
+        _EQUIPMENT_TYPES = {}
+        path = Path(__file__).resolve().parents[2] / "Records" / \
+            "InventoryItemData.jsonl"
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "InventoryEquipmentData" not in line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                        if isinstance(value, str):
+                            value = json.loads(
+                                re.sub(r",\s*([}\]])", r"\1", value))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    ident = value.get("m_Id") or {}
+                    item_guid = str(ident.get("m_Guid") or "").lower()
+                    if item_guid and value.get("m_EquipmentType"):
+                        _EQUIPMENT_TYPES[item_guid] = str(
+                            value["m_EquipmentType"]).lower()
+        except OSError:
+            pass
+    wanted = str(equipment_type).lower()
+    return any(_EQUIPMENT_TYPES.get(item) == wanted for item in required)
 
 
 def shards_from_threshold(threshold_json):
@@ -151,8 +262,55 @@ def _blocking_targets(battle_state, source_uid):
     return set()
 
 
+def _compare_value(actual, op, expected):
+    """Apply the client's EComparisons values to ordinary integers."""
+    if op in ("OneLessThan", "OneMoreThan", "TwoMoreThan"):
+        expected += {"OneLessThan": -1, "OneMoreThan": 1,
+                     "TwoMoreThan": 2}[op]
+        return actual == expected
+    return {"GreaterThanOrEqual": actual >= expected,
+            "LessThanOrEqual": actual <= expected,
+            "Equal": actual == expected,
+            "Equals": actual == expected,
+            "GreaterThan": actual > expected,
+            "LessThan": actual < expected}.get(op, True)
+
+
+def _filter_zones(collections):
+    return {ZONE_MAP.get(z, z.lower()) for z in
+            str(collections or "").split("|") if z}
+
+
+def _player_matches(card, source_card, player_filter):
+    """Match Compare*Filter's EPlayerCardTargets against a live card."""
+    owner = card.get("user_id")
+    source_owner = (source_card or {}).get("src_owner_id",
+                    (source_card or {}).get("user_id"))
+    if str(player_filter or "").lower() in {"self", "you", "controller"}:
+        return owner == source_owner
+    if str(player_filter or "").lower() in {
+            "opponent", "opposing", "singleopponent", "multipleopponents"}:
+        return owner != source_owner
+    return True
+
+
+def _stored_uids(stored_names, ability_state):
+    values = []
+    for item in (ability_state or {}).get("stored_targets", {}).values():
+        values.extend(item or [])
+    for key in ("StoredTargets", "stored_targets"):
+        values.extend((ability_state or {}).get(key) or [])
+    if isinstance(stored_names, dict):
+        values.extend(stored_names.get("uids") or [])
+    try:
+        return {int(value) for value in values}
+    except (TypeError, ValueError):
+        return set()
+
+
 def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
-                         source_card=None):
+                         source_card=None, card_pool=None, champion_pool=None,
+                         ability_state=None, db=None):
     """Evaluate a gamedata CardFilter tree against one card.
 
     ``card`` is a dict with at least card_uid, card_type, location, user_id,
@@ -163,17 +321,20 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
         return True
     t = _last(filter_json.get("_t"))
     if t == "AndCardFilter":
-        return all(evaluate_card_filter(card, f, source_uid, stored_names,
-                                        source_card)
+        return all(evaluate_card_filter(
+            card, f, source_uid, stored_names, source_card, card_pool,
+            champion_pool, ability_state, db)
                    for f in filter_json.get("m_TargetFilters", []))
     if t == "OrCardFilter":
-        return any(evaluate_card_filter(card, f, source_uid, stored_names,
-                                        source_card)
+        return any(evaluate_card_filter(
+            card, f, source_uid, stored_names, source_card, card_pool,
+            champion_pool, ability_state, db)
                    for f in filter_json.get("m_TargetFilters", []))
     if t == "NotCardFilter":
         return not evaluate_card_filter(
             card, filter_json.get("m_TargetFilter", {}), source_uid,
-            stored_names, source_card)
+            stored_names, source_card, card_pool, champion_pool,
+            ability_state, db)
     if t == "IsType":
         wanted = set((filter_json.get("m_CardType", "") or "").split("|"))
         actual = set((card.get("card_type") or "").split("|"))
@@ -234,6 +395,36 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
     if t == "IsTapped":
         return bool(int(card.get("state", 0) or 0)
                     & int(game_engine.ECardStates.Tapped))
+    if t in ("BlockingFilter", "BeingBlockedByFilter"):
+        state = ability_state or {}
+        blocker_map = {}
+        for key in ("ai_blockers", "blockers"):
+            for attacker, blockers in (state.get(key) or {}).items():
+                try:
+                    blocker_map[int(attacker)] = {
+                        int(blocker) for blocker in blockers or []}
+                except (TypeError, ValueError):
+                    continue
+        card_uid = int(card.get("card_uid", 0) or 0)
+        if t == "BlockingFilter":
+            pairs = [(attacker, card_uid) for attacker, blockers in
+                     blocker_map.items() if card_uid in blockers]
+        else:
+            pairs = [(card_uid, blocker) for blocker in next(
+                (blockers for attacker, blockers in blocker_map.items()
+                 if attacker == card_uid), set())]
+        nested = filter_json.get("m_Filter") or {}
+        if not nested:
+            return bool(pairs)
+        by_uid = {int(item.get("card_uid", 0)): item
+                  for item in card_pool or []}
+        if source_card:
+            by_uid[int(source_card.get("card_uid", 0) or 0)] = source_card
+        return any(attacker in by_uid and evaluate_card_filter(
+            by_uid[attacker] if t == "BlockingFilter" else by_uid[blocker],
+            nested, source_uid, stored_names, source_card, card_pool,
+            champion_pool, ability_state, db)
+                   for attacker, blocker in pairs)
     if t in ("HasAllAttributeFlags", "HasAttribute"):
         wanted = (filter_json.get("m_CardAttributeFlags") or "")
         if not wanted:
@@ -439,6 +630,152 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
         card_subtypes = {x.lower() for x in
                          str(card.get("subtype") or "").split() if x}
         return bool(source_subtypes & card_subtypes)
+    if t == "HasASharedClassWithSourceChampionFilter":
+        if not source_card:
+            return False
+        champion_class = str(source_card.get("champion_class") or "").lower()
+        if not champion_class:
+            # Champion rows use subtype as their class in the fallback
+            # representation used by campaign/PvP setup.
+            champion_class = str(source_card.get("subtype") or "").lower()
+        return bool(champion_class) and champion_class in \
+            str(card.get("subtype") or "").lower()
+    if t == "HasASharedSubtypeWithSourceChampionFilter":
+        if not source_card:
+            return False
+        raw_subtypes = (source_card.get("champion_subtypes") or
+                        source_card.get("champion_subtype") or
+                        source_card.get("subtype") or "")
+        if isinstance(raw_subtypes, str):
+            raw_subtypes = raw_subtypes.split()
+        source_subtypes = {str(value).lower() for value in raw_subtypes if value}
+        card_subtypes = {str(value).lower() for value in
+                         str(card.get("subtype") or "").split() if value}
+        return bool(source_subtypes & card_subtypes)
+    if t == "HasKeywordAbility":
+        keyword = filter_json.get("m_Keyword") or ""
+        for ability_guid in card.get("card_abilities") or []:
+            if db is not None:
+                from .triggers import ability_matches_keyword
+                if ability_matches_keyword(db, ability_guid, keyword):
+                    return True
+            elif keyword.lower() in {str(value).lower() for value in
+                                     card.get("keywords") or []}:
+                return True
+        return False
+    if t == "IsSocketed":
+        if filter_json.get("m_CompareToAbilitySource"):
+            return bool(int(card.get("gems", 0) or 0) & int(
+                (source_card or {}).get("gems", 0) or 0))
+        count = int(card.get("gem_count", 0) or 0)
+        if filter_json.get("m_MustBeMinor") and not card.get("gem_is_minor"):
+            count = 0
+        return _compare_value(count,
+                              filter_json.get("m_ComparisonOp", "Equals"),
+                              int(filter_json.get("m_SocketedValue", 0) or 0))
+    if t == "IsMercenaryFilter":
+        return card.get("card_type") == "Champion" and template_is_mercenary(
+            card.get("template_guid"))
+    if t == "IsEquippedCardFilter":
+        return template_equipment_match(
+            card.get("template_guid"), filter_json.get("m_EquipmentType"))
+    if t == "InCollection":
+        wanted = _filter_zones(filter_json.get("m_CardSource"))
+        return not wanted or card.get("location") in wanted
+    if t == "IsStoredCardFilter":
+        return int(card.get("card_uid", 0) or 0) in _stored_uids(
+            stored_names, ability_state)
+    if t in ("IsChildOfAbilitySource", "IsChildOfAbilitySourceFilter"):
+        return int(card.get("parent_uid", 0) or 0) == int(source_uid or 0)
+    if t == "IsParentOfAbilitySourceFilter":
+        return int((source_card or {}).get("parent_uid", 0) or 0) == int(
+            card.get("card_uid", 0) or 0)
+    if t == "OtherTroops":
+        targeted = {int(value) for value in (ability_state or {}).get(
+            "targeted_uids", []) if value is not None}
+        return "Troop" in str(card.get("card_type") or "").split("|") and \
+            int(card.get("card_uid", 0) or 0) not in targeted
+    if t == "PlayersWhoControlMatchingFilter":
+        if card.get("card_type") != "Champion":
+            return False
+        pool = card_pool or []
+        collection = _filter_zones(filter_json.get("m_CardCollection"))
+        target_filter = filter_json.get("m_TargetFilter") or {}
+        count = sum(1 for candidate in pool
+                    if candidate.get("user_id") == card.get("user_id")
+                    and candidate.get("location") in collection
+                    and evaluate_card_filter(
+                        candidate, target_filter, source_uid, stored_names,
+                        source_card, pool, champion_pool, ability_state, db))
+        return _compare_value(count,
+                              filter_json.get("m_ComparisonOp", "Equals"),
+                              int(filter_json.get("m_RequiredQuantity", 0) or 0))
+    if t == "TACFilter":
+        serialized = filter_json.get("m_SerializedTAC") or {}
+        data = serialized.get("data", "") if isinstance(serialized, dict) \
+            else serialized
+        from .tac import tac_string
+        name = tac_string(data, "Name").lower()
+        if name == "isquick":
+            return bool({"QuickAction", "Quick"} & set(
+                str(card.get("card_type") or "").split("|")))
+        if name == "isbasic":
+            return not bool({"QuickAction", "Quick"} & set(
+                str(card.get("card_type") or "").split("|")))
+        if name == "playermeetsthresholdrequirementstocast":
+            thresholds = (ability_state or {}).get(
+                "player_threshold" if _side_of(card.get("user_id")) == "player"
+                else "ai_threshold", {})
+            return all(int(thresholds.get(shard, thresholds.get(str(shard), 0)) or 0)
+                       > 0 for shard in card.get("shards") or [])
+        return False
+    if t in ("CompareAttackToHighestFilter", "CompareAttackToLowestFilter",
+             "CompareResourceCostToHighestFilter"):
+        pool = card_pool or [card]
+        wanted_zones = _filter_zones(filter_json.get("m_CollectionFlags"))
+        nested = filter_json.get("m_CardFilter") or {}
+        values = []
+        for candidate in pool:
+            if wanted_zones and candidate.get("location") not in wanted_zones:
+                continue
+            if not _player_matches(candidate, source_card,
+                                   filter_json.get("m_PlayerFilter")):
+                continue
+            if not evaluate_card_filter(candidate, nested, source_uid,
+                                        stored_names, source_card, pool,
+                                        champion_pool, ability_state, db):
+                continue
+            field = "cost" if t == "CompareResourceCostToHighestFilter" \
+                else "attack"
+            values.append(int(candidate.get(field, 0) or 0))
+        if not values:
+            return False
+        extreme = max(values) if "Highest" in t else min(values)
+        field = "cost" if t == "CompareResourceCostToHighestFilter" else "attack"
+        return _compare_value(int(card.get(field, 0) or 0),
+                              filter_json.get("m_ComparisonOp", "Equals"),
+                              extreme)
+    if t == "CompareResourceCostToMyHighestFilter":
+        pool = card_pool or [card]
+        source_owner = (source_card or {}).get("src_owner_id",
+                        (source_card or {}).get("user_id"))
+        values = [int(candidate.get("cost", 0) or 0) for candidate in pool
+                  if candidate.get("user_id") == source_owner and
+                  candidate.get("location") == "warzone"]
+        if not values:
+            return False
+        return _compare_value(int(card.get("cost", 0) or 0),
+                              filter_json.get("m_ComparisonOp", "Equals"),
+                              max(values))
+    if t == "CompareHealthToHighestFilter":
+        pool = champion_pool or []
+        values = [int(champ[3] if not isinstance(champ, dict)
+                       else champ.get("defense", 0) or 0) for champ in pool]
+        if not values:
+            return False
+        return _compare_value(int(card.get("defense", 0) or 0),
+                              filter_json.get("m_ComparisonOp", "Equals"),
+                              max(values))
     if t == "CompareCastingCostToSourceCountersFilter":
         if not source_card:
             return True
@@ -576,6 +913,19 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     except Exception:
         fjson = {}
 
+    # A few isolated targeting fixtures intentionally use the pre-socket
+    # schema.  Build optional projections rather than making the evaluator
+    # depend on the newest runtime DB shape.
+    gc_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(game_cards)").fetchall()}
+    ct_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(card_templates)").fetchall()}
+    gc_gems = "gc.gems" if "gems" in gc_columns else "0"
+    gc_original = ("gc.original_template_guid"
+                   if "original_template_guid" in gc_columns else "''")
+    ct_rarity = "ct.rarity" if "rarity" in ct_columns else "''"
+    ct_sockets = "ct.socket_count" if "socket_count" in ct_columns else "0"
+
     # Filters such as HasSourceResourceCost and shared-source filters are
     # evaluated against the live source card by the original client.  Build
     # that context once and pass it through every candidate evaluation below;
@@ -586,10 +936,13 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
             "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
             "gc.template_guid, ct.name, COALESCE(ct.cost,0), ct.subtype, "
-            "ct.threshold_json, gc.card_attributes "
+            "ct.threshold_json, gc.card_attributes, %s, %s, %s, %s, %s, "
+            "gc.permanent_buffs "
             "FROM game_cards gc LEFT JOIN card_templates ct "
             "ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
+            "WHERE gc.session_id=? AND gc.card_uid=?" %
+            (ct_rarity, ct_sockets, gc_gems, gc_original,
+             "gc.card_abilities" if "card_abilities" in gc_columns else "'[]'"),
             (session_id, int(source_uid))).fetchone()
         if source_row:
             source_card = {
@@ -608,8 +961,30 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 "shards": shards_from_threshold(source_row[11]),
                 "attributes": int(source_row[12] or 0),
                 "faction": template_faction(source_row[7]),
+                "rarity": source_row[13] or "",
+                "socket_count": int(source_row[14] or 0),
+                "gems": int(source_row[15] or 0),
+                "original_template_guid": source_row[16] or "",
+                "card_abilities": json.loads(source_row[17] or "[]")
+                if isinstance(source_row[17], str) else (source_row[17] or []),
                 "counters": {}, "counter_guids": {}, "int_attrs": {},
             }
+            try:
+                source_buffs = json.loads(source_row[18] or "{}")
+                source_card["parent_uid"] = int(
+                    source_buffs.get("parent_uid", 0) or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    if source_card is None:
+        # Champion abilities use a SessionCardId that is not necessarily
+        # materialized in game_cards.  Keep ownership available to typed
+        # filters even when the source's printed card row is absent.
+        source_card = {"card_uid": int(source_uid or 0),
+                       "user_id": controller_uid,
+                       "src_owner_id": controller_uid,
+                       "src_owner_side": _side_of(controller_uid),
+                       "card_type": "Champion", "subtype": "",
+                       "shards": [], "card_abilities": []}
     top_n = _find_filter_type(fjson, "TopNOfDeck")
     blocking_filter = _find_filter_type(fjson, "BlockingFilter")
     blocking_targets = _blocking_targets(battle_state, source_uid) \
@@ -640,9 +1015,10 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
            "gc.template_guid, gc.card_state, "
            "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
            "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-           "gc.card_abilities, gc.permanent_buffs "
+           "gc.card_abilities, gc.permanent_buffs, %s, %s, %s, %s "
            "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-           "WHERE gc.session_id=?")
+           "WHERE gc.session_id=?" %
+           (ct_rarity, ct_sockets, gc_gems, gc_original))
     params = [session_id]
     placeholders = ",".join("?" * len(zones))
     sql += f" AND gc.location IN ({placeholders})"
@@ -653,8 +1029,9 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     sql += (" ORDER BY gc.user_id, gc.position" if top_n is not None
             else " ORDER BY gc.position")
     out = []
+    candidate_cards = []
     top_n_by_owner = {}
-    for cu, ctype, loc, uid, template_guid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs \
+    for cu, ctype, loc, uid, template_guid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs, rarity, socket_count, gems, original_template_guid \
             in db.execute(sql, params):
         int_attrs = {}
         counters = {}
@@ -669,8 +1046,10 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                     counters = dict(saved["counters"])
                 if isinstance(saved.get("counter_guids"), dict):
                     counter_guids = dict(saved["counter_guids"])
+            parent_uid = int(saved.get("parent_uid", 0) or 0) \
+                if isinstance(saved, dict) else 0
         except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+            parent_uid = 0
         try:
             for ability_guid in json.loads(card_abs or "[]"):
                 for _eg, _et, _ep in db.execute(
@@ -703,9 +1082,26 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 "subtype": subtype or "",
                 "int_attrs": int_attrs,
                 "faction": template_faction(template_guid),
+                "rarity": rarity or "",
+                "socket_count": int(socket_count or 0),
+                "gems": int(gems or 0),
+                "gem_count": 1 if int(gems or 0) else 0,
+                "original_template_guid": original_template_guid or "",
+                "parent_uid": parent_uid,
+                "card_abilities": json.loads(card_abs or "[]")
+                if isinstance(card_abs, str) else (card_abs or []),
                 "counters": counters,
                 "counter_guids": counter_guids,
                 "shards": shards_from_threshold(thresh)}
+        if int(gems or 0):
+            try:
+                gem_row = db.execute(
+                    "SELECT gem_type_name FROM gem_templates WHERE gem_type=?",
+                    (int(gems),)).fetchone()
+                card["gem_is_minor"] = bool(
+                    gem_row and "minor" in str(gem_row[0] or "").lower())
+            except Exception:
+                card["gem_is_minor"] = False
         if battle_state and battle_state.get("turn_player"):
             active = battle_state.get("turn_player")
             card["active_player_id"] = (
@@ -728,17 +1124,58 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             # TopHalfOfDeck limits the inspected portion of the deck before
             # applying the nested filter.
             top_n_by_owner.setdefault(int(uid or 0), []).append(card)
-        elif evaluate_card_filter(card, fjson, source_uid,
-                                  source_card=source_card):
-            out.append(int(cu))
+        else:
+            candidate_cards.append(card)
+
+    # Comparison filters inspect a collection that may be broader than the
+    # target template's own collection flags.  The current candidate pool is
+    # still the correct fallback for small fixtures and ordinary targets; the
+    # resolver supplies the complete live collection when it is available.
+    for card in candidate_cards:
+        if evaluate_card_filter(card, fjson, source_uid,
+                                source_card=source_card,
+                                card_pool=candidate_cards,
+                                champion_pool=champions or [],
+                                ability_state=battle_state, db=db):
+            out.append(int(card["card_uid"]))
 
     if top_n is not None:
-        amount = max(0, int(top_n.get("m_Amount", 1) or 1))
         nested = top_n.get("m_Filter") or {}
         selected = []
         for owner_cards in top_n_by_owner.values():
             if top_n.get("m_CountFromBottom"):
                 owner_cards = list(reversed(owner_cards))
+            amount = int(top_n.get("m_Amount", 1) or 1)
+            owner = owner_cards[0].get("user_id") if owner_cards else controller_uid
+            if top_n.get("m_AddSapphire"):
+                thresholds = (battle_state or {}).get(
+                    "player_threshold" if _side_of(owner) == "player"
+                    else "ai_threshold", {})
+                amount += int(thresholds.get(16, thresholds.get("16", 0)) or 0)
+            if top_n.get("m_AddX"):
+                amount += int((battle_state or {}).get(
+                    "x_cost_paid", (source_card or {}).get(
+                        "card_x_cost_paid", 0)) or 0)
+            if top_n.get("m_AddRemovedCounters"):
+                amount += int((battle_state or {}).get(
+                    "counter_cost_paid", 0) or 0) * int(
+                        top_n.get("m_AddRemovedCountersMultiplier", 1) or 1)
+            if top_n.get("m_AddSourceCardsAttack"):
+                amount += int((source_card or {}).get("attack", 0) or 0)
+            if top_n.get("m_AddSourceCardsDefense"):
+                amount += int((source_card or {}).get("defense", 0) or 0)
+            if top_n.get("m_AddSourceCardsCost"):
+                amount += int((source_card or {}).get("cost", 0) or 0)
+            if top_n.get("m_AddDamageDealt"):
+                amount += int((battle_state or {}).get("damage_dealt", 0) or 0)
+            if top_n.get("m_AddDamageThatWouldBeDealt"):
+                amount += int((battle_state or {}).get(
+                    "damage_that_would_be_dealt", 0) or 0)
+            variable = top_n.get("m_AddCardIntegerVariable") or ""
+            if variable:
+                amount += int((source_card or {}).get("int_attrs", {}).get(
+                    variable, 0) or 0)
+            amount = max(0, amount)
             if top_n.get("m_TopHalfOfDeck"):
                 inspect = owner_cards[:(len(owner_cards) + 1) // 2]
                 selected.extend(
@@ -746,12 +1183,17 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                     for card in inspect
                     if amount > 0 and
                     evaluate_card_filter(card, nested, source_uid,
-                                         source_card=source_card))
+                                         source_card=source_card,
+                                         card_pool=owner_cards,
+                                         ability_state=battle_state, db=db))
             else:
                 owner_count = 0
                 for card in owner_cards:
                     if not evaluate_card_filter(card, nested, source_uid,
-                                                source_card=source_card):
+                                                source_card=source_card,
+                                                card_pool=owner_cards,
+                                                ability_state=battle_state,
+                                                db=db):
                         continue
                     selected.append(int(card["card_uid"]))
                     owner_count += 1
@@ -771,7 +1213,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                           "subtype": "", "shards": [],
                           "faction": "",
                           "src_owner_side": _side_of(controller_uid),
-                          "src_owner_id": controller_uid}
+                          "src_owner_id": controller_uid,
+                          "gem_count": 0, "card_abilities": []}
             if battle_state:
                 marker_turn = int(
                     battle_state.get("damaged_opponent_turn", 0) or 0)
@@ -784,7 +1227,10 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             if opposing and int(c_owner or 0) == int(controller_uid or 0):
                 continue
             if evaluate_card_filter(champ_card, fjson, source_uid,
-                                    source_card=source_card):
+                                    source_card=source_card,
+                                    card_pool=candidate_cards,
+                                    champion_pool=champions or [],
+                                    ability_state=battle_state, db=db):
                 out.append(int(c_uid))
     return out
 

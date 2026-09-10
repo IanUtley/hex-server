@@ -43,11 +43,15 @@ _TAC_CONTAINER_HASHES = {
         "Condition", "DataToAppend", "HasAsSubset", "MinimumValues",
         "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
         "PermanentData", "ThisTurnsData")}
-_TAC_LIST_HASHES = {_tac_attr_hash("Conditions")}
+_TAC_LIST_HASHES = {_tac_attr_hash("Conditions"),
+                    _tac_attr_hash("RequiredEquipment")}
 _TAC_STRING_HASHES = {
+    _tac_attr_hash("Guid"),
+    _tac_attr_hash("FunctionName"),
     _tac_attr_hash("GainedCounterType"),
     _tac_attr_hash("RemovedCounterType"),
     _tac_attr_hash("CompareWith"),
+    _tac_attr_hash("Name"),
 }
 
 
@@ -62,6 +66,14 @@ def tac_int(data_b64, name, default=0):
         return default
     value = decode_tac_tree(data_b64).get(_tac_attr_hash(str(name)))
     return value if isinstance(value, int) else default
+
+
+def tac_string(data_b64, name, default=""):
+    """Return a string TAC attribute, such as a TACFilter template name."""
+    if not data_b64 or not name:
+        return default
+    value = decode_tac_tree(data_b64).get(_tac_attr_hash(str(name)))
+    return value if isinstance(value, str) else default
 
 
 def decode_tac_tree(data_b64):

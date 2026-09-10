@@ -534,9 +534,14 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         ]
         existing = {row[1] for row in db.execute(
             "PRAGMA table_info(game_cards)").fetchall()}
+        parent_data = {}
+        if (bstate or {}).get("resolving_source_uid") is not None:
+            parent_data["parent_uid"] = int(
+                bstate["resolving_source_uid"])
         for column, value in (("owner_user_id", player_uid),
                               ("original_template_guid", tpl_guid),
-                              ("gems", copied_gems)):
+                              ("gems", copied_gems),
+                              ("permanent_buffs", json.dumps(parent_data))):
             if column in existing:
                 columns.append(column)
                 values.append(value)
