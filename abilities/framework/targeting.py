@@ -358,6 +358,30 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
                 "Equals": cost == target,
                 "GreaterThan": cost > target,
                 "LessThan": cost < target}.get(op, True)
+    if t == "HasSourceResourceCost":
+        # The client compares the candidate's effective resource cost with
+        # the ability source's printed resource cost.  This is distinct from
+        # HasSourceCastingCostFilter: the authored EComparisons value is the
+        # relation itself (GreaterThan, OneLessThan, ...), not an additive
+        # offset supplied by the caller.
+        if not source_card:
+            return True
+        actual = int(card.get("cost", 0) or 0) + int(
+            card.get("resource_x_cost_paid", 0) or 0)
+        source_cost = int(source_card.get("cost", 0) or 0)
+        op = str(filter_json.get("m_ComparisonOp") or "Equals")
+        if op in ("OneLessThan", "OneMoreThan", "TwoMoreThan"):
+            target = source_cost + {
+                "OneLessThan": -1, "OneMoreThan": 1,
+                "TwoMoreThan": 2,
+            }[op]
+            return actual == target
+        return {"GreaterThanOrEqual": actual >= source_cost,
+                "LessThanOrEqual": actual <= source_cost,
+                "Equal": actual == source_cost,
+                "Equals": actual == source_cost,
+                "GreaterThan": actual > source_cost,
+                "LessThan": actual < source_cost}.get(op, True)
     if t == "HasResourceCost":
         op = filter_json.get("m_ComparisonOp", "GreaterThanOrEqual")
         target = int(filter_json.get("m_ResourceCost", 0) or 0)
@@ -551,6 +575,41 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
         fjson = json.loads(tpl["filter_json"] or "{}")
     except Exception:
         fjson = {}
+
+    # Filters such as HasSourceResourceCost and shared-source filters are
+    # evaluated against the live source card by the original client.  Build
+    # that context once and pass it through every candidate evaluation below;
+    # previously those filters silently saw ``None`` and defaulted open.
+    source_card = None
+    if source_uid is not None:
+        source_row = db.execute(
+            "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
+            "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
+            "gc.template_guid, ct.name, COALESCE(ct.cost,0), ct.subtype, "
+            "ct.threshold_json, gc.card_attributes "
+            "FROM game_cards gc LEFT JOIN card_templates ct "
+            "ON ct.guid=gc.template_guid "
+            "WHERE gc.session_id=? AND gc.card_uid=?",
+            (session_id, int(source_uid))).fetchone()
+        if source_row:
+            source_card = {
+                "card_uid": int(source_row[0]),
+                "card_type": source_row[1] or "",
+                "location": source_row[2] or "",
+                "user_id": source_row[3],
+                "state": int(source_row[4] or 0),
+                "attack": int(source_row[5] or 0),
+                "defense": int(source_row[6] or 0),
+                "template_guid": source_row[7] or "",
+                "name": source_row[8] or "",
+                "cost": int(source_row[9] or 0),
+                "subtype": source_row[10] or "",
+                "rarity": "",
+                "shards": shards_from_threshold(source_row[11]),
+                "attributes": int(source_row[12] or 0),
+                "faction": template_faction(source_row[7]),
+                "counters": {}, "counter_guids": {}, "int_attrs": {},
+            }
     top_n = _find_filter_type(fjson, "TopNOfDeck")
     blocking_filter = _find_filter_type(fjson, "BlockingFilter")
     blocking_targets = _blocking_targets(battle_state, source_uid) \
@@ -578,7 +637,7 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     wants_champions = any(z in ("champions", "warzone") for z in zones) or \
         "IsHero" in (tpl["filter_json"] or "")
     sql = ("SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-           "gc.card_state, "
+           "gc.template_guid, gc.card_state, "
            "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
            "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
            "gc.card_abilities, gc.permanent_buffs "
@@ -595,7 +654,7 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             else " ORDER BY gc.position")
     out = []
     top_n_by_owner = {}
-    for cu, ctype, loc, uid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs \
+    for cu, ctype, loc, uid, template_guid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs \
             in db.execute(sql, params):
         int_attrs = {}
         counters = {}
@@ -643,6 +702,7 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 "src_owner_id": controller_uid,
                 "subtype": subtype or "",
                 "int_attrs": int_attrs,
+                "faction": template_faction(template_guid),
                 "counters": counters,
                 "counter_guids": counter_guids,
                 "shards": shards_from_threshold(thresh)}
@@ -668,7 +728,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             # TopHalfOfDeck limits the inspected portion of the deck before
             # applying the nested filter.
             top_n_by_owner.setdefault(int(uid or 0), []).append(card)
-        elif evaluate_card_filter(card, fjson, source_uid):
+        elif evaluate_card_filter(card, fjson, source_uid,
+                                  source_card=source_card):
             out.append(int(cu))
 
     if top_n is not None:
@@ -684,11 +745,13 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                     int(card["card_uid"])
                     for card in inspect
                     if amount > 0 and
-                    evaluate_card_filter(card, nested, source_uid))
+                    evaluate_card_filter(card, nested, source_uid,
+                                         source_card=source_card))
             else:
                 owner_count = 0
                 for card in owner_cards:
-                    if not evaluate_card_filter(card, nested, source_uid):
+                    if not evaluate_card_filter(card, nested, source_uid,
+                                                source_card=source_card):
                         continue
                     selected.append(int(card["card_uid"]))
                     owner_count += 1
@@ -706,6 +769,7 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                           "state": 0, "attack": 0, "defense": c_hp,
                           "name": c_name or "Champion", "cost": 0,
                           "subtype": "", "shards": [],
+                          "faction": "",
                           "src_owner_side": _side_of(controller_uid),
                           "src_owner_id": controller_uid}
             if battle_state:
@@ -719,7 +783,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 continue
             if opposing and int(c_owner or 0) == int(controller_uid or 0):
                 continue
-            if evaluate_card_filter(champ_card, fjson, source_uid):
+            if evaluate_card_filter(champ_card, fjson, source_uid,
+                                    source_card=source_card):
                 out.append(int(c_uid))
     return out
 

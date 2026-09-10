@@ -90,5 +90,25 @@ def transform_card(handler, game, session, pl_t, ai_t, card_uid, new_template_gu
                            attributes=effective_attributes)
     game.push_card_moved(scid, owner, zone,
                          game_engine.ECardLocations.Top, new_position)
+    if bstate is not None:
+        from .triggers import resolve_triggers
+
+        # The transformed card can have a self trigger, while other cards
+        # listen for the separate "another card transforms" event. Both are
+        # authored event types and use the normal trigger-condition path.
+        resolve_triggers(
+            _dbmod._db, handler, game, session, pl_t, ai_t, bstate,
+            "CardTransformedEvent", int(card_uid),
+            source_owner_uid=owner_user_id,
+            event_source_collection=cur_zone,
+            event_destination_collection=new_location,
+            event_previous_state=old_state)
+        resolve_triggers(
+            _dbmod._db, handler, game, session, pl_t, ai_t, bstate,
+            "CardTransformsEvent", int(card_uid),
+            source_owner_uid=owner_user_id,
+            event_source_collection=cur_zone,
+            event_destination_collection=new_location,
+            event_previous_state=old_state)
     _log(f"    Transformed {hex(card_uid)} -> {name} ({new_template_guid[:8]}) in {new_location}")
     return int(card_uid)

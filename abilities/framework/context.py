@@ -338,6 +338,14 @@ class EffectContext:
                 event_source_collection="deck",
                 event_destination_collection="discard",
                 event_previous_state=0)
+            resolve_triggers(
+                self.db, self.handler, self.game, self.session,
+                self.player_uid, self.ai_uid, self.bstate,
+                "CardDiscardedEvent", int(row[0]),
+                source_owner_uid=deck_owner,
+                event_source_collection="deck",
+                event_destination_collection="discard",
+                event_previous_state=0)
             total += 1
         return f"bury {total} cards"
 
@@ -457,6 +465,15 @@ class EffectContext:
             scid, owner, game_engine.ECardCollections.Discard, ct,
             template_id=tpl_guid, attack=atk, defense=defense, cost=cost,
             gems=gem, state=0, nulling=(row[3] == "deck"))
+        from .triggers import resolve_triggers
+
+        resolve_triggers(
+            self.db, self.handler, self.game, self.session,
+            self.player_uid, self.ai_uid, self.bstate,
+            "CardDiscardedEvent", int(target), source_owner_uid=owner_id,
+            event_source_collection=row[3],
+            event_destination_collection="discard",
+            event_previous_state=int(row[4] or 0))
         return f"discarded {hex(int(target))}"
 
     def discard_or_sacrifice(self) -> str:
@@ -1051,6 +1068,15 @@ class EffectContext:
                 self.db, self.handler, self.game, self.session,
                 self.player_uid, self.ai_uid, self.bstate, trigger, target,
                 source_owner_uid=int(row[1] or 0))
+        elif (int(remove or 0) & int(game_engine.ECardStates.Tapped)
+              and int(row[0] or 0) & int(game_engine.ECardStates.Tapped)):
+            from .triggers import resolve_triggers
+
+            resolve_triggers(
+                self.db, self.handler, self.game, self.session,
+                self.player_uid, self.ai_uid, self.bstate,
+                "CardReadiedEvent", target,
+                source_owner_uid=int(row[1] or 0))
         return state
 
     def replenish_resources(self) -> str:
@@ -1310,11 +1336,41 @@ class EffectContext:
             self.player_uid, self.ai_uid, self.bstate,
             self.effect_guid, self.param)
 
+    def _emit_authored_event(self, event_type: str,
+                             target: int | None = None) -> str:
+        """Dispatch one metadata-defined ability event.
+
+        ``FireEventEffectTemplate`` is the authored bridge for keyword-like
+        events such as Fateweave, Illuminate, Verdict, and Prophecy. Keep the
+        dispatch here so the effect uses the same trigger, condition, and
+        target machinery as ordinary game events in both PVE and PVP.
+        """
+        from .triggers import resolve_triggers
+
+        source = self.bstate.get("resolving_source_uid")
+        if source is None:
+            source = target
+        if source is None:
+            return f"{event_type}: no source"
+        source = int(source)
+        owner = self.target_owner(source, default=None)
+        if owner is None:
+            owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
+        result = resolve_triggers(
+            self.db, self.handler, self.game, self.session,
+            self.player_uid, self.ai_uid, self.bstate,
+            str(event_type).rsplit(".", 1)[-1], source,
+            source_owner_uid=int(owner),
+            extra_target=(int(target) if target is not None and
+                          int(target) != source else None))
+        return f"fired {str(event_type).rsplit('.', 1)[-1]}" + (
+            f": {result}" if result else "")
+
     def create_and_cast_spell(self):
         return self._legacy("_create_and_cast_spell_legacy")
 
     def verdict(self):
-        return self._legacy("_verdict_legacy")
+        return self._emit_authored_event("VerdictEvent")
 
     def grant_ability(self):
         return self._legacy("_grant_ability_legacy")
@@ -1326,7 +1382,17 @@ class EffectContext:
         return self._legacy("_play_card_legacy")
 
     def fire_event(self):
-        return self._legacy("_fire_event_legacy")
+        event_type = self.template_value("m_TriggerType", "") or ""
+        event_type = str(event_type).rsplit(".", 1)[-1]
+        if event_type in ("", "GenericEvent"):
+            # Older records use GenericEvent for the named Prophesied
+            # operation. The effect template name is the typed fallback.
+            name = str(self.template_value("m_Name", "") or "")
+            if name.lower().startswith("fire") and name.endswith("Event"):
+                event_type = name[4:]
+        if not event_type:
+            return "fire event: no authored event type"
+        return self._emit_authored_event(event_type, self.resolved_target())
 
     def activate_ability(self):
         return self._legacy("_activate_ability_legacy")

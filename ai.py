@@ -380,6 +380,16 @@ def ai_discard_card(handler, game, session, pl_t, ai_t):
                            template_id=tpl_guid)
     game.push_card_moved(scid, ai_t, game_engine.ECardCollections.Discard,
                          game_engine.ECardLocations.Top, 0)
+    import ability as _abil
+    import battle_engine as _be
+    bstate = getattr(handler, "_current_bstate", None)
+    if bstate is None:
+        bstate = _be.load_state(session)
+    _abil.resolve_triggers(
+        _db, handler, game, session, pl_t, ai_t, bstate,
+        "CardDiscardedEvent", int(card_uid), source_owner_uid=0,
+        event_source_collection="hand",
+        event_destination_collection="discard")
     log_req(f"    AI discards {name} ({hex(card_uid)})")
     return int(card_uid)
 
@@ -1167,6 +1177,9 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                 be.save_state(session, battle_state)
                 continue
         game = handler._fresh_game(session, pl_t, ai_t, battle_state)
+        _abil_phase = __import__("ability")
+        _abil_phase.resolve_turn_phase_triggers(
+            _db, handler, game, session, pl_t, ai_t, battle_state, phase, 0)
         game.push_turn_phase(phase, ai_t, ai_t)
         # The AI holds priority for its phases: an AI-targeted GreenLight makes
         # the client call LoseGreenLight (its PlayerId != the human's), clearing
@@ -1212,6 +1225,12 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                 (session.session_id,)).fetchall()
             for wzr in ai_wz:
                 scid = game_engine.SessionCardId(game_engine.UID(wzr[0]))
+                previous_state_row = _db.execute(
+                    "SELECT card_state FROM game_cards "
+                    "WHERE session_id=? AND card_uid=?",
+                    (session.session_id, int(wzr[0]))).fetchone()
+                previous_state = int(previous_state_row[0] or 0) \
+                    if previous_state_row else 0
                 # Ready/untap: clear combat states + CameOutThisTurn; set
                 # StartedATurnOnYourSide.
                 attrs_row = _db.execute(
@@ -1242,6 +1261,16 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                                       template_id=wzr[1],
                                       state=(pstate if pstate is not None else
                                              game_engine.ECardStates.StartedATurnOnYourSide))
+                current_state = (pstate if pstate is not None else
+                                 game_engine.ECardStates.StartedATurnOnYourSide)
+                if (previous_state & game_engine.ECardStates.Tapped and
+                        not (current_state & game_engine.ECardStates.Tapped)):
+                    import ability as _abil_ready
+                    _abil_ready.resolve_triggers(
+                        _db, handler, game, session, pl_t, ai_t,
+                        battle_state, "CardReadiedEvent", int(wzr[0]),
+                        source_owner_uid=0,
+                        event_previous_state=previous_state)
             _db.commit()
             clear_expired_temporary_attributes(
                 _db, session.session_id, 0, "prep", clear_stat_buffs=True)
@@ -1652,6 +1681,10 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
     ev_th.new_value = battle_state["ai_threshold"].get(color, 0) + 1
     battle_state["ai_threshold"][color] = ev_th.new_value
     game._push(ev_th)
+    from abilities.framework.triggers import resolve_gain_threshold_triggers
+    resolve_gain_threshold_triggers(
+        _db, handler, game, session, pl_t, ai_t, battle_state,
+        0, color=color)
     # Playing a basic threshold grants the champion a charge point.
     battle_state["ai_charges"] = battle_state.get("ai_charges", 0) + 1
     game.ai_charges = battle_state["ai_charges"]

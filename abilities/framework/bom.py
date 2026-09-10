@@ -500,6 +500,12 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                     db, handler, game, session, pl_t, ai_t, bstate,
                     "CardExitedZoneEvent", int(target_uid),
                     source_owner_uid=row[1])
+            if current <= 0 < value:
+                from .triggers import resolve_triggers
+                resolve_triggers(
+                    db, handler, game, session, pl_t, ai_t, bstate,
+                    "CardGainedIntAttrEvent", int(target_uid),
+                    source_owner_uid=row[1], event_int_attribute=attr)
             return f"intattr {attr}={value} target={hex(int(target_uid))}"
 
         if pm.get("property") == "cardcost":
@@ -1262,6 +1268,14 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             event_source_collection=old_loc,
             event_destination_collection=loc,
             event_previous_state=old_state)
+        if loc == "discard":
+            resolve_triggers(
+                db, handler, game, session, pl_t, ai_t, bstate,
+                "CardDiscardedEvent", int(target),
+                source_owner_uid=(int(owner_id[0]) if owner_id else 0),
+                event_source_collection=old_loc,
+                event_destination_collection=loc,
+                event_previous_state=old_state)
     if loc == "deck" and dest == "deck_target":
         # A revealed-card choice such as Oakhenge returns the unchosen cards
         # to the deck.  Merely changing their location leaves all of them at
@@ -2604,6 +2618,10 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                             ev_th.delta = amount
                             ev_th.new_value = threshold[flag]
                             game._push(ev_th)
+                            from .triggers import resolve_gain_threshold_triggers
+                            resolve_gain_threshold_triggers(
+                                db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id, color=flag)
                         if side == "player":
                             game.player_threshold = dict(threshold)
                         else:
@@ -2741,7 +2759,9 @@ def _shift_power(game, session, db, handler, pl_t, ai_t, bstate, ability_guid):
     target_uid = (bstate or {}).get("player_shift_target")
     if not source_uid or not target_uid:
         return f"shift: missing source/target (source={source_uid} target={target_uid})"
-    handler._shift_ability_between(session, pl_t, ai_t, int(source_uid), int(target_uid), ability_guid, game)
+    handler._shift_ability_between(
+        session, pl_t, ai_t, int(source_uid), int(target_uid), ability_guid,
+        game, bstate=bstate)
     return f"shift {ability_guid[:8]} {hex(int(source_uid))} -> {hex(int(target_uid))}"
 
 

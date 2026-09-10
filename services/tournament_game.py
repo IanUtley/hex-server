@@ -84,6 +84,27 @@ def _pvp_gain_charge_trigger_game(handler, session, state, owner_id):
     return game
 
 
+def _pvp_gain_threshold_trigger_game(handler, session, state, owner_id,
+                                     color):
+    """Build the shared event stream for a PvP threshold gain."""
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        return None
+    owner_id = int(owner_id)
+    opp_pid = pids[0] if pids[1] == owner_id else pids[1]
+    owner_handler = player_handlers.get(owner_id) or handler
+    owner_handler._current_bstate = state
+    pl_uid = _ge.UID.make(244, owner_id)
+    opp_uid = _ge.UID.make(244, opp_pid)
+    game = _ge.Game(int(session.session_id), pl_uid, opp_uid)
+    _pvp_populate_game_state(game, state, owner_id, opp_pid)
+    from abilities.framework.triggers import resolve_gain_threshold_triggers
+    resolve_gain_threshold_triggers(
+        _db, owner_handler, game, session, pl_uid, opp_uid, state,
+        owner_id, color=color)
+    return game
+
+
 # ── PvP state persistence (session.turn_order / turn_order_json) ────────────
 # Mirrors the battle_engine.load_state / save_state pattern but with a PvP-
 # specific schema (two human players, no AI).  State lives in the DB so a
@@ -841,6 +862,18 @@ def _pvp_run_phase_start(session, state, phase):
                 st_view = _pvp_fra_view(
                     state, turn_uid,
                     pids[1] if turn_uid == pids[0] else pids[0])
+                st_view["phase"] = phase
+                st_view["_last_turn_phase_event"] = state.get(
+                    "_last_turn_phase_event")
+                resolve_turn_phase_triggers = getattr(
+                    __import__("abilities.framework.triggers",
+                              fromlist=["resolve_turn_phase_triggers"]),
+                    "resolve_turn_phase_triggers")
+                resolve_turn_phase_triggers(
+                    _db, turn_h, warm, session, turn_uid_p, opp_uid_st,
+                    st_view, phase, turn_uid)
+                state["_last_turn_phase_event"] = st_view.get(
+                    "_last_turn_phase_event")
                 resolve_triggers(_db, turn_h, warm, session, turn_uid_p,
                                  opp_uid_st, st_view, "TurnStartedEvent",
                                  None, turn_uid)
@@ -953,6 +986,31 @@ def _pvp_run_phase_start(session, state, phase):
                 pvp_draw_cache[_pid] = dr
             if _pvp_check_game_end(session, state):
                 return
+    # TurnPhaseEvent is emitted by the client's TurnPhaseState.OnEntry.  PvP
+    # constructs one Game packet per viewer, so resolve it once against the
+    # active player's handler and mirror the resulting chain events to both.
+    if phase != _ge.ETurnPhases.StartTurn:
+        phase_h = player_handlers.get(turn_uid)
+        if phase_h:
+            phase_game = _ge.Game(int(session.session_id),
+                                  _ge.UID.make(244, turn_uid),
+                                  _ge.UID.make(244, defender_pid))
+            from abilities.framework.triggers import resolve_turn_phase_triggers
+            phase_view = _pvp_fra_view(state, turn_uid, defender_pid)
+            phase_view["phase"] = phase
+            phase_view["_last_turn_phase_event"] = state.get(
+                "_last_turn_phase_event")
+            resolve_turn_phase_triggers(
+                _db, phase_h, phase_game, session,
+                _ge.UID.make(244, turn_uid),
+                _ge.UID.make(244, defender_pid),
+                phase_view, phase, turn_uid)
+            state["_last_turn_phase_event"] = phase_view.get(
+                "_last_turn_phase_event")
+            if phase_game.events:
+                _pvp_send_same_events(
+                    session, phase_game, _ge.UID.make(244, turn_uid),
+                    _ge.UID.make(244, defender_pid))
     chain_from_phase_start = bool(state.get("stack"))
     defender_pid = pids[1] if turn_uid == pids[0] else pids[0]
     phase_priority_pid = (defender_pid
@@ -4314,6 +4372,10 @@ def pvp_handle_transaction(handler, session, inner_bytes):
         thresh[shard_color] = int(cur or 0) + 1
     state[thresh_key] = thresh
     pvp_save_state(session, state)
+    threshold_trigger_game = None
+    if shard_color and not is_shards_of_fate:
+        threshold_trigger_game = _pvp_gain_threshold_trigger_game(
+            handler, session, state, my_pid, shard_color)
     resource_ability_events = _pvp_resolve_granted_resource_abilities(
         handler, session, state, int(played_card_uid), my_pid)
     # The resource is now played — refresh the turn player's options so the
@@ -4391,6 +4453,9 @@ def pvp_handle_transaction(handler, session, inner_bytes):
         g._push(ev_chg)
         if charge_trigger_game:
             for trigger_event in charge_trigger_game.events:
+                g._push(trigger_event)
+        if threshold_trigger_game:
+            for trigger_event in threshold_trigger_game.events:
                 g._push(trigger_event)
         for resource_event in resource_ability_events:
             g._push(resource_event)
@@ -4729,6 +4794,11 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid):
         ev_th.delta = 1
         ev_th.new_value = int(thresh[flag])
         g._push(ev_th)
+        threshold_trigger_game = _pvp_gain_threshold_trigger_game(
+            handler, session, state, owner_id, flag)
+        if threshold_trigger_game:
+            for trigger_event in threshold_trigger_game.events:
+                g._push(trigger_event)
 
     # The selected card is not moved into hand or PlayedResources.  All
     # presented candidates, including the selected one, return face-down to

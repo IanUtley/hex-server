@@ -17,6 +17,7 @@ from .targeting import (
     ZONE_MAP,
     _side_of,
     shards_from_threshold,
+    template_faction,
 )
 
 
@@ -72,7 +73,7 @@ class ConditionContext:
                  champions=None, ability_source_card_owner=None,
                  trigger_owner_id=None, event_source_collection=None,
                  event_destination_collection=None, event_previous_state=None,
-                 uses_previous_state=False):
+                 uses_previous_state=False, event_int_attribute=None):
         self.db = db
         self.session = session
         self.bstate = bstate or {}
@@ -89,6 +90,7 @@ class ConditionContext:
         self.event_source_collection = event_source_collection
         self.event_destination_collection = event_destination_collection
         self.event_previous_state = event_previous_state
+        self.event_int_attribute = event_int_attribute
         self.uses_previous_state = bool(uses_previous_state)
         # The ability SOURCE CARD's actual owner (its game_cards.user_id) —
         # distinct from the EVENT's source owner.  IsControlledBy /
@@ -190,8 +192,12 @@ class ConditionContext:
                     "defense": defense, "template_guid": row[7],
                     "name": row[8] or "", "cost": row[9] or 0,
                     "subtype": row[10] or "",
+                    "faction": template_faction(row[7]),
                     "shards": shards_from_threshold(row[11]),
                     "attributes": int(row[12] or 0) | int(row[13] or 0),
+                    "int_attrs": (permanent.get("int_attrs", {})
+                                  if isinstance(permanent.get("int_attrs", {}), dict)
+                                  else {}),
                     "counters": counters,
                     "counter_guids": counter_guids,
                     "damaged_opponent_this_turn": list(
@@ -242,7 +248,8 @@ class ConditionContext:
         sql = ("SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
                "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
                "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-               "gc.card_attributes, ct.attributes "
+               "gc.card_attributes, ct.attributes, gc.template_guid, "
+               "COALESCE(gc.permanent_buffs,'{}') "
                "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
                "WHERE gc.session_id=? AND gc.location IN (%s)"
                % ",".join("?" * len(zones)))
@@ -253,6 +260,13 @@ class ConditionContext:
         out = []
         for r in self.db.execute(sql, params):
             counters, counter_guids = self._game_card_counter_counts(r[0])
+            try:
+                saved = json.loads(r[14] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                saved = {}
+            int_attrs = saved.get("int_attrs", {}) if isinstance(saved, dict) else {}
+            if not isinstance(int_attrs, dict):
+                int_attrs = {}
             out.append({"card_uid": int(r[0]), "card_type": r[1],
                         "location": r[2], "user_id": r[3],
                         "state": int(r[4] or 0), "attack": r[5],
@@ -261,6 +275,8 @@ class ConditionContext:
                         "subtype": r[9] or "",
                         "shards": shards_from_threshold(r[10]),
                         "attributes": int(r[11] or 0) | int(r[12] or 0),
+                        "faction": template_faction(r[13]),
+                        "int_attrs": int_attrs,
                         "counters": counters,
                         "counter_guids": counter_guids,
                         "damaged_opponent_this_turn": list(
@@ -410,8 +426,9 @@ def evaluate_condition(node, ctx):
         card = ctx.card(uid)
         if card is None:
             return True
-        return evaluate_card_filter(card, node.get("m_CardFilter"),
-                                    ctx.ability_source_uid)
+        return evaluate_card_filter(
+            card, node.get("m_CardFilter"), ctx.ability_source_uid,
+            source_card=ctx.card(ctx.ability_source_uid))
     if t == "TriggerCardEnteredZone":
         card = ctx.card(ctx.trigger_uid)
         if card is None:
@@ -455,6 +472,96 @@ def evaluate_condition(node, ctx):
         side = _side_of(ctx.ability_source_owner_id)
         drawn = int(ctx.bstate.get(f"{side}_draws_this_turn", 0))
         return drawn == nth
+    if t == "TriggerEventIsCombatDamage":
+        # The combat resolver emits CardDealtDamageEvent. Ability damage uses
+        # CardWouldBeDamagedEvent and must not satisfy this condition.
+        return _last(ctx.event_type) == "CardDealtDamageEvent"
+    if t == "TriggerEventIntAttribute":
+        return (_last(ctx.event_type) == "CardGainedIntAttrEvent" and
+                str(node.get("m_Attribute") or "") == str(
+                    ctx.event_int_attribute or ""))
+    if t == "TurnPhaseCondition":
+        wanted = str(node.get("m_TurnPhase") or "")
+        try:
+            wanted_value = int(getattr(game_engine.ETurnPhases, wanted))
+        except (AttributeError, TypeError, ValueError):
+            wanted_value = None
+        current = (ctx.bstate or {}).get("phase")
+        if current is None:
+            try:
+                import battle_engine
+                current = battle_engine.current_phase(ctx.bstate)
+            except Exception:
+                current = None
+        return (str(current) == wanted or
+                (wanted_value is not None and int(current or -1) == wanted_value))
+    if t == "CardsDiscardedThisTurn":
+        owner = ctx.ability_source_owner_id
+        if (ctx.bstate or {}).get("pvp"):
+            value = int(ctx.bstate.get(
+                f"cards_discarded_this_turn_{int(owner or 0)}", 0) or 0)
+        else:
+            value = int(ctx.bstate.get(
+                f"{_side_of(owner)}_cards_discarded_this_turn", 0) or 0)
+        required = int(node.get("m_RequiredQuantity", node.get(
+            "m_Amount", node.get("m_Value", 1))) or 1)
+        return _compare(value, node.get("m_ComparisonOp", "GreaterThanOrEqual"),
+                        required)
+    if t == "IntAttrFilter":
+        target = ctx.card(ctx.trigger_uid) or ctx.card(ctx.ability_source_uid)
+        return evaluate_card_filter(target, node, ctx.ability_source_uid) \
+            if target is not None else True
+    if t == "TACTriggerCondition":
+        serialized = node.get("m_Conditions") or {}
+        data = serialized.get("data") if isinstance(serialized, dict) else None
+        if not data:
+            return True
+        try:
+            from .tac import decode_tac_tree, _tac_attr_hash
+            required = decode_tac_tree(data)
+        except (TypeError, ValueError):
+            return True
+        # GainThresholdEvent carries exactly one shard IntAttr with value 1.
+        # Other event TAC fields can be supplied by callers through the same
+        # transient map, keeping this evaluator independent of card names.
+        event_tac = dict((ctx.bstate or {}).get("event_tac") or {})
+        color = (ctx.bstate or {}).get("gain_threshold_color")
+        if color is not None:
+            for name, flag in game_engine.SHARD_TO_FLAG.items():
+                if int(flag) == int(color):
+                    event_tac[_tac_attr_hash(name.title())] = 1
+                    break
+
+        def _matches(condition):
+            if not isinstance(condition, dict):
+                return True
+            minimum_hash = _tac_attr_hash("MinimumValues")
+            subset_hash = _tac_attr_hash("HasAsSubset")
+            for key, value in (condition.get(minimum_hash) or {}).items():
+                if int(event_tac.get(key, 0) or 0) < int(value or 0):
+                    return False
+            for key, value in (condition.get(subset_hash) or {}).items():
+                if isinstance(value, dict):
+                    if not _matches_nested(event_tac, key, value):
+                        return False
+                elif event_tac.get(key) != value:
+                    return False
+            return True
+
+        def _matches_nested(actual, key, expected):
+            # Nested event TACs are represented with the same hash-keyed
+            # mapping.  This helper intentionally requires the expected
+            # values rather than treating missing data as a wildcard.
+            value = actual.get(key)
+            if not isinstance(value, dict):
+                return False
+            return all(value.get(k) == v for k, v in expected.items())
+
+        conditions_hash = _tac_attr_hash("Conditions")
+        conditions = required.get(conditions_hash)
+        if not conditions:
+            conditions = [required]
+        return all(_matches(condition) for condition in conditions)
     if t == "TriggerPlayerIsActivePlayer":
         return ctx.bstate.get("turn_player") == _side_of(ctx.ability_source_owner_id)
     if t == "TriggerCardSameNameInZone":

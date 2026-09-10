@@ -1303,6 +1303,12 @@ class HCPHandler:
                     resolve_triggers(
                         _db, self, game, session, pl_t, ai_t, bstate,
                         "CardEnteredZoneEvent", uid, owner_id)
+                if destination == "discard":
+                    resolve_triggers(
+                        _db, self, game, session, pl_t, ai_t, bstate,
+                        "CardDiscardedEvent", uid, owner_id,
+                        event_source_collection=row[1],
+                        event_destination_collection="discard")
 
     @staticmethod
     def _set_cost_instance_bounds(cost_instance, minimum, maximum):
@@ -1574,6 +1580,10 @@ class HCPHandler:
             ev_th.delta = 1
             ev_th.new_value = th[flag]
             game._push(ev_th)
+            from abilities.framework.triggers import resolve_gain_threshold_triggers
+            resolve_gain_threshold_triggers(
+                _db, self, game, session, pl_t, ai_t, bstate,
+                owner_id, color=flag)
             game.push_player_updated(
                 ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
         log_req(f"    Shards of Fate (AI): gained {color} threshold")
@@ -2851,6 +2861,10 @@ class HCPHandler:
                 ev_th.delta = 1
                 ev_th.new_value = th[flag]
                 g._push(ev_th)
+                from abilities.framework.triggers import resolve_gain_threshold_triggers
+                resolve_gain_threshold_triggers(
+                    _db, self, g, session, pl_t, ai_t, bstate,
+                    pend["owner_id"], color=flag)
                 g.push_player_updated(
                     pl_t, champ_id=getattr(self, "_player_champ_scid", None))
             # Hide EVERY candidate again (back to the face-down deck) — the
@@ -3815,6 +3829,11 @@ class HCPHandler:
         _abil.resolve_triggers(_db, self, game, session, pl_t, ai_t, bstate,
                                "CardEnteredZoneEvent", int(card_uid),
                                source_owner_uid=owner_uid)
+        _abil.resolve_triggers(_db, self, game, session, pl_t, ai_t, bstate,
+                               "CardDiscardedEvent", int(card_uid),
+                               source_owner_uid=owner_uid,
+                               event_source_collection="hand",
+                               event_destination_collection="discard")
         return game, owner_player_uid
 
     def _extract_transaction_targets(self, inner_bytes, exclude_uid):
@@ -4502,6 +4521,9 @@ class HCPHandler:
                 # Mountain God: "This deals 1 damage to you.").  The AI side
                 # fires these in ai.run_ai_turn; the player side was missing.
                 import ability as _abil_start
+                _abil_start.resolve_turn_phase_triggers(
+                    _db, self, warm, session, pl_t, ai_t, bstate, phase,
+                    self.user_profile["id"])
                 _abil_start.resolve_triggers(
                     _db, self, warm, session, pl_t, ai_t, bstate,
                     "TurnStartedEvent", None, self.user_profile["id"])
@@ -4639,6 +4661,10 @@ class HCPHandler:
                 # A fully-populated fresh Game so PlayerUpdated reports the live
                 # resources/health/charges/SP (not the bare defaults).
                 game = self._fresh_game(session, pl_t, ai_t, bstate)
+                import ability as _abil_phase
+                _abil_phase.resolve_turn_phase_triggers(
+                    _db, self, game, session, pl_t, ai_t, bstate, phase,
+                    self.user_profile["id"])
                 game.push_turn_phase(phase, pl_t, pl_t)
                 game.push_green_light(pl_t, self._priority_context_for(phase, bstate))
                 game.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
@@ -4671,6 +4697,10 @@ class HCPHandler:
                 return True
             # Non-stop phase: push it and auto-advance.
             game = self._fresh_game(session, pl_t, ai_t, bstate)
+            import ability as _abil_phase
+            _abil_phase.resolve_turn_phase_triggers(
+                _db, self, game, session, pl_t, ai_t, bstate, phase,
+                self.user_profile["id"])
             if phase == game_engine.ETurnPhases.Draw:
                 # The human draws a card at the Draw phase — except on their very
                 # first turn when they chose to play first.
@@ -4696,6 +4726,12 @@ class HCPHandler:
                     (session.session_id, self.user_profile["id"])).fetchall()
                 for wzr in wz_rows:
                     scid = game_engine.SessionCardId(game_engine.UID(wzr[0]))
+                    previous_state_row = _db.execute(
+                        "SELECT card_state FROM game_cards "
+                        "WHERE session_id=? AND card_uid=?",
+                        (session.session_id, int(wzr[0]))).fetchone()
+                    previous_state = int(previous_state_row[0] or 0) \
+                        if previous_state_row else 0
                     # Ready/untap: clear combat states (Tapped, Attacking,
                     # HasAttacked, Blocking, HasBlocked) and CameOutThisTurn;
                     # set StartedATurnOnYourSide.
@@ -4729,6 +4765,14 @@ class HCPHandler:
                         pstate = _ge.ECardStates.StartedATurnOnYourSide
                     game.push_card_updated(scid, pl_t, game_engine.ECardCollections.Warzone, ct,
                                           template_id=wzr[1], state=pstate)
+                    if (previous_state & _ge.ECardStates.Tapped and
+                            not (pstate & _ge.ECardStates.Tapped)):
+                        import ability as _abil_ready
+                        _abil_ready.resolve_triggers(
+                            _db, self, game, session, pl_t, ai_t, bstate,
+                            "CardReadiedEvent", int(wzr[0]),
+                            source_owner_uid=self.user_profile["id"],
+                            event_previous_state=previous_state)
                 _db.commit()
                 # "AfterCardsReadyOnPlayersTurn" effects (e.g. Nazhk's
                 # CantReadyAutomatically) must survive through this ready
@@ -5522,44 +5566,22 @@ class HCPHandler:
         log_req(f"    One-shot ability {ag[:8]} removed from {hex(int(card_uid))}")
         return True
 
-    def _apply_power_shifted_triggers(self, session, target_uid, game):
-        """Resolve PowerShiftedEvent triggers on a card a power was shifted onto.
-
-        A shifted-on target may carry abilities that fire when a power is
-        shifted onto it (e.g. Deepgaze Acolyte's "gets +1[ATK]/+1[DEF]"). Each
-        such ability's game text is parsed for "+N[ATK]" / "+M[DEF]" and the
-        buff is persisted on game_cards.card_attack_mod / card_defense_mod (so
-        reconnects, the Prep re-push and combat all see it) and reflected on
-        the pushed CardUpdated. Returns (atk_mod, def_mod).
-        """
-        import re as _re
-        ability_guids = self._card_ability_list(session, target_uid)
-        atk_mod = 0
-        def_mod = 0
-        if ability_guids:
-            ph = ",".join("?" * len(ability_guids))
-            rows = _db.execute(
-                f"SELECT ability_guid, game_text FROM card_abilities_meta "
-                f"WHERE trigger_event_type=? AND ability_guid IN ({ph})",
-                ("Game.Shared.Mechanics.PowerShiftedEvent",) + tuple(ability_guids)).fetchall()
-            for ag, text in rows:
-                ma = _re.search(r'\+(\d+)\s*\[ATK\]', text or "")
-                md = _re.search(r'\+(\d+)\s*\[DEF\]', text or "")
-                if ma:
-                    atk_mod += int(ma.group(1))
-                if md:
-                    def_mod += int(md.group(1))
-                log_req(f"    PowerShifted trigger {ag[:8]}: +{atk_mod}ATK/+{def_mod}DEF")
-            if atk_mod or def_mod:
-                _db.execute(
-                    "UPDATE game_cards SET card_attack_mod=card_attack_mod+?, card_defense_mod=card_defense_mod+? "
-                    "WHERE session_id=? AND card_uid=?",
-                    (atk_mod, def_mod, session.session_id, int(target_uid)))
-                _db.commit()
-        return atk_mod, def_mod
+    def _apply_power_shifted_triggers(self, session, target_uid, game,
+                                      pl_t, ai_t, bstate):
+        """Dispatch the authored PowerShiftedEvent through the shared BOM."""
+        row = _db.execute(
+            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+            (session.session_id, int(target_uid))).fetchone()
+        if not row:
+            return ""
+        from abilities.framework.triggers import resolve_triggers
+        return resolve_triggers(
+            _db, self, game, session, pl_t, ai_t, bstate,
+            "PowerShiftedEvent", int(target_uid), source_owner_uid=row[0],
+            extra_target=int(target_uid))
 
     def _shift_ability_between(self, session, pl_t, ai_t, source_uid, target_uid,
-                               ability_guid, game):
+                               ability_guid, game, bstate=None):
         """Move a granted ability from one card instance to another (ShiftPower).
 
         Removes `ability_guid` from the source's card_abilities, adds it to the
@@ -5601,7 +5623,8 @@ class HCPHandler:
         # PowerShiftedEvent triggers (e.g. Deepgaze Acolyte +1/+1). Persists
         # the buff (card_attack_mod / card_defense_mod); _card_full_data below
         # folds it into the pushed stats.
-        self._apply_power_shifted_triggers(session, target_uid, game)
+        self._apply_power_shifted_triggers(
+            session, target_uid, game, pl_t, ai_t, bstate or {})
         # Push CardUpdated for both cards so the client updates the ability
         # icons + attribute icons. Build the CardDef from the template via
         # _card_full_data so the pushed card keeps its threshold pips / text
@@ -7574,6 +7597,11 @@ class HCPHandler:
                         ev_th.player_id = pl_t; ev_th.color = shard_val; ev_th.operation = 1; ev_th.delta = 1
                         ev_th.new_value = thresh_count
                         g3._push(ev_th)
+                        from abilities.framework.triggers import resolve_gain_threshold_triggers
+                        resolve_gain_threshold_triggers(
+                            _db, self, g3, session, pl_t, ai_t, bstate,
+                            self.user_profile["id"] if self.user_profile else 0,
+                            color=shard_val)
                 # Playing any resource, including Shards of Fate, grants a
                 # champion charge point.
                 ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()

@@ -31,6 +31,7 @@ from .effects.counters import (
     push_card_counters, counter_name_from_text,
 )
 from .stat_mod import apply_card_stat_mod
+from .targeting import _side_of
 
 
 _RECORD_STORE = DEFAULT_RECORD_STORE
@@ -755,7 +756,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                      extra_target=None, zones=None,
                      event_source_collection=None,
                      event_destination_collection=None,
-                     event_previous_state=None):
+                     event_previous_state=None, event_int_attribute=None):
     """Fire every card ability whose trigger_event_type == event_type.
 
     ``source_uid`` is the card that entered / attacked / blocked / died.
@@ -765,6 +766,29 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     from db import log_req
     bstate = bstate or {}
     bstate["event_type"] = event_type
+
+    # Keep this event-local counter in the same authoritative battle state
+    # used by the client TAC condition CardsDiscardedThisTurn. Increment before
+    # evaluating triggers so the discard that caused the event is included.
+    if event_type == "CardDiscardedEvent":
+        try:
+            discarded_owner = int(source_owner_uid or 0)
+        except (TypeError, ValueError):
+            discarded_owner = 0
+        if bstate.get("pvp"):
+            key = f"cards_discarded_this_turn_{discarded_owner}"
+        else:
+            key = f"{_side_of(discarded_owner)}_cards_discarded_this_turn"
+        bstate[key] = int(bstate.get(key, 0) or 0) + 1
+    elif event_type == "TurnStartedEvent":
+        try:
+            turn_owner = int(source_owner_uid or 0)
+        except (TypeError, ValueError):
+            turn_owner = 0
+        if bstate.get("pvp"):
+            bstate[f"cards_discarded_this_turn_{turn_owner}"] = 0
+        else:
+            bstate[f"{_side_of(turn_owner)}_cards_discarded_this_turn"] = 0
 
     logs = []
 
@@ -984,7 +1008,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     event_source_collection=event_source_collection,
                     event_destination_collection=event_destination_collection,
                     event_previous_state=event_previous_state,
-                    uses_previous_state=uses_previous_state)
+                    uses_previous_state=uses_previous_state,
+                    event_int_attribute=event_int_attribute)
                 if not trigger_condition_met(raw, cond_ctx):
                     continue
                 chance = _chance_to_happen(graph)
@@ -1141,6 +1166,28 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     return "; ".join(logs)
 
 
+def resolve_turn_phase_triggers(db, handler, game, session, pl_t, ai_t,
+                                bstate, phase, owner_id):
+    """Dispatch one metadata-defined TurnPhaseEvent on phase entry.
+
+    The original client enqueues this event from TurnPhaseState.OnEntry. The
+    server has several phase drivers (PvE human, PvE AI, and PvP), so keep the
+    once-per-phase guard here instead of duplicating it in each driver.
+    """
+    try:
+        phase = int(phase)
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        return ""
+    marker = (int(bstate.get("turn_number", 0) or 0), phase, owner_id)
+    if bstate.get("_last_turn_phase_event") == marker:
+        return ""
+    bstate["_last_turn_phase_event"] = marker
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "TurnPhaseEvent", None, source_owner_uid=owner_id)
+
+
 def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
                                  bstate, owner_id):
     """Dispatch the data-defined event for a newly gained champion charge.
@@ -1162,6 +1209,32 @@ def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
     return resolve_triggers(
         db, handler, game, session, pl_t, ai_t, bstate,
         "GainChargeEvent", int(champ.uid.uid64), owner_id)
+
+
+def resolve_gain_threshold_triggers(db, handler, game, session, pl_t, ai_t,
+                                    bstate, owner_id, color=None):
+    """Dispatch the metadata-defined event for a gained threshold."""
+    try:
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    champ = (getattr(handler, "_ai_champ_scid", None)
+             if owner_id == 0 else
+             getattr(handler, "_player_champ_scid", None))
+    if champ is None:
+        return ""
+    old = bstate.get("gain_threshold_color")
+    if color is not None:
+        bstate["gain_threshold_color"] = int(color)
+    try:
+        return resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "GainThresholdEvent", int(champ.uid.uid64), owner_id)
+    finally:
+        if old is None:
+            bstate.pop("gain_threshold_color", None)
+        else:
+            bstate["gain_threshold_color"] = old
 
 
 def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):

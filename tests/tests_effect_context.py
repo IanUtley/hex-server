@@ -149,6 +149,37 @@ def test_context_draw_preserves_owner_and_handler_boundary():
     assert all(call[-1] == 5 for call in handler.calls)
 
 
+def test_context_authored_events_use_typed_event_names():
+    context = EffectContext.from_legacy(
+        object(), _Session(), _DB(), object(), "player", "ai",
+        {"resolving_source_uid": 123, "resolving_owner_id": 5},
+        "fire-effect", "")
+    with mock.patch.object(
+            context, "template_value",
+            side_effect=lambda name, default=None: {
+                "m_TriggerType": "Game.Shared.Mechanics.FateweavedEvent",
+                "m_Name": "fireFateweavedEvent",
+            }.get(name, default)), mock.patch(
+                "abilities.framework.triggers.resolve_triggers",
+                return_value="triggered") as resolve:
+        assert context.fire_event() == "fired FateweavedEvent: triggered"
+    assert resolve.call_args.args[7:9] == ("FateweavedEvent", 123)
+    assert resolve.call_args.kwargs["source_owner_uid"] == 5
+
+
+def test_context_verdict_emits_shared_authored_event():
+    context = EffectContext.from_legacy(
+        object(), _Session(), _DB(), object(), "player", "ai",
+        {"resolving_source_uid": 123, "resolving_owner_id": 5},
+        "verdict-effect", "")
+    with mock.patch(
+            "abilities.framework.triggers.resolve_triggers",
+            return_value="triggered") as resolve:
+        assert context.verdict() == "fired VerdictEvent: triggered"
+    assert resolve.call_args.args[7:9] == ("VerdictEvent", 123)
+    assert resolve.call_args.kwargs["source_owner_uid"] == 5
+
+
 def test_context_draw_effect_uses_typed_or_fixture_count():
     handler = _DrawHandler()
     context = EffectContext.from_legacy(
@@ -460,6 +491,8 @@ if __name__ == "__main__":
     test_context_decorator_adapts_legacy_leaf_arguments()
     test_all_registered_effects_use_the_context_adapter()
     test_context_draw_preserves_owner_and_handler_boundary()
+    test_context_authored_events_use_typed_event_names()
+    test_context_verdict_emits_shared_authored_event()
     test_context_draw_effect_uses_typed_or_fixture_count()
     test_context_randomize_variable_uses_typed_bounds()
     test_context_stat_mod_uses_shared_operation_boundary()

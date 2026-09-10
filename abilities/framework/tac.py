@@ -33,6 +33,60 @@ def _tac_attr_hash(name):
 _TAC_GUID_HASH = _tac_attr_hash("Guid")
 _TAC_FUNC_HASH = _tac_attr_hash("FunctionName")
 
+# These are the structural TAC attributes used by authored trigger
+# conditions.  Ordinary unknown attributes are integer values in the event
+# TACs we currently receive; keeping the structural names explicit preserves
+# the metadata-driven decoder without turning card names into rules.
+_TAC_CONTAINER_HASHES = {
+    _tac_attr_hash(name) for name in (
+        "CardStatsThisTurn", "CardStatsWithSpecificDuration", "CardGameStats",
+        "Condition", "DataToAppend", "HasAsSubset", "MinimumValues",
+        "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
+        "PermanentData", "ThisTurnsData")}
+_TAC_LIST_HASHES = {_tac_attr_hash("Conditions")}
+
+
+def decode_tac_tree(data_b64):
+    """Decode TAC while retaining nested TAC/list structure.
+
+    ``decode_tac`` remains the flat compatibility API used for simple ability
+    flags. Trigger conditions need the client's nested ``MinimumValues`` and
+    ``HasAsSubset`` structure, so expose a small structural decoder alongside
+    it. Unknown leaf attributes are read as IntAttrs, matching TriggerEvent
+    TAC payloads such as GainThresholdEvent.
+    """
+    try:
+        b = _b64.b64decode(data_b64)
+    except Exception:
+        return {}
+    if len(b) < 2:
+        return {}
+    i = 2
+
+    def parse_body():
+        nonlocal i
+        out = {}
+        while i + 4 <= len(b):
+            attr = _st.unpack_from("<I", b, i)[0]
+            i += 4
+            if attr == 0:
+                break
+            if attr in _TAC_CONTAINER_HASHES:
+                out[attr] = parse_body()
+            elif attr in _TAC_LIST_HASHES:
+                out.setdefault(attr, []).append(parse_body())
+            else:
+                if i + 4 > len(b):
+                    break
+                out[attr] = _st.unpack_from("<i", b, i)[0]
+                i += 4
+        return out
+
+    try:
+        return parse_body()
+    except (IndexError, struct.error, ValueError):
+        return {}
+
 
 def decode_tac(data_b64):
     """Decode a serialized TAC (base64 str) into {name_hash: value}.

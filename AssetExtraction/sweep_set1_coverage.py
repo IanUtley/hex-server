@@ -40,6 +40,22 @@ DISPATCHED_EVENTS = {
     "Game.Shared.Mechanics.CardWouldBeDrawnEvent",
     "Game.Shared.Mechanics.CardWouldBeDamagedEvent",
     "Game.Shared.Mechanics.CardCreatedEvent",
+    "Game.Shared.Mechanics.CardDiscardedEvent",
+    "Game.Shared.Mechanics.CardReadiedEvent",
+    "Game.Shared.Mechanics.CardTransformedEvent",
+    "Game.Shared.Mechanics.CardTransformsEvent",
+    "Game.Shared.Mechanics.FateweavedEvent",
+    "Game.Shared.Mechanics.IlluminatedEvent",
+    "Game.Shared.Mechanics.VerdictEvent",
+    "Game.Shared.Mechanics.ProphesiedEvent",
+    "Game.Shared.Mechanics.GainThresholdEvent",
+    "Game.Shared.Mechanics.ConscriptEvent",
+    "Game.Shared.Mechanics.CardActivatedEvent",
+    "Game.Shared.Mechanics.CardDealtDamageEvent",
+    "Game.Shared.Mechanics.CardTappedEvent",
+    "Game.Shared.Mechanics.CardGainedIntAttrEvent",
+    "Game.Shared.Mechanics.TurnPhaseEvent",
+    "Game.Shared.Mechanics.PowerShiftedEvent",
 }
 
 # Condition types the condition_engine models (last segment).
@@ -51,6 +67,9 @@ MODELED_CONDITIONS = {
     "TriggerPlayerControlsCard", "TriggerPlayerControlsTarget",
     "TriggerCardMatchesFilter", "TriggerCardEnteredZone",
     "TriggerCardIsNthCardDrawnThisTurnByThisPlayer",
+    "TriggerEventIsCombatDamage", "TriggerEventIntAttribute",
+    "TurnPhaseCondition", "CardsDiscardedThisTurn", "IntAttrFilter",
+    "TriggerAbilityIsChargePower",
     "TriggerPlayerIsActivePlayer", "TriggerCardSameNameInZone",
     "TriggerCardCounter", "TriggerPlayerHealth",
     "AbilityControllerHasThresholdAbilityCondition",
@@ -63,6 +82,8 @@ MODELED_CONDITIONS = {
     "ChampionActionsCastThisTurn",
     "TriggerCardIsStoredTargetOfAbilitySource",
     "RequiresSourcePassesFilterCondition",
+    "RequiresDateTime", "AbilityVariableCondition",
+    "NotContingentAbilityCondition", "NotContingentEffectCondition",
 }
 
 # Card-filter types the targeting layer can evaluate (last segment).
@@ -71,6 +92,7 @@ MODELED_FILTERS = {
     "IsType", "IsTroop", "IsArtifact", "IsResource", "IsHero",
     "IsSubType", "IsAttacking", "IsTapped", "IsAbilitySource",
     "IsCardName", "IsNotControlledBy", "HasSourceCastingCostFilter",
+    "HasSourceResourceCost", "HasResourceCost", "InFaction", "IntAttrFilter",
     "IsColor", "DamagedOpponentThisTurn", "InZone", "IsControlledBy",
     "HasAttackValue", "HasDefenseValue",
 }
@@ -129,8 +151,7 @@ def main():
                     "TransformCardAbilityEffectTemplate",
                     "ActivateAbilityEffectTemplate"}
     # Leaves registered but effectively no-ops.
-    stubs = {"DiscardCardAbilityEffectTemplate", "VerdictAbilityEffectTemplate",
-             "FireEventEffectTemplate"}
+    stubs = set()
 
     cards = db.execute(
         "SELECT guid, name, abilities_json FROM card_templates "
