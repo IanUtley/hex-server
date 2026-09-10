@@ -44,6 +44,11 @@ _TAC_CONTAINER_HASHES = {
         "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
         "PermanentData", "ThisTurnsData")}
 _TAC_LIST_HASHES = {_tac_attr_hash("Conditions")}
+_TAC_STRING_HASHES = {
+    _tac_attr_hash("GainedCounterType"),
+    _tac_attr_hash("RemovedCounterType"),
+    _tac_attr_hash("CompareWith"),
+}
 
 
 def decode_tac_tree(data_b64):
@@ -75,6 +80,20 @@ def decode_tac_tree(data_b64):
                 out[attr] = parse_body()
             elif attr in _TAC_LIST_HASHES:
                 out.setdefault(attr, []).append(parse_body())
+            elif attr in _TAC_STRING_HASHES:
+                if i >= len(b):
+                    break
+                length = 0
+                shift = 0
+                while i < len(b):
+                    byte = b[i]
+                    i += 1
+                    length |= (byte & 0x7f) << shift
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+                out[attr] = b[i:i + length].decode("utf-8", "replace")
+                i += length
             else:
                 if i + 4 > len(b):
                     break
@@ -84,7 +103,7 @@ def decode_tac_tree(data_b64):
 
     try:
         return parse_body()
-    except (IndexError, struct.error, ValueError):
+    except (IndexError, _st.error, ValueError):
         return {}
 
 

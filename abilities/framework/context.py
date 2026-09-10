@@ -821,6 +821,20 @@ class EffectContext:
         guid = str(counter_guid or "").lower()
         operation = str(operation or "add").lower()
         amount = int(amount or 0)
+
+        def emit_counter_added(old_value, new_value, owner_id):
+            if int(new_value or 0) <= int(old_value or 0):
+                return
+            from .tac import _tac_attr_hash
+            from .triggers import resolve_triggers
+
+            resolve_triggers(
+                self.db, self.handler, self.game, self.session,
+                self.player_uid, self.ai_uid, self.bstate,
+                "CounterAddedToCardEvent", target,
+                source_owner_uid=int(owner_id or 0),
+                event_tac={_tac_attr_hash("GainedCounterType"): name})
+
         if is_champion_target(self.handler, self.bstate, target):
             old, new = change_champion_counter(
                 self.bstate, target, guid, amount,
@@ -833,6 +847,7 @@ class EffectContext:
                     self.game, self.session, self.handler,
                     self.player_uid, self.ai_uid, self.bstate,
                     target, guid, old, new)
+            emit_counter_added(old, new, self.target_owner(target, 0))
             return old, new
 
         old = card_counters(self.db, self.session.session_id, target).get(
@@ -856,6 +871,7 @@ class EffectContext:
             self.game, self.session, self.db, self.handler,
             self.player_uid, self.ai_uid, target, bstate=self.bstate,
             changed_counter=name, old_value=old)
+        emit_counter_added(old, new, self.target_owner(target, 0))
         return old, new
 
     def store_target(self, target: int | None = None) -> str:

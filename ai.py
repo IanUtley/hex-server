@@ -676,11 +676,39 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
             return getattr(handler, "_player_champ_scid", None) or game_engine.SessionCardId(pl_t)
         return getattr(handler, "_ai_champ_scid", None) or game_engine.SessionCardId(ai_t)
 
+    def _would_deal_damage(source_uid, target_uid, amount):
+        """Run CardWouldDealDamage replacement triggers for one combat hit."""
+        if int(amount or 0) <= 0:
+            return False
+        source_row = _db.execute(
+            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+            (session.session_id, int(source_uid))).fetchone()
+        source_owner = source_row[0] if source_row else _owner_of(
+            attacker_uid if int(source_uid) in {
+                int(x) for x in attackers.keys()
+            } else defender_uid)
+        return bool(_abil.resolve_triggers(
+            _db, handler, game, session, pl_t, ai_t, bstate,
+            "CardWouldDealDamageEvent", int(source_uid),
+            source_owner_uid=source_owner, extra_target=int(target_uid),
+            event_tac={"damage": int(amount), "is_combat_damage": 1}))
+
     att_health = health_key(attacker_uid)
     def_health = health_key(defender_uid)
     defender_champ = champ_scid(defender_uid)
 
     game = handler._fresh_game(session, pl_t, ai_t, bstate)
+    # DeclareAttackState enqueues one CardsAttackedEvent before combat damage
+    # begins. Dispatch it from the shared combat resolver so PvE and PvP
+    # receive the same metadata TAC (Diligent Counselor uses NumAttackers).
+    if not first_strike:
+        from abilities.framework.tac import _tac_attr_hash
+        attacker_champ = champ_scid(attacker_uid)
+        _abil.resolve_triggers(
+            _db, handler, game, session, pl_t, ai_t, bstate,
+            "CardsAttackedEvent", int(attacker_champ.uid.uid64),
+            source_owner_uid=_owner_of(attacker_uid),
+            event_tac={_tac_attr_hash("NumAttackers"): len(attackers)})
     def_health_before = bstate.get(def_health, 20)
     att_health_before = bstate.get(att_health, 20)
     att_lifegain = 0
@@ -777,10 +805,13 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 step_b_atk = b_atk if b_deals else 0
                 b_prevent = "prevent_combat_damage" in b_flags
                 b_lethal = "lethal" in b_flags
-                total_block_atk += step_b_atk
                 if b_prevent:
                     log_req(f"    Blocked combat: {hex(b)} prevents combat damage")
                     continue
+                if step_b_atk and _would_deal_damage(b, u, step_b_atk):
+                    log_req(f"    Blocked combat: {hex(b)} damage was replaced")
+                    step_b_atk = 0
+                total_block_atk += step_b_atk
                 # The attacker assigns its remaining damage to this blocker: it
                 # needs `b_def - b_dmg` to die; leftover carries to the next.
                 b_need = max(0, b_def - b_dmg)
@@ -838,9 +869,13 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
             # kill the blockers, any remaining damage breaks through to the
             # defender's champion.
             if remaining > 0 and (a_attrs & game_engine.ECardAttributes.Juggernaught):
-                old_health = bstate.get(def_health, 20)
-                bstate[def_health] = max(0, old_health - remaining)
-                log_req(f"    Trample: {hex(u)} deals {remaining} leftover -> defender health {old_health}->{bstate[def_health]}")
+                if _would_deal_damage(u, defender_champ.uid.uid64,
+                                       remaining):
+                    log_req(f"    Trample: {hex(u)} damage was replaced")
+                else:
+                    old_health = bstate.get(def_health, 20)
+                    bstate[def_health] = max(0, old_health - remaining)
+                    log_req(f"    Trample: {hex(u)} deals {remaining} leftover -> defender health {old_health}->{bstate[def_health]}")
             # SpiritDrain heals for actual combat damage dealt, not the
             # attacker's full power.  `remaining` is the damage left after
             # assigning damage to blockers; Juggernaught carries that
@@ -888,20 +923,23 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
         else:
             # Unblocked: the attacker hits the defender's champion.
             if a_deals:
-                old_health = bstate.get(def_health, 20)
-                bstate[def_health] = max(0, old_health - step_atk)
-                if step_atk > 0:
-                    dmg_targets.append(int(defender_champ.uid.uid64))
-                tnow = int(bstate.get("turn_number", 1))
-                if bstate.get("damaged_opponent_turn") != tnow:
-                    bstate["damaged_opponent_this_turn"] = []
-                    bstate["damaged_opponent_turn"] = tnow
-                damaged = bstate.setdefault("damaged_opponent_this_turn", [])
-                if int(u) not in damaged:
-                    damaged.append(int(u))
-                log_req(f"    Combat damage: {hex(u)} deals {step_atk} -> defender health {old_health}->{bstate[def_health]}")
-                if a_attrs & game_engine.ECardAttributes.SpiritDrain:
-                    att_lifegain += step_atk
+                if _would_deal_damage(u, defender_champ.uid.uid64, step_atk):
+                    log_req(f"    Combat damage: {hex(u)} was replaced")
+                else:
+                    old_health = bstate.get(def_health, 20)
+                    bstate[def_health] = max(0, old_health - step_atk)
+                    if step_atk > 0:
+                        dmg_targets.append(int(defender_champ.uid.uid64))
+                    tnow = int(bstate.get("turn_number", 1))
+                    if bstate.get("damaged_opponent_turn") != tnow:
+                        bstate["damaged_opponent_this_turn"] = []
+                        bstate["damaged_opponent_turn"] = tnow
+                    damaged = bstate.setdefault("damaged_opponent_this_turn", [])
+                    if int(u) not in damaged:
+                        damaged.append(int(u))
+                    log_req(f"    Combat damage: {hex(u)} deals {step_atk} -> defender health {old_health}->{bstate[def_health]}")
+                    if a_attrs & game_engine.ECardAttributes.SpiritDrain:
+                        att_lifegain += step_atk
             else:
                 log_req(f"    Combat damage: {hex(u)} does not deal damage this step")
         # Damage-trigger events: one CardDealtDamageEvent per damaged card

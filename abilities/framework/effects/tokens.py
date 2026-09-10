@@ -555,6 +555,12 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     if created_cards:
         from ..triggers import resolve_triggers
     for card_uid in created_cards:
+        # The original client distinguishes the created card's own
+        # CardCreatedEvent from the event seen by other cards.  Replica/
+        # creation triggers (for example Restless Fabricator) listen to the
+        # latter, so publish both from the shared token factory.
+        resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
+                         "OtherCardCreatedEvent", card_uid, player_uid)
         resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                          "CardCreatedEvent", card_uid, player_uid,
                          zones=())

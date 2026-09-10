@@ -112,11 +112,15 @@ def _warzone_ability_holders(db, session_id, controller_uid, zones=("warzone",))
     zone_values = list(dict.fromkeys(
         list(zones) + (["mod"] if "warzone" in zones else [])))
     placeholders = ",".join("?" * len(zone_values))
-    rows = db.execute(
+    cursor = db.execute(
         ("SELECT card_uid, card_abilities FROM game_cards "
          "WHERE session_id=? AND user_id=? AND location IN (%s) "
          "AND card_abilities IS NOT NULL AND card_abilities != ''") % placeholders,
-        (session_id, controller_uid) + tuple(zone_values)).fetchall()
+        (session_id, controller_uid) + tuple(zone_values))
+    # A few lightweight context tests deliberately provide only fetchone on
+    # their database double.  No holder rows can be discovered there, while
+    # a real sqlite cursor always exposes fetchall().
+    rows = cursor.fetchall() if hasattr(cursor, "fetchall") else []
     for cu, ab_json in rows:
         try:
             ags = [g.lower() for g in json.loads(ab_json or "[]")]
@@ -756,7 +760,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                      extra_target=None, zones=None,
                      event_source_collection=None,
                      event_destination_collection=None,
-                     event_previous_state=None, event_int_attribute=None):
+                     event_previous_state=None, event_int_attribute=None,
+                     event_tac=None):
     """Fire every card ability whose trigger_event_type == event_type.
 
     ``source_uid`` is the card that entered / attacked / blocked / died.
@@ -791,6 +796,30 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             bstate[f"{_side_of(turn_owner)}_cards_discarded_this_turn"] = 0
 
     logs = []
+    inspired_events = set()
+
+    def _emit_inspired_event(inspirer_uid, entering_uid, inspirer_owner):
+        """Emit the client CardInspiredEvent once per successful inspirer.
+
+        ``AsEntersPlayEvent`` is the shared metadata event used to resolve an
+        Inspire ability.  The original client also enqueues a second,
+        separate event so abilities such as ``When this inspires a troop``
+        can react.  Keep the two events distinct and guard multiple Inspire
+        abilities on one card from producing duplicate notifications.
+        """
+        if entering_uid is None or int(inspirer_uid) == int(entering_uid):
+            return
+        key = (int(inspirer_uid), int(entering_uid))
+        if key in inspired_events:
+            return
+        inspired_events.add(key)
+        result = resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardInspiredEvent", int(inspirer_uid),
+            source_owner_uid=int(inspirer_owner or 0),
+            extra_target=int(entering_uid))
+        if result:
+            logs.append(result)
 
     def _opposing_owner(player_id):
         # Practice uses 0 for AI and one non-zero human id. PvP has two
@@ -1009,7 +1038,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     event_destination_collection=event_destination_collection,
                     event_previous_state=event_previous_state,
                     uses_previous_state=uses_previous_state,
-                    event_int_attribute=event_int_attribute)
+                    event_int_attribute=event_int_attribute,
+                    event_tac=event_tac)
                 if not trigger_condition_met(raw, cond_ctx):
                     continue
                 chance = _chance_to_happen(graph)
@@ -1070,6 +1100,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     # resolution target when the event did not provide one.
                     if resolution_target is None:
                         resolution_target = extra_target
+                if event_type == "AsEntersPlayEvent":
+                    _emit_inspired_event(cu, source_uid, ability_owner_id)
                 # Check if this ability ignores the chain (Deploy/Inspire/Deathcry
                 # have m_IgnoresChain=1 — execute immediately, no priority window)
                 ignores = graph.ignores_chain

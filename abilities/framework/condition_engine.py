@@ -73,7 +73,8 @@ class ConditionContext:
                  champions=None, ability_source_card_owner=None,
                  trigger_owner_id=None, event_source_collection=None,
                  event_destination_collection=None, event_previous_state=None,
-                 uses_previous_state=False, event_int_attribute=None):
+                 uses_previous_state=False, event_int_attribute=None,
+                 event_tac=None):
         self.db = db
         self.session = session
         self.bstate = bstate or {}
@@ -91,6 +92,11 @@ class ConditionContext:
         self.event_destination_collection = event_destination_collection
         self.event_previous_state = event_previous_state
         self.event_int_attribute = event_int_attribute
+        # Trigger events carry a transient TAC in the original client.  Keep
+        # it on the evaluation context rather than mutating the shared battle
+        # state, since nested triggers can otherwise overwrite one another's
+        # event payload.
+        self.event_tac = event_tac or {}
         self.uses_previous_state = bool(uses_previous_state)
         # The ability SOURCE CARD's actual owner (its game_cards.user_id) —
         # distinct from the EVENT's source owner.  IsControlledBy /
@@ -474,8 +480,13 @@ def evaluate_condition(node, ctx):
         return drawn == nth
     if t == "TriggerEventIsCombatDamage":
         # The combat resolver emits CardDealtDamageEvent. Ability damage uses
-        # CardWouldBeDamagedEvent and must not satisfy this condition.
-        return _last(ctx.event_type) == "CardDealtDamageEvent"
+        # CardWouldBeDamagedEvent and must not satisfy this condition. A
+        # replacement event carries the original combat flag in its event
+        # TAC, matching the client's CardWouldDealDamageEvent.IDamage data.
+        if _last(ctx.event_type) == "CardDealtDamageEvent":
+            return True
+        return (_last(ctx.event_type) == "CardWouldDealDamageEvent" and
+                bool((ctx.event_tac or {}).get("is_combat_damage")))
     if t == "TriggerEventIntAttribute":
         return (_last(ctx.event_type) == "CardGainedIntAttrEvent" and
                 str(node.get("m_Attribute") or "") == str(
@@ -508,6 +519,13 @@ def evaluate_condition(node, ctx):
         return _compare(value, node.get("m_ComparisonOp", "GreaterThanOrEqual"),
                         required)
     if t == "IntAttrFilter":
+        attr_name = str(node.get("m_Attribute") or "")
+        if attr_name.startswith("AbilityTAC>"):
+            from .tac import _tac_attr_hash
+            actual = int((ctx.event_tac or {}).get(
+                _tac_attr_hash(attr_name.split(">", 1)[1]), 0) or 0)
+            rhs = int(node.get("m_Value", 0) or 0)
+            return _compare(actual, node.get("m_ComparisonOp", "Equals"), rhs)
         target = ctx.card(ctx.trigger_uid) or ctx.card(ctx.ability_source_uid)
         return evaluate_card_filter(target, node, ctx.ability_source_uid) \
             if target is not None else True
@@ -524,7 +542,8 @@ def evaluate_condition(node, ctx):
         # GainThresholdEvent carries exactly one shard IntAttr with value 1.
         # Other event TAC fields can be supplied by callers through the same
         # transient map, keeping this evaluator independent of card names.
-        event_tac = dict((ctx.bstate or {}).get("event_tac") or {})
+        event_tac = dict(ctx.event_tac or
+                         (ctx.bstate or {}).get("event_tac") or {})
         color = (ctx.bstate or {}).get("gain_threshold_color")
         if color is not None:
             for name, flag in game_engine.SHARD_TO_FLAG.items():

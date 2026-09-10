@@ -1721,12 +1721,27 @@ def _battle_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         logs.append(f"{hex(d)} deals {datk} to you -> {result}")
         return "; ".join(logs)
     atk = _card_atk(db, session, a, bstate)
-    logs.append(f"{hex(a)} deals {atk} to {hex(d)} -> "
-                f"{_deal_damage(game, session, db, handler, pl_t, ai_t, bstate, d, atk)}")
+    result = _deal_damage(game, session, db, handler, pl_t, ai_t, bstate,
+                          d, atk)
+    logs.append(f"{hex(a)} deals {atk} to {hex(d)} -> {result}")
+    from .triggers import resolve_triggers
+    resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardBattledEvent", a,
+        source_owner_uid=_deck_owner_for_target(
+            db, handler, session, bstate, a) or 0,
+        extra_target=d)
     if "battles" in low:
         datk = _card_atk(db, session, d, bstate)
-        logs.append(f"{hex(d)} deals {datk} to {hex(a)} -> "
-                    f"{_deal_damage(game, session, db, handler, pl_t, ai_t, bstate, a, datk)}")
+        result = _deal_damage(game, session, db, handler, pl_t, ai_t, bstate,
+                              a, datk)
+        logs.append(f"{hex(d)} deals {datk} to {hex(a)} -> {result}")
+        resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardBattledEvent", d,
+            source_owner_uid=_deck_owner_for_target(
+                db, handler, session, bstate, d) or 0,
+            extra_target=a)
     return "; ".join(logs)
 
 
@@ -1809,6 +1824,8 @@ def _create_token_copy_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     if created:
         from .triggers import resolve_triggers
         for card_uid in created_uids:
+            resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
+                             "OtherCardCreatedEvent", int(card_uid), owner)
             resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                              "CardCreatedEvent", int(card_uid), owner,
                              zones=())

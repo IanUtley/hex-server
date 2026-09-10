@@ -50,6 +50,49 @@ def deal_damage(game, session, db, handler, pl_t, ai_t, bstate, uid, amount):
             return "no card"
 
     from ..triggers import resolve_triggers
+
+    # The client checks the dealer's replacement abilities before it checks
+    # the recipient's CardWouldBeDamagedEvent.  Ability damage and combat
+    # damage both enter through this shared path, so this is the common
+    # metadata-driven hook for cards such as Blasphemous Horror and Brood
+    # Count. Champions are not game_cards rows, so recover their controller
+    # from the live handler/PvP champion map.
+    dealer = (bstate or {}).get("resolving_source_uid")
+    if dealer is not None:
+        dealer = int(dealer)
+        drow = db.execute(
+            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+            (session.session_id, dealer)).fetchone()
+        dealer_owner = drow[0] if drow else None
+        if dealer_owner is None and (bstate or {}).get("pvp"):
+            for pid, cuid in ((bstate or {}).get("champ_map") or {}).items():
+                if int(cuid) == dealer:
+                    dealer_owner = int(pid)
+                    break
+        if dealer_owner is None:
+            pchamp = getattr(handler, "_player_champ_scid", None)
+            achamp = getattr(handler, "_ai_champ_scid", None)
+            if achamp is not None and int(achamp.uid.uid64) == dealer:
+                dealer_owner = 0
+            elif pchamp is not None and int(pchamp.uid.uid64) == dealer:
+                dealer_owner = (handler.user_profile["id"]
+                                if handler.user_profile else 0)
+        if not (bstate or {}).get("_resolving_would_deal"):
+            bstate["_resolving_would_deal"] = True
+            try:
+                replaced = resolve_triggers(
+                    db, handler, game, session, pl_t, ai_t, bstate,
+                    "CardWouldDealDamageEvent", dealer,
+                    source_owner_uid=int(dealer_owner or 0),
+                    extra_target=uid_i,
+                    event_tac={"damage": int(amount),
+                               "is_combat_damage": int(
+                                   bool((bstate or {}).get("combat_damage")))})
+            finally:
+                bstate.pop("_resolving_would_deal", None)
+            if replaced:
+                return "replaced"
+
     if resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                         "CardWouldBeDamagedEvent", uid_i,
                         source_owner_uid=row[1] if row else 0):
