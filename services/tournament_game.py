@@ -1763,8 +1763,7 @@ def pvp_advance_past_non_stops(session, state):
     # / ai.player_can_attack_troops.  With no eligible attackers the turn skips
     # DeclareAttack/DeclareDefense/AssignDamage entirely (FirstMain -> SecondMain).
     has_ready = pvp_turn_has_attackers(session, turn_pid)
-    phase_list = (_be.COMBAT_TURN_PHASES if has_ready
-                  else _be.BASE_TURN_PHASES)
+    phase_list = _pvp_turn_phase_list(state, turn_pid, has_ready)
     try:
         cur = phase_list.index(int(state.get("phase", 6)))
     except ValueError:
@@ -1802,6 +1801,27 @@ def pvp_advance_past_non_stops(session, state):
                 log_req(f"    PvP auto-advance: stopped at Discard "
                         f"(hand {hc[0]} > 7)")
                 return advanced
+
+
+def _pvp_turn_phase_list(state, turn_pid, has_ready):
+    """Build the active player's phase cycle, including authored extra
+    combats scheduled in ThisTurnsData."""
+    import battle_engine as _be
+
+    phases = (_be.COMBAT_TURN_PHASES if has_ready
+              else _be.BASE_TURN_PHASES)
+    entries = (state.get("extra_combats_this_turn") or {}).get(
+        str(turn_pid), [])
+    if not entries:
+        return phases
+    try:
+        second_main = phases.index(_ge.ETurnPhases.SecondMainPhase)
+    except ValueError:
+        return phases
+    return (phases[:second_main + 1] +
+            sum((_be.COMBAT_STEPS + [_ge.ETurnPhases.SecondMainPhase]
+                 for _entry in entries), []) +
+            phases[second_main + 1:])
 
 
 def _pvp_thresholds_met(thresh_json, player_threshold):
@@ -3726,8 +3746,7 @@ def route_pvp_pass(handler, session):
         has_ready = True
     else:
         has_ready = pvp_turn_has_attackers(session, turn_pid)
-    phase_list = (_be.COMBAT_TURN_PHASES if has_ready
-                  else _be.BASE_TURN_PHASES)
+    phase_list = _pvp_turn_phase_list(state, turn_pid, has_ready)
     try:
         cur_idx = phase_list.index(old_phase)
     except ValueError:
@@ -3828,6 +3847,7 @@ def route_pvp_pass(handler, session):
         state.pop("damaged_opponent_turn", None)
         state.pop("attackers", None)
         state.pop("blockers", None)
+        state.pop("extra_combats_this_turn", None)
         for _pid in pids_:
             state[f"res_played_{_pid}"] = 0
         next_idx = 0

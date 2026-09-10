@@ -83,6 +83,36 @@ def test_battle_state_persistence_omits_runtime_builder():
     assert persisted == {"turn_player": "player"}
     assert state["_ability_builder"] is builder
 
+
+def test_extra_combat_entries_extend_the_current_turn_after_second_main():
+    import battle_engine
+    import game_engine
+
+    state = {
+        "player_has_ready_troop": False,
+        "extra_combats_this_turn": {
+            "player": [{"ready_your_troops": True}],
+        },
+    }
+    phases = battle_engine.build_turn_phases(state)
+    second_main = phases.index(game_engine.ETurnPhases.SecondMainPhase)
+    assert phases[second_main + 1:second_main + 1 + len(
+        battle_engine.COMBAT_STEPS)] == battle_engine.COMBAT_STEPS
+    assert phases[second_main + 1 + len(battle_engine.COMBAT_STEPS)] == \
+        game_engine.ETurnPhases.SecondMainPhase
+
+
+def test_pvp_extra_combat_entries_use_the_active_player_key():
+    from services.tournament_game import _pvp_turn_phase_list
+    import battle_engine
+    import game_engine
+
+    phases = _pvp_turn_phase_list(
+        {"extra_combats_this_turn": {"1001": [{}]}}, 1001, False)
+    second_main = phases.index(game_engine.ETurnPhases.SecondMainPhase)
+    assert phases[second_main + 1:second_main + 1 + len(
+        battle_engine.COMBAT_STEPS)] == battle_engine.COMBAT_STEPS
+
     class Session:
         turn_order = None
 
@@ -147,6 +177,22 @@ def test_context_draw_preserves_owner_and_handler_boundary():
     assert context.draw(2) == "draw 2 for owner 5"
     assert len(handler.calls) == 2
     assert all(call[-1] == 5 for call in handler.calls)
+
+
+def test_tac_decoder_preserves_append_to_list_metadata():
+    from abilities.framework.tac import decode_tac_tree, tac_function, tac_string
+
+    # Representative authored TAC from Records.  Keeping the fixture local
+    # makes this test independent of the developer's runtime database.
+    param = (
+        "AgD231pIDEFwcGVuZFRvTGlzdKx3EcQURXh0cmFDb21iYXRzVGhpc1R1cm4d"
+        "ssWzDVRoaXNUdXJuc0RhdGEG67dBAQAAAAAAAAA="
+    )
+    tree = decode_tac_tree(param)
+    assert tac_function(param) == "AppendToList"
+    assert tac_string(param, "ListName") == "ExtraCombatsThisTurn"
+    assert tac_string(param, "Where") == "ThisTurnsData"
+    assert tree
 
 
 def test_context_authored_events_use_typed_event_names():

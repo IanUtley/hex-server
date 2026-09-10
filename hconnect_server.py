@@ -9064,12 +9064,15 @@ class HCPHandler:
                             # pass button labelled "Resolve <Card>".
                             if (_be.stack_empty(bstate) and not pending_input and
                                     bstate.get("turn_player") == _be.PLAYER):
-                                if cur_phase == game_engine.ETurnPhases.FirstMainPhase:
+                                if cur_phase in (
+                                        game_engine.ETurnPhases.FirstMainPhase,
+                                        game_engine.ETurnPhases.SecondMainPhase):
                                     # A troop may have entered during this chain
                                     # (notably a Speed troop). Recompute before
                                     # rebuilding the green light so the next
                                     # prompt immediately offers ProceedToCombat.
-                                    bstate["player_has_ready_troop"] = self._player_can_attack_troops(session)
+                                    if cur_phase == game_engine.ETurnPhases.FirstMainPhase:
+                                        bstate["player_has_ready_troop"] = self._player_can_attack_troops(session)
                                     bstate["turn_phases"] = _be.build_turn_phases(bstate)
                                     _be.save_state(session, bstate)
                                 # The chain fully emptied on the player's turn:

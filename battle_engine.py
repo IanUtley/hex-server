@@ -145,9 +145,25 @@ def build_turn_phases(state):
     pass — for the player in _advance_to_priority, for the AI in ai.run_ai_turn).
     The AI gets combat phases too, so it can attack (aggressive personality).
     """
-    if state.get("player_has_ready_troop"):
-        return COMBAT_TURN_PHASES
-    return BASE_TURN_PHASES
+    phases = (COMBAT_TURN_PHASES if state.get("player_has_ready_troop")
+              else BASE_TURN_PHASES)
+    entries = (state.get("extra_combats_this_turn") or {}).get(
+        "player", [])
+    if not entries:
+        return phases
+    # The client leaves SecondMainPhase, consumes one ExtraCombatsThisTurn
+    # entry, and returns directly to the combat priority window.  Preserve the
+    # ordinary first combat (when present), then append one combat sequence per
+    # authored entry before EndPhase.  This keeps the phase cursor stable when
+    # an ability is resolved during FirstMain or SecondMain.
+    try:
+        second_main = phases.index(game_engine.ETurnPhases.SecondMainPhase)
+    except ValueError:
+        return phases
+    return (phases[:second_main + 1] +
+            sum((COMBAT_STEPS + [game_engine.ETurnPhases.SecondMainPhase]
+                 for _entry in entries), []) +
+            phases[second_main + 1:])
 
 
 def is_self_stop(state, phase):
@@ -355,6 +371,7 @@ def advance_phase(state):
         state["turn_player"] = next_turn_player(state)
         state["turn_number"] = state.get("turn_number", 1) + 1
         state["phase_idx"] = 0
+        state.pop("extra_combats_this_turn", None)
         state["turn_phases"] = build_turn_phases(state)
         return current_phase(state)
     state["phase_idx"] = idx

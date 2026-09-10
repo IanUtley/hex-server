@@ -1435,22 +1435,34 @@ class EffectContext:
             list_name = tac_string(serialized, "ListName")
             where = tac_string(serialized, "Where", "ThisTurnsData")
             data = {"source_uid": self.bstate.get("resolving_source_uid")}
-            if tac_int(serialized, "ReadyYourTroops", 0):
+            from .tac import decode_tac_tree, _tac_attr_hash
+            tree = decode_tac_tree(serialized)
+            nested = tree.get(_tac_attr_hash("DataToAppend"))
+            ready = tac_int(serialized, "ReadyYourTroops", 0)
+            if isinstance(nested, dict):
+                ready = nested.get(_tac_attr_hash("ReadyYourTroops"), ready)
+            if ready:
                 data["ReadyYourTroops"] = 1
             # The extracted typed template is authoritative for nested TAC
             # data.  Keep unknown fields rather than making a card-specific
             # interpretation of a future list entry.
-            template = self.template_value("m_SerializedTAC", {}) or {}
-            if isinstance(template, dict):
-                from .tac import decode_tac_tree, _tac_attr_hash
-                tree = decode_tac_tree(template.get("data") or "")
-                nested = tree.get(_tac_attr_hash("DataToAppend"))
-                if isinstance(nested, dict):
-                    data.update({str(k): v for k, v in nested.items()})
+            if isinstance(nested, dict):
+                data.update({str(k): v for k, v in nested.items()})
             lists = self.bstate.setdefault("list_attrs", {})
             ability_lists = lists.setdefault(self.ability_guid, {})
             entries = ability_lists.setdefault(list_name, [])
             entries.append({"where": where, **data})
+            if list_name == "ExtraCombatsThisTurn":
+                owner = self.target_owner(
+                    target, self.bstate.get("resolving_owner_id", 0))
+                owner_key = (str(owner) if self.bstate.get("pvp") else
+                             ("ai" if int(owner or 0) == 0 else "player"))
+                extra = self.bstate.setdefault(
+                    "extra_combats_this_turn", {}).setdefault(owner_key, [])
+                extra.append({
+                    "ready_your_troops": bool(ready),
+                    "source_uid": data.get("source_uid"),
+                })
             return f"appended {list_name}"
 
         if function == "CycleCardArt":
