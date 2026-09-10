@@ -60,6 +60,49 @@ def _pl_ai():
     return pl_t, ai_t
 
 
+def test_cards_attacked_dispatch_uses_group_count_once(db):
+    """The attack-group event carries NumAttackers and is not replayed."""
+    from unittest import mock
+    from abilities.framework import triggers
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"turn_number": 4}
+    source_uid = int(handler._player_champ_scid.uid.uid64)
+    with mock.patch.object(triggers, "resolve_triggers",
+                           return_value="fired") as dispatch:
+        assert triggers.resolve_cards_attacked(
+            db, handler, game, SessionStub(), pl_t, ai_t, bstate,
+            source_uid, 5, [103, 101, 102]) == "fired"
+        assert triggers.resolve_cards_attacked(
+            db, handler, game, SessionStub(), pl_t, ai_t, bstate,
+            source_uid, 5, [101, 102, 103]) == ""
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[7:9] == (
+        "CardsAttackedEvent", source_uid)
+    assert dispatch.call_args.kwargs["event_tac"]
+    from abilities.framework.tac import _tac_attr_hash
+    assert dispatch.call_args.kwargs["event_tac"][_tac_attr_hash(
+        "NumAttackers")] == 3
+
+
+def test_card_battled_dispatch_is_directional(db):
+    """A card battle gives each participant its own trigger perspective."""
+    from unittest import mock
+    from abilities.framework import triggers
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    with mock.patch.object(triggers, "resolve_triggers",
+                           return_value="fired") as dispatch:
+        assert triggers.resolve_card_battled(
+            db, handler, game, SessionStub(), pl_t, ai_t, {},
+            101, 5, 202, 0) == "fired"
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[7:9] == ("CardBattledEvent", 101)
+    assert dispatch.call_args.kwargs["extra_target"] == 202
+
+
 def test_generated_card_uid_is_independent_of_row_id(db):
     """Generated tokens must not reuse a SessionCardId from another card.
 
@@ -858,6 +901,8 @@ def test_incantation_of_fear_counter_on_opposing_crypt_entry(db):
 
 def _main():
     tests = (test_brood_creeper_damage_to_opposing_champion_summons,
+             test_cards_attacked_dispatch_uses_group_count_once,
+             test_card_battled_dispatch_is_directional,
              test_brood_creeper_does_not_fire_on_own_champion,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,

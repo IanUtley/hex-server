@@ -25,6 +25,8 @@ from abilities import (
     bom_has_discard,
     bom_has_leaf,
     resolve_triggers,
+    resolve_cards_attacked,
+    resolve_card_battled,
     resolve_enters_play_triggers,
     resolve_stack_trigger,
     _stat_delta,

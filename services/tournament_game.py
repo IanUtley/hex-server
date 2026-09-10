@@ -6886,6 +6886,14 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
         if view.get("ai_health") is not None:
             state[f"hp_{opp_pid}"] = int(view["ai_health"])
         pvp_save_state(session, state)
+    if attackers:
+        # One champion-scoped event represents the whole declaration; do not
+        # emit one event per attacker because metadata conditions consume the
+        # authored NumAttackers TAC value.
+        from abilities.framework.triggers import resolve_cards_attacked
+        resolve_cards_attacked(
+            _db, handler, g, session, my_uid, opp_uid, state,
+            my_champ or int(my_uid.uid64), my_pid, attackers)
     _db.commit()
     if combats:
         g.push_combat_listing(my_uid, combats)

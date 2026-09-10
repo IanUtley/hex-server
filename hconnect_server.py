@@ -8847,6 +8847,17 @@ class HCPHandler:
             # Rage X: when this attacks it gets +X ATK this turn.
             from abilities.framework.keywords.combat import apply_rage_keyword
             apply_rage_keyword(_db, session, self, game, pl_t, ai_t, bstate, u)
+        if attackers:
+            # The client raises one champion-scoped CardsAttackedEvent after
+            # the complete attack declaration, carrying the total attacker
+            # count for metadata conditions such as "three or more".
+            import ability as _abil
+            player_champ = (getattr(self, "_player_champ_scid", None) or
+                            game_engine.SessionCardId(pl_t))
+            _abil.resolve_cards_attacked(
+                _db, self, game, session, pl_t, ai_t, bstate,
+                int(player_champ.uid.uid64), self.user_profile["id"],
+                attackers)
         _db.commit()
         game.push_combat_listing(pl_t, combats)
         self._send_battle_events(session, game, pl_t)

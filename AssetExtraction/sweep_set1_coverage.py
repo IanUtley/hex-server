@@ -56,6 +56,14 @@ DISPATCHED_EVENTS = {
     "Game.Shared.Mechanics.CardGainedIntAttrEvent",
     "Game.Shared.Mechanics.TurnPhaseEvent",
     "Game.Shared.Mechanics.PowerShiftedEvent",
+    "Game.Shared.Mechanics.CardScroungedEvent",
+    "Game.Shared.Mechanics.GainChargeEvent",
+    "Game.Shared.Mechanics.CardsAttackedEvent",
+    "Game.Shared.Mechanics.CardBattledEvent",
+    "Game.Shared.Mechanics.CombatEndedEvent",
+    "Game.Shared.Mechanics.ChampionWouldLoseEvent",
+    "Game.Shared.Mechanics.OtherCardCreatedEvent",
+    "Game.Shared.Mechanics.HiddenCardEnteredZoneEvent",
 }
 
 # Condition types the condition_engine models (last segment).
@@ -84,6 +92,17 @@ MODELED_CONDITIONS = {
     "RequiresSourcePassesFilterCondition",
     "RequiresDateTime", "AbilityVariableCondition",
     "NotContingentAbilityCondition", "NotContingentEffectCondition",
+    "TriggerPlayerIsActivePlayer", "TriggerCardSameNameInZone",
+    "TriggerCardIsStoredTargetOfAbilitySource", "TriggerCardCounter",
+    "TriggerPlayerHealth", "ChampionActionsCastThisTurn",
+    "AbilityControllerHasThresholdAbilityCondition",
+    "AbilityControllerIsActiveAbilityCondition",
+    "AbilityControllerHasPriorityAbilityCondition",
+    "SourceCardHasCounters", "RequiresCardsControlled",
+    "CardFilterAbilityCondition", "RequiresChampionHealth",
+    "RequiresChampionCharges", "RequiresResourceThreshold",
+    "RequiresTotalResources", "RequiresDateTime",
+    "NotContingentAbilityCondition", "NotContingentEffectCondition",
 }
 
 # Card-filter types the targeting layer can evaluate (last segment).
@@ -95,6 +114,22 @@ MODELED_FILTERS = {
     "HasSourceResourceCost", "HasResourceCost", "InFaction", "IntAttrFilter",
     "IsColor", "DamagedOpponentThisTurn", "InZone", "IsControlledBy",
     "HasAttackValue", "HasDefenseValue",
+    "IsNotType", "IsRarity", "IsSocketable", "IsBlocking",
+    "IsDamagedThisTurn", "BlockingFilter", "BeingBlockedByFilter",
+    "HasAnyAttributeFlags", "HasName", "IsNotControlledBy",
+    "NameContainsFilter", "HasSourceTypeFilter",
+    "HasASharedShardWithSourceFilter", "HasASharedRarityWithSourceFilter",
+    "HasASharedSubtypeWithSourceFilter",
+    "HasASharedClassWithSourceChampionFilter",
+    "HasASharedSubtypeWithSourceChampionFilter", "HasKeywordAbility",
+    "IsMercenaryFilter", "IsSocketable", "IsEquippedCardFilter",
+    "InCollection", "IsStoredCardFilter", "IsChildOfAbilitySource",
+    "IsChildOfAbilitySourceFilter", "IsParentOfAbilitySourceFilter",
+    "OtherTroops", "PlayersWhoControlMatchingFilter", "TACFilter",
+    "CompareAttackToHighestFilter", "CompareAttackToLowestFilter",
+    "CompareResourceCostToHighestFilter", "CompareResourceCostToMyHighestFilter",
+    "CompareHealthToHighestFilter", "CompareCastingCostToSourceCountersFilter",
+    "HasCountersValue", "TopNOfDeck",
 }
 
 

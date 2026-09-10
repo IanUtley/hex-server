@@ -46,6 +46,8 @@ from .framework.deathcry import resolve_deathcry, _resolve_deathcry_effect
 from .framework.stat_mod import apply_card_stat_mod
 from .framework.triggers import (
     resolve_triggers,
+    resolve_cards_attacked,
+    resolve_card_battled,
     resolve_enters_play_triggers,
     resolve_stack_trigger,
 )

@@ -1206,6 +1206,49 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     return "; ".join(logs)
 
 
+def resolve_cards_attacked(db, handler, game, session, pl_t, ai_t, bstate,
+                           source_uid, source_owner_uid, attacker_uids):
+    """Emit the metadata ``CardsAttackedEvent`` once for an attack group.
+
+    The client raises this champion-scoped event after all attackers are
+    declared, not once per card.  Its TAC payload carries the attack count;
+    this is what cards such as Diligent Counselor test.  Attack declaration
+    has separate PvE/PvP and human/AI entry points, so keep the lifecycle
+    boundary here and deduplicate reconnect/replay of the same declaration.
+    """
+    uids = sorted({int(uid) for uid in (attacker_uids or [])})
+    if not uids:
+        return ""
+    try:
+        turn = int((bstate or {}).get("turn_number", 0) or 0)
+    except (TypeError, ValueError):
+        turn = 0
+    marker = "%d:%d:%s" % (
+        turn, int(source_owner_uid or 0), ",".join(str(uid) for uid in uids))
+    if (bstate or {}).get("_cards_attacked_event_marker") == marker:
+        return ""
+    bstate["_cards_attacked_event_marker"] = marker
+    from .tac import _tac_attr_hash
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardsAttackedEvent", int(source_uid),
+        source_owner_uid=int(source_owner_uid or 0),
+        event_tac={_tac_attr_hash("NumAttackers"): len(uids)})
+
+
+def resolve_card_battled(db, handler, game, session, pl_t, ai_t, bstate,
+                         source_uid, source_owner_uid, target_uid,
+                         target_owner_uid):
+    """Raise one directional metadata event for a card-to-card battle."""
+    if source_uid is None or target_uid is None:
+        return ""
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardBattledEvent", int(source_uid),
+        source_owner_uid=int(source_owner_uid or 0),
+        extra_target=int(target_uid))
+
+
 def resolve_turn_phase_triggers(db, handler, game, session, pl_t, ai_t,
                                 bstate, phase, owner_id):
     """Dispatch one metadata-defined TurnPhaseEvent on phase entry.

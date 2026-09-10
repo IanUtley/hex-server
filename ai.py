@@ -698,17 +698,43 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
     defender_champ = champ_scid(defender_uid)
 
     game = handler._fresh_game(session, pl_t, ai_t, bstate)
+    # A normal combat pair raises two directional CardBattledEvents (one for
+    # each troop).  The same resolver is called for first-strike and normal
+    # damage, so persist a pair marker to keep the lifecycle event single-shot.
+    combat_pairs = []
+    for attacker in attackers:
+        for blocker in blockers_map.get(int(attacker), []):
+            combat_pairs.append((int(attacker), int(blocker)))
+    combat_marker = "%d:%s" % (
+        int(bstate.get("turn_number", 0) or 0),
+        ";".join("%d-%d" % pair for pair in sorted(combat_pairs)))
+    if combat_pairs and bstate.get("_card_battled_event_marker") != combat_marker:
+        from abilities.framework.triggers import resolve_card_battled
+        for attacker, blocker in combat_pairs:
+            attacker_row = _db.execute(
+                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+                (session.session_id, attacker)).fetchone()
+            blocker_row = _db.execute(
+                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
+                (session.session_id, blocker)).fetchone()
+            attacker_owner = attacker_row[0] if attacker_row else 0
+            blocker_owner = blocker_row[0] if blocker_row else 0
+            resolve_card_battled(
+                _db, handler, game, session, pl_t, ai_t, bstate,
+                attacker, attacker_owner, blocker, blocker_owner)
+            resolve_card_battled(
+                _db, handler, game, session, pl_t, ai_t, bstate,
+                blocker, blocker_owner, attacker, attacker_owner)
+        bstate["_card_battled_event_marker"] = combat_marker
     # DeclareAttackState enqueues one CardsAttackedEvent before combat damage
     # begins. Dispatch it from the shared combat resolver so PvE and PvP
     # receive the same metadata TAC (Diligent Counselor uses NumAttackers).
     if not first_strike:
-        from abilities.framework.tac import _tac_attr_hash
         attacker_champ = champ_scid(attacker_uid)
-        _abil.resolve_triggers(
+        _abil.resolve_cards_attacked(
             _db, handler, game, session, pl_t, ai_t, bstate,
-            "CardsAttackedEvent", int(attacker_champ.uid.uid64),
-            source_owner_uid=_owner_of(attacker_uid),
-            event_tac={_tac_attr_hash("NumAttackers"): len(attackers)})
+            int(attacker_champ.uid.uid64),
+            _owner_of(attacker_uid), attackers)
     def_health_before = bstate.get(def_health, 20)
     att_health_before = bstate.get(att_health, 20)
     att_lifegain = 0
