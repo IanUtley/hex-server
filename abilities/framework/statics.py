@@ -108,7 +108,7 @@ def _target_owner(db, session_id, owner, player_filter):
     return owner
 
 
-def _card_property_value(db, session_id, card_uid, prop):
+def _card_property_value(db, session_id, card_uid, prop, bstate=None):
     """Read a typed current-card property for an ability variable."""
     row = db.execute(
         "SELECT COALESCE(ct.attack, 0), COALESCE(ct.defense, 0), "
@@ -121,7 +121,30 @@ def _card_property_value(db, session_id, card_uid, prop):
     if not row:
         return None
     if prop == "ResourceCostTrue":
-        return effective_cost(db, session_id, {}, int(card_uid))
+        # A static modifier can use the source card's cost as its variable
+        # (for example, ``this gets +ATK/+DEF equal to its cost``).  The
+        # normal effective-cost path includes continuous static deltas, which
+        # evaluates the same CardPropertyVariable again.  Break only that
+        # re-entrant evaluation and retain the authoritative base/instance
+        # cost; the outer call still includes all non-recursive cost auras.
+        state = bstate if isinstance(bstate, dict) else None
+        stack = state.setdefault("_card_property_cost_stack", []) if state is not None else []
+        uid = int(card_uid)
+        row_cost = db.execute(
+            "SELECT COALESCE(ct.cost,0), COALESCE(gc.card_cost_mod,0) "
+            "FROM game_cards gc JOIN card_templates ct "
+            "ON ct.guid=gc.template_guid "
+            "WHERE gc.session_id=? AND gc.card_uid=?",
+            (session_id, uid)).fetchone()
+        if uid in stack:
+            return max(0, int(row_cost[0] or 0) + int(row_cost[1] or 0)) if row_cost else 0
+        stack.append(uid)
+        try:
+            return effective_cost(db, session_id, state or {}, uid)
+        finally:
+            stack.pop()
+            if state is not None and not stack:
+                state.pop("_card_property_cost_stack", None)
     if prop not in ("CurrentAttackValue", "CurrentDefenseValue"):
         return None
     value = int(row[0 if prop == "CurrentAttackValue" else 1] or 0)
@@ -233,7 +256,8 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
                                      source_uid)
         if t == "CardPropertyVariable":
             prop = var.get("m_Property") or ""
-            value = _card_property_value(db, session_id, source_uid, prop)
+            value = _card_property_value(
+                db, session_id, source_uid, prop, bstate=bstate)
             if value is not None:
                 return value
             return int(var.get("m_DefaultValue", 0) or 0)
