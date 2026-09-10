@@ -1412,6 +1412,20 @@ class CardCollectionsMergedSessionEventArgs(SessionEventArgs):
         return self.end_write()
 
 
+class CycleCardArtSessionEventArgs(SessionEventArgs):
+    """Game.Shared.CycleCardArtSessionEventArgs (client class 72)."""
+    CLASS_ID = 72
+
+    def __init__(self):
+        super().__init__()
+        self.session_card_id = SessionCardId()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_scid(self.session_card_id)
+        return self.end_write()
+
+
 def make_game_ended_packet(session_id, sender_uid, winners, losers):
     """Build a NetworkPacketSessionEventArgs carrying a GameEnded event.
 

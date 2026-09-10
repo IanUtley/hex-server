@@ -64,6 +64,7 @@ from domain.events import (
     DeckCreatedSessionEventArgs,
     GreenLightSessionEventArgs,
     CardCollectionsMergedSessionEventArgs,
+    CycleCardArtSessionEventArgs,
     CardMovedSessionEventArgs,
     CardCountersChangedSessionEventArgs,
     CombatsThatNeedDamageSessionEventArgs,

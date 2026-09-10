@@ -697,7 +697,7 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 | `DoubleChoiceAbilityEffectTemplate` | implemented | Creates the metadata-defined random Choice cards, exposes the built-in Choose-and-Play picker, supports the second-choice stage, and resumes the parent ability after selection in PvE and PvP. |
 | `TransformCardAbilityEffectTemplate` | implemented | Target from bstate; template GUID from game-text link or `effect_guid`. |
 | `ActivateAbilityEffectTemplate` | implemented | Recurses via `param` (m_AbilityToInvoke). |
-| `TACAbilityEffectTemplate` | partial | Decodes operation + GUID; only `ShiftAbility` handled. |
+| `TACAbilityEffectTemplate` | implemented | `EffectContext` executes every TAC operation present in the current Records snapshot: list append, art cycle, resource depletion, escalation, stored-target cleanup, threshold gain, deck movement, collection replacement, base-ability revocation, power shift, and tame. |
 | `RandomizeVariableEffectTemplate` | implemented | Uses typed min/max fields (including dynamic max fields) and stores the result in the active ability-variable map; the stale historical alias remains only for direct legacy callers. |
 | `GrantAbilityEffectTemplate`, `PlayCardAbilityEffectTemplate`, `RevertPermanentModificationsAbilityEffectTemplate`, `RevealCardsAbilityEffectTemplate`, `StoreTargetsAbilityEffectTemplate` | implemented | Metadata-driven state/event paths; simple state effects use `EffectContext`, while play/reveal/grant retain their required orchestration. |
 
@@ -710,7 +710,7 @@ The same adapter boundary now covers the prompt- and combat-heavy
 `DoubleChoiceAbilityEffectTemplate` and `BlockEffectTemplate`; their
 continuation and combat contracts remain in named context operations rather
 than being compressed into artificial simple leaves.
-| `FireEventEffectTemplate`, `VerdictAbilityEffectTemplate` | partial | Registered compatibility leaves; still require their authored event/verdict contracts before they can be treated as complete. |
+| `FireEventEffectTemplate`, `VerdictAbilityEffectTemplate` | implemented | Dispatch typed authored event names through the shared trigger resolver in both PvE and PvP. |
 
 `RepeatingAbilityEffectTemplate` is resolved by the main resolver because it
 contains a nested typed ability and loop-count field rather than a normal

@@ -1414,6 +1414,273 @@ class EffectContext:
         return self._legacy("_activate_ability_legacy")
 
     def tac(self):
+        """Apply one metadata-defined TAC operation.
+
+        TAC operations are the client's generic escape hatch for mechanics
+        that do not need a dedicated effect-template class.  Keep the
+        operation name and arguments in Records, while using the same typed
+        target, owner, persistence, and event helpers as ordinary effects.
+        """
+        import game_engine
+        from .tac import (tac_function, tac_guid, tac_int, tac_string)
+
+        serialized = self.template_value("m_SerializedTAC", None)
+        if isinstance(serialized, dict):
+            serialized = serialized.get("data")
+        serialized = serialized or self.param
+        function = tac_function(serialized)
+        target = self.resolved_target()
+
+        if function == "AppendToList":
+            list_name = tac_string(serialized, "ListName")
+            where = tac_string(serialized, "Where", "ThisTurnsData")
+            data = {"source_uid": self.bstate.get("resolving_source_uid")}
+            if tac_int(serialized, "ReadyYourTroops", 0):
+                data["ReadyYourTroops"] = 1
+            # The extracted typed template is authoritative for nested TAC
+            # data.  Keep unknown fields rather than making a card-specific
+            # interpretation of a future list entry.
+            template = self.template_value("m_SerializedTAC", {}) or {}
+            if isinstance(template, dict):
+                from .tac import decode_tac_tree, _tac_attr_hash
+                tree = decode_tac_tree(template.get("data") or "")
+                nested = tree.get(_tac_attr_hash("DataToAppend"))
+                if isinstance(nested, dict):
+                    data.update({str(k): v for k, v in nested.items()})
+            lists = self.bstate.setdefault("list_attrs", {})
+            ability_lists = lists.setdefault(self.ability_guid, {})
+            entries = ability_lists.setdefault(list_name, [])
+            entries.append({"where": where, **data})
+            return f"appended {list_name}"
+
+        if function == "CycleCardArt":
+            if target is None:
+                return "cycle card art: no target"
+            from domain.events import CycleCardArtSessionEventArgs
+            event = CycleCardArtSessionEventArgs()
+            event.session_card_id = game_engine.SessionCardId(
+                game_engine.UID(int(target)))
+            self.game._push(event)
+            return f"cycled art {hex(int(target))}"
+
+        if function == "DepleteResources":
+            owner = self.target_owner(target, self.bstate.get(
+                "resolving_owner_id", 0))
+            owner = int(owner or 0)
+            if self.bstate.get("pvp"):
+                key = f"res_{owner}"
+            else:
+                key = "player_resources" if owner else "ai_resources"
+            current = int(self.bstate.get(key, 0) or 0)
+            self.bstate[key] = 0
+            if owner:
+                self.game.player_resources = 0
+            else:
+                self.game.ai_resources = 0
+            if current:
+                from ._shared import owner_uid
+                event = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
+                event.player_id = owner_uid(owner, self.player_uid,
+                                            self.ai_uid, self.bstate)
+                event.operation = 2
+                event.delta = current
+                event.new_value = 0
+                self.game._push(event)
+            return f"depleted {owner} resources ({current})"
+
+        if function == "Escalate":
+            owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
+            side = "ai" if owner == 0 else "player"
+            key = f"{side}_escalation_uses"
+            if self.bstate.get("_esc_counted_this_resolution"):
+                return "escalate (already counted by ESC leaf)"
+            self.bstate[key] = int(self.bstate.get(key, 0) or 0) + 1
+            self.bstate["_esc_counted_this_resolution"] = True
+            return f"escalate {side} (uses={self.bstate[key]})"
+
+        if function == "ForgetAllCards":
+            self.bstate.setdefault("stored_targets", {}).pop(
+                self.ability_guid, None)
+            self.bstate.setdefault("ability_lists", {}).pop(
+                self.ability_guid, None)
+            return "forgot stored cards"
+
+        if function in ("GainTargetsThresholds", "GainTargetsProvidedThresholds"):
+            if target is None:
+                return "gain thresholds: no target"
+            owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
+            amounts = {}
+            if function == "GainTargetsProvidedThresholds":
+                row = self.db.execute(
+                    "SELECT card_abilities FROM game_cards "
+                    "WHERE session_id=? AND card_uid=?",
+                    (self.session.session_id, int(target))).fetchone()
+                try:
+                    ability_guids = json.loads(row[0] or "[]") if row else []
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    ability_guids = []
+                from game_engine import SHARD_TO_FLAG
+                from .fields import effect_template
+                for ability_guid in ability_guids:
+                    effects = self.db.execute(
+                        "SELECT effect_guid, effect_type FROM ability_effects "
+                        "WHERE ability_guid=?", (str(ability_guid).lower(),)
+                    ).fetchall()
+                    for effect_guid, effect_type in effects:
+                        if effect_type != "CardModifierAbilityEffectTemplate":
+                            continue
+                        modifier = (effect_template(effect_guid) or {}).get(
+                            "m_Modifier") or {}
+                        if str(modifier.get("_t", "")).rsplit(".", 1)[-1] != \
+                                "ThresholdModifier":
+                            continue
+                        color = SHARD_TO_FLAG.get(str(
+                            modifier.get("m_ThresholdColor", "")).lower())
+                        if color:
+                            amounts[color] = amounts.get(color, 0) + 1
+            else:
+                row = self.db.execute(
+                    "SELECT threshold_json FROM card_templates ct "
+                    "JOIN game_cards gc ON gc.template_guid=ct.guid "
+                    "WHERE gc.session_id=? AND gc.card_uid=?",
+                    (self.session.session_id, int(target))).fetchone()
+                from .targeting import shards_from_threshold
+                for color in shards_from_threshold(row[0] if row else ""):
+                    amounts[color] = amounts.get(color, 0) + 1
+            from ._shared import owner_uid
+            for color, amount in amounts.items():
+                key = (f"thresh_{owner}" if self.bstate.get("pvp") else
+                       ("player_threshold" if owner else "ai_threshold"))
+                values = self.bstate.setdefault(key, {})
+                old = int(values.get(color, values.get(str(color), 0)) or 0)
+                values[color] = old + int(amount)
+                event = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
+                event.player_id = owner_uid(owner, self.player_uid,
+                                            self.ai_uid, self.bstate)
+                event.color = color
+                event.operation = 1
+                event.delta = int(amount)
+                event.new_value = values[color]
+                self.game._push(event)
+            return f"gained {sum(amounts.values())} threshold(s)"
+
+        if function == "MoveInDeck":
+            if target is None:
+                return "move in deck: no target"
+            row = self.db.execute(
+                "SELECT user_id, location, position FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (self.session.session_id, int(target))).fetchone()
+            if not row or row[1] != "deck":
+                return "move in deck: target not in deck"
+            offset = tac_int(serialized, "Offset", 0)
+            deck = [int(value[0]) for value in self.db.execute(
+                "SELECT card_uid FROM game_cards WHERE session_id=? "
+                "AND user_id=? AND location='deck' ORDER BY position, id",
+                (self.session.session_id, int(row[0]))).fetchall()]
+            if int(target) not in deck or not deck:
+                return "move in deck: target missing"
+            old = deck.index(int(target))
+            new = max(0, min(len(deck) - 1, old - int(offset)))
+            deck.insert(new, deck.pop(old))
+            self.db.executemany(
+                "UPDATE game_cards SET position=? WHERE session_id=? "
+                "AND card_uid=?",
+                [(index, self.session.session_id, uid)
+                 for index, uid in enumerate(deck)])
+            self.db.commit()
+            return f"moved {hex(int(target))} in deck {old}->{new}"
+
+        if function == "RemoveFromStoredTargetsAbility":
+            if target is None:
+                return "remove stored target: no target"
+            stored = self.bstate.setdefault("stored_targets", {}).setdefault(
+                self.ability_guid, [])
+            try:
+                stored.remove(int(target))
+            except ValueError:
+                pass
+            return f"removed {hex(int(target))} from stored targets"
+
+        if function == "ReplaceCardInCollection":
+            if target is None:
+                target = self.bstate.get("resolving_source_uid")
+            new_template = tac_guid(serialized)
+            if target is None or not new_template:
+                return "replace collection: missing target/template"
+            row = self.db.execute(
+                "SELECT user_id, original_template_guid, template_guid "
+                "FROM game_cards WHERE session_id=? AND card_uid=?",
+                (self.session.session_id, int(target))).fetchone()
+            original = row[1] if row and row[1] else row[2] if row else ""
+            user_id = int(row[0]) if row else int(
+                self.bstate.get("resolving_owner_id", 0) or 0)
+            if original:
+                self.db.execute(
+                    "UPDATE collections SET quantity=quantity-1 "
+                    "WHERE user_id=? AND card_template_id=? AND quantity>0",
+                    (user_id, original))
+            self.db.execute(
+                "INSERT INTO collections(user_id, card_template_id, quantity) "
+                "VALUES (?, ?, 1) ON CONFLICT(user_id, card_template_id) "
+                "DO UPDATE SET quantity=quantity+1",
+                (user_id, new_template))
+            self.db.commit()
+            return f"replaced collection card with {new_template[:8]}"
+
+        if function == "RevokeBaseAbilities":
+            if target is None:
+                return "revoke base abilities: no target"
+            row = self.db.execute(
+                "SELECT gc.card_abilities, ct.abilities_json, gc.card_state "
+                "FROM game_cards gc JOIN card_templates ct "
+                "ON ct.guid=gc.template_guid WHERE gc.session_id=? "
+                "AND gc.card_uid=?", (self.session.session_id, int(target))).fetchone()
+            if not row:
+                return "revoke base abilities: target not found"
+            try:
+                current = json.loads(row[0] or "[]")
+                base = set(json.loads(row[1] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                current, base = [], set()
+            base = {str(guid).lower() for guid in base}
+            remaining = [guid for guid in current
+                         if str(guid).lower() not in base]
+            self.db.execute(
+                "UPDATE game_cards SET card_abilities=? WHERE session_id=? "
+                "AND card_uid=?", (json.dumps(remaining),
+                                     self.session.session_id, int(target)))
+            self.db.commit()
+            from .bom import _push_card_state
+            _push_card_state(self.game, self.session, self.db, self.handler,
+                             self.player_uid, self.ai_uid, int(target),
+                             int(row[2] or 0), self.bstate)
+            return f"revoked {len(current) - len(remaining)} base abilities"
+
+        if function == "ShiftAbility":
+            source = self.bstate.get("player_shift_source")
+            destination = self.bstate.get("player_shift_target") or target
+            guid = tac_guid(serialized)
+            if not source or not destination or not guid:
+                return "shift: missing source/target/ability"
+            self.handler._shift_ability_between(
+                self.session, self.player_uid, self.ai_uid, int(source),
+                int(destination), guid, self.game, bstate=self.bstate)
+            return f"shift {guid[:8]} {hex(int(source))} -> {hex(int(destination))}"
+
+        if function == "Tame":
+            if target is None:
+                return "tame: no target"
+            from .bom import _card_modifier_legacy
+            # Tame is a typed capture operation: the shared IntAttrModifier
+            # path owns voiding, capture records, and zone-exit triggers.
+            self.bstate["player_mod_target"] = int(target)
+            return _card_modifier_legacy(
+                self.game, self.session, self.db, self.handler,
+                self.player_uid, self.ai_uid, self.bstate, self.effect_guid,
+                json.dumps({"property": "intattr", "attribute": "Tamed",
+                             "amount": 1}))
+
         return self._legacy("_tac_legacy")
 
     def block(self):
