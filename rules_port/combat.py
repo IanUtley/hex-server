@@ -38,6 +38,35 @@ class CombatId:
         return self.attacker_id is not None and self.serial_number > 0
 
 
+def coerce_combat_id(value) -> CombatId:
+    """Normalize a wire ``domain.types.CombatId`` or a port ``CombatId``.
+
+    The transport/legacy layer builds ``game_engine.CombatId`` (attacker UID +
+    serial), while the RulesPort combat manager keys on ``CombatId``
+    (attacker uid64 + serial_number).  Passing the wire object straight into
+    ``create_attack`` raised ``AttributeError: 'CombatId' object has no
+    attribute 'is_valid'`` and aborted the AI attack declaration.
+    """
+    if isinstance(value, CombatId):
+        return value
+    attacker = getattr(value, "attacker_id", None)
+    if attacker is None:
+        attacker = getattr(value, "attacker", None)
+    serial = getattr(value, "serial_number", None)
+    if serial is None:
+        serial = getattr(value, "serial", 0)
+    try:
+        attacker = (None if attacker is None
+                    else int(getattr(attacker, "uid64", attacker)))
+    except (TypeError, ValueError):
+        attacker = None
+    try:
+        serial = int(serial or 0)
+    except (TypeError, ValueError):
+        serial = 0
+    return CombatId(attacker, serial)
+
+
 @dataclass
 class CombatResult:
     source: object
@@ -127,13 +156,14 @@ class CombatManager:
         self._next_serial = 0
 
     def contains(self, combat_id: CombatId) -> bool:
-        return combat_id in self._combat_map
+        return coerce_combat_id(combat_id) in self._combat_map
 
     def get(self, combat_id: CombatId) -> Optional[Combat]:
-        return self._combat_map.get(combat_id)
+        return self._combat_map.get(coerce_combat_id(combat_id))
 
     def create_attack(self, combat_id: CombatId, instigator, defender) -> Combat:
-        existing = self.get(combat_id)
+        combat_id = coerce_combat_id(combat_id)
+        existing = self._combat_map.get(combat_id)
         if existing is not None:
             return existing
         if not combat_id.is_valid:
@@ -146,7 +176,7 @@ class CombatManager:
         return combat
 
     def remove_combat(self, combat_id: CombatId) -> None:
-        combat = self._combat_map.pop(combat_id, None)
+        combat = self._combat_map.pop(coerce_combat_id(combat_id), None)
         if combat is not None:
             self.combats.remove(combat)
 

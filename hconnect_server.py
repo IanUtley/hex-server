@@ -3537,11 +3537,17 @@ class HCPHandler(ProfileStreamMixin):
         perm = card_type & (game_engine.ECardTypes.Troop |
                             game_engine.ECardTypes.Artifact |
                             game_engine.ECardTypes.Constant)
+        # The client keys its chain view by a unique ability instance id (C#
+        # ``Session.m_NextAbilityInstanceId``).  A hardcoded id collides with a
+        # still-pending projected chain item, and ``queue_projected_chain``
+        # then silently reuses the old ability instead of queueing this card.
+        inst_id = int(bstate.get("_next_instance_id", 1) or 1)
+        bstate["_next_instance_id"] = inst_id + 1
         if perm:
             chain_descriptor = {
                 "kind": "troop", "source_uid": card_uid,
                 "ability_guids": [], "target_uid": None,
-                "instance_id": 1, "x_cost": 0,
+                "instance_id": inst_id, "x_cost": 0,
             }
             _be.stack_push(bstate, chain_descriptor)
         else:
@@ -3552,7 +3558,7 @@ class HCPHandler(ProfileStreamMixin):
                                    for ability in play_plan.cast_abilities],
                 "target_uid": (effect_targets[-1]
                                 if effect_targets else None),
-                "instance_id": 1, "x_cost": x_cost,
+                "instance_id": inst_id, "x_cost": x_cost,
                 "activations": {
                     guid: activation.as_dict()
                     for guid, activation in activations.items()
@@ -3566,7 +3572,8 @@ class HCPHandler(ProfileStreamMixin):
                 first_player_id=pl_t)
         game.push_ability_on_chain(
             scid, game_engine.ResourceId.from_str(
-                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
+                game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
+            ability_instance_id=inst_id)
         _be.save_state(session, bstate)
         game.push_green_light(
             ai_t, game_engine.EPriorityContext.ResolveTopOfChain)
@@ -17316,7 +17323,16 @@ class HCPHandler(ProfileStreamMixin):
                     _rules_players = [p for p, _position in
                                       (getattr(session, "players", ()) or ())]
                     _rules_ai = next((p for p in _rules_players
-                                      if p != player_uid), player_uid)
+                                      if not _same_uid(p, player_uid)), None)
+                    if _rules_ai is None:
+                        # Practice persists the human participant twice, so
+                        # the session list has no distinct opponent.  Fall
+                        # back to the canonical server-driven AI identity.
+                        # Using ``player_uid`` here built ``Game(pl, pl)`` and
+                        # every RulesPort closure derived from it reported the
+                        # human as the AI, projecting opponent cards onto the
+                        # local side.
+                        _rules_ai = game_engine.UID.make(3, 1000)
                     self._fresh_game(session, player_uid, _rules_ai,
                                      _rules_state)
                 handled = self._dispatch_rules_port_transaction(

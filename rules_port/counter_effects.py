@@ -66,12 +66,19 @@ def _project(context, uid, owner, guid, old, new, champion=False):
             secret_counter_guids={guid} if _secret(guid) else set(),
             secret_counter_owner_uid=recipient)
     else:
-        from pvp_db import db_card_source_info, db_card_owner_id
+        from pvp_db import (db_card_source_info, db_card_owner_id,
+                            db_card_mutation_field)
         row = db_card_source_info(context.session.session_id, int(uid), conn=context.db)
         if not row:
             return
+        # ``db_card_source_info`` returns (template, type, location, owner);
+        # the persisted counters live in ``permanent_buffs`` and must be read
+        # through the typed mutation accessor.  Indexing row[4] raised
+        # IndexError and aborted the turn-start (Tunneling) lifecycle.
         try:
-            counts = json.loads(row[4] or "{}").get("counters", {})
+            counts = json.loads(db_card_mutation_field(
+                context.session.session_id, int(uid), "permanent_buffs",
+                conn=context.db) or "{}").get("counters", {})
         except (TypeError, ValueError, json.JSONDecodeError):
             counts = {}
         counts = counts if isinstance(counts, dict) else {}

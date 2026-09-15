@@ -275,7 +275,14 @@ class GameActionStack:
 
     def push(self, action: GameAction) -> None:
         held: list[GameAction] = []
-        if not action.untargeted_trigger() and not self.has_untargeted_triggers():
+        # C# ``GameActionStack.Push``: ``!(action is PushOntoChainAction) &&
+        # !HasUntargetedTriggers()``.  The port previously tested the incoming
+        # action's ``UntargetedTrigger()`` instead of its type, which held back
+        # a non-untargeted ``PushOntoChainAction`` and reordered the trigger
+        # queue.  ``kernel`` cannot import ``actions`` (cycle), so match the
+        # class by name exactly as the loop below already does.
+        is_push_onto_chain = action.__class__.__name__ == "PushOntoChainAction"
+        if not is_push_onto_chain and not self.has_untargeted_triggers():
             while self._stack and self._stack[-1].__class__.__name__ == (
                     "PushOntoChainAction"):
                 held.append(self._stack.pop())

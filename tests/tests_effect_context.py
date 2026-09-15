@@ -830,6 +830,52 @@ def test_context_counter_uses_champion_state_and_event_projection():
     push.assert_called_once()
 
 
+def test_rules_port_counter_projection_reads_persisted_buffs():
+    """``_project`` must read ``permanent_buffs`` through the typed accessor.
+
+    ``db_card_source_info`` returns four columns; indexing ``row[4]`` raised
+    IndexError during the Tunneling turn-start advance and closed the game
+    connection ("stuck at end-phase").
+    """
+    from rules_port.counter_effects import _project
+
+    class _Game:
+        def __init__(self):
+            self.updated = []
+            self.counters = []
+
+        def push_card_updated(self, *args, **kwargs):
+            self.updated.append((args, kwargs))
+
+        def push_card_counters_changed(self, *args, **kwargs):
+            self.counters.append((args, kwargs))
+
+    class _Handler:
+        def _card_full_data(self, game, scid, template):
+            return (template, "Troop", "Spy", 1, 1, 1, 0)
+
+    game = _Game()
+    context = SimpleNamespace(
+        game=game, session=_Session(), db=_DB(), handler=_Handler(),
+        player_uid="player", ai_uid="ai", bstate={})
+
+    with mock.patch(
+            "pvp_db.db_card_source_info",
+            return_value=("tpl-guid", "Troop", "underground", 0)), \
+            mock.patch(
+                "pvp_db.db_card_mutation_field",
+                return_value='{"counters": {"tunneling": 2}}'), \
+            mock.patch(
+                "pvp_db.db_counter_template_id",
+                return_value="def75520-0b8b-447f-8705-b34e71043890"), \
+            mock.patch("pvp_db.db_card_owner_id", return_value=0):
+        _project(context, 1281, 0,
+                 "def75520-0b8b-447f-8705-b34e71043890", 1, 2)
+
+    assert game.counters, "counter projection must emit its change event"
+    assert game.updated, "counter projection must emit a CardUpdated"
+
+
 def test_context_remove_from_combat_preserves_state_event_boundary():
     context = EffectContext.from_legacy(
         _Game(), _Session(), _DB(), object(), "player", "ai",
@@ -1111,6 +1157,7 @@ if __name__ == "__main__":
     test_context_stat_modifier_resolves_typed_input_and_duration()
     test_context_counter_hides_card_persistence_and_projection()
     test_context_counter_uses_champion_state_and_event_projection()
+    test_rules_port_counter_projection_reads_persisted_buffs()
     test_context_remove_from_combat_preserves_state_event_boundary()
     test_context_card_state_owns_projection_and_tap_trigger()
     test_context_lose_thresholds_preserves_state_and_event_operation()

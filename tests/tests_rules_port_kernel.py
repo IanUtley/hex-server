@@ -927,6 +927,62 @@ def test_persisted_game_factory_accepts_explicit_card_mutation_adapter():
     assert port.event_sink.mutation_adapter is mutation
 
 
+def test_random_target_sample_bounds_the_pool():
+    """A random auto-target must resolve to a bounded sample.
+
+    Infernal Professor's "a random non-resource card from your deck" target
+    previously resolved to the whole legal pool, moving the entire deck into
+    hand.  ``_random_target_sample`` bounds it to the target's maximum.
+    """
+    from rules_port.resolution import _random_target_sample
+
+    class _Rng:
+        def next(self, bound):
+            return 0
+
+    pool = [11, 22, 33, 44, 55]
+    assert _random_target_sample(pool, 1, {"_rules_rng": _Rng()}) == (11,)
+    two = _random_target_sample(pool, 2, {"_rules_rng": _Rng()})
+    assert len(two) == 2 and all(value in pool for value in two)
+    # A pool at or below the requested count is returned unchanged.
+    assert _random_target_sample([7], 1, {}) == (7,)
+
+
+def test_records_filter_matches_keeps_card_with_threshold_context():
+    """A threshold context must not shadow the filtered card value.
+
+    ``records_filter_matches`` iterates the active player's threshold pool;
+    the loop variable previously shadowed the card dict, so every filter
+    evaluated with a threshold context compared against an int and returned
+    False (Subterranean Spy's ThisIsUnderground reveal silently failed).
+    """
+    from rules_port.filters import records_filter_matches
+    card = {"card_uid": 1, "card_type": "Troop", "location": "underground",
+            "user_id": 5, "state": 0}
+    context = SimpleNamespace(
+        bstate={"resolving_owner_id": 5, "player_threshold": {16: 1}})
+    spec = {"_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+            "m_Collection": "Underground"}
+    assert records_filter_matches(card, spec, source=card, context=context)
+
+
+def test_combat_manager_accepts_wire_combat_id():
+    """The AI passes ``game_engine.CombatId`` into the port combat manager.
+
+    The wire struct exposes ``attacker``/``serial`` while the port keys on
+    ``attacker_id``/``serial_number``; without coercion ``create_attack``
+    raised ``AttributeError: 'CombatId' object has no attribute 'is_valid'``
+    and aborted the AI attack declaration.
+    """
+    wire = game_engine.CombatId(game_engine.UID.make(244, 7), 9)
+    manager = CombatManager()
+    combat = manager.create_attack(wire, "instigator", "defender")
+    assert combat.combat_id.attacker_id == int(game_engine.UID.make(244, 7).uid64)
+    assert combat.combat_id.serial_number == 9
+    assert manager.contains(wire)
+    assert manager.get(combat.combat_id) is combat
+
+
 def test_combat_port_preserves_blocker_order_and_crush_damage_routing():
     manager = CombatManager()
     attacker = CombatCardStub(10, 7, crush=True)

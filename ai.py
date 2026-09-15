@@ -1799,7 +1799,17 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         # the item sits in CastSpells until both players pass.  Hand priority
         # to the player so they can respond (Countermagic / instant actions);
         # the human's pass drains the chain when the AI turn resumes.
-        if not be.stack_empty(battle_state):
+        if native_mode:
+            # The port owns the chain.  The legacy checkpoint can retain a
+            # stale descriptor after the native resolver pops it; trusting
+            # ``stack_empty`` then sent a spurious ResolveTopOfChain GreenLight
+            # and left the client stuck on an empty chain window with no
+            # playable options.
+            _port = getattr(session, "_rules_port_session", None)
+            on_chain = _port is not None and not _port.chain.is_empty
+        else:
+            on_chain = not be.stack_empty(battle_state)
+        if on_chain:
             battle_state["ai_turn_phase_idx"] = idx + 1
             be.save_state(session, battle_state)
             handler._push_phase_options_empty(session, pl_t, ai_t)

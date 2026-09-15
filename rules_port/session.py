@@ -1805,6 +1805,11 @@ class AuthoritativeSession:
             # resolution is over, except for an ability with ongoing effects.
             if popped is not None and not getattr(popped, "has_ongoing_effects", False):
                 self.ability_manager.remove(ability_instance_id)
+            # Drop the durable projected-chain descriptor too.  Leaving it in
+            # ``_projected_chain_descriptors`` lets the next reattach's
+            # ``rehydrate_projected_chain`` re-queue the resolved item, so the
+            # ability resolves again on every subsequent transaction.
+            self.forget_projected_chain(ability_instance_id)
             # Effect application and chain removal form one authoritative
             # resolution boundary for reconnect/persistence.
             self.persist()

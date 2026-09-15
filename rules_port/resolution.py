@@ -4,6 +4,35 @@ from __future__ import annotations
 
 from .actions import AbilityResolutionState
 
+
+def _random_target_sample(candidates, count, battle_state):
+    """Port of ``AbilityTargetTemplate.FilterRandomTargets``.
+
+    A random auto-target resolves from the full legal pool but the effect
+    applies to at most ``count`` cards chosen with the session RNG.  The C#
+    client does a partial Fisher-Yates: for ``i`` from ``n`` down to
+    ``n - count + 1`` it picks ``rng.Next(i)``, swaps that slot with slot
+    ``i-1`` and keeps the picked card.  Reproducing the swap (rather than a
+    plain ``pop``) keeps the RNG call sequence and pool state identical to the
+    client for replay parity.
+    """
+    pool = list(candidates)
+    total = len(pool)
+    count = max(1, int(count or 1))
+    if total <= count:
+        return tuple(pool)
+    rng = (battle_state or {}).get("_rules_rng")
+    if rng is not None and hasattr(rng, "next"):
+        picked = []
+        for i in range(total, total - count, -1):
+            index = int(rng.next(i)) % i
+            picked.append(pool[index])
+            pool[index] = pool[i - 1]
+        return tuple(picked)
+    import random
+    return tuple(random.sample(pool, count))
+
+
 class NativeEffectBackend:
     """Walk one typed ability without entering the legacy BOM resolver."""
 
@@ -91,7 +120,7 @@ class NativeEffectBackend:
                             both_players = str(
                                 target_spec.player_filter or "").lower() not in {
                                     "self", "you", "controller"}
-                            target_values = tuple(legal_targets(
+                            candidates = tuple(legal_targets(
                                 db, session.session_id,
                                 ability.responsible_player_id,
                                 target_spec.guid, ability.source_uid,
@@ -99,7 +128,17 @@ class NativeEffectBackend:
                                 champions=(getattr(
                                     handler, "_champion_targets", lambda: [])()
                                            or []),
-                                battle_state=battle_state)[:1])
+                                battle_state=battle_state))
+                            if target_spec.is_random:
+                                candidates = _random_target_sample(
+                                    candidates,
+                                    max(1, int(target_spec.maximum or 1)),
+                                    battle_state)
+                                target_values = candidates
+                            else:
+                                maximum = int(target_spec.maximum or 0)
+                                target_values = (candidates[:maximum]
+                                                 if maximum > 0 else candidates[:1])
                         elif kind in ("AbilityTriggerCardTargetTemplate",
                                       "SourceDrawnTargetTemplate",
                                       "SourceBuriedTargetTemplate"):
@@ -108,7 +147,7 @@ class NativeEffectBackend:
                         elif target_spec.is_auto:
                             both_players = str(target_spec.player_filter or "").lower() in (
                                 "multipleplayers", "allplayers")
-                            target_values = tuple(legal_targets(
+                            candidates = tuple(legal_targets(
                                 db, session.session_id,
                                 int(ability.responsible_player_id or 0),
                                 target_spec.guid, ability.source_uid,
@@ -116,6 +155,22 @@ class NativeEffectBackend:
                                 champions=(getattr(handler, "_champion_targets",
                                                    lambda: [])() or []),
                                 battle_state=battle_state))
+                            if target_spec.is_random:
+                                # A random auto-target (e.g. Infernal Professor's
+                                # "a random non-resource card from your deck")
+                                # must resolve to a bounded random sample, not
+                                # every legal card.  Iterating the whole pool
+                                # moved the entire deck into hand.
+                                candidates = _random_target_sample(
+                                    candidates,
+                                    max(1, int(target_spec.maximum or 1)),
+                                    battle_state)
+                            elif int(target_spec.maximum or 0) > 0 and \
+                                    len(candidates) > int(target_spec.maximum):
+                                # C# GetAutoTargets truncates a non-random
+                                # auto-target to GetMaximumTargetCount.
+                                candidates = candidates[:int(target_spec.maximum)]
+                            target_values = candidates
                         elif target_spec.target_kind == "SourceRevealedTargetTemplate":
                             from .targeting import revealed_target_uids
                             candidates = revealed_target_uids(

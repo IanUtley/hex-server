@@ -974,12 +974,17 @@ def records_filter_matches(card, spec, *, source=None, context=None,
         if thresholds is None:
             thresholds = state.get("ai_threshold")
         normalized_thresholds = {}
-        for key, value in (thresholds or {}).items():
+        # NOTE: the loop variable must not shadow ``value`` (the card dict
+        # being filtered).  It previously did, so every Records filter
+        # evaluated with a threshold context compared against an int and
+        # returned False — e.g. Subterranean Spy's "while underground" gate
+        # (ThisIsUnderground) always failed and the hand was never revealed.
+        for threshold_key, threshold_value in (thresholds or {}).items():
             try:
-                key = int(key)
+                threshold_key = int(threshold_key)
             except (TypeError, ValueError):
                 pass
-            normalized_thresholds[key] = int(value or 0)
+            normalized_thresholds[threshold_key] = int(threshold_value or 0)
         if not explicit_player:
             player = {"resource_thresholds": normalized_thresholds}
     return records_filter_from_metadata(spec).matches(
