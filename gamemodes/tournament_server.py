@@ -62,10 +62,25 @@ def _ensure_corinth_event():
             tzinfo=timezone.utc) <= datetime.now(timezone.utc)
     except ValueError:
         expired = False
-    if expired and str(room.get("status", "")).lower() != "closed":
-        _tournament_db.db_tournament_expire(CORINTH_TOURNAMENT_ID)
+    if expired:
+        # Roll the singleton into the next monthly event after its old
+        # expiry. Results remain in tournament_results; only live run state
+        # is discarded by db_tournament_expire.
+        next_expiry = _current_month_expiry()
+        if next_expiry != str(expiry):
+            _tournament_db.db_tournament_expire(CORINTH_TOURNAMENT_ID)
+            _tournament_db.db_tournament_set_expiry(
+                CORINTH_TOURNAMENT_ID, next_expiry)
+            _tournament_db.db_tournament_reopen(CORINTH_TOURNAMENT_ID)
+            return True
+        if str(room.get("status", "")).lower() != "closed":
+            _tournament_db.db_tournament_expire(CORINTH_TOURNAMENT_ID)
         return False
-    return str(room.get("status", "")).lower() != "closed"
+    if str(room.get("status", "")).lower() == "closed":
+        # Persistent async events must not disappear when generic stale-room
+        # cleanup closes their old created_at row.
+        _tournament_db.db_tournament_reopen(CORINTH_TOURNAMENT_ID)
+    return True
 
 
 def seed_pool():

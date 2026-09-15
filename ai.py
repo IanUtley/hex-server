@@ -15,6 +15,7 @@ import time
 
 import game_engine
 from db import _db, log_req
+from debug_runtime import trace_rules_port
 from pvp_db import (db_set_card_state_or,
                     db_discard_card,
                     db_warzone_troop_attributes,
@@ -60,7 +61,7 @@ def _checkpoint_engine(session, state):
     return battle_engine
 
 
-def _queue_stack_item(session, state, item):
+def _queue_stack_item(session, state, item, owner_id=None):
     """Queue one already-instanced item through the active rules boundary."""
     if (getattr(session, "_rules_port_session", None) is not None or
             (state or {}).get("_rules_port_attached")):
@@ -72,7 +73,8 @@ def _queue_stack_item(session, state, item):
             # a typed owner and must hand its response window to the human;
             # the compatibility descriptor remains only for reconnect/wire
             # projection and never selects the item to resolve.
-            owner_id = getattr(port, "active_player_id", None)
+            if owner_id is None:
+                owner_id = getattr(port, "active_player_id", None)
             if owner_id is None:
                 owner_id = next(iter(getattr(port, "player_ids", ()) or ()), None)
             responder = next(
@@ -1245,6 +1247,48 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         import battle_engine as be
     native_mode = (getattr(session, "_rules_port_session", None) is not None or
                    (battle_state or {}).get("_rules_port_attached"))
+    # RulesPort uses the typed participant IDs established by the persisted
+    # game adapter.  ``ai_t`` is the same typed SessionPlayer UID used in the
+    # native queue; raw checkpoint IDs must not be mixed into this scheduler.
+    native_ai_id = ai_t
+    native_port = getattr(session, "_rules_port_session", None)
+    if native_mode:
+        if native_port is None:
+            raise RuntimeError(
+                "attached RulesPort session has no authoritative host")
+        # Practice/PvE has one server participant.  A stale host Game can
+        # carry the human UID in its ``ai_uid`` field after a reconnect; do
+        # not let that identity enter the native scheduler as the AI.
+        if not (session.session_name or "").startswith("tourney-"):
+            canonical_ai = game_engine.UID.make(3, 1000)
+            if int(getattr(ai_t, "uid64", ai_t)) != int(canonical_ai.uid64):
+                log_req(
+                    f"    AI driver corrected stale participant {ai_t!r} "
+                    f"-> {canonical_ai!r}")
+                ai_t = canonical_ai
+                native_ai_id = canonical_ai
+        trace_rules_port(log_req, "ai-entry", native_port, battle_state)
+        native_ai_id = native_port.coerce_transaction_player_id(ai_t)
+        # The AI driver is a server actor, not a phase-transition fallback.
+        # A stale compatibility cursor can request it after a human phase has
+        # already resumed. Never let that invocation overwrite the native
+        # active player or repeatedly re-emit the same phase to the client.
+        if native_port.active_player_id != native_ai_id:
+            log_req(
+                f"    AI driver ignored: native active="
+                f"{native_port.active_player_id!r} != ai={native_ai_id!r} "
+                f"phase={native_port.current_turn_phase!r}")
+            return battle_state
+        if (native_port.current_turn_phase ==
+                game_engine.ETurnPhases.StartTurn and
+                native_port.action_stack.count == 0 and
+                int(getattr(native_port, "total_turns_taken", 0) or 0) == 0):
+            # The initial Practice checkpoint is assigned StartTurn before
+            # the native action stack has had its first tick. Enter it through
+            # the RulesPort state object; do not let the AI loop synthesize a
+            # phase or skip the turn-start lifecycle.
+            native_port.materialize_current_phase()
+            log_req("    AI driver materialized initial native StartTurn")
     # Resolve any pending chain left over from the player's turn before the AI
     # continues (the AI auto-passes; both sides count as passed).  An attached
     # RulesPort session must consume its native action stack here: popping the
@@ -1327,6 +1371,27 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
     idx = start_idx
     native_phase_already_entered = None
     while True:
+        if native_mode:
+            # RulesPort is the phase/turn authority. Re-check ownership on
+            # every iteration because a native pass can rotate the active
+            # player while a compatibility callback is still on the stack.
+            port = getattr(session, "_rules_port_session", None)
+            if port is None or port.active_player_id != native_ai_id:
+                log_req(
+                    f"    AI driver stopped: native active="
+                    f"{getattr(port, 'active_player_id', None)!r} "
+                    f"!= ai={native_ai_id!r}")
+                return battle_state
+            native_phase = port.current_turn_phase
+            trace_rules_port(log_req, "ai-loop", port, battle_state)
+            phases = be.turn_phases(battle_state)
+            try:
+                idx = phases.index(native_phase)
+            except ValueError:
+                log_req(
+                    f"    AI driver stopped: native phase {native_phase!r} "
+                    "is absent from the persisted phase list")
+                return battle_state
         phases = be.turn_phases(battle_state)
         if idx >= len(phases):
             break
@@ -1368,28 +1433,36 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         native_lifecycle = (battle_state.get("_rules_port_attached") or
                            getattr(session, "_rules_port_session", None) is not None)
         native_phase_result = None
-        phase_was_entered_natively = (native_phase_already_entered == phase)
+        port = getattr(session, "_rules_port_session", None)
+        from rules_port.kernel import PriorityWindowAction
+        from rules_port.phases import phase_name as native_phase_name
+        phase_was_entered_natively = (
+            native_phase_already_entered == phase or
+            getattr(port, "_native_phase_already_entered", None) == phase or
+            (port is not None and
+             isinstance(port.action_stack.peek(), PriorityWindowAction) and
+             getattr(port.action_stack.peek(), "_rules_port_phase", None) ==
+             native_phase_name(phase)))
+        if (phase_was_entered_natively and
+                getattr(port, "_native_phase_already_entered", None) == phase):
+            port._native_phase_already_entered = None
         if native_lifecycle and not phase_was_entered_natively:
-            # AI policy remains mode-owned, but phase entry and its mutations
-            # belong to the same RulesPort session as human play.
-            port = getattr(session, "_rules_port_session", None)
-            if port is not None:
-                port.current_turn_phase = phase
-                port.active_player_id = ai_t
-                if phase == game_engine.ETurnPhases.StartTurn:
-                    native_phase_result = port.resolve_turn_start()
-                else:
-                    native_phase_result = port.resolve_turn_phase_entry(phase)
+            # A native phase must already have been entered by
+            # drive_until_input()/transition_to(). The old compatibility
+            # fallback assigned current_turn_phase and active_player_id here,
+            # which could resurrect an earlier phase after the human had
+            # passed it. Stop and leave the native scheduler untouched.
+            log_req(
+                f"    AI driver stopped: phase {phase!r} was not entered "
+                "by RulesPort")
+            return battle_state
         elif native_lifecycle:
             native_phase_already_entered = None
-            # The transition already created this native priority action.
-            # Consume the AI side immediately; leave the human queued only if
-            # this phase is configured as an opponent-turn stop.
-            stop_for_human = be.is_opp_stop(battle_state, phase)
-            port = getattr(session, "_rules_port_session", None)
-            if port is not None:
-                port.auto_pass_internal_priority(
-                    [ai_t] if stop_for_human else port.player_ids)
+            # The native transition already materialized the priority action.
+            # Do not consult the compatibility stop helpers here and do not
+            # auto-pass the whole queue before the AI has made its decisions.
+            # After the AI acts below, RulesPort will consume the AI's native
+            # pass and either hand the window to the human or advance.
         # Unity's StartTurnState.ResetActiveCards runs before any
         # TurnStarted/phase trigger.  Age existing warzone cards first so a
         # token created by a start-of-turn trigger keeps CameOutThisTurn.
@@ -1641,8 +1714,21 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                     ct, template_id=tpl,
                     state=int(card_state or 0))
             if native_lifecycle:
-                from rules_port.lifecycle import complete_turn
-                next_player = complete_turn(battle_state)
+                # The native EndTurn -> StartTurn transition invokes the
+                # Practice turn-boundary callback.  Calling complete_turn here
+                # as well advances the compatibility owner twice and can hand
+                # control straight back to the AI/human. Consume the AI's
+                # native EndTurn action and let that single callback select
+                # the next participant, including bonus turns.
+                port = getattr(session, "_rules_port_session", None)
+                action = port.action_stack.peek() if port is not None else None
+                if (port is not None and
+                        isinstance(action, PriorityWindowAction) and
+                        action.priority_player_id == native_ai_id):
+                    port.pass_player_priority(native_ai_id)
+                if port is not None:
+                    port.drive_until_input(max_steps=64)
+                next_player = battle_state.get("turn_player")
             else:
                 next_player = be.next_turn_player(battle_state)
                 battle_state["turn_player"] = next_player
@@ -1723,8 +1809,20 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             log_req(f"    AI phase {phase}: card on chain — priority to player "
                     f"(waiting for response)")
             return
-        # If this phase is a stop for the human, hand priority over and wait.
-        if be.is_opp_stop(battle_state, phase):
+        # If the native RulesPort queue now belongs to the human, hand the
+        # native window over and wait.  RulesPort, rather than the legacy stop
+        # cursor, decides whether this phase is an ALL/ACTIVE/DEFENDING stop.
+        native_waiting_for_human = False
+        if native_lifecycle:
+            port = getattr(session, "_rules_port_session", None)
+            action = port.action_stack.peek() if port is not None else None
+            if isinstance(action, PriorityWindowAction):
+                if action.priority_player_id == native_ai_id:
+                    port.pass_player_priority(native_ai_id)
+                native_waiting_for_human = (
+                    action.priority_player_id == pl_t)
+        if ((not native_lifecycle and be.is_opp_stop(battle_state, phase)) or
+                native_waiting_for_human):
             # If the human has NO eligible blockers at DeclareDefense (only
             # tapped troops, e.g. a Gemsoul Feeder that attacked), they can't
             # block — the AI's attackers go unblocked and the AI just advances
@@ -1777,23 +1875,30 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             port = getattr(session, "_rules_port_session", None)
             if port is not None:
                 if phase == game_engine.ETurnPhases.FirstMainPhase:
-                    legal_attackers = ai_can_attack_troops(
-                        handler, session, battle_state)
+                    # ai_can_attack_troops reads the handler's current battle
+                    # state.  Refresh that reference after the AI's resource
+                    # play, then use the helper's two-argument API.  Passing
+                    # the persisted state as a third argument raises before
+                    # the native phase can advance.
+                    handler._current_bstate = battle_state
+                    legal_attackers = ai_can_attack_troops(handler, session)
                     port.has_legal_attackers = bool(legal_attackers)
                     port.active_player_skips_attack = not bool(legal_attackers)
-                try:
-                    next_phase = port.advance_turn_phase()
-                except (TypeError, ValueError) as exc:
-                    log_req(f"    Native AI phase transition failed: {exc}")
-                    return battle_state
-                if next_phase is None:
-                    return battle_state
+                action = port.action_stack.peek()
+                if isinstance(action, PriorityWindowAction) and \
+                        action.priority_player_id == native_ai_id:
+                    port.pass_player_priority(native_ai_id)
+                # An empty native queue is the RulesPort scheduler's signal to
+                # run action cleanup and phase transition. Never call the
+                # legacy cursor or choose the next phase from this AI loop.
+                port.drive_until_input(max_steps=64)
+                next_phase = port.current_turn_phase
                 native_phase_already_entered = next_phase
                 phases = be.turn_phases(battle_state)
                 try:
-                    idx = phases.index(next_phase, idx + 1)
+                    idx = phases.index(next_phase)
                 except ValueError:
-                    idx = idx + 1
+                    return battle_state
                 battle_state["phase_idx"] = idx
                 be.save_state(session, battle_state)
                 continue
@@ -2011,7 +2116,7 @@ def ai_play_troop(handler, game, session, ai_t, battle_state):
     # One chain item at a time: if a previous play/trigger is still pending,
     # the AI waits for the player's response before playing again.
     if not _be.stack_empty(battle_state):
-        return
+        return False
     resources = battle_state.get("ai_resources", 0)
     threshold = battle_state.get("ai_threshold", {})
     rows = db_ai_hand_playables(
@@ -2082,8 +2187,9 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     window (countermagic etc.)."""
     import json as _j
     _be = _checkpoint_engine(session, battle_state)
-    if not _be.stack_empty(battle_state):
-        return
+    native_mode = getattr(session, "_rules_port_session", None) is not None
+    if (not native_mode and not _be.stack_empty(battle_state)):
+        return False
     resources = int(battle_state.get("ai_resources", 0))
     cost = int(card.cost or 0)
     # Preserve an X value selected by the evaluator (removal/sweeper paths
@@ -2103,7 +2209,7 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     total = cost + x_cost
     if total > resources:
         log_req(f"    AI cannot afford {card.name} ({total}>{resources})")
-        return
+        return False
     tid = int(card.card_uid)
     scid = game_engine.SessionCardId(game_engine.UID(tid))
     from rules_port.card_transactions import apply_card_play
@@ -2111,7 +2217,7 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
         _db, session.session_id, battle_state, tid, 0, total,
         destination="CastSpells")
     if transition is None:
-        return
+        return False
     resource_change = transition.resource_change
     tpl_g, ct_n, nm, cost2, atk2, def2, gem2 = handler._card_full_data(
         game, scid, card.template_guid, None)
@@ -2134,14 +2240,14 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     if card.is_troop() or card.is_artifact() or card.is_constant():
         _queue_stack_item(session, battle_state, {
             "kind": "troop", "source_uid": tid, "instance_id": inst_id,
-        })
+        }, owner_id=ai_t)
     else:
         _queue_stack_item(session, battle_state, {
             "kind": "spell", "source_uid": tid,
             "ability_guids": card.ability_guids,
             "target_uid": target_uid,
             "instance_id": inst_id, "x_cost": x_cost,
-        })
+        }, owner_id=ai_t)
     game.ai_resources = resource_change.new_value
     ev_cur = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
     ev_cur.player_id = ai_t
@@ -2153,13 +2259,14 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     log_req(f"    AI played {card.name} ({card.template_guid[:8]}) to chain "
             f"(cost={cost2}+{x_cost}, target={hex(int(target_uid)) if target_uid else 'none'}, "
             f"resources left={battle_state['ai_resources']})")
+    return True
 
 
 def ai_tunnel_hand_troop(handler, game, session, ai_t, pl_t, battle_state):
     """Prefer an authored hand Tunneling route before ordinary card play."""
     _be = _checkpoint_engine(session, battle_state)
     if not _be.stack_empty(battle_state):
-        return False
+        return
     if (getattr(session, "_rules_port_session", None) is not None or
             battle_state.get("_rules_port_attached")):
         from rules_port.tunneling import tunneling_value
@@ -3155,6 +3262,77 @@ def ai_play_combat_trick(handler, game, session, ai_t, pl_t, battle_state):
                                   trick, evaluator=ev)
                 log_req(f"    AI lifegain dump: {trick.name}")
                 return True
+    return False
+
+
+def ai_respond_to_priority(handler, game, session, ai_t, pl_t, battle_state):
+    """Choose the AI's action in an opponent-owned response window.
+
+    The client AI does not blindly pass an opponent's chain window: its
+    opponent-turn main-phase path considers quick removal, and its combat
+    path considers combat tricks/quick actions.  Practice has no AI client to
+    submit that pass, so the host calls this response hook first and only
+    supplies the native pass when the same metadata-driven checks find no
+    useful quick response.
+    """
+    native_mode = getattr(session, "_rules_port_session", None) is not None
+    if (not native_mode and
+            not _checkpoint_engine(session, battle_state).stack_empty(battle_state)):
+        return False
+    try:
+        import ai_eval as _aieval
+        evaluator = _aieval.build_evaluator(
+            handler, session, battle_state, ai_t, pl_t)
+    except Exception as exc:
+        log_req(f"    AI response evaluator error: {exc!r}")
+        return False
+
+    port = getattr(session, "_rules_port_session", None)
+    phase = getattr(port, "current_turn_phase", None)
+    combat_phases = {
+        game_engine.ETurnPhases.DeclareAttackPriorityWindow,
+        game_engine.ETurnPhases.DeclareDefensePriorityWindow,
+        game_engine.ETurnPhases.FirstStrikePriorityWindow,
+    }
+    if phase in combat_phases and ai_play_combat_trick(
+            handler, game, session, ai_t, pl_t, battle_state):
+        return True
+
+    # Mirrors AITactical.BuildBoard(..., MyTurn=false): removal is considered
+    # only when the card is quick-speed, and only against an authored useful
+    # target.  This avoids spending an ordinary sorcery as an interrupt.
+    for target in evaluator.threatening_targets():
+        card, x_cost, target_uid = evaluator.find_removal_for(
+            target, quick=True)
+        if card is None:
+            continue
+        if ai_play_hand_card(
+                handler, game, session, ai_t, battle_state, card,
+                evaluator=evaluator, x_cost=x_cost, target_uid=target_uid):
+            log_req(f"    AI response: quick removal {card.name}")
+            return True
+
+    # Client DumpQuickActions uses a harmless lifegain quick action as its
+    # final combat fallback.  Keep that decision data-driven and restricted
+    # to combat, where the effect can affect the current exchange.
+    if phase in combat_phases:
+        for card in evaluator.hand:
+            hints = evaluator.hints_for(card)
+            if (not card.is_quick_action() or
+                    evaluator.is_playable(card) != "True" or
+                    hints.buff is not None or hints.removal is not None):
+                continue
+            heals = any(
+                effect_type == "CardModifierAbilityEffectTemplate" and
+                (params.get("property") or "").lower() in ("healhero", "heal")
+                for ability_guid in card.ability_guids
+                for effect_type, params in evaluator.effects_for(ability_guid))
+            if heals and int(battle_state.get("ai_health", 20)) <= 16:
+                if ai_play_hand_card(
+                        handler, game, session, ai_t, battle_state, card,
+                        evaluator=evaluator):
+                    log_req(f"    AI response: lifegain quick action {card.name}")
+                    return True
     return False
 
 

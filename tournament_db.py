@@ -147,6 +147,27 @@ def db_tournament_expire(tid, conn=None):
         connection.commit()
 
 
+def db_tournament_reopen(tid, conn=None):
+    """Reopen a persistent event without discarding its result history."""
+    connection = conn or _db_layer._db
+    try:
+        connection.execute(
+            "UPDATE tournaments SET status='waiting', players_json='{}', "
+            "session_id=NULL WHERE id=?", (int(tid),))
+        # Active signups belong to the closed run. Keep their rows for
+        # history, but make a fresh deck/search lifecycle on re-entry.
+        connection.execute(
+            "UPDATE tournament_signups SET status='withdrew', "
+            "deck_ready=0, searching=0 WHERE tournament_id=? "
+            "AND status='active'", (int(tid),))
+        if conn is None:
+            connection.commit()
+    except BaseException:
+        if conn is None:
+            connection.rollback()
+        raise
+
+
 def db_tournament_update_players(tid, players_json, conn=None):
     connection = conn or _db_layer._db
     try:

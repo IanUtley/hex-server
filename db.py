@@ -1886,6 +1886,16 @@ def db_tournament_cleanup_old(age_days=1):
     try:
         cleanup_db.execute("PRAGMA busy_timeout=500")
         cleanup_db.execute("BEGIN IMMEDIATE")
+        has_tournament_types = bool(cleanup_db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='tournament_types'").fetchone())
+        persistent_event_clause = ""
+        if has_tournament_types:
+            persistent_event_clause = (
+                " AND NOT EXISTS (SELECT 1 FROM tournament_types tt "
+                "WHERE tt.id=tournaments.type_id AND "
+                "LOWER(COALESCE(tt.style, '')) IN "
+                "('async', 'asynchronous'))")
         # Keep an ended session's event source until the replay worker has
         # indexed it. Abandoned/non-ended sessions can be removed immediately;
         # completed sessions require a ready replay (or no events at all).
@@ -1912,7 +1922,8 @@ def db_tournament_cleanup_old(age_days=1):
         closed_cursor = cleanup_db.execute(
             "UPDATE tournaments SET status='closed' "
             "WHERE status<>'closed' AND created_at IS NOT NULL "
-            "AND datetime(created_at) <= datetime('now', ?)",
+            "AND datetime(created_at) <= datetime('now', ?)" +
+            persistent_event_clause,
             (cutoff,))
 
         # Tournament-owned pools and match history are run state, not the
@@ -1921,7 +1932,8 @@ def db_tournament_cleanup_old(age_days=1):
         expired_tournaments = [
             row[0] for row in cleanup_db.execute(
                 "SELECT id FROM tournaments WHERE created_at IS NOT NULL "
-                "AND datetime(created_at) <= datetime('now', ?)",
+                "AND datetime(created_at) <= datetime('now', ?)" +
+                persistent_event_clause,
                 (cutoff,)).fetchall()
         ]
         if expired_tournaments:

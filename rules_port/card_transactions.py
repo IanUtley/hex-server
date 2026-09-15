@@ -233,6 +233,28 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         if payload.get("activation_data") and not ability.bind_activation(
                 payload["activation_data"]):
             return False
-        from .actions import PushOntoChainAction
-        self.port.push_game_action(PushOntoChainAction(ability))
+        # Keep the activation on the same durable projected-chain boundary as
+        # host/AI card abilities.  A live client commonly sends the response
+        # pass on a fresh GameSession wrapper; persisting only the native
+        # ability instance ID leaves reconnect with no ability object to
+        # resolve and silently drops the chain item.
+        if not self.port.pay_ability_cost(ability):
+            return False
+        activation = ability.activation.as_dict()
+        descriptor = {
+            "kind": "ability",
+            "source_uid": int(payload["source_card_id"]),
+            "ability_guid": str(payload["ability_template_id"]).lower(),
+            "instance_id": int(ability.instance_id),
+            "activation_data": activation,
+        }
+        self.port.queue_projected_chain(
+            descriptor, transaction.player_id,
+            first_player_id=transaction.player_id)
+        sink = getattr(self.port, "event_sink", None)
+        if sink is not None:
+            sink.ability_pushed_on_chain(ability)
+            priority = self.port.action_stack.priority_player_id
+            if priority is not None:
+                sink.green_light(priority)
         return True

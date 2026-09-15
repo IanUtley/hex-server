@@ -527,6 +527,46 @@ def test_summon_choosing_collection_stays_out_of_warzone(db):
         for ev in game.events)
 
 
+def test_native_choice_target_opens_one_picker_for_all_options(db):
+    """Native Choosing summons defer to their authored child target."""
+    from rules_port.context import EffectContext
+
+    target = SimpleNamespace(
+        requires_input=True,
+        target_kind="AbilityTargetTemplate",
+        collection_flags="Deck|Choosing",
+        player_filter="MultiplePlayers",
+        guid=_ag("choice-target"))
+    child = SimpleNamespace(targets=(target,))
+    ability = SimpleNamespace(
+        instance_id=9,
+        continuation=lambda **kwargs: {
+            "ability_guid": "parent",
+            "source_uid": 77,
+            "owner_id": 5,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": kwargs["resume_effect_order"],
+        })
+    prompts = []
+    handler = SimpleNamespace(
+        _prompt_choice_cards=lambda *args: prompts.append(args[-1]))
+    context = EffectContext.from_rules_port(
+        object(), SimpleNamespace(session_id=1), db, handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"resolving_source_uid": 77, "resolving_owner_id": 5,
+         "resolving_effect_order": 3}, "effect", _ag("child"),
+        ability=ability)
+    with mock.patch("gamedata.ability_graph", return_value=child), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=[101, 102]):
+        result = context.activate_ability()
+    assert "awaiting choice of 2" in result, result
+    assert len(prompts) == 1
+    assert prompts[0]["kind"] == "choice_zone_target"
+    assert prompts[0]["choice_uids"] == [101, 102]
+
+
 def test_choice_ability_transforms_real_parent(db):
     """Playing a Choice token applies its automatic ability to its parent."""
     import db as db_module
@@ -654,6 +694,8 @@ def main():
          test_double_choice_creates_random_choices_and_clears_before_second),
         ("Choosing summon creates option cards",
          test_summon_choosing_collection_stays_out_of_warzone),
+        ("Native choice target opens one picker",
+         test_native_choice_target_opens_one_picker_for_all_options),
         ("Choice transforms its real parent",
          test_choice_ability_transforms_real_parent),
         ("Records choice filter preserves typed target data",

@@ -46,6 +46,7 @@ TPL = {
     "wretched_wrangler": "638e079b-7d0a-4c9e-a81f-ca29e918731c",
     "lifeweaver": "410c66bb-243b-489f-b2d2-c3a96089a717",
     "reece": "eef7e012-f355-4f36-ae99-89b7ebd0ee25",
+    "minion_of_yazukan": "e976d596-f915-4a9e-bb95-2276292ae288",
 }
 
 ABILITIES = [
@@ -444,14 +445,18 @@ def test_prairie_scout_activation_gating(db):
 
 
 def test_hand_tunnel_activation_gating(db):
-    """A Hand-scoped Tunnel ability is offered only with its own threshold
-    and activation-resource cost; the printed troop cost is not the gate."""
+    """Hand Tunnel uses its authored threshold and activation cost.
+
+    Minion of Yazukan is the exact BasicAction regression: it tunnels itself
+    from hand for one Blood threshold and two resources.
+    """
     import battle_engine as be
     import hconnect_server as hcs
     from gamedata import DEFAULT_RECORD_STORE
     from hconnect_server import HCPHandler
 
     add_card(db, 110, 5, "reece", "hand")
+    add_card(db, 111, 5, "minion_of_yazukan", "hand")
 
     class ReeseHandler:
         user_profile = {"id": 5}
@@ -493,8 +498,21 @@ def test_hand_tunnel_activation_gating(db):
             (110, TPL["reece"]): ["598fe8be-5c04-918c-e0aa-82e88aee3d28"]
         }, available
 
+        blood_state = state(2, 0)
+        blood_state["player_threshold"] = {
+            game_engine.SHARD_TO_FLAG["blood"]: 1}
+        assert HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), blood_state) == {
+                (111, TPL["minion_of_yazukan"]): [
+                    "95474d1e-ac9b-6c02-cb95-0305ebec42dc"]
+            }
+
         assert not HCPHandler._affordable_troop_abilities(
             handler, SessionStub(), state(1, 1))
+        no_blood = state(2, 0)
+        assert not HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), no_blood)
+
         assert not HCPHandler._affordable_troop_abilities(
             handler, SessionStub(), state(2, 0))
     finally:

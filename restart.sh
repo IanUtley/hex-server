@@ -35,6 +35,7 @@ SOURCES=(
     "$BASE_DIR/static.py"
     "$BASE_DIR/ability.py"
     "$BASE_DIR/ai.py"
+    "$BASE_DIR/debug_runtime.py"
     "$BASE_DIR/battle_engine.py"
     "$BASE_DIR/AssetExtraction/generate_starter_decks.py"
     "$BASE_DIR/campaign_chains/__init__.py"
@@ -182,7 +183,7 @@ log "Starting HConnect server on :$SERVER_PORT ..."
 # sessions.  Keep an explicit override for rollback/probes, but make a plain
 # restart deterministic so the port cannot be silently skipped.
 export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
-setsid nohup python3 -u "$BASE_DIR/hconnect_server.py" \
+setsid nohup "$BASE_DIR/run_hconnect.sh" \
     >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
 SERVER_PID=$!
 

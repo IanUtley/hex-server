@@ -351,8 +351,18 @@ class PriorityWindowAction(GameAction):
             self.session.send_turn_phase_update()
 
     def could_pass_priority(self, player_id) -> bool:
-        if self.priority_player_id != player_id:
-            return False
+        coerce = getattr(self.session, "coerce_transaction_player_id", None)
+        current = self.priority_player_id
+        if callable(coerce):
+            current = coerce(current)
+            player_id = coerce(player_id)
+        if current != player_id:
+            try:
+                if int(getattr(current, "uid64", current)) != int(
+                        getattr(player_id, "uid64", player_id)):
+                    return False
+            except (TypeError, ValueError):
+                return False
         if (phase_name(getattr(self.session, "current_turn_phase", "")) == "Discard" and
                 self.session.hand_larger_than_maximum(player_id)):
             return False

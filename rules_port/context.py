@@ -2767,10 +2767,81 @@ class EffectContext:
             self.resolved_target(),
             default=self.bstate.get("resolving_owner_id", 0))
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
+            # A number of Records abilities materialize several temporary
+            # cards in Choosing and then ActivateAbility a typed child whose
+            # target is "a card in the choice zone".  The summons are not
+            # individual pauses; the child target is the single client picker
+            # boundary.  Detect that contract from the child graph so every
+            # such effect gets one picker containing all authored options.
+            from gamedata import DEFAULT_RECORD_STORE, ability_graph
+            from rules_port.targeting import legal_targets
+            from rules_port.resolution import resolve_port_ability
+            child = ability_graph(DEFAULT_RECORD_STORE, child_guid)
+            choice_target = None
+            if child is not None:
+                for index, target in enumerate(child.targets):
+                    if (not target.requires_input or
+                            not str(target.target_kind or "").endswith(
+                                "AbilityTargetTemplate") or
+                            "choosing" not in str(
+                                target.collection_flags or "").lower()):
+                        continue
+                    candidates = legal_targets(
+                        self.db, self.session.session_id, int(owner_id or 0),
+                        target.guid, source_uid,
+                        both_players=str(target.player_filter or "").lower()
+                        not in {"self", "you", "controller"},
+                        champions=(getattr(
+                            self.handler, "_champion_targets", lambda: [])()
+                                   or []),
+                        battle_state=self.bstate)
+                    if candidates:
+                        choice_target = (index, [int(uid) for uid in candidates])
+                    break
+            if choice_target is not None and int(owner_id or 0) != 0:
+                target_index, choice_uids = choice_target
+                parent = self.continuation()
+                pending = {
+                    "kind": "choice_zone_target",
+                    "choice_uids": choice_uids,
+                    "source_uid": int(source_uid or 0),
+                    "owner_id": int(owner_id),
+                    "instance_id": int(getattr(
+                        self.ability, "instance_id", 1) or 1),
+                    "ability_guid": child_guid,
+                    "continuation": {
+                        "ability_guid": child_guid,
+                        "source_uid": int(source_uid or 0),
+                        "owner_id": int(owner_id),
+                        "target_map": {},
+                        "variables": dict(
+                            self.bstate.get("ability_variables") or {}),
+                        "resume_effect_order": 0,
+                        "target_index": int(target_index),
+                    },
+                    "parent": parent,
+                }
+                self.bstate["pending_choice"] = pending
+                self.bstate["resolution_paused"] = True
+                prompt = getattr(self.handler, "_prompt_choice_cards", None)
+                if callable(prompt):
+                    prompt(self.game, self.session, self.player_uid,
+                           self.ai_uid, self.bstate, pending)
+                return (f"activate ability: awaiting choice of "
+                        f"{len(choice_uids)} card(s)")
+            if choice_target is not None and int(owner_id or 0) == 0:
+                # AI choice is still resolved through the same child graph;
+                # only the client-facing picker is omitted.
+                target_index, choice_uids = choice_target
+                target_map = {int(target_index): (int(choice_uids[0]),)}
+                return resolve_port_ability(
+                    self.handler, self.game, self.session, self.db,
+                    self.player_uid, self.ai_uid, self.bstate, child_guid,
+                    source_uid, owner_id, target_map=target_map,
+                    variables=self.bstate.get("ability_variables") or {})
             # Child abilities must re-enter the RulesPort lifecycle so their
             # instance/continuation state and native effect dispatch are not
             # lost at this nested boundary.
-            from rules_port.resolution import resolve_port_ability
             target_map = {}
             selected = self.bstate.get("selected_choice_uid")
             if selected is not None:

@@ -11,11 +11,13 @@ Source counterparts: ``Session.cs:InternalTick2`` and
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Mapping, Optional
 
 import game_engine
+from domain.constants import CARD_UID_TYPE
 from domain.events import (PlayerWishesToDrawFirstSessionEventArgs,
                            PlayerWishesToPlayFirstSessionEventArgs)
 
@@ -468,6 +470,48 @@ class GameEngineEventSink:
         event.context = context
         self._publish(event)
 
+    def ability_pushed_on_chain(self, ability) -> None:
+        """Publish the client chain entry for a native ability activation.
+
+        The RulesPort scheduler owns the ability lifecycle, but the Unity
+        client still needs the existing class-22 event to create its chain
+        animation and priority state.  Previously a typed activation paid
+        its cost and entered the native chain without producing that wire
+        projection, leaving the client showing only the cost change.
+        """
+        source_uid = getattr(ability, "source_uid", None)
+        try:
+            source_uid = int(getattr(source_uid, "uid64", source_uid))
+        except (TypeError, ValueError):
+            source_uid = 0
+        source_card_id = game_engine.SessionCardId(
+            game_engine.UID(source_uid) if source_uid else game_engine.UID.invalid())
+
+        target_card_ids = []
+        activation = getattr(ability, "activation", None)
+        target_map = getattr(activation, "target_map", {}) or {}
+        for selected in target_map.values():
+            values = selected if isinstance(selected, (list, tuple, set)) else (selected,)
+            for value in values:
+                try:
+                    uid64 = int(getattr(value, "uid64", value))
+                except (TypeError, ValueError):
+                    continue
+                if uid64 and (uid64 & 0xFF) == CARD_UID_TYPE:
+                    target_card_ids.append(game_engine.SessionCardId(
+                        game_engine.UID(uid64)))
+
+        template_id = getattr(ability, "ability_template_id", "")
+        try:
+            template_id = game_engine.ResourceId.from_str(str(template_id))
+        except (TypeError, ValueError):
+            template_id = game_engine.ResourceId.invalid()
+        self.game.push_ability_on_chain(
+            source_card_id, template_id,
+            ability_instance_id=int(getattr(ability, "instance_id", 0) or 0),
+            target_card_ids=target_card_ids,
+            ignores_chain=bool(getattr(ability, "ignores_chain", False)))
+
     def card_moved(self, session_card_id, player_id, collection,
                    location=game_engine.ECardLocations.Top, index=0) -> bool:
         """Apply a card-zone mutation, then publish its client event.
@@ -581,6 +625,7 @@ class AuthoritativeSession:
         self._turn_start_resolver: Optional[Callable[[], object]] = None
         self._turn_boundary_resolver: Optional[Callable[[object], object]] = None
         self._turn_phase_entry_resolver: Optional[Callable[[object], object]] = None
+        self._phase_priority_resolver: Optional[Callable[[object, object], object]] = None
         self._ability_resolver: Optional[Callable[[object], AbilityResolutionState]] = None
         self._activation_requester: Optional[Callable[[object, tuple], None]] = None
         self._ability_cost_payer: Optional[Callable[[object], bool]] = None
@@ -613,6 +658,7 @@ class AuthoritativeSession:
         self.eliminated_player_ids: set[object] = set()
         self.turn_phase_preferences: dict[object, dict[str, tuple[object, ...]]] = {}
         self.total_turns_taken = 0
+        self._phase_transition_depth = 0
         # Branch facts consumed by the client-derived phase states.  They are
         # refreshed by the mode adapter at checkpoint boundaries; defaults are
         # deliberately conservative for standalone scheduler tests.
@@ -694,6 +740,27 @@ class AuthoritativeSession:
         """
         self._turn_phase_entry_resolver = resolver
 
+    def set_phase_priority_resolver(self, resolver) -> None:
+        """Register the mode's stop policy for newly entered phase windows."""
+        self._phase_priority_resolver = resolver
+
+    def configure_phase_priority(self, action) -> None:
+        """Apply the host stop policy to one materialized native action.
+
+        ``TurnPhaseState`` constructs the action before a mode can inspect its
+        persisted stop preferences.  Rebuilding the queue here keeps that
+        policy in the native action, including ``NONE`` for an auto-passed
+        phase, rather than leaving a phantom ALL-player GreenLight active.
+        """
+        resolver = self._phase_priority_resolver
+        if resolver is None:
+            return
+        priority_players = resolver(self, action)
+        if priority_players is None:
+            return
+        action.priority_players = priority_players
+        action.reset_priority_window(start_with_active_player=False)
+
     def resolve_turn_phase_entry(self, phase=None):
         """Run the phase-entry projection after the native state transition."""
         if self._turn_phase_entry_resolver is None:
@@ -702,6 +769,43 @@ class AuthoritativeSession:
             self.current_turn_phase if phase is None else phase)
         self.persist()
         return result
+
+    def materialize_current_phase(self) -> bool:
+        """Enter an unmaterialized checkpoint phase through its native state.
+
+        A freshly created Practice checkpoint starts at ``StartTurn`` before
+        the first scheduler tick.  Reconnects and ordinary transitions already
+        have an action on the stack; only that initial checkpoint needs this
+        explicit entry so its turn-start resolver and native priority action
+        are both created before the mode driver runs.
+        """
+        if self.action_stack.count:
+            return False
+        state = self.phase_states.get(phase_name(self.current_turn_phase))
+        if state is None:
+            return False
+        state.on_entry(self)
+        self.persist()
+        return True
+
+    def begin_first_turn(self, active_player_id) -> bool:
+        """Start the first PvE/Practice turn after both hands are kept.
+
+        Practice setup still sends the client's non-interactive ``StartGame``
+        packet from the host setup projection.  The native scheduler must
+        nevertheless leave its Mulligan action behind before the AI driver is
+        invoked; otherwise a fresh checkpoint can report ``turn_player=ai``
+        while the native session remains active for the human in Mulligan.
+        Entering ``StartTurn`` through the normal state object keeps the
+        first-turn lifecycle and priority action RulesPort-owned.
+        """
+        if phase_name(self.current_turn_phase) != "Mulligan":
+            return False
+        self.action_stack.clear()
+        self.active_player_id = self.coerce_transaction_player_id(
+            active_player_id)
+        self.current_turn_phase = game_engine.ETurnPhases.StartTurn
+        return self.materialize_current_phase()
 
     def set_choice_transaction_resolver(self, resolver) -> None:
         self._choice_transaction_resolver = resolver
@@ -794,6 +898,44 @@ class AuthoritativeSession:
         prevents service handlers from reaching into the native action stack
         and inventing priority state during reconnect or hot reload.
         """
+        # Phase-entry projection can synchronously build another Game and
+        # re-enter the adapter. At that point transition_to has already
+        # selected the new phase/owner but has not finished materializing its
+        # priority action. A compatibility checkpoint captured before the
+        # transition must not rewrite either value in the middle of that
+        # operation (the live symptom was AI StartTurn becoming the human's
+        # FirstMainPhase). The outer attach will persist the completed native
+        # transition normally.
+        if self._phase_transition_depth:
+            return
+        # Checkpoint JSON historically stored raw uint64 IDs, while the live
+        # session/action queue uses typed UID values.  Keep every value that
+        # enters the native scheduler in the session's participant identity
+        # domain.  Otherwise ``PriorityWindowAction`` compares a raw integer
+        # with a UID, so a displayed pass is accepted by ingress but cannot
+        # consume the native queue; the same phase is then projected again.
+        participants = tuple(self.player_ids)
+
+        def canonical_participant(value):
+            if value is None:
+                return None
+            try:
+                raw = _uid_value(value)
+            except (TypeError, ValueError):
+                raw = None
+            for participant in participants:
+                if value is participant or value == participant:
+                    return participant
+                if raw is not None:
+                    try:
+                        if _uid_value(participant) == raw:
+                            return participant
+                    except (TypeError, ValueError):
+                        continue
+            return value
+
+        active_player_id = canonical_participant(active_player_id)
+        client_player_id = canonical_participant(client_player_id)
         try:
             index = int(phase_idx)
         except (TypeError, ValueError):
@@ -807,6 +949,17 @@ class AuthoritativeSession:
         self.action_stack.priority_player_id = client_player_id
         current = self.phase_states.get(phase_name(self.current_turn_phase))
         top = self.action_stack.peek()
+        if isinstance(top, PriorityWindowAction):
+            # Rehydrate the action's queue as well as the stack mirror.  A
+            # cached action can survive a reconnect with raw IDs even when no
+            # stop-policy resolver is installed (notably in focused/native
+            # hosts), and the queue is the value used by pass_priority().
+            from collections import deque
+            top._priority_queue = deque(
+                canonical_participant(player)
+                for player in tuple(getattr(top, "_priority_queue", ()))
+                if canonical_participant(player) is not None)
+            self.action_stack.priority_player_id = top.priority_player_id
         # A cached host can cross a phase boundary while its old compatibility
         # action is still in memory. A native chain response is distinct from
         # a phase window and must remain untouched.
@@ -816,14 +969,25 @@ class AuthoritativeSession:
                 phase_name(self.current_turn_phase)):
             self.action_stack.clear()
             top = None
+        if (isinstance(top, PriorityWindowAction) and
+                getattr(top, "ability_responding_to", None) is None):
+            # Reattached actions are materialized from the durable snapshot,
+            # so they need the same stop-policy translation as actions created
+            # by TurnPhaseState.on_entry.
+            self.configure_phase_priority(top)
+        initial_start_turn = (
+            phase_name(self.current_turn_phase) == "StartTurn" and
+            int(getattr(self, "total_turns_taken", 0) or 0) == 0)
         if (ensure_current_priority and self.action_stack.count == 0 and
                 current is not None and
-                current.priority_players is not TurnPhasePlayers.NONE):
+                current.priority_players is not TurnPhasePlayers.NONE and
+                not initial_start_turn):
             from collections import deque
             priority_action = PriorityWindowAction(current.priority_players)
             priority_action._rules_port_phase = phase_name(
                 self.current_turn_phase)
             self.action_stack.push(priority_action)
+            self.configure_phase_priority(priority_action)
             # The checkpoint already tells us which human owns the current
             # client window. For ALL-player windows this preserves APNAP order
             # while ensuring reconnect does not revert to the active side.
@@ -846,6 +1010,39 @@ class AuthoritativeSession:
             self.action_stack.push(priority_action)
             priority_action._priority_queue = deque([client_player_id])
             self.action_stack.priority_player_id = client_player_id
+        # A persisted projected chain must always own the top-level response
+        # action. Run this after ordinary checkpoint materialization too, so a
+        # stale phase action cannot shadow a chain restored from JSON.
+        self.ensure_projected_chain_action()
+
+    def prune_orphan_actions(self, legacy_stack=None) -> bool:
+        """Discard a stale RulesPort action that owns no live work.
+
+        A double-clicked ability can persist a ``ResolveTopOfChainAction``
+        after the chain item is gone; the orphaned action then makes every
+        later card appear unplayable.  Only discard the action when nothing
+        authoritative still owns the window: an ordinary phase window, a live
+        projected chain item, a legacy stack descriptor, and a pending
+        activation are all live and must be preserved.  In particular a
+        manual/triggered ability response window has ``ability_responding_to``
+        set, so it is not an ordinary phase window; discarding it while the
+        chain still holds the ability strands the chain and the client pass
+        loop never resolves it.
+        """
+        if self.action_stack is None or self.action_stack.count == 0:
+            return False
+        top = self.action_stack.peek()
+        if (isinstance(top, PriorityWindowAction) and
+                getattr(top, "ability_responding_to", None) is None):
+            return False
+        if not self.chain.is_empty:
+            return False
+        if legacy_stack:
+            return False
+        if self.pending_activation:
+            return False
+        self.action_stack.clear()
+        return True
 
     def set_discard_transaction_resolver(self, resolver: Callable[[RulesTransaction], bool]) -> None:
         self._discard_transaction_resolver = resolver
@@ -1033,6 +1230,13 @@ class AuthoritativeSession:
                     live_phase = current_phase(live_state)
                     if live_phase is not None:
                         self.current_turn_phase = live_phase
+        # A server-driven card can be queued between two compatibility
+        # projections.  The durable RulesPort snapshot is the transaction
+        # boundary in that case; repair a live response queue that still has
+        # the previous participant before PlayerHasPriorityRequirement runs.
+        # Without this, the wire GreenLight can name the human while the
+        # freshly re-entered PriorityWindowAction still rejects that pass.
+        self.reconcile_projected_chain_priority()
         if self.terminated or transaction.player_id not in self.player_ids:
             return False
         if ((transaction.phase is not None and
@@ -1047,6 +1251,57 @@ class AuthoritativeSession:
                        else phase_name(transaction.phase)),
             "payload": _json_value(transaction.payload),
         })
+        return True
+
+    def reconcile_projected_chain_priority(self) -> bool:
+        """Align a live chain response queue with its durable priority.
+
+        AI card plays are projected to the client without a client transaction
+        of their own.  A reconnect or re-entrant projection can therefore
+        leave the response action's queue at the AI while the persisted native
+        snapshot already names the human.  Repair only that projected-chain
+        boundary; ordinary phase windows retain their configured stop policy.
+        """
+        top = self.action_stack.peek()
+        if (self.chain.is_empty or not isinstance(top, PriorityWindowAction) or
+                getattr(top, "ability_responding_to", None) is None or
+                self.snapshot_store is None):
+            return False
+        try:
+            saved = self.snapshot_store.load()
+        except Exception:
+            return False
+        if not isinstance(saved, Mapping):
+            return False
+        desired = saved.get("priority_player_id")
+        if desired is None:
+            return False
+        desired = self.coerce_transaction_player_id(desired)
+        if desired not in self.player_ids:
+            return False
+
+        def same(left, right):
+            try:
+                return _uid_value(left) == _uid_value(right)
+            except (TypeError, ValueError):
+                return left == right
+
+        current = top.priority_player_id
+        if same(current, desired) and same(
+                self.action_stack.priority_player_id, desired):
+            return False
+
+        queue = list(getattr(top, "_priority_queue", ()) or ())
+        queue = [player for player in queue if not same(player, desired)]
+        if (top.priority_players is TurnPhasePlayers.ACTIVE and
+                not same(desired, self.active_player_id)):
+            # The active AI has already made its server-side decision.  The
+            # explicitly persisted human responder is the only participant
+            # that should remain in this response window.
+            queue.clear()
+        queue.insert(0, desired)
+        top._priority_queue = deque(queue)
+        self.action_stack.priority_player_id = desired
         return True
 
     @property
@@ -1410,6 +1665,20 @@ class AuthoritativeSession:
             return False
         return action.pass_priority(player_id)
 
+    def coerce_transaction_player_id(self, player_id):
+        """Map a wire/raw participant ID onto this session's typed identity."""
+        try:
+            incoming = _uid_value(player_id)
+        except (TypeError, ValueError):
+            return player_id
+        for participant in self.player_ids:
+            try:
+                if _uid_value(participant) == incoming:
+                    return participant
+            except (TypeError, ValueError):
+                continue
+        return player_id
+
     def declare_attack(self, player_id, defending_card, attacking_card):
         """Session-owned counterpart of the client's ``DeclareAttack`` call.
 
@@ -1512,6 +1781,15 @@ class AuthoritativeSession:
             # could not be interrupted by the opposing player.
             self.push_game_action(PriorityWindowAction(
                 TurnPhasePlayers.ALL, ability))
+        # Keep the authoritative native lifecycle and the existing client
+        # projection together.  Without this event a manual ability can be
+        # paid and queued successfully while Unity never enters its chain UI.
+        if self.event_sink is not None:
+            self.event_sink.ability_pushed_on_chain(ability)
+            if self.action_stack.priority_player_id is not None:
+                self.event_sink.green_light(
+                    self.action_stack.priority_player_id,
+                    game_engine.EPriorityContext.Normal)
         return True
 
     def resolve_top_of_chain(self, ability_instance_id: int) -> AbilityResolutionState:
@@ -1541,19 +1819,41 @@ class AuthoritativeSession:
                     game_engine.EPriorityContext.Normal)
         return state
 
+    def _participant_index(self, player_id):
+        """Find a participant across raw and typed UID checkpoint forms."""
+        try:
+            player_value = _uid_value(player_id)
+        except (TypeError, ValueError):
+            player_value = player_id
+        for index, participant in enumerate(self.player_ids):
+            if participant is player_id or participant == player_id:
+                return index
+            try:
+                if _uid_value(participant) == player_value:
+                    return index
+            except (TypeError, ValueError):
+                continue
+        raise ValueError(f"unknown session participant: {player_id!r}")
+
     def player_ids_in_turn_order(self):
-        active_at = self.player_ids.index(self.active_player_id)
+        active_at = self._participant_index(self.active_player_id)
         return self.player_ids[active_at:] + self.player_ids[:active_at]
 
     def player_ids_in_priority_order(self):
         priority = self.action_stack.priority_player_id
-        if priority not in self.player_ids:
+        try:
+            index = self._participant_index(priority)
+        except ValueError:
             return self.player_ids_in_turn_order()
-        index = self.player_ids.index(priority)
         return self.player_ids[index:] + self.player_ids[:index]
 
     def defending_player_ids(self):
-        return tuple(pid for pid in self.player_ids if pid != self.active_player_id)
+        try:
+            active_at = self._participant_index(self.active_player_id)
+        except ValueError:
+            return tuple(self.player_ids)
+        return tuple(pid for index, pid in enumerate(self.player_ids)
+                     if index != active_at)
 
     @property
     def has_combats(self) -> bool:
@@ -1587,17 +1887,22 @@ class AuthoritativeSession:
 
     def transition_to(self, next_phase) -> None:
         require_legal_transition(self.current_turn_phase, next_phase)
-        old_state = self.phase_states.get(phase_name(self.current_turn_phase))
-        if old_state is not None:
-            old_state.on_exit(self)
-        self.current_turn_phase = next_phase
-        new_state = self.phase_states.get(phase_name(next_phase))
-        if new_state is not None:
-            new_state.on_entry(self)
-        self.send_turn_phase_update()
-        # Phase transitions are authoritative scheduler mutations too. Save
-        # after the client-visible update so reconnect resumes at this phase.
-        self.persist()
+        self._phase_transition_depth += 1
+        try:
+            old_state = self.phase_states.get(
+                phase_name(self.current_turn_phase))
+            if old_state is not None:
+                old_state.on_exit(self)
+            self.current_turn_phase = next_phase
+            new_state = self.phase_states.get(phase_name(next_phase))
+            if new_state is not None:
+                new_state.on_entry(self)
+            self.send_turn_phase_update()
+            # Phase transitions are authoritative scheduler mutations too.
+            # Save after the client-visible update so reconnect resumes here.
+            self.persist()
+        finally:
+            self._phase_transition_depth -= 1
 
     def advance_turn_phase(self):
         """Use the current C# phase-state object to choose the next phase.
@@ -1621,10 +1926,31 @@ class AuthoritativeSession:
         if (phase_name(self.current_turn_phase) == "EndTurn" and
                 phase_name(next_phase) == "StartTurn" and
                 self.player_ids):
+            # Reconnect checkpoints may still carry the uint64 form while
+            # the native participant tuple contains UID wrappers.  Strict
+            # tuple.index() then returns -1 and the fallback selects player 0
+            # again, so a human turn never rotates back to the AI.
             try:
-                active_index = self.player_ids.index(self.active_player_id)
-            except ValueError:
-                active_index = -1
+                active_value = _uid_value(self.active_player_id)
+            except (TypeError, ValueError):
+                active_value = self.active_player_id
+            def same_participant(participant):
+                try:
+                    return _uid_value(participant) == active_value
+                except (TypeError, ValueError):
+                    return participant == self.active_player_id
+
+            active_index = next(
+                (index for index, participant in enumerate(self.player_ids)
+                 if same_participant(participant)),
+                -1)
+            if os.environ.get("HEX_RULES_PORT_TRACE"):
+                print(
+                    "[rules-trace] end-turn-rotation "
+                    f"active={self.active_player_id!r} "
+                    f"players={self.player_ids!r} "
+                    f"active_index={active_index}",
+                    flush=True)
             self.active_player_id = self.player_ids[
                 (active_index + 1) % len(self.player_ids)]
             self.auto_pass_states.clear()
@@ -1644,6 +1970,10 @@ class AuthoritativeSession:
                 if (boundary_result not in (None, True, False) and
                         boundary_result in self.player_ids):
                     self.active_player_id = boundary_result
+            if os.environ.get("HEX_RULES_PORT_TRACE"):
+                print(
+                    "[rules-trace] end-turn-rotated "
+                    f"active={self.active_player_id!r}", flush=True)
         self.transition_to(next_phase)
         return next_phase
 
@@ -1676,20 +2006,103 @@ class AuthoritativeSession:
         self.push_game_action(ResolveTopOfChainAction(ability))
         if first_player_id is not None:
             self.action_stack.priority_player_id = first_player_id
-        # The generic host has one client and an internally-driven AI; its
-        # opponent does not submit a transaction. PvP overrides this method
-        # with the two-human ALL-player window.
-        priority_action = PriorityWindowAction(
-            TurnPhasePlayers.ACTIVE, ability)
+        # Manual/triggered abilities use the same ALL-player response window
+        # as the client session. Card-play projections remain ACTIVE-only in
+        # the generic practice host; PvP overrides this method with its own
+        # two-human ALL-player window.
+        priority_players = (TurnPhasePlayers.ALL
+                            if descriptor.get("kind") == "ability"
+                            else TurnPhasePlayers.ACTIVE)
+        priority_action = PriorityWindowAction(priority_players, ability)
         self.push_game_action(priority_action)
         if first_player_id is not None:
-            # ACTIVE windows normally begin with the session's active player,
-            # but a server-driven AI card must expose the response window to
-            # the human first. The mode adapter supplies that typed identity.
+            # Preserve APNAP order while allowing a mode adapter to nominate
+            # the first responder for a server-driven activation.  An
+            # ACTIVE-only window normally contains just the active player,
+            # but an AI-owned card is deliberately handed to the human first
+            # so the human can respond.  Insert that nominated participant
+            # even when the policy queue did not include it.
             from collections import deque
-            priority_action._priority_queue = deque([first_player_id])
+            queue = list(priority_action._priority_queue)
+            try:
+                queue.remove(first_player_id)
+            except ValueError:
+                # The explicit responder is authoritative for a host-driven
+                # activation; do not leave the queue owned by the AI merely
+                # because the generic ACTIVE policy was used to construct it.
+                # The AI's decision has already happened, so an ACTIVE window
+                # with a non-active first responder contains only that one
+                # responder. ALL-player APNAP windows retain the remainder.
+                if priority_players is TurnPhasePlayers.ACTIVE:
+                    queue.clear()
+            queue.insert(0, first_player_id)
+            priority_action._priority_queue = deque(queue)
             self.action_stack.priority_player_id = first_player_id
         return ability
+
+    def ensure_projected_chain_action(self) -> bool:
+        """Keep the native action stack aligned with an active projected chain.
+
+        The projected descriptor and chain ids are durable, while action
+        objects are intentionally rebuilt on reconnect. A compatibility
+        checkpoint can therefore contain a live chain together with an old
+        phase ``PriorityWindowAction``. Letting that ordinary window consume
+        a pass leaves the chain unresolved forever. Rebuild the response
+        window around the existing chain item before ingress handles another
+        transaction.
+        """
+        if self.chain.is_empty:
+            return False
+        ability = self.chain.peek_ability()
+        if ability is None:
+            return False
+        top = self.action_stack.peek()
+        if isinstance(top, PriorityWindowAction):
+            responding_to = getattr(top, "ability_responding_to", None)
+            # Action objects are rebuilt independently from the durable
+            # projected-chain descriptor on a reconnect/reload.  They are
+            # therefore not guaranteed to retain Python object identity with
+            # the Chain's freshly rehydrated ability.  The ability instance
+            # id is the authoritative identity at this boundary.  Treating
+            # two wrappers for that same id as different actions rebuilt the
+            # response window on every client pass, putting priority back on
+            # the human and leaving the ability permanently on the chain.
+            try:
+                same_chain_item = (
+                    int(getattr(responding_to, "instance_id", -1)) ==
+                    int(getattr(ability, "instance_id", -2)))
+            except (TypeError, ValueError):
+                same_chain_item = False
+            if same_chain_item:
+                return False
+
+        # The chain is authoritative here; any ordinary phase action is stale
+        # relative to it. Recreate the same LIFO pair used by
+        # ``queue_projected_chain`` without adding the chain item twice.
+        first_player_id = self.action_stack.priority_player_id
+        self.action_stack.clear()
+        self.push_game_action(ResolveTopOfChainAction(ability))
+        descriptor = getattr(ability, "descriptor", {}) or {}
+        priority_players = (TurnPhasePlayers.ALL
+                            if descriptor.get("kind") == "ability"
+                            else TurnPhasePlayers.ACTIVE)
+        priority_action = PriorityWindowAction(priority_players, ability)
+        self.push_game_action(priority_action)
+        if first_player_id is not None:
+            from collections import deque
+            queue = list(priority_action._priority_queue)
+            if first_player_id in queue:
+                queue.remove(first_player_id)
+            elif priority_players is TurnPhasePlayers.ACTIVE:
+                queue.clear()
+            # The durable chain checkpoint can nominate the non-active human
+            # for an AI-owned card. Rebuilding an ACTIVE response action must
+            # preserve that explicit responder rather than restoring an AI
+            # queue that rejects the client's next pass.
+            queue.insert(0, first_player_id)
+            priority_action._priority_queue = deque(queue)
+            self.action_stack.priority_player_id = first_player_id
+        return True
 
     def forget_projected_chain(self, instance_id) -> None:
         try:

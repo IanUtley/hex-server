@@ -66,7 +66,11 @@ class FirstMainPhaseState(TurnPhaseState):
     """C# ``FirstMainPhaseState.DetermineNextTurnPhase`` override."""
 
     def __init__(self, phase) -> None:
-        super().__init__(phase)
+        # The client derives FirstMainPhaseState from PriorityWindowState,
+        # so its native action starts as ALL. Stop preferences may cause the
+        # host to auto-pass one participant, but the phase itself must not be
+        # constructed as an ACTIVE-only window.
+        super().__init__(phase, priority_players=TurnPhasePlayers.ALL)
 
     def get_next_turn_phase(self, session=None):
         return ("SecondMainPhase" if getattr(session, "active_player_skips_attack", False)

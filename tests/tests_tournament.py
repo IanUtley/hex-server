@@ -157,17 +157,22 @@ def test_old_tournaments_close_and_remove_only_their_game_state():
         test_db.executescript(
             """
             CREATE TABLE tournaments (
-                id INTEGER PRIMARY KEY, status TEXT, session_id TEXT,
+                id INTEGER PRIMARY KEY, type_id INTEGER, status TEXT, session_id TEXT,
                 created_at TEXT
+            );
+            CREATE TABLE tournament_types (
+                id INTEGER PRIMARY KEY, style TEXT
             );
             CREATE TABLE game_sessions (session_id TEXT PRIMARY KEY, state TEXT);
             CREATE TABLE game_cards (session_id TEXT, card_uid INTEGER);
             CREATE TABLE session_events (session_id TEXT);
             CREATE TABLE game_replays (session_id TEXT, status TEXT);
+            INSERT INTO tournament_types VALUES (1, 'se'), (2, 'async');
             INSERT INTO tournaments VALUES
-                (10001, 'started', 'old-session', datetime('now', '-2 days')),
-                (10002, 'waiting', NULL, datetime('now', '-2 days')),
-                (10003, 'started', 'new-session', datetime('now'));
+                (10001, 1, 'started', 'old-session', datetime('now', '-2 days')),
+                (10002, 1, 'waiting', NULL, datetime('now', '-2 days')),
+                (10003, 1, 'started', 'new-session', datetime('now')),
+                (10004, 2, 'waiting', NULL, datetime('now', '-2 days'));
             INSERT INTO game_sessions VALUES
                 ('old-session', 'started'), ('new-session', 'started');
             INSERT INTO game_cards VALUES ('old-session', 1), ('new-session', 2);
@@ -183,7 +188,8 @@ def test_old_tournaments_close_and_remove_only_their_game_state():
         assert test_db.execute(
             "SELECT id, status FROM tournaments ORDER BY id"
         ).fetchall() == [
-            (10001, "closed"), (10002, "closed"), (10003, "started")
+            (10001, "closed"), (10002, "closed"), (10003, "started"),
+            (10004, "waiting")
         ]
         assert test_db.execute(
             "SELECT session_id FROM game_sessions ORDER BY session_id"

@@ -57,6 +57,27 @@ def _bool_call(owner, method: str, *args) -> bool:
     return bool(callback(*args)) if callable(callback) else False
 
 
+def _same_player_id(session, left, right) -> bool:
+    """Compare participant identities across wire and native UID domains.
+
+    The client serializes player IDs as uint64 values while the native rules
+    session normally keeps typed ``UID`` objects.  A reconnect or a projected
+    AI action can therefore leave one side of a requirement as the raw value
+    even though it names the same participant.
+    """
+    coerce = getattr(session, "coerce_transaction_player_id", None)
+    if callable(coerce):
+        left = coerce(left)
+        right = coerce(right)
+    if left == right:
+        return True
+    try:
+        return int(getattr(left, "uid64", left)) == int(
+            getattr(right, "uid64", right))
+    except (TypeError, ValueError):
+        return False
+
+
 def _compare(lhs, operation, rhs) -> bool:
     op = getattr(operation, "name", operation)
     op = str(op).replace("_", "").replace(" ", "").lower()
@@ -89,7 +110,9 @@ class PlayerHasPriorityRequirement:
     player_id: object
 
     def is_valid(self, session, player_id) -> bool:
-        return self.player_id == player_id == session.action_stack.priority_player_id
+        return (_same_player_id(session, self.player_id, player_id) and
+                _same_player_id(session, player_id,
+                                session.action_stack.priority_player_id))
 
 
 @dataclass(frozen=True)

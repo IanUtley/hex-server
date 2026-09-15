@@ -256,20 +256,10 @@ def summon_token(context, payload=None):
         from .triggers import dispatch_trigger
         dispatch_trigger(context, "CardEnteredZoneEvent", uid, owner,
                          data={"event_destination_collection": location})
-    if location == "choosing" and made and owner != 0:
-        # This is a real client choice boundary: the following authored
-        # ActivateAbility copies the selected card from Choosing.  Suspend
-        # the parent ability after generation so the picker can answer first.
-        pending = context.continuation()
-        pending.update({"kind": "choice_zone_copy",
-                        "choice_uids": [int(uid) for uid, _ in made]})
-        context.bstate["pending_choice"] = pending
-        context.bstate["resolution_paused"] = True
-        prompt = getattr(context.handler, "_prompt_choice_cards", None)
-        if callable(prompt):
-            prompt(context.game, context.session, context.player_uid,
-                   context.ai_uid, context.bstate, pending)
-        return f"summoned {len(made)} token(s); awaiting choice"
+    # A Choosing summon only materializes an authored option.  The following
+    # ActivateAbility/PlayCard effect owns the actual target boundary.  Do not
+    # pause here: when an ability creates several options, pausing each summon
+    # would turn one picker into one sequential picker per option.
     return f"summoned {len(made)} token(s)"
 
 

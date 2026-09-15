@@ -2,6 +2,25 @@
 
 Open the console by pressing **backtick/tilde** (`` ` ``) after login.
 
+## Server implementation status
+
+This is the original Unity client developer-console inventory. These commands
+are not server chat commands, and the server does not implement any of the
+namespaced commands listed below (for example, `cheat.addcard` or
+`debug.practice`). They are therefore marked **Not implemented by this
+server** as a group; a client command may still exist in the original client
+without having a server-side handler in this repository.
+
+The implemented server-side debugging commands use `!` or `/` prefixes and
+are documented in [COMMANDS.md](COMMANDS.md). The implemented list is:
+`game_end`, `encounter`, `challenge`, `reload`, `hand`, `aihand`, `zones`,
+`playable`, `draw`, `gencard`, `addcard`, `top`, `discard`,
+`move`, `update`, `state`, `attr`, `threshold`, `resource`, `charge`,
+`spellpoints`, `health`, `pass`, `phase`, and `help`.
+
+Status: **Not implemented by this server** for every command in the tables
+below.
+
 ## Account
 | Command | Description |
 |---|---|

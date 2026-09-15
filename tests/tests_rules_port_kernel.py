@@ -42,13 +42,15 @@ from rules_port.wire import (extract_session_card_uids,
                              submit_classified_transaction)
 from rules_port.runtime_adapter import (PvpRuntimeFacts, RuntimeCard,
                                          SQLiteCardMutationAdapter)
-from rules_port.actions import AbilityResolutionState, PushOntoChainAction
+from rules_port.actions import (AbilityResolutionState, PushOntoChainAction,
+                                ResolveTopOfChainAction)
 from rules_port.triggers import MetadataTriggerAdapter, TriggerEvent
 from rules_port.targets import MetadataTargetAdapter, TargetSelection
 from rules_port.async_bridge import (AsyncActivationPublisher,
                                      AsyncEventPublisher,
                                      AsyncRulesCoordinator, AsyncUIEventBus)
-from rules_port.adapter import rules_session_for, session_from_persisted_game
+from rules_port.adapter import (_native_participant_ids, rules_session_for,
+                                session_from_persisted_game)
 from rules_port.pvp_session import PvpAuthoritativeSession
 from rules_port.combat import (CombatId, CombatManager, CombatPhase,
                                CombatResolver)
@@ -58,10 +60,12 @@ from rules_port.conditions import evaluate_condition
 from rules_port.persistence import (current_phase as native_current_phase,
                                     load_state as native_load_state,
                                     persistence_state)
-from rules_port.lifecycle import complete_turn, should_draw_for_turn
+from rules_port.lifecycle import (complete_turn, practice_phase_priority,
+                                  practice_priority_players, should_draw_for_turn)
 from rules_port.cast_stats import record_card_cast
 from rules_port import pvp_lifecycle
 import game_engine
+from domain.constants import AI_UID_TYPE, PLAYER_UID_TYPE
 from domain.events import PlayerWishesToDrawFirstSessionEventArgs
 from gamedata.play_plan import AbilityInstance as MetadataAbilityInstance
 
@@ -388,6 +392,26 @@ def test_pass_priority_transaction_matches_client_requirements_and_routes_window
         player, game_engine.ETurnPhases.FirstMainPhase))
 
 
+def test_pass_priority_accepts_equivalent_raw_wire_priority_identity():
+    """Reconnect/AI projections must not strand a typed client pass."""
+    player = game_engine.UID.make(244, 101)
+    ai = game_engine.UID.make(3, 102)
+    session = AuthoritativeSession(551, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    window = PriorityWindowAction(TurnPhasePlayers.ACTIVE)
+    session.push_game_action(window)
+    # Simulate a persisted/projected raw uint64 priority value.  The native
+    # participant remains the typed UID used by the transaction path.
+    window._priority_queue.clear()
+    window._priority_queue.append(int(player.uid64))
+    session.action_stack.priority_player_id = int(player.uid64)
+    transaction = RulesTransaction.pass_priority(
+        player, game_engine.ETurnPhases.FirstMainPhase)
+    assert session.submit_transaction(transaction)
+    assert session.handle_transaction()
+    assert window.priority_player_id is None
+
+
 def test_choose_draw_first_reorders_players_like_client_transaction():
     player, opponent = game_engine.UID.make(244, 1), game_engine.UID.make(3, 2)
     game = game_engine.Game(55, player, opponent)
@@ -609,6 +633,34 @@ def test_persisted_game_adapter_uses_session_rng_and_existing_event_sink():
     assert stored.turn_order["rules_port"]["seed_w"] == 202
 
 
+def test_persisted_game_adapter_repairs_raw_practice_participants():
+    stored = PersistedSessionStub()
+    stored.session_id = 551
+    stored.seed_z, stored.seed_w = 1, 2
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 123)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    # This is the JSON shape written by older practice sessions: only the
+    # human is registered, and some rows contain it twice.
+    stored.players = [(123, 0), (123, 0)]
+    port = session_from_persisted_game(
+        stored, game_engine.Game(551, player, ai))
+    assert port.player_ids == (player, ai)
+    assert port.coerce_transaction_player_id(player) == player
+
+
+def test_practice_participants_survive_projection_with_duplicate_human_uids():
+    stored = PersistedSessionStub()
+    stored.session_name = "Session-practice-participant-test"
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 124)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    stored.players = [(int(player.uid64), 0), (int(player.uid64), 0)]
+    malformed_projection = game_engine.Game(552, player, player)
+
+    participants = _native_participant_ids(stored, malformed_projection)
+
+    assert participants == (player, ai)
+
+
 def test_persisted_game_adapter_rehydrates_rules_scheduler_snapshot():
     stored = PersistedSessionStub()
     stored.session_id = 56
@@ -680,6 +732,56 @@ def test_generic_projected_card_chain_is_owned_by_native_action_stack():
     assert restored.chain._instance_ids == [78]
 
 
+def test_generic_ai_projected_card_can_start_with_human_response():
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 14)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    session = AuthoritativeSession(60, (player, ai), seed_z=1, seed_w=2)
+    session.active_player_id = ai
+    session.queue_projected_chain(
+        {"kind": "troop", "source_uid": 903, "instance_id": 79},
+        ai, first_player_id=player)
+
+    action = session.action_stack.peek()
+    assert isinstance(action, PriorityWindowAction)
+    assert action.priority_player_id == player
+
+    restored = AuthoritativeSession(60, (player, ai), seed_z=8, seed_w=9)
+    assert restored.restore_snapshot(session.snapshot())
+    assert restored.active_player_id == ai
+    assert restored.rehydrate_projected_chain()
+    restored_action = restored.action_stack.peek()
+    assert isinstance(restored_action, PriorityWindowAction)
+    assert restored_action.priority_player_id == player
+    assert restored.pass_player_priority(player)
+    assert restored_action.priority_player_id is None
+
+
+def test_projected_chain_reconciles_priority_from_durable_snapshot():
+    from collections import deque
+
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 15)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    source = AuthoritativeSession(61, (player, ai), seed_z=1, seed_w=2)
+    source.active_player_id = ai
+    source.queue_projected_chain(
+        {"kind": "troop", "source_uid": 904, "instance_id": 80},
+        ai, first_player_id=player)
+    saved = source.snapshot()
+
+    store = SimpleNamespace(load=lambda: saved)
+    restored = AuthoritativeSession(
+        61, (player, ai), seed_z=8, seed_w=9, snapshot=store)
+    assert restored.restore_snapshot(saved)
+    assert restored.rehydrate_projected_chain()
+    action = restored.action_stack.peek()
+    action._priority_queue = deque([ai])
+    restored.action_stack.priority_player_id = ai
+
+    assert restored.reconcile_projected_chain_priority()
+    assert action.priority_player_id == player
+    assert restored.action_stack.priority_player_id == player
+
+
 def test_reconnect_restores_normalized_transaction_history_for_parity():
     player = game_engine.UID.make(244, 42)
     source = AuthoritativeSession(71, (player,), seed_z=1, seed_w=2)
@@ -743,6 +845,73 @@ def test_enable_rules_port_upgrades_a_previously_cached_light_host():
     assert upgraded is light
     assert upgraded.runtime_facts is not None
     assert upgraded.event_sink.mutation_adapter._pvp is api
+
+
+def test_cached_enable_keeps_native_shared_turn_over_stale_projection():
+    stored = PersistedSessionStub()
+    stored.session_id = 590
+    stored.seed_z, stored.seed_w = 7, 8
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 27)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    stored.players = [(player, 0), (ai, 1)]
+    game = game_engine.Game(590, player, ai)
+    shared = {"turn_player": "ai", "phase_idx": 0}
+    port = enable_rules_port(stored, game, shared)
+    stale = {"turn_player": "player", "phase_idx": 8}
+
+    attached = enable_rules_port(stored, game, stale)
+
+    assert attached is port
+    assert stored._rules_port_battle_state is shared
+    assert stale["turn_player"] == "ai"
+    assert stale["phase_idx"] == 0
+    assert attached.runtime_facts.battle_state is shared
+
+
+def test_enable_rules_port_repairs_cached_legacy_practice_participants():
+    stored = PersistedSessionStub()
+    stored.session_id = 60
+    stored.seed_z, stored.seed_w = 9, 10
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 29)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    stored.players = [(29, 0), (29, 0)]
+    game = game_engine.Game(60, player, ai)
+    cached = rules_session_for(stored, game)
+    cached.player_ids = (29,)
+    cached.active_player_id = 29
+    cached.action_stack.priority_player_id = 29
+
+    repaired = enable_rules_port(stored, game, {})
+
+    assert repaired is cached
+    assert repaired.player_ids == (player, ai)
+    assert repaired.active_player_id == player
+    assert repaired.action_stack.priority_player_id == player
+
+
+def test_cached_participant_repair_updates_priority_window_queue():
+    from collections import deque
+
+    stored = PersistedSessionStub()
+    stored.session_id = 61
+    stored.seed_z, stored.seed_w = 11, 12
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 30)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    stored.players = [(30, 0), (30, 0)]
+    game = game_engine.Game(61, player, ai)
+    cached = rules_session_for(stored, game)
+    cached.player_ids = (30,)
+    cached.active_player_id = 30
+    action = PriorityWindowAction(TurnPhasePlayers.ALL)
+    cached.action_stack.push(action)
+    action._priority_queue = deque([30])
+    cached.action_stack.priority_player_id = 30
+
+    repaired = enable_rules_port(stored, game, {})
+
+    assert repaired.action_stack.peek() is action
+    assert list(action._priority_queue) == [player]
+    assert action.priority_player_id == player
 
 
 def test_persisted_game_factory_accepts_explicit_card_mutation_adapter():
@@ -1702,10 +1871,28 @@ def test_phase_entry_projection_runs_before_native_priority_window():
     assert isinstance(session.action_stack.peek(), PriorityWindowAction)
 
 
+def test_first_turn_boundary_leaves_mulligan_for_selected_ai_owner():
+    player = game_engine.UID.make(244, 77)
+    ai = game_engine.UID.make(3, 78)
+    session = AuthoritativeSession(177, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.Mulligan
+    session.active_player_id = player
+    assert session.materialize_current_phase()
+    assert session.action_stack.count == 1
+
+    assert session.begin_first_turn(ai)
+    assert session.current_turn_phase == game_engine.ETurnPhases.StartTurn
+    assert session.active_player_id == ai
+    assert session.total_turns_taken == 1
+    assert isinstance(session.action_stack.peek(), PriorityWindowAction)
+    assert session.action_stack.priority_player_id == ai
+
+
 def test_phase_state_priority_populations_match_client_state_subclasses():
     states = AuthoritativeSession(55, ("a", "b"), seed_z=1, seed_w=2).phase_states
     assert states["PreGame"].priority_players is TurnPhasePlayers.NONE
     assert states["Ready"].priority_players is TurnPhasePlayers.ALL
+    assert states["FirstMainPhase"].priority_players is TurnPhasePlayers.ALL
     assert states["DeclareAttack"].priority_players is TurnPhasePlayers.ACTIVE
     assert states["DeclareDefense"].priority_players is TurnPhasePlayers.DEFENDING
     assert not states["Draw"].chain_can_resolve()
@@ -1724,6 +1911,78 @@ def test_end_turn_rotation_updates_native_active_player():
     assert session.current_turn_phase == game_engine.ETurnPhases.StartTurn
     assert session.active_player_id == "o"
     assert seen == ["o"]
+
+
+def test_end_turn_rotation_matches_raw_active_uid_to_typed_participants():
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 246)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    session = AuthoritativeSession(57, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.EndTurn
+    session.active_player_id = int(player.uid64)
+
+    session.advance_turn_phase()
+
+    assert session.current_turn_phase == game_engine.ETurnPhases.StartTurn
+    assert session.active_player_id == ai
+
+
+def test_practice_end_phase_rotates_duplicate_persisted_player_row_to_ai():
+    """The live Practice row can contain the human UID in both player slots."""
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 246)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    game = SimpleNamespace(player_uid=player, ai_uid=ai)
+    persisted = SimpleNamespace(players=[
+        (int(player.uid64), 0),
+        (int(player.uid64), 0),
+    ])
+    participants = _native_participant_ids(persisted, game)
+    session = AuthoritativeSession(
+        58, participants, seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.EndPhase
+    session.active_player_id = int(player.uid64)
+    state = {
+        "player_self_stops": [],
+        "player_opp_stops": [int(game_engine.ETurnPhases.EndPhase)],
+    }
+    session.set_phase_priority_resolver(
+        lambda port, _action: practice_phase_priority(
+            state, port.current_turn_phase,
+            active_player_id=port.active_player_id,
+            player_id=player))
+
+    assert session.materialize_current_phase()
+    assert session.pass_player_priority(player)
+    assert session.pass_player_priority(ai)
+    session.drive_until_input()
+
+    assert session.player_ids == (player, ai)
+    assert session.current_turn_phase == game_engine.ETurnPhases.StartTurn
+    assert session.active_player_id == ai
+    assert session.action_stack.priority_player_id == ai
+
+
+def test_reentrant_checkpoint_cannot_replace_owner_during_turn_transition():
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 247)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    session = AuthoritativeSession(
+        581, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.EndTurn
+    session.active_player_id = player
+    phases = [game_engine.ETurnPhases.StartTurn,
+              game_engine.ETurnPhases.FirstMainPhase]
+
+    def stale_nested_attach(_phase):
+        session.sync_checkpoint(
+            phases=phases, phase_idx=1,
+            active_player_id=player, client_player_id=player,
+            ensure_current_priority=True)
+
+    session.set_turn_phase_entry_resolver(stale_nested_attach)
+    session.advance_turn_phase()
+
+    assert session.current_turn_phase == game_engine.ETurnPhases.StartTurn
+    assert session.active_player_id == ai
+    assert session.action_stack.priority_player_id == ai
 
 
 def test_end_turn_boundary_can_override_native_rotation_for_bonus_turn():
@@ -2108,6 +2367,139 @@ def test_manual_ability_finish_opens_all_player_chain_priority_window():
     assert session.finish_ability_on_chain(ability)
     assert isinstance(session.action_stack.peek(), PriorityWindowAction)
     assert session.action_stack.priority_player_id == player
+
+
+def test_manual_ability_finish_projects_chain_entry_and_green_light():
+    """Native manual activations must enter the existing Unity chain UI."""
+    player = game_engine.UID.make(244, 57)
+    opponent = game_engine.UID.make(3, 58)
+    game = game_engine.Game(57, player, opponent)
+    session = AuthoritativeSession(
+        57, (player, opponent), seed_z=1, seed_w=2,
+        event_sink=GameEngineEventSink(game))
+    ability = SimpleNamespace(
+        instance_id=19,
+        source_uid=game_engine.UID.make(1, 8).uid64,
+        ability_template_id="4ba9e978-53fd-a3ed-88ca-d57632f186cb",
+        activation=SimpleNamespace(
+            target_map={0: (game_engine.UID.make(1, 9).uid64,)}),
+        metadata=SimpleNamespace(graph=SimpleNamespace(manual=True)),
+        is_triggered=False, ignores_chain=False,
+        untargeted_trigger=False, paid=False)
+    session.set_ability_cost_payer(lambda _ability: True)
+
+    assert session.finish_ability_on_chain(ability)
+    chain_events = [
+        event for event in game.events
+        if isinstance(event, game_engine.AbilityPushedOnChainSessionEventArgs)]
+    green_lights = [
+        event for event in game.events
+        if isinstance(event, game_engine.GreenLightSessionEventArgs)]
+    assert len(chain_events) == 1
+    assert chain_events[0].source_card_id.uid.uid64 == 0x801
+    assert [item.uid.uid64 for item in chain_events[0].target_card_ids] == [
+        0x901]
+    assert str(chain_events[0].ability_template_id.guid) == (
+        "4ba9e978-53fd-a3ed-88ca-d57632f186cb")
+    assert len(green_lights) == 1
+    assert green_lights[0].player_id == player
+
+
+def test_practice_manual_ability_response_window_auto_passes_ai():
+    """A Practice opponent must not strand a manual ability on the chain."""
+    player = game_engine.UID.make(244, 59)
+    opponent = game_engine.UID.make(3, 60)
+    session = AuthoritativeSession(
+        59, (player, opponent), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    session.active_player_id = player
+    ability = SimpleNamespace(
+        instance_id=21, source_uid=game_engine.UID.make(1, 8).uid64,
+        ability_template_id="598fe8be-5c04-918c-e0aa-82e88aee3d28",
+        metadata=SimpleNamespace(graph=SimpleNamespace(manual=True)),
+        is_triggered=False, ignores_chain=False,
+        untargeted_trigger=False, paid=False)
+    resolved = []
+    session.set_ability_cost_payer(lambda _ability: True)
+    session.set_ability_resolver(
+        lambda item: resolved.append(item) or AbilityResolutionState.COMPLETED)
+    assert session.finish_ability_on_chain(ability)
+    assert session.action_stack.priority_player_id == player
+
+    assert session.pass_player_priority(player)
+    while (session.action_stack.priority_player_id is not None and
+           session.action_stack.priority_player_id != player):
+        assert session.pass_player_priority(
+            session.action_stack.priority_player_id)
+    session.drive_until_input()
+
+    assert resolved == [ability]
+    assert session.chain.is_empty
+
+
+def test_live_projected_chain_response_window_survives_reattach_prune():
+    """A reattach must not prune a manual ability's live response window.
+
+    The HConnect host runs a per-transaction orphan cleanup before
+    ``sync_checkpoint``.  A manual/triggered ability response window has
+    ``ability_responding_to`` set, so it is not an ordinary phase window; if
+    the cleanup also ignored the live chain it cleared the window, the rebuilt
+    phase window gave the human priority, the server-driven AI pass was
+    rejected, and the ability stayed on the chain forever (Minion of Yazukan's
+    hand Tunneling paid its cost but never resolved).
+    """
+    player = game_engine.UID.make(244, 61)
+    opponent = game_engine.UID.make(3, 62)
+    session = AuthoritativeSession(
+        62, (player, opponent), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    session.active_player_id = player
+    session.action_stack.clear()
+
+    resolved = []
+    session.set_ability_resolver(
+        lambda item: resolved.append(item.instance_id) or
+        AbilityResolutionState.COMPLETED)
+    session.queue_projected_chain(
+        {"kind": "ability", "source_uid": 0x0801, "instance_id": 1,
+         "ability_guid": "95474d1e-ac9b-6c02-cb95-0305ebec42dc",
+         "activation_data": {}},
+        player, first_player_id=player)
+
+    # The response window is live; a reattach prune must leave it alone.
+    assert session.prune_orphan_actions(None) is False
+    assert session.chain._instance_ids == [1]
+    assert session.action_stack.priority_player_id == player
+
+    # Human passes; the AI's server-driven response re-runs the reattach
+    # (fresh Game projection) before it is asked to pass.
+    assert session.pass_player_priority(player)
+    assert session.action_stack.priority_player_id == opponent
+    assert session.prune_orphan_actions(None) is False
+    assert session.action_stack.priority_player_id == opponent
+
+    # The AI's pass is now accepted and the chain resolves.
+    assert session.pass_player_priority(opponent)
+    assert session.action_stack.priority_player_id is None
+    session.drive_until_input()
+    assert resolved == [1]
+    assert session.chain.is_empty
+
+
+def test_orphan_phase_action_without_chain_item_is_pruned():
+    """The double-click guard still clears a chainless stale action."""
+    player = game_engine.UID.make(244, 63)
+    opponent = game_engine.UID.make(3, 64)
+    session = AuthoritativeSession(
+        63, (player, opponent), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    session.active_player_id = player
+    session.action_stack.clear()
+    ability = AbilityStub(99)
+    session.action_stack.push(ResolveTopOfChainAction(ability))
+    assert session.chain.is_empty
+    assert session.prune_orphan_actions(None) is True
+    assert session.action_stack.count == 0
 
 
 def test_completed_chain_resolution_persists_effect_boundary():
@@ -2498,6 +2890,96 @@ def test_metadata_card_executor_keeps_zone_mutation_as_explicit_adapter():
     assert calls == [("play_resource", {"card_id": 7})]
 
 
+def test_metadata_manual_ability_uses_reconnectable_projected_chain():
+    """A response pass must not discard a typed ability instance on reattach."""
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 41)
+    port = AuthoritativeSession(141, (player,), seed_z=1, seed_w=2)
+    executor = MetadataCardTransactionExecutor(
+        port,
+        graph_loader=lambda guid: ability_graph(DEFAULT_RECORD_STORE, guid),
+        owner_id=41)
+    tx = SimpleNamespace(
+        player_id=player,
+        payload={
+            "source_card_id": 2561,
+            "ability_template_id": (
+                "598fe8be-5c04-918c-e0aa-82e88aee3d28"),
+            "activation_data": {"target_map": {}},
+            "ability_instance_id": 0,
+        })
+
+    assert executor("activate_ability", tx)
+    assert port.chain._instance_ids == [1]
+    saved = port.snapshot()
+    assert saved["projected_chain"][0]["kind"] == "ability"
+    assert saved["projected_chain"][0]["activation_data"]["target_map"] == {}
+
+    restored = AuthoritativeSession(141, (player,), seed_z=9, seed_w=9)
+    assert restored.restore_snapshot(saved)
+    assert restored.rehydrate_projected_chain()
+    assert restored.chain.peek_ability().source_uid == 2561
+    assert restored.chain.peek_ability().ability_template_id == (
+        "598fe8be-5c04-918c-e0aa-82e88aee3d28")
+
+
+def test_projected_chain_replaces_stale_phase_action_before_pass():
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 42)
+    ai = game_engine.UID.make(3, 1000)
+    source = AuthoritativeSession(142, (player, ai), seed_z=1, seed_w=2)
+    source.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    source.active_player_id = player
+    source.action_stack.priority_player_id = player
+    source.queue_projected_chain(
+        {"kind": "ability", "source_uid": 2305, "ability_guid": "tunnel",
+         "instance_id": 1, "activation_data": {}},
+        player, first_player_id=player)
+    saved = source.snapshot()
+
+    restored = AuthoritativeSession(142, (player, ai), seed_z=9, seed_w=9)
+    assert restored.restore_snapshot(saved)
+    restored.rehydrate_projected_chain()
+    # Simulate the bad reconnect state observed in the live session: the
+    # descriptor/chain survived, but only a normal phase window was rebuilt.
+    restored.action_stack.clear()
+    normal = PriorityWindowAction(TurnPhasePlayers.ACTIVE)
+    restored.action_stack.push(normal)
+    restored.action_stack.priority_player_id = player
+    assert restored.ensure_projected_chain_action()
+    action = restored.action_stack.peek()
+    assert isinstance(action, PriorityWindowAction)
+    assert action.ability_responding_to is restored.chain.peek_ability()
+    assert restored.action_stack.priority_player_id == player
+
+
+def test_projected_chain_keeps_rehydrated_response_window_by_instance_id():
+    """A reload must not reset an in-progress response window to its opener."""
+    from rules_port.session import ProjectedChainAbility
+    from collections import deque
+
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 43)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    session = AuthoritativeSession(143, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    session.active_player_id = player
+    ability = session.queue_projected_chain(
+        {"kind": "ability", "source_uid": 2305, "ability_guid": "tunnel",
+         "instance_id": 2, "activation_data": {}},
+        player, first_player_id=player)
+    response = session.action_stack.peek()
+    # Restore paths can recreate the action's wrapper separately from the
+    # Chain wrapper.  It still names the same durable ability instance.
+    response.ability_responding_to = ProjectedChainAbility(
+        2, ability.descriptor, player)
+    response._priority_queue = deque([ai])
+    session.action_stack.priority_player_id = ai
+
+    assert not session.ensure_projected_chain_action()
+    assert session.action_stack.peek() is response
+    assert response.priority_player_id == ai
+
+
 def test_metadata_card_executor_can_separate_resource_mutation_adapter():
     calls = []
     executor = MetadataCardTransactionExecutor(
@@ -2885,6 +3367,103 @@ def test_rules_session_sync_checkpoint_owns_practice_main_priority():
     assert not port.active_player_skips_attack
     assert isinstance(port.action_stack.peek(), PriorityWindowAction)
     assert port.pass_player_priority(player)
+
+
+def test_sync_checkpoint_canonicalizes_raw_priority_for_native_pass():
+    player = game_engine.UID.make(244, 73)
+    ai = game_engine.UID.make(3, 1000)
+    port = AuthoritativeSession(79, (player, ai), seed_z=1, seed_w=2)
+    port.current_turn_phase = game_engine.ETurnPhases.SecondMainPhase
+    port.active_player_id = ai
+    window = PriorityWindowAction(TurnPhasePlayers.ALL)
+    window._rules_port_phase = "SecondMainPhase"
+    port.action_stack.push(window)
+    window._priority_queue.clear()
+    window._priority_queue.append(int(player.uid64))
+    port.action_stack.priority_player_id = int(player.uid64)
+
+    port.sync_checkpoint(
+        phases=(game_engine.ETurnPhases.SecondMainPhase,), phase_idx=0,
+        active_player_id=int(ai.uid64),
+        client_player_id=int(player.uid64),
+        ensure_main_priority=False, ensure_current_priority=False)
+
+    assert port.active_player_id == ai
+    assert port.action_stack.priority_player_id == player
+    assert port.pass_player_priority(player)
+
+
+def test_practice_stop_matrix_keeps_both_passes_native():
+    player = game_engine.UID.make(244, 71)
+    ai = game_engine.UID.make(3, 1000)
+    phase = game_engine.ETurnPhases.SecondMainPhase
+    first_main = game_engine.ETurnPhases.FirstMainPhase
+
+    both = {"player_self_stops": [phase], "player_opp_stops": [phase]}
+    assert practice_priority_players(
+        both, phase, active_is_player=True) is TurnPhasePlayers.ALL
+    assert practice_priority_players(
+        {"player_self_stops": [first_main], "player_opp_stops": []},
+        first_main, active_is_player=True) is TurnPhasePlayers.ACTIVE
+    assert practice_priority_players(
+        {"player_self_stops": [], "player_opp_stops": [first_main]},
+        first_main, active_is_player=True) is TurnPhasePlayers.ALL
+    assert practice_priority_players(
+        {"player_opp_stops": [phase]}, phase,
+        active_is_player=False) is TurnPhasePlayers.ALL
+    assert practice_priority_players(
+        {"player_opp_stops": []}, game_engine.ETurnPhases.FirstMainPhase,
+        active_is_player=False) is TurnPhasePlayers.ACTIVE
+
+    session = AuthoritativeSession(78, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = phase
+    session.active_player_id = player
+    session.action_stack.push(PriorityWindowAction(TurnPhasePlayers.ALL))
+    assert session.action_stack.priority_player_id == player
+    assert session.pass_player_priority(player)
+    assert session.action_stack.priority_player_id == ai
+    assert session.pass_player_priority(ai)
+    session.drive_until_input()
+    assert session.current_turn_phase == game_engine.ETurnPhases.EndPhase
+
+
+def test_practice_phase_priority_normalizes_raw_and_typed_participants():
+    player = game_engine.UID.make(244, 79)
+    ai = game_engine.UID.make(3, 1000)
+    state = {
+        "player_self_stops": [game_engine.ETurnPhases.FirstMainPhase,
+                               game_engine.ETurnPhases.SecondMainPhase],
+        "player_opp_stops": [],
+    }
+
+    assert practice_phase_priority(
+        state, game_engine.ETurnPhases.FirstMainPhase,
+        active_player_id=int(player.uid64), player_id=player
+    ) is TurnPhasePlayers.ACTIVE
+    assert practice_phase_priority(
+        state, game_engine.ETurnPhases.SecondMainPhase,
+        active_player_id=player, player_id=int(player.uid64)
+    ) is TurnPhasePlayers.ACTIVE
+    assert practice_phase_priority(
+        state, game_engine.ETurnPhases.SecondMainPhase,
+        active_player_id=int(ai.uid64), player_id=player
+    ) is TurnPhasePlayers.ACTIVE
+    opponent_stop = dict(state, player_opp_stops=[
+        game_engine.ETurnPhases.SecondMainPhase])
+    assert practice_phase_priority(
+        opponent_stop, game_engine.ETurnPhases.SecondMainPhase,
+        active_player_id=int(ai.uid64), player_id=player
+    ) is TurnPhasePlayers.ALL
+
+
+def test_native_active_raw_uid_is_live_in_typed_participants():
+    from hconnect_server import _uid_in
+
+    player = game_engine.UID.make(PLAYER_UID_TYPE, 245)
+    ai = game_engine.UID.make(AI_UID_TYPE, 1000)
+    assert _uid_in(int(player.uid64), (player, ai))
+    assert not _uid_in(int(game_engine.UID.make(AI_UID_TYPE, 1001).uid64),
+                       (player, ai))
 
 
 def test_rules_session_rehydrates_non_main_native_phase_window():

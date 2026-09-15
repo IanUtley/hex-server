@@ -49,6 +49,27 @@ CORINTH_SHARD_GUIDS = (
 )
 
 
+def _rollback_shared_db_on_error(func):
+    """Release the legacy shared tournament connection on failed requests.
+
+    The normal commit remains at each operation's existing transaction
+    boundary.  This guard covers the gap where a caller has written through
+    ``_db`` and an exception occurs before that commit is reached.
+    """
+    def guarded(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except BaseException:
+            try:
+                _db.rollback()
+            except Exception:
+                pass
+            raise
+    guarded.__name__ = getattr(func, "__name__", "guarded")
+    guarded.__doc__ = getattr(func, "__doc__", None)
+    return guarded
+
+
 def _is_corinth_room(room):
     try:
         return bool(int(room.get("format") or 0) &
@@ -963,25 +984,34 @@ def resume_corinth_deck_construction(handler, room_id):
     if (not room or not signup or not _is_corinth_room(room) or
             str(room.get("status", "")).lower() == "closed" or live):
         return False
-    if signup.get("status") != "active":
-        from tournament_db import db_tournament_signup_set_status
-        db_tournament_signup_set_status(tid, player_uid, "active", conn=_db)
-        db_tournament_signup_set_async_state(
-            tid, player_uid, deck_ready=False, searching=False, conn=_db)
-        _db.commit()
+    needs_commit = False
+    try:
+        if signup.get("status") != "active":
+            from tournament_db import db_tournament_signup_set_status
+            db_tournament_signup_set_status(tid, player_uid, "active", conn=_db)
+            db_tournament_signup_set_async_state(
+                tid, player_uid, deck_ready=False, searching=False, conn=_db)
+            needs_commit = True
+        pool = db_tournament_pool(tid, player_uid, conn=_db)
+        if len(pool) != len(CORINTH_SHARD_GUIDS) * 4:
+            db_seed_tournament_pool(tid, player_uid, CORINTH_SHARD_GUIDS * 4,
+                                    conn=_db)
+            pool = db_tournament_pool(tid, player_uid, conn=_db)
+            needs_commit = True
+        if needs_commit:
+            _db.commit()
+    except BaseException:
+        _db.rollback()
+        raise
     with player_handler_lock:
         player_handlers[player_uid] = handler
-    pool = db_tournament_pool(tid, player_uid, conn=_db)
-    if len(pool) != len(CORINTH_SHARD_GUIDS) * 4:
-        db_seed_tournament_pool(tid, player_uid, CORINTH_SHARD_GUIDS * 4,
-                                conn=_db)
-        pool = db_tournament_pool(tid, player_uid, conn=_db)
     _push_corinth_deck_construction(handler, tid, pool)
     log_req(f">>> Auth reconnect: resumed Corinth tid={tid} "
             f"player={player_uid}")
     return True
 
 
+@_rollback_shared_db_on_error
 def start_waiting_room_game(room_id, handler_overrides=None,
                             match_player_uids=None):
     """Create a game session for a filled room or an async pair.

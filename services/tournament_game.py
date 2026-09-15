@@ -2830,6 +2830,40 @@ def pvp_push_main_phase_options(session, state):
     # the client's charge ability buttons light up (CanActivateAbility ->
     # State.CanUseAbility needs the champion in PlayerOptions.m_Targets).
     _pvp_add_champion_options(g, session, state, turn_pid, pl_t)
+    # Log the final option payload after every contributor has appended to it.
+    # The client replaces its PlayerOptions cache on each PlayerOptionList, so
+    # the server-side affordability count alone cannot show whether the
+    # champion option survived into the 3055 packet.
+    for event in g.events:
+        if not isinstance(event, _ge.PlayerOptionListSessionEventArgs):
+            continue
+        option_parts = []
+        for option in event.options:
+            if not isinstance(option, _ge.PlayerOptionSessionEventArgs):
+                continue
+            card_uid = getattr(getattr(option.card, "uid", None), "uid64", option.card)
+            instance_parts = []
+            for instance in option.instances:
+                if not isinstance(instance, _ge.OptionInstanceSessionEventArgs):
+                    continue
+                targets = getattr(instance, "target_instances", ()) or ()
+                target_count = len(targets)
+                cost_count = sum(
+                    1 for target in targets
+                    if isinstance(target, _ge.CostInstanceSessionEventArgs)
+                )
+                instance_parts.append(
+                    f"{str(instance.opt_id.guid)[:8]}"
+                    f"/targets={target_count}/costs={cost_count}"
+                )
+            option_parts.append(
+                f"card={card_uid}/state={int(option.state)}/"
+                f"instances=[{','.join(instance_parts)}]"
+            )
+        log_req(
+            f"    PvP final-options pid={event.player_id} "
+            f"options=[{' ; '.join(option_parts)}]"
+        )
     pkt = g.make_network_packet(pl_t)
     dw = encode_datawrapper(0, 3055, compress_gzip(encode_sync_event(pkt)), 1,
                              client_session_guid(h))

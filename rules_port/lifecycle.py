@@ -199,7 +199,9 @@ def is_self_stop(state, phase):
         game_engine.ETurnPhases.DeclareAttackPriorityWindow,
         game_engine.ETurnPhases.DeclareDefensePriorityWindow,
     }
-    return phase in always or phase in set(state.get("player_self_stops") or defaults)
+    configured = state.get("player_self_stops")
+    stops = defaults if configured is None else set(configured)
+    return phase in always or phase in stops
 
 
 def is_opp_stop(state, phase):
@@ -210,7 +212,69 @@ def is_opp_stop(state, phase):
         game_engine.ETurnPhases.DeclareAttackPriorityWindow,
         game_engine.ETurnPhases.DeclareDefensePriorityWindow,
     }
-    return phase in always or phase in set(state.get("player_opp_stops") or defaults)
+    configured = state.get("player_opp_stops")
+    stops = defaults if configured is None else set(configured)
+    return phase in always or phase in stops
+
+
+def practice_priority_players(state, phase, *, active_is_player):
+    """Return the native priority-window kind for a Practice/PvE phase.
+
+    Practice has one wire client and one server-driven participant, but it
+    still uses the same stop semantics as a two-player session.  When both
+    players stop in the active player's phase the native queue is ``ALL``:
+    the active player passes, then the opponent passes internally, and only
+    then may RulesPort advance the phase.
+    """
+    from .kernel import TurnPhasePlayers
+
+    if active_is_player:
+        self_stop = is_self_stop(state, phase)
+        opponent_stop = is_opp_stop(state, phase)
+        if self_stop and opponent_stop:
+            return TurnPhasePlayers.ALL
+        if self_stop:
+            return TurnPhasePlayers.ACTIVE
+        if opponent_stop:
+            return TurnPhasePlayers.ALL
+        return TurnPhasePlayers.NONE
+
+    # DeclareDefense is the one phase whose C# action deliberately queues the
+    # defending player rather than APNAP/all-player priority. All ordinary
+    # opponent stops use ALL so the AI can pass through its native queue.
+    if phase == game_engine.ETurnPhases.DeclareDefense:
+        return TurnPhasePlayers.DEFENDING
+    # The server AI still needs a native priority turn to play resources and
+    # cards.  A missing opponent stop only means the human should not be
+    # shown that AI window; it does not mean the AI phase is NONE.  With an
+    # opponent stop, ALL lets the AI act first and then exposes the human
+    # response window.
+    return (TurnPhasePlayers.ALL if is_opp_stop(state, phase)
+            else TurnPhasePlayers.ACTIVE)
+
+
+def practice_phase_priority(state, phase, *, active_player_id,
+                            player_id):
+    """Resolve Practice's native window policy across persisted UID forms.
+
+    Practice checkpoints historically persist participant IDs as uint64s,
+    while the live Game projection uses ``UID`` objects.  Keep that identity
+    normalization beside the stop matrix so the HConnect adapter cannot
+    accidentally classify the human's own phase as an opponent phase.
+    """
+    def uid_value(value):
+        try:
+            return int(getattr(value, "uid64", value))
+        except (TypeError, ValueError):
+            return None
+
+    active_value = uid_value(active_player_id)
+    player_value = uid_value(player_id)
+    active_is_player = (
+        active_value is not None and player_value is not None and
+        active_value == player_value)
+    return practice_priority_players(
+        state, phase, active_is_player=active_is_player)
 
 
 def ai_held_phase_context(state):
