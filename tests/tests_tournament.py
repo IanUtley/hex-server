@@ -35,6 +35,60 @@ def test_pvp_concede_ends_for_both_players():
         )
 
 
+def test_stale_pvp_disconnect_does_not_notify_current_handler():
+    class Session:
+        session_id = 42765
+        session_name = "tourney-7"
+        state = "started"
+
+    stale = object()
+    current = object()
+    previous_handlers = tournament_game.player_handlers
+    try:
+        tournament_game.player_handlers = {1001: current, 1002: object()}
+        with mock.patch("game_session.find_session_by_player",
+                        return_value=Session()), \
+                mock.patch.object(tournament_game, "pvp_load_state",
+                                  return_value={"pvp": True}), \
+                mock.patch.object(tournament_game, "db_game_session_pids",
+                                  return_value=[1001, 1002]):
+            assert not tournament_game.notify_pvp_player_disconnected(
+                1001, stale)
+    finally:
+        tournament_game.player_handlers = previous_handlers
+
+
+def test_pvp_disconnect_hands_priority_to_survivor():
+    class Session:
+        session_id = 42765
+        session_name = "tourney-7"
+        state = "started"
+
+    survivor_handler = object()
+    previous_handlers = tournament_game.player_handlers
+    state = {
+        "pvp": True,
+        "phase": 10,
+        "turn_pid": 1001,
+        "priority_pid": 1002,
+    }
+    try:
+        tournament_game.player_handlers = {1001: survivor_handler}
+        with mock.patch.object(tournament_game, "pvp_session_lock"), \
+                mock.patch.object(tournament_game, "pvp_load_state",
+                                   side_effect=lambda _session: state), \
+                mock.patch.object(tournament_game, "pvp_save_state"), \
+                mock.patch.object(tournament_game, "db_game_session_pids",
+                                   return_value=[1001, 1002]), \
+                mock.patch.object(tournament_game, "_send_pvp_packet"), \
+                mock.patch.object(tournament_game, "pvp_push_main_phase_options"):
+            assert tournament_game._pvp_reassign_priority_after_disconnect(
+                Session(), 1002, 1001)
+        assert state["priority_pid"] == 1001
+    finally:
+        tournament_game.player_handlers = previous_handlers
+
+
 def test_tournament_session_pids_ignore_non_player_card_owners():
     test_db = sqlite3.connect(":memory:")
     previous_db = db._db
@@ -106,13 +160,16 @@ def test_old_tournaments_close_and_remove_only_their_game_state():
                 id INTEGER PRIMARY KEY, status TEXT, session_id TEXT,
                 created_at TEXT
             );
-            CREATE TABLE game_sessions (session_id TEXT PRIMARY KEY);
+            CREATE TABLE game_sessions (session_id TEXT PRIMARY KEY, state TEXT);
             CREATE TABLE game_cards (session_id TEXT, card_uid INTEGER);
+            CREATE TABLE session_events (session_id TEXT);
+            CREATE TABLE game_replays (session_id TEXT, status TEXT);
             INSERT INTO tournaments VALUES
                 (10001, 'started', 'old-session', datetime('now', '-2 days')),
                 (10002, 'waiting', NULL, datetime('now', '-2 days')),
                 (10003, 'started', 'new-session', datetime('now'));
-            INSERT INTO game_sessions VALUES ('old-session'), ('new-session');
+            INSERT INTO game_sessions VALUES
+                ('old-session', 'started'), ('new-session', 'started');
             INSERT INTO game_cards VALUES ('old-session', 1), ('new-session', 2);
             """
         )

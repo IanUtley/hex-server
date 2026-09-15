@@ -27,6 +27,9 @@ def _is_secret_counter_guid(value):
     guid = _guid_text(value)
     if not guid:
         return False
+    # Underground hides the card identity, not its public Tunneling progress.
+    if guid == "def75520-0b8b-447f-8705-b34e71043890":
+        return False
     if guid in _SECRET_COUNTER_CACHE:
         return _SECRET_COUNTER_CACHE[guid]
     secret = False
@@ -49,7 +52,8 @@ class CardDef:
     def __init__(self, name: str, card_type: int = ECardTypes.Troop,
                  cost: int = 0, attack: int = 0, defense: int = 0,
                  shards: List[int] = None, abilities: List[ResourceId] = None,
-                 attributes: int = ECardAttributes.Unknown, lethal: bool = False):
+                 attributes: int = ECardAttributes.Unknown, lethal: bool = False,
+                 subtype: str = ""):
         self.name = name
         self.card_type = card_type
         self.cost = cost
@@ -59,6 +63,7 @@ class CardDef:
         self.abilities = abilities or []
         self.attributes = attributes
         self.lethal = bool(lethal)
+        self.subtype = str(subtype or "")
         self.escalation = 0
         self.spell_point_cost_mods: Dict[ResourceId, int] = {}
         self.uses_per_game_counts: Dict[ResourceId, int] = {}
@@ -67,7 +72,9 @@ class CardDef:
         self.related_cards: List[SessionCardId] = []
         self.gems = 0
         self.rage = 0
+        self.tunneling = 0
         self.int_attrs = {}
+        self.damage_shield = False
 
     @property
     def is_resource(self):
@@ -156,6 +163,10 @@ class Game:
         self.ai_resources_played: List[SessionCardId] = []
 
         self.card_defs: Dict[SessionCardId, CardDef] = {}
+        # Player-level visibility modifiers are keyed by the objective UID of
+        # the player who has the permission.  They are projected into
+        # PlayerUpdated and used to redact opposing hand CardUpdated events.
+        self._visibility_by_uid: Dict[int, Dict[str, int]] = {}
 
         self.events: List[SessionEventArgs] = []
 
@@ -291,6 +302,11 @@ class Game:
         ev.defense = kwargs.get('defense', cdef.defense if cdef else 0)
         ev.cost = kwargs.get('cost', cdef.cost if cdef else 0)
         ev.controller = player_uid
+        # Underground cards are face-down to the opposing player.  Keep the
+        # owner's full CardUpdated representation, then make_network_packet
+        # applies Nulling only to the opponent's copy.
+        if collection == ECardCollections.Underground:
+            ev._underground_owner_uid = player_uid
         ev.attributes = kwargs.get('attributes', cdef.attributes if cdef else ECardAttributes.Unknown)
         ev.lethal = kwargs.get('lethal', getattr(cdef, 'lethal', False) if cdef else False)
         ev.int_attrs = dict(kwargs.get('int_attrs', getattr(cdef, 'int_attrs', {}) or {}))
@@ -301,7 +317,30 @@ class Game:
         if orig_template:
             ev.orig_template = ResourceId.from_str(orig_template)
         ev.gems = kwargs.get('gems', cdef.gems if cdef else 0)
+        ev.sub_type = kwargs.get('sub_type', getattr(cdef, 'subtype', '')
+                                if cdef else '') or ''
+        thresholds = kwargs.get('thresholds')
+        if thresholds is not None:
+            ev.threshold_list = list(thresholds)
+            ev.thresholds = list(thresholds)
+            ev.threshold_values = [0, 0, 0, 0, 0, 0]
+            for shard in thresholds:
+                try:
+                    index = {
+                        ECardShards.Colorless: 0,
+                        ECardShards.Blood: 1,
+                        ECardShards.Ruby: 2,
+                        ECardShards.Sapphire: 3,
+                        ECardShards.Wild: 4,
+                        ECardShards.Diamond: 5,
+                    }.get(int(shard), None)
+                    if index is not None:
+                        ev.threshold_values[index] += 1
+                except (TypeError, ValueError):
+                    continue
         ev.rage = kwargs.get('rage', cdef.rage if cdef else 0)
+        ev.tunneling = kwargs.get(
+            'tunneling', getattr(cdef, 'tunneling', 0) if cdef else 0)
         ev.nulling = kwargs.get('nulling', False)
         related = kwargs.get('related_cards', None)
         if related is None and cdef and cdef.related_cards:
@@ -338,6 +377,9 @@ class Game:
             ev.abilities = list(cdef.abilities)
         if cdef and cdef.spell_point_cost_mods:
             ev.spell_point_cost_mods = dict(cdef.spell_point_cost_mods)
+        ev.damage_shield = kwargs.get(
+            'damage_shield', getattr(cdef, 'damage_shield', False)
+            if cdef else False)
         if cdef and cdef.escalation:
             ev.escalation = cdef.escalation
         if cdef and cdef.card_type == ECardTypes.Resource:
@@ -587,8 +629,15 @@ class Game:
                    else self.ai_champion_card_id)
         if cid:
             ev.champion_id = cid
+        ev.max_hand_size = int(getattr(self, "max_hand_size", 7))
         if deck_sleeve_id:
             ev.deck_sleeve_id = ResourceId.from_str(deck_sleeve_id)
+        visibility = self._visibility_by_uid.get(
+            int(getattr(player_uid, "uid64", player_uid) or 0), {})
+        ev.can_see_enemy_hand = bool(
+            int(visibility.get("CanSeeOpponentsHand", 0) or 0))
+        ev.can_see_enemy_underground = bool(
+            int(visibility.get("CanSeeUndergroundTroops", 0) or 0))
         self._push(ev)
 
     def push_show_tip(self, text: str, has_button: bool = False):
@@ -798,8 +847,14 @@ class Game:
         """
         if not self.events:
             return
-        last_ev = self.events[-1]
-        if not isinstance(last_ev, PlayerOptionListSessionEventArgs):
+        # State refresh events (notably CardUpdated for a champion) may be
+        # emitted between the option list and its metadata.  The option list
+        # is still the owning event; requiring it to be literally last drops
+        # the activation from the client-visible cache.
+        last_ev = next(
+            (event for event in reversed(self.events)
+             if isinstance(event, PlayerOptionListSessionEventArgs)), None)
+        if last_ev is None:
             return
         opt = self._make_event(PlayerOptionSessionEventArgs)
         opt.card = champ_scid
@@ -861,27 +916,109 @@ class Game:
             opt.instances.append(inst)
         last_ev.options.append(opt)
 
+    def get_or_add_card_option(self, option_list,
+                               card: SessionCardId, usage: int):
+        """Return the option for ``card`` and merge its usage flags.
+
+        The client stores one ``ECardUsage`` value per session card.  Several
+        server paths can contribute to that value (for example, a hand card
+        can be both normally playable and manually activatable for Tunnel),
+        so emitting two PlayerOption entries for the same card is incorrect:
+        the later entry overwrites the earlier one in the client's cache.
+        """
+        card_uid = card.uid.to_uint64()
+        for option in option_list.options:
+            existing = getattr(option, "card", None)
+            if (existing is not None and existing.uid.to_uint64() == card_uid):
+                option.state = int(option.state) | int(usage)
+                return option
+
+        option = self._make_event(PlayerOptionSessionEventArgs)
+        option.card = card
+        option.state = int(usage)
+        option_list.options.append(option)
+        return option
+
     def push_options(self, player_uid: UID, available_cards: List[SessionCardId]):
         ev = self._make_event(PlayerOptionListSessionEventArgs)
         ev.player_id = player_uid
         for cid in available_cards:
-            opt = self._make_event(PlayerOptionSessionEventArgs)
-            opt.card = cid
-            opt.state = ECardUsage.Play
+            opt = self.get_or_add_card_option(ev, cid, ECardUsage.Play)
             inst = self._make_event(OptionInstanceSessionEventArgs)
             inst.opt_id = ResourceId.from_str(PLAY_CARD_ABILITY_TEMPLATE_ID)
             opt.instances.append(inst)
-            ev.options.append(opt)
         self._push(ev)
 
     def make_network_packet(self, player_uid: UID) -> NetworkPacketSessionEventArgs:
+        # Transaction adapters may carry the decoded numeric UID; the wire
+        # encoder requires the typed UID object with ``to_uint64``.
+        if not isinstance(player_uid, UID):
+            player_uid = UID(int(getattr(player_uid, "uid64", player_uid)))
         pkt = NetworkPacketSessionEventArgs()
         pkt.session_id = self.session_id
         pkt.player_id = player_uid
         import copy
         visible_events = []
         player_value = getattr(player_uid, "uid64", player_uid)
+        # A visible-hand projection and the normal opponent-hand refresh can
+        # occur in the same checkpoint.  The latter is intentionally a
+        # face-down CardUpdated (it has an invalid template id), but applying
+        # it after the full projection would leave Unity with a visible,
+        # template-less card -- the black rectangle reported for
+        # Subterranean Spy.  Keep the UIDs for which this viewer already has
+        # a complete hand definition so that placeholder updates can be
+        # omitted below without affecting other viewers.
+        revealed_hand_uids = {
+            int(event.session_card_id.uid.uid64)
+            for event in self.events
+            if (isinstance(event, CardUpdatedSessionEventArgs)
+                and event.collection == ECardCollections.Hand
+                and getattr(event, "_hand_reveal_viewer_uid", None) is not None
+                and int(player_value or 0) == int(getattr(
+                    getattr(event, "_hand_reveal_viewer_uid"), "uid64",
+                    getattr(event, "_hand_reveal_viewer_uid")) or 0))
+        }
         for event in self.events:
+            reveal_viewer = getattr(event, "_hand_reveal_viewer_uid", None)
+            if (reveal_viewer is not None and
+                    int(player_value or 0) != int(getattr(
+                        reveal_viewer, "uid64", reveal_viewer) or 0)):
+                continue
+            underground_owner = getattr(event, "_underground_owner_uid", None)
+            filtered = None
+            if (underground_owner is not None and
+                    isinstance(event, CardUpdatedSessionEventArgs) and
+                    int(player_value or 0) != int(getattr(
+                        underground_owner, "uid64", underground_owner) or 0)):
+                # Do not reveal the template of an opponent's tunneled card.
+                # The UID and Underground collection remain public, while the
+                # client receives the same nulling form it uses for a hidden
+                # hand/deck card.
+                filtered = copy.copy(event)
+                filtered.ser = Serializer()
+                filtered.nulling = True
+            if (isinstance(event, CardUpdatedSessionEventArgs) and
+                    event.collection == ECardCollections.Hand and
+                    int(player_value or 0) != int(getattr(
+                        event.controller, "uid64", event.controller) or 0)):
+                visibility = self._visibility_by_uid.get(
+                    int(player_value or 0), {})
+                if int(visibility.get("CanSeeOpponentsHand", 0) or 0):
+                    # AI/legacy hand refreshes use nulling=True with an
+                    # invalid ResourceId.  If the full viewer-scoped update
+                    # is already queued, dropping this placeholder preserves
+                    # the card definition while still allowing later full
+                    # updates (state/attributes) through.
+                    card_uid = int(event.session_card_id.uid.uid64)
+                    card_guid = getattr(getattr(event, "card_id", None),
+                                        "guid", None)
+                    if (event.nulling and card_uid in revealed_hand_uids
+                            and getattr(card_guid, "int", 0) == 0):
+                        continue
+                    if filtered is None:
+                        filtered = copy.copy(event)
+                        filtered.ser = Serializer()
+                    filtered.nulling = False
             private_to = getattr(event, "_private_player_uid", None)
             if private_to is not None:
                 private_value = getattr(private_to, "uid64", private_to)
@@ -897,8 +1034,9 @@ class Game:
                 # separate class-54 value-change event is filtered entirely
                 # above, matching the client's private counter dispatch.
                 if isinstance(event, CardUpdatedSessionEventArgs):
-                    filtered = copy.copy(event)
-                    filtered.ser = Serializer()
+                    if filtered is None:
+                        filtered = copy.copy(event)
+                        filtered.ser = Serializer()
                     pairs = [
                         (template, count)
                         for template, count in zip(
@@ -910,8 +1048,21 @@ class Game:
                     filtered.counter_counts = [p[1] for p in pairs]
                     visible_events.append(filtered)
                     continue
-            visible_events.append(event)
+            visible_events.append(filtered or event)
         for event in visible_events:
+            # RulesPort emits numeric service-player ids internally, while
+            # the legacy event serializers require typed UID instances.  The
+            # boundary is the single safe place to normalize every event
+            # field consumed by ``Serializer.add_uid`` (including combat's
+            # attacking_player_id and ability controller).
+            for name, value in vars(event).items():
+                if (isinstance(value, int) and
+                        (name == "player_id" or name.endswith("_player_id")
+                         or name == "controller")):
+                    try:
+                        setattr(event, name, UID(int(value)))
+                    except (TypeError, ValueError):
+                        pass
             pkt.add_event(event)
         if event_logger is not None:
             try:

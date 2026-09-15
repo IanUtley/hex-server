@@ -13,6 +13,8 @@ card resolves without blowing up.  Failures are printed and written to
 ``/tmp/set1_sweep_failures.txt`` for triage.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -46,6 +48,26 @@ def _set1_abilities(db):
     rows = db.execute(
         "SELECT abilities_json, name FROM card_templates WHERE set_guid=?",
         (SET1,)).fetchall()
+    for abjson, name in rows:
+        if not abjson:
+            continue
+        try:
+            for ag in json.loads(abjson):
+                if isinstance(ag, str) and "-" in ag:
+                    out.setdefault(ag.lower(), name)
+        except Exception:
+            continue
+    return out
+
+
+def _catalog_abilities(db):
+    """{ability_guid: representative card name} for the full card catalog."""
+    out = {}
+    rows = db.execute(
+        "SELECT abilities_json, name FROM card_templates "
+        "WHERE LOWER(COALESCE(card_type,'')) NOT IN "
+        "('resource', 'resource card')"
+    ).fetchall()
     for abjson, name in rows:
         if not abjson:
             continue
@@ -178,7 +200,11 @@ def _resolve_one(db, handler, game, session, pl_t, ai_t, bstate, ability_guid,
     bstate["resolving_source_uid"] = src_uid
     if trig:
         # Triggered: fire the event, then drain the chain like the server.
-        _fire_event(db, handler, game, session, pl_t, ai_t, bstate, trig, src_uid)
+        # Records stores the fully qualified type name, while the fixture
+        # dispatcher accepts the event class name used by the server logs.
+        event_class = str(trig).rsplit(".", 1)[-1]
+        _fire_event(db, handler, game, session, pl_t, ai_t, bstate,
+                    event_class, src_uid)
         for item in list(bstate.get("stack") or []):
             bstate["stack"].remove(item)
             resolve_stack_trigger(handler, game, session, db, pl_t, ai_t,
@@ -193,7 +219,7 @@ def _resolve_one(db, handler, game, session, pl_t, ai_t, bstate, ability_guid,
     return "bom"
 
 
-def _run_sweep():
+def _run_sweep(all_cards=False):
     fd, sandbox_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     shutil.copy(SRC, sandbox_path)
@@ -202,7 +228,7 @@ def _run_sweep():
     session = SessionStub()
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
-    abilities = _set1_abilities(db)
+    abilities = _catalog_abilities(db) if all_cards else _set1_abilities(db)
     plain = _plain_troop(db)
     fails = []
     passed = 0
@@ -218,11 +244,12 @@ def _run_sweep():
                 game = game_engine.Game(1, pl_t, ai_t)
                 bstate = {"player_health": 20, "ai_health": 20,
                           "turn_number": 1}
-                _resolve_one(db, handler, game, session, pl_t, ai_t, bstate,
-                             ag, src_uid, tpl)
-                # Serialize every event — catches state=None / bad card types
-                # on the wire.
-                game.make_network_packet(pl_t)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _resolve_one(db, handler, game, session, pl_t, ai_t,
+                                 bstate, ag, src_uid, tpl)
+                    # Serialize every event — catches state=None / bad card
+                    # types on the wire.
+                    game.make_network_packet(pl_t)
                 bstate.pop("resolving_owner_id", None)
                 bstate.pop("resolving_source_uid", None)
                 passed += 1
@@ -237,14 +264,15 @@ def _run_sweep():
             os.remove(sandbox_path)
         except OSError:
             pass
-    print(f"Set 1 sweep: {passed}/{len(abilities)} abilities resolved cleanly")
+    label = "card catalog" if all_cards else "Set 1"
+    print(f"{label} sweep: {passed}/{len(abilities)} abilities resolved cleanly")
     if fails:
         print(f"FAILED ({len(fails)}):")
         for ag, name in fails:
             print(f"  {name}  {ag}")
         print(f"details -> {OUT}")
     else:
-        print("All Set 1 abilities resolved and serialized without crashing.")
+        print(f"All {label} abilities resolved and serialized without crashing.")
     return len(fails)
 
 
@@ -253,4 +281,9 @@ if __name__ == "__main__":
         os.remove(OUT)
     except OSError:
         pass
-    sys.exit(0 if _run_sweep() == 0 else 0)  # sweep reports; doesn't fail CI
+    all_cards = "--all" in sys.argv[1:]
+    failures = _run_sweep(all_cards=all_cards)
+    # The historical Set 1 sweep is report-only for compatibility with the
+    # aggregate runner.  Explicit full-catalog audits are strict so they can
+    # be used as a release gate.
+    sys.exit(failures if all_cards else 0)

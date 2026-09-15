@@ -9,16 +9,121 @@ from datetime import datetime, timezone
 from binascii import unhexlify
 
 from db import _db, log_req  # _db retained for legacy fixture injection
-from profile_db import db_get_deck_by_id
+from profile_db import db_get_deck_by_id, db_send_email
 from tournament_db import (
     db_tournament_by_id, db_tournament_players_name_map,
     db_tournament_signups_by_tournament, db_tournament_completed_for_player,
     db_tournament_signup_by_player, db_tournament_matches,
     db_tournament_match_start, db_tournament_match_result,
+    db_tournament_discard_match,
     db_tournament_set_status, db_tournament_room_for_game,
-    db_seed_tournament_game_deck, db_insert_tournament_champion_card)
+    db_seed_tournament_game_deck, db_insert_tournament_champion_card,
+    db_tournament_pool_replace, db_tournament_pool_delete,
+    db_seed_tournament_pool, db_tournament_pool,
+    db_tournament_signup_set_async_state, db_tournament_async_ready_players,
+    db_tournament_player_score, db_tournament_finalize_player_run)
+from pvp_db import db_game_deck_cards, db_delete_game_session
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, client_session_guid
 import gamemodes.tournament_server as tournament_server
+from domain.enums import ESessionFlags, ETournamentFormats
+from domain.constants import (
+    AUTHORITATIVE_SESSION_UID_TYPE, SERVICE_GAME_SESSION_UID_TYPE,
+    SERVICE_PLAYER_UID_TYPE, TOURNAMENT_DECK_CONSTRUCTION_DATA_TYPE,
+    TOURNAMENT_GAME_DATA_TYPE, TOURNAMENT_INFO_DATA_TYPE,
+    TOURNAMENT_SESSION_START_DATA_TYPE,
+)
+
+CORINTH_MERRY_MELEE_MODE = "corinth_merry_melee"
+CORINTH_CHAMPION_GUID = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+CORINTH_RUN_WINS = 5
+CORINTH_RUN_LOSSES = 3
+# Corinth starts with four of each basic shard in the main deck.  Additional
+# cards enter the deck later through Corinth's charge power; they are not a
+# sideboard/deck-construction pool.
+CORINTH_SHARD_GUIDS = (
+    "b253393b-fdde-47c4-9288-4b8efb0698b1",
+    "1f897193-72a1-487e-a6bd-f3f6e7897c47",
+    "cd41bd00-7585-4762-a721-6163bdaee3c3",
+    "8554b2c8-cf48-467d-bf55-ab45e306ce43",
+    "6865d8d5-bd2e-43c6-8a68-53d1bde6bc28",
+)
+
+
+def _is_corinth_room(room):
+    try:
+        return bool(int(room.get("format") or 0) &
+                    int(ETournamentFormats.Iconoclast))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _is_async_room(room):
+    return str(room.get("style", "")).lower() in {"async", "asynchronous"}
+
+
+def tournament_id_from_session_name(session_name):
+    """Extract the event ID from ``tourney-<event>-<match>`` names."""
+    try:
+        parts = str(session_name or "").split("-")
+        if len(parts) < 2 or parts[0] != "tourney":
+            return 0
+        return int(parts[1])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _retire_finished_async_runs(tid, player_uids):
+    """Retire players who reached the Merry Melee run limit."""
+    retire = []
+    for uid in {int(value) for value in player_uids}:
+        wins, losses = db_tournament_player_score(tid, uid)
+        if wins >= CORINTH_RUN_WINS or losses >= CORINTH_RUN_LOSSES:
+            result = db_tournament_finalize_player_run(tid, uid, "completed")
+            if result:
+                retire.append(uid)
+                _email_tournament_rewards(db_tournament_by_id(tid), result)
+    return retire
+
+
+def retire_completed_corinth_runs():
+    """Retire Merry Melee runs that reached 5 wins or 3 losses.
+
+    This is deliberately safe to call from the scheduler every minute:
+    ``db_tournament_finalize_player_run`` is idempotent once the live run has
+    been removed, and reward mail is created only for the successful final
+    run returned by that operation.
+    """
+    room = db_tournament_by_id(40004)
+    if not room or not _is_corinth_room(room) or not _is_async_room(room):
+        return 0
+    candidates = db_tournament_signups_by_tournament(40004, status="active")
+    checked = 0
+    for signup in candidates:
+        pid = int(signup["player_uid"])
+        wins, losses = db_tournament_player_score(40004, pid)
+        if wins < CORINTH_RUN_WINS and losses < CORINTH_RUN_LOSSES:
+            continue
+        # A client can reach the run limit while an abandoned setup/session
+        # row is still present. Remove that unfinished assignment before
+        # retiring the run, otherwise the remaining player is permanently
+        # excluded from the async matcher by the live-match guard.
+        for match in db_tournament_matches(40004):
+            if (match.get("state") == "Complete" or pid not in (
+                    int(match.get("player1_uid") or 0),
+                    int(match.get("player2_uid") or 0))):
+                continue
+            db_tournament_discard_match(
+                40004, match.get("session_id"), conn=_db)
+            db_delete_game_session(match.get("session_id"), conn=_db)
+            _db.commit()
+            log_req(f"  Corinth run retirement removed unfinished match "
+                    f"session={match.get('session_id')}")
+        retired = _retire_finished_async_runs(40004, (pid,))
+        if retired:
+            checked += len(retired)
+            log_req(f"  Corinth run retired by scheduler: pid={pid} "
+                    f"score={wins}-{losses}")
+    return checked
 
 # ── shared tournament state ──────────────────────────────────────────
 # Keep these objects alive across ``importlib.reload``.  The main server
@@ -40,7 +145,7 @@ def _encode_enter_tournament_error(comp, session_id, tournament_id, error_name):
          ("Error", "enum1",
           (f"Game.Shared.Network.Tournaments.EEnterTournamentError.{error_name}", 0))])
     body = compress_gzip(inner) if comp else inner
-    return encode_datawrapper(0, 25029, body, comp, session_id)
+    return encode_datawrapper(0, TOURNAMENT_GAME_DATA_TYPE, body, comp, session_id)
 
 
 def _make_deck_data(deck_id):
@@ -72,17 +177,71 @@ def _tournament_session_flags(room):
     exactly one format flag from the tournament format bitmask.
     """
     format_bits = _tournament_format_bitmask(room)
-    flags = 8192  # Game.Shared.ESessionFlags.IsDuelingPit
-    if format_bits & 16:  # Game.Shared.Tournaments.ETournamentFormats.Immortal
-        flags |= 1024  # Game.Shared.ESessionFlags.IsImmortalPvP
+    flags = ESessionFlags.IsDuelingPit
+    if format_bits & ETournamentFormats.Iconoclast:
+        flags |= ESessionFlags.IsIconoclast
+    elif format_bits & ETournamentFormats.Immortal:
+        flags |= ESessionFlags.IsImmortalPvP
     else:
-        flags |= 4096  # Game.Shared.ESessionFlags.IsStandardPvP
+        flags |= ESessionFlags.IsStandardPvP
     return flags
 
 
 def _tournament_style_bitmask(room):
     style_str = (room.get("style") or "sw").lower()
-    return {"se": 0, "sw": 1}.get(style_str, 0)
+    return {"se": 0, "sw": 1, "async": 2, "asynchronous": 2}.get(
+        style_str, 0)
+
+
+def _tournament_rewards(room):
+    """Load and validate the configured native tournament reward JSON."""
+    if not room or not room.get("type_id"):
+        return {"tournamentRewards": []}
+    columns = {row[1] for row in _db.execute(
+        "PRAGMA table_info(tournament_types)")}
+    if "rewards_json" not in columns:
+        return {"tournamentRewards": []}
+    row = _db.execute(
+        "SELECT rewards_json FROM tournament_types WHERE id=?",
+        (int(room["type_id"]),),
+    ).fetchone()
+    try:
+        value = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    rewards = value.get("tournamentRewards")
+    return {"tournamentRewards": rewards if isinstance(rewards, list) else []}
+
+
+def _email_tournament_rewards(room, result):
+    """Create one claimable mail item for a reward-eligible run."""
+    if not result or int(result.get("wins", 0)) < CORINTH_RUN_WINS:
+        return
+    attachments = []
+    for group in _tournament_rewards(room).get("tournamentRewards", []):
+        if (not group.get("basedOnPoints") or
+                int(group.get("place", 0)) != int(result["wins"])):
+            continue
+        for reward in group.get("rewards", []):
+            prize = reward.get("prizeResource")
+            if isinstance(prize, dict):
+                prize = prize.get("m_Guid")
+            if int(reward.get("type", -1)) == 3 and prize:
+                attachments.append({
+                    "type": "CARD",
+                    "template": str(prize),
+                    "quantity": max(1, int(reward.get("quantity", 1) or 1)),
+                })
+    if attachments:
+        db_send_email(
+            int(result["player_uid"]),
+            "Rewards for participating in tournament",
+            "Thank you for participating in the tournament. Claim the attached "
+            "rewards from this message.",
+            sender="SYSTEM", attachments=attachments,
+        )
 
 
 _TOURNAMENT_OPPONENT_WIN_FLOOR = 1.0 / 3.0
@@ -98,11 +257,21 @@ def build_tournament_desc_json(room):
     players = db_tournament_players_name_map(room["id"])
     all_signups = db_tournament_signups_by_tournament(room["id"], status=None)
     matches = db_tournament_matches(room["id"])
-    max_p = room.get("max_players", 2)
-    min_p = room.get("min_players", max_p)
+    async_event = _is_async_room(room)
+    # Async events are persistent catalog entries.  Their database
+    # max_players=0 means "no concurrent room cap", not zero lobby seats.
+    # The client uses maxPlayers for OPEN/FULL rendering, so expose the
+    # single-player deck-building entry point here.
+    max_p = 1 if async_event else room.get("max_players", 2)
+    min_p = 1 if async_event else room.get("min_players", max_p)
     complete = _tournament_is_complete(room, matches)
     if complete:
         tournament_state = "Complete"
+    elif async_event:
+        # A persistent async event remains open while individual runs are
+        # playing.  Match history belongs in the detail view, not in the
+        # lobby's registration state.
+        tournament_state = "WaitForStart"
     elif str(room.get("status", "")).lower() == "started" or matches:
         tournament_state = "PlayGames"
     else:
@@ -116,8 +285,13 @@ def build_tournament_desc_json(room):
         # tournament descriptor or double-clicking it opens the entry/fee UI.
         "roomType": "waitRoom" if max_p > 1 and not complete else "",
         "id": room["id"],
-        "name": f"{room.get('type_name', '')} #{room['id']}",
-        "numPlayers": len(all_signups) if all_signups else len(players),
+        # Async events are singleton catalog entries.  The client uses this
+        # field as a localization key/display name and does not append a
+        # process suffix for asynchronous styles.
+        "name": (room.get("type_name", "") if _is_async_room(room)
+                 else f"{room.get('type_name', '')} #{room['id']}"),
+        "numPlayers": 0 if async_event else (
+            len(all_signups) if all_signups else len(players)),
         "maxPlayers": max_p,
         "minPlayers": min_p,
         "maxRounds": room.get("games_count", 1),
@@ -128,7 +302,7 @@ def build_tournament_desc_json(room):
         "state": tournament_state,
         "currentRound": current_round,
         "requiredTOS": 0,
-        "rewards": {"tournamentRewards": []},
+        "rewards": _tournament_rewards(room),
         "fees": {},
     }
 
@@ -186,6 +360,10 @@ def build_tournament_info_data(base_room):
     for match in matches:
         p1 = int(match["player1_uid"])
         p2 = int(match["player2_uid"])
+        p1_live = bool(int(match.get("player1_live", 1) or 0))
+        p2_live = bool(int(match.get("player2_live", 1) or 0))
+        async_tournament = str(room.get("style", "")).lower() in {
+            "async", "asynchronous"}
         stats.setdefault(p1, {
             "wins": 0, "losses": 0, "games_won": 0,
             "games_played": 0, "state": "WaitingForNewRound",
@@ -200,8 +378,9 @@ def build_tournament_info_data(base_room):
             "elimination_reason": _TPE_NOT_ELIMINATED,
             "elimination_round": 0,
         })
-        if p1 != p2:
+        if p1 != p2 and p1_live:
             stats[p1]["opponents"].add(p2)
+        if p1 != p2 and p2_live:
             stats[p2]["opponents"].add(p1)
         game_wins = {p1: 0, p2: 0}
         for winner_key in ("game1_winner", "game2_winner", "game3_winner"):
@@ -210,9 +389,11 @@ def build_tournament_info_data(base_room):
                 continue
             loser = p2 if winner == p1 else p1
             game_wins[winner] += 1
-            stats[winner]["games_won"] += 1
-            stats[winner]["games_played"] += 1
-            stats[loser]["games_played"] += 1
+            if (winner == p1 and p1_live) or (winner == p2 and p2_live):
+                stats[winner]["games_won"] += 1
+                stats[winner]["games_played"] += 1
+            if (loser == p1 and p1_live) or (loser == p2 and p2_live):
+                stats[loser]["games_played"] += 1
         if match.get("state") == "Complete":
             if game_wins[p1] > game_wins[p2]:
                 match_winner, match_loser = p1, p2
@@ -224,15 +405,18 @@ def build_tournament_info_data(base_room):
                 if match_winner not in (p1, p2):
                     match_loser = 0
             if match_loser:
-                stats[match_winner]["wins"] += 1
-                stats[match_loser]["losses"] += 1
-                stats[match_loser]["state"] = "Eliminated"
-                stats[match_loser]["elimination_reason"] = (
-                    _TPE_LOST_MATCH_SINGLE_ELIM
-                )
-                stats[match_loser]["elimination_round"] = int(
-                    match.get("round_id") or 0
-                )
+                if ((match_winner == p1 and p1_live) or
+                        (match_winner == p2 and p2_live)):
+                    stats[match_winner]["wins"] += 1
+                if ((match_loser == p1 and p1_live) or
+                        (match_loser == p2 and p2_live)):
+                    stats[match_loser]["losses"] += 1
+                    if not async_tournament:
+                        stats[match_loser]["state"] = "Eliminated"
+                        stats[match_loser]["elimination_reason"] = (
+                            _TPE_LOST_MATCH_SINGLE_ELIM)
+                        stats[match_loser]["elimination_round"] = int(
+                            match.get("round_id") or 0)
 
     if matches:
         for player in stats.values():
@@ -374,6 +558,11 @@ def _tournament_is_complete(room, matches):
     """Return whether the room's configured rounds have all completed."""
     if str(room.get("status", "")).lower() in {"complete", "closed"}:
         return True
+    # Merry Melee/gauntlet is a persistent event.  Individual player runs
+    # retire independently; the tournament itself ends only when expiry or an
+    # explicit administrative close changes the room status.
+    if str(room.get("style", "")).lower() in {"async", "asynchronous"}:
+        return False
     if not matches or any(m.get("state") != "Complete" for m in matches):
         return False
     expected_rounds = max(1, int(room.get("games_count") or 1))
@@ -405,7 +594,8 @@ def _push_tournament_status_event(handler, tournament_id, complete):
         ]))],
     )
     info_dw = encode_datawrapper(
-        0, 25058, compress_gzip(info_inner), 1, client_session_guid(handler))
+        0, TOURNAMENT_INFO_DATA_TYPE, compress_gzip(info_inner), 1,
+        client_session_guid(handler))
     handler.scnt += 1
     handler.send({
         "issuer": _SERVICE_MAIL_UID,
@@ -466,14 +656,39 @@ def _publish_tournament_result(tid, signups, finished, handler_overrides=None):
                     f"pid={player_uid}: {exc}")
 
 
+def _return_async_players_to_deckbuilder(tid, player_uids, retired=()):
+    """Open the next Corinth deck build for players with runs remaining."""
+    room = db_tournament_by_id(tid)
+    if not room or not _is_corinth_room(room) or not _is_async_room(room):
+        return
+    retired = {int(uid) for uid in retired}
+    signups = {
+        int(signup["player_uid"]): signup
+        for signup in db_tournament_signups_by_tournament(tid, status=None)
+    }
+    for player_uid in {int(uid) for uid in player_uids}:
+        signup = signups.get(player_uid)
+        handler = player_handlers.get(player_uid)
+        if (not signup or signup.get("status") != "active" or
+                player_uid in retired or not handler):
+            continue
+        pool = db_tournament_pool(tid, player_uid, conn=_db)
+        if len(pool) != len(CORINTH_SHARD_GUIDS) * 4:
+            db_seed_tournament_pool(
+                tid, player_uid, CORINTH_SHARD_GUIDS * 4, conn=_db)
+            pool = db_tournament_pool(tid, player_uid, conn=_db)
+        _push_corinth_deck_construction(handler, tid, pool)
+        log_req(f"  Corinth async result: returned pid={player_uid} "
+                f"to deck construction")
+
+
 def record_tournament_game_result(session, winner_pid, loser_pid):
-    """Persist a completed tournament PvP game and publish the lobby update."""
+    """Persist a completed game and advance active async players to deck build."""
     session_name = str(getattr(session, "session_name", "") or "")
     if not session_name.startswith("tourney-"):
         return False
-    try:
-        tid = int(session_name[len("tourney-"):])
-    except ValueError:
+    tid = tournament_id_from_session_name(session_name)
+    if not tid:
         return False
     room = db_tournament_by_id(tid)
     if not room:
@@ -495,12 +710,21 @@ def record_tournament_game_result(session, winner_pid, loser_pid):
     if not match_id:
         return False
 
+    retired = (_retire_finished_async_runs(
+        tid, (int(winner_pid), int(loser_pid)))
+        if _is_async_room(room) else [])
+
     matches = db_tournament_matches(tid)
     finished = _tournament_is_complete(room, matches)
     db_tournament_set_status(tid, "complete" if finished else "started")
+    if finished:
+        db_tournament_pool_delete(tid)
     _publish_tournament_result(tid, signups, finished)
+    if not finished:
+        _return_async_players_to_deckbuilder(
+            tid, (winner_pid, loser_pid), retired=retired)
     log_req(f"  Tournament {tid}: recorded match {match_id}, "
-            f"winner={winner_pid}, complete={finished}")
+            f"winner={winner_pid}, complete={finished}, retired={retired}")
     return True
 
 
@@ -545,14 +769,79 @@ def record_tournament_forfeit(tournament_id, loser_pid, handler=None):
     )
     if not match_id:
         return False
+    retired = (_retire_finished_async_runs(
+        tid, (winner_pid, loser_pid))
+        if _is_async_room(room) else [])
     signups = db_tournament_signups_by_tournament(tid, status=None)
     finished = _tournament_is_complete(room, db_tournament_matches(tid))
     db_tournament_set_status(tid, "complete" if finished else "started")
+    if finished:
+        db_tournament_pool_delete(tid)
     _publish_tournament_result(tid, signups, finished,
                                {loser_pid: handler} if handler else None)
+    if not finished:
+        # A forfeit is still a completed async game.  Keep the persistent
+        # Corinth event in the lobby, but return both eligible players to the
+        # next deck-construction screen just like a normally resolved game.
+        _return_async_players_to_deckbuilder(
+            tid, (winner_pid, loser_pid), retired=retired)
     log_req(f"  Tournament {tid}: recorded forfeit match {match_id}, "
-            f"winner={winner_pid}, loser={loser_pid}, complete={finished}")
+            f"winner={winner_pid}, loser={loser_pid}, complete={finished}, "
+            f"retired={retired}")
     return True
+
+
+def recover_stale_tournament_matches(age_seconds=3600):
+    """Resolve old incomplete tournament games before session cleanup.
+
+    A disconnected client can leave a tournament match in ``PlayGame`` while
+    the durable PvP checkpoint still identifies the player who held priority.
+    That player is the timeout loser; the other player receives the win.  The
+    normal forfeit/result path is deliberately reused so match state, scores,
+    run-limit retirement, rewards, and the next async deck build stay in sync.
+    """
+    try:
+        seconds = max(1, int(age_seconds))
+    except (TypeError, ValueError):
+        seconds = 3600
+    cutoff_ticks = _dotnet_ticks_now() - seconds * 10_000_000
+    rows = _db.execute(
+        "SELECT tm.tournament_id, tm.session_id, tm.player1_uid, "
+        "tm.player2_uid, tm.start_time, gs.turn_order_json "
+        "FROM tournament_matches tm "
+        "JOIN game_sessions gs ON CAST(gs.session_id AS TEXT)="
+        "CAST(tm.session_id AS TEXT) "
+        "WHERE tm.state<>'Complete' AND tm.start_time > 0 "
+        "AND tm.start_time <= ?",
+        (cutoff_ticks,),
+    ).fetchall()
+    recovered = 0
+    for row in rows:
+        tid, session_id, player1, player2, _start_time, state_json = row
+        try:
+            state = json.loads(state_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = {}
+        try:
+            priority_pid = int(state.get("priority_pid") or 0)
+        except (TypeError, ValueError):
+            priority_pid = 0
+        players = {int(player1), int(player2)}
+        if priority_pid not in players:
+            log_req(
+                f"  Stale tournament match skipped: tid={tid} "
+                f"session={session_id} has no valid priority player")
+            continue
+        room = db_tournament_by_id(tid)
+        if not room:
+            continue
+        if record_tournament_forfeit(int(tid), priority_pid):
+            recovered += 1
+            log_req(
+                f"  Recovered stale tournament match: tid={tid} "
+                f"session={session_id} loser={priority_pid} "
+                f"winner={next(pid for pid in players if pid != priority_pid)}")
+    return recovered
 
 
 def push_tournament_room_data(handler, room, display_name,
@@ -618,8 +907,88 @@ def push_tournament_room_data(handler, room, display_name,
 _SERVICE_MAIL_UID = "0.0.0.0.ServiceTournaments.252"
 
 
-def start_waiting_room_game(room_id, handler_overrides=None):
-    """Create a game session when a room fills up.
+def _push_corinth_deck_construction(handler, room_id, pool_cards):
+    """Put one async Corinth entrant directly into deck construction."""
+    # Deck construction is also the start of a new async run. Refresh the
+    # rich tournament-info projection first so the client replaces any cached
+    # score from the retired run with the new 0-0 live-run state.
+    try:
+        push_tournament_room_data(
+            handler, f"tourn:tournament-{int(room_id)}_full", "")
+    except Exception as exc:
+        log_req(f"    WARN: Corinth score refresh failed: {exc}")
+    pool = [(str(template_guid), "", int(card_uid), 0, 0, 0)
+            for card_uid, template_guid, _location in pool_cards]
+    inner = encode_objfmt_response(
+        ["Game.Shared.Network.Tournaments.DeckConstructionStartedEventArgs",
+         "Game.Shared.Tournaments.TournamentInfo",
+         "Game.Shared.Domain.deck_bits"],
+        [("TournamentID", "ulong", int(room_id)),
+         ("TournamentInfo", "struct",
+          ("Game.Shared.Tournaments.TournamentInfo",
+           [("TournamentID", "ulong", int(room_id))])),
+         ("my_Deck", "deckbits", ("corinth", "Corinth", 0, 0,
+                                    {"main": pool, "sideboard": []},
+                                    CORINTH_CHAMPION_GUID)),
+         ("timeForSideboarding", "long", 0),
+         ("PlayerID", "ulong", int(handler.client_reck_id or 0))])
+    body = compress_gzip(inner)
+    dw = encode_datawrapper(
+        0, TOURNAMENT_DECK_CONSTRUCTION_DATA_TYPE, body, 1,
+        client_session_guid(handler))
+    handler.scnt += 1
+    handler.send({
+        "issuer": _SERVICE_MAIL_UID, "target": "ServicePlayer",
+        "instance": handler.sid or "0", "reqid": 0, "c": 0,
+        "conh": 0, "sid": handler.sid,
+    }, dw)
+    log_req(f"    Pushed Corinth deck construction tid={room_id} "
+            f"player={handler.client_reck_id}")
+
+
+def resume_corinth_deck_construction(handler, room_id):
+    """Resume a Corinth deck build after a reconnect has authenticated.
+
+    Tournament reconnect requests can arrive before the auth response on a
+    freshly recreated client socket.  In that window the handler still has
+    its placeholder ReckID, so the reconnect must be retried after auth.
+    """
+    tid = int(room_id or 0)
+    player_uid = int(getattr(handler, "client_reck_id", 0) or 0)
+    room = db_tournament_room_for_game(tid, conn=_db) if tid else None
+    signup = (db_tournament_signup_by_player(tid, player_uid, conn=_db)
+              if tid and player_uid else None)
+    live = bool(signup and db_tournament_player_run_live(
+        tid, player_uid, conn=_db))
+    if (not room or not signup or not _is_corinth_room(room) or
+            str(room.get("status", "")).lower() == "closed" or live):
+        return False
+    if signup.get("status") != "active":
+        from tournament_db import db_tournament_signup_set_status
+        db_tournament_signup_set_status(tid, player_uid, "active", conn=_db)
+        db_tournament_signup_set_async_state(
+            tid, player_uid, deck_ready=False, searching=False, conn=_db)
+        _db.commit()
+    with player_handler_lock:
+        player_handlers[player_uid] = handler
+    pool = db_tournament_pool(tid, player_uid, conn=_db)
+    if len(pool) != len(CORINTH_SHARD_GUIDS) * 4:
+        db_seed_tournament_pool(tid, player_uid, CORINTH_SHARD_GUIDS * 4,
+                                conn=_db)
+        pool = db_tournament_pool(tid, player_uid, conn=_db)
+    _push_corinth_deck_construction(handler, tid, pool)
+    log_req(f">>> Auth reconnect: resumed Corinth tid={tid} "
+            f"player={player_uid}")
+    return True
+
+
+def start_waiting_room_game(room_id, handler_overrides=None,
+                            match_player_uids=None):
+    """Create a game session for a filled room or an async pair.
+
+    ``match_player_uids`` is deliberately separate from the tournament's
+    registered player list: persistent async events can contain many entrants
+    while every battle session still contains exactly two players.
 
     ``EnterTournament`` runs on the joining client's request thread.  Keep a
     snapshot of the handlers selected for this room while that request is
@@ -633,7 +1002,8 @@ def start_waiting_room_game(room_id, handler_overrides=None):
         log_req(f"  Room {room_id}: not found")
         return
     players = json.loads(room.get("players_json", "{}"))
-    pids = list(players.keys())
+    pids = ([str(int(pid)) for pid in match_player_uids]
+            if match_player_uids is not None else list(players.keys()))
     room_handlers = dict(handler_overrides or {})
     with player_handler_lock:
         for puid_str in pids:
@@ -641,36 +1011,72 @@ def start_waiting_room_game(room_id, handler_overrides=None):
             room_handlers.setdefault(puid, player_handlers.get(puid))
     log_req(f"  Room {room_id}: start handlers="
             f"{[(int(pid), bool(room_handlers.get(int(pid)))) for pid in pids]}")
-    session_name = f"tourney-{room_id}"
-    inst = gs._next_instance()
-    sid_value = encoder.make_uid(13, inst)          # AuthoritativeSession (matches live game)
-    srv_value = encoder.make_uid(246, inst * 7)
+    # Use the HConnect connection for instance allocation as well as the
+    # session/match writes below.  Opening a second connection here can block
+    # indefinitely while tournament_server is updating the same SQLite meta
+    # row, leaving both clients stuck in Finding Player.
+    inst = gs._next_instance(conn=_db)
+    session_name = f"tourney-{room_id}-{inst}"
+    sid_value = encoder.make_uid(AUTHORITATIVE_SESSION_UID_TYPE, inst)
+    srv_value = encoder.make_uid(SERVICE_GAME_SESSION_UID_TYPE, inst * 7)
     session = gs.GameSession(sid_value, srv_value, session_name,
                              int(pids[0]) if pids else 0)
+    corinth_mode = _is_corinth_room(room)
+    if corinth_mode:
+        # The mode is carried in the persisted session because the later
+        # GameSession handlers are reconstructed from the database after the
+        # tournament service hands the battle to HConnect.
+        session.encounter_data = {
+            "tournament_mode": CORINTH_MERRY_MELEE_MODE,
+            "tournament_type_id": int(room.get("type_id") or 0),
+            "starting_hand_size": 4,
+            "skip_draw_phase": True,
+            "end_turn_draw_count": 4,
+            "recycle_discard_at_end_turn": True,
+        }
     for puid_str in pids:
-        session.add_player(encoder.make_uid(244, int(puid_str)), 0)  # ServicePlayer
+        session.add_player(
+            encoder.make_uid(SERVICE_PLAYER_UID_TYPE, int(puid_str)), 0,
+            conn=_db)
     session.state = "starting"
-    session._persist()
+    session._persist(conn=_db)
     if len(pids) >= 2:
         ordered_pids = [int(pid) for pid in pids[:2]]
         db_tournament_match_start(
             room_id, session.session_id, ordered_pids[0], ordered_pids[1],
-            round_id=1, start_time=_dotnet_ticks_now(),
+            round_id=1, start_time=_dotnet_ticks_now(), conn=_db,
         )
-    tournament_server.start_tournament(room_id, sid_value)
+    # A persistent async event remains joinable while individual two-player
+    # matches are created and retired underneath it.
+    if not (corinth_mode and match_player_uids is not None):
+        tournament_server.start_tournament(room_id, sid_value)
 
     # Seed each player's deck into game_cards.
     for puid_str in pids:
         puid = int(puid_str)
-        signup = db_tournament_signup_by_player(room_id, puid)
+        signup = db_tournament_signup_by_player(room_id, puid, conn=_db)
         deck_db_id = signup["deck_id"] if signup else 0
         if not deck_db_id:
             deck_db_id = player_decks.get(puid, 0)
-        if not deck_db_id:
+        if not deck_db_id and not corinth_mode:
             log_req(f"    WARN: No deck for player {puid} in room {room_id} — skipping")
             continue
-        seed = db_seed_tournament_game_deck(
-            session.session_id, puid, deck_db_id)
+        if corinth_mode:
+            if match_player_uids is not None:
+                main_cards = [guid for _uid, guid, location in
+                              db_tournament_pool(room_id, puid, conn=_db)
+                              if int(location) == 0]
+                seed = db_seed_tournament_game_deck(
+                    session.session_id, puid, 0, card_guids=main_cards,
+                    champion_guid=CORINTH_CHAMPION_GUID, conn=_db)
+            else:
+                seed = db_seed_tournament_game_deck(
+                    session.session_id, puid, 0,
+                    card_guids=CORINTH_SHARD_GUIDS * 4,
+                    champion_guid=CORINTH_CHAMPION_GUID, conn=_db)
+        else:
+            seed = db_seed_tournament_game_deck(
+                session.session_id, puid, deck_db_id, conn=_db)
         log_req(
             f"    Seeded {seed['inserted']} cards "
             f"(skipped: int={seed['skipped_int']} "
@@ -678,10 +1084,17 @@ def start_waiting_room_game(room_id, handler_overrides=None):
             f"from deck {deck_db_id} for player {puid}")
         if seed["champion_guid"]:
             db_insert_tournament_champion_card(
-                session.session_id, puid, seed["champion_guid"])
+                session.session_id, puid, seed["champion_guid"], conn=_db)
             log_req(f"    Created champion {seed['champion_guid'][:8]} "
                     f"for player {puid}")
+        if corinth_mode and match_player_uids is None:
+            db_tournament_pool_replace(
+                room_id, puid,
+                [(card_uid, template_guid, 1) for card_uid, template_guid in
+                 db_game_deck_cards(session.session_id, puid, conn=_db)],
+                conn=_db)
 
+    _db.commit()
     log_req(f"  Room {room_id}: game started as {session_name}")
 
     # Push DeckConstructionStarted (25072) to set CurrentTournament.
@@ -698,27 +1111,54 @@ def start_waiting_room_game(room_id, handler_overrides=None):
                 if not s_deck:
                     s_deck = player_decks.get(puid, 0)
 
-                # 25072 — sets CurrentTournament
-                dcs_inner = encode_objfmt_response(
-                    ["Game.Shared.Network.Tournaments.DeckConstructionStartedEventArgs",
-                     "Game.Shared.Tournaments.TournamentInfo",
-                     "Game.Shared.Domain.deck_bits"],
-                    [("TournamentID", "ulong", room_id),
-                     ("TournamentInfo", "struct",
-                      ("Game.Shared.Tournaments.TournamentInfo",
-                       [("TournamentID", "ulong", room_id)])),
-                     ("my_Deck", "class", "Game.Shared.Domain.deck_bits"),
-                     ("timeForSideboarding", "long", 0),
-                     ("PlayerID", "ulong", int(puid))])
-                dcs_body = compress_gzip(dcs_inner)
-                dcs_dw = encode_datawrapper(0, 25072, dcs_body, 1,
-                                            client_session_guid(h))
-                h.scnt += 1
-                h.send({
-                    "issuer": _SERVICE_MAIL_UID,
-                    "target": "ServicePlayer", "instance": h.sid or "0",
-                    "reqid": 0, "c": 0, "conh": 0, "sid": h.sid,
-                }, dcs_dw)
+                if corinth_mode and match_player_uids is None:
+                    # Corinth's starting cards are the actual main deck. The
+                    # client must not receive a sideboard/pool here.
+                    pool_cards = [
+                        (str(template_guid), "", int(card_uid), 0, 0, 0)
+                        for card_uid, template_guid in db_game_deck_cards(
+                            session.session_id, puid, conn=_db)
+                    ]
+                    deck_bits = (
+                        "corinth", "Corinth", 0, 0,
+                        {"main": pool_cards, "sideboard": []},
+                        CORINTH_CHAMPION_GUID)
+                else:
+                    deck_bits = None
+
+                # 25072 sets CurrentTournament.  A matched Corinth client
+                # is already past deck construction, so do not overwrite its
+                # saved deck with an empty construction packet.
+                if not (corinth_mode and match_player_uids is not None):
+                    dcs_inner = encode_objfmt_response(
+                        ["Game.Shared.Network.Tournaments.DeckConstructionStartedEventArgs",
+                         "Game.Shared.Tournaments.TournamentInfo",
+                         "Game.Shared.Domain.deck_bits"],
+                        [("TournamentID", "ulong", room_id),
+                         ("TournamentInfo", "struct",
+                          ("Game.Shared.Tournaments.TournamentInfo",
+                           [("TournamentID", "ulong", room_id)])),
+                         ("my_Deck", "deckbits", deck_bits or
+                          ("", "", 0, 0, [])),
+                         ("timeForSideboarding", "long", 0),
+                         ("PlayerID", "ulong", int(puid))])
+                    dcs_body = compress_gzip(dcs_inner)
+                    dcs_dw = encode_datawrapper(
+                        0, TOURNAMENT_DECK_CONSTRUCTION_DATA_TYPE,
+                        dcs_body, 1, client_session_guid(h))
+                    h.scnt += 1
+                    h.send({
+                        "issuer": _SERVICE_MAIL_UID,
+                        "target": "ServicePlayer", "instance": h.sid or "0",
+                        "reqid": 0, "c": 0, "conh": 0, "sid": h.sid,
+                    }, dcs_dw)
+
+                if corinth_mode and match_player_uids is None:
+                    # The ordinary two-player start is deferred for async
+                    # Corinth; matching sends this transition later.
+                    log_req(f"    Deferred 25060/25058 for Corinth tid={room_id} "
+                            f"player={puid}")
+                    continue
 
                 # 25060 — override sideboarding → Battle
                 sid_u64 = int(session.session_id) if isinstance(session.session_id, int) else 0
@@ -744,7 +1184,7 @@ def start_waiting_room_game(room_id, handler_overrides=None):
                      ("DeckId", "uid", (s_deck << 8) | 17),
                      ("Forced", "bool", True)])
                 evt_body = compress_gzip(evt_inner)
-                evt_dw = encode_datawrapper(0, 25060, evt_body, 1,
+                evt_dw = encode_datawrapper(0, TOURNAMENT_SESSION_START_DATA_TYPE, evt_body, 1,
                                             client_session_guid(h))
                 h.scnt += 1
                 h.send({
@@ -761,7 +1201,7 @@ def start_waiting_room_game(room_id, handler_overrides=None):
                     [("Info", "struct", ("Game.Shared.Tournaments.TournamentInfo", [
                         ("TournamentID", "ulong", room_id)]))])
                 ti_body = compress_gzip(ti_inner)
-                ti_dw = encode_datawrapper(0, 25058, ti_body, 1,
+                ti_dw = encode_datawrapper(0, TOURNAMENT_INFO_DATA_TYPE, ti_body, 1,
                                             client_session_guid(h))
                 h.scnt += 1
                 h.send({
@@ -771,3 +1211,88 @@ def start_waiting_room_game(room_id, handler_overrides=None):
                 log_req(f"    Pushed 25072+25060+25058 for tid={room_id}")
             except Exception as e:
                 log_req(f"  WARN: push 25072 to {puid} failed: {e}")
+
+
+_corinth_match_lock = threading.Lock()
+
+
+def try_start_corinth_match(room_id, handler_override=None):
+    """Pair the first two ready Corinth entrants and start their match."""
+    room = db_tournament_room_for_game(room_id)
+    if not room or not _is_corinth_room(room) or not _is_async_room(room):
+        return False
+    with _corinth_match_lock:
+        ready = db_tournament_async_ready_players(room_id, conn=_db)
+        eligible = []
+        for pid, name in ready:
+            wins, losses = db_tournament_player_score(room_id, pid)
+            if wins >= CORINTH_RUN_WINS or losses >= CORINTH_RUN_LOSSES:
+                _retire_finished_async_runs(room_id, (pid,))
+                log_req(f"  Corinth matcher: pid {pid} reached run limit "
+                        f"({wins}-{losses}); excluded")
+                continue
+            eligible.append((pid, name))
+        ready = eligible
+        if len(ready) < 2:
+            return False
+        pids = [int(ready[0][0]), int(ready[1][0])]
+        for pid in pids:
+            db_tournament_signup_set_async_state(
+                room_id, pid, searching=False, conn=_db)
+        handlers = {}
+        if handler_override is not None:
+            handlers[int(getattr(handler_override, "client_reck_id", 0) or 0)] = handler_override
+        with player_handler_lock:
+            for pid in pids:
+                handlers.setdefault(pid, player_handlers.get(pid))
+        start_waiting_room_game(
+            room_id, handler_overrides=handlers, match_player_uids=pids)
+        log_req(f"  Corinth async match started tid={room_id} players={pids}")
+        return True
+
+
+def push_tournament_session_start(handler, room_id, session_id,
+                                   session_name, deck_id, room):
+    """Push the deferred 25060/25058 transition after deck confirmation."""
+    sid_u64 = int(session_id) if isinstance(session_id, int) else 0
+    enc_flags = _tournament_session_flags(room)
+    evt_inner = encode_objfmt_response(
+        ["Game.Shared.Network.Tournaments.TournamentSessionStartEventArgs",
+         "Game.Shared.SessionState",
+         "Game.Shared.SessionStateEncounterData",
+         "Game.Shared.UID"],
+        [("SessionState", "struct",
+          ("Game.Shared.SessionState",
+           [("SessionId", "uid", sid_u64),
+            ("SessionName", "string", session_name),
+            ("MinimumPlayerCount", "int", 2),
+            ("MaximumPlayerCount", "int", 2),
+            ("EncounterData", "struct",
+             ("Game.Shared.SessionStateEncounterData",
+              [("SessionFlags", "int", enc_flags),
+               ("IsVirtualTournament", "bool", True),
+               ("TournamentID", "ulong", int(room_id))])),
+            ("JoinInsteadOfReconnect", "bool", True)])),
+         ("DeckId", "uid", (int(deck_id) << 8) | 17),
+         ("Forced", "bool", True)])
+    evt_dw = encode_datawrapper(
+        0, TOURNAMENT_SESSION_START_DATA_TYPE,
+        compress_gzip(evt_inner), 1, client_session_guid(handler))
+    handler.scnt += 1
+    handler.send({"issuer": _SERVICE_MAIL_UID, "target": "ServicePlayer",
+                  "instance": handler.sid or "0", "reqid": 0, "c": 0,
+                  "conh": 0, "sid": handler.sid}, evt_dw)
+
+    ti_inner = encode_objfmt_response(
+        ["Game.Shared.Network.Tournaments.TournamentInfoEventArgs",
+         "Game.Shared.Tournaments.TournamentInfo", "System.UInt64"],
+        [("Info", "struct", ("Game.Shared.Tournaments.TournamentInfo",
+                               [("TournamentID", "ulong", int(room_id))]))])
+    ti_dw = encode_datawrapper(
+        0, TOURNAMENT_INFO_DATA_TYPE, compress_gzip(ti_inner), 1,
+        client_session_guid(handler))
+    handler.scnt += 1
+    handler.send({"issuer": _SERVICE_MAIL_UID, "target": "ServicePlayer",
+                  "instance": handler.sid or "0", "reqid": 0, "c": 0,
+                  "conh": 0, "sid": handler.sid}, ti_dw)
+    log_req(f"    Pushed deferred 25060+25058 for Corinth tid={room_id}")

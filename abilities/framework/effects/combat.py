@@ -81,13 +81,18 @@ def _block_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     attackers, blocker_key = _active_combat(bstate, attacker_uid)
     defender_id = _combat_defender_id(
         handler, bstate, attackers, attacker_uid)
-    blocker_row = db.execute(
-        "SELECT user_id, location, card_type, card_state "
-        "FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, blocker_uid)).fetchone()
-    attacker_row = db.execute(
-        "SELECT location FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, attacker_uid)).fetchone()
+    from pvp_db import (db_card_owner_zone_state, db_card_sacrifice_info,
+                        db_update_card_state)
+    blocker_state = db_card_owner_zone_state(
+        session.session_id, blocker_uid, conn=db)
+    blocker_type = db_card_sacrifice_info(
+        session.session_id, blocker_uid, conn=db)
+    blocker_row = ((blocker_state[0], blocker_state[1], blocker_type[2],
+                    blocker_state[2])
+                   if blocker_state and blocker_type else None)
+    attacker_state = db_card_owner_zone_state(
+        session.session_id, attacker_uid, conn=db)
+    attacker_row = (attacker_state[1],) if attacker_state else None
     if not attackers or not attacker_row or attacker_row[0] != "warzone":
         return "block: attacker is not active"
     if not blocker_row or blocker_row[1] != "warzone":
@@ -110,11 +115,10 @@ def _block_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     assigned.append(blocker_uid)
     existing[str(attacker_uid)] = [str(value) for value in assigned]
     bstate[blocker_key] = existing
-    db.execute(
-        "UPDATE game_cards SET card_state = card_state | ? "
-        "WHERE session_id=? AND card_uid=?",
-        (game_engine.ECardStates.Blocking | game_engine.ECardStates.HasBlocked,
-         session.session_id, blocker_uid))
+    db_update_card_state(
+        session.session_id, blocker_uid,
+        set_bits=game_engine.ECardStates.Blocking |
+        game_engine.ECardStates.HasBlocked, conn=db)
     db.commit()
 
     defender_uid = None

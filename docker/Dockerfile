@@ -35,6 +35,7 @@ COPY tests/ /hex/tests/
 # The root wildcard above includes replay_server.py; this package includes the
 # tournament scheduler used by the running services.
 COPY docker/docker_bootstrap.py /hex/docker/docker_bootstrap.py
+COPY supervisord.conf /hex/supervisord.conf
 # Records and generated starter-deck data are materialized into the writable
 # container filesystem at startup when a mounted HEX_GAMEDATA file is
 # available. They are intentionally not copied into the image.
@@ -47,8 +48,7 @@ RUN python3 -m compileall -q /hex
 # Ports: 9933 = HConnect game server, 8081 = HTTP proxy.
 EXPOSE 9933 8081
 
-# Supervisord-style entrypoint: launch all services. Each writes to a log
-# that we tail on stdout for `docker logs`.
+# Supervisor entrypoint: keep all services under one process supervisor.
 COPY docker/docker_entrypoint.sh /hex/docker_entrypoint.sh
 RUN chmod +x /hex/docker_entrypoint.sh
 

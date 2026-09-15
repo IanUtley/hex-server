@@ -385,6 +385,34 @@ def test_pvp_main_options_offer_resource_until_turn_played():
     print("PASS PvP resource option visibility")
 
 
+def test_card_option_usage_merges_play_and_activate():
+    """A playable hand card with Tunnel must retain both client affordances."""
+    player = game_engine.UID.make(244, 1001)
+    opponent = game_engine.UID.make(244, 1002)
+    card = game_engine.SessionCardId(game_engine.UID(201))
+    game = game_engine.Game(1, player, opponent)
+    game.push_options(player, [card])
+    option_list = next(
+        event for event in game.events
+        if isinstance(event, game_engine.PlayerOptionListSessionEventArgs))
+
+    option = game.get_or_add_card_option(
+        option_list, card, game_engine.ECardUsage.Activate)
+    tunnel = game._make_event(game_engine.OptionInstanceSessionEventArgs)
+    tunnel.opt_id = game_engine.ResourceId.from_str(
+        "a4fc4440-4f02-4f40-b786-214ad0205dad")
+    option.instances.append(tunnel)
+
+    assert len(option_list.options) == 1
+    assert option.state == (game_engine.ECardUsage.Play |
+                            game_engine.ECardUsage.Activate)
+    assert {str(instance.opt_id.guid) for instance in option.instances} == {
+        game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID,
+        "a4fc4440-4f02-4f40-b786-214ad0205dad",
+    }
+    print("PASS card option Play/Activate merge")
+
+
 def test_pvp_champion_options_exclude_triggers_and_basic_on_chain():
     """Triggered champion abilities never become clickable options.
 
@@ -669,6 +697,51 @@ def test_mulligan_priority_is_sent_to_both_clients():
     print("PASS PvP mulligan priority broadcast")
 
 
+def test_phase_start_resolves_defender_before_turn_phase_triggers():
+    """The first phase after mulligan must build both phase UIDs safely."""
+    class Session:
+        session_id = 1
+        server_id = 100
+        turn_order = {}
+
+        def _persist(self):
+            pass
+
+    session = Session()
+    previous = (
+        tournament_game.db_game_session_pids,
+        tournament_game.player_handlers,
+        tournament_game.pvp_save_state,
+        tournament_game.pvp_push_main_phase_options,
+        tournament_game._pvp_log_stack,
+    )
+    try:
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        # No handler is needed to exercise the phase-trigger UID construction;
+        # an actual client handler would only add packet-generation work.
+        tournament_game.player_handlers = {}
+        tournament_game.pvp_save_state = lambda *_args: None
+        tournament_game.pvp_push_main_phase_options = lambda *_args: None
+        tournament_game._pvp_log_stack = lambda *_args: None
+        state = {
+            "pvp": True,
+            "pids": [1001, 1002],
+            "turn_pid": 1001,
+            "phase": game_engine.ETurnPhases.FirstMainPhase,
+            "champ_map": {},
+        }
+        tournament_game._pvp_run_phase_start(
+            session, state, game_engine.ETurnPhases.FirstMainPhase)
+        assert state["priority_pid"] == 1001
+    finally:
+        (tournament_game.db_game_session_pids,
+         tournament_game.player_handlers,
+         tournament_game.pvp_save_state,
+         tournament_game.pvp_push_main_phase_options,
+         tournament_game._pvp_log_stack) = previous
+    print("PASS PvP phase start initializes defender")
+
+
 def test_pvp_quick_action_handoff_updates_both_clients():
     """A quick-action response window must set the same priority owner on
     both clients, not leave the passer dependent on the heartbeat."""
@@ -884,9 +957,11 @@ if __name__ == "__main__":
     test_phase_selection_after_blockers()
     test_pvp_state_view_preserves_escalation_and_charges()
     test_pvp_main_options_offer_resource_until_turn_played()
+    test_card_option_usage_merges_play_and_activate()
     test_pvp_champion_options_exclude_triggers_and_basic_on_chain()
     test_pvp_activation_summoning_sickness_only_applies_to_troops()
     test_pvp_hand_refresh_pushes_current_dynamic_cost()
     test_mulligan_priority_is_sent_to_both_clients()
+    test_phase_start_resolves_defender_before_turn_phase_triggers()
     test_pvp_quick_action_handoff_updates_both_clients()
     test_pvp_steadfast_attacker_stays_untapped()

@@ -177,12 +177,11 @@ def effect_field(db, bstate, effect_guid, field_name, default=0):
     source_uid = (bstate or {}).get("resolving_source_uid")
     if source_uid is not None:
         try:
-            row = db.execute(
-                "SELECT permanent_buffs FROM game_cards "
-                "WHERE session_id=? AND card_uid=?",
-                ((bstate or {}).get("session_id", 0), int(source_uid))).fetchone()
-            if row and row[0]:
-                data = json.loads(row[0] or "{}")
+            from pvp_db import db_card_permanent_buffs
+            value = db_card_permanent_buffs(
+                (bstate or {}).get("session_id", 0), int(source_uid), conn=db)
+            if value:
+                data = json.loads(value or "{}")
                 values = data.get("card_integer_variables") or {}
                 if values:
                     bstate["card_integer_variables"] = values
@@ -247,7 +246,9 @@ def modifier_metadata(effect_guid):
         "DefenseModifier": "defense",
         "DamageModifier": "damage",
         "HealHeroModifier": "healhero",
-        "LoseLifeModifier": "damage",
+        # Life loss is distinct from damage. A replacement such as Hardshell
+        # Ambush must not replace the health loss caused by its own trigger.
+        "LoseLifeModifier": "loselife",
         "SetHeroHealthModifier": "setherohealth",
         "CardCostModifier": "cardcost",
         "ChargePointsModifier": "chargepoints",
@@ -261,17 +262,24 @@ def modifier_metadata(effect_guid):
         "CounterModifier": "counter",
         "DamageMultiplierModifier": "damagemultiplier",
         "DamageImmunityModifier": "damageimmunity",
+        "DamageShieldModifier": "damageshield",
         "BlockImmunityModifier": "blockimmunity",
         "BlockImmunityExceptionModifier": "blockimmunityexception",
         "BlockRestrictionModifier": "blockrestriction",
         "TargetingImmunityModifier": "targetingimmunity",
+        "AttackImmunityModifier": "attackimmunity",
+        "SubTypeModifier": "subtype",
     }
     out = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
-                "m_Value", "m_ThresholdColor", "m_Shard",
+                "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_CardFilter", "m_CopySourceCard", "m_SetThresholds",
                 "m_RemoveAllCounters", "m_RemoveHalfRoundedUp",
                 "m_ReplaceExistingValue", "m_IsCombatDamage",
-                "m_CombatDamageOnly", "m_NonCombatDamageOnly"):
+                "m_CombatDamageOnly", "m_NonCombatDamageOnly",
+                "m_OnlyPreventFromDamageDealer",
+                "m_DamageDealerAdditionalTarget", "m_OneShot",
+                "m_LastsIndefinitely"):
         if key in modifier:
             out[key[2:].lower()] = modifier[key]
     counter = modifier.get("m_CardCounterTemplateId")
@@ -281,4 +289,13 @@ def modifier_metadata(effect_guid):
     if isinstance(input_value, dict):
         out["input_variable"] = field_variable_name(input_value)
         out["input_value"] = resolve_field(input_value, default=0)
+    # IntAttrModifier stores its dynamic operand in m_ValueField, whereas
+    # numeric modifiers generally use m_InputValue.  Both are typed
+    # EffectInputVariable fields in Records and must reach the leaf resolver.
+    value_field = modifier.get("m_ValueField")
+    if isinstance(value_field, dict):
+        out["input_variable"] = field_variable_name(value_field)
+        out["input_value"] = resolve_field(value_field, default=0)
+    if "m_LoseHalfHealth" in modifier:
+        out["lose_half_health"] = bool(modifier["m_LoseHalfHealth"])
     return out

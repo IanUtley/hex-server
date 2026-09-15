@@ -208,6 +208,7 @@ def test_reveal(db):
     add_card(db, 101, 5, loc="deck", state=0)
     pl_t, ai_t, game, bstate = new_game(db)
     bstate["resolving_owner_id"] = 5
+    bstate["_rules_port_native_effect"] = True
     db.execute(
         "INSERT INTO card_abilities_meta VALUES ('test-ability',0,'','look at two "
         "random cards from your deck.','{}',0,0,0,0,0,'[]')")
@@ -283,6 +284,7 @@ def test_battle_damage(db):
     pl_t, ai_t, game, bstate = new_game(db)
     bstate["resolving_source_uid"] = 100
     bstate["player_spell_target"] = 200
+    bstate["_rules_port_native_effect"] = True
     _LEAFS["Battle2CardsAbilityEffectTemplate"](
         game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
     row = db.execute(

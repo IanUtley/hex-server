@@ -33,8 +33,9 @@ from .fields import (ability_variables, effect_template,
 from .targeting import (legal_targets, evaluate_card_filter,
                          validate_target_selection)
 from ._shared import pvp_champion_uid, pvp_opponent_pid
-from .builder import AbilityBuilder
+from .builder import AbilityBuilder, AbilityContinuation
 from .context import EffectContext
+from .trace import begin_effect, end_effect
 from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
 from gamedata.play_plan import ActivationData
 
@@ -42,9 +43,48 @@ from gamedata.play_plan import ActivationData
 _RECORD_STORE = DEFAULT_RECORD_STORE
 
 
+def _randint(bstate, minimum, maximum):
+    """Use the migrated session RNG, falling back for legacy callers."""
+    rng = (bstate or {}).get("_rules_rng")
+    if rng is not None and hasattr(rng, "next_range"):
+        lo, hi = int(minimum), int(maximum)
+        return lo if hi <= lo else int(rng.next_range(lo, hi + 1))
+    return random.randint(int(minimum), int(maximum))
+
+
+def _choice(bstate, values):
+    values = list(values)
+    if not values:
+        raise IndexError("cannot choose from an empty sequence")
+    rng = (bstate or {}).get("_rules_rng")
+    if rng is not None and hasattr(rng, "next"):
+        return values[int(rng.next(len(values)))]
+    return random.choice(values)
+
+
+def _sample(bstate, values, count):
+    pool = list(values)
+    count = max(0, min(int(count), len(pool)))
+    if count == 0:
+        return []
+    rng = (bstate or {}).get("_rules_rng")
+    if rng is None or not hasattr(rng, "next"):
+        return random.sample(pool, count)
+    result = []
+    for _ in range(count):
+        result.append(pool.pop(int(rng.next(len(pool)))))
+    return result
+
+
 def _parse_param(param):
     if not param:
         return None
+    # Current Records-backed TargetSpec data is already materialized as a
+    # dict.  Keep accepting the legacy JSON string form, but do not discard
+    # typed filters before inspecting them (the built-in ChooseAndPlay target
+    # is the important case).
+    if isinstance(param, (dict, list)):
+        return param
     try:
         d = json.loads(param)
         return d if isinstance(d, dict) else None
@@ -69,11 +109,8 @@ def _target_template_ids(db, ability_guid):
 
 
 def _target_template(db, template_id):
-    row = db.execute(
-        "SELECT template_id, game_text, is_auto_target, is_random_target, "
-        "optional, explicit, player_filter, collection_flags, "
-        "min_target_count, max_target_count, filter_json, target_kind "
-        "FROM target_templates WHERE template_id=?", (template_id,)).fetchone()
+    from pvp_db import db_target_template_row
+    row = db_target_template_row(template_id, conn=db)
     if not row:
         return None
     return {
@@ -221,15 +258,11 @@ def _revealed_target_uids(db, session, bstate, owner_id, source_uid,
     filt = _parse_param(template.get("filter_json")) or {}
     out = []
     for uid in revealed:
-        row = db.execute(
-            "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-            "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-            "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-            "gc.card_attributes, ct.attributes "
-            "FROM game_cards gc JOIN card_templates ct "
-            "ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session.session_id, uid)).fetchone()
+        from pvp_db import db_condition_card_row
+        full_row = db_condition_card_row(session.session_id, uid, conn=db)
+        row = (full_row[:7] + (full_row[8], full_row[9], full_row[10],
+                               full_row[11], full_row[12], full_row[13])
+               if full_row else None)
         if not row:
             continue
         card = {
@@ -262,6 +295,18 @@ def _auto_target_uids(db, handler, bstate, session, ability_guid, source_uid,
             controller = pvp_champion_uid(bstate, owner_id)
             opponent_pid = pvp_opponent_pid(bstate, owner_id)
             opponent = pvp_champion_uid(bstate, opponent_pid)
+            # Lightweight/PvP-shaped headless sessions may expose champion
+            # SessionCardIds on the handler before they have constructed the
+            # persisted champ_map.  Use those IDs only as a fallback; live
+            # sessions remain authoritative through champ_map above.
+            if controller is None:
+                player_champ, ai_champ = _champion_uids(handler, bstate)
+                player_id = getattr(handler, "user_profile", {}) or {}
+                player_id = player_id.get("id")
+                if player_id is not None and int(owner_id) == int(player_id):
+                    controller, opponent = player_champ, ai_champ
+                else:
+                    controller, opponent = ai_champ, player_champ
             uid = (opponent if player_filter in {
                 "opponent", "opposing", "singleopponent", "multipleopponents"
             } else controller)
@@ -349,12 +394,13 @@ def _auto_target_uids(db, handler, bstate, session, ability_guid, source_uid,
                                int(bstate.get("ai_health", 20))))
     pool = legal_targets(db, session.session_id, owner_id,
                          template["template_id"], source_uid,
-                         both_players=True, champions=champ_pool)
+                         both_players=True, champions=champ_pool,
+                         battle_state=bstate)
     if template.get("is_random_target"):
         if not pool:
             return [], True
         n = min(len(pool), max(1, template.get("max_target_count") or 1))
-        return random.sample(pool, n), True
+        return _sample(bstate, pool, n), True
     return pool, True
 
 
@@ -368,7 +414,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     ability_guid, source_uid, owner_id, target_map=None,
                     variables=None, depth=0, root_ability_guid=None,
                     resume_from_order=None, activation_data=None,
-                    effect_groups=None):
+                    effect_groups=None, native_effect=None):
     """Resolve an ability's BOM data-driven, mirroring the client's
     authoritative AbilityInstance: effects run group-by-group in order, each
     gated by its gamedata condition and contingencies, with ability variables
@@ -376,6 +422,17 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     if depth > 16:
         return "resolution depth exceeded"
     bstate = bstate or {}
+    # A live RulesPort session may use this module only as the explicit
+    # Records effect interpreter.  Direct callers otherwise create a second
+    # ability lifecycle (old target/continuation/stack semantics) alongside
+    # the port.  Fail at the boundary so new gameplay paths cannot silently
+    # reintroduce the hybrid architecture.
+    if ((getattr(session, "_rules_port_session", None) is not None or
+         bstate.get("_rules_port_attached")) and
+            not bstate.get("_rules_port_allow_legacy_backend")):
+        raise RuntimeError(
+            "legacy ability resolver bypassed RulesPort; use "
+            "rules_port.resolve_port_ability")
     incoming_activation = (ActivationData.from_dict(activation_data)
                            if activation_data is not None else None)
     if incoming_activation is not None:
@@ -441,7 +498,6 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     prev_source = bstate.get("resolving_source_uid")
     prev_effect = bstate.get("resolving_effect_guid")
     prev_effect_order = bstate.get("resolving_effect_order")
-    prev_ability_builder = bstate.get("_ability_builder")
     previous_target_map = bstate.get("ability_target_map")
     prev_grant_target = bstate.get("grant_target")
     prev_skip_transform = bstate.get("_skip_transform")
@@ -453,7 +509,6 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     bstate["session_id"] = session.session_id
     bstate["resolving_owner_id"] = owner_id if owner_id is not None else 0
     bstate["resolving_source_uid"] = source_uid
-    bstate["_ability_builder"] = ability_builder
     bstate["_ability_damage_dealt"] = 0
     previous_variables = bstate.get("ability_variables")
     bstate["ability_variables"] = variables
@@ -513,7 +568,11 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         # cards to reveal (TopNOfDeck), not as a single card target.  The leaf
         # reads the target filter's TopN value and selects the cards itself.
         if eff.get("effect_type") == "RevealCardsAbilityEffectTemplate":
-            return ([int(source_uid)] if source_uid is not None else [None]), False
+            # A nested/metadata-only activation can have no source card.  An
+            # absent source is an empty target set, never a list containing
+            # ``None``: secondary-target resolution treats a non-empty list as
+            # a real target and would otherwise attempt ``int(None)``.
+            return ([int(source_uid)] if source_uid is not None else []), False
         template = _target_at(tidx)
 
         def _validate_selected(values):
@@ -539,10 +598,13 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             return validate_target_selection(
                 db, session.session_id, owner_id, template["template_id"],
                 source_uid, values, both_players=both, champions=pool)
-        # MatchSecondaryTargetTemplate is not a generic "all legal cards"
-        # target.  It means every legal opposing card whose name matches the
-        # target selected by the previous effect.  Countermagic relies on this
-        # for its permanent +2 cost modifier across every zone.
+        # MatchSecondaryTargetTemplate is used for two related metadata
+        # contracts.  Countermagic matches every card with the same name as a
+        # previously selected card; Withering Touch uses the same template
+        # shape to mean every legal card controlled by the previously selected
+        # champion.  Keep both meanings data-driven: a champion has no
+        # game_cards row, so the old name-only lookup made Withering's hand
+        # selector empty and accidentally hid pure artifacts as well.
         if (template is not None
                 and (template.get("target_kind") or "")
                 == "MatchSecondaryTargetTemplate"
@@ -557,21 +619,43 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 if previous:
                     break
             if previous:
-                target_row = db.execute(
-                    "SELECT ct.name FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.card_uid=?",
-                    (session.session_id, int(previous[0]))).fetchone()
+                from pvp_db import (db_condition_card_row,
+                                    db_session_card_owners, db_cards_with_name)
+                previous_projection = db_condition_card_row(
+                    session.session_id, int(previous[0]), conn=db)
+                target_row = ((previous_projection[8],)
+                              if previous_projection else None)
+                champ_pool = _champion_targets(handler, bstate)
+                previous_owner = None
+                if target_row is None:
+                    for champ_uid, champ_owner, _champ_name, _champ_hp in champ_pool:
+                        if int(champ_uid) == int(previous[0]):
+                            previous_owner = int(champ_owner)
+                            break
+                if previous_owner is not None:
+                    # The target template still supplies the card-type and
+                    # zone predicates.  Filter the legal result to the
+                    # controller of the previous champion; using
+                    # both_players=False here would incorrectly apply the
+                    # template's ``MultiplePlayers`` opposing predicate to
+                    # the same controller and return nothing.
+                    legal = legal_targets(
+                        db, session.session_id, owner_id,
+                        template["template_id"], source_uid,
+                        both_players=True, champions=champ_pool,
+                        battle_state=bstate)
+                    owners = {int(row[0]): int(row[1]) for row in
+                              db_session_card_owners(session.session_id, conn=db)}
+                    return [uid for uid in legal
+                            if owners.get(int(uid)) == previous_owner], False
                 if target_row and target_row[0]:
                     legal = legal_targets(
                         db, session.session_id, owner_id,
                         template["template_id"], source_uid,
-                        both_players=True, champions=[])
-                    name_rows = db.execute(
-                        "SELECT gc.card_uid FROM game_cards gc "
-                        "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                        "WHERE gc.session_id=? AND lower(ct.name)=lower(?)",
-                        (session.session_id, target_row[0])).fetchall()
+                        both_players=True, champions=champ_pool,
+                        battle_state=bstate)
+                    name_rows = db_cards_with_name(
+                        session.session_id, target_row[0], conn=db)
                     same_name = {int(row[0]) for row in name_rows}
                     return [uid for uid in legal if int(uid) in same_name], False
         if (template is not None
@@ -601,9 +685,20 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             # the secondary target receives every remaining revealed card.
             if sti < 0:
                 max_count = max(1, int(template.get("max_target_count") or 1))
-                if len(candidates) > max_count:
+                # SourceRevealed targets are normally selected by the client,
+                # even when the reveal produced exactly one legal card.  The
+                # old ``len > max`` check accidentally auto-selected that card
+                # and skipped optional pickers such as Starsphere's
+                # "optional revealed card" child ability.
+                optional_revealed = (
+                    bool(template.get("optional"))
+                    or int(template.get("min_target_count") or 0) == 0
+                )
+                should_prompt = bool(candidates) and (
+                    optional_revealed or len(candidates) > max_count)
+                if should_prompt:
                     if template.get("is_random_target"):
-                        candidates = random.sample(candidates, max_count)
+                        candidates = _sample(bstate, candidates, max_count)
                     else:
                         # A revealed-card target is an explicit client choice,
                         # not an auto-target.  Pause the BOM after the reveal
@@ -613,20 +708,25 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                         # pending continuation.
                         prompt = getattr(handler, "_prompt_revealed_choice",
                                          None)
-                        if (callable(prompt)
+                        if (int(owner_id or 0) != 0 and callable(prompt)
                                 and not (bstate or {}).get(
                                     "pending_revealed_choice")):
                             prompt(game, session, pl_t, ai_t, bstate,
                                    ability_guid, int(source_uid or 0),
                                    int(owner_id or 0), candidates,
                                    list((bstate or {}).get(
-                                       "revealed_cards") or []))
+                                       "revealed_cards") or []),
+                                   optional=optional_revealed)
                             bstate["resolution_paused"] = True
                             return [], False
-                        # Non-interactive/AI resolution has no client picker;
-                        # choose the first legal card, matching the old harness
-                        # fallback.
-                        candidates = candidates[:max_count]
+                        # AI-controlled revealed-card choices are random in
+                        # the client rules engine; never open the human card
+                        # picker for an AI Oakhenge-style effect.
+                        if int(owner_id or 0) == 0:
+                            import random as _random
+                            candidates = [_random.choice(candidates)]
+                        else:
+                            candidates = candidates[:max_count]
             return candidates, False
         if template is not None and (template.get("is_auto_target")
                                      or template.get("is_random_target")
@@ -667,29 +767,62 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 source_uid, both_players=False)
             candidates = [int(uid) for uid in candidates]
             if candidates:
+                # The client AI resolves built-in choice-card pickers without
+                # opening the human chooser. Select only from the generated,
+                # metadata-legal instances; this prevents stale/foreign
+                # choice cards from being treated as an option.
+                if int(owner_id or 0) == 0:
+                    from .effects.choices import ai_choice_prefer_missing
+                    return [ai_choice_prefer_missing(
+                        db, session, bstate, candidates)], False
                 if not (bstate or {}).get("pending_choice"):
                     parent = (bstate or {}).get("_choice_parent") or {}
-                    pending = {
-                        "kind": "choice_card_target",
-                        "owner_id": int(owner_id),
-                        "source_uid": (int(source_uid)
-                                       if source_uid is not None else 0),
-                        "ability_guid": str(
-                            parent.get("ability_guid") or ability_guid).lower(),
-                        "choice_uids": candidates,
-                        "resume_effect_order": int(
-                            parent.get("resume_effect_order",
-                                       int(eff["effect_order"]) + 1)),
-                        "target_map": {
-                            str(key): value for key, value in target_map.items()
-                        },
-                        "variables": dict(variables or {}),
-                    }
+                    pending = AbilityContinuation.from_state(
+                        bstate,
+                        ability_guid=(parent.get("ability_guid") or
+                                      ability_guid),
+                        source_uid=source_uid, owner_id=owner_id,
+                        target_map=target_map, variables=variables,
+                        resume_effect_order=int(parent.get(
+                            "resume_effect_order",
+                            int(eff["effect_order"]) + 1)),
+                    ).to_dict()
+                    pending.update({"kind": "choice_card_target",
+                                    "choice_uids": candidates})
                     prompt = getattr(handler, "_prompt_choice_cards", None)
                     if callable(prompt):
                         prompt(game, session, pl_t, ai_t, bstate, pending)
                         bstate["resolution_paused"] = True
                         return [], False
+        # A nested DiscardCard ability (for example Stargazer's
+        # ``DiscardACard`` child) owns an explicit hand target.  It is a
+        # continuation checkpoint, not an auto-target: publish the normal
+        # class-23 configuration through the host and resume the parent BOM
+        # with the selected target map on the following transaction.
+        if (template is not None and
+                eff.get("effect_type") == "DiscardCardAbilityEffectTemplate"
+                and "hand" in str(template.get("collection_flags", "")).lower()
+                and not (bstate or {}).get("pending_discard_ability")):
+            prompt = getattr(handler, "_push_discard_prompt", None)
+            if callable(prompt):
+                bstate["rules_port_resume_effect_order"] = int(
+                    eff.get("effect_order", 0)) + 1
+                prompt(game, session, pl_t, ai_t, bstate,
+                       ability_guid=ability_guid)
+                if "ai_discarded_uid" not in bstate:
+                    bstate["resolution_paused"] = True
+                return [], False
+        # ``PutThisIntoYourDeck`` is authored as a source-card move even when
+        # the extracted target template describes the returned card instead
+        # of carrying an explicit selection.  Preserve the C# source binding
+        # rather than allowing an unrelated activation target to redirect it.
+        if (source_uid is not None and
+                eff.get("effect_type") == "MoveCardToZoneEffectTemplate"):
+            move_param = _parse_param(eff.get("param")) or {}
+            move_name = str(move_param.get("name", "")).lower()
+            move_dest = str(move_param.get("destination", "")).lower()
+            if move_name == "putthisintoyourdeck" or move_dest.endswith("deck"):
+                return [int(source_uid)], False
         # A zone move with no target-template index is a source-card effect.
         # Do this before the root activation fallback: a spell can carry a
         # target for an earlier damage leaf while its later "put this into
@@ -791,6 +924,21 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             for effect in _effect_list(db, ability_guid)
         )
         threshold_search = has_standard_resource and has_threshold_effect
+        # Some abilities use the same client target picker to choose a card
+        # that remains in its zone.  Scheme is the important example: its
+        # following typed effect creates four matching cards in the deck.
+        # This must be identified from the BOM, not card text or a card GUID.
+        matching_target_effect = None
+        for effect in _effect_list(db, ability_guid):
+            if effect["effect_type"] != (
+                    "CreateTokenMatchingTargetAbilityEffectTemplate"):
+                continue
+            effect_template_row = effect_template(effect["effect_guid"]) or {}
+            collection = effect_template_row.get("m_CardCollection")
+            if str(collection).rsplit(".", 1)[-1].lower() == "deck":
+                matching_target_effect = effect
+                break
+        matching_target = matching_target_effect is not None
         try:
             candidates = legal_targets(
                 db, session.session_id, owner_id, template["template_id"],
@@ -800,8 +948,18 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         candidates = [int(c) for c in candidates]
         if not candidates:
             return "search deck: no matching card"
+        # AI/non-interactive resolution still uses the same target semantics:
+        # choose a legal card, keep it in the deck, and let the following
+        # typed matching-token effect run against that target.  Do not route
+        # this through the ordinary search-to-hand helper.
+        if matching_target and (owner_id == 0 or
+                                not callable(getattr(
+                                    handler, "_prompt_deck_search", None))):
+            chosen = _choice(bstate, candidates)
+            target_map[int(eff["target_index"])] = int(chosen)
+            return f"matching target: selected {hex(int(chosen))}"
         if owner_id == 0:
-            chosen = random.choice(candidates)
+            chosen = _choice(bstate, candidates)
             return move_deck_card_to_hand(
                 game, session, db, handler, pl_t, ai_t, chosen,
                 owner_id, bstate)
@@ -810,7 +968,23 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             prompt_args = (game, session, pl_t, ai_t, bstate,
                            root_ability_guid, int(source_uid) if source_uid
                            else 0, int(owner_id), candidates)
-            if threshold_search:
+            if matching_target:
+                parent = dict((bstate or {}).get("_choice_parent") or {})
+                continuation = {
+                    "ability_guid": str(ability_guid).lower(),
+                    "source_uid": (int(source_uid)
+                                   if source_uid is not None else 0),
+                    "owner_id": int(owner_id),
+                    "target_index": int(eff["target_index"]),
+                    "target_map": {
+                        str(key): value for key, value in target_map.items()
+                    },
+                    "variables": dict(variables or {}),
+                    "parent": parent,
+                }
+                result = prompt(*prompt_args, kind="matching_target",
+                                continuation=continuation)
+            elif threshold_search:
                 result = prompt(*prompt_args, kind="shard")
             else:
                 result = prompt(*prompt_args)
@@ -823,7 +997,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             return result
         # Non-interactive handler (unit tests): auto-pick a random legal card,
         # matching the old deathcry fallback.
-        chosen = random.choice(candidates)
+        chosen = _choice(bstate, candidates)
         return move_deck_card_to_hand(
             game, session, db, handler, pl_t, ai_t, chosen, owner_id, bstate)
 
@@ -854,10 +1028,11 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 name = pm.get("variable") or "RandomNumber"
                 lo = int(pm.get("min", 1))
                 hi = int(pm.get("max", lo))
-                variables[name] = random.randint(lo, max(lo, hi))
+                variables[name] = _randint(bstate, lo, max(lo, hi))
                 applied[inst_id] = True
                 continue
             if etype in ("SetCardIntegerVariableEffectTemplate",
+                         "SetConstantValueVariableEffectTemplate",
                          "SetAbilityVariableEffectEffectTemplate"):
                 # CardIntegerVariables belong to the source card instance,
                 # not to the transient AbilityInstance variable map.  Keep a
@@ -870,18 +1045,24 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 operation = (template.get("m_Operation") or
                              pm.get("operation") or "Set")
                 input_field = template.get("m_InputValue")
-                if input_field is not None:
+                if etype == "SetConstantValueVariableEffectTemplate":
+                    # The deprecated constant template stores its operand in
+                    # m_Value rather than the CardAbility InputValue field.
+                    input_field = template.get("m_Value", pm.get("value", 0))
+                if input_field is not None and not isinstance(input_field, (int, float)):
                     value = resolve_field(input_field, variables,
                                           bstate.get("effect_outputs") or
                                           {}, bstate, 0)
                 else:
-                    value = int(pm.get("value") or 0)
+                    value = int(input_field if input_field is not None
+                                else (pm.get("value") or 0))
                 source_row = None
                 if source_uid is not None:
-                    source_row = db.execute(
-                        "SELECT permanent_buffs FROM game_cards "
-                        "WHERE session_id=? AND card_uid=?",
-                        (session.session_id, int(source_uid))).fetchone()
+                    from pvp_db import db_card_mutation_field
+                    source_buffs = db_card_mutation_field(
+                        session.session_id, int(source_uid),
+                        "permanent_buffs", conn=db)
+                    source_row = (source_buffs,) if source_buffs is not None else None
                 try:
                     instance_data = json.loads(
                         (source_row[0] if source_row else "{}") or "{}")
@@ -898,11 +1079,10 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     new_value = int(value)
                 if variable and source_uid is not None and source_row:
                     card_values[variable] = new_value
-                    db.execute(
-                        "UPDATE game_cards SET permanent_buffs=? "
-                        "WHERE session_id=? AND card_uid=?",
-                        (json.dumps(instance_data, separators=(",", ":")),
-                         session.session_id, int(source_uid)))
+                    from pvp_db import db_set_card_mutation_field
+                    db_set_card_mutation_field(
+                        session.session_id, int(source_uid), "permanent_buffs",
+                        json.dumps(instance_data, separators=(",", ":")), conn=db)
                     db.commit()
                 bstate.setdefault("card_integer_variables", {})[variable] = \
                     new_value
@@ -926,6 +1106,12 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             if not _contingency_met(eff):
                 applied[inst_id] = False
                 continue
+            if bstate.pop("ai_discarded_uid", "__missing__") != "__missing__":
+                # The AI continuation already performed this discard through
+                # the owner-aware mutation path; do not execute the child
+                # discard leaf a second time or open a player picker.
+                applied[inst_id] = True
+                continue
             uids, needs_prompt = _resolve_targets(eff)
             if needs_prompt:
                 logs.append(_prompt_or_auto_pick(
@@ -933,6 +1119,10 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 applied[inst_id] = False
                 if bstate.get("resolution_paused"):
                     break
+                continue
+            if "ai_discarded_uid" in bstate:
+                bstate.pop("ai_discarded_uid", None)
+                applied[inst_id] = True
                 continue
             # A revealed-card prompt pauses the BOM before its leaf runs.
             # Do not fall through and execute that leaf once with a null
@@ -977,12 +1167,11 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     # (e.g. Spawn of Othuyeg's child "Bury the top card of
                     # your deck" buries the damaged champion's deck).
                     child_owner = owner_id
-                    trow = db.execute(
-                        "SELECT user_id FROM game_cards "
-                        "WHERE session_id=? AND card_uid=?",
-                        (session.session_id, int(t_uid))).fetchone()
-                    if trow:
-                        child_owner = trow[0]
+                    from pvp_db import db_card_owner_id
+                    target_owner = db_card_owner_id(
+                        session.session_id, int(t_uid), conn=db)
+                    if target_owner is not None:
+                        child_owner = target_owner
                     else:
                         if (bstate or {}).get("pvp"):
                             for _pid, _cuid in (bstate.get("champ_map") or {}).items():
@@ -1000,18 +1189,18 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                             elif au is not None and int(t_uid) == int(au):
                                 child_owner = 0
                     previous_choice_parent = bstate.get("_choice_parent")
-                    bstate["_choice_parent"] = {
-                        "ability_guid": ability_guid,
-                        "resume_effect_order": int(eff["effect_order"]) + 1,
-                        "owner_id": int(owner_id),
-                        "target_map": dict(target_map or {}),
-                        "variables": dict(variables or {}),
-                    }
+                    bstate["_choice_parent"] = AbilityContinuation.from_state(
+                        bstate, ability_guid=ability_guid,
+                        source_uid=source_uid, owner_id=owner_id,
+                        target_map=target_map, variables=variables,
+                        resume_effect_order=int(
+                            eff["effect_order"]) + 1).to_dict()
                     try:
                         logs.append(resolve_ability(
                             handler, game, session, db, pl_t, ai_t, bstate,
                             child, source_uid, child_owner, target_map,
-                            variables, depth + 1, root_ability_guid))
+                            variables, depth + 1, root_ability_guid,
+                            native_effect=native_effect))
                     finally:
                         if previous_choice_parent is None:
                             bstate.pop("_choice_parent", None)
@@ -1041,7 +1230,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                         logs.append(resolve_ability(
                             handler, game, session, db, pl_t, ai_t, bstate,
                             child_guid, source_uid, owner_id, {}, variables,
-                            depth + 1, root_ability_guid))
+                            depth + 1, root_ability_guid,
+                            native_effect=native_effect))
                         if bstate.get("resolution_paused"):
                             break
                 applied[inst_id] = True
@@ -1063,6 +1253,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                         if other["effect_instance_id"] != secondary_index:
                             continue
                         previous_uids, _previous_prompt = _resolve_targets(other)
+                        previous_uids = [uid for uid in (previous_uids or [])
+                                         if uid is not None]
                         if previous_uids:
                             secondary_uid = int(previous_uids[0])
                         break
@@ -1091,9 +1283,55 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                         # granted trigger survives a zone transfer such as
                         # Reginald moving into the opponent's deck.
                         bstate["grant_target"] = target_uid
-                logs.append(fn(EffectContext.from_legacy(
+                else:
+                    # Target aliases are per-effect execution state, not
+                    # persistent ability state.  Leaving the previous
+                    # effect's target here lets source-bound effects such as
+                    # Tunnel/MoveCardToZone act on an unrelated card (often
+                    # the player's card when an opponent effect resolves).
+                    # Source-bound leaves use resolving_source_uid as their
+                    # explicit fallback, so stale aliases must be removed.
+                    for key in ("player_mod_target", "player_spell_target",
+                                "resolving_target_uid", "grant_target"):
+                        bstate.pop(key, None)
+                trace = begin_effect(db, session, game, bstate, eff, target_uid)
+                previous_native_dispatch = bstate.get(
+                    "_rules_port_native_effect")
+                if native_effect is not None:
+                    bstate["_rules_port_native_effect"] = True
+                context_factory = (EffectContext.from_rules_port
+                                   if (bstate or {}).get(
+                                       "_rules_port_attached") else
+                                   EffectContext.from_legacy)
+                context = context_factory(
                     game, session, db, handler, pl_t, ai_t, bstate,
-                    eff["effect_guid"], eff["param"])))
+                    eff["effect_guid"], eff["param"],
+                    ability=ability_builder)
+                try:
+                    result = (native_effect(etype, context, eff)
+                              if native_effect is not None else None)
+                    if result is None:
+                        if native_effect is not None:
+                            # Keep the compatibility boundary observable.
+                            # A native resolver must never silently turn an
+                            # unported effect into a successful port effect.
+                            bstate.setdefault(
+                                "rules_port_legacy_effects", []).append(etype)
+                            if bstate.get("_rules_port_strict_effects"):
+                                raise RuntimeError(
+                                    "RulesPort effect has no native handler: "
+                                    f"{etype} ({eff.get('effect_guid')})")
+                        result = fn(context)
+                except Exception as exc:
+                    end_effect(db, session, game, bstate, trace, error=exc)
+                    raise
+                finally:
+                    if previous_native_dispatch is None:
+                        bstate.pop("_rules_port_native_effect", None)
+                    else:
+                        bstate["_rules_port_native_effect"] = previous_native_dispatch
+                end_effect(db, session, game, bstate, trace, result=result)
+                logs.append(result)
             if previous_secondary_uid is None:
                 bstate.pop("resolving_secondary_target_uid", None)
             else:
@@ -1128,10 +1366,6 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         bstate.pop("resolving_effect_order", None)
     else:
         bstate["resolving_effect_order"] = prev_effect_order
-    if prev_ability_builder is None:
-        bstate.pop("_ability_builder", None)
-    else:
-        bstate["_ability_builder"] = prev_ability_builder
     if previous_target_map is None:
         bstate.pop("ability_target_map", None)
     else:

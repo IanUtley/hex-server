@@ -35,7 +35,8 @@ Adding a new card ability::
 
 from .framework.bom import (_LEAFS, _walk_bom, leaf_register, bom_has_leaf,
                             bom_has_discard, bom_leaf_prompt_data)
-from .framework.builder import AbilityBuilder, CostRef, EffectRef, TargetRef
+from .framework.builder import (AbilityBuilder, AbilityContinuation, CostRef,
+                                EffectRef, TargetRef)
 from .framework.context import EffectContext
 from .framework.effects.registry import effect
 from .framework.tac import decode_tac, tac_guid, tac_function, tac_int
@@ -49,6 +50,8 @@ from .framework.triggers import (
     resolve_cards_attacked,
     resolve_card_battled,
     resolve_enters_play_triggers,
+    resolve_turn_phase_triggers,
+    resolve_turn_ended_triggers,
     resolve_stack_trigger,
 )
 from .framework._shared import _stat_delta
@@ -78,11 +81,9 @@ def resolve_effect(ability_guid):
         owner = bstate.get("resolving_owner_id")
         if owner is None and src is not None:
             try:
-                orow = db.execute(
-                    "SELECT user_id FROM game_cards "
-                    "WHERE session_id=? AND card_uid=?",
-                    (session.session_id, int(src))).fetchone()
-                owner = orow[0] if orow else 0
+                from pvp_db import db_card_owner_id
+                owner = db_card_owner_id(
+                    session.session_id, int(src), conn=db) or 0
             except Exception:
                 owner = 0
         out = resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
@@ -145,11 +146,9 @@ def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
     owner_id = bstate.get("resolving_owner_id")
     if owner_id is None and src_uid is not None:
         try:
-            orow = db.execute(
-                "SELECT user_id FROM game_cards "
-                "WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(src_uid))).fetchone()
-            owner_id = orow[0] if orow else 0
+            from pvp_db import db_card_owner_id
+            owner_id = db_card_owner_id(
+                session.session_id, int(src_uid), conn=db) or 0
         except Exception:
             owner_id = 0
     if owner_id is None:

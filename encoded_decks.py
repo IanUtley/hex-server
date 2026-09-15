@@ -5,14 +5,8 @@ This format is used in the profile stream to send deck data to the client.
 import io
 import struct
 import json
-import sqlite3
 
-_g_db_path = "/home/ianutley/Hex/hconnect.db"
-
-def _get_db():
-    db = sqlite3.connect(_g_db_path)
-    db.row_factory = sqlite3.Row
-    return db
+from profile_db import db_card_instance_for_encoded_deck
 
 def write_varint(buf, val):
     while val >= 0x80:
@@ -78,9 +72,8 @@ def encode_card_group_id(buf, template_guid, is_extended, card_ids):
         write_varint(buf, delta)
         prev = cid
 
-def encode_encoded_decks(db_decks, user_id):
+def encode_encoded_decks(db_decks, user_id, conn=None):
     """Create the full EncodedDecks binary payload."""
-    db = _get_db()
     buf = io.BytesIO()
 
     # Collect card data for CardGroupId encoding
@@ -99,12 +92,10 @@ def encode_encoded_decks(db_decks, user_id):
             active_gems = {}
         cards = []
         for cid in card_ids:
-            row = db.execute(
-                "SELECT template_guid, is_extended_art FROM card_instances WHERE user_id=? AND instance_id=?",
-                (user_id, cid)).fetchone()
+            row = db_card_instance_for_encoded_deck(user_id, cid, conn=conn)
             if row:
-                tguid = row["template_guid"]
-                is_ext = row["is_extended_art"]
+                tguid = row[1]
+                is_ext = row[2]
                 cards.append((tguid, 1, bool(is_ext), False, False))
                 key = (tguid, bool(is_ext))
                 if key not in all_cards_by_group:
@@ -147,5 +138,4 @@ def encode_encoded_decks(db_decks, user_id):
         if card_ids:
             encode_card_group_id(buf, tguid, is_ext, card_ids)
 
-    db.close()
     return buf.getvalue()

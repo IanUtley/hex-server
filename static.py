@@ -98,6 +98,7 @@ DDL = [
         socket_count INTEGER DEFAULT 0,
         no_pvp INTEGER DEFAULT 0,
         is_pve INTEGER DEFAULT 0,
+        equipment_modified INTEGER DEFAULT 0,
         threshold_json TEXT DEFAULT '[]',
         abilities_json TEXT DEFAULT '[]',
         attributes INTEGER DEFAULT 0,
@@ -433,8 +434,21 @@ DDL = [
         min_players INTEGER NOT NULL DEFAULT 2,
         max_players INTEGER NOT NULL DEFAULT 2,
         games_count INTEGER NOT NULL DEFAULT 1,
-        set_id TEXT
+        set_id TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        rewards_json TEXT NOT NULL DEFAULT '{}'
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tournament_type_banned_cards (
+        tournament_type_id INTEGER NOT NULL REFERENCES tournament_types(id),
+        card_guid TEXT NOT NULL,
+        PRIMARY KEY (tournament_type_id, card_guid)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_tournament_banned_cards_type
+        ON tournament_type_banned_cards(tournament_type_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS tournaments (
@@ -443,7 +457,8 @@ DDL = [
         status TEXT NOT NULL DEFAULT 'waiting',
         players_json TEXT DEFAULT '{}',
         session_id TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (datetime('now')),
+        expires_at TEXT
     )
     """,
     """
@@ -473,6 +488,8 @@ DDL = [
         entry_group INTEGER NOT NULL DEFAULT 0,
         fee_paid INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'active',
+        deck_ready INTEGER NOT NULL DEFAULT 0,
+        searching INTEGER NOT NULL DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now')),
         UNIQUE(tournament_id, player_uid)
     )
@@ -493,12 +510,48 @@ DDL = [
         game1_winner INTEGER NOT NULL DEFAULT 0,
         game2_winner INTEGER NOT NULL DEFAULT 0,
         game3_winner INTEGER NOT NULL DEFAULT 0,
+        player1_live INTEGER NOT NULL DEFAULT 1,
+        player2_live INTEGER NOT NULL DEFAULT 1,
         UNIQUE(tournament_id, session_id)
     )
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_tournament_matches_tournament_round
         ON tournament_matches(tournament_id, round_id DESC, id DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tournament_pool (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+        player_uid INTEGER NOT NULL,
+        card_uid INTEGER NOT NULL,
+        template_guid TEXT NOT NULL,
+        location INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(tournament_id, player_uid, card_uid)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_tournament_pool_player
+        ON tournament_pool(tournament_id, player_uid, location)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tournament_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+        player_uid INTEGER NOT NULL,
+        run_number INTEGER NOT NULL,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        result TEXT NOT NULL DEFAULT 'quit',
+        final_match_id INTEGER NOT NULL DEFAULT 0,
+        completed_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(tournament_id, player_uid, run_number)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_tournament_results_player
+        ON tournament_results(tournament_id, player_uid, id)
     """,
     """
     CREATE TABLE IF NOT EXISTS meta (
@@ -813,6 +866,7 @@ DDL = [
         read_at TEXT DEFAULT NULL,
         gold_delivered INTEGER DEFAULT 0,
         platinum_delivered INTEGER DEFAULT 0,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
         claimed_at TEXT DEFAULT NULL
     )
     """,
@@ -1020,6 +1074,7 @@ REDEEM_CODES = [
     ("10000gold", 10000, 0, 10),
     ("5000gold", 5000, 0, 10),
     ("5000all", 5000, 5000, 10),
+    ("allpvp", 0, 0, 1),
     ("expiredcode", 0, 0, 0),
 ]
 
@@ -1315,13 +1370,14 @@ def _migrate_short_tournament_ids(db):
     for old_id, new_id in migrations:
         db.execute(
             "INSERT INTO tournaments "
-            "(id, type_id, status, players_json, session_id, created_at) "
-            "SELECT ?, type_id, status, players_json, session_id, created_at "
+            "(id, type_id, status, players_json, session_id, created_at, expires_at) "
+            "SELECT ?, type_id, status, players_json, session_id, created_at, expires_at "
             "FROM tournaments WHERE id=?",
             (new_id, old_id),
         )
         for table in ("tournament_decks", "tournament_signups",
-                      "tournament_matches"):
+                      "tournament_matches", "tournament_pool",
+                      "tournament_results"):
             db.execute(
                 f"UPDATE {table} SET tournament_id=? WHERE tournament_id=?",
                 (new_id, old_id),
@@ -1344,6 +1400,38 @@ def ensure_schema(db):
     """
     for stmt in DDL:
         db.execute(stmt)
+    tournament_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(tournaments)")}
+    if "expires_at" not in tournament_columns:
+        db.execute("ALTER TABLE tournaments ADD COLUMN expires_at TEXT")
+    tournament_type_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(tournament_types)")}
+    if "rewards_json" not in tournament_type_columns:
+        db.execute("ALTER TABLE tournament_types ADD COLUMN rewards_json "
+                   "TEXT NOT NULL DEFAULT '{}'")
+    signup_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(tournament_signups)")}
+    if "deck_ready" not in signup_columns:
+        db.execute("ALTER TABLE tournament_signups ADD COLUMN deck_ready "
+                   "INTEGER NOT NULL DEFAULT 0")
+    if "searching" not in signup_columns:
+        db.execute("ALTER TABLE tournament_signups ADD COLUMN searching "
+                   "INTEGER NOT NULL DEFAULT 0")
+    email_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(emails)")}
+    if "attachments_json" not in email_columns:
+        db.execute("ALTER TABLE emails ADD COLUMN attachments_json "
+                   "TEXT NOT NULL DEFAULT '[]'")
+    # Existing installations predate per-player asynchronous gauntlet runs.
+    # Add the flags in place so historical match rows remain usable.
+    match_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(tournament_matches)")}
+    if "player1_live" not in match_columns:
+        db.execute("ALTER TABLE tournament_matches ADD COLUMN player1_live "
+                   "INTEGER NOT NULL DEFAULT 1")
+    if "player2_live" not in match_columns:
+        db.execute("ALTER TABLE tournament_matches ADD COLUMN player2_live "
+                   "INTEGER NOT NULL DEFAULT 1")
     db.commit()
 
     # Keep the schema version in the database so release-time upgrades can
@@ -1627,8 +1715,11 @@ def ensure_schema(db):
         ecols = {r[1] for r in db.execute("PRAGMA table_info(ability_effects)")}
         tcols = {r[1] for r in db.execute("PRAGMA table_info(card_templates)")}
         added_lethal = "lethal" not in tcols
+        added_equipment_modified = "equipment_modified" not in tcols
         if added_lethal:
             db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
+        if added_equipment_modified:
+            db.execute("ALTER TABLE card_templates ADD COLUMN equipment_modified INTEGER DEFAULT 0")
         if "gem_abilities" not in dcols:
             db.execute("ALTER TABLE decks ADD COLUMN gem_abilities TEXT DEFAULT '{}'")
         if "effect_group_id" not in ecols:
@@ -1671,17 +1762,21 @@ def ensure_schema(db):
         # field was normalized into card_templates. Backfill from the same
         # Records/gamedata extractor used for fresh databases, keyed by GUID;
         # never infer this keyword from display text or card names.
-        if added_lethal:
+        if added_lethal or added_equipment_modified:
             from AssetExtraction.gamedata_seed import extract
-            lethal_rows = [
-                (int(row[-1] or 0), row[0])
-                for row in extract()["tables"].get("card_templates", [])
-                if len(row) >= 20
-            ]
-            db.executemany(
-                "UPDATE card_templates SET lethal=? WHERE guid=?",
-                lethal_rows,
-            )
+            card_rows = extract()["tables"].get("card_templates", [])
+            if added_lethal:
+                db.executemany(
+                    "UPDATE card_templates SET lethal=? WHERE guid=?",
+                    [(int(row[-1] or 0), row[0]) for row in card_rows
+                     if len(row) >= 20],
+                )
+            if added_equipment_modified:
+                db.executemany(
+                    "UPDATE card_templates SET equipment_modified=? WHERE guid=?",
+                    [(int(row[11] or 0), row[0]) for row in card_rows
+                     if len(row) >= 21],
+                )
             db.commit()
     except Exception:
         pass
@@ -1985,16 +2080,48 @@ def ensure_schema(db):
     # format is the ETournamentFormats bitmask (matches the client enum):
     # Constructed=0, Sealed_Deck=1, Booster_Draft=2, Chapter1=4, Chapter2=8,
     # Immortal=16, Chapter3=32, Chapter4=64, Chapter5=128, ...
+    # ``enabled`` controls the currently offered catalog.  Retired types are
+    # retained in the table so historical tournament rows keep their original
+    # name and format, but they must not be refilled or exposed as waiting
+    # rooms.
     TOURNAMENT_TYPES = [
-        (1, "1v1 Immortal - Best of 1", "se", 16,           2, 2, 1, None),
-        (2, "Limited Sealed - 5 Games","sw", 1,            1, 1, 5, "set01"),
-        (3, "Set 1 Draft (AI)",        "sw", 2,            1, 1, 3, "set01"),
+        (1, "1v1 Immortal - Best of 1", "se", 16, 2, 2, 1, None, 1),
+        # ETournamentFormats.Iconoclast; the client uses this to select the
+        # Corinth/Corinth-the-Iconoclast battle rules and deck presentation.
+        # ``max_players=0`` is the client's open/unlimited sentinel for an
+        # asynchronous catalog entry.  The individual match is still paired
+        # two-player by the async matchmaking path.
+        (4, "Merry-Melee-Corinth", "async", 536870912, 1, 0, 1, None, 1),
     ]
+    tournament_type_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(tournament_types)")
+    }
+    if "enabled" not in tournament_type_columns:
+        db.execute(
+            "ALTER TABLE tournament_types ADD COLUMN enabled INTEGER "
+            "NOT NULL DEFAULT 1")
     if db.execute("SELECT COUNT(*) FROM tournament_types").fetchone()[0] == 0:
         db.executemany(
             "INSERT INTO tournament_types (id, name, style, format, "
-            "min_players, max_players, games_count, set_id) VALUES (?,?,?,?,?,?,?,?)",
+            "min_players, max_players, games_count, set_id, enabled) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             TOURNAMENT_TYPES)
+    else:
+        for tournament_type in TOURNAMENT_TYPES:
+            db.execute(
+                "INSERT INTO tournament_types "
+                "(id, name, style, format, min_players, max_players, "
+                "games_count, set_id, enabled) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+                "style=excluded.style, format=excluded.format, "
+                "min_players=excluded.min_players, "
+                "max_players=excluded.max_players, "
+                "games_count=excluded.games_count, set_id=excluded.set_id, "
+                "enabled=excluded.enabled",
+                tournament_type)
+        db.execute(
+            "UPDATE tournament_types SET enabled=0 WHERE id NOT IN (?, ?)",
+            tuple(item[0] for item in TOURNAMENT_TYPES))
     # Keep the seeded 1v1 event aligned with the actual server behavior: one
     # game, two players, and single-elimination completion semantics.
     db.execute(
@@ -2002,6 +2129,47 @@ def ensure_schema(db):
         "min_players=2, max_players=2, games_count=1 WHERE id=1",
         ("1v1 Immortal - Best of 1",),
     )
+    # Merry Melee rewards are represented using the client's native
+    # TournamentRewardCollection shape.  ``basedOnPoints`` makes ``place``
+    # the win threshold for the asynchronous gauntlet rather than a ranking
+    # position.  This is deliberately stored as JSON so the event catalog can
+    # be configured without changing the protocol shape.
+    corinth_rewards = json.dumps({
+        "tournamentRewards": [{
+            "place": 5,
+            "range": 0,
+            "basedOnPoints": True,
+            "population": 0,
+            "rewards": [{
+                # TournamentRewardInfo.prizeResource is a ResourceId in the
+                # client protocol, not a bare JSON string.  The alternate-art
+                # Replicator's Gambit template is the KS1 epic below.
+                "prizeResource": {
+                    "m_Guid": "95e3096e-15fa-4bff-a3af-a44df6dc7c2c",
+                },
+                "quantity": 1,
+                "type": 3,
+                "population": 0,
+                "trid": 0,
+            }],
+        }],
+    }, separators=(",", ":"))
+    db.execute(
+        "UPDATE tournament_types SET rewards_json=? WHERE id=4",
+        (corinth_rewards,),
+    )
+    # Client-authored Iconoclast ban list. Store GUIDs so generated-card
+    # selection is independent of localized card names.
+    db.execute(
+        "DELETE FROM tournament_type_banned_cards WHERE tournament_type_id=4")
+    db.executemany(
+        "INSERT INTO tournament_type_banned_cards "
+        "(tournament_type_id, card_guid) VALUES (?, ?)",
+        [
+            (4, "79ba006b-5fae-44f2-b5f5-024c5d73a3b0"),
+            (4, "022207ee-02d8-44ea-84bb-cccf49f0fb18"),
+            (4, "3a4a6cac-48ff-4b90-8755-7dcd5d720548"),
+        ])
 
     if db.execute("SELECT COUNT(*) FROM chest_probabilities").fetchone()[0] == 0:
         db.executemany(

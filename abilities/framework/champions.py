@@ -27,9 +27,8 @@ def validate_ability_cost(db, session, player_uid, ability_guid, bstate):
     Returns (ok: bool, charge_cost: int, spell_cost: int, eff_sp_cost: int,
              missing_charges: int, missing_sp: int).
     """
-    row = db.execute(
-        "SELECT charge_cost, spell_cost FROM talent_abilities "
-        "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
+    from pve_db import db_talent_ability_costs
+    row = db_talent_ability_costs(ability_guid, conn=db)
     if not row:
         return False, 0, 0, 0, 0, 0
     cc = row[0] or 0

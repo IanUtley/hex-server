@@ -24,3 +24,4 @@ share/
 .mimocode/
 .env
 .env.*
+.venv-pyright/

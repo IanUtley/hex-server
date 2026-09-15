@@ -3,13 +3,14 @@
 import json, gzip, os
 
 from db import log_req
-from profile_db import (db_get_store_items, db_update_resources,
+from profile_db import (db_get_store_items, db_adjust_user_currency,
                         db_record_purchase, db_add_inventory, db_save_deck,
                         db_redeem_code, db_send_email,
                         db_next_card_instance_for_user, db_insert_card_instance,
                         db_add_collection, db_get_store_item,
                         db_get_user_currency, db_set_user_currency,
                         db_set_inventory_client_uid)
+from pvp_db import db_pvp_booster_card_guids
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, encode_store_response
 
 # Store deck data — loaded from JSON files in Hex root
@@ -49,6 +50,23 @@ def _grant_deck_to_player(user_id, cards, deck_name, handler=None, conn=None):
     if handler is not None:
         handler.push_cards_to_client()
     return deck_db_id
+
+
+def grant_vendor_code_cards(user_id, redeem_code, conn=None):
+    """Grant card instances for a card-bearing vendor code."""
+    if str(redeem_code).strip().lower() != "allpvp":
+        return []
+    next_id = db_next_card_instance_for_user(user_id, conn=conn)
+    grants = []
+    for template_guid in db_pvp_booster_card_guids(conn=conn):
+        db_add_collection(user_id, template_guid, 4, conn=conn)
+        for _ in range(4):
+            db_insert_card_instance(user_id, next_id, template_guid,
+                                    conn=conn)
+            next_id += 1
+        grants.append((template_guid, 4))
+    log_req(f"    Granted allpvp: {len(grants)} templates x4")
+    return grants
 
 
 def apply_purchase(conn, user_id, item_id, quantity):
@@ -105,18 +123,20 @@ def apply_purchase(conn, user_id, item_id, quantity):
 def apply_redeem(conn, user_id, redeem_code):
     """Apply a redemption and its system email in one transaction."""
     result = db_redeem_code(redeem_code, conn=conn)
-    if result is None:
-        return {"gold": 0, "platinum": 0, "redeemed": False}
-    new_gold = db_get_user_currency(user_id, "gold", conn=conn) + result["gold"]
-    new_platinum = (db_get_user_currency(user_id, "platinum", conn=conn)
-                    + result["platinum"])
-    db_update_resources(
-        user_id, gold=new_gold, platinum=new_platinum, conn=conn)
+    if not result["redeemed"]:
+        return {"gold": 0, "platinum": 0, "redeemed": False,
+                "error_message": result["error_message"]}
+    card_grants = grant_vendor_code_cards(user_id, redeem_code, conn=conn)
+    new_gold, new_platinum = db_adjust_user_currency(
+        user_id, gold_delta=result["gold"],
+        platinum_delta=result["platinum"], conn=conn)
     parts = []
     if result["gold"] > 0:
         parts.append(f"{result['gold']:,} Gold")
     if result["platinum"] > 0:
         parts.append(f"{result['platinum']:,} Platinum")
+    if card_grants:
+        parts.append(f"{len(card_grants)} PvP card templates x4")
     reward_desc = ", ".join(parts)
     db_send_email(
         user_id, f"Code Redeemed: {redeem_code}",
@@ -125,7 +145,9 @@ def apply_redeem(conn, user_id, redeem_code):
         "SYSTEM", conn=conn)
     return {
         "gold": result["gold"], "platinum": result["platinum"],
+        "card_grants": card_grants,
         "redeemed": True,
+        "error_message": "",
     }
 
 
@@ -171,6 +193,8 @@ def handle_purchase(handler, target, instance, reqid, comp, session_id, conh,
     else:
         p["gold"] = remaining
 
+    error_value = 0 if result["redeemed"] else 1
+    error_message = result.get("error_message", "")
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Escrow.PurchaseItemResponse",
          "System.Int32", "System.String",
@@ -240,6 +264,8 @@ def handle_redeem(handler, target, instance, reqid, comp, session_id, conh,
     if result["redeemed"]:
         p["gold"] += gold_delta
         p["platinum"] += plat_delta
+        if result.get("card_grants"):
+            handler.push_cards_to_client()
         log_req(f"    RedeemCode success: gold+{gold_delta} plat+{plat_delta}")
     else:
         log_req(f"    RedeemCode invalid: {redeem_code}")
@@ -248,7 +274,8 @@ def handle_redeem(handler, target, instance, reqid, comp, session_id, conh,
          "System.Collections.Generic.List`1#Game.Shared.ResourceId",
          "Game.Shared.ResourceId", "System.Guid", "System.Int32",
          "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits"],
+         "System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits",
+         "Game.Shared.Network.Escrow.ERedeemCodeError", "System.String"],
         [("ItemTemplateIds", "coll",
           ("System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)),
          ("GoldDelta", "int", gold_delta),
@@ -256,7 +283,10 @@ def handle_redeem(handler, target, instance, reqid, comp, session_id, conh,
          ("CardBits", "coll",
           ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
          ("StarterDecksBits", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits", 0))]
+          ("System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits", 0)),
+         ("Error", "enum1",
+          ("Game.Shared.Network.Escrow.ERedeemCodeError", error_value)),
+         ("ErrorMessage", "string", error_message)]
     )
 
     resp_body = compress_gzip(resp_inner) if comp else resp_inner

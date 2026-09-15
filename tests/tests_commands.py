@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import commands
 import game_engine
+import battle_engine
 
 
 class SessionStub:
@@ -21,6 +22,16 @@ class HandlerStub:
 
     def _card_full_data(self, _game, _scid, template_guid, _instance_id=None):
         return template_guid, "Troop", "Chosen Card", 1, 2, 3, 0
+
+
+class BattleSessionStub(SessionStub):
+    server_id = 1
+
+    def __init__(self, state):
+        self.turn_order = state
+
+    def _persist(self):
+        pass
 
 
 def test_top_moves_named_hand_card_to_deck_position_zero():
@@ -67,6 +78,55 @@ def test_top_moves_named_hand_card_to_deck_position_zero():
         db.close()
 
 
+def test_resource_command_persists_authoritative_pools():
+    session = BattleSessionStub(battle_engine.default_state())
+    session.turn_order["player_resources"] = 2
+    session.turn_order["player_total_resources"] = 3
+    old_send = commands._send_game_events
+    packets = []
+    commands._send_game_events = lambda *args: packets.append(args[1])
+    try:
+        result = commands._dispatch(
+            HandlerStub(), "resource", ["7", "9"], session,
+            game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+            "", "")
+        assert result == "Resources: 7/9 for me"
+        state = battle_engine.load_state(session)
+        assert state["player_resources"] == 7
+        assert state["player_total_resources"] == 9
+        events = packets[0].events
+        assert events[-1].resources == 7
+        assert events[-1].total_resources == 9
+    finally:
+        commands._send_game_events = old_send
+
+
+def test_threshold_command_reports_delta_from_previous_value():
+    state = battle_engine.default_state()
+    state["player_threshold"] = {4: 1}
+    session = BattleSessionStub(state)
+    old_send = commands._send_game_events
+    packets = []
+    commands._send_game_events = lambda *args: packets.append(args[1])
+    try:
+        commands._dispatch(
+            HandlerStub(), "threshold", ["me", "0", "3", "0", "0", "0", "0"],
+            session, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+            "", "")
+        assert battle_engine.load_state(session)["player_threshold"][4] == 3
+        threshold_events = [
+            event for event in packets[0].events
+            if isinstance(event, game_engine.PlayerResourceThresholdChangedSessionEventArgs)
+        ]
+        assert len(threshold_events) == 1
+        assert threshold_events[0].delta == 2
+        assert threshold_events[0].new_value == 3
+    finally:
+        commands._send_game_events = old_send
+
+
 if __name__ == "__main__":
     test_top_moves_named_hand_card_to_deck_position_zero()
+    test_resource_command_persists_authoritative_pools()
+    test_threshold_command_reports_delta_from_previous_value()
     print("PASS !top command")

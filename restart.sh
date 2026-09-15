@@ -59,6 +59,12 @@ esac
 
 stop_services() {
     log "Stopping previous processes (hconnect_server, proxy, tournament, replay)..."
+    if [[ -f /tmp/hex-supervisord.pid ]]; then
+        supervisor_pid="$(< /tmp/hex-supervisord.pid)"
+        if [[ "$supervisor_pid" =~ ^[0-9]+$ ]]; then
+            kill -TERM "$supervisor_pid" 2>/dev/null || true
+        fi
+    fi
     pkill -9 -f "$BASE_DIR/hconnect_server.py" 2>/dev/null || true
     pkill -9 -f "$BASE_DIR/proxy.py" 2>/dev/null || true
     pkill -9 -f "$BASE_DIR/gamemodes/tournament_server.py" 2>/dev/null || true
@@ -159,7 +165,23 @@ for logfile in "$LOG_DIR/hconnect_log.txt" "$LOG_DIR/proxy_log.txt" "$LOG_DIR/hc
 done
 echo "=================================" >> "$LOG_DIR/hconnect_log.txt"
 
+if [[ "${HEX_USE_SUPERVISOR:-0}" == "1" ]]; then
+    command -v supervisord >/dev/null 2>&1 || die \
+        "HEX_USE_SUPERVISOR=1 but supervisord is not installed (pip install -r requirements.txt)"
+    log "Starting Supervisor-managed Hex services ..."
+    export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
+    setsid nohup supervisord -n -c "$BASE_DIR/supervisord.conf" \
+        >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
+    SUPERVISOR_PID=$!
+    SERVER_PID=$SUPERVISOR_PID
+    PROXY_PID=$SUPERVISOR_PID
+    REPLAY_PID=$SUPERVISOR_PID
+else
 log "Starting HConnect server on :$SERVER_PORT ..."
+# The migrated RulesPort is the active transaction path for live client
+# sessions.  Keep an explicit override for rollback/probes, but make a plain
+# restart deterministic so the port cannot be silently skipped.
+export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
 setsid nohup python3 -u "$BASE_DIR/hconnect_server.py" \
     >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
 SERVER_PID=$!
@@ -177,6 +199,7 @@ log "Starting replay server ..."
 setsid nohup python3 -u "$BASE_DIR/replay_server.py" \
     >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
 REPLAY_PID=$!
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Wait until both processes are alive and their ports accept connections.

@@ -36,9 +36,8 @@ def _side_of(user_id):
 
 
 def _opponent_id(db, session_id, owner):
-    for (r,) in db.execute(
-            "SELECT DISTINCT user_id FROM game_cards WHERE session_id=?",
-            (session_id,)):
+    from pvp_db import db_session_user_ids
+    for (r,) in db_session_user_ids(session_id, conn=db):
         if r != owner:
             return r
     return 0
@@ -60,24 +59,31 @@ def _card_dict(row):
 
 def _cards_in_zones(db, session_id, user_id, zones, bstate=None,
                     include_champions=False):
-    placeholders = ",".join("?" * len(zones))
-    rows = db.execute(
-        "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-        "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-        "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-        "gc.card_attributes, ct.attributes "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-        "WHERE gc.session_id=? AND gc.location IN (%s)"
-        % placeholders,
-        [session_id] + list(zones)).fetchall()
+    from pvp_db import db_static_card_rows, db_card_mutation_field
+    rows = db_static_card_rows(session_id, zones, conn=db)
     if user_id is not None:
         rows = [r for r in rows if r[3] == user_id]
     out = [_card_dict(r) for r in rows]
+    # CardThresholdModifier/SubTypeModifier alter the instance context rather
+    # than the immutable card template.  Static target filters must see those
+    # current values in both the display and combat paths.
+    for card in out:
+        try:
+            buffs_value = db_card_mutation_field(
+                session_id, card["card_uid"], "permanent_buffs", conn=db)
+            buffs = json.loads(buffs_value or "{}") if buffs_value else {}
+            if isinstance(buffs, dict):
+                if isinstance(buffs.get("subtype"), str):
+                    card["subtype"] = buffs["subtype"]
+                if isinstance(buffs.get("thresholds"), list):
+                    card["shards"] = [int(value) for value in
+                                      buffs["thresholds"]]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
     if include_champions and bstate is not None:
         players = {}
-        for (uid,) in db.execute(
-                "SELECT DISTINCT user_id FROM game_cards WHERE session_id=?",
-                (session_id,)):
+        from pvp_db import db_session_user_ids
+        for (uid,) in db_session_user_ids(session_id, conn=db):
             players[uid] = _opponent_id(db, session_id, uid)
         champs = [
             (0, "ai", bstate.get("ai_health", 20)),
@@ -110,14 +116,8 @@ def _target_owner(db, session_id, owner, player_filter):
 
 def _card_property_value(db, session_id, card_uid, prop, bstate=None):
     """Read a typed current-card property for an ability variable."""
-    row = db.execute(
-        "SELECT COALESCE(ct.attack, 0), COALESCE(ct.defense, 0), "
-        "COALESCE(gc.card_attack_mod, 0), COALESCE(gc.card_defense_mod, 0), "
-        "gc.permanent_buffs, gc.temporary_buffs "
-        "FROM game_cards gc JOIN card_templates ct "
-        "ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_property_state
+    row = db_card_property_state(session_id, int(card_uid), conn=db)
     if not row:
         return None
     if prop == "ResourceCostTrue":
@@ -130,12 +130,8 @@ def _card_property_value(db, session_id, card_uid, prop, bstate=None):
         state = bstate if isinstance(bstate, dict) else None
         stack = state.setdefault("_card_property_cost_stack", []) if state is not None else []
         uid = int(card_uid)
-        row_cost = db.execute(
-            "SELECT COALESCE(ct.cost,0), COALESCE(gc.card_cost_mod,0) "
-            "FROM game_cards gc JOIN card_templates ct "
-            "ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session_id, uid)).fetchone()
+        from pvp_db import db_card_cost_location_state
+        row_cost = db_card_cost_location_state(session_id, uid, conn=db)
         if uid in stack:
             return max(0, int(row_cost[0] or 0) + int(row_cost[1] or 0)) if row_cost else 0
         stack.append(uid)
@@ -354,16 +350,8 @@ def ability_variable_value(db, session_id, bstate, ability_guid, var_name,
     if not ability_guid or not var_name:
         return None
     raw = None
-    for table in ("card_abilities_meta", "champion_abilities"):
-        try:
-            row = db.execute(
-                "SELECT raw_json FROM %s WHERE ability_guid=? LIMIT 1" % table,
-                (str(ability_guid).lower(),)).fetchone()
-        except Exception:
-            row = None
-        if row and row[0]:
-            raw = row[0]
-            break
+    from pvp_db import db_any_ability_raw_json
+    raw = db_any_ability_raw_json(ability_guid, conn=db)
     if raw is None:
         from .fields import _raw_ability
         raw = json.dumps(_raw_ability(db, ability_guid))
@@ -483,16 +471,8 @@ def _sum_list_attr_variable(db, session_id, bstate, owner, var, source_uid):
             card_uid = int(value)
         except (TypeError, ValueError):
             continue
-        row = db.execute(
-            "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-            "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-            "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-            "gc.card_attributes, ct.attributes, gc.card_attack_mod, "
-            "gc.card_defense_mod, gc.permanent_buffs, gc.temporary_buffs "
-            "FROM game_cards gc JOIN card_templates ct "
-            "ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session_id, card_uid)).fetchone()
+        from pvp_db import db_card_list_stat_row
+        row = db_card_list_stat_row(session_id, card_uid, conn=db)
         if not row:
             continue
         card = _card_dict(row[:13])
@@ -654,6 +634,8 @@ def _flag_from_text(text):
         flags.add("prevent_noncombat_damage")
     if "can't gain health" in low or "cannot gain health" in low:
         flags.add("cant_gain_health")
+    if "can't lose health" in low or "cannot lose health" in low:
+        flags.add("cant_lose_health")
     if "can't play cards" in low or "cannot play cards" in low:
         flags.add("cant_play_cards")
     if "no maximum hand size" in low:
@@ -672,6 +654,25 @@ def _flag_from_text(text):
     if m:
         flags.add("rage")
     return flags
+
+
+def _flag_from_typed_intattr(attribute):
+    """Map the client IntAttr enum to the internal rule flags.
+
+    ``m_Attribute`` is the rules value; ``m_GameText`` is only its localized
+    presentation.  Keep the text parser as a compatibility path for old
+    extracted rows which do not contain the typed field.
+    """
+    name = str(attribute or "").rsplit(".", 1)[-1].lower()
+    return {
+        "cantgainhealth": {"cant_gain_health"},
+        "cantlosehealth": {"cant_lose_health"},
+        "cantplaycards": {"cant_play_cards"},
+        "unlimitedhandsize": {"no_max_hand_size"},
+        "preventcombatdamage": {"prevent_combat_damage"},
+        "preventnoncombatdamage": {"prevent_noncombat_damage"},
+        "shinharecreationbonus": {"shinhare_plus_one"},
+    }.get(name, set())
 
 
 def _apply_leaf(db, session_id, bstate, param, raw, owner, source_uid,
@@ -697,10 +698,11 @@ def _apply_leaf(db, session_id, bstate, param, raw, owner, source_uid,
         if bits:
             deltas["attrs"] |= bits
     elif prop == "intattr":
-        deltas["flags"] |= _flag_from_text(text)
         # Data-driven from the gamedata IntAttrModifier fields
         # (m_Attribute/m_Value), not the effect's game text.
         attr = param.get("attribute") or ""
+        typed_flags = _flag_from_typed_intattr(attr)
+        deltas["flags"] |= (typed_flags if attr else _flag_from_text(text))
         base = int(param.get("amount") or 0)
         if attr == "Rage" and base > 0:
             if "for each" in (text or "").lower() or \
@@ -726,7 +728,12 @@ def _apply_leaf(db, session_id, bstate, param, raw, owner, source_uid,
                 deltas["rage"] = deltas.get("rage", 0) + base
                 deltas["attrs"] |= game_engine.ECardAttributes.Rage
     elif prop == "damagemultiplier":
-        deltas["flags"].add("double_damage")
+        if param.get("combatdamageonly"):
+            deltas["flags"].add("double_combat_damage")
+        elif param.get("noncombatdamageonly"):
+            deltas["flags"].add("double_noncombat_damage")
+        else:
+            deltas["flags"].add("double_damage")
     elif prop in ("blockimmunityexception", "blockimmunity", "blockrestriction"):
         deltas["flags"] |= _flag_from_text(text)
     elif prop == "damageimmunity":
@@ -737,15 +744,13 @@ def _apply_leaf(db, session_id, bstate, param, raw, owner, source_uid,
 
 def _static_leaves(db, ability_guid):
     """[(param, raw_json)] for a static ability's CardModifier leaves."""
-    row = db.execute(
-        "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-        (ability_guid,)).fetchone()
-    raw = row[0] if row else ""
+    from pvp_db import db_ability_raw_json, db_ability_effect_rows
+    raw = db_ability_raw_json(ability_guid, conn=db) or ""
     out = []
-    for effect_guid, etype, param in db.execute(
-            "SELECT effect_guid, effect_type, param FROM ability_effects "
-            "WHERE ability_guid=? AND effect_type='CardModifierAbilityEffectTemplate'",
-            (ability_guid,)):
+    for effect_guid, etype, param in db_ability_effect_rows(
+            ability_guid, conn=db):
+        if etype != "CardModifierAbilityEffectTemplate":
+            continue
         try:
             pm = json.loads(param or "{}")
         except Exception:
@@ -773,6 +778,22 @@ def _static_leaves(db, ability_guid):
                     "counter_template_guid"]
             if typed.get("operation"):
                 pm["operation"] = typed["operation"]
+            if typed.get("input_variable"):
+                pm["input_variable"] = typed["input_variable"]
+            if typed.get("input_value") and not pm.get("amount"):
+                pm["amount"] = typed["input_value"]
+            # m_Value is the literal operand for IntAttrModifier and is
+            # distinct from m_InputValue (which is usually a variable).
+            if "value" in typed:
+                pm["amount"] = typed["value"]
+            for key in ("cardfilter", "iscombatdamage", "copysourcecard",
+                        "setthresholds", "shard", "subtype"):
+                if key in typed:
+                    pm[key] = typed[key]
+            for key in ("combatdamageonly", "noncombatdamageonly",
+                        "replaceexistingvalue"):
+                if key in typed:
+                    pm[key] = typed[key]
             if "value" in typed:
                 pm["amount"] = typed["value"]
         out.append((pm, raw))
@@ -781,20 +802,17 @@ def _static_leaves(db, ability_guid):
 
 def _card_static_abilities(db, session_id, card_uid):
     """Static ability GUIDs + raw_json for one card instance."""
-    row = db.execute(
-        "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
-    if not row or not row[0]:
+    from pvp_db import db_card_ability_payload, db_ability_static_metadata
+    payload = db_card_ability_payload(session_id, int(card_uid), conn=db)
+    if not payload:
         return []
     try:
-        ags = [g.lower() for g in json.loads(row[0])]
+        ags = [g.lower() for g in json.loads(payload)]
     except Exception:
         return []
     out = []
     for ag in ags:
-        m = db.execute(
-            "SELECT trigger_event_type, is_manual, raw_json "
-            "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
+        m = db_ability_static_metadata(ag, conn=db)
         if not m:
             continue
         # Zone-wide statics (socketed gems' "Rage 1 in all zones") are
@@ -809,20 +827,55 @@ def _card_static_abilities(db, session_id, card_uid):
                 flags = fm.group(1)
             is_zone_static = all(z in flags for z in
                                   ("Deck", "Hand", "Warzone", "Discard"))
-        if (not m[0] and not m[1]) or is_zone_static:
+        # A trigger collection covering every zone does not make a triggered
+        # ability continuous.  Grave Nibbler's one-shot has all-zone
+        # collection flags because it listens while Underground; treating it
+        # as static applies its +2/+2 once continuously and again when the
+        # death trigger resolves.  Only CardCreatedEvent abilities use this
+        # all-zone static convention.
+        if ((not m[0] and not m[1]) or
+                (is_zone_static and "CardCreatedEvent" in str(m[0]))):
             out.append((ag, raw))
+    return out
+
+
+def rule_modifiers(db, session_id, bstate, card_uid):
+    """Return typed rule modifiers currently attached to one card.
+
+    Runtime modifiers are kept in the instance buff JSON.  Continuous card
+    abilities are folded from the same Records-backed leaves so combat does
+    not depend on localized text or on whether a client refresh happened.
+    """
+    out = []
+    for column in ("permanent_buffs", "temporary_buffs"):
+        from pvp_db import db_card_mutation_field
+        value = db_card_mutation_field(session_id, int(card_uid), column, conn=db)
+        try:
+            buffs = json.loads(value or "{}") if value else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            buffs = {}
+        if isinstance(buffs, dict):
+            out.extend(value for value in buffs.get("rule_modifiers", [])
+                       if isinstance(value, dict))
+    for ability_guid, _raw in _card_static_abilities(
+            db, session_id, int(card_uid)):
+        for param, _raw_effect in _static_leaves(db, ability_guid):
+            if param.get("property") in (
+                    "damageimmunity", "targetingimmunity", "attackimmunity",
+                    "blockimmunity", "blockimmunityexception",
+                    "blockrestriction", "damagemultiplier"):
+                out.append(dict(param))
     return out
 
 
 def self_deltas(db, session_id, bstate, card_uid):
     """Deltas from the card's own static abilities (self-targeting leaves)."""
-    row = db.execute(
-        "SELECT user_id, location FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_owner_location_position
+    row = db_card_owner_location_position(session_id, int(card_uid), conn=db)
     if not row:
         return {"atk": 0, "def": 0, "cost_mod": 0, "attrs": 0,
                 "flags": set(), "rage": 0}
-    owner, loc = row
+    owner, loc, _position = row
     if loc != "warzone":
         # WhileCardInPlay statics only apply while the card is in play; zone-
         # wide cost reductions come through the aura pass instead.
@@ -876,9 +929,8 @@ def self_deltas(db, session_id, bstate, card_uid):
 
 
 def _target_template(db, template_id):
-    row = db.execute(
-        "SELECT collection_flags, player_filter, filter_json, game_text "
-        "FROM target_templates WHERE template_id=?", (template_id,)).fetchone()
+    from pvp_db import db_static_target_template
+    row = db_static_target_template(template_id, conn=db)
     if not row:
         return None
     try:
@@ -905,13 +957,12 @@ def _target_kind(tt):
 
 
 def _ability_target_templates(db, ability_guid):
-    row = db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (ability_guid,)).fetchone()
-    if not row or not row[0]:
+    from pvp_db import db_ability_target_template_ids
+    payload = db_ability_target_template_ids(ability_guid, conn=db)
+    if not payload:
         return []
     try:
-        ids = json.loads(row[0])
+        ids = json.loads(payload)
     except Exception:
         return []
     return [i for i in ids if i]
@@ -920,25 +971,27 @@ def _ability_target_templates(db, ability_guid):
 def aura_deltas(db, session_id, bstate, card_uid):
     """Deltas from other cards the controller controls whose static aura
     targets this card (e.g. Soul Armaments' +2/+2 to troops you control)."""
-    row = db.execute(
-        "SELECT user_id, location FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_owner_location_position
+    row = db_card_owner_location_position(session_id, int(card_uid), conn=db)
     if not row:
         return {"atk": 0, "def": 0, "cost_mod": 0, "attrs": 0,
                 "flags": set(), "rage": 0}
-    owner, loc = row
+    owner, loc, _position = row
     empty = {"atk": 0, "def": 0, "cost_mod": 0, "attrs": 0,
              "flags": set(), "rage": 0}
     if loc != "warzone":
         # Zone-wide auras can still hit cards outside the warzone (e.g.
         # Technical Genius: "Your artifacts in all zones have cost -1").
         pass
-    # Cards that can project an aura: the controller's warzone cards.
-    holders = db.execute(
-        "SELECT card_uid, card_abilities FROM game_cards "
-        "WHERE session_id=? AND user_id=? AND location='warzone' "
-        "AND card_uid!=? AND card_abilities!=''",
-        (session_id, owner, int(card_uid))).fetchall()
+    # Cards that can project an aura: the controller's permanents, including
+    # underground cards.  CardCreatedEvent abilities whose trigger collection
+    # covers every zone are continuous statics in the client; Subterranean
+    # Saboteur is the canonical example (its underground ability changes the
+    # effective casting speed of matching cards already in hand).
+    from pvp_db import db_cards_in_zones_with_abilities
+    holders = [row for row in db_cards_in_zones_with_abilities(
+        session_id, owner, ("warzone", "underground"), conn=db)
+        if int(row[0]) != int(card_uid)]
     total = dict(empty)
     for src_uid, ab_json in holders:
         try:
@@ -946,11 +999,19 @@ def aura_deltas(db, session_id, bstate, card_uid):
         except Exception:
             continue
         for ag in ags:
-            m = db.execute(
-                "SELECT trigger_event_type, is_manual, raw_json "
-                "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
-            if not m or m[0] or m[1]:
+            from pvp_db import db_ability_static_metadata
+            m = db_ability_static_metadata(ag, conn=db)
+            if not m or m[1]:
                 continue
+            if m[0]:
+                raw = m[2] or ""
+                # Only CardCreatedEvent abilities authored for all relevant
+                # collections are continuous.  Other triggered abilities
+                # must still resolve through the trigger dispatcher.
+                if "CardCreatedEvent" not in str(m[0]) or not all(
+                        zone in raw for zone in
+                        ('Deck', 'Hand', 'Warzone', 'Discard')):
+                    continue
             tpl_ids = _ability_target_templates(db, ag)
             if not tpl_ids:
                 continue  # self-targeting ability — handled by self_deltas
@@ -1014,13 +1075,8 @@ def effective_stats(db, session_id, bstate, card_uid):
     it must be kept alongside the other combat flags for authoritative
     resolution.
     """
-    row = db.execute(
-        "SELECT gc.card_attack_mod, gc.card_defense_mod, gc.card_damage, "
-        "gc.card_attributes, ct.attack, ct.defense, ct.attributes, "
-        "gc.permanent_buffs, gc.temporary_buffs, gc.temporary_attributes "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_combat_state
+    row = db_card_combat_state(session_id, int(card_uid), conn=db)
     if not row:
         return 0, 0, 0, set(), 0
     atk = (row[4] or 0) + (row[0] or 0)
@@ -1028,15 +1084,33 @@ def effective_stats(db, session_id, bstate, card_uid):
     dmg = row[2] or 0
     attrs = (row[3] or 0) | (row[6] or 0) | (row[9] or 0)
     instance_rage = 0
+    instance_damage_flags = set()
     for buff_col in (row[7], row[8]):
         try:
             buffs = json.loads(buff_col or "{}")
             atk += int(buffs.get("atk", 0) or 0)
             def_ += int(buffs.get("def", 0) or 0)
             instance_rage += int(buffs.get("rage", 0) or 0)
+            for rule in buffs.get("rule_modifiers", []) or []:
+                if not isinstance(rule, dict):
+                    continue
+                if rule.get("property") != "damagemultiplier":
+                    continue
+                if int(rule.get("value", 0) or 0) <= 1:
+                    continue
+                if rule.get("combatdamageonly"):
+                    d_flags = {"double_combat_damage"}
+                elif rule.get("noncombatdamageonly"):
+                    d_flags = {"double_noncombat_damage"}
+                else:
+                    d_flags = {"double_damage"}
+                # ``d`` is initialized below; retain the temporary flags in
+                # the local accumulator until the static deltas are merged.
+                instance_damage_flags |= d_flags
         except Exception:
             pass
     d = effective_deltas(db, session_id, bstate, card_uid)
+    d["flags"] |= instance_damage_flags
     atk += d["atk"]
     def_ += d["def"]
     attrs |= d["attrs"]
@@ -1044,11 +1118,9 @@ def effective_stats(db, session_id, bstate, card_uid):
     # Rage (e.g. a socketed gem's "Rage 1 in all zones").  Guarded for DBs /
     # fixtures without the column.
     try:
-        rv = db.execute(
-            "SELECT ct.rage_value FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session_id, int(card_uid))).fetchone()
+        from pvp_db import db_card_rage_lethal
+        rv_all = db_card_rage_lethal(session_id, int(card_uid), conn=db)
+        rv = (rv_all[:1] if rv_all else None)
         if rv and rv[0]:
             d["rage"] += int(rv[0])
     except Exception:
@@ -1069,11 +1141,9 @@ def effective_stats(db, session_id, bstate, card_uid):
     # Keep this query additive so older focused test fixtures without the
     # migrated column continue to resolve as cards without Lethal.
     try:
-        lethal_row = db.execute(
-            "SELECT ct.lethal FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session_id, int(card_uid))).fetchone()
+        from pvp_db import db_card_rage_lethal
+        lethal_all = db_card_rage_lethal(session_id, int(card_uid), conn=db)
+        lethal_row = (lethal_all[1],) if lethal_all else None
     except sqlite3.OperationalError:
         lethal_row = None
     if lethal_row and lethal_row[0]:
@@ -1081,15 +1151,23 @@ def effective_stats(db, session_id, bstate, card_uid):
     return atk, max(0, def_ - dmg), attrs, d["flags"], d["rage"]
 
 
+def effective_attributes(db, session_id, bstate, card_uid):
+    """Return the current combat keyword bits for one card instance.
+
+    Combat option generation must use the same continuous/static evaluation as
+    combat resolution.  In particular, conditional CardModifier abilities
+    (Electroid's Dwarf/Robot count is one example) are not persisted in
+    ``game_cards.card_attributes``.
+    """
+    return effective_stats(db, session_id, bstate, card_uid)[2]
+
+
 def effective_cost(db, session_id, bstate, card_uid):
     """Current play cost of a card instance (template cost + cost modifiers +
     continuous static cost reductions) — the X value for AbilityResourceXCost
     variables and the cost shown/charged for hand cards."""
-    row = db.execute(
-        "SELECT ct.cost, gc.card_cost_mod, gc.cost_mod_json, gc.location "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_cost_location_state
+    row = db_card_cost_location_state(session_id, int(card_uid), conn=db)
     if not row:
         return 0
     cost = (row[0] or 0) + (row[1] or 0)
@@ -1123,9 +1201,8 @@ def controller_flags(db, session_id, bstate, owner):
     """Aggregated combat flags from every static ability the controller has in
     play (e.g. Te'talca's "your cards and effects deal double damage")."""
     flags = set()
-    for (uid,) in db.execute(
-            "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
-            "AND location='warzone'", (session_id, owner)):
+    from pvp_db import db_warzone_card_uids
+    for (uid,) in db_warzone_card_uids(session_id, owner, conn=db):
         d = self_deltas(db, session_id, bstate, uid)
         flags |= d["flags"]
     return flags
@@ -1135,9 +1212,8 @@ def global_flags(db, session_id, bstate):
     """Flags from every player's warzone statics (e.g. Emberspire Witch's
     "Champions can't gain health" applies while she is in play)."""
     flags = set()
-    for (owner,) in db.execute(
-            "SELECT DISTINCT user_id FROM game_cards "
-            "WHERE session_id=? AND location='warzone'", (session_id,)):
+    from pvp_db import db_warzone_owner_ids
+    for (owner,) in db_warzone_owner_ids(session_id, conn=db):
         flags |= controller_flags(db, session_id, bstate, owner)
     return flags
 
@@ -1152,10 +1228,8 @@ def health_gain_bonus(db, session_id, bstate, owner):
     copies stack independently.
     """
     total = 0
-    rows = db.execute(
-        "SELECT card_uid FROM game_cards "
-        "WHERE session_id=? AND user_id=? AND location='warzone'",
-        (session_id, owner)).fetchall()
+    from pvp_db import db_warzone_card_uids
+    rows = db_warzone_card_uids(session_id, owner, conn=db)
     for (card_uid,) in rows:
         for ability_guid, _raw in _card_static_abilities(
                 db, session_id, int(card_uid)):
@@ -1189,16 +1263,48 @@ def can_block(db, session_id, bstate, attacker_uid, blocker_uid):
         db, session_id, bstate, attacker_uid)
     b_atk, b_def, b_attrs, b_flags, _ = effective_stats(
         db, session_id, bstate, blocker_uid)
-    brow = db.execute(
-        "SELECT card_type, card_state FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session_id, int(blocker_uid))).fetchone()
+    from pvp_db import db_card_mutation_info, db_card_state_value
+    brow_info = db_card_mutation_info(session_id, int(blocker_uid), conn=db)
+    brow_state = db_card_state_value(session_id, int(blocker_uid), conn=db)
+    brow = (brow_info[2], brow_state) if brow_info else None
     if not brow or "Troop" not in (brow[0] or ""):
         return False
     if int(brow[1] or 0) & game_engine.ECardStates.Tapped:
         return False
     if b_attrs & game_engine.ECardAttributes.CantBlock:
         return False
+    combat_cards = _cards_in_zones(
+        db, session_id, None, ["warzone"], bstate=bstate)
+    by_uid = {int(card["card_uid"]): card for card in combat_cards}
+    attacker_card = by_uid.get(int(attacker_uid))
+    blocker_card = by_uid.get(int(blocker_uid))
+    if attacker_card and blocker_card:
+        def _matches(candidate, source, rule):
+            filter_json = rule.get("filter") or rule.get("cardfilter")
+            return bool(filter_json and evaluate_card_filter(
+                candidate, filter_json, int(source["card_uid"]),
+                source_card=source, card_pool=combat_cards,
+                ability_state=bstate, db=db))
+
+        attacker_rules = rule_modifiers(
+            db, session_id, bstate, int(attacker_uid))
+        block_immunity = [rule for rule in attacker_rules
+                          if rule.get("property") == "blockimmunity"]
+        if any(_matches(blocker_card, attacker_card, rule)
+               for rule in block_immunity):
+            return False
+        exceptions = [rule for rule in attacker_rules
+                      if rule.get("property") == "blockimmunityexception"]
+        if exceptions and not any(
+                _matches(blocker_card, attacker_card, rule)
+                for rule in exceptions):
+            return False
+        blocker_rules = rule_modifiers(
+            db, session_id, bstate, int(blocker_uid))
+        if any(_matches(attacker_card, blocker_card, rule)
+               for rule in blocker_rules
+               if rule.get("property") == "blockrestriction"):
+            return False
     # "Unblockable" (CantBeBlocked, e.g. Infiltrator Bot's activated ability):
     # the attacker cannot be blocked at all.
     if a_attrs & game_engine.ECardAttributes.CantBeBlocked:
@@ -1214,11 +1320,8 @@ def can_block(db, session_id, bstate, attacker_uid, blocker_uid):
             return False
         is_artifact = False
         is_blood = False
-        row = db.execute(
-            "SELECT ct.card_type, ct.threshold_json FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session_id, int(blocker_uid))).fetchone()
+        from pvp_db import db_card_type_threshold
+        row = db_card_type_threshold(session_id, int(blocker_uid), conn=db)
         if row:
             ctype = row[0] or ""
             is_troop = "Troop" in ctype

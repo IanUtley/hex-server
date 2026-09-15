@@ -32,6 +32,7 @@ INC_COUNTER = "12a1bb1f-6308-650c-4d75-35a12cb4c5cd"
 DROO = "6a095431-820f-5d7c-dd9f-2eef65ce4e7c"
 VILEFANG = "0ead517d-9926-d1ff-becf-fada9afc6f31"
 RIDGE_RAIDER_DEATH = "3b79c597-7b6e-0896-7128-fd6b1df48f03"
+GORTEZUMA_COND = "180773b3-b10b-5633-f60c-42eb3556fd9d"
 
 
 class SessionStub:
@@ -75,7 +76,11 @@ def make_db():
             db.execute(
                 "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
     for row in src.execute(
-            "SELECT * FROM ability_effect_conditions WHERE condition_id=?", (INC_COND,)):
+        "SELECT * FROM ability_effect_conditions WHERE condition_id=?", (INC_COND,)):
+        db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
+    for row in src.execute(
+        "SELECT * FROM ability_effect_conditions WHERE condition_id=?",
+        (GORTEZUMA_COND,)):
         db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
     for row in src.execute(
             "SELECT * FROM card_counter_templates WHERE template_id=?", (INC_COUNTER,)):
@@ -338,6 +343,22 @@ def test_has_source_resource_cost_compares_live_source(db):
     assert evaluate_card_filter(pricier, filt, 1, source_card=source)
 
 
+def test_champion_health_condition_honors_controller_and_opponent(db):
+    """Gortezuma checks the opposing champion, in PvE and persisted PvP."""
+    pve = ctx(db, ability_source_uid=700, ability_source_owner_id=5,
+              bstate={"player_health": 20, "ai_health": 20})
+    assert not evaluate_effect_condition(db, GORTEZUMA_COND, pve)
+    pve.bstate["ai_health"] = 10
+    assert evaluate_effect_condition(db, GORTEZUMA_COND, pve)
+
+    pvp = ctx(db, ability_source_uid=700, ability_source_owner_id=1001,
+              bstate={"pvp": True, "pids": [1001, 1002],
+                      "hp_1001": 20, "hp_1002": 20})
+    assert not evaluate_effect_condition(db, GORTEZUMA_COND, pvp)
+    pvp.bstate["hp_1002"] = 10
+    assert evaluate_effect_condition(db, GORTEZUMA_COND, pvp)
+
+
 def test_tac_trigger_condition_matches_threshold_event_tac(db):
     condition = {
         "m_TriggerCondition": {
@@ -369,5 +390,7 @@ if __name__ == "__main__":
         test_common_trigger_conditions_are_metadata_faithful)
     run("HasSourceResourceCost compares live source",
         test_has_source_resource_cost_compares_live_source)
+    run("Champion health condition honors opponent",
+        test_champion_health_condition_honors_controller_and_opponent)
     run("TAC trigger matches threshold event TAC",
         test_tac_trigger_condition_matches_threshold_event_tac)

@@ -33,7 +33,11 @@ DB_PATH = os.environ.get(
 REQUEST_LOG = "/tmp/hconnect_requests.log"
 _log_req_file = open(REQUEST_LOG, "a", buffering=1)
 
-_SQLITE_RETRY_DELAYS = (0.05, 0.10, 0.25, 0.50, 1.00)
+# SQLITE_BUSY honors the connection busy timeout; SQLITE_LOCKED variants do
+# not.  The latter can occur while another service is finishing a short
+# session/tournament save, so keep retrying long enough for that writer to
+# finish instead of consuming a valid PvP action and acknowledging a no-op.
+_SQLITE_RETRY_DELAYS = (0.05, 0.10, 0.25, 0.50, 1.00, 2.00, 4.00, 8.00)
 _SQLITE_LOCK_CODES = {
     getattr(sqlite3, "SQLITE_BUSY", 5),
     getattr(sqlite3, "SQLITE_LOCKED", 6),
@@ -43,6 +47,45 @@ _SQLITE_LOCK_CODES = {
 _sqlite_retry_stats = Counter()
 _sqlite_retry_stats_lock = threading.Lock()
 _SQLITE_RETRY_LOG_MILESTONES = {1, 2, 3, 5, 10, 25, 50, 100}
+
+_named_row_types = {}
+
+
+def _named_row_factory(cursor, values):
+    """Return a tuple-compatible row that also supports column-name access.
+
+    Keeping the tuple base is intentional: a large amount of older server
+    code compares returned rows with tuples or iterates them.  New code can
+    use ``row[\"column_name\"]`` without having to know where that column is
+    positioned in the SELECT list.
+    """
+    columns = tuple(column[0] for column in cursor.description)
+    row_type = _named_row_types.get(columns)
+    if row_type is None:
+        class NamedRow(tuple):
+            __columns__ = columns
+
+            def __getitem__(self, key):
+                if isinstance(key, str):
+                    try:
+                        key = self.__columns__.index(key)
+                    except ValueError as exc:
+                        raise IndexError(key) from exc
+                return super().__getitem__(key)
+
+            def keys(self):
+                return self.__columns__
+
+            def get(self, key, default=None):
+                try:
+                    return self[key]
+                except IndexError:
+                    return default
+
+        row_type = NamedRow
+        row_type.__name__ = "NamedRow"
+        _named_row_types[columns] = row_type
+    return row_type(values)
 
 
 def _sqlite_sql_shape(sql):
@@ -160,7 +203,7 @@ def connect(database_path=None, *, check_same_thread=True):
         check_same_thread=check_same_thread,
     )
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = _named_row_factory
     return conn
 
 
@@ -361,9 +404,10 @@ def db_ensure_resource_grants(db=None):
     con.commit()
 
 
-def db_card_ability_list(session_id, card_uid):
+def db_card_ability_list(session_id, card_uid, conn=None):
     """Current ability GUID list for a card instance (game_cards.card_abilities)."""
-    row = _db.execute(
+    connection = conn or _db
+    row = connection.execute(
         "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
         (session_id, int(card_uid))).fetchone()
     if not row or not row[0]:
@@ -449,7 +493,6 @@ def log(msg):
 # sqlite3 timeout (5 seconds) can turn that collision into a request failure.
 # Wait longer for the writer to finish instead.
 _db = connect(DB_PATH, check_same_thread=False)
-_db.row_factory = None
 _db.execute("PRAGMA busy_timeout=30000")
 _db.execute("PRAGMA journal_mode=WAL")
 _db.execute("PRAGMA foreign_keys=ON")
@@ -675,6 +718,55 @@ def db_add_collection(user_id, template_guid, quantity=1, conn=None):
         connection.commit()
 
 
+def db_remove_collection(user_id, template_guid, quantity=1, conn=None):
+    """Remove available card copies from a collection in the caller's transaction."""
+    connection = conn or _db
+    connection.execute(
+        "UPDATE collections SET quantity=quantity-? "
+        "WHERE user_id=? AND card_template_id=? AND quantity>=?",
+        (int(quantity), user_id, template_guid, int(quantity)))
+    if conn is None:
+        connection.commit()
+
+
+def db_reward_card_template(template_guid, conn=None):
+    """Return card display fields needed for a persisted reward."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT name, cost, attack, defense FROM card_templates "
+        "WHERE guid=?", (template_guid,)).fetchone()
+
+
+def db_grant_card_instance(user_id, template_guid, conn=None):
+    """Add one collection copy and create its owned card instance."""
+    connection = conn or _db
+    db_add_collection(user_id, template_guid, 1, connection)
+    instance_id = db_next_card_instance_for_user(user_id, connection)
+    db_insert_card_instance(user_id, instance_id, template_guid, connection)
+    if conn is None:
+        connection.commit()
+    return instance_id
+
+
+def db_update_champion_xp(champion_id, xp, level, conn=None):
+    """Persist a computed champion XP/level pair."""
+    connection = conn or _db
+    connection.execute(
+        "UPDATE champions SET xp=?, level=? WHERE id=?",
+        (int(xp), int(level), champion_id))
+    if conn is None:
+        connection.commit()
+
+
+def db_champion_reward_profile(champion_id, conn=None):
+    """Return champion fields needed for reward response encoding."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT id, champion_name, level, xp, champion_class, race, gender, "
+        "last_campaign_id, last_deck_id, is_deleted, pet_name "
+        "FROM champions WHERE id=?", (champion_id,)).fetchone()
+
+
 def db_add_card(user_id, template_id):
     existing = _db.execute("SELECT id, quantity FROM collections WHERE user_id=? AND card_template_id=?", (user_id, template_id)).fetchone()
     if existing:
@@ -709,6 +801,119 @@ def db_get_inventory(user_id):
     """Return list of (template_guid, quantity) for profile push."""
     rows = _db.execute("SELECT template_guid, quantity FROM player_inventory WHERE user_id=?", (user_id,)).fetchall()
     return [(r[0], r[1]) for r in rows]
+
+
+def db_inventory_item(user_id, template_guid, conn=None):
+    """Return ``(id, quantity, client_item_uid)`` for one inventory item."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT id, quantity, client_item_uid FROM player_inventory "
+        "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
+        (user_id, template_guid)).fetchone()
+
+
+def db_consume_inventory(user_id, template_guid, quantity, conn=None):
+    """Atomically consume inventory and return ``(client_uid, remaining)``."""
+    connection = conn or _db
+    row = db_inventory_item(user_id, template_guid, connection)
+    if not row or int(row[1] or 0) < int(quantity):
+        return None
+    remaining = int(row[1] or 0) - int(quantity)
+    if remaining:
+        connection.execute(
+            "UPDATE player_inventory SET quantity=? WHERE id=?",
+            (remaining, row[0]))
+    else:
+        connection.execute("DELETE FROM player_inventory WHERE id=?", (row[0],))
+    if conn is None:
+        connection.commit()
+    return row[2] or 0, remaining
+
+
+def db_next_inventory_client_uid(user_id, conn=None):
+    """Return the next stable client-facing inventory UID for a user."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
+        "FROM player_inventory WHERE user_id=?", (user_id,)).fetchone()
+    return int(row[0] or 1)
+
+
+def db_upsert_inventory_item(user_id, template_guid, quantity=1,
+                             client_item_uid=0, conn=None):
+    """Add inventory and assign a client UID when the row lacks one."""
+    connection = conn or _db
+    row = db_inventory_item(user_id, template_guid, connection)
+    if row:
+        item_id, old_quantity, old_uid = row
+        new_uid = old_uid or client_item_uid
+        connection.execute(
+            "UPDATE player_inventory SET quantity=?, client_item_uid=? "
+            "WHERE id=?", (int(old_quantity or 0) + int(quantity),
+                            new_uid, item_id))
+    else:
+        new_uid = client_item_uid
+        connection.execute(
+            "INSERT INTO player_inventory "
+            "(user_id, template_guid, quantity, client_item_uid) "
+            "VALUES (?,?,?,?)", (user_id, template_guid, quantity, new_uid))
+    if conn is None:
+        connection.commit()
+    return new_uid
+
+
+def db_add_stardust(user_id, rarity, quantity=1, conn=None):
+    """Add stardust of one rarity within the caller's transaction."""
+    connection = conn or _db
+    connection.execute(
+        "INSERT INTO stardust (user_id, rarity, quantity) VALUES (?,?,?) "
+        "ON CONFLICT(user_id, rarity) DO UPDATE SET quantity=quantity+?",
+        (user_id, rarity, quantity, quantity))
+    if conn is None:
+        connection.commit()
+
+
+def db_pack_set_info(pack_guid, conn=None):
+    """Return ``(set_guid, is_full_set, is_primal)`` for a pack mapping."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT set_guid, is_full_set, is_primal FROM pack_set_map "
+        "WHERE pack_guid=?", (pack_guid,)).fetchone()
+
+
+def db_chest_probabilities(conn=None):
+    """Return weighted chest rarity rows for reward selection."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT rarity, weight FROM chest_probabilities").fetchall()
+
+
+def db_create_treasure_chest(user_id, set_guid, rarity, conn=None,
+                             template_guid=None):
+    """Create one unopened treasure chest and return its database ID."""
+    connection = conn or _db
+    if template_guid is None:
+        cur = connection.execute(
+            "INSERT INTO treasure_chests (user_id, set_guid, chest_rarity) "
+            "VALUES (?,?,?)", (user_id, set_guid, rarity))
+    else:
+        cur = connection.execute(
+            "INSERT INTO treasure_chests "
+            "(user_id, set_guid, chest_rarity, opened, template_guid) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (user_id, set_guid, rarity, template_guid))
+    if conn is None:
+        connection.commit()
+    return cur.lastrowid
+
+
+def db_get_unopened_chests_full(user_id, conn=None):
+    """Return unopened chest fields needed by the login profile stream."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT id, set_guid, chest_rarity, template_guid "
+        "FROM treasure_chests WHERE user_id=? AND opened=0", (user_id,)
+    ).fetchall()
 
 
 # === Arena (Frost Ring Arena) ===
@@ -1057,6 +1262,15 @@ def db_get_store_item(item_id, conn=None):
         "FROM store_items WHERE id=?", (int(item_id),)).fetchone()
 
 
+def db_store_item_name_for_template(template_guid, conn=None):
+    """Return the display name for a store template GUID."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT name FROM store_items WHERE template_guid=?",
+        (template_guid,)).fetchone()
+    return row[0] if row else None
+
+
 def db_primal_pack_for(pack_guid):
     """Return the Primal pack GUID for the same set as *pack_guid*, or None.
 
@@ -1173,6 +1387,140 @@ def db_get_deck_by_id(deck_id):
     }
 
 
+def db_find_deck_owner(deck_id, conn=None):
+    """Return the owning user ID for a deck, or None when it is unknown."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT user_id FROM decks WHERE id=?", (deck_id,)).fetchone()
+    return row[0] if row else None
+
+
+def db_deck_champion_name(deck_id, conn=None):
+    """Return the display name of a deck's PvE champion, if assigned."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT ch.champion_name FROM decks d "
+        "JOIN champions ch ON ch.id=d.pve_champion_id WHERE d.id=?",
+        (deck_id,)).fetchone()
+    return row[0] if row else None
+
+
+def db_set_champion_last_deck(champion_id, deck_id, user_id=None, conn=None):
+    """Link a deck to a champion, optionally enforcing champion ownership."""
+    connection = conn or _db
+    predicate = "id=?"
+    params = [deck_id, champion_id]
+    if user_id is not None:
+        predicate += " AND user_id=?"
+        params.append(user_id)
+    cur = connection.execute(
+        "UPDATE champions SET last_deck_id=? WHERE " + predicate, params)
+    if conn is None:
+        connection.commit()
+    return cur.rowcount
+
+
+def db_champion_last_deck(champion_id, conn=None):
+    """Return ``(last_deck_id, pet_name)`` for a champion."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT last_deck_id, pet_name FROM champions WHERE id=?",
+        (champion_id,)).fetchone()
+
+
+def db_card_instance_template(user_id, instance_id, conn=None):
+    """Return the template GUID for a user's card instance."""
+    connection = conn or _db
+    row = connection.execute(
+        "SELECT template_guid FROM card_instances "
+        "WHERE user_id=? AND instance_id=?", (user_id, instance_id)).fetchone()
+    return row[0] if row else None
+
+
+def db_update_champion_talents(champion_id, user_id, talents, conn=None):
+    """Save a champion's talent GUID JSON only when owned by the user."""
+    connection = conn or _db
+    cur = connection.execute(
+        "UPDATE champions SET talents=? WHERE id=? AND user_id=?",
+        (talents, champion_id, user_id))
+    if conn is None:
+        connection.commit()
+    return cur.rowcount
+
+
+def db_champion_profile(champion_id, conn=None):
+    """Return the profile fields needed by champion response encoding."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT champion_name, race, champion_class, gender, level, "
+        "last_deck_id, pet_name FROM champions WHERE id=?", (champion_id,)
+    ).fetchone()
+
+
+def db_delete_champion(champion_id, user_id, conn=None):
+    """Soft-delete a champion only when it belongs to the requesting user."""
+    connection = conn or _db
+    cur = connection.execute(
+        "UPDATE champions SET is_deleted=1 WHERE id=? AND user_id=?",
+        (champion_id, user_id))
+    if conn is None:
+        connection.commit()
+    return cur.rowcount
+
+
+def db_profile_card_instances(user_id, conn=None):
+    """Return owned card instances joined to display template stats."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT ci.template_guid, ct.name, ct.cost, ct.attack, ct.defense, "
+        "ci.instance_id, ci.is_extended_art FROM card_instances ci "
+        "JOIN card_templates ct ON ct.guid=ci.template_guid "
+        "WHERE ci.user_id=? ORDER BY ci.instance_id", (user_id,)
+    ).fetchall()
+
+
+def db_collection_card_list(user_id, conn=None):
+    """Return collection counts with the card fields used by profile encoding."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT ct.guid, ct.name, ct.cost, ct.attack, ct.defense, "
+        "col.quantity FROM collections col "
+        "JOIN card_templates ct ON ct.guid=col.card_template_id "
+        "WHERE col.user_id=? ORDER BY ct.name", (user_id,)
+    ).fetchall()
+
+
+def db_card_instance_display(user_id, instance_id, conn=None):
+    """Return display fields for one owned card instance."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT ci.template_guid, ct.card_type, ct.name, ct.cost, "
+        "ct.attack, ct.defense FROM card_instances ci "
+        "JOIN card_templates ct ON ci.template_guid=ct.guid "
+        "WHERE ci.user_id=? AND ci.instance_id=?",
+        (user_id, instance_id)).fetchone()
+
+
+def db_card_instance_art(user_id, instance_id, conn=None):
+    """Return one owned card instance's art state."""
+    connection = conn or _db
+    return connection.execute(
+        "SELECT id, template_guid, is_extended_art FROM card_instances "
+        "WHERE user_id=? AND instance_id=?", (user_id, instance_id)
+    ).fetchone()
+
+
+def db_set_card_instance_extended_art(user_id, instance_id, conn=None):
+    """Set extended-art state for one owned card instance."""
+    connection = conn or _db
+    cur = connection.execute(
+        "UPDATE card_instances SET is_extended_art=1 "
+        "WHERE user_id=? AND instance_id=?", (user_id, instance_id))
+    if conn is None:
+        connection.commit()
+    return cur.rowcount
+
+
 def db_get_decks(user_id):
     rows = _db.execute("SELECT id, deck_name, cards, pve_champion_id, pvp_champion_guid, active_gems, deck_sleeve_guid, gameboard_guid, coin_guid FROM decks WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
     return [{"id": r[0], "name": r[1], "cards": r[2], "pve_champion_id": r[3], "pvp_champion_guid": r[4], "active_gems": r[5], "deck_sleeve_guid": r[6], "gameboard_guid": r[7], "coin_guid": r[8]} for r in rows]
@@ -1219,6 +1567,26 @@ def db_get_recent_chat(room, limit=30):
 
 # === Inbound transaction capture -------------------------------------------
 
+def _session_capture_connection():
+    """Return a short-lived connection for optional PvP transaction capture.
+
+    Transaction capture is diagnostic data, not authoritative game state.  It
+    must not share the legacy module connection: handler threads can otherwise
+    interleave a cursor's ``fetch*`` calls, and a failed audit INSERT can leave
+    the gameplay connection contending for the single SQLite writer slot.
+    A busy database is expected while a game is being saved, so this connection
+    deliberately gives up quickly and lets the caller skip the audit record.
+    """
+    if (DB_PATH == ":memory:" or
+            not isinstance(_db, RetryingConnection)):
+        # Isolated in-memory connections do not see the test schema/state.
+        return _db, False
+    capture_db = sqlite3.connect(DB_PATH, timeout=0.25,
+                                 check_same_thread=False)
+    capture_db.execute("PRAGMA busy_timeout=250")
+    return capture_db, True
+
+
 def db_session_state_hash(session_id):
     """Return a deterministic digest of the authoritative session state.
 
@@ -1226,25 +1594,30 @@ def db_session_state_hash(session_id):
     including hidden-zone cards. It is for replay comparison, not client
     visibility.
     """
-    session_row = _db.execute(
-        "SELECT state, players_json, turn_order_json, seed_z, seed_w, "
-        "deck_template_id FROM game_sessions WHERE session_id=?",
-        (str(session_id),)).fetchone()
-    if session_row is None:
-        return ""
+    capture_db, owns_connection = _session_capture_connection()
+    try:
+        session_row = capture_db.execute(
+            "SELECT state, players_json, turn_order_json, seed_z, seed_w, "
+            "deck_template_id FROM game_sessions WHERE session_id=?",
+            (str(session_id),)).fetchone()
+        if session_row is None:
+            return ""
 
-    card_columns = [row[1] for row in _db.execute(
-        "PRAGMA table_info(game_cards)")]
-    card_rows = _db.execute(
-        "SELECT * FROM game_cards WHERE session_id=? ORDER BY id",
-        (str(session_id),)).fetchall()
-    snapshot = {
-        "session": list(session_row),
-        "cards": [dict(zip(card_columns, row)) for row in card_rows],
-    }
-    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
-                         default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+        card_columns = [row[1] for row in capture_db.execute(
+            "PRAGMA table_info(game_cards)")]
+        card_rows = capture_db.execute(
+            "SELECT * FROM game_cards WHERE session_id=? ORDER BY id",
+            (str(session_id),)).fetchall()
+        snapshot = {
+            "session": list(session_row),
+            "cards": [dict(zip(card_columns, row)) for row in card_rows],
+        }
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                             default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    finally:
+        if owns_connection:
+            capture_db.close()
 
 
 def db_record_session_transaction(session_id, player_uid, request_id,
@@ -1253,29 +1626,45 @@ def db_record_session_transaction(session_id, player_uid, request_id,
                                   pre_state_hash):
     """Persist one raw inbound transaction before rules resolution."""
     payload = inner_bytes if isinstance(inner_bytes, bytes) else b""
-    cursor = _db.execute(
-        "INSERT INTO session_transactions "
-        "(session_id, player_uid, received_seq, data_type, request_id, "
-        "compressed, transaction_id, transaction_type, classification_json, "
-        "inner_bytes, pre_state_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (str(session_id), str(player_uid), time.time_ns(), int(data_type),
-         int(request_id or 0), int(compressed or 0), int(transaction_id),
-         str(transaction_type or ""),
-         json.dumps(classification or {}, sort_keys=True, default=str),
-         payload, str(pre_state_hash or "")))
-    _db.commit()
-    return int(cursor.lastrowid)
+    capture_db, owns_connection = _session_capture_connection()
+    try:
+        cursor = capture_db.execute(
+            "INSERT INTO session_transactions "
+            "(session_id, player_uid, received_seq, data_type, request_id, "
+            "compressed, transaction_id, transaction_type, classification_json, "
+            "inner_bytes, pre_state_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (str(session_id), str(player_uid), time.time_ns(), int(data_type),
+             int(request_id or 0), int(compressed or 0), int(transaction_id),
+             str(transaction_type or ""),
+             json.dumps(classification or {}, sort_keys=True, default=str),
+             payload, str(pre_state_hash or "")))
+        capture_db.commit()
+        return int(cursor.lastrowid)
+    except BaseException:
+        capture_db.rollback()
+        raise
+    finally:
+        if owns_connection:
+            capture_db.close()
 
 
 def db_complete_session_transaction(row_id, post_state_hash, handled,
                                     error=""):
     """Mark a captured transaction after its handler has returned."""
-    _db.execute(
-        "UPDATE session_transactions SET post_state_hash=?, status=?, "
-        "handled=?, completed_at=datetime('now'), error=? WHERE id=?",
-        (str(post_state_hash or ""), "completed" if not error else "error",
-         1 if handled else 0, str(error or ""), int(row_id)))
-    _db.commit()
+    capture_db, owns_connection = _session_capture_connection()
+    try:
+        capture_db.execute(
+            "UPDATE session_transactions SET post_state_hash=?, status=?, "
+            "handled=?, completed_at=datetime('now'), error=? WHERE id=?",
+            (str(post_state_hash or ""), "completed" if not error else "error",
+             1 if handled else 0, str(error or ""), int(row_id)))
+        capture_db.commit()
+    except BaseException:
+        capture_db.rollback()
+        raise
+    finally:
+        if owns_connection:
+            capture_db.close()
 
 
 # === Replay event log ===
@@ -1388,29 +1777,41 @@ def db_tournament_by_id(tid):
 
 
 def db_tournament_create(inst_id, type_id):
-    _db.execute(
-        "INSERT OR IGNORE INTO tournaments (id, type_id) VALUES (?, ?)",
-        (inst_id, type_id))
-    _db.commit()
+    try:
+        _db.execute(
+            "INSERT OR IGNORE INTO tournaments (id, type_id) VALUES (?, ?)",
+            (inst_id, type_id))
+        _db.commit()
+    except BaseException:
+        _db.rollback()
+        raise
     return inst_id
 
 
 def db_tournament_update_players(tid, players_json):
-    _db.execute(
-        "UPDATE tournaments SET players_json=? WHERE id=?", (players_json, tid))
-    _db.commit()
+    try:
+        _db.execute(
+            "UPDATE tournaments SET players_json=? WHERE id=?", (players_json, tid))
+        _db.commit()
+    except BaseException:
+        _db.rollback()
+        raise
     return len(json.loads(players_json)) if players_json else 0
 
 
 def db_tournament_set_status(tid, status, session_id=None):
-    if session_id:
-        _db.execute(
-            "UPDATE tournaments SET status=?, session_id=? WHERE id=?",
-            (status, str(session_id), tid))
-    else:
-        _db.execute(
-            "UPDATE tournaments SET status=? WHERE id=?", (status, tid))
-    _db.commit()
+    try:
+        if session_id:
+            _db.execute(
+                "UPDATE tournaments SET status=?, session_id=? WHERE id=?",
+                (status, str(session_id), tid))
+        else:
+            _db.execute(
+                "UPDATE tournaments SET status=? WHERE id=?", (status, tid))
+        _db.commit()
+    except BaseException:
+        _db.rollback()
+        raise
 
 
 def db_tournament_count_by_status(status):
@@ -1429,15 +1830,24 @@ def db_tournament_close_orphaned_started():
     closed.  Live sessions, including disconnected games that can be
     rejoined, are left untouched.
     """
-    cursor = _db.execute(
-        "UPDATE tournaments SET status='closed' "
-        "WHERE status='started' "
-        "AND NOT EXISTS ("
-        "  SELECT 1 FROM game_sessions gs "
-        "  WHERE CAST(gs.session_id AS TEXT)=CAST(tournaments.session_id AS TEXT)"
-        ")"
-    )
-    _db.commit()
+    try:
+        cursor = _db.execute(
+            "UPDATE tournaments SET status='closed' "
+            "WHERE status='started' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM tournament_types tt "
+            "  WHERE tt.id=tournaments.type_id "
+            "  AND LOWER(COALESCE(tt.style, '')) IN ('async', 'asynchronous')"
+            ") "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM game_sessions gs "
+            "  WHERE CAST(gs.session_id AS TEXT)=CAST(tournaments.session_id AS TEXT)"
+            ")"
+        )
+        _db.commit()
+    except BaseException:
+        _db.rollback()
+        raise
     return int(cursor.rowcount or 0)
 
 
@@ -1476,12 +1886,25 @@ def db_tournament_cleanup_old(age_days=1):
     try:
         cleanup_db.execute("PRAGMA busy_timeout=500")
         cleanup_db.execute("BEGIN IMMEDIATE")
+        # Keep an ended session's event source until the replay worker has
+        # indexed it. Abandoned/non-ended sessions can be removed immediately;
+        # completed sessions require a ready replay (or no events at all).
         stale_sessions = [
             str(row[0]) for row in cleanup_db.execute(
-                "SELECT DISTINCT session_id FROM tournaments "
-                "WHERE session_id IS NOT NULL AND TRIM(session_id)<>'' "
-                "AND created_at IS NOT NULL "
-                "AND datetime(created_at) <= datetime('now', ?)",
+                "SELECT DISTINCT t.session_id FROM tournaments t "
+                "JOIN game_sessions gs ON CAST(gs.session_id AS TEXT) "
+                "= CAST(t.session_id AS TEXT) "
+                "WHERE t.session_id IS NOT NULL AND TRIM(t.session_id)<>'' "
+                "AND t.created_at IS NOT NULL "
+                "AND datetime(t.created_at) <= datetime('now', ?) "
+                "AND (gs.state <> 'ended' OR NOT EXISTS ("
+                "  SELECT 1 FROM session_events se "
+                "  WHERE CAST(se.session_id AS TEXT)=CAST(gs.session_id AS TEXT)"
+                ") OR EXISTS ("
+                "  SELECT 1 FROM game_replays gr "
+                "  WHERE CAST(gr.session_id AS TEXT)=CAST(gs.session_id AS TEXT) "
+                "  AND gr.status='ready'"
+                "))",
                 (cutoff,)).fetchall()
             if row and row[0] is not None
         ]
@@ -1491,6 +1914,32 @@ def db_tournament_cleanup_old(age_days=1):
             "WHERE status<>'closed' AND created_at IS NOT NULL "
             "AND datetime(created_at) <= datetime('now', ?)",
             (cutoff,))
+
+        # Tournament-owned pools and match history are run state, not the
+        # permanent tournament descriptor.  Retain the descriptor for lobby
+        # history, but release all per-run data once the event has expired.
+        expired_tournaments = [
+            row[0] for row in cleanup_db.execute(
+                "SELECT id FROM tournaments WHERE created_at IS NOT NULL "
+                "AND datetime(created_at) <= datetime('now', ?)",
+                (cutoff,)).fetchall()
+        ]
+        if expired_tournaments:
+            placeholders = ",".join("?" for _ in expired_tournaments)
+            pool_exists = cleanup_db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='tournament_pool'").fetchone()
+            if pool_exists:
+                cleanup_db.execute(
+                    "DELETE FROM tournament_pool WHERE tournament_id IN (" +
+                    placeholders + ")", expired_tournaments)
+            matches_exists = cleanup_db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='tournament_matches'").fetchone()
+            if matches_exists:
+                cleanup_db.execute(
+                    "DELETE FROM tournament_matches WHERE tournament_id IN (" +
+                    placeholders + ")", expired_tournaments)
 
         cards_removed = 0
         sessions_removed = 0
@@ -2273,7 +2722,7 @@ def db_hand_card_count(session_id, user_id):
     return row[0] if row else 0
 
 
-def db_warzone_troops_with_state(session_id, user_id=None):
+def db_warzone_troops_with_state(session_id, user_id=None, conn=None):
     """Return list of (card_uid, template_guid, card_state, user_id) for warzone troops."""
     sql = ("SELECT card_uid, template_guid, card_state, user_id "
            "FROM game_cards WHERE session_id=? AND location='warzone' "
@@ -2282,7 +2731,7 @@ def db_warzone_troops_with_state(session_id, user_id=None):
     if user_id is not None:
         sql += " AND user_id=?"
         params.append(user_id)
-    return _db.execute(sql, params).fetchall()
+    return (conn or _db).execute(sql, params).fetchall()
 
 
 def db_hand_cards_with_templates(session_id, user_id):
@@ -2339,13 +2788,10 @@ def db_warzone_card_uids(session_id, user_id=None):
 
 
 def db_warzone_troops_basic(session_id, user_id=None):
-    """Return list of (card_uid, card_type, card_state, combined_attributes)
-    for warzone troops (template attributes OR instance-granted attributes)."""
-    sql = ("SELECT gc.card_uid, gc.card_type, gc.card_state, "
-           "(ct.attributes | gc.card_attributes) "
-           "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-           "WHERE gc.session_id=? AND gc.location='warzone' "
-           "AND gc.card_type LIKE '%Troop%'")
+    """Return list of (card_uid, card_type, card_state) warzone troops."""
+    sql = ("SELECT card_uid, card_type, card_state FROM game_cards "
+           "WHERE session_id=? AND location='warzone' "
+           "AND card_type LIKE '%Troop%'")
     params = [session_id]
     if user_id is not None:
         sql += " AND user_id=?"
@@ -2396,6 +2842,49 @@ def db_card_instance_full(session_id, card_uid):
     return row
 
 
+def db_game_card_effective_cost(session_id, card_uid, battle_state=None):
+    """Return the current payable cost for one card instance.
+
+    The RulesPort facts adapter must validate a card with the same cost that
+    the legacy play/payment path uses.  A template's printed cost is only the
+    starting point: ``game_cards.card_cost_mod`` and dynamic/static modifiers
+    (for example Infernal Professor's reduction) are part of the effective
+    cost.  Keep this calculation behind the shared DB facade so the ported
+    rules kernel remains SQL-free and both paths use one authority.
+
+    ``battle_state`` is optional for callers that only need persisted instance
+    modifiers; the canonical static evaluator accepts an empty state in that
+    case.  Older focused fixtures may not contain all modifier columns, so a
+    conservative template-plus-instance fallback is retained.
+    """
+    try:
+        from rules_port.static_rules import effective_cost
+        return max(0, int(effective_cost(
+            _db, session_id, battle_state or {}, int(card_uid))))
+    except Exception:
+        try:
+            row = _db.execute(
+                "SELECT ct.cost, gc.card_cost_mod "
+                "FROM game_cards gc JOIN card_templates ct "
+                "ON ct.guid=gc.template_guid "
+                "WHERE gc.session_id=? AND gc.card_uid=?",
+                (session_id, int(card_uid))).fetchone()
+        except sqlite3.OperationalError:
+            # Keep older/minimal test schemas usable when the per-instance
+            # modifier columns have not been migrated yet.
+            row = _db.execute(
+                "SELECT ct.cost FROM game_cards gc "
+                "JOIN card_templates ct ON ct.guid=gc.template_guid "
+                "WHERE gc.session_id=? AND gc.card_uid=?",
+                (session_id, int(card_uid))).fetchone()
+        if not row:
+            return 0
+        cost = int(row[0] or 0)
+        if len(row) > 1:
+            cost += int(row[1] or 0)
+        return max(0, cost)
+
+
 def db_card_owner(session_id, card_uid):
     """Return (id, owner_user_id, template_guid) for a card, or None."""
     row = _db.execute(
@@ -2405,17 +2894,18 @@ def db_card_owner(session_id, card_uid):
     return row
 
 
-def db_card_basic(session_id, card_uid):
+def db_card_basic(session_id, card_uid, conn=None):
     """Return (template_guid, user_id) for a game card."""
-    return _db.execute(
+    return (conn or _db).execute(
         "SELECT template_guid, user_id FROM game_cards "
         "WHERE session_id=? AND card_uid=?",
         (session_id, int(card_uid))).fetchone()
 
 
-def db_card_state_raw(session_id, card_uid):
+def db_card_state_raw(session_id, card_uid, conn=None):
     """Return the current card_state integer for a card, or 0."""
-    row = _db.execute(
+    connection = conn or _db
+    row = connection.execute(
         "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
         (session_id, int(card_uid))).fetchone()
     return row[0] if row and row[0] else 0
@@ -2456,6 +2946,155 @@ def db_card_info_joined(session_id, card_uid):
     return row
 
 
+def db_rules_port_card_projection(session_id, card_uid):
+    """Return the card fields required by the typed play/resource boundary.
+
+    Keeping this read behind the shared DB API prevents the RulesPort host
+    from reaching into ``_db`` for card legality or event projection data.
+    """
+    return _db.execute(
+        "SELECT gc.template_guid, gc.location, gc.user_id, ct.name, "
+        "ct.card_type, ct.abilities_json, ct.current_resources_granted, "
+        "ct.max_resources_granted, ct.attack, ct.defense "
+        "FROM game_cards gc JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+
+
+def db_rules_port_card_state_projection(session_id, card_uid):
+    """Return fields needed by the typed ready-card projection."""
+    return _db.execute(
+        "SELECT template_guid, card_type, user_id, card_state "
+        "FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+
+
+def db_rules_port_hand_rows(session_id, user_id):
+    """Return opening-hand rows in client display order for a mulligan."""
+    return _db.execute(
+        "SELECT id, card_uid FROM game_cards "
+        "WHERE session_id=? AND user_id=? AND location='hand' "
+        "ORDER BY position",
+        (session_id, int(user_id))).fetchall()
+
+
+def db_rules_port_session_card_ids(session_id, user_id):
+    """Return stable row ids for a player's session deck shuffle."""
+    return [row[0] for row in _db.execute(
+        "SELECT id FROM game_cards WHERE session_id=? AND user_id=?",
+        (session_id, int(user_id))).fetchall()]
+
+
+def db_rules_port_deck_active_gems(deck_id):
+    """Return the serialized active-gem map for an opening deck."""
+    row = _db.execute("SELECT active_gems FROM decks WHERE id=?",
+                      (int(deck_id),)).fetchone()
+    return row[0] if row else None
+
+
+def db_rules_port_draw_rows(session_id, user_id, count):
+    """Return the next deck cards and template metadata for a redraw."""
+    return _db.execute(
+        "SELECT gc.card_uid, gc.card_template_id, gc.template_guid, "
+        "ct.name, ct.card_type, ct.cost, ct.attack, ct.defense, "
+        "ct.threshold_json, ct.abilities_json "
+        "FROM game_cards gc JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='deck' "
+        "ORDER BY gc.position LIMIT ?",
+        (session_id, int(user_id), int(count))).fetchall()
+
+
+def db_rules_port_warzone_projection(session_id):
+    """Return warzone cards with owner/template/state for phase refresh events."""
+    return _db.execute(
+        "SELECT gc.card_uid, gc.template_guid, gc.user_id, gc.card_state "
+        "FROM game_cards gc WHERE gc.session_id=? AND gc.location='warzone'",
+        (session_id,)).fetchall()
+
+
+def db_rules_port_first_hand_card(session_id, user_id):
+    """Return the first hand card UID, used only for an omitted target fallback."""
+    row = _db.execute(
+        "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
+        "AND location='hand' ORDER BY position LIMIT 1",
+        (session_id, int(user_id))).fetchone()
+    return int(row[0]) if row else None
+
+
+def db_rules_port_hand_card(session_id, card_uid, user_id):
+    """Return a specific owned hand card row for a discard continuation."""
+    return _db.execute(
+        "SELECT id, template_guid FROM game_cards WHERE session_id=? "
+        "AND card_uid=? AND user_id=? AND location='hand'",
+        (session_id, int(card_uid), int(user_id))).fetchone()
+
+
+def db_rules_port_card_instance_id(session_id, card_uid):
+    """Return the stored card-template/instance id for a session card."""
+    row = _db.execute(
+        "SELECT card_template_id FROM game_cards "
+        "WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+    return row[0] if row else None
+
+
+def db_rules_port_talent_ability_exists(ability_guid):
+    """Whether an ability GUID is authored as a champion/talent ability."""
+    row = _db.execute(
+        "SELECT 1 FROM talent_abilities WHERE ability_guid=? LIMIT 1",
+        (str(ability_guid),)).fetchone()
+    return bool(row)
+
+
+def db_rules_port_cards_with_ability(session_id, user_id, ability_guid,
+                                     card_uid=None):
+    """Return candidate owned hand/warzone cards carrying an ability GUID."""
+    sql = ("SELECT card_uid, card_uses FROM game_cards WHERE session_id=? "
+           "AND user_id=? AND location IN ('warzone','hand') "
+           "AND card_abilities LIKE ?")
+    params = [session_id, int(user_id), f'%"{ability_guid}"%']
+    if card_uid is not None:
+        sql += " AND card_uid=?"
+        params.append(int(card_uid))
+    return _db.execute(sql, tuple(params)).fetchall()
+
+
+def db_rules_port_ability_costs(ability_guid):
+    """Return (charge_cost, spell_cost) for a talent ability, if authored."""
+    row = _db.execute(
+        "SELECT charge_cost, spell_cost FROM talent_abilities "
+        "WHERE ability_guid=? LIMIT 1", (str(ability_guid),)).fetchone()
+    return row if row else None
+
+
+def db_rules_port_redraw_hand(session_id, user_id, draw_count):
+    """Replace a player's opening hand and return ``(old_rows, new_rows)``.
+
+    This is the transaction's atomic storage portion; callers are responsible
+    only for projecting the returned rows to each client.
+    """
+    import random
+    old_rows = db_rules_port_hand_rows(session_id, user_id)
+    if old_rows:
+        _db.executemany(
+            "UPDATE game_cards SET location='deck', card_state=0 WHERE id=?",
+            [(row[0],) for row in old_rows])
+    ids = db_rules_port_session_card_ids(session_id, user_id)
+    random.shuffle(ids)
+    if ids:
+        _db.executemany("UPDATE game_cards SET position=? WHERE id=?",
+                        [(pos, row_id) for pos, row_id in enumerate(ids)])
+    new_rows = db_rules_port_draw_rows(session_id, user_id, draw_count)
+    if new_rows:
+        _db.executemany(
+            "UPDATE game_cards SET location='hand' WHERE session_id=? AND card_uid=?",
+            [(session_id, row[0]) for row in new_rows])
+    _db.commit()
+    return old_rows, new_rows
+
+
 def db_card_template_field(template_guid, field):
     """Return a single column value from card_templates by guid, or None."""
     valid = {"abilities_json", "attributes", "card_type", "sacrifice_target",
@@ -2481,7 +3120,7 @@ def db_card_template_attrs_joined(session_id, card_uid):
 
 # === Battle mutation helpers (read/write) ====================================
 
-def db_set_card_location(session_id, card_uid, location, extra_set=None, extra_params=None):
+def db_set_card_location(session_id, card_uid, location, extra_set=None, extra_params=None, conn=None):
     """Move a card to a new zone, with optional extra SET clauses."""
     sql = f"UPDATE game_cards SET location=?"
     params = [location]
@@ -2489,8 +3128,9 @@ def db_set_card_location(session_id, card_uid, location, extra_set=None, extra_p
         sql += f", {extra_set}"
     params.extend(extra_params or [])
     params.extend([session_id, int(card_uid)])
-    _db.execute(f"{sql} WHERE session_id=? AND card_uid=?", params)
-    _db.commit()
+    connection = conn or _db
+    connection.execute(f"{sql} WHERE session_id=? AND card_uid=?", params)
+    connection.commit()
 
 
 def db_discard_card(session_id, card_uid, owner_user_id=None,
@@ -2536,13 +3176,14 @@ def db_set_card_owner_and_discard(session_id, card_uid, owner_user_id):
     return db_discard_card(session_id, card_uid, owner_user_id=owner_user_id)
 
 
-def db_set_card_state_or(session_id, card_uid, state_bits):
+def db_set_card_state_or(session_id, card_uid, state_bits, conn=None):
     """OR in state_bits to a card's card_state. Persisted and committed."""
-    _db.execute(
+    connection = conn or _db
+    connection.execute(
         "UPDATE game_cards SET card_state = (card_state | ?) "
         "WHERE session_id=? AND card_uid=?",
         (state_bits, session_id, int(card_uid)))
-    _db.commit()
+    connection.commit()
 
 
 def db_set_card_state_replace(session_id, card_uid, clear_bits, set_bits):
@@ -2565,13 +3206,14 @@ def db_clear_combat_states(session_id, card_uid):
     _db.commit()
 
 
-def db_set_card_played_to_zone(session_id, card_uid, location):
+def db_set_card_played_to_zone(session_id, card_uid, location, conn=None):
     """Update a card's location and set position to sentinel value."""
-    _db.execute(
+    connection = conn or _db
+    connection.execute(
         "UPDATE game_cards SET location=?, position=9999 "
         "WHERE session_id=? AND card_uid=?",
         (location, session_id, int(card_uid)))
-    _db.commit()
+    connection.commit()
 
 
 def db_card_set_warzone_arrival(session_id, card_uid):

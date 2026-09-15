@@ -672,6 +672,53 @@ The four **completeness gates** (mirror `AbilityTemplate`):
 Effect ordering must follow `sort by m_EffectGroupId, then m_EffectInstanceId`,
 and effects in the same group are simultaneous (no server yields between them).
 
+### RulesPort hand-off and UI continuations
+
+In a live battle, `rules_port.wire` receives the already-classified typed
+transaction and creates one authoritative `AbilityInstance`. Before the BOM
+walk it checks phase/priority, source collection, activation and X costs,
+thresholds, and every metadata target. A rejected typed intent is acknowledged
+and is not retried through the legacy dispatcher.
+
+The resolver then performs the same ordered hand-off as the client:
+
+```text
+typed activation
+  -> AbilityBuilder/AbilityGraph
+  -> ApplyEffectGroup (conditions, contingencies, targets, leaf)
+  -> SQLite + Game event projection
+  -> continuation or next GreenLight/option packet
+```
+
+Explicit targets, discard/sacrifice costs, choice cards, deck searches,
+conversations, and triggered-ability responses are checkpoints. When one is
+needed, the port persists the ability instance ID, source card, target map,
+variables, and resume effect order. The next matching typed response resumes
+that instance; it must not create a duplicate trigger or restart earlier effect
+groups. A completed mutation updates the card row and emits the corresponding
+`CardMoved`/`CardUpdated` (and `CardDiscarded` for removal) before the client
+receives rebuilt options and priority.
+
+Player-level visibility modifiers follow the same projection contract. The
+`CanSeeOpponentsHand` flag is persisted by the RulesPort host, and each fresh
+checkpoint resends complete viewer-scoped hand `CardUpdated` events. A later
+face-down placeholder cannot overwrite that definition, so cards revealed by
+Subterranean Spy remain rendered with their real template instead of a black
+rectangle; clients without the permission still receive nulling updates.
+
+Choice-card abilities use the authored target/filter graph. A generated Choice
+card is played from `Choosing` for free, then its automatic ability resolves
+against the parent source card. This is the resource-choice contract used by
+Shard of Cunning: the AI selects a legal Blood or Sapphire token according to
+its threshold state and the selected token's typed `ThresholdModifier` emits
+the threshold event. No card-name or display-text rule is required.
+
+Resource modifier leaves distinguish `CurrentResourceModifier` from
+`TotalResourceModifier`. Current-resource changes are temporary pool grants;
+total-resource changes raise the maximum pool. Thus Hideous Conversion's
+authored `[L1][R0]` operation grants one temporary current resource, and its
+post-resolution options use that updated pool.
+
 ---
 
 ## 14. Support matrix — what the Python framework currently implements

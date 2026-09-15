@@ -28,6 +28,8 @@ from abilities import (
     resolve_cards_attacked,
     resolve_card_battled,
     resolve_enters_play_triggers,
+    resolve_turn_phase_triggers,
+    resolve_turn_ended_triggers,
     resolve_stack_trigger,
     _stat_delta,
     register_custom_ability,

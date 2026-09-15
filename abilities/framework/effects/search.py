@@ -18,16 +18,13 @@ def move_deck_card_to_hand(game, session, db, handler, pl_t, ai_t, card_uid,
     Hand.  It also emits the CardMoved/CardDrawn/CardUpdated events expected by
     the client.
     """
-    row = db.execute(
-        "SELECT template_guid, card_template_id FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_zone_details, db_move_card_to_location
+    details = db_card_zone_details(session.session_id, int(card_uid), conn=db)
+    row = details[:2] if details else None
     if not row:
         return "search deck: card not found"
-    db.execute(
-        "UPDATE game_cards SET location='hand', position=100 "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(card_uid)))
+    db_move_card_to_location(
+        session.session_id, int(card_uid), "hand", position=100, conn=db)
     db.commit()
     scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
     owner = owner_uid(owner_id, pl_t, ai_t, bstate)
@@ -40,4 +37,3 @@ def move_deck_card_to_hand(game, session, db, handler, pl_t, ai_t, card_uid,
                            ct, template_id=row[0], cost=cost, attack=atk,
                            defense=def_)
     return f"searched deck card {hex(int(card_uid))} to hand"
-

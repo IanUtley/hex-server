@@ -104,6 +104,20 @@ Reload-only modules can be refreshed without restarting HConnect:
 kill -USR1 "$(pgrep -f '[h]connect_server.py' | head -n1)"
 ```
 
+During development, Supervisor can own all four long-running processes after
+installing the dependencies from `requirements.txt`:
+
+```bash
+HEX_USE_SUPERVISOR=1 bash restart.sh
+supervisorctl -c supervisord.conf status
+```
+
+The Docker entrypoint runs the same `supervisord.conf` in the foreground after
+database bootstrap. Supervisor restarts a failed service and writes the
+service logs under `/tmp`; use `supervisorctl` for targeted stop, start, or
+restart operations. `restart.sh` retains its direct-process mode when
+`HEX_USE_SUPERVISOR` is unset.
+
 Use a full restart after changing `hconnect_server.py`, startup wiring,
 encoders, schema initialization, or process configuration. Do not run tests in
 parallel when they use SQLite or the shared runtime database.
@@ -116,6 +130,17 @@ python3 tests/verify_goldens.py
 python3 tests/run_all.py
 git diff --check
 ```
+
+The repository includes a pre-commit hook for syntax checks and the quick core
+test set. Enable it once per checkout with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook uses the disposable test database created by `tests/run_all.py` and
+does not access the live `hconnect.db`. Run `python3 tests/run_all.py` before
+pushing to `main` for the full suite and golden verification.
 
 For client-visible failures, read the client log first:
 `/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Hex_Data/output_log.txt`.
@@ -134,7 +159,8 @@ logs and database state.
 | `services/*.py` | one client-request family per module; new handlers validate input and call domain APIs |
 | `services/auction.py` | retained Auction House API surface; currently an intentional stub |
 | `game_engine.py` | session event types, event construction, and event serialization |
-| `battle_engine.py` | turn phases, priority, auto-pass, chain state, and phase persistence |
+| `battle_engine.py` | legacy rollback implementation for turn phases, priority, auto-pass, chain state, and phase persistence; normal live gameplay uses `rules_port/` |
+| `rules_port/` | Semantic port of HexClient/Game.Shared rules; owns C#-ordered session/action, phase, priority, chain, combat, transaction, ability, trigger, and target primitives |
 | `game_session.py` | session lifecycle and DB-backed session state |
 | `ai.py` | AI turn, card-choice, and combat decisions |
 | `abilities/` | metadata-driven ability parsing, targeting, conditions, effect leaves, and the shared `EffectContext`/`AbilityBuilder` adapters |
@@ -146,6 +172,7 @@ logs and database state.
 | `profile_db.py` | profile, champion, deck, collection, inventory, mail, social, and store persistence API |
 | `pve_db.py` | campaign/FRA/encounter persistence API |
 | `pvp_db.py` | shared session, card, and battle persistence API used by PVE and PVP |
+| `chat_db.py` | chat-history persistence API |
 | `tournament_db.py` | tournament, bracket, signup, and tournament-match persistence API |
 | `replay_db.py` | replay event/index persistence API |
 | `replay.py` | replay packaging plus list/fetch compatibility helpers |
@@ -158,6 +185,31 @@ normal session path. The old `services/practice.py` and replay browser module
 were removed. `auction.py` stays because Auction is a substantial unimplemented
 API surface. Replay packaging stays in the root `replay.py` even if playback
 endpoints remain incomplete.
+
+The `rules_port/` package is the semantic migration boundary for battle rules;
+see [`rules_port/README.md`](rules_port/README.md) for its contracts and
+adapter responsibilities. `application.player_transactions.classify_player_transaction`
+remains the protocol decoder, while `rules_port.wire.submit_classified_transaction`
+normalizes typed intents and validates them against the authoritative port
+session. `rules_port.adapter.rules_session_for` caches that host on a live
+session wrapper; `enable_rules_port` supplies the SQLite mutation and PvP-facts
+adapters, and a newly loaded wrapper rehydrates from its namespaced snapshot.
+
+`restart.sh` enables live RulesPort attachment (`HEX_RULES_PORT_AUTO_ATTACH=1`)
+by default. Payload-bearing card, ability, choice, discard, combat, and phase
+transactions are consumed by the port, acknowledged on both success and
+rejection, and never reinterpreted by a legacy handler. Set
+`HEX_RULES_PORT_AUTO_ATTACH=0` only as an explicit rollback switch while
+diagnosing a migration regression. The port requires typed nested values from
+the decoder; it never guesses card IDs or ability targets from display text.
+When a rule pauses for UI input, its continuation is persisted and the matching
+typed response resumes the same ability instance before the next priority
+event. Debug-cheat and non-gameplay probes remain outside this boundary.
+After each RulesPort scheduler tick, the host persists the post-action-stack
+snapshot as well; this keeps a completed chain resolver from reappearing on a
+reconnect and blocking the next card transaction. A settled manual ability in
+First/Second Main also rebuilds the metadata-derived `PlayerOptionList` before
+returning the normal green light.
 
 The service registry is the first dispatch path. Unsupported or not-yet-
 converted service types may use the compatibility path in HConnect until their
@@ -173,6 +225,19 @@ the `@effect` decorator. `AbilityBuilder` must wrap the authoritative
 `AbilityGraph`/`AbilityInstance` and reuse its costs, target templates, typed
 fields, ordering, conditions, and continuation behavior; it must not introduce
 a parallel card-rules source.
+
+Resource and cost transitions are likewise RulesPort-owned. Use the typed
+resource transitions for current/total pools, thresholds, charges, spell
+points, resource-play resets, and payments; mode services and AI may only
+project their returned deltas into SQLite and client events. The raw
+player-ID variants are for the tournament checkpoint schema, while the
+canonical `player`/`ai` variants are for Practice/PvE sessions.
+`AbilityCostPlan` and its application transition own numeric ability costs;
+the host must not decrement those counters directly after planning.
+Attached-session card display costs must use `rules_port.static_rules.effective_cost`
+as well, so the client-visible cost and the payment validator cannot be fed by
+different evaluators. The historical `abilities.framework.cost_mod` path is
+reserved for explicitly disabled rollback sessions.
 
 ## 5. Database contract
 
@@ -190,6 +255,9 @@ databases or PostgreSQL without changing handlers.
   `replay_db` according to ownership. A cross-domain operation uses one
   explicit transaction and calls each domain API with the same connection.
 - SQL is parameterized. Reads return stable rows or plain data structures;
+  rows returned through `db.connect()` (including the shared `_db`) support
+  both `row["field_name"]` and legacy numeric indexing. Prefer field names in
+  new DB/domain code so callers do not depend on SELECT-column order;
   writes make their transaction boundary explicit. Do not commit from a leaf
   helper when the caller is coordinating multiple writes.
 - Existing direct SQL in the large legacy handlers is migration debt. Do not
@@ -207,6 +275,13 @@ Important persistence entities include `users`, `champions`, `decks`,
 client-derived metadata tables. `game_cards` is the authoritative per-session
 card representation; resolve its `template_guid` through `card_templates`.
 Store unsigned client UIDs as text where SQLite signed integers are unsafe.
+
+Practice sessions (`Session-*`) do not write replay event or transaction
+capture rows. Tournament cleanup removes stale tournament `game_sessions` and
+`game_cards` after replay generation is safe. The replay worker retains the
+generated artifact for its configured retention period, then removes its
+`game_replays`, `session_events`, and `session_transactions` rows and the
+expired artifact file.
 
 ## 6. Protocol invariants
 

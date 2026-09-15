@@ -18,11 +18,8 @@ def kill_troop(game, session, db, handler, pl_t, ai_t, card_uid, bstate=None,
     """
     from ._shared import _log, owner_uid
 
-    row = db.execute(
-        "SELECT template_guid, user_id, (ct.attributes | gc.card_attributes) "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session.session_id, int(card_uid))).fetchone()
+    from pvp_db import db_card_death_info, db_kill_card_to_discard
+    row = db_card_death_info(session.session_id, int(card_uid), conn=db)
     if not row:
         return
     tpl_guid, owner_id, attrs = row[0], row[1], (row[2] or 0)
@@ -39,26 +36,21 @@ def kill_troop(game, session, db, handler, pl_t, ai_t, card_uid, bstate=None,
                             source_owner_uid=owner_id):
             _log(f"    CardWouldEnterZone replaced death of {hex(card_uid)}")
             return
-    from db import db_discard_card
-    db_discard_card(
-        session.session_id, card_uid,
-        extra_set=("card_state=(card_state & ~?) | ?, card_damage=0, "
-                   "temporary_buffs='{}', temporary_attributes=0"),
-        extra_params=(
-            _ge.ECardStates.CameOutThisTurn | _ge.ECardStates.Tapped |
-            _ge.ECardStates.Attacking | _ge.ECardStates.HasAttacked |
-            _ge.ECardStates.Blocking | _ge.ECardStates.HasBlocked |
-            _ge.ECardStates.Damaged,
-            _ge.ECardStates.Dead),
-        connection=db)
+    db_kill_card_to_discard(
+        session.session_id, int(card_uid),
+        _ge.ECardStates.CameOutThisTurn | _ge.ECardStates.Tapped |
+        _ge.ECardStates.Attacking | _ge.ECardStates.HasAttacked |
+        _ge.ECardStates.Blocking | _ge.ECardStates.HasBlocked |
+        _ge.ECardStates.Damaged,
+        _ge.ECardStates.Dead, conn=db)
     import game_engine
     scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
     _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, tpl_guid)
     owner = owner_uid(owner_id, pl_t, ai_t, bstate)
-    game.push_card_updated(scid, owner, _ge.ECardCollections.Discard, ct,
-                           attack=atk, defense=def_, template_id=tpl_guid)
     game.push_card_moved(scid, owner, _ge.ECardCollections.Discard,
                          _ge.ECardLocations.Top, 0)
+    game.push_card_updated(scid, owner, _ge.ECardCollections.Discard, ct,
+                           attack=atk, defense=def_, template_id=tpl_guid)
     _log(f"    Killed {hex(card_uid)} ({cause})")
 
     # A card leaving the warzone fires its "when this leaves play" triggers
@@ -97,13 +89,8 @@ def state_based_deaths(game, session, db, handler, pl_t, ai_t, bstate):
     combat damage must not die because the static layer's delta was missing
     from the stored buffs.
     """
-    rows = db.execute(
-        "SELECT gc.card_uid, gc.template_guid, ct.defense, gc.card_defense_mod, "
-        "gc.card_damage, gc.permanent_buffs, gc.temporary_buffs FROM game_cards gc "
-        "JOIN card_templates ct ON ct.guid = gc.template_guid "
-        "WHERE gc.session_id=? AND gc.location='warzone' "
-        "AND gc.card_type LIKE '%Troop%'",
-        (session.session_id,)).fetchall()
+    from pvp_db import db_warzone_troop_state_rows
+    rows = db_warzone_troop_state_rows(session.session_id, conn=db)
     dead = []
     for card_uid, tpl_guid, base_def, def_mod, dmg, perm_json, temp_json in rows:
         def_ = base_def + (def_mod or 0)

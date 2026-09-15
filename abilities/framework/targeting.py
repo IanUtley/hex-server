@@ -856,11 +856,8 @@ def _side_of(user_id):
 
 def target_template(db, template_id):
     """Return the target_templates row as a dict, or None."""
-    row = db.execute(
-        "SELECT template_id, game_text, is_auto_target, is_random_target, "
-        "optional, explicit, player_filter, collection_flags, "
-        "min_target_count, max_target_count, filter_json, target_kind "
-        "FROM target_templates WHERE template_id=?", (template_id,)).fetchone()
+    from pvp_db import db_target_template_row
+    row = db_target_template_row(template_id, conn=db)
     if not row:
         return None
     return {
@@ -908,23 +905,19 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     tpl = target_template(db, template_id)
     if not tpl:
         return []
+    # ``AbilitySourceCardTargetTemplate`` means literal ``this``.  Its
+    # collection flags are authored for the card's normal zone (often
+    # Warzone), but self-triggered abilities can resolve after the source has
+    # moved to Underground or Discard.  The source identity is authoritative
+    # at this boundary; do not lose the target merely because its current
+    # collection differs from the template's visibility mask.
+    if (str(tpl.get("target_kind") or "") ==
+            "AbilitySourceCardTargetTemplate" and source_uid is not None):
+        return [int(source_uid)]
     try:
         fjson = json.loads(tpl["filter_json"] or "{}")
     except Exception:
         fjson = {}
-
-    # A few isolated targeting fixtures intentionally use the pre-socket
-    # schema.  Build optional projections rather than making the evaluator
-    # depend on the newest runtime DB shape.
-    gc_columns = {row[1] for row in db.execute(
-        "PRAGMA table_info(game_cards)").fetchall()}
-    ct_columns = {row[1] for row in db.execute(
-        "PRAGMA table_info(card_templates)").fetchall()}
-    gc_gems = "gc.gems" if "gems" in gc_columns else "0"
-    gc_original = ("gc.original_template_guid"
-                   if "original_template_guid" in gc_columns else "''")
-    ct_rarity = "ct.rarity" if "rarity" in ct_columns else "''"
-    ct_sockets = "ct.socket_count" if "socket_count" in ct_columns else "0"
 
     # Filters such as HasSourceResourceCost and shared-source filters are
     # evaluated against the live source card by the original client.  Build
@@ -932,18 +925,8 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     # previously those filters silently saw ``None`` and defaulted open.
     source_card = None
     if source_uid is not None:
-        source_row = db.execute(
-            "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-            "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-            "gc.template_guid, ct.name, COALESCE(ct.cost,0), ct.subtype, "
-            "ct.threshold_json, gc.card_attributes, %s, %s, %s, %s, %s, "
-            "gc.permanent_buffs "
-            "FROM game_cards gc LEFT JOIN card_templates ct "
-            "ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?" %
-            (ct_rarity, ct_sockets, gc_gems, gc_original,
-             "gc.card_abilities" if "card_abilities" in gc_columns else "'[]'"),
-            (session_id, int(source_uid))).fetchone()
+        from pvp_db import db_target_source_row
+        source_row = db_target_source_row(session_id, int(source_uid), conn=db)
         if source_row:
             source_card = {
                 "card_uid": int(source_row[0]),
@@ -973,6 +956,11 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 source_buffs = json.loads(source_row[18] or "{}")
                 source_card["parent_uid"] = int(
                     source_buffs.get("parent_uid", 0) or 0)
+                if isinstance(source_buffs.get("subtype"), str):
+                    source_card["subtype"] = source_buffs["subtype"]
+                if isinstance(source_buffs.get("thresholds"), list):
+                    source_card["shards"] = [int(value) for value in
+                                              source_buffs["thresholds"]]
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
     if source_card is None:
@@ -1011,31 +999,20 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     self_only = player_filter in {"self", "you", "controller"}
     wants_champions = any(z in ("champions", "warzone") for z in zones) or \
         "IsHero" in (tpl["filter_json"] or "")
-    sql = ("SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-           "gc.template_guid, gc.card_state, "
-           "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-           "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-           "gc.card_abilities, gc.permanent_buffs, %s, %s, %s, %s "
-           "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-           "WHERE gc.session_id=?" %
-           (ct_rarity, ct_sockets, gc_gems, gc_original))
-    params = [session_id]
-    placeholders = ",".join("?" * len(zones))
-    sql += f" AND gc.location IN ({placeholders})"
-    params += zones
-    if not both_players:
-        sql += " AND gc.user_id=?"
-        params.append(controller_uid)
-    sql += (" ORDER BY gc.user_id, gc.position" if top_n is not None
-            else " ORDER BY gc.position")
+    from pvp_db import (db_target_candidate_rows, db_ability_effect_rows,
+                        db_gem_template_name)
+    candidate_rows = db_target_candidate_rows(
+        session_id, zones, controller_uid=controller_uid,
+        both_players=both_players, top_n=top_n is not None, conn=db)
     out = []
     candidate_cards = []
     top_n_by_owner = {}
     for cu, ctype, loc, uid, template_guid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs, rarity, socket_count, gems, original_template_guid \
-            in db.execute(sql, params):
+            in candidate_rows:
         int_attrs = {}
         counters = {}
         counter_guids = {}
+        dynamic_shards = None
         try:
             saved = json.loads(raw_buffs or "{}")
             persisted = saved.get("int_attrs", {}) if isinstance(saved, dict) else {}
@@ -1046,15 +1023,19 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                     counters = dict(saved["counters"])
                 if isinstance(saved.get("counter_guids"), dict):
                     counter_guids = dict(saved["counter_guids"])
+                if isinstance(saved.get("subtype"), str):
+                    subtype = saved["subtype"]
+                if isinstance(saved.get("thresholds"), list):
+                    dynamic_shards = [int(value) for value in
+                                      saved["thresholds"]]
             parent_uid = int(saved.get("parent_uid", 0) or 0) \
                 if isinstance(saved, dict) else 0
         except (TypeError, ValueError, json.JSONDecodeError):
             parent_uid = 0
         try:
             for ability_guid in json.loads(card_abs or "[]"):
-                for _eg, _et, _ep in db.execute(
-                        "SELECT effect_guid,effect_type,param FROM ability_effects WHERE ability_guid=?",
-                        (ability_guid,)).fetchall():
+                for _eg, _et, _ep in db_ability_effect_rows(
+                        ability_guid, conn=db):
                     if _et != "CardModifierAbilityEffectTemplate":
                         continue
                     _pd = json.loads(_ep or "{}")
@@ -1092,14 +1073,13 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                 if isinstance(card_abs, str) else (card_abs or []),
                 "counters": counters,
                 "counter_guids": counter_guids,
-                "shards": shards_from_threshold(thresh)}
+                "shards": (dynamic_shards if dynamic_shards is not None else
+                            shards_from_threshold(thresh))}
         if int(gems or 0):
             try:
-                gem_row = db.execute(
-                    "SELECT gem_type_name FROM gem_templates WHERE gem_type=?",
-                    (int(gems),)).fetchone()
+                gem_name = db_gem_template_name(int(gems), conn=db)
                 card["gem_is_minor"] = bool(
-                    gem_row and "minor" in str(gem_row[0] or "").lower())
+                    gem_name and "minor" in str(gem_name).lower())
             except Exception:
                 card["gem_is_minor"] = False
         if battle_state and battle_state.get("turn_player"):
@@ -1131,13 +1111,36 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     # target template's own collection flags.  The current candidate pool is
     # still the correct fallback for small fixtures and ordinary targets; the
     # resolver supplies the complete live collection when it is available.
+    def _blocked_by_targeting_immunity(card):
+        if card.get("card_type") == "Champion":
+            return False
+        try:
+            from .statics import rule_modifiers
+            rules = rule_modifiers(
+                db, session_id, battle_state or {}, int(card["card_uid"]))
+        except (AttributeError, TypeError, ValueError):
+            rules = []
+        for rule in rules:
+            if rule.get("property") != "targetingimmunity":
+                continue
+            filter_json = rule.get("filter") or rule.get("cardfilter")
+            if filter_json and source_card and evaluate_card_filter(
+                    source_card, filter_json, source_uid,
+                    source_card=card, card_pool=candidate_cards,
+                    champion_pool=champions or [],
+                    ability_state=battle_state, db=db):
+                return True
+        return False
+
     for card in candidate_cards:
-        if evaluate_card_filter(card, fjson, source_uid,
+        if (_blocked_by_targeting_immunity(card) or
+                not evaluate_card_filter(card, fjson, source_uid,
                                 source_card=source_card,
                                 card_pool=candidate_cards,
                                 champion_pool=champions or [],
-                                ability_state=battle_state, db=db):
-            out.append(int(card["card_uid"]))
+                                ability_state=battle_state, db=db)):
+            continue
+        out.append(int(card["card_uid"]))
 
     if top_n is not None:
         nested = top_n.get("m_Filter") or {}

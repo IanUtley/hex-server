@@ -247,11 +247,9 @@ class CardInfo:
         if self._effects_cache is not None:
             return self._effects_cache
         out = []
+        from pvp_db import db_ability_effect_type_params
         for ag in self.ability_guids:
-            for e in _db.execute(
-                    "SELECT effect_type, param FROM ability_effects "
-                    "WHERE ability_guid=? ORDER BY effect_order",
-                    (ag,)).fetchall():
+            for e in db_ability_effect_type_params(ag, conn=_db):
                 try:
                     pm = json.loads(e[1]) if e[1] else {}
                 except Exception:
@@ -510,35 +508,15 @@ class CardEvaluator:
 
     # -- DB loads ----------------------------------------------------------
     def _load_hand(self):
-        rows = _db.execute(
-            "SELECT gc.card_uid, gc.template_guid, gc.location, "
-            "       ct.card_type, ct.name, ct.rarity, ct.cost, ct.attack, "
-            "       ct.defense, ct.threshold_json, ct.abilities_json, "
-            "       ct.attributes, ct.subtype, ct.variable_cost, "
-            "       ct.current_resources_granted, ct.max_resources_granted, "
-            "       gc.card_state, gc.card_damage, gc.permanent_buffs, "
-            "       gc.temporary_buffs, gc.temporary_attributes "
-            "FROM game_cards gc JOIN card_templates ct "
-            "  ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='hand' "
-            "ORDER BY gc.position",
-            (self.session.session_id,)).fetchall()
+        from pvp_db import db_ai_evaluator_card_rows
+        rows = db_ai_evaluator_card_rows(
+            self.session.session_id, 0, "hand", conn=_db)
         return [CardInfo(r) for r in rows]
 
     def _load_warzone(self, user_id):
-        rows = _db.execute(
-            "SELECT gc.card_uid, gc.template_guid, gc.location, "
-            "       ct.card_type, ct.name, ct.rarity, ct.cost, ct.attack, "
-            "       ct.defense, ct.threshold_json, ct.abilities_json, "
-            "       ct.attributes, ct.subtype, ct.variable_cost, "
-            "       ct.current_resources_granted, ct.max_resources_granted, "
-            "       gc.card_state, gc.card_damage, gc.permanent_buffs, "
-            "       gc.temporary_buffs, gc.temporary_attributes, "
-            "       gc.card_attack_mod, gc.card_defense_mod "
-            "FROM game_cards gc JOIN card_templates ct "
-            "  ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='warzone'",
-            (self.session.session_id, user_id)).fetchall()
+        from pvp_db import db_ai_evaluator_card_rows
+        rows = db_ai_evaluator_card_rows(
+            self.session.session_id, user_id, "warzone", conn=_db)
         cards = []
         for r in rows:
             c = CardInfo(r)
@@ -548,21 +526,16 @@ class CardEvaluator:
         return cards
 
     def _hand_count(self, user_id):
-        row = _db.execute(
-            "SELECT COUNT(*) FROM game_cards "
-            "WHERE session_id=? AND user_id=? AND location='hand'",
-            (self.session.session_id, user_id)).fetchone()
-        return int(row[0] or 0) if row else 0
+        from pvp_db import db_hand_count
+        return db_hand_count(self.session.session_id, user_id, conn=_db)
 
     # -- ability effect cache ----------------------------------------------
     def effects_for(self, ability_guid):
         if ability_guid in self._effects_cache:
             return self._effects_cache[ability_guid]
         out = []
-        for e in _db.execute(
-                "SELECT effect_type, param FROM ability_effects "
-                "WHERE ability_guid=? ORDER BY effect_order",
-                (ability_guid,)).fetchall():
+        from pvp_db import db_ability_effect_type_params
+        for e in db_ability_effect_type_params(ability_guid, conn=_db):
             try:
                 pm = json.loads(e[1]) if e[1] else {}
             except Exception:
@@ -1297,13 +1270,12 @@ class CardEvaluator:
     # -- targeting help ----------------------------------------------------
     def _metadata_action_targets(self, card, ag):
         """Return legal explicit targets from the card's target metadata."""
-        row = _db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ag,)).fetchone()
-        if not row or not row[0]:
+        from pvp_db import db_ability_target_template_ids, db_target_template_row
+        payload = db_ability_target_template_ids(ag, conn=_db)
+        if not payload:
             return None
         try:
-            template_ids = json.loads(row[0])
+            template_ids = json.loads(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
         found_explicit = False
@@ -1314,13 +1286,10 @@ class CardEvaluator:
                      if callable(getattr(self.handler, "_champion_targets", None))
                      else [])
         for template_id in template_ids or []:
-            target = _db.execute(
-                "SELECT target_kind, is_auto_target, explicit "
-                "FROM target_templates WHERE template_id=?",
-                (str(template_id),)).fetchone()
-            kind = (target[0] if target else "") or ""
-            auto = int(target[1] or 0) if target else 0
-            explicit = int(target[2] or 0) if target else 0
+            target = db_target_template_row(str(template_id), conn=_db)
+            kind = (target[11] if target else "") or ""
+            auto = int(target[2] or 0) if target else 0
+            explicit = int(target[5] or 0) if target else 0
             if (auto or not explicit or kind in (
                     "PlayerTargetTemplate", "AbilitySourceCardTargetTemplate",
                     "AbilityCreatedTargetTemplate")):

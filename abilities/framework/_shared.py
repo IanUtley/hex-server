@@ -42,8 +42,9 @@ def _log(msg):
 
 def _card_state_of(db, session, card_uid):
     try:
-        from db import db_card_state
-        return db_card_state(session.session_id, int(card_uid))
+        from pvp_db import db_card_state_value
+        return db_card_state_value(
+            session.session_id, int(card_uid), conn=db)
     except Exception:
         return 0
 
@@ -56,16 +57,8 @@ def next_game_card_uid(db, session_id):
     when cards were inserted or restored in a different order, causing the
     client/server card cache to resolve a token as another card.
     """
-    row = db.execute(
-        "SELECT COALESCE(MAX(card_uid >> 8), 10000) + 1 "
-        "FROM game_cards WHERE session_id=?", (session_id,)).fetchone()
-    instance = max(10001, int(row[0] or 10001))
-    while db.execute(
-            "SELECT 1 FROM game_cards WHERE session_id=? AND card_uid=? "
-            "LIMIT 1", (session_id, game_engine.UID.make(1, instance).uid64)
-            ).fetchone():
-        instance += 1
-    return game_engine.UID.make(1, instance).uid64
+    from pvp_db import db_next_card_uid
+    return db_next_card_uid(session_id, conn=db)
 
 
 def card_collection_for_location(location):
@@ -186,6 +179,8 @@ def attribute_bits_from_flags(flags):
     This is deliberately separate from localized game-text parsing.  The
     extracted ``m_AttributeFlags`` value is authoritative whenever present.
     """
+    if isinstance(flags, int):
+        return int(flags)
     bits = 0
     for token in str(flags or "").replace("|", " ").split():
         normalized = token.strip().lower().replace("_", "")
@@ -251,10 +246,8 @@ def clear_combat_damage(db, session_id):
     be incorrectly killed when that bonus is removed (for example, a 2/3
     troop with +3 DEF and 3 marked damage).
     """
-    db.execute(
-        "UPDATE game_cards SET card_damage=0 "
-        "WHERE session_id=? AND location='warzone'",
-        (session_id,))
+    from pvp_db import db_clear_warzone_damage
+    db_clear_warzone_damage(session_id, conn=db)
     db.commit()
 
 
@@ -266,12 +259,9 @@ def clear_expired_temporary_attributes(db, session_id, owner_id, boundary,
     behavior.  The metadata is stored alongside temporary stat buffs so no
     schema change is needed, and unrelated temporary grants can coexist.
     """
-    rows = db.execute(
-        "SELECT card_uid, user_id, temporary_attributes, temporary_buffs "
-        "FROM game_cards WHERE session_id=? AND "
-        "(temporary_attributes != 0 OR "
-        "(temporary_buffs IS NOT NULL AND temporary_buffs != '{}'))",
-        (session_id,)).fetchall()
+    from pvp_db import (db_temporary_attribute_rows,
+                        db_set_temporary_card_state)
+    rows = db_temporary_attribute_rows(session_id, conn=db)
     changed = []
     for card_uid, target_owner, attrs, raw_buffs in rows:
         buffs = _temporary_buffs_json(raw_buffs)
@@ -309,10 +299,8 @@ def clear_expired_temporary_attributes(db, session_id, owner_id, boundary,
         new_buffs = json.dumps(buffs, separators=(",", ":"), sort_keys=True)
         if new_attrs == int(attrs or 0) and new_buffs == (raw_buffs or "{}"):
             continue
-        db.execute(
-            "UPDATE game_cards SET temporary_attributes=?, temporary_buffs=? "
-            "WHERE session_id=? AND card_uid=?",
-            (new_attrs, new_buffs, session_id, int(card_uid)))
+        db_set_temporary_card_state(session_id, int(card_uid), new_attrs,
+                                    new_buffs, conn=db)
         changed.append(int(card_uid))
     if changed:
         db.commit()
@@ -352,33 +340,28 @@ def apply_attribute_grant(game, session, db, handler, pl_t, ai_t, target_uid,
             if not bits:
                 return 0
     col = "temporary_attributes" if temporary else "card_attributes"
-    row = db.execute(
-        f"SELECT {col} FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, target_uid)).fetchone()
-    cur = row[0] if row else 0
-    db.execute(
-        f"UPDATE game_cards SET {col}=? WHERE session_id=? AND card_uid=?",
-        (cur | bits, session.session_id, target_uid))
+    from pvp_db import (db_card_attribute_value, db_set_card_attribute_value,
+                        db_card_owner_id, db_card_mutation_field,
+                        db_set_card_mutation_field, db_card_source_info)
+    cur = db_card_attribute_value(session.session_id, target_uid, col, conn=db)
+    db_set_card_attribute_value(session.session_id, target_uid, col,
+                                cur | bits, conn=db)
     if temporary:
         boundary = _temporary_attribute_expiry_boundary(duration)
         if boundary:
             if source_owner_id is None:
                 source_uid = (bstate or {}).get("resolving_source_uid")
                 if source_uid is not None:
-                    owner_row = db.execute(
-                        "SELECT user_id FROM game_cards "
-                        "WHERE session_id=? AND card_uid=?",
-                        (session.session_id, int(source_uid))).fetchone()
-                    if owner_row:
-                        source_owner_id = owner_row[0]
+                    owner_row = db_card_owner_id(
+                        session.session_id, int(source_uid), conn=db)
+                    if owner_row is not None:
+                        source_owner_id = owner_row
                 if source_owner_id is None:
                     source_owner_id = (bstate or {}).get("resolving_owner_id", 0)
             source_owner_id = int(source_owner_id or 0)
-            meta_row = db.execute(
-                "SELECT temporary_buffs FROM game_cards "
-                "WHERE session_id=? AND card_uid=?",
-                (session.session_id, target_uid)).fetchone()
-            buffs = _temporary_buffs_json(meta_row[0] if meta_row else "{}")
+            meta_value = db_card_mutation_field(
+                session.session_id, target_uid, "temporary_buffs", conn=db)
+            buffs = _temporary_buffs_json(meta_value or "{}")
             expirations = buffs.setdefault(_TEMPORARY_ATTRIBUTE_EXPIRATIONS, {})
             for bit in (1 << n for n in range(bits.bit_length())):
                 if bits & bit:
@@ -386,25 +369,21 @@ def apply_attribute_grant(game, session, db, handler, pl_t, ai_t, target_uid,
                         "owner": source_owner_id,
                         "boundary": boundary,
                     }
-            db.execute(
-                "UPDATE game_cards SET temporary_buffs=? "
-                "WHERE session_id=? AND card_uid=?",
-                (json.dumps(buffs, separators=(",", ":"), sort_keys=True),
-                 session.session_id, target_uid))
+            db_set_card_mutation_field(
+                session.session_id, target_uid, "temporary_buffs",
+                json.dumps(buffs, separators=(",", ":"), sort_keys=True),
+                conn=db)
     db.commit()
-    trow = db.execute(
-        "SELECT template_guid, location FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, target_uid)).fetchone()
+    trow = db_card_source_info(session.session_id, target_uid, conn=db)
     if trow and trow[0]:
         scid = game_engine.SessionCardId(game_engine.UID(target_uid))
         _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, trow[0])
-        orow = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, target_uid)).fetchone()
-        owner = owner_uid(orow[0] if orow else 0, pl_t, ai_t, bstate)
-        game.push_card_updated(scid, owner, card_collection_for_location(trow[1]), ct,
+        owner_id = db_card_owner_id(session.session_id, target_uid, conn=db)
+        owner = owner_uid(owner_id if owner_id is not None else 0,
+                          pl_t, ai_t, bstate)
+        game.push_card_updated(scid, owner, card_collection_for_location(trow[2]), ct,
                                template_id=trow[0], attack=atk, defense=def_,
-                               attributes=cur | bits, nulling=(trow[1] == "deck"))
+                               attributes=cur | bits, nulling=(trow[2] == "deck"))
     _log(f"    Attribute grant {hex(target_uid)}: +{bits:b}")
     return bits
 

@@ -189,14 +189,14 @@ class ApplicationCommandDispatcher:
 
     @staticmethod
     def _social_mutation(tx, command):
-        import db
+        import profile_db
         operations = {
-            "add_friend": db.db_send_friend_request,
-            "accept_friend": db.db_accept_friend_request,
-            "ignore_friend_request": db.db_ignore_friend_request,
-            "remove_friend": db.db_remove_friend,
-            "ignore_player": db.db_ignore_player,
-            "unignore_player": db.db_unignore_player,
+            "add_friend": profile_db.db_send_friend_request,
+            "accept_friend": profile_db.db_accept_friend_request,
+            "ignore_friend_request": profile_db.db_ignore_friend_request,
+            "remove_friend": profile_db.db_remove_friend,
+            "ignore_player": profile_db.db_ignore_player,
+            "unignore_player": profile_db.db_unignore_player,
         }
         try:
             operation = operations[command.operation]

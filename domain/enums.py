@@ -44,6 +44,61 @@ class ETurnPhases:
     EndGame = 24
 
 
+class ESessionFlags:
+    """Game.Shared.ESessionFlags [Flags] (values match the client)."""
+    None_ = 0
+    IsEncounter = 1
+    IsInDungeon = 2
+    IsPvE = 4
+    IsTutorial = 8
+    IsTournament = 16
+    IsSealed = 32
+    IsDraft = 64
+    IsPvEArena = 128
+    IsVirtualTournament = 256
+    IsDemo = 512
+    IsImmortalPvP = 1024
+    IsNonEncounterRequest = 2048
+    IsStandardPvP = 4096
+    IsDuelingPit = 8192
+    IsPractice = 16384
+    IsRock = 32768
+    IsSiege = 65536
+    IsIconoclast = 131072
+    IsWhosTheBoss = 262144
+    IsRoid = 524288
+    IsEpicSpellWars = 1048576
+    IsPortalCombat = 2097152
+    DoubleLifeTotals = 4194304
+    StartWithThreeResources = 8388608
+    InfinityPlay = 16777216
+
+
+class ETournamentFormats:
+    """Game.Shared.Tournaments.ETournamentFormats values."""
+    Constructed = 0
+    Sealed_Deck = 1
+    Booster_Draft = 2
+    SealedDeck = Sealed_Deck
+    BoosterDraft = Booster_Draft
+    Immortal = 16
+    InfinityPlay = 8192
+    PortalCombat = 65536
+    EpicSpellWars = 131072
+    Factioned = 1048576
+    Rock = 2097152
+    Singleton = 4194304
+    Chapter = 8388608
+    Janklander = 16777216
+    RecentChapter = 33554432
+    EDH = 67108864
+    ROID = 134217728
+    Iconoclast = 536870912
+    WhosTheBoss = 268435456
+    Iconoclast = 536870912
+    WildWest = 1073741824
+
+
 # ======================================================================
 #  Card Types
 # ======================================================================
@@ -130,6 +185,11 @@ class ECardStates:
     EffectExpired = 512
     ZoneChangeReplacement = 1024
     Activated = 2048
+    # Matches Game.Shared.Mechanics.ECardStates.VoidsIfDestroyed in the
+    # Unity client.  This transient flag is cleared by Session.ResetActiveCards
+    # before start-of-turn triggers and must be represented in server state so
+    # token/zone-change projections stay in sync with the client.
+    VoidsIfDestroyed = 4096
     CameOutThisTurn = 8192
     StartedATurnOnYourSide = 16384
 

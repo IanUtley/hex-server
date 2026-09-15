@@ -39,6 +39,10 @@ AIR_SUP = "555d8419-a849-6cbc-79c6-2f04b417fa09"    # troops w/ Flight +1/+1
 OATH = "df329e4c-7c33-4bb4-e1d3-bbffa277fc00"       # same-name troops +2/+2
 HIGH_TOMB = "6ac287a1-da4a-0d14-5ff0-de0329393fbb"  # +1/+1 per card in all crypts
 ENDBRINGER = "69f6aafa-89e8-687b-bea5-db5ef08d8a25"  # Orcs Rage 2 per champ <=10hp
+GORTEZUMA = "b24b07cf-3da5-0014-fa56-8936700c3f52"  # self Invincible if opponent <=10
+GORTEZUMA_COND = "180773b3-b10b-5633-f60c-42eb3556fd9d"
+ELECTROID = "e0c9f434-86e1-20a8-47c0-2a1c5f27f5ff"
+ELECTROID_COND = "c96dccfd-f714-4508-a3a6-f21779918aae"
 
 TPL_PLAIN = "11111111-1111-1111-1111-111111111111"
 TPL_SOUL = "22222222-2222-2222-2222-222222222222"
@@ -104,9 +108,11 @@ def make_db():
                            "(?,?,?,?,?,?,?,?,?,?,?,?)", r)
 
     for ag in (LIGHT, SOUL, TECH, ROCK, WALL, OZAWA, DANDELION, EMBER,
-               TE_TALCA, HARVESTER, AIR_SUP, OATH, HIGH_TOMB, ENDBRINGER):
+               TE_TALCA, HARVESTER, AIR_SUP, OATH, HIGH_TOMB, ENDBRINGER,
+               GORTEZUMA, ELECTROID):
         copy_ability(ag)
-    for cid in ("1b5793b0", "d4a01cea", "72c15be6"):
+    for cid in ("1b5793b0", "d4a01cea", "72c15be6", GORTEZUMA_COND,
+                ELECTROID_COND):
         for r in src.execute(
                 "SELECT condition_id, name, condition_json "
                 "FROM ability_effect_conditions WHERE condition_id LIKE ?",
@@ -157,6 +163,10 @@ def make_db():
         2, 3, 3, int(game_engine.ECardAttributes.Flight), [])
     tpl("88888888-8888-8888-8888-888888888888", "Other Troop", "Troop",
         1, 1, 1, 0, [])
+    tpl("11111111-1111-1111-1111-111111111120", "Gortezuma", "Troop",
+        2, 2, 2, 0, [GORTEZUMA])
+    tpl("11111111-1111-1111-1111-111111111121", "Electroid", "Troop|Artifact",
+        1, 3, 4, 0, [ELECTROID], subtype="Robot")
     src.close()
     db.commit()
     return db
@@ -326,12 +336,55 @@ def test_endbringer_scaled_rage(db):
     assert d["attrs"] & game_engine.ECardAttributes.Rage
 
 
+def test_gortezuma_invincible_uses_opponent_health(db):
+    card(db, 101, 5, "11111111-1111-1111-1111-111111111120", "warzone",
+         json.dumps([GORTEZUMA]))
+    bstate = {"player_health": 20, "ai_health": 20}
+    assert not (effective_deltas(db, 1, bstate, 101)["attrs"] &
+                game_engine.ECardAttributes.Immortal)
+    bstate["ai_health"] = 10
+    assert (effective_deltas(db, 1, bstate, 101)["attrs"] &
+            game_engine.ECardAttributes.Immortal)
+    pvp_state = {"pvp": True, "pids": [5, 9], "hp_5": 20, "hp_9": 20}
+    assert not (effective_deltas(db, 1, pvp_state, 101)["attrs"] &
+                game_engine.ECardAttributes.Immortal)
+    pvp_state["hp_9"] = 10
+    assert (effective_deltas(db, 1, pvp_state, 101)["attrs"] &
+            game_engine.ECardAttributes.Immortal)
+
+
 def test_flight_block_legality(db):
     card(db, 101, 5, "11111111-1111-1111-1111-11111111111f", "warzone")  # flyer
     card(db, 102, 0, TPL_PLAIN, "warzone")
     card(db, 103, 0, "11111111-1111-1111-1111-11111111111e", "warzone")  # flyer
     assert not can_block(db, 1, {}, 101, 102)
     assert can_block(db, 1, {}, 101, 103)
+
+
+def test_electroid_combat_threshold_is_continuous(db):
+    """Electroid's authored condition must gate both attack and block.
+
+    The condition is a continuous static modifier, so four qualifying troops
+    (including Electroid itself) remove both CantAttack and CantBlock without
+    any card-name rule in the combat path.
+    """
+    card(db, 101, 5, "11111111-1111-1111-1111-111111111121", "warzone",
+         json.dumps([ELECTROID]),
+         state=int(game_engine.ECardStates.StartedATurnOnYourSide))
+    attrs = effective_stats(db, 1, {}, 101)[2]
+    assert attrs & game_engine.ECardAttributes.CantAttack
+    assert attrs & game_engine.ECardAttributes.CantBlock
+
+    for uid, subtype in ((102, "Dwarf"), (103, "Dwarf"), (104, "Robot")):
+        guid = f"11111111-1111-1111-1111-{uid:012x}"
+        db.execute(
+            "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (guid, f"Qualifying {uid}", "Troop", 1, 1, 1, 0,
+             "[]", "[]", subtype))
+        card(db, uid, 5, guid, "warzone")
+    attrs = effective_stats(db, 1, {}, 101)[2]
+    assert not (attrs & game_engine.ECardAttributes.CantAttack)
+    assert not (attrs & game_engine.ECardAttributes.CantBlock)
 
 
 def test_damage_threshold_variable(db):
@@ -650,7 +703,11 @@ if __name__ == "__main__":
     run("Oath of Valor uses stored name", test_oath_of_valor_stored_name)
     run("High Tomb Lord counts both crypts", test_high_tomb_lord_both_crypts)
     run("Endbringer scales Rage with champions", test_endbringer_scaled_rage)
+    run("Gortezuma checks opposing champion health",
+        test_gortezuma_invincible_uses_opponent_health)
     run("Flight needs a flyer to block", test_flight_block_legality)
+    run("Electroid gates combat on Dwarf/Robot control",
+        test_electroid_combat_threshold_is_continuous)
     run("Damage scales with Blood threshold", test_damage_threshold_variable)
     run("CountListAttr uses gamedata list name",
         test_count_list_attribute_uses_gamedata_list_name)

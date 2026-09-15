@@ -52,6 +52,7 @@ TPL_INFILTRATOR = "cad6307e-bafc-492f-84f6-3b914071d5d3"
 TPL_INCANT_FEAR = "f8103511-772f-40ea-8599-04d520508bac"
 AG_INCANT_FEAR = "1026a613-0814-a633-0869-3d35aaa8dd72"
 TPL_STRENGTH_REDWOOD = "27e20321-3e24-4802-8ffe-b4579616ff5c"
+AG_HARDSHELL_LOSE_LIFE = "3c64eeac-7953-d876-67c1-445b90b8ccbc"
 
 
 def _pl_ai():
@@ -101,6 +102,22 @@ def test_card_battled_dispatch_is_directional(db):
     assert dispatch.call_count == 1
     assert dispatch.call_args.args[7:9] == ("CardBattledEvent", 101)
     assert dispatch.call_args.kwargs["extra_target"] == 202
+
+
+def test_lose_life_modifier_is_not_damage(db):
+    """LoseLifeModifier must not recursively fire damage replacement hooks."""
+    from tests.tests_cards_fixes import _copy_ability
+    from abilities.framework.resolution import resolve_ability
+
+    _copy_ability(db, AG_HARDSHELL_LOSE_LIFE)
+    pl_t, ai_t = _pl_ai()
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+    source_uid = int(handler._player_champ_scid.uid.uid64)
+    resolve_ability(handler, game_engine.Game(1, pl_t, ai_t), SessionStub(),
+                    db, pl_t, ai_t, bstate, AG_HARDSHELL_LOSE_LIFE,
+                    source_uid, 5, {0: source_uid})
+    assert bstate["player_health"] == 19, bstate
 
 
 def test_generated_card_uid_is_independent_of_row_id(db):
@@ -903,6 +920,7 @@ def _main():
     tests = (test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
+             test_lose_life_modifier_is_not_damage,
              test_brood_creeper_does_not_fire_on_own_champion,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,

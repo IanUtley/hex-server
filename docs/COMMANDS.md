@@ -1,6 +1,8 @@
 # Chat Command Reference
 
-All commands use `!` prefix. Type in chat (any tab works after session room join).
+Commands accept either the historical `!` prefix or `/` prefix. Type in chat
+(any tab works after session room join). `thresholds` is accepted as an alias
+for `threshold`.
 The server accepts these commands only when `allowcon` is present in
 `HEX_PROFILE_FLAGS`.
 

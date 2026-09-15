@@ -167,6 +167,47 @@ def _object_field(rec, field):
     return None
 
 
+def _modifier_metadata(rec):
+    """Copy rules fields from CardModifier's typed child into BOM params.
+
+    ``m_GameText`` is a localization/display field.  Keeping the child
+    modifier's identity and operands in the generated row lets runtime code
+    work from the same metadata even when Records are not available.
+    """
+    modifier = _object_field(rec, "m_Modifier") or {}
+    out = {}
+    for source, target in (
+            ("m_Attribute", "attribute"),
+            ("m_AttributeFlags", "attribute_flags"),
+            ("m_Operation", "operation"),
+            ("m_Value", "value"),
+            ("m_Amount", "amount"),
+            ("m_RemoveAllCounters", "removeallcounters"),
+            ("m_RemoveHalfRoundedUp", "removehalfroundedup"),
+            ("m_ReplaceExistingValue", "replaceexistingvalue"),
+            ("m_IsCombatDamage", "iscombatdamage"),
+            ("m_CombatDamageOnly", "combatdamageonly"),
+            ("m_NonCombatDamageOnly", "noncombatdamageonly"),
+            ("m_OneShot", "oneshot"),
+            ("m_LastsIndefinitely", "lastsindefinitely"),
+            ("m_LoseHalfHealth", "lose_half_health")):
+        if source in modifier and modifier[source] is not None:
+            value = modifier[source]
+            if isinstance(value, dict) and "m_Value" in value:
+                value = value["m_Value"]
+            out[target] = value
+    input_value = modifier.get("m_InputValue")
+    if isinstance(input_value, dict):
+        if input_value.get("m_InputVariableName"):
+            out["input_variable"] = input_value["m_InputVariableName"]
+        if "m_Value" in input_value:
+            out["input_value"] = input_value["m_Value"]
+    counter = modifier.get("m_CardCounterTemplateId")
+    if isinstance(counter, dict) and counter.get("m_Guid"):
+        out["counter_template_guid"] = str(counter["m_Guid"]).lower()
+    return out
+
+
 # --- per-card conversion -----------------------------------------------------
 
 def _attributes_to_int(flags):
@@ -407,14 +448,15 @@ def _card_ability_bom(data, ability_guids):
             r'"m_InputVariableName"\s*:\s*"([^"]+)"', rec)
         if iv:
             ivar = iv.group(1)
-        effect_templates[g] = (ttype, param, gtext, prop, ivar)
+        effect_templates[g] = (ttype, param, gtext, prop, ivar,
+                               _modifier_metadata(rec))
 
     rows = []
     all_discovered = set()
     seen = set()
     pending = [g for g in ability_guids if g]
 
-    def _card_modifier_param(gtext, prop, ivar, var_map, e):
+    def _card_modifier_param(gtext, prop, ivar, var_map, e, typed):
         """Parent-level CardModifier params for one child effect.
 
         property comes from the child's m_Modifier class; the amount resolves
@@ -428,14 +470,18 @@ def _card_ability_bom(data, ability_guids):
             am = re.search(r'([+-]?\d+)\s*\[(ATK|DEF)\]', gtext or "")
             if am:
                 amount = int(am.group(1))
-        return json.dumps({
+        values = {
             "text": gtext,
             "property": prop.lower(),
             "amount": amount,
             "duration": e["duration"],
             "target_index": e["target_index"],
             "condition_id": e["condition_id"],
-        })
+        }
+        # Merge the authoritative typed child fields into the compatibility
+        # payload so generated rows remain usable without Records.
+        values.update(typed)
+        return json.dumps(values)
 
     def expand(ag):
         if ag in seen:
@@ -450,11 +496,12 @@ def _card_ability_bom(data, ability_guids):
             if key in seen:
                 continue
             seen.add(key)
-            ttype, invoke_param, gtext, prop, ivar = effect_templates.get(
-                eg, ("?", "", "", "", ""))
+            ttype, invoke_param, gtext, prop, ivar, typed = effect_templates.get(
+                eg, ("?", "", "", "", "", {}))
             param = invoke_param
             if ttype == "CardModifierAbilityEffectTemplate":
-                param = _card_modifier_param(gtext, prop, ivar, var_map, e)
+                param = _card_modifier_param(gtext, prop, ivar, var_map, e,
+                                              typed)
             rows.append((
                 ag, eg, order, ttype, param,
                 e["group_id"], e["condition_id"], e["target_index"],

@@ -35,6 +35,7 @@ import os
 import time
 from binascii import hexlify
 
+import db as connection_db
 import pvp_db as db_layer
 
 # UID type codes (must match hconnect_server.py)
@@ -106,7 +107,7 @@ def _db():
     # Session state is written from HConnect while the separate tournament
     # scheduler may be updating the same WAL database.  Use the same wait
     # policy as db.py so a transient writer collision does not abort a turn.
-    return db_layer.connect(_DB_PATH)
+    return connection_db.connect(_DB_PATH)
 
 
 def _next_instance(conn=None):

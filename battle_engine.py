@@ -119,10 +119,10 @@ OPP_DEFAULT_STOPS = {
     game_engine.ETurnPhases.DeclareDefensePriorityWindow,
 }
 
-# Runtime ability resolution attaches the active metadata builder to the
-# in-memory battle state so nested effects can reuse it.  It is deliberately
-# not part of the JSON session contract: the builder contains graph/store
-# objects and must be reconstructed when a later transaction resumes.
+# Compatibility scrub for snapshots created by a server that pre-dates the
+# ephemeral EffectContext builder boundary.  Current resolution never writes
+# runtime objects into battle state; the filter only prevents an in-flight
+# legacy snapshot from breaking an upgrade/reload.
 _RUNTIME_STATE_KEYS = frozenset({"_ability_builder"})
 
 
@@ -130,8 +130,8 @@ def persistence_state(state):
     """Return the JSON-safe view of a live battle state.
 
     Resolution may persist from inside an effect (for example, while drawing
-    a card).  Keep runtime-only objects in the live dict, but omit them from
-    the session snapshot written to ``turn_order_json``.
+    a card).  Current resolver state is JSON-safe; strip the obsolete legacy
+    key defensively when resuming a process that still has an old snapshot.
     """
     if not isinstance(state, dict):
         return state
@@ -209,6 +209,12 @@ def ai_held_phase_context(state):
 def load_state(session):
     """Load the battle state dict for a session (defaults if absent)."""
     try:
+        shared = getattr(session, "_rules_port_battle_state", None)
+        if isinstance(shared, dict) and "turn_player" in shared:
+            for key in ("player_threshold", "ai_threshold"):
+                if key in shared and isinstance(shared[key], dict):
+                    shared[key] = {int(k): v for k, v in shared[key].items()}
+            return shared
         data = session.turn_order
         if isinstance(data, dict) and "turn_player" in data:
             # JSON serializes int keys as strings; convert threshold dicts back.
@@ -223,58 +229,73 @@ def load_state(session):
 
 def save_state(session, state):
     """Persist battle state into the session's turn_order_json column."""
+    if isinstance(getattr(session, "_rules_port_battle_state", None), dict):
+        session._rules_port_battle_state = state
     session.turn_order = persistence_state(state)
     try:
-        session._persist()
+        # Battle resolution already performs card writes through the process
+        # shared connection. Persisting through a second connection can block
+        # behind that still-open transaction; the blocked AI thread then
+        # stops sending packets and the client loses its heartbeat.
+        import db as _db_layer
+        try:
+            session._persist(conn=_db_layer._db)
+        except TypeError:
+            # Retain compatibility with small legacy test/session doubles.
+            session._persist()
+        _db_layer._db.commit()
     finally:
         # The active resolver still needs its builder after a nested save.
         session.turn_order = state
 
 
-# --- Chain / stack ----------------------------------------------------------
-# The chain holds pending resolutions for the current phase (troops, spells,
-# triggers). It is cleared at the start of each phase; when both players pass
-# priority, the top resolves and executes, then priority is re-granted until the
-# chain empties (then the phase advances). Each item:
+# --- Chain / stack compatibility facade ------------------------------------
+# The authoritative primitives live in rules_port.chain. The persisted chain
+# format remains here for legacy callers and battle-state serialization.
+# Each item:
 #   {"kind": "troop"|"trigger"|"spell", "source_uid": int, "instance_id": int,
 #    "ability_guid": str, "targets": [int]}
 
 def stack_push(state, item):
-    state.setdefault("stack", []).append(item)
+    from rules_port.chain import push
+    push(state, item)
 
 
 def stack_pop(state):
-    stack = state.get("stack") or []
-    return stack.pop() if stack else None
+    from rules_port.chain import pop
+    return pop(state)
 
 
 def stack_top(state):
-    stack = state.get("stack") or []
-    return stack[-1] if stack else None
+    from rules_port.chain import top
+    return top(state)
 
 
 def stack_empty(state):
-    return not (state.get("stack") or [])
+    from rules_port.chain import empty
+    return empty(state)
 
 
 def stack_clear(state):
-    state["stack"] = []
+    from rules_port.chain import clear
+    clear(state)
 
 
 def stack_set_pass(state, player, passed):
     """Mark whether the player (PLAYER/AI) has passed priority for the current
     chain. When both have passed, the top resolves."""
-    key = "stack_player_passed" if player == PLAYER else "stack_ai_passed"
-    state[key] = bool(passed)
+    from rules_port.chain import set_pass
+    set_pass(state, player, passed)
 
 
 def stack_both_passed(state):
-    return bool(state.get("stack_player_passed")) and bool(state.get("stack_ai_passed"))
+    from rules_port.chain import both_passed
+    return both_passed(state)
 
 
 def stack_reset_passes(state):
-    state["stack_player_passed"] = False
-    state["stack_ai_passed"] = False
+    from rules_port.chain import reset_passes
+    reset_passes(state)
 
 
 def default_state(turn_player=PLAYER):

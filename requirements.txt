@@ -1,1 +1,2 @@
 PyYAML==6.0.2
+supervisor==4.2.5

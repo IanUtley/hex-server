@@ -8,6 +8,156 @@ from .registry import effect
 from .._shared import next_game_card_uid, owner_uid
 
 
+@effect("NoOpEffectTemplate")
+def no_op(effect):
+    """Preserve client target-resolution semantics without mutation."""
+    return "no-op"
+
+
+@effect("DrawCardAbilityEffectTemplate")
+def draw_one_card(effect):
+    """The singular client draw template is exactly one typed draw."""
+    return effect.draw(1, owner=effect.target_owner(default=None))
+
+
+@effect("ReturnToHandAbilityEffectTemplate")
+def return_to_hand(effect):
+    return effect.return_to_hand()
+
+
+@effect("ClearStoredAbilityEffectTemplate")
+def clear_stored(effect):
+    return effect.clear_stored()
+
+
+@effect("SetResponsiblePlayerAbilityEffectTemplate")
+def set_responsible_player(effect):
+    return effect.set_responsible_player()
+
+
+@effect("CopyAbilityVariableEffectTemplate")
+def copy_ability_variable(effect):
+    return effect.copy_ability_variable()
+
+
+@effect("SetCardCountVariableEffectTemplate")
+def set_card_count_variable(effect):
+    return effect.set_card_count_variable()
+
+
+@effect("SetCardIntegerVariableEffectTemplate")
+def set_card_integer_variable(effect):
+    return effect.set_card_integer_variable()
+
+
+@effect("SetConstantValueVariableEffectTemplate")
+def set_constant_value_variable(effect):
+    return effect.set_constant_value_variable()
+
+
+@effect("TransformCardToTargetAbilityEffectTemplate")
+def transform_card_to_target(effect):
+    return effect.transform_card_to_target()
+
+
+@effect("FinishMovingCardToWarzoneEffectTemplate")
+def finish_moving_to_warzone(effect):
+    return effect.finish_moving_to_warzone()
+
+
+@effect("FinishResolvingCardAbilityEffectTemplate")
+def finish_resolving_card(effect):
+    return effect.finish_resolving_card()
+
+
+@effect("ActivatePowerAbilityEffectTemplate")
+def activate_power(effect):
+    # Ordinary power activations share the same child-ability scheduler. The
+    # champion charge-power selector remains a metadata/session concern.
+    return effect.activate_ability()
+
+
+@effect("InterruptSpellAbilityEffectTemplate")
+def interrupt_spell(effect):
+    return effect.counter_spell()
+
+
+@effect("BuiltInPlayCardAbilityEffectTemplate")
+def built_in_play_card(effect):
+    return effect.play_card()
+
+
+@effect("SummonXTokenTroopsAbilityEffectTemplate")
+def summon_x_tokens(effect):
+    return effect.summon_x_tokens()
+
+
+@effect("TargetPlayerTakesControlEffectTemplate")
+def target_player_takes_control(effect):
+    return effect.target_player_takes_control()
+
+
+@effect("StealCardAbilityEffectTemplate")
+def steal_card(effect):
+    return effect.steal_card()
+
+
+@effect("StealEffectsAbilityEffectTemplate")
+def steal_effects(effect):
+    return effect.steal_effects()
+
+
+@effect("LoseGameAbilityEffectTemplate")
+def lose_game(effect):
+    return effect.lose_game()
+
+
+@effect("RevertTransformedCardAbilityEffectTemplate")
+def revert_transformed_card(effect):
+    return effect.revert_transformed_card()
+
+
+@effect("PlayerAttributeAbilityEffectTemplate")
+def player_attribute(effect):
+    return effect.player_attribute()
+
+
+@effect("ExchangeCardsAbilityEffectTemplate")
+def exchange_cards(effect):
+    return effect.exchange_cards()
+
+
+@effect("MergeCardCollectionsAbilityEffectTemplate")
+def merge_card_collections(effect):
+    return effect.merge_card_collections()
+
+
+@effect("ZombiePlagueAbilityEffectTemplate")
+def zombie_plague(effect):
+    return effect.zombie_plague()
+
+
+@effect("XarloxAbilityEffectTemplate")
+def xarlox(effect):
+    return effect.xarlox()
+
+
+@effect("PlanCAbilityEffectTemplate")
+def plan_c(effect):
+    return effect.plan_c()
+
+
+@effect("ShuffleCardCollectionAbilityEffectTemplate")
+def shuffle_collection(effect):
+    return effect.shuffle_collection()
+
+
+@effect("ExtraCombatsThisTurnAbilityEffectTemplate")
+def extra_combats_obsolete(effect):
+    """The client template is obsolete and intentionally has no mutation."""
+    return "extra combats: obsolete"
+
+
 def _resolved_target(bstate):
     return ((bstate or {}).get("resolving_target_uid")
             or (bstate or {}).get("player_mod_target")
@@ -17,10 +167,9 @@ def _resolved_target(bstate):
 
 def _push_card_in_zone(game, session, db, handler, pl_t, ai_t, bstate,
                        uid, location):
-    row = db.execute(
-        "SELECT template_guid, user_id FROM game_cards "
-        "WHERE session_id=? AND card_uid=?", (session.session_id, int(uid))
-    ).fetchone()
+    from pvp_db import db_card_source_info
+    source = db_card_source_info(session.session_id, int(uid), conn=db)
+    row = (source[0], source[3]) if source else None
     if not row:
         return
     from .._shared import card_collection_for_location
@@ -29,51 +178,40 @@ def _push_card_in_zone(game, session, db, handler, pl_t, ai_t, bstate,
         game, scid, row[0])
     owner = owner_uid(row[1], pl_t, ai_t, bstate)
     collection = card_collection_for_location(location)
+    game.push_card_moved(scid, owner, collection,
+                         game_engine.ECardLocations.Top, 0)
     game.push_card_updated(scid, owner, collection, ct, template_id=row[0],
                            cost=cost, attack=atk, defense=defense,
                            nulling=(str(location).lower() == "deck"))
-    game.push_card_moved(scid, owner, collection,
-                         game_engine.ECardLocations.Top, 0)
+    from .visibility import refresh_player_visibility
+    refresh_player_visibility(
+        db, session, handler, game, pl_t, ai_t, bstate)
 
 
 def _create_matching_target(game, session, db, handler, pl_t, ai_t, bstate,
                             target, count, collection):
     """Create copies of a target template using the normal token projection."""
-    row = db.execute(
-        "SELECT template_guid, user_id FROM game_cards "
-        "WHERE session_id=? AND card_uid=?", (session.session_id, int(target))
-    ).fetchone()
+    from pvp_db import (db_card_source_info, db_copy_template_payload,
+                        db_next_game_card_row_id, db_insert_generated_card)
+    source = db_card_source_info(session.session_id, int(target), conn=db)
+    row = (source[0], source[3]) if source else None
     if not row:
         return 0
     tpl_guid, owner_id = row
-    tpl = db.execute(
-        "SELECT card_type, abilities_json, attributes FROM card_templates "
-        "WHERE guid=?", (tpl_guid,)).fetchone()
+    tpl = db_copy_template_payload(tpl_guid, conn=db)
     if not tpl:
         return 0
     loc = {"hand": "hand", "deck": "deck", "underground": "underground",
            "void": "void", "warzone": "warzone"}.get(
                str(collection or "warzone").lower(), "warzone")
     created = []
-    columns_info = {row[1] for row in db.execute(
-        "PRAGMA table_info(game_cards)").fetchall()}
     for index in range(max(0, int(count))):
-        next_id = db.execute(
-            "SELECT COALESCE(MAX(id),10000)+1 FROM game_cards "
-            "WHERE session_id=?", (session.session_id,)).fetchone()[0]
+        next_id = db_next_game_card_row_id(session.session_id, conn=db)
         uid = next_game_card_uid(db, session.session_id)
-        columns = ["id", "session_id", "user_id", "card_uid", "template_guid",
-                   "card_template_id", "location", "position", "card_state",
-                   "card_abilities", "card_type", "card_attributes"]
-        values = [next_id, session.session_id, owner_id, uid, tpl_guid, tpl_guid,
-                  loc, 0, 0, tpl[1] or "[]", tpl[0], int(tpl[2] or 0)]
-        for name, value in (("owner_user_id", owner_id),
-                            ("original_template_guid", tpl_guid),
-                            ("gems", 0)):
-            if name in columns_info:
-                columns.append(name); values.append(value)
-        db.execute("INSERT INTO game_cards ({}) VALUES ({})".format(
-            ",".join(columns), ",".join("?" for _ in columns)), values)
+        db_insert_generated_card(
+            session.session_id, owner_id, uid, tpl_guid, loc, tpl[0], tpl[1],
+            tpl[2], next_id, conn=db, owner_user_id=owner_id,
+            original_template_guid=tpl_guid, gems=0)
         created.append(int(uid))
     db.commit()
     for uid in created:

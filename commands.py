@@ -15,34 +15,78 @@ from encoder import encode_datawrapper, compress_gzip, encode_sync_event
 
 
 def reload_runtime_modules():
-    """Reload server modules used by the HConnect SIGUSR1 hook."""
-    import importlib, ai as aim
+    """Reload loaded Python runtime modules used by the HConnect SIGUSR1 hook.
+
+    Static schema/data initialization and ``hconnect_server`` itself still
+    require a full restart.  The accept loop and live handler objects must not
+    be recreated while clients are connected.
+    """
+    import importlib
+    import ai as aim
     import gamemodes.tournament_engine as te, gamemodes.tournament_server as ts
     import services.tournament_game as tg, services.chat as sch
     import services.arena as arena_service, services.mail as mail_service
     import encoder as en, db as dbm
+    import game_engine as game_engine_module
+    import game_session as game_session_module
+    import battle_engine as battle_engine_module
+    import pvp_db as pvp_db_module
+    import profile_db as profile_db_module
+    import pve_db as pve_db_module
+    import chat_db as chat_db_module
+    import replay_db as replay_db_module
+    import tournament_db as tournament_db_module
+    import application.dispatcher as application_dispatcher
+    import application.player_transactions as player_transactions
+    import gamedata.play_plan as play_plan
     import abilities.framework.bom as ability_bom
     import abilities.framework.targeting as ability_targeting
     import abilities.framework.resolution as ability_resolution
     import abilities.framework.triggers as ability_triggers
+    import rules_port.wire as rules_wire
+    import rules_port.runtime_adapter as rules_runtime
+    import rules_port.transactions as rules_transactions
     import abilities as abilities_pkg, ability as ability_compat
-    importlib.reload(dbm); importlib.reload(aim); importlib.reload(en)
-    # Campaign handlers are imported by the live HConnect module and must be
-    # refreshed here as well; otherwise SIGUSR1 would leave campaign.py
-    # changes stale until a full process restart.
-    importlib.reload(campaign)
-    # tournament_game imports the trigger dispatcher lazily, but Python
-    # retains the already-loaded abilities.framework.triggers module. Refresh
-    # the framework first, then public abilities and game services.
-    importlib.reload(ability_targeting)
-    importlib.reload(ability_resolution)
-    importlib.reload(ability_bom)
-    importlib.reload(ability_triggers)
-    importlib.reload(abilities_pkg)
-    importlib.reload(ability_compat)
-    importlib.reload(te); importlib.reload(ts)
-    importlib.reload(tg); importlib.reload(sch)
-    importlib.reload(arena_service); importlib.reload(mail_service)
+
+    # Reload foundational modules first, then all already-loaded modules in
+    # the application/runtime packages.  Filtering sys.modules avoids
+    # importing optional services solely because SIGUSR1 was received.
+    groups = [
+        [dbm],
+        [pvp_db_module, profile_db_module, pve_db_module, chat_db_module,
+         replay_db_module, tournament_db_module],
+        [game_engine_module, game_session_module, battle_engine_module,
+         application_dispatcher, player_transactions, play_plan, campaign],
+        [ability_targeting, ability_resolution, ability_bom, ability_triggers,
+         abilities_pkg, ability_compat],
+        [rules_transactions, rules_runtime, rules_wire],
+        [aim, te, ts, tg, sch, arena_service, mail_service, en],
+    ]
+    prefixes = ("abilities", "rules_port", "application", "services",
+                "gamemodes", "gamedata")
+    loaded = {
+        module.__name__: module
+        for module in _sys.modules.values()
+        if module is not None and any(
+            module.__name__ == prefix
+            or module.__name__.startswith(prefix + ".")
+            for prefix in prefixes)
+        and module.__name__ not in {"commands", "hconnect_server"}
+    }
+    for module in sorted(loaded.values(),
+                         key=lambda item: item.__name__.count("."),
+                         reverse=True):
+        groups.append([module])
+
+    reloaded = []
+    seen = set()
+    for group in groups:
+        for module in group:
+            if module.__name__ in seen:
+                continue
+            importlib.reload(module)
+            seen.add(module.__name__)
+            reloaded.append(module.__name__)
     # When launched as ``python hconnect_server.py``, the live module is
     # ``__main__``. Rebind its tournament globals after reloading.
     hc = _sys.modules.get("__main__")
@@ -61,7 +105,8 @@ def reload_runtime_modules():
     hc.start_waiting_room_game = te.start_waiting_room_game
     hc._encode_enter_tournament_error = te._encode_enter_tournament_error
     hc._make_deck_data = te._make_deck_data
-    return "Tournament, AI, ability, Arena, and Mail modules reloaded + globals rebound"
+    return (f"Reloaded {len(reloaded)} runtime modules + tournament globals "
+            "rebound: " + ", ".join(reloaded))
 
 
 def _chat_card_link(name, template_guid):
@@ -82,7 +127,14 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
                 "!update !threshold !resource !pass !phase !draw !discard "
                 "!addcard !top")
 
-    action = parts[0].lower()
+    # Accept both the historical ``!command`` spelling and the slash spelling
+    # used by the in-client developer console.  Keep the canonical command
+    # names singular internally so old scripts continue to work.
+    action = parts[0].lower().lstrip("!/")
+    if action == "thresholds":
+        action = "threshold"
+    elif action == "resources":
+        action = "resource"
     args = parts[1:]
     import sys
     print(f"  [CMD DEBUG] action={action} args={args}", file=sys.stderr, flush=True)
@@ -211,17 +263,15 @@ def _cmd_encounter(handler, args):
 
     # Find the player's champion and campaign
     uid = handler.user_profile["id"]
-    champ = db.execute(
-        "SELECT id, last_deck_id FROM champions WHERE user_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1",
-        (uid,)).fetchone()
+    from profile_db import db_latest_champion_for_user
+    champ = db_latest_champion_for_user(uid, conn=db)
     if not champ:
         return "No champion found — create one first"
     champ_id, deck_db_id = champ[0], champ[1]
     deck_uid64 = (deck_db_id << 8) | 17 if deck_db_id else 0
 
-    camp = db.execute(
-        "SELECT id FROM campaigns WHERE champion_id=? ORDER BY id DESC LIMIT 1",
-        (champ_id,)).fetchone()
+    from pve_db import db_latest_campaign_any
+    camp = db_latest_campaign_any(champ_id, conn=db)
     camp_id = camp[0] if camp else 0
 
     import campaign
@@ -274,11 +324,9 @@ def _cmd_game_end(handler, args):
         out.append("No active battle session")
 
     # 2) Campaign gameendnotify — updates campaign state (reveals quest NPC on a win).
-    camp_row = db.execute(
-        "SELECT c.id FROM campaigns c JOIN champions ch ON c.champion_id=ch.id "
-        "WHERE ch.user_id=? ORDER BY c.id DESC LIMIT 1",
-        (handler.user_profile["id"],)
-    ).fetchone()
+    from pve_db import db_latest_campaign_for_user
+    camp_row = db_latest_campaign_for_user(
+        handler.user_profile["id"], conn=db)
     if not camp_row:
         out.append("No active campaign for this player")
     elif not campaign_handled:
@@ -304,9 +352,8 @@ def _cmd_challenge(handler, args):
     my_id = handler.user_profile["id"] if handler.user_profile else 0
 
     # Look up opponent
-    opp_row = db.execute(
-        "SELECT id, name FROM users WHERE LOWER(name)=LOWER(?) LIMIT 1",
-        (opp_name,)).fetchone()
+    from profile_db import db_find_user_by_name, db_latest_deck_for_user
+    opp_row = db_find_user_by_name(opp_name)
     if not opp_row:
         return f"Player '{opp_name}' not found"
 
@@ -322,17 +369,11 @@ def _cmd_challenge(handler, args):
     opp_handler = active[0][0]
 
     # Get challenger's deck
-    my_deck = db.execute(
-        "SELECT id FROM decks WHERE user_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1",
-        (my_id,)).fetchone()
-    my_deck_id = my_deck[0] if my_deck else 0
+    my_deck_id = db_latest_deck_for_user(my_id, conn=db)
     my_deck_uid64 = (my_deck_id << 8) | 17 if my_deck_id else 0
 
     # Get opponent's deck
-    opp_deck = db.execute(
-        "SELECT id FROM decks WHERE user_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1",
-        (opp_id,)).fetchone()
-    opp_deck_id = opp_deck[0] if opp_deck else 0
+    opp_deck_id = db_latest_deck_for_user(opp_id, conn=db)
     opp_deck_uid64 = (opp_deck_id << 8) | 17 if opp_deck_id else 0
 
     # Create game session
@@ -463,10 +504,9 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
     """
     if user_id is None:
         user_id = handler.user_profile["id"]
-    row = db.execute(
-        "SELECT gc.card_template_id, gc.location, gc.template_guid FROM game_cards gc "
-        "WHERE gc.session_id=? AND gc.user_id=? AND gc.card_uid=?",
-        (session.session_id, user_id, card_id)).fetchone()
+    from pvp_db import (db_card_command_info, db_template_projection,
+                        db_deck_active_gems)
+    row = db_card_command_info(session.session_id, user_id, card_id, conn=db)
     if not row:
         return
     instance_id = row[0]
@@ -478,9 +518,7 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
     ct = game_engine.ECardTypes.Troop
     cost, atk, def_ = 0, 0, 0
     if row[2]:
-        trow = db.execute(
-            "SELECT ct.card_type, ct.cost, ct.attack, ct.defense "
-            "FROM card_templates ct WHERE ct.guid=?", (row[2],)).fetchone()
+        trow = db_template_projection(row[2], conn=db)
         if trow:
             tpl_guid = row[2]
             ct = game_engine.card_type_from_db(trow[0])
@@ -490,26 +528,26 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
     abilities = []
     gem_type = 0
     if tpl_guid != "00000000-0000-0000-0000-000000000000":
-        srow = db.execute("SELECT threshold_json, abilities_json FROM card_templates WHERE guid=?", (tpl_guid,)).fetchone()
+        srow = db_template_projection(tpl_guid, conn=db)
         if srow:
-            if srow[0]:
+            if srow[4]:
                 try:
-                    td = _json.loads(srow[0])
+                    td = _json.loads(srow[4])
                     shard_flags_map = {0:0, 1:4, 2:8, 3:16, 4:32, 5:64}
                     raw_list = td.get('list', [])
                     shards = [shard_flags_map.get(s, s) for s in raw_list]
                 except: pass
-            if srow[1]:
+            if srow[5]:
                 try:
-                    abilities = [game_engine.ResourceId.from_str(g) for g in _json.loads(srow[1])]
+                    abilities = [game_engine.ResourceId.from_str(g) for g in _json.loads(srow[5])]
                 except: pass
         # Fetch gems from deck
         arena_k = hconnect_server.db_get_arena_state(handler.user_profile["id"])
         deck_k_id = handler._resolve_fra_deck_id(arena_k["deck_id"]) or 0
-        gem_row = db.execute("SELECT active_gems FROM decks WHERE id=?", (deck_k_id,)).fetchone()
-        if gem_row and gem_row[0]:
+        gem_value = db_deck_active_gems(deck_k_id, conn=db)
+        if gem_value:
             try:
-                gems = _json.loads(gem_row[0])
+                gems = _json.loads(gem_value)
                 gem_type = int(gems.get(str(instance_id), 0)) if gems else 0
             except: pass
     scid = game_engine.SessionCardId(game_engine.UID(card_id))
@@ -547,10 +585,8 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         game = game_engine.Game(session.session_id, pl_t, ai_t)
         drew = 0
         for _ in range(count):
-            r = db.execute(
-                "SELECT COUNT(*) FROM game_cards WHERE session_id=? AND user_id=? AND location='deck'",
-                (session.session_id, command_owner_id)).fetchone()
-            if not r or r[0] == 0:
+            from pvp_db import db_deck_card_count
+            if db_deck_card_count(session.session_id, command_owner_id, conn=db) == 0:
                 break
             handler._player_draw_card(game, session, pl_t, command_owner_id)
             drew += 1
@@ -573,23 +609,20 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         a = args[0]
         al = a.lower()
         target = None
+        # Import both lookup helpers before branching.  The name path used to
+        # import ``db_deck_card_by_name`` only inside the numeric branch, so a
+        # normal ``!addcard Grave Nibbler`` request raised an UnboundLocalError
+        # instead of performing the lookup.
+        from pvp_db import db_deck_card_by_uid, db_deck_card_by_name
         try:
             uid_int = int(al)
-            row = db.execute(
-                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id FROM game_cards gc "
-                "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='deck' AND gc.card_uid=? LIMIT 1",
-                (session.session_id, command_owner_id, uid_int)).fetchone()
+            row = db_deck_card_by_uid(
+                session.session_id, command_owner_id, uid_int, conn=db)
             if row:
                 target = row
         except ValueError:
-            rows = db.execute(
-                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id FROM game_cards gc "
-                "JOIN card_templates ct ON ct.guid = gc.template_guid "
-                "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='deck' "
-                "AND LOWER(ct.name) LIKE ? ORDER BY gc.position LIMIT 1",
-                (session.session_id, command_owner_id, "%" + al + "%")).fetchall()
-            if rows:
-                target = rows[0]
+            target = db_deck_card_by_name(
+                session.session_id, command_owner_id, al, conn=db)
         if not target:
             return f"No copy of '{a}' left in deck"
         card_uid, tpl_guid, card_tpl_id = target
@@ -602,21 +635,20 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         # Trigger the discard effect directly: pick a random hand card and move
         # it to the discard zone (DiscardCardAbilityEffectTemplate behaviour).
         import random as _rnd
-        hand_rows = db.execute(
-            "SELECT card_uid, template_guid FROM game_cards WHERE session_id=? AND user_id=? "
-            "AND location='hand' ORDER BY position",
-            (session.session_id, handler.user_profile["id"])).fetchall()
+        from pvp_db import db_hand_cards_for_discard, db_card_original_owner_id
+        hand_rows = [(row[1], row[2]) for row in db_hand_cards_for_discard(
+            session.session_id, handler.user_profile["id"], conn=db)]
         if not hand_rows:
             return "No cards in hand"
         row = _rnd.choice(hand_rows)
         card_uid, tpl_guid = row[0], row[1]
         # Discard to the card's OWNER (a Mind Grasp steal returns to the AI's
         # graveyard — user_id is the controller, owner_user_id the true owner).
-        owner_row = db.execute(
-            "SELECT owner_user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, card_uid)).fetchone()
-        owner_uid = owner_row[0] if owner_row else handler.user_profile["id"]
-        from db import db_discard_card
+        owner_uid = db_card_original_owner_id(
+            session.session_id, card_uid, conn=db)
+        if owner_uid is None:
+            owner_uid = handler.user_profile["id"]
+        from pvp_db import db_discard_card
         db_discard_card(session.session_id, card_uid, owner_user_id=owner_uid)
         owner_player_uid = ai_t if owner_uid == 0 else pl_t
         game = game_engine.Game(session.session_id, pl_t, ai_t)
@@ -645,63 +677,29 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             return "Usage: !top <card_id|name>"
         selector = " ".join(args).strip()
         target = None
+        from pvp_db import (db_hand_card_by_uid, db_hand_card_by_name,
+                            db_move_hand_card_to_deck_top)
         try:
             card_uid = int(selector)
         except ValueError:
             card_uid = None
         if card_uid is not None:
-            target = db.execute(
-                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
-                "ct.name FROM game_cards gc "
-                "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                "WHERE gc.session_id=? AND gc.user_id=? "
-                "AND gc.location='hand' AND gc.card_uid=? LIMIT 1",
-                (session.session_id, command_owner_id, card_uid)).fetchone()
+            target = db_hand_card_by_uid(
+                session.session_id, command_owner_id, card_uid, conn=db)
         else:
-            target = db.execute(
-                "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
-                "ct.name FROM game_cards gc "
-                "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                "WHERE gc.session_id=? AND gc.user_id=? "
-                "AND gc.location='hand' AND LOWER(ct.name)=LOWER(?) "
-                "ORDER BY gc.position, gc.card_uid LIMIT 1",
-                (session.session_id, command_owner_id, selector)).fetchone()
+            target = db_hand_card_by_name(
+                session.session_id, command_owner_id, selector, exact=True, conn=db)
             if target is None:
-                target = db.execute(
-                    "SELECT gc.card_uid, gc.template_guid, gc.card_template_id, "
-                    "ct.name FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.user_id=? "
-                    "AND gc.location='hand' AND LOWER(ct.name) LIKE LOWER(?) "
-                    "ORDER BY gc.position, gc.card_uid LIMIT 1",
-                    (session.session_id, command_owner_id,
-                     "%" + selector + "%")).fetchone()
+                target = db_hand_card_by_name(
+                    session.session_id, command_owner_id, selector, exact=False,
+                    conn=db)
         if target is None:
             return f"No card matching '{selector}' in hand"
 
         card_uid, tpl_guid, card_tpl_id, card_name = target
-        # Reindex the existing deck before inserting the selected card at the
-        # top.  The temporary offset avoids collisions if a uniqueness
-        # constraint is added to (session_id, user_id, location, position).
-        deck_count = db.execute(
-            "SELECT COUNT(*) FROM game_cards WHERE session_id=? AND user_id=? "
-            "AND location='deck'", (session.session_id, command_owner_id)
-        ).fetchone()[0]
-        db.execute(
-            "UPDATE game_cards SET position=position+? "
-            "WHERE session_id=? AND user_id=? AND location='deck'",
-            (int(deck_count) + 1, session.session_id, command_owner_id))
-        db.execute(
-            "UPDATE game_cards SET location='deck', position=0, card_state=0 "
-            "WHERE session_id=? AND user_id=? AND card_uid=? "
-            "AND location='hand'",
-            (session.session_id, command_owner_id, int(card_uid)))
-        db.execute(
-            "UPDATE game_cards SET position=position-? "
-            "WHERE session_id=? AND user_id=? AND location='deck' "
-            "AND card_uid<>?",
-            (int(deck_count), session.session_id, command_owner_id,
-             int(card_uid)))
+        from pvp_db import db_move_hand_card_to_deck_top
+        db_move_hand_card_to_deck_top(
+            session.session_id, command_owner_id, int(card_uid), conn=db)
         db.commit()
 
         owner_player_uid = (pl_t if not is_tourney
@@ -753,20 +751,15 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
     elif action == "hand":
         target = args[0].lower() if args else "me"
         user_id = handler.user_profile["id"] if target != "opp" else 0
-        rows = db.execute(
-            "SELECT gc.card_uid, ct.name, ct.cost, ct.card_type FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='hand' ORDER BY gc.position",
-            (session.session_id, user_id)).fetchall()
+        from pvp_db import db_hand_display_rows
+        rows = db_hand_display_rows(session.session_id, user_id, conn=db)
         lines = [f"{r[1]} [{r[0]}]" for r in rows]
         return f"{target} hand: " + ", ".join(lines)
 
     elif action == "aihand":
         # Reveal all AI hand cards to the player (push CardUpdated with nulling=False)
-        rows = db.execute(
-            "SELECT gc.card_uid, gc.template_guid FROM game_cards gc "
-            "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='hand' ORDER BY gc.position",
-            (session.session_id,)).fetchall()
+        from pvp_db import db_ai_hand_template_rows
+        rows = db_ai_hand_template_rows(session.session_id, conn=db)
         if not rows:
             return "AI hand is empty"
         game = game_engine.Game(session.session_id, pl_t, ai_t)
@@ -791,11 +784,9 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             except ValueError:
                 filter_names.append(a.lower())
         name_filter = " ".join(filter_names) if filter_names else ""
-        rows = db.execute(
-            "SELECT gc.card_uid, ct.name FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.user_id=? AND gc.position < 100 ORDER BY gc.position LIMIT 7",
-            (session.session_id, handler.user_profile["id"])).fetchall()
+        from pvp_db import db_playable_hand_rows
+        rows = db_playable_hand_rows(
+            session.session_id, handler.user_profile["id"], conn=db)
         game = game_engine.Game(session.session_id, pl_t, ai_t)
         playable = []
         for row in rows:
@@ -812,14 +803,14 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
     elif action == "threshold":
         target = args[0].lower() if args else ""
         if target in ("me", "opp"):
-            vals = [int(a) for a in args[1:7]]
+            vals = [max(0, int(a)) for a in args[1:7]]
         else:
             target = "me"
-            vals = [int(a) for a in args[0:6]]
+            vals = [max(0, int(a)) for a in args[0:6]]
         while len(vals) < 6:
             vals.append(0)
         if (session.session_name or "").startswith("tourney-"):
-            from db import db_game_session_pids
+            from pvp_db import db_game_session_pids
             from services import tournament_game as _tg
             state = _tg.pvp_load_state(session) or {}
             pids = db_game_session_pids(session.session_id)
@@ -848,17 +839,22 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         }
         import battle_engine as _be
         bstate = _be.load_state(session)
-        bstate["player_threshold" if target == "me" else "ai_threshold"] = thresholds
+        threshold_key = "player_threshold" if target == "me" else "ai_threshold"
+        previous = dict(bstate.get(threshold_key) or {})
+        bstate[threshold_key] = thresholds
         _be.save_state(session, bstate)
         game.player_threshold = dict(bstate.get("player_threshold") or {})
         game.ai_threshold = dict(bstate.get("ai_threshold") or {})
-        game.push_player_updated(uid, champ_id=getattr(handler, "_player_champ_scid" if target == "me" else "_ai_champ_scid", None))
-        for cs_val, count in zip([1, 4, 8, 16, 32, 64], vals):
-            if count > 0:
+        for cs_val, value in zip([1, 4, 8, 16, 32, 64], vals):
+            old_value = int(previous.get(cs_val,
+                                         previous.get(str(cs_val), 0)) or 0)
+            if old_value != value:
                 ev = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
-                ev.player_id = uid; ev.color = cs_val; ev.operation = 1
-                ev.delta = count; ev.new_value = count
+                ev.player_id = uid; ev.color = cs_val
+                ev.operation = 1 if value > old_value else 2
+                ev.delta = abs(value - old_value); ev.new_value = value
                 game._push(ev)
+        game.push_player_updated(uid, champ_id=getattr(handler, "_player_champ_scid" if target == "me" else "_ai_champ_scid", None))
         _send_game_events(handler, game, session, pl_t)
         return f"Thresholds: {vals} for {target}"
 
@@ -871,7 +867,7 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             val = int(args[0]) if args else 0
         uid = pl_t if target == "me" else ai_t
         if (session.session_name or "").startswith("tourney-"):
-            from db import db_game_session_pids
+            from pvp_db import db_game_session_pids
             from services import tournament_game as _tg
             state = _tg.pvp_load_state(session) or {}
             pids = db_game_session_pids(session.session_id)
@@ -936,21 +932,66 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
     elif action == "resource":
         target = args[0].lower() if args else ""
         if target in ("me", "opp"):
-            avail = int(args[1]) if len(args) > 1 else 0
-            maxr = int(args[2]) if len(args) > 2 else avail
+            avail = max(0, int(args[1])) if len(args) > 1 else 0
+            maxr = max(0, int(args[2])) if len(args) > 2 else avail
         else:
             target = "me"
-            avail = int(args[0]) if args else 0
-            maxr = int(args[1]) if len(args) > 1 else avail
+            avail = max(0, int(args[0])) if args else 0
+            maxr = max(0, int(args[1])) if len(args) > 1 else avail
         uid = pl_t if target == "me" else ai_t
+
+        # Resource commands must update the authoritative state before
+        # emitting HUD events.  Previously this branch only sent transient
+        # events from a fresh Game (whose pools default to 0/0), so the next
+        # phase/priority refresh restored the old values.
+        if (session.session_name or "").startswith("tourney-"):
+            from pvp_db import db_game_session_pids
+            from services import tournament_game as _tg
+            state = _tg.pvp_load_state(session) or {}
+            pids = db_game_session_pids(session.session_id)
+            changed_pid = (int(handler.client_reck_id) if target == "me"
+                           else next((int(pid) for pid in pids
+                                      if int(pid) != int(handler.client_reck_id)),
+                                     int(handler.client_reck_id)))
+            state[f"res_{changed_pid}"] = max(0, avail)
+            state[f"res_total_{changed_pid}"] = max(0, maxr)
+            _tg.pvp_save_state(session, state)
+            _tg._pvp_sync_game_state(session)
+            _refresh_pvp_debug_options(_tg, session, state)
+            return f"Resources: {avail}/{maxr} for {target}"
+
+        import battle_engine as _be
+        bstate = _be.load_state(session)
+        current_key = "player_resources" if target == "me" else "ai_resources"
+        total_key = "player_total_resources" if target == "me" else "ai_total_resources"
+        old_avail = int(bstate.get(current_key, 0) or 0)
+        old_maxr = int(bstate.get(total_key, 0) or 0)
+        bstate[current_key] = max(0, avail)
+        bstate[total_key] = max(0, maxr)
+        _be.save_state(session, bstate)
+
         game = game_engine.Game(session.session_id, pl_t, ai_t)
+        game.player_resources = bstate.get("player_resources", 0)
+        game.player_total_resources = bstate.get("player_total_resources", 0)
+        game.player_threshold = dict(bstate.get("player_threshold") or {})
+        game.ai_resources = bstate.get("ai_resources", 0)
+        game.ai_total_resources = bstate.get("ai_total_resources", 0)
+        game.ai_threshold = dict(bstate.get("ai_threshold") or {})
+        if old_avail != avail:
+            ev_c = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
+            ev_c.player_id = uid
+            ev_c.operation = 1 if avail > old_avail else 2
+            ev_c.delta = abs(avail - old_avail)
+            ev_c.new_value = avail
+            game._push(ev_c)
+        if old_maxr != maxr:
+            ev_t = game_engine.PlayerTotalResourcePoolChangedSessionEventArgs()
+            ev_t.player_id = uid
+            ev_t.operation = 1 if maxr > old_maxr else 2
+            ev_t.delta = abs(maxr - old_maxr)
+            ev_t.new_value = maxr
+            game._push(ev_t)
         game.push_player_updated(uid, champ_id=getattr(handler, "_player_champ_scid" if target == "me" else "_ai_champ_scid", None))
-        ev_c = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
-        ev_c.player_id = uid; ev_c.operation = 0; ev_c.delta = avail; ev_c.new_value = avail
-        game._push(ev_c)
-        ev_t = game_engine.PlayerTotalResourcePoolChangedSessionEventArgs()
-        ev_t.player_id = uid; ev_t.operation = 0; ev_t.delta = maxr; ev_t.new_value = maxr
-        game._push(ev_t)
         _send_game_events(handler, game, session, pl_t)
         return f"Resources: {avail}/{maxr} for {target}"
 
@@ -958,10 +999,9 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         if not args:
             return "Usage: gencard <name>"
         name = " ".join(args).lower()
-        trow = db.execute(
-            "SELECT guid, card_type, cost, attack, defense, abilities_json, attributes "
-            "FROM card_templates WHERE LOWER(name) LIKE ? LIMIT 1",
-            ("%" + name + "%",)).fetchone()
+        from pvp_db import (db_gencard_template, db_next_card_uid,
+                            db_next_game_card_row_id, db_insert_generated_card)
+        trow = db_gencard_template(name, conn=db)
         if not trow:
             return f"No card template matching '{name}'"
         tpl_guid, card_type_str, cost, atk, def_, ab_json, attrs = trow
@@ -969,18 +1009,13 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         # value can change the UID type (e.g. Card -> Player), which corrupts
         # the client's card cache.  Allocate the next instance with the real
         # Card UID type instead.
-        max_instance = db.execute(
-            "SELECT COALESCE(MAX(card_uid >> 8), 0) FROM game_cards "
-            "WHERE session_id=?", (session.session_id,)).fetchone()[0]
-        max_cuid = game_engine.UID.make(1, int(max_instance or 0) + 1).uid64
-        db.execute(
-            "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
-            "card_template_id, location, position, card_type, card_abilities, "
-            "card_attributes, owner_user_id, original_template_guid) "
-            "VALUES (?, ?, ?, ?, ?, 'hand', 0, ?, ?, ?, ?, ?)",
-            (session.session_id, command_owner_id, max_cuid, tpl_guid,
-             tpl_guid, card_type_str, ab_json or "[]", attrs or 0,
-             command_owner_id, tpl_guid))
+        max_cuid = db_next_card_uid(session.session_id, conn=db)
+        db_insert_generated_card(
+            session.session_id, command_owner_id, max_cuid, tpl_guid, "hand",
+            card_type_str, ab_json, attrs,
+            db_next_game_card_row_id(session.session_id, conn=db), conn=db,
+            position=0, card_state=0, owner_user_id=command_owner_id,
+            original_template_guid=tpl_guid)
         db.commit()
         # Sync per-instance data from the template (card_type, abilities, attributes,
         # original_template_guid) — ensures all columns are valid regardless of
@@ -1006,8 +1041,8 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             "!playable [id|name ...] — set golden outlines (no args = all)",
             "!gencard <name> — generate a copy of a card template to your hand",
             "!addcard <name|id> — draw the next copy of that card from your deck",
-            "!threshold [me|opp] C B R S W D — set 6 threshold counts",
-            "!resource [me|opp] <current> <maximum> — set resources",
+            "!threshold[/thresholds] [me|opp] C B R S W D — set 6 threshold counts",
+            "!resource [/resource] [me|opp] <current> <maximum> — set resources",
             "!charge [me|opp] <N> — set champion charges",
             "!spellpoints [me|opp] <N> — set champion spell points",
             "!health [me|opp] <N> — set champion health",
@@ -1034,18 +1069,16 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         if is_tourney:
             my_pid = int(handler.client_reck_id)
             if target == "opp":
-                rows = db.execute("SELECT DISTINCT user_id FROM game_cards WHERE session_id=? AND user_id!=?",
-                                  (session.session_id, my_pid)).fetchall()
+                from pvp_db import db_session_user_ids
+                rows = [row for row in db_session_user_ids(
+                    session.session_id, conn=db) if int(row[0]) != my_pid]
                 user_id = rows[0][0] if rows else 0
             else:
                 user_id = my_pid
         else:
             user_id = handler.user_profile["id"] if target != "opp" else 0
-        all_rows = db.execute(
-            "SELECT gc.card_uid, gc.location, ct.name, ct.guid FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid = gc.template_guid "
-            "WHERE gc.session_id=? AND gc.user_id=? ORDER BY gc.location, gc.position",
-            (session.session_id, user_id)).fetchall()
+        from pvp_db import db_zone_display_rows
+        all_rows = db_zone_display_rows(session.session_id, user_id, conn=db)
         by_zone = {}
         for r in all_rows:
             zone_name = r[1] or 'Deck'
@@ -1065,8 +1098,8 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
                      'discard': 16, 'void': 32, 'playedresources': 64,
                      'castspells': 128, 'underground': 256}
         zone_val = ZONE_MAP.get(zone_name.lower(), 1)
-        db.execute("UPDATE game_cards SET location=? WHERE session_id=? AND card_uid=?",
-                    (zone_name, session.session_id, card_id))
+        from pvp_db import db_move_debug_card
+        db_move_debug_card(session.session_id, card_id, zone_name, conn=db)
         db.commit()
         # CardMoved first (animation), then CardUpdated (updates cache to new zone)
         game = game_engine.Game(session.session_id, pl_t, ai_t)

@@ -85,6 +85,14 @@ Within one ability, effect groups execute in the metadata's
 Some legacy trigger paths still resolve directly; they are compatibility gaps,
 not a reason to add a new card-name special case.
 
+The live RulesPort is the migration boundary for these gameplay transactions.
+Typed card/ability activations, choices, costs, combat declarations, and phase
+passes are validated and ordered by `rules_port`; SQLite and `Game` events are
+the host projection of an accepted decision. A UI checkpoint persists its
+continuation and resumes the same ability instance, then emits the next
+priority event. `HEX_RULES_PORT_AUTO_ATTACH=0` is an explicit rollback switch;
+normal `restart.sh` startup enables the port.
+
 ## Setup, first turn, and mulligan
 
 - The server creates both player and opponent/AI session identities, champion
@@ -136,6 +144,14 @@ then leave for the appropriate destination.
 
 Do not expose hidden card identities to the opponent. Reconnect reconstructs
 the same filtered projection from the DB rather than trusting client state.
+
+The client stores one `ECardUsage` value per card in its option cache. Manual
+abilities authored for the card's current collection (including Hand for
+Tunnel) are advertised as `Activate`; when the same card is also normally
+playable, the server merges `Play | Activate` and the ability instances into
+one option. This preserves the normal playable affordance and lets the client
+offer its Play-or-Tunnel choice. A card with only the manual route receives
+`Activate` alone.
 
 ## Combat
 

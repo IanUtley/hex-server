@@ -19,6 +19,7 @@ POLL_SECONDS = float(os.environ.get("HEX_REPLAY_POLL_SECONDS", "5"))
 REPLAYABLE_PREFIXES = ("tourney-", "pvp-", "Challenge_")
 RECIPIENT_DUPLICATE_WINDOW_MS = int(
     os.environ.get("HEX_REPLAY_DUPLICATE_WINDOW_MS", "250"))
+REPLAY_RETENTION_DAYS = int(os.environ.get("HEX_REPLAY_RETENTION_DAYS", "30"))
 
 
 def _connect():
@@ -295,6 +296,17 @@ def process_once(conn=None):
                  event_count, max_event_id, "ready", ""), conn=conn)
             conn.commit()
             built += 1
+        cleanup = db_layer.db_cleanup_old_replays(
+            REPLAY_RETENTION_DAYS, conn=conn)
+        if owns:
+            conn.commit()
+        # Replay files are outside SQLite's transaction. A missing file is
+        # harmless, and an unlink failure must not undo database cleanup.
+        for path in cleanup.get("paths", ()):
+            try:
+                os.remove(path)
+            except (FileNotFoundError, OSError):
+                pass
         return built
     finally:
         if owns:

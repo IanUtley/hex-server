@@ -19,6 +19,7 @@ import argparse
 import gzip
 import json
 import os
+import pickle
 import re
 import sqlite3
 from pathlib import Path
@@ -334,6 +335,7 @@ def _extract_cards(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ..
             helpers["int_field"](raw, "m_SocketCount"),
             1 if helpers["int_field"](raw, "m_IneligibleForPvPRandomTemplates") else 0,
             1 if helpers["int_field"](raw, "m_IsPvE") else 0,
+            1 if helpers["int_field"](raw, "m_EquipmentModifiedCard") else 0,
             helpers["threshold_to_json"](raw),
             helpers["abilities_to_json"](raw),
             helpers["attributes_to_int"](helpers["str_field"](raw, "m_AttributeFlags")),
@@ -1221,7 +1223,43 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
     return sorted(set(rows))
 
 
+_EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _extract_cache_file(cache_key: str) -> str:
+    import hashlib
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:20]
+    return os.path.join("/tmp", f"hex_records_seed_{digest}.pkl")
+
+
 def extract(path: str | None = None) -> dict[str, Any]:
+    """Extract the Records snapshot once per process/path.
+
+    ``static.ensure_schema`` may need more than one table from the same
+    snapshot during startup.  Re-parsing every YAML record for each migration
+    made validation fixtures appear hung before the first test ran.  Records
+    are immutable for the process, so sharing the completed extraction is
+    safe and keeps production startup semantics unchanged.
+    """
+    cache_key = str(resolve_path(path) if path or configured_path()
+                    else configured_records_path())
+    cached = _EXTRACT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    cache_file = _extract_cache_file(cache_key)
+    try:
+        source_stat = os.stat(cache_key)
+        with open(cache_file, "rb") as stream:
+            disk = pickle.load(stream)
+        if (isinstance(disk, tuple) and len(disk) == 3 and
+                disk[0] == int(source_stat.st_mtime_ns) and
+                disk[1] == int(source_stat.st_size) and
+                isinstance(disk[2], dict)):
+            _EXTRACT_CACHE[cache_key] = disk[2]
+            return disk[2]
+    except (OSError, EOFError, ValueError, pickle.PickleError,
+            AttributeError, ImportError):
+        pass
     if path or configured_path():
         resolved = resolve_path(path)
         data = load_text(resolved)
@@ -1269,7 +1307,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
         )
     )
 
-    return {
+    result = {
         "source": resolved,
         "tables": {
             "card_templates": cards,
@@ -1291,10 +1329,19 @@ def extract(path: str | None = None) -> dict[str, Any]:
             "pack_set_map": _extract_pack_map(data),
         },
     }
+    _EXTRACT_CACHE[cache_key] = result
+    try:
+        source_stat = os.stat(cache_key)
+        with open(cache_file, "wb") as stream:
+            pickle.dump((int(source_stat.st_mtime_ns), int(source_stat.st_size),
+                         result), stream, protocol=pickle.HIGHEST_PROTOCOL)
+    except (OSError, pickle.PickleError):
+        pass
+    return result
 
 
 TABLE_COLUMNS = {
-    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_minimum", "rage_value", "subtype", "lethal"),
+    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "equipment_modified", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_minimum", "rage_value", "subtype", "lethal"),
     "card_abilities_meta": ("ability_guid", "casting_behavior", "is_manual", "activation_cost", "uses_per_game", "uses_per_turn", "cooldown", "exhausts_on_use", "is_triggered", "target_template_ids", "trigger_event_type", "game_text", "raw_json"),
     "ability_effects": (
         "ability_guid", "effect_guid", "effect_order", "effect_type", "param",

@@ -46,6 +46,101 @@ def _side_of(user_id):
     return "ai" if not user_id else "player"
 
 
+def _champion_owner_ids(ctx, source_owner):
+    """Return the champion owners visible to a health condition.
+
+    Practice/FRA state uses ``player_health``/``ai_health`` while persisted
+    PvP state uses ``hp_<pid>``. Health conditions need the owner IDs as well
+    as the side labels so ``SingleOpponent`` can be evaluated from the same
+    metadata in both modes.
+    """
+    state = ctx.bstate or {}
+    try:
+        source_owner = int(source_owner)
+    except (TypeError, ValueError):
+        source_owner = 0
+    owners = {source_owner}
+    if state.get("pvp"):
+        for value in state.get("pids") or []:
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        for value in (state.get("champ_map") or {}).keys():
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        for value in (state.get("pvp_health_map") or {}).keys():
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    else:
+        # The AI champion is conventionally owner 0. The player owner is
+        # discoverable from live cards or explicit champion tuples.
+        owners.add(0)
+        for _c_uid, owner, _name, _health in ctx.champions:
+            try:
+                owners.add(int(owner))
+            except (TypeError, ValueError):
+                pass
+        try:
+            from pvp_db import db_session_user_ids
+            for owner in db_session_user_ids(ctx.session.session_id, conn=ctx.db):
+                owners.add(int(owner))
+        except Exception:
+            pass
+    return owners
+
+
+def _champion_health(ctx, owner):
+    """Read a champion's current health from either battle-state shape."""
+    try:
+        owner = int(owner)
+    except (TypeError, ValueError):
+        return 20
+    state = ctx.bstate or {}
+    if state.get("pvp"):
+        health_map = state.get("pvp_health_map") or {}
+        key = health_map.get(owner)
+        if key is None:
+            key = health_map.get(str(owner))
+        if key is None:
+            key = f"hp_{owner}"
+        if key in state:
+            try:
+                return int(state[key] or 0)
+            except (TypeError, ValueError):
+                return 20
+    else:
+        key = "player_health" if owner else "ai_health"
+        if key in state:
+            try:
+                return int(state[key] or 0)
+            except (TypeError, ValueError):
+                return 20
+    for _c_uid, c_owner, _name, health in ctx.champions:
+        try:
+            if int(c_owner) == owner:
+                return int(health or 0)
+        except (TypeError, ValueError):
+            continue
+    # A complete battle state always carries health. Keep malformed or
+    # partial state from turning every <= health condition into true.
+    return 20
+
+
+def _opposing_champion_healths(ctx, source_owner):
+    owners = _champion_owner_ids(ctx, source_owner)
+    try:
+        source_owner = int(source_owner)
+    except (TypeError, ValueError):
+        source_owner = 0
+    return [_champion_health(ctx, owner)
+            for owner in owners if owner != source_owner]
+
+
 def _filter_zones(node):
     """Return exact InZone collections contained in a card-filter tree."""
     if isinstance(node, dict):
@@ -159,18 +254,8 @@ class ConditionContext:
                 "src_owner_side": self._src_side,
             }
         if key not in self._cards:
-            row = self.db.execute(
-                "SELECT gc.card_uid, COALESCE(gc.card_type, ct.card_type), "
-                "gc.location, gc.user_id, gc.card_state, "
-                "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-                "gc.template_guid, ct.name, COALESCE(ct.cost,0), "
-                "ct.subtype, ct.threshold_json, gc.card_attributes, ct.attributes, "
-                "gc.card_attack_mod, gc.card_defense_mod, "
-                "COALESCE(gc.permanent_buffs,'{}') "
-                "FROM game_cards gc LEFT JOIN card_templates ct "
-                "ON ct.guid = gc.template_guid "
-                "WHERE gc.session_id=? AND gc.card_uid=?",
-                (self.session.session_id, key)).fetchone()
+            from pvp_db import db_condition_card_row
+            row = db_condition_card_row(self.session.session_id, key, conn=self.db)
             if row:
                 base_atk = int(row[5] or 0)
                 base_def = int(row[6] or 0)
@@ -232,11 +317,9 @@ class ConditionContext:
     def _game_card_counter_counts(self, card_uid):
         """Return a game card's persisted counter names and GUIDs."""
         try:
-            row = self.db.execute(
-                "SELECT permanent_buffs FROM game_cards WHERE session_id=? "
-                "AND card_uid=?", (self.session.session_id, int(card_uid))
-            ).fetchone()
-            data = json.loads((row[0] if row else "{}") or "{}")
+            from pvp_db import db_card_permanent_buffs
+            data = json.loads(db_card_permanent_buffs(
+                self.session.session_id, int(card_uid), conn=self.db) or "{}")
         except Exception:
             data = {}
         if not isinstance(data, dict):
@@ -247,24 +330,22 @@ class ConditionContext:
                 guids if isinstance(guids, dict) else {})
 
     def _zones(self, flags):
+        # Records use the literal ``None`` sentinel for an unrestricted
+        # source/destination collection (for example, Minion of Yazukan's
+        # "when this goes underground" trigger).  Treat it as no filter;
+        # interpreting it as a real zone suppresses otherwise valid zone
+        # transitions because ``warzone``/``underground`` can never equal
+        # ``none``.
         return {ZONE_MAP.get(z, z.lower())
-                for z in (flags or "").split("|") if z}
+                for z in (flags or "").split("|")
+                if z and str(z).lower() not in {"none", "null"}}
 
     def _cards_in_zones(self, zones, user_id=None):
-        sql = ("SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-               "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-               "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-               "gc.card_attributes, ct.attributes, gc.template_guid, "
-               "COALESCE(gc.permanent_buffs,'{}') "
-               "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-               "WHERE gc.session_id=? AND gc.location IN (%s)"
-               % ",".join("?" * len(zones)))
-        params = [self.session.session_id] + list(zones)
-        if user_id is not None:
-            sql += " AND gc.user_id=?"
-            params.append(user_id)
+        from pvp_db import db_condition_cards_in_zones
+        rows = db_condition_cards_in_zones(
+            self.session.session_id, zones, user_id=user_id, conn=self.db)
         out = []
-        for r in self.db.execute(sql, params):
+        for r in rows:
             counters, counter_guids = self._game_card_counter_counts(r[0])
             try:
                 saved = json.loads(r[14] or "{}")
@@ -330,19 +411,18 @@ class ConditionContext:
                         pass
             return total
         try:
-            row = self.db.execute(
-                "SELECT name FROM card_counter_templates WHERE template_id=?",
-                (counter_guid,)).fetchone()
+            from pvp_db import db_counter_template_name
+            name = db_counter_template_name(counter_guid, conn=self.db)
         except Exception:
             return 0
-        if not row:
+        if not name:
             return 0
-        name = row[0]
-        prow = self.db.execute(
-            "SELECT permanent_buffs FROM game_cards WHERE session_id=? AND card_uid=?",
-            (self.session.session_id, card["card_uid"])).fetchone()
+        from pvp_db import db_card_mutation_field
+        permanent_value = db_card_mutation_field(
+            self.session.session_id, card["card_uid"], "permanent_buffs",
+            conn=self.db)
         try:
-            data = json.loads((prow[0] if prow else "{}") or "{}")
+            data = json.loads(permanent_value or "{}")
             counters = data.get("counters") or {}
             return int(counters.get((name or "").lower(), 0) or 0)
         except Exception:
@@ -395,16 +475,12 @@ def evaluate_condition(node, ctx):
         activated = (ctx.bstate or {}).get("activated_ability_guid")
         if not activated:
             return False
-        for table in ("champion_abilities", "talent_abilities"):
-            try:
-                row = ctx.db.execute(
-                    "SELECT charge_cost FROM %s WHERE ability_guid=? "
-                    "LIMIT 1" % table, (str(activated).lower(),)).fetchone()
-            except Exception:
-                row = None
-            if row is not None:
-                return int(row[0] or 0) > 0
-        return False
+        from pvp_db import db_charge_ability_cost
+        try:
+            cost = db_charge_ability_cost(activated, conn=ctx.db)
+        except Exception:
+            cost = None
+        return cost is not None and int(cost or 0) > 0
     if t == "TriggerPlayerControlsCard":
         card = ctx.card(ctx.trigger_uid)
         if card is None:
@@ -457,6 +533,12 @@ def evaluate_condition(node, ctx):
         # crypt-entry triggers intentionally leave this flag unset. Require
         # the transient Dead bit from the pre-move state so cards buried from
         # hand/deck cannot masquerade as deaths.
+        if (ctx.uses_previous_state and source_zones and source is None):
+            # A previous-state death trigger cannot be proven from the
+            # post-move row alone. Older discard callers that omit the
+            # transition metadata must fail closed rather than treating a
+            # hand/deck burial as a troop death.
+            return False
         if (ctx.uses_previous_state and source_zones
                 and source in ctx._zones("Warzone")
                 and destination in ctx._zones("Discard")):
@@ -591,12 +673,9 @@ def evaluate_condition(node, ctx):
                            or node.get("m_CollectionFlags", ""))
         if not zones:
             return True
-        rows = ctx.db.execute(
-            "SELECT 1 FROM game_cards WHERE session_id=? AND template_guid=? "
-            "AND location IN (%s) LIMIT 1"
-            % ",".join("?" * len(zones)),
-            [ctx.session.session_id, card["template_guid"]] + list(zones)).fetchone()
-        return bool(rows)
+        from pvp_db import db_template_in_zones
+        return db_template_in_zones(
+            ctx.session.session_id, card["template_guid"], zones, conn=ctx.db)
     if t == "TriggerCardIsStoredTargetOfAbilitySource":
         if ctx.trigger_uid is None:
             return False
@@ -715,24 +794,51 @@ def evaluate_condition(node, ctx):
                 return False
         return True
     if t == "CardFilterAbilityCondition":
-        zones = ctx._zones(node.get("m_CollectionFlags", "")
-                           or node.get("m_CardCollection", ""))
-        if not zones:
-            return True
+        # This is an ability-source condition: "if this is underground",
+        # "if this is in your hand", etc.  It must test the source card, not
+        # whether any card anywhere in the filtered zone matches.  The latter
+        # incorrectly allowed Grave Nibbler's underground one-shot to fire
+        # merely because another card was underground.
         fjson = node.get("m_CardFilter") or {}
-        return any(evaluate_card_filter(card, fjson, ctx.ability_source_uid)
-                   for card in ctx._cards_in_zones(zones))
+        source = ctx.card(ctx.ability_source_uid)
+        return (evaluate_card_filter(
+                    source, fjson, ctx.ability_source_uid,
+                    source_card=source)
+                if source is not None else True)
     if t == "RequiresSourcePassesFilterCondition":
         card = ctx.card(ctx.ability_source_uid)
         if card is None:
             return True
         return evaluate_card_filter(card, node.get("m_Filter") or {},
                                     ctx.ability_source_uid)
-    if t in ("RequiresChampionHealth", "RequiresChampionCharges",
+    if t == "RequiresChampionHealth":
+        source_owner = ctx.ability_source_owner_id
+        player_filter = (node.get("m_PlayerFilter") or "Self")
+        source_health = _champion_health(ctx, source_owner)
+        opposing = _opposing_champion_healths(ctx, source_owner)
+        if node.get("m_QuantityIsHighestOpposingChampionsHealth"):
+            if not opposing:
+                return False
+            value = source_health
+            target = max(opposing)
+        elif player_filter in ("SingleOpponent", "MultipleOpponents"):
+            if not opposing:
+                return False
+            # The current game modes have one opposing champion. ``max`` is
+            # the safe extension for authored multi-opponent conditions and
+            # matches the meaning of the highest-opposing flag above.
+            value = max(opposing)
+            target = int(node.get("m_RequiredQuantity", 0) or 0)
+        else:
+            value = source_health
+            target = int(node.get("m_RequiredQuantity", 0) or 0)
+        return _compare(value, node.get("m_ComparisonOp", "GreaterThanOrEqual"),
+                        target)
+
+    if t in ("RequiresChampionCharges",
              "RequiresResourceThreshold", "RequiresTotalResources"):
         side = _side_of(ctx.ability_source_owner_id)
-        key = {"RequiresChampionHealth": f"{side}_health",
-               "RequiresChampionCharges": f"{side}_charges",
+        key = {"RequiresChampionCharges": f"{side}_charges",
                "RequiresTotalResources": f"{side}_total_resources",
                "RequiresResourceThreshold": None}.get(t)
         if key is None:
@@ -788,15 +894,14 @@ def evaluate_effect_condition(db, condition_id, ctx):
     if not condition_id:
         return True
     try:
-        row = db.execute(
-            "SELECT condition_json FROM ability_effect_conditions "
-            "WHERE condition_id=?", (condition_id,)).fetchone()
+        from pvp_db import db_effect_condition_json
+        condition_json = db_effect_condition_json(condition_id, conn=db)
     except Exception:
         return True
-    if not row or not row[0]:
+    if not condition_json:
         return True
     try:
-        node = json.loads(row[0])
+        node = json.loads(condition_json)
     except Exception:
         return True
     return evaluate_condition(node, ctx)

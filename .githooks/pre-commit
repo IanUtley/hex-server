@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-commit] Running Python syntax checks..."
+python3 -m py_compile hconnect_server.py db.py static.py encoder.py
+
+echo "[pre-commit] Running quick tests against a disposable database..."
+python3 tests/run_all.py --quick

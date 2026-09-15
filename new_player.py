@@ -7,6 +7,14 @@ booster packs so a fresh account has something to play with.
 Granting is idempotent: callers only invoke this for newly-created users.
 """
 
+from profile_db import (
+    db_grant_collection_cards,
+    db_grant_inventory_item,
+    db_initialize_new_player,
+    db_insert_collection_card_instances,
+    db_next_card_instance_id,
+)
+
 # The five basic threshold shards (Resource / Land).
 BASIC_SHARDS = [
     "b253393b-fdde-47c4-9288-4b8efb0698b1",  # Blood Shard
@@ -45,36 +53,17 @@ def grant_new_player(db, user_id):
     actually populated from via push_cards_to_client at login).
     """
     # Starting gold + platinum.
-    db.execute(
-        "UPDATE users SET gold=?, platinum=? WHERE id=?",
-        (STARTING_GOLD, STARTING_PLATINUM, user_id))
+    db_initialize_new_player(user_id, STARTING_GOLD, STARTING_PLATINUM, conn=db)
 
     # Allocate instance IDs for the granted cards.
-    max_row = db.execute(
-        "SELECT MAX(instance_id) FROM card_instances WHERE user_id=?",
-        (user_id,)).fetchone()
-    cid = max(max_row[0] + 1, 5000) if max_row and max_row[0] else 5000
+    cid = db_next_card_instance_id(user_id, conn=db)
 
     def grant_cards(guid, quantity):
         nonlocal cid
         # collections: template + quantity
-        existing = db.execute(
-            "SELECT id, quantity FROM collections WHERE user_id=? AND card_template_id=?",
-            (user_id, guid)).fetchone()
-        if existing:
-            db.execute(
-                "UPDATE collections SET quantity=? WHERE id=?",
-                (existing[1] + quantity, existing[0]))
-        else:
-            db.execute(
-                "INSERT INTO collections (user_id, card_template_id, quantity) VALUES (?,?,?)",
-                (user_id, guid, quantity))
-        # card_instances: one row per physical card
-        for _ in range(quantity):
-            db.execute(
-                "INSERT OR IGNORE INTO card_instances (user_id, instance_id, template_guid) VALUES (?,?,?)",
-                (user_id, cid, guid))
-            cid += 1
+        db_grant_collection_cards(user_id, guid, quantity, conn=db)
+        cid = db_insert_collection_card_instances(
+            user_id, cid, guid, quantity, conn=db)
 
     # 100 of each basic shard in the collection.
     for shard_guid in BASIC_SHARDS:
@@ -84,16 +73,6 @@ def grant_new_player(db, user_id):
     grant_cards(HEARTSWORN_GUID, HEARTSWORN_QUANTITY)
 
     # 3 Shards of Fate booster packs in the inventory.
-    existing_pack = db.execute(
-        "SELECT id, quantity FROM player_inventory WHERE user_id=? AND template_guid=?",
-        (user_id, PACK_GUID)).fetchone()
-    if existing_pack:
-        db.execute(
-            "UPDATE player_inventory SET quantity=? WHERE id=?",
-            (existing_pack[1] + PACK_QUANTITY, existing_pack[0]))
-    else:
-        db.execute(
-            "INSERT INTO player_inventory (user_id, template_guid, quantity) VALUES (?,?,?)",
-            (user_id, PACK_GUID, PACK_QUANTITY))
+    db_grant_inventory_item(user_id, PACK_GUID, PACK_QUANTITY, conn=db)
 
     db.commit()
