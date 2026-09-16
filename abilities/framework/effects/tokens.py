@@ -371,7 +371,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     into_deck = False
     token_name = "token troop"
     enters_exhausted = 0
-    deck_location = "Unknown"
+    deck_location = "unknown"
     into_hand = False
     into_choosing = False
     param_has_dynamic_amount = False
@@ -393,7 +393,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                 into_hand = True
             if collection == "choosing":
                 into_choosing = True
-            deck_location = p.get("location", "Unknown")
+            deck_location = p.get("location", "unknown")
             amount_var = p.get("amount_variable", "")
             param_has_dynamic_amount = bool(amount_var)
             if amount_var and ability_guid:
@@ -453,6 +453,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         db, bstate, effect_guid, "m_CardLocation")
     if typed_location:
         deck_location = str(typed_location)
+    deck_location = str(deck_location or "unknown").rsplit(".", 1)[-1].lower()
     if not param_has_dynamic_amount:
         typed_amount = effect_field(
             db, bstate, effect_guid, "m_Amount", default=0)
@@ -618,6 +619,16 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         pass
 
     created_cards = []
+    from pvp_db import db_resolve_talent_modified_template
+    resolving_owner = int((bstate or {}).get("resolving_owner_id", 0) or 0)
+    profile = getattr(handler, "user_profile", None)
+    player_id = int((profile.get("id", 0) if isinstance(profile, dict)
+                     else getattr(profile, "id", 0)) or 0)
+    active_talents = (getattr(handler, "_player_talent_guids", ())
+                      if resolving_owner == player_id else
+                      getattr(handler, "_ai_talent_guids", ()))
+    tpl_guid = db_resolve_talent_modified_template(
+        tpl_guid, active_talents, conn=db)
     for index in range(count):
         card_uid = next_game_card_uid(db, session.session_id)
         location = ("hand" if into_hand else
@@ -626,9 +637,15 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
         # Unknown deck location means the card is shuffled into the deck.
         # Start it at a temporary position; after all cards are created the
         # deck-relative insertion helper assigns an unbiased permutation.
-        position = (100 if into_hand else
-                    (0 if into_deck and deck_location == "Unknown" else
-                     (9999 if into_deck else 0)))
+        if into_deck and deck_location == "bottom":
+            from pvp_db import db_deck_next_position
+            position = db_deck_next_position(session.session_id, player_uid,
+                                             conn=db)
+        else:
+            position = (100 if into_hand else
+                        (9999 if into_deck and deck_location in
+                         ("", "unknown", "random") else
+                         (0 if into_deck else 0)))
         from pvp_db import (db_copy_template_payload, db_next_game_card_row_id,
                             db_insert_generated_card)
         template = db_copy_template_payload(tpl_guid, conn=db)
@@ -648,7 +665,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
             gems=copied_gems, permanent_buffs=json.dumps(parent_data))
         created_cards.append(card_uid)
     db.commit()
-    if created_cards and into_deck and deck_location == "Unknown":
+    if created_cards and into_deck and deck_location in ("", "unknown", "random"):
         from pvp_db import db_randomly_insert_deck_cards
         db_randomly_insert_deck_cards(
             session.session_id, int(player_uid), created_cards, connection=db)

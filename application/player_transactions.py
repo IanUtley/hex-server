@@ -314,7 +314,12 @@ def typed_payload_from_decoded(command, decoded):
         if ability_match is None:
             guid_match = re.search(
                 rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
-                rb"m_Guid;[^;]*;[^;]*;[^;]*;[^;]*;"
+                # ResourceId.m_Guid is encoded by the client as
+                # ``m_Guid;<type>;<count>;<flags>;<length>;<hex>``.  The
+                # length field is the fourth metadata value after m_Guid;
+                # older recovery code expected one extra value and therefore
+                # dropped otherwise valid champion activations.
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;"
                 rb"([0-9a-fA-F]{32});", raw)
             if guid_match:
                 compact = guid_match.group(1).decode("ascii").lower()
@@ -336,7 +341,7 @@ def typed_payload_from_decoded(command, decoded):
             # labelled value and continue with the typed target recovery.
             dashed_guid = re.search(
                 rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
-                rb"m_Guid;[^;]*;[^;]*;[^;]*;[^;]*;"
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;"
                 rb"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                 rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12});", raw)
             if dashed_guid:
@@ -547,6 +552,12 @@ def typed_payload_from_decoded(command, decoded):
                  id_list(item.get("CardIds", item.get("card_ids"))))
                 for item in assignments if isinstance(item, Mapping)
                 if numeric_id(item.get("CombatId", item.get("combat_id"))) is not None)
+        else:
+            # An empty order is the valid client representation for a combat
+            # with no attackers/blockers. Preserve it as typed payload so the
+            # RulesPort can consume the transaction and advance past
+            # AssignDamage; returning None makes the boundary reject it.
+            payload["assignments"] = ()
     if raw_payload:
         raw_payload.update(payload)
         payload = raw_payload

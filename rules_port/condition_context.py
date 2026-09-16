@@ -57,6 +57,22 @@ class ConditionContext:
         uid = int(uid)
         if uid in self._champions:
             owner, name, health = self._champions[uid]
+            # PvP ownership is the raw participant id, not the compatibility
+            # ``user_profile["id"]`` that ``handler._champion_targets`` reports.
+            # C# resolves ``TriggerPlayerControlsAbilitySource`` from the
+            # champion card's controller (EndPhaseState uses the active
+            # player's champion), so map the champion back to its participant
+            # here; otherwise the owner never matches and the trigger is
+            # silently dropped.
+            if self.bstate.get("pvp"):
+                for pid, champ_uid in (
+                        self.bstate.get("champ_map") or {}).items():
+                    try:
+                        if int(champ_uid) == uid:
+                            owner = int(pid)
+                            break
+                    except (TypeError, ValueError):
+                        continue
             counters, guids = self._counter_counts(uid)
             return {"card_uid": uid, "card_type": "Champion",
                     "location": "champions", "user_id": owner,

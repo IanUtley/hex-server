@@ -49,11 +49,13 @@ def _cond_is_dungeon(db, session, user_id):
 
 
 def _has_previous_dungeon_win(db, session):
-    """Return whether this dungeon has a completed encounter win already.
+    """Return whether the previous encounter in this dungeon was won.
 
     Ruthlessly Efficient is a dungeon-run bonus, not a general dungeon
     opening bonus.  The extracted ability row lost its nested condition, so
-    use the campaign's persisted win count to recover the intended timing.
+    use the campaign's persisted consecutive-win streak to recover the
+    intended timing.  The streak is reset to 0 on a dungeon loss and
+    incremented on each dungeon win (see ``campaign._apply_gameend``).
     """
     session_name = (session.session_name or "") if session else ""
     if not session_name.startswith("camp_"):
@@ -63,15 +65,16 @@ def _has_previous_dungeon_win(db, session):
     except (TypeError, ValueError):
         return False
     from pve_db import db_campaign_runtime_row
+    # ``db_campaign_runtime_row`` returns ``(state_json, campaign_type)``.
     row = db_campaign_runtime_row(camp_id, conn=db)
-    if not row or (row[0] or "").upper() != "DUNGEON":
+    if not row or (row[1] or "").upper() != "DUNGEON":
         return False
     try:
-        state = json.loads(row[1] or "{}")
+        state = json.loads(row[0] or "{}")
     except (TypeError, ValueError):
         return False
     try:
-        return int(state.get("Wins", 0) or 0) > 0
+        return int(state.get("dungeon_win_count", 0) or 0) > 0
     except (TypeError, ValueError):
         return False
 
@@ -328,25 +331,12 @@ def pregame_modifiers(db, session, user_id, ability_guids):
                         for param in rage_params),
                 })
 
-        target_types, target_zones = _target_template_flags(db, str(guid))
-        if (target_zones and "Hand" in target_zones
-                and target_types & {"BasicAction", "QuickAction"}
-                and re.search(r"starting hand", description or "",
-                              re.IGNORECASE)):
-            for param in effect_params:
-                if ((param.get("property") or "").lower() != "cardcost"
-                        or str(param.get("duration") or "").lower()
-                        != "permanent"):
-                    continue
-                delta = _card_cost_delta(param)
-                if delta:
-                    result["starting_hand_effects"].append({
-                        "ability_guid": str(guid).lower(),
-                        "card_cost_mod": delta,
-                        "card_types": sorted(target_types &
-                                              {"BasicAction", "QuickAction"}),
-                    })
-                    break
+        # Starting-hand cost modifiers (e.g. Devoted) are authored as
+        # GameStartedEvent triggered abilities.  They are discovered and
+        # resolved by the normal trigger dispatcher, so applying their
+        # ``cardcost`` leaf here as well would reduce the cost twice.  The
+        # rage variant below stays because its trigger leaf is an ``intattr``
+        # with no attribute and therefore does not apply natively.
     return result
 
 

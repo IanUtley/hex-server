@@ -230,6 +230,25 @@ class EffectContext:
         target = self.target() if target is None else target
         if target is None:
             return default
+        # PlayerTargetTemplate resolves to a typed player UID in the native
+        # resolver, not to a game_cards card UID. Map both wire namespaces
+        # before attempting the card/champion lookup so effects such as
+        # ``put into your deck`` use the activating player's deck.
+        try:
+            target_id = int(getattr(target, "uid64", target))
+            profile = getattr(self.handler, "user_profile", None)
+            player_owner = (int(profile.get("id", 0))
+                            if isinstance(profile, dict) else 0)
+            for participant, owner in ((self.player_uid, player_owner),
+                                       (self.ai_uid, 0)):
+                if int(getattr(participant, "uid64", participant)) == target_id:
+                    return owner
+            if target_id == player_owner:
+                return player_owner
+            if target_id == 0:
+                return 0
+        except (TypeError, ValueError):
+            pass
         from pvp_db import db_card_owner_id
         card_owner = db_card_owner_id(
             self.session.session_id, int(target), conn=self.db)
@@ -254,6 +273,16 @@ class EffectContext:
             except (AttributeError, TypeError, ValueError):
                 continue
         return default
+
+    def active_talent_guids(self):
+        """Return the selected talents for the side resolving this effect."""
+        owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
+        profile = getattr(self.handler, "user_profile", None)
+        player = int((profile.get("id", 0) if isinstance(profile, dict)
+                      else getattr(profile, "id", 0)) or 0)
+        if owner and owner == player:
+            return tuple(getattr(self.handler, "_player_talent_guids", ()))
+        return tuple(getattr(self.handler, "_ai_talent_guids", ()))
 
     def draw(self, count: int, owner: int | None = None) -> str:
         """Draw cards through the existing PvE/PvP handler boundary."""
@@ -1576,6 +1605,19 @@ class EffectContext:
             self.session.session_id, target, destination, position,
             new_state,
             clear_dead=clear_dead, clear_bits=clear_bits, conn=self.db)
+        if destination == "deck":
+            # C# ``MoveCardToZone`` with an "Unknown"/random destination
+            # location shuffles the card into the deck.  Leaving it at
+            # position 0 put the moved cards on TOP, so a following "draw N"
+            # returned the same cards (Corinth's Shifted Paradigm looked like
+            # it never shuffled).
+            dest_location = str(self.template_value(
+                "m_DestinationLocation", "") or "").rsplit(".", 1)[-1].lower()
+            if dest_location in ("", "unknown", "random"):
+                from pvp_db import db_randomly_insert_deck_cards
+                db_randomly_insert_deck_cards(
+                    self.session.session_id, int(old[0] or 0), [target],
+                    conn=self.db)
         self.db.commit()
         details = db_card_zone_details(
             self.session.session_id, target, conn=self.db)
@@ -1594,6 +1636,9 @@ class EffectContext:
         self.game.push_card_updated(
             scid, owner, collection, ct, template_id=tpl, cost=cost,
             attack=attack, defense=defense, gems=gem,
+            # A card put back into the deck is hidden (nulled) like any other
+            # deck card; only the destination determines this.
+            nulling=destination == "deck",
             state=int(db_card_state_value(
                 self.session.session_id, target, conn=self.db) or 0))
         event = "CardEnteredZoneEvent"

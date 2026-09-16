@@ -141,6 +141,8 @@ def summon_token(context, payload=None):
     location = {"deck": "deck", "hand": "hand", "choosing": "choosing",
                 "underground": "underground", "void": "void"}.get(
                     collection, "warzone")
+    deck_location = str(context.template_value(
+        "m_CardLocation", "") or "").rsplit(".", 1)[-1].lower()
     card_filter = payload.get("card_filter")
     selected_guids = None
     candidate_count = None
@@ -225,6 +227,9 @@ def summon_token(context, payload=None):
     target_owner = context.target_owner(target, default=owner)
     if location in {"deck", "hand"} and target_owner is not None:
         owner = int(target_owner)
+    from pvp_db import db_resolve_talent_modified_template
+    guid = db_resolve_talent_modified_template(
+        guid, context.active_talent_guids(), conn=context.db)
     template = db_copy_template_payload(guid, conn=context.db)
     if not template:
         return "summon token: template payload missing"
@@ -240,14 +245,32 @@ def summon_token(context, payload=None):
             continue
         uid = next_game_card_uid(context.db, context.session.session_id)
         gem_type = _random_socket_gems(create_guid, context.db)
+        if location == "deck":
+            if deck_location in ("bottom",):
+                position = __import__("pvp_db").db_deck_next_position(
+                    context.session.session_id, owner, conn=context.db)
+            elif deck_location in ("top",):
+                position = 0
+            else:
+                # Unknown/omitted is a random deck insertion.  A temporary
+                # position keeps the card in the deck until the shared
+                # insertion helper assigns a uniformly random slot.
+                position = 9999
+        else:
+            position = 0
         db_insert_generated_card(
             context.session.session_id, owner, uid, create_guid, location,
             create_template[0], create_template[1], create_template[2],
             db_next_game_card_row_id(context.session.session_id, conn=context.db),
-            conn=context.db, owner_user_id=owner,
+            conn=context.db, position=position, owner_user_id=owner,
             original_template_guid=create_guid, gems=gem_type)
         made.append((int(uid), create_guid))
     context.db.commit()
+    if location == "deck" and deck_location in ("", "unknown", "random"):
+        from pvp_db import db_randomly_insert_deck_cards
+        db_randomly_insert_deck_cards(
+            context.session.session_id, owner,
+            [uid for uid, _create_guid in made], connection=context.db)
     for uid, created_guid in made:
         scid = game_engine.SessionCardId(game_engine.UID(uid))
         _tpl, card_type, name, cost, attack, defense, gems = \

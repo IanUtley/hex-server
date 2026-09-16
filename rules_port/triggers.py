@@ -83,9 +83,10 @@ class NativeTriggerBackend:
     """Dispatch Records triggers without the historical trigger scanner."""
 
     def __call__(self, *, db, handler, game, session, player_uid, ai_uid,
-                 battle_state, event: TriggerEvent):
+                 battle_state, event: TriggerEvent,
+                 force_ignores_chain: bool = False):
         from gamedata import ability_graph, DEFAULT_RECORD_STORE
-        from pvp_db import db_card_location, db_card_owner_id
+        from pvp_db import db_card_basic, db_card_location, db_card_owner_id
         from rules_port.counter_effects import TUNNELING_ABILITY_GUID
         from rules_port.conditions import ConditionContext, trigger_condition_met
         from rules_port.trigger_discovery import RecordsTriggerDiscovery
@@ -176,19 +177,31 @@ class NativeTriggerBackend:
             # the same complete card-data seam.
             if not hasattr(handler, "_card_full_data") or uid is None:
                 return
-            row = db_card_location(session.session_id, int(uid), conn=db)
-            if not row or str(row).lower() in {"hand", "deck", "void", "choosing"}:
+            basic = db_card_basic(session.session_id, int(uid), conn=db)
+            if not basic:
+                return
+            template_guid = basic[0]
+            location = db_card_location(session.session_id, int(uid), conn=db)
+            # ``db_card_location`` returns the ZONE, not a template.  Passing
+            # it as the template GUID made ``_card_full_data`` fall back to the
+            # all-zero template, and ``card_collection_for_location`` defaults
+            # any unknown zone to Warzone — so an end-of-turn champion trigger
+            # re-published Corinth as an empty warzone card.  Champions are
+            # already represented through PlayerUpdated.ChampionId, so never
+            # project them as a collection card.
+            if not location or str(location).lower() in {
+                    "hand", "deck", "void", "choosing", "champion"}:
                 return
             try:
                 import game_engine
                 scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
                 tpl, ctype, _name, cost, attack, defense, gems = \
-                    handler._card_full_data(game, scid, row)
+                    handler._card_full_data(game, scid, template_guid)
                 from .runtime_helpers import (card_collection_for_location,
                                               owner_uid)
                 game.push_card_updated(
                     scid, owner_uid(owner, player_uid, ai_uid, battle_state),
-                    card_collection_for_location(row), ctype,
+                    card_collection_for_location(location), ctype,
                     template_id=tpl, cost=cost, attack=attack,
                     defense=defense, gems=gems)
             except Exception:
@@ -273,8 +286,13 @@ class NativeTriggerBackend:
                 target = event.target_card_id or event.source_card_id
                 explicit = [index for index, spec in enumerate(graph.targets)
                             if spec.requires_input and spec.explicit]
-                target_index = next((index for index, spec in enumerate(graph.targets)
-                                     if spec.requires_input), 0)
+                # Only a player-input target consumes the trigger target.  An
+                # ability whose targets are all auto (Corinth's end-of-turn
+                # "your hand"/"your crypt") must NOT receive the event source
+                # as target 0, or the effect resolves against the champion.
+                requires_input_index = next(
+                    (index for index, spec in enumerate(graph.targets)
+                     if spec.requires_input), None)
                 if explicit:
                     from .targeting import legal_targets
                     template = graph.targets[explicit[0]].guid
@@ -302,8 +320,10 @@ class NativeTriggerBackend:
 
                 instance_id = int(battle_state.get("_next_instance_id", 1))
                 battle_state["_next_instance_id"] = instance_id + 1
-                ignores = bool(graph.ignores_chain or event_name == "TurnStartedEvent" or
-                               str(location or "").lower() == "underground")
+                ignores = bool(
+                    graph.ignores_chain or force_ignores_chain or
+                    event_name == "TurnStartedEvent" or
+                    str(location or "").lower() == "underground")
                 if ignores:
                     from .resolution import resolve_port_ability
                     old_source = battle_state.get("resolving_source_uid")
@@ -318,8 +338,9 @@ class NativeTriggerBackend:
                         result = resolve_port_ability(
                             handler, game, session, db, player_uid, ai_uid,
                             battle_state, key[1], source_uid, source_card_owner,
-                            target_map=({target_index: int(target)}
-                                        if target is not None else {}),
+                            target_map=({requires_input_index: int(target)}
+                                        if (requires_input_index is not None
+                                            and target is not None) else {}),
                             instance_id=instance_id)
                     finally:
                         battle_state["resolving_source_uid"] = old_source
@@ -428,11 +449,17 @@ def dispatch_trigger(context, event_type, source_card_id, source_player_id=None,
 def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
                             battle_state, event_type, source_card_id,
                             source_player_id=None, target_card_id=None,
-                            data=None):
-    """Dispatch a host-emitted event without constructing a legacy context."""
+                            data=None, force_ignores_chain=False):
+    """Dispatch a host-emitted event without constructing a legacy context.
+
+    ``force_ignores_chain`` lets a mode resolve an authored trigger inline
+    instead of chaining it.  Merry-Melee-Corinth uses it for the end-of-turn
+    ability, which resolves without a priority window in that format.
+    """
     return NativeTriggerBackend()(
         db=db, handler=handler, game=game, session=session,
         player_uid=player_uid, ai_uid=ai_uid, battle_state=battle_state,
+        force_ignores_chain=force_ignores_chain,
         event=TriggerEvent(
             str(event_type).rsplit(".", 1)[-1], source_card_id,
             source_player_id, target_card_id, dict(data or {})))

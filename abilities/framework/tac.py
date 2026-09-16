@@ -43,8 +43,9 @@ _TAC_CONTAINER_HASHES = {
         "Condition", "DataToAppend", "HasAsSubset", "MinimumValues",
         "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
         "PermanentData", "ThisTurnsData")}
-_TAC_LIST_HASHES = {_tac_attr_hash("Conditions"),
-                    _tac_attr_hash("RequiredEquipment")}
+_TAC_LIST_HASHES = {_tac_attr_hash(name) for name in (
+    "Conditions", "RequiredEquipment", "RequiredTalents", "AlternateVersions",
+    "Abilities")}
 _TAC_STRING_HASHES = {
     _tac_attr_hash("Guid"),
     _tac_attr_hash("FunctionName"),

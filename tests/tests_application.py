@@ -40,6 +40,22 @@ def test_ability_guid_is_extracted_without_objfmt_field_counting():
         "95474d1e-ac9b-6c02-cb95-0305ebec42dc"
 
 
+def test_typed_payload_recovers_objfmt_nested_champion_activation():
+    """The live Mono encoding has four ResourceId metadata fields."""
+    from types import SimpleNamespace
+    raw = (b"m_AbilityActivationData;4;4;0;7;SourceCardId;5;5;1;value;"
+           b"6;1;1;m_UID64;7;2;0;0101000000000000;"
+           b"AbilityTemplateId;8;6;1;m_Guid;9;7;0;36;"
+           b"2f6e6655df575028ba4201067242f4be;"
+           b"AbilityInstanceId;ActivateAbilityTransaction")
+    command = SimpleNamespace(is_ability_activate=True)
+    payload = typed_payload_from_decoded(command, {"__raw__": raw})
+    assert payload["source_card_id"] == 257
+    assert payload["ability_template_id"] == \
+        "2f6e6655-df57-5028-ba42-01067242f4be"
+    assert payload["activation_data"] == {}
+
+
 def test_typed_payload_extractor_reads_only_named_decoded_fields():
     payload = typed_payload_from_decoded(None, {
         "SourceCardId": {"UID": 77},
@@ -471,6 +487,14 @@ def test_typed_attack_declaration_recovers_value_wrapped_session_cards():
     assert payload["declarations"] == ((513, (1537,)),)
 
 
+def test_empty_assign_damage_order_is_a_typed_noop():
+    from types import SimpleNamespace
+    command = SimpleNamespace(is_assign_damage=True)
+    payload = typed_payload_from_decoded(
+        command, {"AssignedDamageOrder": []})
+    assert payload == {"assignments": ()}
+
+
 def test_classifier_can_carry_decoder_owned_typed_payload():
     payload = {"card_id": 42}
     command = classify_player_transaction(b"PlayResourceTransaction",
@@ -514,6 +538,7 @@ def main():
     test_typed_activation_x_cost_data_maps_resource_cost()
     test_typed_payload_extracts_encounter_conversation_id()
     test_typed_payload_extracts_combat_declarations()
+    test_empty_assign_damage_order_is_a_typed_noop()
     test_typed_payload_extracts_turn_stops_and_auto_pass()
     test_typed_payload_preserves_quit_semantics()
     test_objfmt_dictionary_is_consumed_for_rules_port_payloads()

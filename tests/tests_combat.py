@@ -92,7 +92,10 @@ def make_db():
             "('eb7e48cd-1c85-813f-6635-d43f50cf7809', "
             "'0ad94887-419c-9e99-7946-74c4f72cdd2e', "
             "'c35dd13a-71e2-b244-847a-d887a0666210', "
-            "'190a4d8c-7c2c-10d0-6429-99c5aeb0791f')").fetchall():
+            "'190a4d8c-7c2c-10d0-6429-99c5aeb0791f', "
+            # Corinth Shifted Paradigm auto-targets: your hand / your crypt.
+            "'8d16143b-2216-3f1d-5fc9-397f15c9bbb2', "
+            "'b02ed2f0-4f09-6139-ee99-40c6239e2df9')").fetchall():
         db.execute("INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                    trow)
     for tpl, name, atk, deff, abjson in (

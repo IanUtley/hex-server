@@ -72,7 +72,7 @@ _RECORD_STORE = DEFAULT_RECORD_STORE
 def _pvp_dispatch_triggers(handler, game, session, state, player_uid,
                            ai_uid, event_type, source_card_id,
                            source_owner_id=None, target_card_id=None,
-                           **event_data):
+                           force_ignores_chain=False, **event_data):
     """Dispatch one PvP event through the native RulesPort trigger path.
 
     Tournament PvP still owns its two-player packet projection, but trigger
@@ -86,7 +86,7 @@ def _pvp_dispatch_triggers(handler, game, session, state, player_uid,
         player_uid=player_uid, ai_uid=ai_uid, battle_state=state,
         event_type=event_type, source_card_id=source_card_id,
         source_player_id=source_owner_id, target_card_id=target_card_id,
-        data=event_data)
+        force_ignores_chain=force_ignores_chain, data=event_data)
 
 
 def _pvp_resolve_ability(handler, game, session, state, player_uid, ai_uid,
@@ -2064,11 +2064,15 @@ def _pvp_run_phase_start(session, state, phase):
             if (phase == _ge.ETurnPhases.EndPhase and
                     not state.get("turn_end_trigger_fired")):
                 end_champion_uid = int(champ_map.get(str(turn_uid), 0) or 0)
+                # Merry-Melee-Corinth resolves the end-of-turn ability inline:
+                # there is no priority window for it in that format, so
+                # chaining it left the ability stuck and the hand unshuffled.
                 _pvp_dispatch_triggers(
                     phase_h, phase_game, session, phase_view,
                     _ge.UID.make(244, turn_uid),
                     _ge.UID.make(244, defender_pid), "TurnEndedEvent",
-                    end_champion_uid or None, turn_uid)
+                    end_champion_uid or None, turn_uid,
+                    force_ignores_chain=bool(state.get("corinth_mode")))
                 state["turn_end_trigger_fired"] = True
             state["_last_turn_phase_event"] = phase_view.get(
                 "_last_turn_phase_event")
@@ -2389,6 +2393,12 @@ def pvp_push_attack_options(session, state):
         _ge.UID(int(state.get("champ_map", {}).get(str(turn_pid), 0)))))
     g.push_player_updated(opp_t, champ_id=_ge.SessionCardId(
         _ge.UID(int(state.get("champ_map", {}).get(str(opp_pid), 0)))))
+    # Mirror PvE ``_push_attack_options``: re-push the warzone CardUpdateds in
+    # the SAME packet as the attack PlayerOptionList.  The client re-evaluates
+    # ``OnPlayerOptionsUpdated`` on a card update, which is what turns the
+    # Attack usage into a selectable attacker; without it the option is cached
+    # but the troop never highlights and the declaration goes out empty.
+    pvp_push_warzone_updates(session, state, game=g)
     if forced:
         _pvp_send_same_events(session, g, pl_t, opp_t)
     else:
@@ -2661,7 +2671,7 @@ def pvp_push_warzone_updates(session, state, game=None):
     rows = db_warzone_display_rows(session.session_id, conn=_db)
     for card_uid, tpl_guid, user_id, cstate, db_ct in rows:
         scid = _ge.SessionCardId(_ge.UID(int(card_uid)))
-        if wz_handler:
+        if wz_handler is not None and hasattr(wz_handler, "_card_full_data"):
             wz_handler._card_full_data(g, scid, tpl_guid)
         cdef = g.card_defs.get(scid)
         attrs = cdef.attributes if cdef else 0
@@ -5859,6 +5869,12 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid,
                          (continuation.get("target_map") or {}).items()}
         child_targets[int(continuation.get("target_index", 0) or 0)] = \
             int(chosen_uid)
+        log_req("    PvP choice_zone_target DEBUG: "
+                f"child={child_guid} child_resume="
+                f"{continuation.get('resume_effect_order')} "
+                f"parent={pending.get('parent', {}).get('ability_guid')} "
+                f"parent_resume="
+                f"{pending.get('parent', {}).get('resume_effect_order')}")
         _pvp_resolve_ability(
             handler, g, session, view, pl_t, ai_t, child_guid,
             child_source, child_owner, target_map=child_targets,

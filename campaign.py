@@ -5536,12 +5536,23 @@ def _apply_gameend(db, camp_id, won):
                 state["VisLocs"].append(_convo_location(
                     quest_npc, cfg["quest_conv"], givequest=True))
         state["Wins"] = state.get("Wins", 0) + 1
+        if is_dungeon:
+            # Consecutive dungeon wins.  The "if you won the last encounter in
+            # this dungeon" PreGame talents read this streak rather than the
+            # cumulative ``Wins`` counter, which also counts non-dungeon
+            # battles and therefore fired on the first dungeon encounter.
+            state["dungeon_win_count"] = int(
+                state.get("dungeon_win_count", 0) or 0) + 1
         # The training battle has been won: stop treating the campaign as the
         # tutorial so later battles randomize the turn player instead of always
         # giving the player first turn.
         state["TutorialDone"] = True
     else:
         state["Losses"] = state.get("Losses", 0) + 1
+        if is_dungeon:
+            # A loss breaks the dungeon streak; the next encounter must not
+            # grant the previous-win PreGame bonuses.
+            state["dungeon_win_count"] = 0
         # Training encounters have an authored defeat conversation.  Return
         # to the trainer's panorama node with that conversation queued so the
         # client can play it immediately; the encounter remains retryable.

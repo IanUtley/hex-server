@@ -81,6 +81,16 @@ class RuntimeCard:
     def is_troop(self) -> bool:
         return self.has_type(ECardTypes.Troop)
 
+    def cares_about_combat_phase(self, phase) -> bool:
+        """Mirror ``Card.CaresAboutCombatPhase`` for native combat facts."""
+        first_strike = bool(self.attributes & int(
+            game_engine.ECardAttributes.FirstStrike))
+        dual_strike = bool(self.attributes & int(
+            game_engine.ECardAttributes.DualStrike))
+        if getattr(phase, "name", "") == "FIRST_STRIKE" or int(phase) == 2:
+            return first_strike or dual_strike
+        return not first_strike or dual_strike
+
 
 @dataclass(frozen=True)
 class RuntimePlayer:
@@ -331,8 +341,19 @@ class PvpRuntimeFacts:
             return False
         try:
             guid = str(ability_template_id).lower()
-            from pvp_db import db_champion_ability_costs
-            return db_champion_ability_costs(guid) is not None
+            # A campaign champion's charge power may be supplied by a
+            # selected champion talent.  It is still serialized on the
+            # synthetic champion card, but its authored cost lives in
+            # talent_abilities rather than champion_abilities.
+            attached = getattr(self, "player_champion_ability_guids", None)
+            if request_raw != owner_raw:
+                attached = getattr(self, "ai_champion_ability_guids", None)
+            if attached is not None and guid not in {
+                    str(value).lower() for value in attached}:
+                return False
+            from pvp_db import db_champion_ability_costs, db_charge_ability_cost
+            return (db_champion_ability_costs(guid) is not None or
+                    db_charge_ability_cost(guid) is not None)
         except Exception:
             return False
 

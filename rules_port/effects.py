@@ -496,6 +496,19 @@ def _card_cost(context, target, param):
     amount = int(param.get("amount") or 0)
     if not amount:
         amount = context.modifier_value(param, param, "cardcost")
+    if not amount:
+        # Extracted CardModifier rows can carry amount 0 with the operand only
+        # in the localized game text (e.g. "cost -[(1)]") or in an ability
+        # variable whose raw record is unavailable.  Recover the signed delta
+        # from the text so the effect still applies.
+        import re
+        match = re.search(r"cost\s*([+-])\s*\[?\(?\s*(\d+)",
+                          str(param.get("text") or ""), re.IGNORECASE)
+        if match:
+            value = int(match.group(2))
+            amount = -value if match.group(1) == "-" else value
+    if not amount:
+        return "cardcost: no change"
     db_add_card_cost_modifier(
         context.session.session_id, int(target), amount, conn=context.db)
     context.db.commit()

@@ -2575,11 +2575,58 @@ def db_transform_candidate_templates(conn=None):
     ).fetchall()
 
 
-def db_copy_template_payload(template_guid, conn=None):
-    """Return the typed fields needed to materialize a generated copy."""
+def db_resolve_talent_modified_template(template_guid, talent_guids,
+                                         conn=None):
+    """Select the authored alternate card for the active champion talents.
+
+    CardTemplate's serialized TAC is the client-owned source of the
+    alternate-version relationship and its RequiredTalents conditions.  Do
+    not select a variant by card name or by the ability text: the same rule is
+    used for every talent-modified generated card.
+    """
+    active = {str(value).lower() for value in (talent_guids or [])}
+    if not active:
+        return str(template_guid).lower()
+    from gamedata import DEFAULT_RECORD_STORE
+    from abilities.framework.tac import (_tac_attr_hash, decode_tac_tree)
+    record = DEFAULT_RECORD_STORE.get("CardTemplate", str(template_guid))
+    if record is None:
+        return str(template_guid).lower()
+    serialized = record.field("m_SerializedTAC", {}) or {}
+    data = serialized.get("data") if isinstance(serialized, dict) else serialized
+    tree = decode_tac_tree(data)
+    alternates = tree.get(_tac_attr_hash("AlternateVersions"), [])
+    chosen = str(template_guid).lower()
+    best = 0
+    connection = conn or _db_layer._db
+    for alternate in alternates if isinstance(alternates, list) else []:
+        if not isinstance(alternate, dict):
+            continue
+        guid = alternate.get(_tac_attr_hash("Guid"))
+        condition = alternate.get(_tac_attr_hash("Condition"), {})
+        required = condition.get(_tac_attr_hash("RequiredTalents"), []) \
+            if isinstance(condition, dict) else []
+        required = {
+            str(item.get(_tac_attr_hash("Guid"))).lower()
+            for item in required if isinstance(item, dict)
+        }
+        if not guid or not required.issubset(active) or len(required) <= best:
+            continue
+        exists = connection.execute(
+            "SELECT 1 FROM card_templates WHERE guid=? LIMIT 1", (str(guid),)
+        ).fetchone()
+        if exists:
+            chosen, best = str(guid).lower(), len(required)
+    return chosen
+
+
+def db_copy_template_payload(template_guid, conn=None, talent_guids=None):
+    """Return typed fields needed to materialize a generated copy."""
+    resolved = db_resolve_talent_modified_template(
+        template_guid, talent_guids, conn=conn)
     return (conn or _db_layer._db).execute(
         "SELECT card_type, abilities_json, attributes FROM card_templates "
-        "WHERE guid=?", (template_guid,)).fetchone()
+        "WHERE guid=?", (resolved,)).fetchone()
 
 
 def db_next_game_card_row_id(session_id, conn=None):

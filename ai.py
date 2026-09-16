@@ -3343,6 +3343,22 @@ def ai_respond_to_priority(handler, game, session, ai_t, pl_t, battle_state):
                         evaluator=evaluator):
                     log_req(f"    AI response: lifegain quick action {card.name}")
                     return True
+    # Default: the AI has no useful quick response.  Pass priority back so the
+    # opponent's chain item resolves, or (when the AI is not the current
+    # priority holder / the window is its own chain top) resolve the top of
+    # the chain.  Practice has no AI client to submit that pass, so the host
+    # performs it here instead of leaving the window stranded.
+    port = getattr(session, "_rules_port_session", None)
+    if port is not None:
+        try:
+            if port.pass_player_priority(ai_t):
+                return True
+            top = port.chain.peek_ability() if getattr(port, "chain", None) else None
+            if top is not None:
+                port.resolve_top_of_chain(int(top.instance_id))
+                return True
+        except Exception as exc:
+            log_req(f"    AI default pass/resolve failed: {exc!r}")
     return False
 
 

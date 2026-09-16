@@ -726,6 +726,15 @@ class HCPHandler(ProfileStreamMixin):
                         current_state.get("turn_phases") or ()).index(phase)
                 except ValueError:
                     pass
+                if (phase == game_engine.ETurnPhases.DeclareDefense and
+                        _same_uid(active_id, getattr(projection, "ai_uid", None)) and
+                        current_state.get("ai_attackers")):
+                    # Native phase states own the transition, but the host
+                    # still owns the client PlayerOptionList projection.
+                    # Without this bridge the defender receives the phase but
+                    # no legal blocker targets (including ordinary Buffalo).
+                    self._push_blocker_options(
+                        _session, projection.player_uid, projection.ai_uid)
                 if phase == game_engine.ETurnPhases.StartTurn:
                     # The native EndTurn state rotates the active player
                     # before entering StartTurn. Keep the compatibility-shaped
@@ -1109,11 +1118,29 @@ class HCPHandler(ProfileStreamMixin):
                     from rules_port.resolution import resolve_port_ability
                     from gamedata import DEFAULT_RECORD_STORE, ability_graph
                     source_uid = int(descriptor.get("source_uid") or 0)
-                    owner_id = 0
-                    if source_uid:
+                    # The projected descriptor is the authoritative owner for
+                    # a synthetic champion (champions are not game_cards
+                    # rows).  Falling back to the DB lookup first turns the
+                    # player's champion into owner 0 and puts generated deck
+                    # cards in the AI deck.
+                    owner_id = descriptor.get("owner_id")
+                    if owner_id is None and source_uid:
                         owner = db_card_owner_id(
                             session.session_id, source_uid, conn=_db)
                         owner_id = int(owner or 0)
+                    owner_id = int(owner_id or 0)
+                    if not live.get("pvp"):
+                        # Native PVE descriptors use typed ServicePlayer/AI
+                        # identities for scheduler ownership. Generated cards
+                        # and deck mutations require the persisted profile
+                        # owner (player) or the canonical AI owner (0).
+                        player_owner = int((self.user_profile or {}).get(
+                            "id", 0)) if isinstance(self.user_profile, dict) else 0
+                        if (_same_uid(owner_id, player_uid) or
+                                owner_id == player_owner):
+                            owner_id = player_owner
+                        elif (_same_uid(owner_id, ai_uid) or owner_id == 0):
+                            owner_id = 0
                     ability_guid = str(
                         descriptor.get("ability_guid") or "").lower()
                     graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
@@ -1152,6 +1179,16 @@ class HCPHandler(ProfileStreamMixin):
                         raise RuntimeError(
                             "RulesPort native card resolver rejected kind "
                             f"{descriptor.get('kind')!r}")
+                elif descriptor.get("kind") == "trigger":
+                    # Authored triggered abilities that do not ignore the
+                    # chain are queued as projected chain items (see
+                    # rules_port/triggers.py).  They resolve through the same
+                    # native Records resolver used for setup-time and PvP
+                    # triggers; the native chain owns ordering, this branch
+                    # only projects the effect.
+                    self._resolve_native_trigger_chain_item(
+                        session, player_uid, ai_uid, live, descriptor,
+                        projected_game)
                 else:
                     raise RuntimeError(
                         "RulesPort chain has no native card resolver for kind "
@@ -1166,6 +1203,15 @@ class HCPHandler(ProfileStreamMixin):
                             "pending_choice", "pending_trigger",
                             "pending_deck_search", "pending_conversation",
                             "pending_discard_ability"))):
+                    # Ability resolution itself removes the native chain
+                    # item, but the projected chain animation also needs the
+                    # matching resolved/removed events.  Without these, the
+                    # champion source remains visually stranded on the chain
+                    # after its charge effect has completed.
+                    projected_game.push_top_of_chain_resolved(
+                        int(ability.instance_id))
+                    projected_game.push_removed_top_of_chain(
+                        int(ability.instance_id))
                     projected_game.push_chain_empty()
                 _native_lifecycle.save_state(session, live)
                 self._send_battle_events(session, projected_game, player_uid)
@@ -1446,6 +1492,12 @@ class HCPHandler(ProfileStreamMixin):
                                         is None)
                         practice_window = not (session.session_name or "").startswith(
                             "tourney-")
+                        log_req("    RulesPort pass DEBUG: "
+                                f"passed={pass_player!r} next={next_player!r} "
+                                f"phase_window={phase_window} "
+                                f"practice={practice_window} "
+                                f"responding_to="
+                                f"{getattr(action, 'ability_responding_to', None)!r}")
                         # Practice/PvE has one client and one server-driven
                         # participant. The AI must pass through the same
                         # native action both for ordinary ALL-player phase
@@ -1473,6 +1525,9 @@ class HCPHandler(ProfileStreamMixin):
                             # pass. Do not unconditionally pass the AI here,
                             # or quick removal/combat tricks can never fire.
                             client_id = transaction.player_id
+                            log_req("    RulesPort AI response loop DEBUG: "
+                                    f"client={client_id!r} "
+                                    f"next={next_player!r}")
                             while (next_player is not None and
                                    not _same_uid(next_player, client_id)):
                                 ai_acted = False
@@ -1507,8 +1562,14 @@ class HCPHandler(ProfileStreamMixin):
                                         "    RulesPort AI response failed; "
                                         f"using pass fallback: {exc!r}")
                                 if not port.pass_player_priority(next_player):
+                                    log_req("    RulesPort AI pass DEBUG: "
+                                            f"pass_player_priority({next_player!r}) "
+                                            "returned False; priority="
+                                            f"{port.action_stack.priority_player_id!r}")
                                     break
                                 next_player = port.action_stack.priority_player_id
+                                log_req("    RulesPort AI pass DEBUG: "
+                                        f"next now {next_player!r}")
                         # A first pass only hands APNAP priority to the next
                         # player. Do not tick an as-yet-unentered action: its
                         # on_enter() may rebuild the queue, undoing that pass.
@@ -1875,6 +1936,24 @@ class HCPHandler(ProfileStreamMixin):
             facts.ai_champion_card_id = _valid_champion(
                 getattr(projected_game, "ai_champion_card_id", None),
                 getattr(self, "_ai_champ_scid", None))
+            # Synthetic champion cards are not in game_cards. Preserve the
+            # exact ability catalog projected on each champion so a talent
+            # charge power can pass the same source-card gate as a signature
+            # champion ability.
+            def _champion_ability_guids(card_id, fallback):
+                card_def = getattr(projected_game, "card_defs", {}).get(card_id)
+                values = tuple(str(value.guid).lower() for value in
+                               (getattr(card_def, "abilities", ()) or ()))
+                if values:
+                    return values
+                return tuple(str(getattr(value, "guid", value)).lower()
+                             for value in (fallback or ()))
+            facts.player_champion_ability_guids = _champion_ability_guids(
+                facts.player_champion_card_id,
+                getattr(self, "_player_champ_abilities", ()))
+            facts.ai_champion_ability_guids = _champion_ability_guids(
+                facts.ai_champion_card_id,
+                getattr(self, "_ai_champ_ability_guids", ()))
         payload_required = any(getattr(command, name, False) for name in (
             "is_discard", "is_ready_card", "is_play_resource",
             "is_play_troop", "is_play_artifact", "is_play_spell",
@@ -2165,6 +2244,37 @@ class HCPHandler(ProfileStreamMixin):
                 except Exception as exc:
                     log_req(
                         f"    PvP RulesPort ability priority projection failed: {exc}")
+            # Practice/PvE has the same native chain semantics as tournament
+            # PvP, but only one client projection.  The activation tick emits
+            # the charge/card updates; replace the stale main-phase options
+            # with a chain-only response window while the ability is pending.
+            if (getattr(command, "is_ability_activate", False) and
+                    not (session.session_name or "").startswith("tourney-") and
+                    getattr(port, "chain", None) is not None and
+                    not port.chain.is_empty):
+                try:
+                    priority = port.action_stack.priority_player_id
+                    if _same_uid(priority, pl_t):
+                        self._push_phase_options_empty(
+                            session, game.player_uid, game.ai_uid)
+                        from rules_port.persistence import load_state as _load_state
+                        chain_game = self._fresh_game(
+                            session, pl_t, ai_t,
+                            _load_state(session, default=lambda: {}))
+                        chain_game.push_turn_phase(
+                            port.current_turn_phase,
+                            pl_t if _same_uid(port.active_player_id, pl_t)
+                            else ai_t,
+                            pl_t)
+                        chain_game.push_green_light(
+                            pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
+                        self._send_battle_events(session, chain_game, pl_t)
+                        log_req(
+                            "    RulesPort Practice ability priority window: "
+                            f"phase={port.current_turn_phase} priority=player")
+                except Exception as exc:
+                    log_req(
+                        f"    RulesPort Practice ability priority projection failed: {exc}")
             # A completed manual ability returns to the same main-phase
             # priority window.  The legacy ability handler rebuilt the
             # PlayerOptionList at that boundary, but the RulesPort action
@@ -4485,6 +4595,13 @@ class HCPHandler(ProfileStreamMixin):
         _be = self._checkpoint_engine(session)
         from abilities.framework.effects.choices import (
             CHOICE_COPY_ABILITY, CHOICE_TARGET_TEMPLATE)
+        log_req("    PvP choice prompt DEBUG: "
+                f"kind={pending.get('kind')} "
+                f"source={pending.get('source_uid')} "
+                f"parent={pending.get('parent', {}).get('ability_guid')} "
+                f"parent_resume="
+                f"{pending.get('parent', {}).get('resume_effect_order')} "
+                f"child={pending.get('continuation', {}).get('ability_guid')}")
 
         def build_prompt(target_game, player_uid):
             ev = target_game._make_event(
@@ -6905,6 +7022,29 @@ class HCPHandler(ProfileStreamMixin):
             event for event in setup_events
             if not isinstance(event, chain_event_types)
         ]
+
+    def _resolve_native_trigger_chain_item(self, session, pl_t, ai_t, bstate,
+                                           item, game):
+        """Resolve a triggered ability selected by the native chain.
+
+        A trigger that does not ignore the chain is discovered by
+        ``rules_port.triggers`` and queued as a projected chain item; the
+        native scheduler owns its ordering and response window.  Resolution
+        goes through the shared Records resolver, and the chain presentation
+        is popped only once the trigger fully resolves so an interactive
+        prompt can keep the chain item visible.
+        """
+        from rules_port.resolution import resolve_port_trigger
+        resolve_port_trigger(
+            self, game, session, _db, pl_t, ai_t, bstate, item)
+        if not bstate.get("resolution_paused") and not any(
+                bstate.get(key) for key in (
+                    "pending_choice", "pending_trigger",
+                    "pending_deck_search", "pending_conversation",
+                    "pending_discard_ability")):
+            instance_id = int(item.get("instance_id", 1) or 1)
+            game.push_top_of_chain_resolved(instance_id)
+            game.push_removed_top_of_chain(instance_id)
 
     def _resolve_native_card_chain_item(self, session, pl_t, ai_t, bstate,
                                         item, game):
@@ -12263,6 +12403,7 @@ class HCPHandler(ProfileStreamMixin):
         bstate = load_checkpoint(session)
         self._current_bstate = bstate
         cur_phase = current_checkpoint_phase(bstate)
+        native_phase_advanced = False
         if cur_phase == game_engine.ETurnPhases.AssignDamage:
             n_att = len(bstate.get("player_attackers") or {})
             # The AssignDamageOrderTransaction carries the player's
@@ -12303,6 +12444,26 @@ class HCPHandler(ProfileStreamMixin):
             if native_combat:
                 bstate = self._resolve_combat_damage(
                     session, pl_t, ai_t, bstate)
+                # Combat damage is resolved by the host projection, but the
+                # native scheduler still owns the phase cursor.  Its priority
+                # action is intentionally waiting for this transaction, so a
+                # normal ``tick()`` cannot advance it.  Clear that consumed
+                # window and perform the native transition before asking the
+                # RulesPort driver to project the next input window;
+                # advancing only the compatibility checkpoint leaves the
+                # port at AssignDamage and makes Mono submit empty orders in
+                # a loop.
+                port = getattr(session, "_rules_port_session", None)
+                if port is not None:
+                    port.action_stack.clear()
+                    port.advance_turn_phase()
+                    phases = list(bstate.get("turn_phases") or ())
+                    try:
+                        bstate["phase_idx"] = phases.index(
+                            port.current_turn_phase)
+                    except ValueError:
+                        pass
+                    native_phase_advanced = True
             else:
                 bstate = self._resolve_combat_damage(session, pl_t, ai_t, bstate)
             save_checkpoint(session, bstate)
@@ -12324,6 +12485,17 @@ class HCPHandler(ProfileStreamMixin):
             if native_combat:
                 bstate = self._resolve_combat_damage(
                     session, pl_t, ai_t, bstate, first_strike=True)
+                port = getattr(session, "_rules_port_session", None)
+                if port is not None:
+                    port.action_stack.clear()
+                    port.advance_turn_phase()
+                    phases = list(bstate.get("turn_phases") or ())
+                    try:
+                        bstate["phase_idx"] = phases.index(
+                            port.current_turn_phase)
+                    except ValueError:
+                        pass
+                    native_phase_advanced = True
             else:
                 bstate = self._resolve_combat_damage(
                     session, pl_t, ai_t, bstate, first_strike=True)
@@ -12340,8 +12512,11 @@ class HCPHandler(ProfileStreamMixin):
             log_req("    AssignDamage: paused for deck-search answer")
             handled = True
             return True
-        # Advance to the next phase (SecondMain after AssignDamage).
-        advance_checkpoint(bstate)
+        # Advance to the next phase (SecondMain after AssignDamage).  Native
+        # RulesPort already performed that transition above; applying the
+        # compatibility cursor a second time would skip the next phase.
+        if not native_phase_advanced:
+            advance_checkpoint(bstate)
         save_checkpoint(session, bstate)
         self._advance_to_priority(session, pl_t, ai_t, bstate)
         return True
@@ -14052,6 +14227,8 @@ class HCPHandler(ProfileStreamMixin):
             try:
                 import json as _tal_json
                 talent_guids = _tal_json.loads(player_talents_json) if player_talents_json else []
+                self._player_talent_guids = [str(value).lower()
+                                             for value in talent_guids]
                 for tg in talent_guids:
                     # All abilities granted by this talent (one-to-many).
                     ab_rows = db_talent_ability_rows(tg, conn=_db)
@@ -14061,7 +14238,9 @@ class HCPHandler(ProfileStreamMixin):
                         # Passive talent with no ability (e.g. Efficient) — skip.
                         pass
             except Exception:
+                self._player_talent_guids = []
                 pass
+            self._ai_talent_guids = []
             # The champion's signature charge power comes from gamedata
             # champion_abilities (e.g. Dimmid's "[DIAMOND][DIAMOND]: [BASIC] [2]
             # Target troop gets Lifedrain this turn") — include it even when it

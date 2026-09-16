@@ -332,6 +332,16 @@ class NativeEffectBackend:
                                 champions=(getattr(handler, "_champion_targets",
                                                    lambda: [])() or []),
                                 battle_state=battle_state))
+                            if not candidates:
+                                # C# GetAutoTargets yields an empty set when no
+                                # card matches the filter.  Falling through to
+                                # ``target_values = (None,)`` made target-aware
+                                # effects fall back to ``resolving_source_uid``;
+                                # Corinth's Shifted Paradigm (auto-targets "your
+                                # hand"/"your crypt") then moved the champion
+                                # into the deck.  An effect with no auto-target
+                                # card simply does nothing.
+                                continue
                             if target_spec.is_random:
                                 # A random auto-target (e.g. Infernal Professor's
                                 # "a random non-resource card from your deck")
