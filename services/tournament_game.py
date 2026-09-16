@@ -487,7 +487,13 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
         return bool(_pvp_resolve_conversation(current, session, raw, my_pid))
     if kind == "choice":
         if (pvp_load_state(session) or {}).get("pending_choice"):
-            return bool(_pvp_resolve_choice(current, session, raw, my_pid))
+            # The native RulesPort continuation carries the selected target in
+            # the typed payload (``activation_data.target_map``).  The legacy
+            # ``raw`` envelope is empty on this path, so pass the payload
+            # through; ``_pvp_resolve_choice`` reads the typed target when the
+            # raw scan finds nothing.
+            return bool(_pvp_resolve_choice(
+                current, session, raw, my_pid, typed_payload=payload))
         return True
     if kind == "discard":
         live = pvp_load_state(session) or {}
@@ -846,6 +852,18 @@ def attach_pvp_rules_port(handler, session, game, state):
             _pvp_resolve_chain(
                 session, state, current_handler(), owner_id, item=descriptor)
         pvp_save_state(session, state)
+        from rules_port.actions import AbilityResolutionState
+        if (not bool(getattr(ability, "ignores_chain", False)) and
+                any(state.get(key) for key in (
+                    "pending_choice", "pending_trigger",
+                    "pending_deck_search", "pending_conversation",
+                    "pending_discard_ability", "resolution_paused"))):
+            # A real chain ability paused on an interactive prompt.  Keep the
+            # chain item (do not forget the projected chain) so the client's
+            # picker is not torn down; resolution resumes when the prompt is
+            # answered.
+            session._rules_port_mutation_emitted = True
+            return AbilityResolutionState.WAITING_FOR_INPUT
         port.forget_projected_chain(int(ability.instance_id))
         # Triggers or nested effects may have placed another descriptor on
         # the persisted PvP stack. Reify its response window in RulesPort as
@@ -868,7 +886,6 @@ def attach_pvp_rules_port(handler, session, game, state):
                 next_item, next_owner,
                 first_player_id=_ge.UID.make(244, next_other))
         session._rules_port_mutation_emitted = True
-        from rules_port.actions import AbilityResolutionState
         return AbilityResolutionState.COMPLETED
 
     def native_activation_cost_payer(ability):
@@ -5564,7 +5581,9 @@ def pvp_handle_transaction(handler, session, inner_bytes, *, typed_payload=None)
     # picker response falls through and is misread as a champion activation.
     pending_state = pvp_load_state(session) or {}
     if pending_state.get("pending_choice") and b"m_UID64" in inner_bytes:
-        return _pvp_resolve_choice(handler, session, inner_bytes, my_pid)
+        return _pvp_resolve_choice(
+            handler, session, inner_bytes, my_pid,
+            typed_payload=typed_payload)
     is_ability_data = b"AbilityActivationData" in inner_bytes
     if (b"SetAbilityActivationDataTransaction" in inner_bytes or
             (is_ability_data and
@@ -5761,7 +5780,8 @@ def pvp_handle_transaction(handler, session, inner_bytes, *, typed_payload=None)
     return _pvp_project_resource_play(
         handler, session, inner_bytes, my_pid, played_card_uid, crow,
         card_name, pids, my_uid, opp_uid)
-def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
+def _pvp_resolve_choice(handler, session, inner_bytes, my_pid,
+                        typed_payload=None):
     """Resolve a private ChooseAndPlay choice and resume its parent BOM."""
     from rules_port import lifecycle as _be
     from rules_port.choice_effects import (
@@ -5771,10 +5791,27 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
     if not pending:
         return False
     selected = extract_card_uids(inner_bytes)
+    if not selected and isinstance(typed_payload, dict):
+        activation = typed_payload.get("activation_data")
+        target_map = (activation.get("target_map")
+                      if isinstance(activation, dict) else None)
+        if isinstance(target_map, dict):
+            for target in target_map.values():
+                values = target if isinstance(target, (list, tuple, set)) else (target,)
+                for value in values:
+                    try:
+                        uid = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if (uid & 0xFF) == 1:
+                        selected.append(uid)
     legal = {int(uid) for uid in pending.get("choice_uids", [])}
     chosen_uid = next((uid for uid in reversed(selected) if int(uid) in legal),
                       None)
     owner_id = int(pending.get("owner_id", 0))
+    log_req(f"    PvP choice parse: selected={[hex(int(u)) for u in selected]} "
+            f"legal={[hex(int(u)) for u in legal]} chosen="
+            f"{hex(int(chosen_uid)) if chosen_uid else None}")
     if owner_id != int(my_pid) or chosen_uid is None:
         log_req(f"    PvP choice answer invalid: pid={my_pid} "
                 f"chosen={chosen_uid} owner={owner_id}")
@@ -6550,10 +6587,12 @@ def _pvp_push_waiting_on(session, waiting_pid):
         # picker; send them an explicit clear instead of the matching id.
         if waiting_pid is not None and int(pid) == int(waiting_pid):
             g.push_waiting_on_player(None)
+            event_desc = "clear"
         else:
             g.push_waiting_on_player(waiting_uid)
+            event_desc = (str(waiting_pid) if waiting_pid else "clear")
         _send_pvp_packet(h, session, g, _ge.UID.make(244, pid),
-                         f"waiting-on-player(wait={waiting_pid or 'clear'})")
+                         f"waiting-on-player(to={pid},event={event_desc})")
 
 
 def _pvp_push_reconnect_snapshot(handler, session, pid):
@@ -7315,8 +7354,6 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
     view["player_spell_target"] = item.get("target_uid")
     g = _ge.Game(int(session.session_id), pl_t, ai_t)
     _pvp_populate_game_state(g, state, owner_id, opp_pid)
-    g.push_top_of_chain_resolved(instance_id)
-    g.push_removed_top_of_chain(instance_id)
     if kind == "trigger":
         try:
             from rules_port.resolution import resolve_port_trigger
@@ -7623,6 +7660,26 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
         state["stack"] = view.get("stack") or []
         _pvp_sync_view_to_state(state, view, owner_id, opp_pid)
         pvp_save_state(session, state)
+    # The chain item is only removed once the ability FULLY resolves, and an
+    # IgnoresChain ability is never added to the client's chain at all
+    # (UIBattle.OnAbilityPushedOnChain plays a card event instead).  Emitting
+    # TopOfChainResolved/RemovedTopOfChain for it — or while the BOM is paused
+    # on an interactive prompt — would tear down the picker the client just
+    # opened.  Mirrors the client: ResolveTopOfChainAction removes the item
+    # only on COMPLETED, and only for a real chain entry.
+    ignores_chain = False
+    if kind == "ability":
+        try:
+            from rules_port.session import projected_ability_ignores_chain
+            ignores_chain = projected_ability_ignores_chain(item)
+        except Exception:
+            ignores_chain = False
+    if not ignores_chain and not any(state.get(key) for key in (
+            "pending_choice", "pending_trigger", "pending_deck_search",
+            "pending_conversation", "pending_discard_ability",
+            "resolution_paused")):
+        g.push_top_of_chain_resolved(instance_id)
+        g.push_removed_top_of_chain(instance_id)
     _pvp_emit_paid_cost_events(g, state)
     _pvp_send_same_events(session, g, pl_t, ai_t)
     if chain_empty and pending_discard:
@@ -9244,6 +9301,14 @@ def handle_ready_for_game_events(handler, session, pvp_events_ready, log_req=log
                     import traceback
                     log_req(f"    push_pvp_game_start FAILED: {e}\n{traceback.format_exc()}")
             del pvp_events_ready[session.session_id]
+            # After BOTH setups are sent, tell the opponent the coin-flip
+            # winner is choosing who goes first.
+            try:
+                state = pvp_load_state(session) or {}
+                _pvp_push_waiting_on(
+                    session, int(state.get("goes_first_pid") or 0) or None)
+            except Exception as e:
+                log_req(f"    PvP pick-goes-first wait push failed: {e}")
             return True
     except Exception as e:
         import traceback

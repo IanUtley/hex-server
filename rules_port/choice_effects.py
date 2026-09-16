@@ -4,26 +4,14 @@ from __future__ import annotations
 
 import random
 import json
-import re
-import struct
 import game_engine
+
+from .wire import extract_session_card_uids
 
 
 def extract_card_uids(raw):
     """Extract typed card SessionCardIds from a client activation payload."""
-    if not isinstance(raw, bytes):
-        return []
-    result = []
-    for match in re.finditer(
-            rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});", raw):
-        try:
-            uid = struct.unpack("<Q", bytes.fromhex(
-                match.group(1).decode("ascii")))[0]
-        except (ValueError, struct.error):
-            continue
-        if (uid & 0xFF) == 1:
-            result.append(int(uid))
-    return result
+    return list(extract_session_card_uids(raw))
 
 
 def _resource_guids(value):

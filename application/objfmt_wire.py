@@ -77,12 +77,20 @@ def parse_datawrapper(body, *, preserve_complex=False):
             val = (body[idx] == 0x31)
             idx += 1
             return name, val
-        elif ("ResourceId" in f_type or "UID" in f_type or
-              "SessionCardId" in f_type or
-              "AbilityActivationData" in f_type):
+        elif (("ResourceId" in f_type or "UID" in f_type or
+               "SessionCardId" in f_type or
+               "AbilityActivationData" in f_type) and
+              not f_type.startswith("System.Collections.Generic.")):
             # Nested identifiers are normally skipped for legacy handlers,
             # but the rules-port ingress needs their typed fields (SourceCardId,
             # AbilityTemplateId, and activation targets) preserved.
+            #
+            # A collection element type can also contain these substrings
+            # (e.g. ``List`1#Game.Shared.SessionCardId`` or
+            # ``List`1#Game.Shared.UID``).  Those are handled by the
+            # List/Dictionary branches below; matching them here with num==0
+            # parsed zero members and left the cursor mid-element, corrupting
+            # the rest of the transaction (TargetMap's SessionCardIds list).
             if not preserve_complex:
                 for _ in range(num):
                     parse_one("", 0)

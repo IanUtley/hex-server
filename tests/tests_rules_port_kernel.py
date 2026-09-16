@@ -2112,6 +2112,13 @@ def test_wire_card_uid_decoder_preserves_declared_order_and_filters_uid_type():
         0x0B00000000000001,)
 
 
+def test_wire_card_uid_decoder_accepts_value_wrapped_session_card_id():
+    """Client choice answers may wrap the UID scalar in ``value``."""
+    raw = (b"m_Targets;1;1;0;Target;1;1;1;value;m_UID64;2;2;0;"
+           b"0101000000000000;")
+    assert extract_session_card_uids(raw) == (0x101,)
+
+
 def test_card_move_mutation_adapter_maps_known_collection_through_pvp_api():
     calls = []
     api = SimpleNamespace(db_set_card_location=lambda *args: calls.append(args))

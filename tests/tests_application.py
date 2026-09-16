@@ -200,6 +200,49 @@ def test_objfmt_dictionary_is_consumed_for_rules_port_payloads():
     assert decoded["TargetMap"] == {7: "selected"}
 
 
+def test_objfmt_session_card_id_list_is_consumed_for_rules_port_payloads():
+    """A ``List<SessionCardId>`` must not be mistaken for a scalar card type.
+
+    The collection's element type string contains ``SessionCardId``.  The
+    generic scalar branch used to match it first with ``num == 0``, parse no
+    members, and leave the cursor mid-element.  Corinth's charge-power choice
+    serializes the picked card in exactly this shape, so the whole TargetMap
+    was corrupted and the server saw no selection.
+    """
+    import struct
+    from binascii import hexlify
+
+    from objfmt_builder import ObjFmtBuilder
+    from hconnect_server import parse_datawrapper
+
+    builder = ObjFmtBuilder("Test.Root")
+    list_idx, list_start = builder.begin_list(
+        "m_SessionCardIds",
+        "System.Collections.Generic.List`1#Game.Shared.SessionCardId",
+        1,
+    )
+    el_idx = builder.begin_element(0, "Game.Shared.SessionCardId", 1)
+    v_start = builder._buf.tell()
+    v_idx = builder._push_size()
+    vt = builder._add_type("Game.Shared.UID")
+    builder._w("value"); builder._sep(); builder._w(str(v_idx)); builder._sep()
+    builder._w(str(vt)); builder._sep(); builder._w("1"); builder._sep()
+    sv_start = builder._buf.tell()
+    sv_idx = builder._push_size()
+    svt = builder._add_type("System.UInt64")
+    builder._w("m_UID64"); builder._sep(); builder._w(str(sv_idx)); builder._sep()
+    builder._w(str(svt)); builder._sep(); builder._w("0"); builder._sep()
+    builder._w(hexlify(struct.pack("<Q", 0x271101)).decode("ascii"))
+    builder._sep()
+    builder._set_size(sv_idx, sv_start)
+    builder._set_size(v_idx, v_start)
+    builder._set_size(el_idx, builder._element_starts[el_idx])
+    builder._set_size(list_idx, list_start)
+
+    decoded = parse_datawrapper(builder.finish(1), preserve_complex=True)
+    assert decoded["m_SessionCardIds"] == [{"value": {"m_UID64": 0x271101}}]
+
+
 def _make_db():
     fd, path = tempfile.mkstemp(prefix="hex-application-", suffix=".db")
     os.close(fd)
@@ -474,6 +517,7 @@ def main():
     test_typed_payload_extracts_turn_stops_and_auto_pass()
     test_typed_payload_preserves_quit_semantics()
     test_objfmt_dictionary_is_consumed_for_rules_port_payloads()
+    test_objfmt_session_card_id_list_is_consumed_for_rules_port_payloads()
     test_mail_commands_commit_related_mutations_together()
     print("application transaction tests passed")
 

@@ -1132,6 +1132,100 @@ def test_pvp_choice_zone_target_resolves_child_then_parent():
     print("PASS PvP choice-zone target resolves child then parent")
 
 
+def test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty():
+    """The native RulesPort projection has no raw envelope.
+
+    ``project_accepted_pvp_transaction`` forwards the typed payload, and the
+    selected card lives in ``activation_data.target_map``.  A real Corinth
+    charge-power answer is exactly this shape: ``inner_bytes`` is empty while
+    the typed payload carries the pick, so reading only the raw bytes made the
+    server log ``selected=[]`` and never copy the card.
+    """
+    class Session:
+        session_id = 1
+        server_id = 100
+        turn_order = {}
+
+        def _persist(self):
+            pass
+
+    pending = {
+        "kind": "choice_zone_target",
+        "choice_uids": [0x271101, 0x271301, 0x271201],
+        "source_uid": 9001,
+        "owner_id": 1001,
+        "instance_id": 5,
+        "ability_guid": "d5b56bd5-child",
+        "continuation": {
+            "ability_guid": "d5b56bd5-child",
+            "source_uid": 9001,
+            "owner_id": 1001,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": 0,
+            "target_index": 0,
+        },
+        "parent": {
+            "ability_guid": "286f1891-parent",
+            "source_uid": 9001,
+            "owner_id": 1001,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": 3,
+        },
+    }
+    session = Session()
+    state = {"pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+             "phase": game_engine.ETurnPhases.EndTurn,
+             "pending_choice": pending}
+    session._rules_port_battle_state = state
+    calls = []
+
+    def _resolve(handler, game, sess, view, pl_t, ai_t, guid, source,
+                 owner, **kwargs):
+        calls.append((str(guid), source, int(owner),
+                      dict(kwargs.get("target_map") or {}),
+                      int(kwargs.get("resume_from_order", 0) or 0)))
+
+    previous = {
+        "pids": tournament_game.db_game_session_pids,
+        "resolve": tournament_game._pvp_resolve_ability,
+        "populate": tournament_game._pvp_populate_game_state,
+        "sync": tournament_game._pvp_sync_view_to_state,
+        "send": tournament_game._pvp_send_same_events,
+        "save": tournament_game.pvp_save_state,
+        "charge": tournament_game._pvp_gain_charge_trigger_game,
+    }
+    try:
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        tournament_game._pvp_resolve_ability = _resolve
+        tournament_game._pvp_populate_game_state = lambda *_a, **_k: None
+        tournament_game._pvp_sync_view_to_state = lambda *_a, **_k: None
+        tournament_game._pvp_send_same_events = lambda *_a, **_k: None
+        tournament_game.pvp_save_state = lambda *_a, **_k: None
+        tournament_game._pvp_gain_charge_trigger_game = lambda *_a, **_k: None
+        with mock.patch(
+                "rules_port.context.EffectContext.from_rules_port",
+                return_value=SimpleNamespace()):
+            handled = tournament_game._pvp_resolve_choice(
+                HandlerStub(tournament_game._db), session, b"", 1001,
+                typed_payload={"activation_data": {"target_map": {0: [0x271301]}}})
+    finally:
+        tournament_game.db_game_session_pids = previous["pids"]
+        tournament_game._pvp_resolve_ability = previous["resolve"]
+        tournament_game._pvp_populate_game_state = previous["populate"]
+        tournament_game._pvp_sync_view_to_state = previous["sync"]
+        tournament_game._pvp_send_same_events = previous["send"]
+        tournament_game.pvp_save_state = previous["save"]
+        tournament_game._pvp_gain_charge_trigger_game = previous["charge"]
+    assert handled
+    assert [call[0] for call in calls] == [
+        "d5b56bd5-child", "286f1891-parent"], calls
+    assert calls[0][3] == {0: 0x271301}, calls
+    assert state.get("pending_choice") is None
+    print("PASS PvP choice reads native payload when raw envelope is empty")
+
+
 if __name__ == "__main__":
     test_parity()
     test_pvp_combat_trigger_stays_on_authoritative_stack()
@@ -1149,3 +1243,4 @@ if __name__ == "__main__":
     test_pvp_quick_action_handoff_updates_both_clients()
     test_pvp_steadfast_attacker_stays_untapped()
     test_pvp_choice_zone_target_resolves_child_then_parent()
+    test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty()

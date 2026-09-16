@@ -1287,7 +1287,8 @@ class HCPHandler(ProfileStreamMixin):
                     pl_t = game_engine.UID.make(244, int(self.client_reck_id))
                     ai_t = game_engine.UID.make(3, 1000)
                     handled = bool(self._resolve_pending_choice(
-                        session, pl_t, ai_t, original.inner_bytes))
+                        session, pl_t, ai_t, original.inner_bytes,
+                        typed_payload=getattr(original, "typed_payload", None)))
                     if handled:
                         session._rules_port_mutation_emitted = True
                     return handled
@@ -2090,7 +2091,29 @@ class HCPHandler(ProfileStreamMixin):
             game = getattr(getattr(port, "event_sink", None), "game", None)
             emitted = bool(getattr(session, "_rules_port_mutation_emitted", False))
             session._rules_port_mutation_emitted = False
-            if game is not None and not emitted:
+            # While an interactive prompt is open (class-23 picker, triggered
+            # target, deck search, ...) the prompt owns the client's UI.  The
+            # scheduler's post-resolution events (GreenLight/TurnPhaseUpdated/
+            # AbilityPushedOnChain) would replace it, so suppress them until
+            # the prompt is answered.
+            prompt_pending = False
+            if (session.session_name or "").startswith("tourney-"):
+                try:
+                    from rules_port.persistence import load_state
+                    _live = load_state(session) or {}
+                    prompt_pending = any(_live.get(key) for key in (
+                        "pending_choice", "pending_trigger",
+                        "pending_deck_search", "pending_conversation",
+                        "pending_discard_ability", "resolution_paused"))
+                except Exception:
+                    prompt_pending = False
+            if game is not None and game.events:
+                log_req(
+                    "    RulesPort post-tick event sink: "
+                    f"emitted={emitted} prompt_pending={prompt_pending} "
+                    f"classes="
+                    f"{[getattr(type(ev), 'CLASS_ID', 0) for ev in game.events]}")
+            if game is not None and not emitted and not prompt_pending:
                     self._send_battle_events(session, game, player_uid)
             # A manual champion activation leaves a chain item pending.  The
             # native resolver emits the mutation packet, but the PvP adapter
@@ -2175,6 +2198,8 @@ class HCPHandler(ProfileStreamMixin):
                             "pending_deck_search", "pending_discard_ability",
                             "pending_conversation", "resolution_paused")))
                     if settled:
+                        log_req("    RulesPort post-ability main-phase options "
+                                "refresh (settled)")
                         if (session.session_name or "").startswith(
                                 "tourney-"):
                             from services.tournament_game import (
@@ -4555,18 +4580,20 @@ class HCPHandler(ProfileStreamMixin):
                         "uid64", None) in choice_ids))]
             build_prompt(private, chooser)
             prompt_handler = player_handlers.get(chooser_id)
+            # Tell the opponent this player is choosing a card FIRST, so the
+            # picker packet below is the last thing the chooser receives and
+            # nothing can cover it.
+            from services.tournament_game import _pvp_push_waiting_on
+            _pvp_push_waiting_on(session, chooser_id)
             if prompt_handler is not None:
                 _send_pvp_packet(prompt_handler, session, private, chooser,
                                  "choice")
-            # Tell the opponent this player is choosing a card.
-            from services.tournament_game import _pvp_push_waiting_on
-            _pvp_push_waiting_on(session, chooser_id)
             return
         _be.save_state(session, bstate)
         build_prompt(game, pl_t)
 
     def _resolve_pending_choice(self, session, pl_t, ai_t, inner_bytes,
-                                ability_guid=None):
+                                ability_guid=None, typed_payload=None):
         """Play a selected Choice token and resume its parent BOM."""
         _be = self._checkpoint_engine(session)
         from abilities.framework.effects.choices import (
@@ -4583,6 +4610,20 @@ class HCPHandler(ProfileStreamMixin):
                 CHOOSE_AND_PLAY_ABILITY, CHOICE_COPY_ABILITY)):
             return False
         selected = extract_card_uids(inner_bytes)
+        if not selected and isinstance(typed_payload, dict):
+            activation = typed_payload.get("activation_data")
+            target_map = (activation.get("target_map")
+                          if isinstance(activation, dict) else None)
+            if isinstance(target_map, dict):
+                for target in target_map.values():
+                    values = target if isinstance(target, (list, tuple, set)) else (target,)
+                    for value in values:
+                        try:
+                            uid = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if (uid & 0xFF) == 1:
+                            selected.append(uid)
         chosen_uid = next((uid for uid in reversed(selected)
                            if int(uid) in {
                                int(value) for value in
@@ -9711,6 +9752,12 @@ class HCPHandler(ProfileStreamMixin):
                     log_req(f"    Decompress failed: {e}")
                     log_req(f"    raw[:60]={hexdump(raw_bytes[:60])}")
                     return
+            # Downstream classifiers and the typed-UID decoder treat the
+            # payload as ``bytes``; normalize buffer-like results so a
+            # bytearray/memoryview cannot silently decode as an empty
+            # transaction (which previously made choice answers look unselected).
+            if isinstance(inner_bytes, (bytearray, memoryview)):
+                inner_bytes = bytes(inner_bytes)
 
             inner_obj = {}
             inner_type = "?"
@@ -10775,7 +10822,8 @@ class HCPHandler(ProfileStreamMixin):
                     handled = pvp_concede(self, session)
                 else:
                     handled = pvp_handle_transaction(
-                        self, session, inner_bytes)
+                        self, session, inner_bytes,
+                        typed_payload=getattr(transaction, "typed_payload", None))
             except Exception as _e:
                 # Never let a PvP transaction exception kill this thread
                 # (it would RST both clients).  Log, ack, and continue.
@@ -11370,7 +11418,9 @@ class HCPHandler(ProfileStreamMixin):
         if (session.session_name or "").startswith("tourney-"):
             from services.tournament_game import pvp_handle_transaction
             handled = pvp_handle_transaction(self, session,
-                                              transaction.inner_bytes)
+                                              transaction.inner_bytes,
+                                              typed_payload=getattr(
+                                                  transaction, "typed_payload", None))
             if not handled:
                 self._push_transaction_ack(session)
             return True
@@ -17416,7 +17466,9 @@ class HCPHandler(ProfileStreamMixin):
                         handled = bool(route_pvp_pass(self, session))
                     else:
                         handled = bool(pvp_handle_transaction(
-                            self, session, transaction.inner_bytes))
+                            self, session, transaction.inner_bytes,
+                            typed_payload=getattr(
+                                transaction, "typed_payload", None)))
                 except Exception as _pvp_error:
                     import traceback
                     log_req(f"    PvP RulesPort adapter exception: {_pvp_error}")

@@ -206,8 +206,18 @@ def typed_payload_from_decoded(command, decoded):
     # heuristic scan of arbitrary UIDs; each value must follow a
     # SessionCardId/SourceCardId label.
     raw = decoded.get("__raw__")
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    elif isinstance(raw, bytearray):
+        raw = bytes(raw)
     raw_payload = {}
     if isinstance(raw, bytes):
+        # Nested SessionCardId values in AbilityTargetInstance can be
+        # wrapped as ``value`` by the Mono client.  Use the shared typed-UID
+        # decoder for this recovery path; the later choice handler still
+        # checks the UID against its persisted legal-choice set.
+        from rules_port.wire import extract_session_card_uids
+
         card_match = re.search(
             rb"(?:m_SessionCardId|SourceCardId|m_SourceCardId).*?"
             rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});", raw)
@@ -304,7 +314,8 @@ def typed_payload_from_decoded(command, decoded):
         if ability_match is None:
             guid_match = re.search(
                 rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
-                rb"m_Guid;[^;]*;[^;]*;[^;]*;([0-9a-fA-F]{32});", raw)
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;[^;]*;"
+                rb"([0-9a-fA-F]{32});", raw)
             if guid_match:
                 compact = guid_match.group(1).decode("ascii").lower()
                 ability_match = re.match(
@@ -318,6 +329,20 @@ def typed_payload_from_decoded(command, decoded):
                         f"{ability_match.group(3).decode()}-"
                         f"{ability_match.group(4).decode()}-"
                         f"{ability_match.group(5).decode()}")
+        if ability_match is None:
+            # The normal ObjFmt decoder can fail on the nested TargetMap
+            # before exposing AbilityTemplateId.  Some client builds emit a
+            # dashed GUID in that same envelope, so recover the explicitly
+            # labelled value and continue with the typed target recovery.
+            dashed_guid = re.search(
+                rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;[^;]*;"
+                rb"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12});", raw)
+            if dashed_guid:
+                ability_match = dashed_guid
+                raw_payload["ability_template_id"] = \
+                    dashed_guid.group(1).decode("ascii").lower()
         if ability_match:
             raw_payload.setdefault("ability_template_id",
                                    ability_match.group(1).decode("ascii").lower())
@@ -332,18 +357,7 @@ def typed_payload_from_decoded(command, decoded):
                 # UID in the envelope; preserve it as target index 0.  Card
                 # UIDs are explicitly typed (low byte == 1), so player or
                 # ability identifiers are never promoted to targets.
-                card_uids = []
-                for match in re.finditer(
-                        rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});",
-                        raw):
-                    try:
-                        value = struct.unpack(
-                            "<Q", bytes.fromhex(match.group(1).decode("ascii"))
-                        )[0]
-                    except (ValueError, UnicodeDecodeError, struct.error):
-                        continue
-                    if (value & 0xFF) == 1:
-                        card_uids.append(int(value))
+                card_uids = list(extract_session_card_uids(raw))
                 if len(card_uids) > 1:
                     # TargetMap and XCostData are distinct records.  Parse
                     # their labelled card fields independently; using the
@@ -353,17 +367,9 @@ def typed_payload_from_decoded(command, decoded):
                         pos = raw.find(label)
                         if pos < 0:
                             return None
-                        for match in re.finditer(
-                                rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});",
-                                raw[pos:]):
-                            try:
-                                value = struct.unpack(
-                                    "<Q", bytes.fromhex(match.group(1).decode("ascii"))
-                                )[0]
-                            except (ValueError, UnicodeDecodeError, struct.error):
-                                continue
-                            if (value & 0xFF) == 1:
-                                return int(value)
+                        values = extract_session_card_uids(raw[pos:])
+                        if values:
+                            return int(values[0])
                         return None
                     effect_target = labelled_card(b"TargetMap")
                     sacrifice_target = labelled_card(b"CardsToSacrifice")
@@ -596,6 +602,10 @@ class PlayerTransactionCommand:
 
 def classify_player_transaction(inner_bytes, *, typed_payload=None):
     """Classify a raw 3029 payload without mutating game state."""
+    if isinstance(inner_bytes, memoryview):
+        inner_bytes = inner_bytes.tobytes()
+    elif isinstance(inner_bytes, bytearray):
+        inner_bytes = bytes(inner_bytes)
     raw = inner_bytes if isinstance(inner_bytes, bytes) else b""
     raw_lower = raw.lower()
     has = lambda name: name.lower().encode("ascii") in raw_lower

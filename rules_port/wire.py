@@ -19,24 +19,37 @@ import game_engine
 from .session import RulesTransaction
 
 
-_SESSION_CARD_UID = re.compile(
-    rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});")
+_SESSION_CARD_UID = re.compile(rb"m_UID64")
 
 
 def extract_session_card_uids(raw: bytes, *, exclude=()) -> tuple[int, ...]:
-    """Decode explicitly serialized ``SessionCardId`` values in wire order."""
+    """Decode explicitly serialized ``SessionCardId`` values in wire order.
+
+    Client builds differ in whether a nested UID has a ``value`` wrapper.
+    Walk only the small scalar field following each explicit ``m_UID64``
+    label, then retain the existing card-type validation.
+    """
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    elif isinstance(raw, bytearray):
+        raw = bytes(raw)
     if not isinstance(raw, bytes):
         return ()
     excluded = {int(value) for value in exclude}
     values = []
     for match in _SESSION_CARD_UID.finditer(raw):
-        try:
-            value = struct.unpack("<Q", bytes.fromhex(
-                match.group(1).decode("ascii")))[0]
-        except (TypeError, ValueError, UnicodeDecodeError, struct.error):
-            continue
-        if (value & 0xFF) == 1 and value not in excluded:
-            values.append(int(value))
+        fields = raw[match.end():].split(b";", 9)
+        for field in fields[1:]:
+            if len(field) != 16 or not re.fullmatch(rb"[0-9A-Fa-f]{16}", field):
+                continue
+            try:
+                value = struct.unpack("<Q", bytes.fromhex(
+                    field.decode("ascii")))[0]
+            except (TypeError, ValueError, UnicodeDecodeError, struct.error):
+                break
+            if (value & 0xFF) == 1 and value not in excluded:
+                values.append(int(value))
+            break
     return tuple(values)
 
 
