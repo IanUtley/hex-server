@@ -15,12 +15,83 @@ import struct
 import game_engine
 
 from .._shared import next_game_card_uid, owner_uid
+from ..builder import AbilityContinuation
 from ..fields import effect_field, effect_template, effect_template_value
 from .registry import effect
 
 
 CHOOSE_AND_PLAY_ABILITY = "7db268ea-c960-68ba-be49-712d760d7ba4"
+# Built-in copy ability referenced by the printed Iconoclast ability.  The
+# client uses this relationship to display the source card's localized text.
+CHOICE_COPY_ABILITY = "d5b56bd5-4d06-995d-6487-d1db36e29853"
 CHOICE_TARGET_TEMPLATE = "6f83ae25-2c6d-42af-8635-b7a4174b0405"
+
+
+def ai_choice_prefer_missing(db, session, bstate, choice_uids):
+    """Choose a generated resource option whose threshold color is missing.
+
+    Choice cards are temporary instances, so inspect their authored ability
+    graph/effect parameters rather than card names or display text.  If no
+    threshold can be derived (or all offered colors are already present), use
+    the session RNG through the normal choice helper's equivalent policy.
+    """
+    candidates = [int(uid) for uid in choice_uids]
+    if not candidates:
+        raise IndexError("cannot choose from an empty sequence")
+    threshold = (bstate or {}).get("ai_threshold", {}) or {}
+    missing = []
+    from pvp_db import (db_card_source_info, db_card_template_ability_payload,
+                        db_ability_effect_type_params)
+    for uid in candidates:
+        row = db_card_source_info(session.session_id, uid, conn=db)
+        if not row:
+            continue
+        try:
+            ability_guids = json.loads(
+                db_card_template_ability_payload(row[0], conn=db) or "[]")
+        except (TypeError, ValueError):
+            ability_guids = []
+        if isinstance(ability_guids, dict):
+            ability_guids = ability_guids.get("abilities", [])
+        colors = set()
+        for ability_guid in ability_guids or []:
+            if isinstance(ability_guid, dict):
+                ability_guid = ability_guid.get("m_Guid") or ability_guid.get("guid")
+            if not ability_guid:
+                continue
+            for effect_type, raw_param in db_ability_effect_type_params(
+                    str(ability_guid).lower(), conn=db):
+                if effect_type != "CardModifierAbilityEffectTemplate":
+                    continue
+                try:
+                    param = json.loads(raw_param or "{}")
+                except (TypeError, ValueError):
+                    param = {}
+                if param.get("property") != "threshold":
+                    continue
+                shard = param.get("shard")
+                if shard:
+                    flag = game_engine.SHARD_TO_FLAG.get(
+                        str(shard).rsplit(".", 1)[-1].lower())
+                    if flag:
+                        colors.add(int(flag))
+                else:
+                    # Compatibility with pre-metadata BOM rows.
+                    match = re.search(r"\[([A-Za-z]+)\]",
+                                      str(param.get("text", "")))
+                    if match:
+                        flag = game_engine.SHARD_TO_FLAG.get(
+                            match.group(1).lower())
+                        if flag:
+                            colors.add(int(flag))
+        if colors and all(int(threshold.get(flag, threshold.get(str(flag), 0)) or 0) <= 0
+                          for flag in colors):
+            missing.append(uid)
+    pool = missing or candidates
+    rng = (bstate or {}).get("_rules_rng")
+    if rng is not None and hasattr(rng, "next"):
+        return pool[int(rng.next(len(pool)))]
+    return random.choice(pool)
 
 
 def extract_card_uids(raw):
@@ -54,15 +125,11 @@ def _resource_guids(value):
 
 def _clear_choice_zone(game, session, db, pl_t, ai_t, handler, bstate):
     """Mirror ``Session.ClearChoiceZone`` before a second choice."""
-    rows = db.execute(
-        "SELECT card_uid, user_id, template_guid, card_type "
-        "FROM game_cards WHERE session_id=? AND location='choosing'",
-        (session.session_id,)).fetchall()
+    from pvp_db import (db_choice_card_rows,
+                        db_move_choice_to_played_resources)
+    rows = db_choice_card_rows(session.session_id, conn=db)
     for uid, card_owner, template_guid, card_type in rows:
-        db.execute(
-            "UPDATE game_cards SET location='PlayedResources', position=0 "
-            "WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(uid)))
+        db_move_choice_to_played_resources(session.session_id, int(uid), conn=db)
         scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
         player = owner_uid(card_owner, pl_t, ai_t, bstate)
         game.push_card_moved(
@@ -83,36 +150,19 @@ def _create_choice_cards(game, session, db, handler, pl_t, ai_t, bstate,
                          owner_id, template_guids):
     """Create the temporary Choice cards and publish their card definitions."""
     cards = []
-    existing = {row[1] for row in db.execute(
-        "PRAGMA table_info(game_cards)").fetchall()}
+    from pvp_db import (db_copy_template_payload, db_next_game_card_row_id,
+                        db_insert_generated_card)
     for template_guid in template_guids:
-        row = db.execute(
-            "SELECT card_type, abilities_json, attributes FROM card_templates "
-            "WHERE guid=?", (template_guid,)).fetchone()
+        row = db_copy_template_payload(template_guid, conn=db)
         if not row:
             continue
         card_uid = next_game_card_uid(db, session.session_id)
-        next_id = db.execute(
-            "SELECT COALESCE(MAX(id), 10000) + 1 FROM game_cards "
-            "WHERE session_id=?", (session.session_id,)).fetchone()[0]
-        columns = [
-            "id", "session_id", "user_id", "card_uid", "template_guid",
-            "card_template_id", "location", "position", "card_state",
-            "card_abilities", "card_type", "card_attributes",
-        ]
-        values = [
-            next_id, session.session_id, int(owner_id), card_uid,
-            template_guid, template_guid, "choosing", 0, 0,
-            row[1] or "[]", row[0] or "Choice", int(row[2] or 0),
-        ]
-        for column, value in (("owner_user_id", int(owner_id)),
-                              ("original_template_guid", template_guid)):
-            if column in existing:
-                columns.append(column)
-                values.append(value)
-        db.execute(
-            "INSERT INTO game_cards ({}) VALUES ({})".format(
-                ",".join(columns), ",".join("?" for _ in columns)), values)
+        db_insert_generated_card(
+            session.session_id, int(owner_id), card_uid, template_guid,
+            "choosing", row[0] or "Choice", row[1], row[2],
+            db_next_game_card_row_id(session.session_id, conn=db), conn=db,
+            position=0, card_state=0, owner_user_id=int(owner_id),
+            original_template_guid=template_guid)
         cards.append((int(card_uid), template_guid, row[0] or "Choice"))
     db.commit()
 
@@ -133,18 +183,14 @@ def _create_choice_cards(game, session, db, handler, pl_t, ai_t, bstate,
 
 def _pending_choice(bstate, owner_id, source_uid, ability_guid,
                     choice_uids, resume_effect_order, target_map, variables):
-    return {
-        "kind": "double_choice",
-        "owner_id": int(owner_id),
-        "source_uid": int(source_uid) if source_uid is not None else 0,
-        "ability_guid": str(ability_guid).lower(),
-        "choice_uids": [int(uid) for uid in choice_uids],
-        "resume_effect_order": int(resume_effect_order),
-        "target_map": {
-            str(key): value for key, value in (target_map or {}).items()
-        },
-        "variables": dict(variables or {}),
-    }
+    pending = AbilityContinuation.from_state(
+        bstate, ability_guid=ability_guid, source_uid=source_uid,
+        owner_id=owner_id, target_map=target_map, variables=variables,
+        resume_effect_order=resume_effect_order).to_dict()
+    pending.update({"kind": "double_choice",
+                    "choice_uids": list(dict.fromkeys(
+                        int(uid) for uid in choice_uids))})
+    return pending
 
 
 def _double_choice_legacy(game, session, db, handler, pl_t, ai_t, bstate,
@@ -187,10 +233,23 @@ def _double_choice_legacy(game, session, db, handler, pl_t, ai_t, bstate,
 
     # AI-controlled triggers use the same random choice policy as the client
     # AI, but do not create a human-facing pause.
-    if not bstate.get("pvp") and owner_id == 0:
-        chosen_uid = random.choice(choice_uids)
+    # ``pvp`` describes the transport/session shape, not who controls this
+    # ability. Practice sessions can use the PvP-shaped state adapter while
+    # still having an AI owner (user_id=0). The client AI never opens a human
+    # chooser for its own generated choices, so owner identity is the
+    # authoritative gate here.
+    if owner_id == 0:
+        chosen_uid = ai_choice_prefer_missing(
+            db, session, bstate, choice_uids)
         play_choice_card(game, session, db, handler, pl_t, ai_t, bstate,
                          chosen_uid, owner_id)
+        # The generated choice card carries the authored threshold/resource
+        # effect.  The client resolves that automatic ability as part of
+        # PlayChoiceCard; omitting this step leaves the shard on the chain
+        # while never granting the selected threshold.
+        resolve_choice_card_abilities(
+            game, session, db, handler, pl_t, ai_t, bstate,
+            chosen_uid, source_uid, owner_id)
         return f"double choice: AI chose {hex(chosen_uid)}"
 
     pending = _pending_choice(
@@ -215,28 +274,23 @@ def double_choice(effect):
 def play_choice_card(game, session, db, handler, pl_t, ai_t, bstate,
                      chosen_uid, owner_id):
     """Play one generated choice card for free, matching PlayChoiceCard."""
-    row = db.execute(
-        "SELECT template_guid, card_type, user_id, location, card_state "
-        "FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(chosen_uid))).fetchone()
-    if not row or row[3] != "choosing" or int(row[2] or 0) != int(owner_id):
+    from pvp_db import (db_card_source_info, db_move_choice_to_played_resources)
+    row = db_card_source_info(session.session_id, int(chosen_uid), conn=db)
+    if not row or row[2] != "choosing" or int(row[3] or 0) != int(owner_id):
         return False
-    db.execute(
-        "UPDATE game_cards SET location='PlayedResources', position=0, "
-        "card_state=0 WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(chosen_uid)))
+    db_move_choice_to_played_resources(session.session_id, int(chosen_uid), conn=db)
     db.commit()
     player = owner_uid(owner_id, pl_t, ai_t, bstate)
     scid = game_engine.SessionCardId(game_engine.UID(int(chosen_uid)))
     _tpl, ctype, name, cost, attack, defense, gems = handler._card_full_data(
         game, scid, row[0])
+    game.push_card_moved(
+        scid, player, game_engine.ECardCollections.PlayedResources,
+        game_engine.ECardLocations.Top, 0)
     game.push_card_updated(
         scid, player, game_engine.ECardCollections.PlayedResources, ctype,
         template_id=row[0], card_name=name, cost=cost, attack=attack,
         defense=defense, gems=gems, state=0)
-    game.push_card_moved(
-        scid, player, game_engine.ECardCollections.PlayedResources,
-        game_engine.ECardLocations.Top, 0)
     # Choice cards are not normal resources.  The client emits
     # SpellCardPlayed from Session.PlayChoiceCard and does not grant resource
     # points or charge for this free play.
@@ -245,7 +299,8 @@ def play_choice_card(game, session, db, handler, pl_t, ai_t, bstate,
 
 
 def resolve_choice_card_abilities(game, session, db, handler, pl_t, ai_t,
-                                  bstate, chosen_uid, source_uid, owner_id):
+                                   bstate, chosen_uid, source_uid, owner_id,
+                                   *, resolver=None):
     """Resolve automatic abilities on a choice card against its real parent.
 
     The client gives a generated Choice card a parent link to the ability's
@@ -253,36 +308,40 @@ def resolve_choice_card_abilities(game, session, db, handler, pl_t, ai_t,
     real parent, which is why Soul Cavalry/Armaments transform Soul Marble
     rather than the temporary choice card itself.
     """
-    row = db.execute(
-        "SELECT card_abilities FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(chosen_uid))).fetchone()
+    from pvp_db import db_card_ability_payload, db_ability_activation_metadata
+    payload = db_card_ability_payload(session.session_id, int(chosen_uid), conn=db)
     try:
         ability_guids = [str(value).lower() for value in
-                         (json.loads(row[0] or "[]") if row else []) if value]
+                         (json.loads(payload or "[]") if payload else []) if value]
     except (TypeError, ValueError, json.JSONDecodeError):
         ability_guids = []
     if not ability_guids:
         return []
 
-    from ..resolution import resolve_ability
+    if resolver is None:
+        from ..resolution import resolve_ability
     logs = []
     for ability_guid in ability_guids:
-        meta = db.execute(
-            "SELECT is_manual FROM card_abilities_meta "
-            "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
-        if meta and int(meta[0] or 0):
+        meta = db_ability_activation_metadata(ability_guid, conn=db)
+        if meta and int(meta[4] or 0):
             continue
-        logs.append(resolve_ability(
-            handler, game, session, db, pl_t, ai_t, bstate,
-            ability_guid, source_uid, owner_id, target_map={}))
+        if resolver is None:
+            logs.append(resolve_ability(
+                handler, game, session, db, pl_t, ai_t, bstate,
+                ability_guid, source_uid, owner_id, target_map={}))
+        else:
+            logs.append(resolver(
+                handler, game, session, db, pl_t, ai_t, bstate,
+                ability_guid, source_uid, owner_id, target_map={},
+                variables={}))
         if bstate.get("resolution_paused"):
             break
     return logs
 
 
 __all__ = [
-    "CHOOSE_AND_PLAY_ABILITY", "CHOICE_TARGET_TEMPLATE",
+    "CHOOSE_AND_PLAY_ABILITY", "CHOICE_COPY_ABILITY",
+    "CHOICE_TARGET_TEMPLATE",
     "extract_card_uids", "double_choice", "play_choice_card",
     "resolve_choice_card_abilities",
 ]

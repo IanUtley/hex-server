@@ -264,7 +264,10 @@ def main() -> int:
     validate_data_sources(
         configured_gamedata, configured_records, database_missing=not exists
     )
-    if not exists and configured_gamedata is not None:
+    # Records are a runtime dependency as well as a source for fresh database
+    # creation.  Materialize them whenever gamedata is configured, including
+    # deployments reusing an existing persistent database.
+    if configured_gamedata is not None:
         from AssetExtraction.gamedata_seed import records_available
 
         if not records_available(configured_records):

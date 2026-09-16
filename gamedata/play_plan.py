@@ -216,7 +216,15 @@ class AbilityInstance:
     @property
     def is_triggered(self) -> bool:
         return bool(self.graph and self.graph.trigger_event_type
-                    or self.graph and self.graph.trigger_condition)
+            or self.graph and self.graph.trigger_condition)
+
+    @property
+    def is_scrounge(self) -> bool:
+        """Whether this graph is the authored Scrounge card ability."""
+        if self.graph is None:
+            return False
+        from rules_port.tac import tac_int
+        return bool(tac_int(self.graph.serialized_tac, "Scrounge", 0))
 
     @property
     def costs(self) -> AbilityCost:
@@ -277,10 +285,18 @@ class AbilityInstance:
             _int(_field(variable, "m_RequiresExplicitSet")))
 
     def _cost_target_spec(self, index: int) -> TargetSpec | None:
-        if self.store is None or index < 0 or index >= len(self.costs.target_costs):
+        # Additional-cost targets (sacrifice/exhaust/etc.) are authored on
+        # the ability graph, not in ``AbilityCost.target_costs`` (the latter
+        # is reserved for numeric counter/resource costs).  Looking in the
+        # numeric cost list made a valid sacrifice target appear as an empty
+        # min/max prompt and prevented the continuation from ever resolving.
+        if self.store is None or self.graph is None:
+            return None
+        authored = self.graph.additional_cost_targets or ()
+        if index < 0 or index >= len(authored):
             return None
         target = self.store.get(
-            "AbilityTargetTemplate", self.costs.target_costs[index][1])
+            "AbilityTargetTemplate", authored[index][1])
         return target.target_spec if target is not None else None
 
     def required_prompts(self) -> tuple[PromptSpec, ...]:
@@ -338,6 +354,9 @@ class AbilityInstance:
                     kind="additional_cost", index=index,
                     ability_guid=self.ability_guid, template_guid=guid,
                     label=kind.replace("_", " "), cost_kind=kind,
+                    minimum=(spec.minimum if spec is not None else 0),
+                    maximum=(spec.maximum if spec is not None else 0),
+                    optional=(spec.optional if spec is not None else False),
                 ))
         return tuple(prompts)
 

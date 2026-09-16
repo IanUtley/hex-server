@@ -21,9 +21,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import game_engine
 import game_session as gs
 import hconnect_server as hcs
-import battle_engine as be
 import encoder
 from db import _db, log_req
+from pvp_db import (
+    db_ai_hand_playables, db_card_combat_identity, db_clear_session_cards,
+    db_copy_template_payload, db_delete_game_session,
+    db_hand_resources_with_template, db_insert_generated_card,
+    db_next_game_card_row_id, db_set_constructed_guids, db_set_resource_guids,
+    db_static_card_rows, db_warzone_troop_attributes,
+    db_warzone_troop_stats, db_zone_card_count,
+)
+from domain.constants import (CARD_UID_TYPE, PLAYER_UID_TYPE,
+                              PLAYER_TRANSACTION_DATA_TYPE,
+                              SESSION_CARD_UID_FIELD_TYPE)
 from services.tournament_game import (
     pvp_default_state, pvp_load_state, pvp_save_state,
     handle_ready_for_game_setup, handle_ready_for_game_events,
@@ -31,16 +41,29 @@ from services.tournament_game import (
 )
 
 SET1 = "0382f729-7710-432b-b761-13677982dcd2"
-SCRATCH_BASE = 987700
+SCRATCH_SESSION_BASE = 987700
+AUTOPLAY_PLAYER_IDS = (5, 6)
+AUTOPLAY_SERVER_ID_MULTIPLIER = 7
+AUTOPLAY_DECK_RESOURCE_COUNT = 12
+AUTOPLAY_DECK_SPELL_COUNT = 28
+AUTOPLAY_CHAMPION_UID_OFFSET = 9000
+AUTOPLAY_PLAYER_UID_STRIDE = 10000
+AUTOPLAY_TURN_CAP = 60
+AUTOPLAY_GUARD_CAP = 1200
+AUTOPLAY_MULLIGAN_ROUNDS = 6
+AUTOPLAY_REDRAW_ROUNDS = (0, 1)
+OPENING_SETUP_PHASES = (game_engine.ETurnPhases.PickGoesFirst,
+                         game_engine.ETurnPhases.Mulligan)
+CARD_POSITION_CHAMPION = 0
+DEFAULT_AUTOPLAY_GAMES = 5
+FIRST_AUTOPLAY_SEED = 1
 
 
 def _cleanup(session_id, pids):
-    _db.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
-    _db.execute("DELETE FROM game_sessions WHERE session_id=?",
-                (session_id,))
+    db_clear_session_cards(session_id)
+    db_delete_game_session(session_id)
     for pid in pids:
         player_handlers.pop(pid, None)
-    _db.commit()
 
 
 def _make_handler(pid, session):
@@ -63,10 +86,17 @@ def _make_handler(pid, session):
     h._ai_champ_scid = None
     h._player_champ_guid = None
     h._ai_champ_guid = None
-    h._player_starting_health = 20
-    h._ai_starting_health = 20
+    h._player_starting_health = game_engine.DEFAULT_STARTING_HEALTH
+    h._ai_starting_health = game_engine.DEFAULT_STARTING_HEALTH
     h._autoplay_drive_ai_turn = True
     h._campaign_gameend = lambda *a, **k: None
+    # Select the live controller explicitly for smoke runs.  The historical
+    # adapter remains available for rollback comparison, while native mode
+    # exercises the same PvP RulesPort attachment used by HConnect.
+    h._rules_port_auto_attach = os.environ.get(
+        "PVP_AUTOPLAY_RULES_PORT", "1").lower() in ("1", "true", "yes")
+    h._application = hcs.ApplicationCommandDispatcher(
+        event_publisher=h._publish_application_events)
     h.send = lambda *a, **k: None
     h.send_and_cache = lambda *a, **k: None
     h._push_transaction_ack = lambda *a, **k: None
@@ -77,37 +107,26 @@ def _seed_deck(session_id, pid, deck, uid_offset=0):
     ctr = [uid_offset]
     for pos, tpl in enumerate(deck):
         ctr[0] += 1
-        cu = game_engine.UID.make(1, ctr[0]).uid64
-        row = _db.execute(
-            "SELECT card_type, attributes, abilities_json FROM card_templates "
-            "WHERE guid=?", (tpl,)).fetchone()
-        _db.execute(
-            "INSERT INTO game_cards (session_id,user_id,card_uid,template_guid,"
-            "card_template_id,location,position,card_state,card_abilities,"
-            "card_type,card_attributes,card_attack_mod,card_defense_mod,"
-            "card_cost_mod,card_damage,permanent_buffs,temporary_buffs,"
-            "card_uses,resolved_at,original_template_guid,temporary_attributes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'{}','{}','{}',0,?,0)",
-            (session_id, pid, cu, tpl, tpl, "deck", pos, 0,
-             row[2] or '[]', row[0], row[1] or 0, tpl))
+        cu = game_engine.UID.make(CARD_UID_TYPE, ctr[0]).uid64
+        card = db_copy_template_payload(tpl)
+        if not card:
+            raise ValueError(f"unknown autoplay template {tpl}")
+        db_insert_generated_card(
+            session_id, pid, cu, tpl, "deck", card[0], card[1], card[2],
+            db_next_game_card_row_id(session_id), position=pos)
 
 
 def _seed_champion(session_id, pid, champ_guid, uid_offset=0):
     ctr = [uid_offset]
     ctr[0] += 1
-    cu = game_engine.UID.make(1, ctr[0]).uid64
-    row = _db.execute(
-        "SELECT card_type, attributes, abilities_json FROM card_templates "
-        "WHERE guid=?", (champ_guid,)).fetchone()
-    _db.execute(
-        "INSERT INTO game_cards (session_id,user_id,card_uid,template_guid,"
-        "card_template_id,location,position,card_state,card_abilities,"
-        "card_type,card_attributes,card_attack_mod,card_defense_mod,"
-        "card_cost_mod,card_damage,permanent_buffs,temporary_buffs,"
-        "card_uses,resolved_at,original_template_guid,temporary_attributes) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'{}','{}','{}',0,?,0)",
-        (session_id, pid, cu, champ_guid, champ_guid, "champions", 0, 0,
-         row[2] or '[]', row[0], row[1] or 0, champ_guid))
+    cu = game_engine.UID.make(CARD_UID_TYPE, ctr[0]).uid64
+    card = db_copy_template_payload(champ_guid)
+    if not card:
+        raise ValueError(f"unknown autoplay champion {champ_guid}")
+    db_insert_generated_card(
+        session_id, pid, cu, champ_guid, "champions", card[0], card[1],
+        card[2], db_next_game_card_row_id(session_id),
+        position=CARD_POSITION_CHAMPION)
     return int(cu)
 
 
@@ -117,7 +136,7 @@ def _transaction(handler, session, inner_bytes):
     # The 3029 handler reloads the session via find_session_by_player; use the
     # same lookup so our view of the state stays in sync with the DB.
     pid = int(handler.client_reck_id)
-    session = gs.find_session_by_player(_ge.UID.make(244, pid).to_uint64()) \
+    session = gs.find_session_by_player(_ge.UID.make(PLAYER_UID_TYPE, pid).to_uint64()) \
         or session
     if os.environ.get("PVP_TRACE"):
         to = session.turn_order
@@ -126,10 +145,11 @@ def _transaction(handler, session, inner_bytes):
                 f"{type(to).__name__} keys="
                 f"{list(to.keys())[:6] if isinstance(to, dict) else 'n/a'}")
     handler.handle_service_request(
-        "ServiceGameSession", str(session.server_id), 3029, 1, 1,
+        "ServiceGameSession", str(session.server_id),
+        PLAYER_TRANSACTION_DATA_TYPE, 1, 1,
         session.session_id, 0, {}, inner_bytes)
     cur = gs.find_session_by_player(
-        _ge.UID.make(244, int(handler.client_reck_id)).to_uint64()) or session
+        _ge.UID.make(PLAYER_UID_TYPE, int(handler.client_reck_id)).to_uint64()) or session
     if os.environ.get("PVP_TRACE"):
         if isinstance(cur.turn_order, dict) and "turn_player" in cur.turn_order:
             log_req(f"    [pvp-trace] after {inner_bytes[:36]!r} — turn_order "
@@ -144,7 +164,7 @@ def _mk_uid_bytes(uid):
     import struct
     from binascii import hexlify
     # ObjFmt field: m_UID64;<idx>;<type>;0;<little-endian-hex>;
-    return (b"m_UID64;0;" + str(7).encode()
+    return (b"m_UID64;0;" + str(SESSION_CARD_UID_FIELD_TYPE).encode()
             + b";0;" + hexlify(struct.pack("<Q", int(uid))) + b";")
 
 
@@ -172,31 +192,29 @@ def _defense_bytes(attacker_uids, blocker_map, champ_uid):
     return out
 
 
-def _play_one_game(seed, turns_cap=60):
+def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
     rnd = random.Random(seed)
-    session_id = SCRATCH_BASE + seed
-    pids = [5, 6]
+    session_id = SCRATCH_SESSION_BASE + seed
+    pids = list(AUTOPLAY_PLAYER_IDS)
     _cleanup(session_id, pids)
 
-    session = gs.GameSession(session_id, session_id * 7,
+    session = gs.GameSession(session_id, session_id * AUTOPLAY_SERVER_ID_MULTIPLIER,
                              f"tourney-{session_id}", pids[0])
     for pid in pids:
-        session.add_player(encoder.make_uid(244, pid), 0)
+        session.add_player(encoder.make_uid(PLAYER_UID_TYPE, pid), 0)
 
     # Seed both players' decks from Set 1 (12 shards + 28 cards each).
-    shards = [r[0] for r in _db.execute(
-        "SELECT DISTINCT guid FROM card_templates WHERE set_guid=? "
-        "AND card_type='Resource'", (SET1,)).fetchall()]
-    others = [r[0] for r in _db.execute(
-        "SELECT guid FROM card_templates WHERE set_guid=? "
-        "AND card_type!='Resource' AND is_pve=0 AND no_pvp=0", (SET1,)).fetchall()]
+    shards = db_set_resource_guids(SET1)
+    others = db_set_constructed_guids(SET1)
     for i, pid in enumerate(pids):
         rnd.shuffle(others)
-        deck = (shards * 12)[:12] + others[:28]
+        deck = (shards * AUTOPLAY_DECK_RESOURCE_COUNT)[:AUTOPLAY_DECK_RESOURCE_COUNT] + others[:AUTOPLAY_DECK_SPELL_COUNT]
         rnd.shuffle(deck)
-        _seed_deck(session_id, pid, deck, uid_offset=i * 10000)
+        _seed_deck(session_id, pid, deck,
+                   uid_offset=i * AUTOPLAY_PLAYER_UID_STRIDE)
         _seed_champion(session_id, pid, "1ae73dcf-e96e-4536-aec3-f53efb5e1c96",
-                       uid_offset=i * 10000 + 9000)
+                       uid_offset=i * AUTOPLAY_PLAYER_UID_STRIDE +
+                       AUTOPLAY_CHAMPION_UID_OFFSET)
     _db.commit()
 
     h1 = _make_handler(pids[0], session)
@@ -225,16 +243,16 @@ def _play_one_game(seed, turns_cap=60):
     # Sequential mulligan: ask 1 redraws (player A), ask 2 redraws (player B),
     # ask 3 keeps, ask 4 keeps — exercises the alternating redraw path the
     # real client uses.
-    for round_i in range(6):
+    for round_i in range(AUTOPLAY_MULLIGAN_ROUNDS):
         cur = gs.find_session_by_player(
-            game_engine.UID.make(244, pids[0]).to_uint64()) or session
+            game_engine.UID.make(PLAYER_UID_TYPE, pids[0]).to_uint64()) or session
         st = pvp_load_state(cur)
-        if not st or len(st.get("kept") or []) >= 2 \
-                or st.get("phase") != 3:
+        if not st or len(st.get("kept") or []) >= len(pids) \
+                or st.get("phase") != game_engine.ETurnPhases.Mulligan:
             break
         ask = st.get("mulligan_pid")
         if ask in pids:
-            if round_i in (0, 1):
+            if round_i in AUTOPLAY_REDRAW_ROUNDS:
                 # Ask 1 (A) redraws, ask 2 (B) redraws — alternating redraw.
                 _transaction(player_handlers[ask], session,
                              b"MulliganTransaction;")
@@ -251,10 +269,10 @@ def _play_one_game(seed, turns_cap=60):
     turns = 0
     guard = 0
     try:
-        while turns < turns_cap and guard < 1200:
+        while turns < turns_cap and guard < AUTOPLAY_GUARD_CAP:
             guard += 1
             cur_session = gs.find_session_by_player(
-                game_engine.UID.make(244, pids[0]).to_uint64()) or session
+                game_engine.UID.make(PLAYER_UID_TYPE, pids[0]).to_uint64()) or session
             state = pvp_load_state(cur_session)
             if state is None:
                 log_req(f"    [pvp-autoplay] STATE LOST at guard {guard} — "
@@ -272,21 +290,18 @@ def _play_one_game(seed, turns_cap=60):
                 candidates = []
                 if pend.get("source_uid"):
                     src = int(pend["source_uid"])
-                    candidates = [r[0] for r in _db.execute(
-                        "SELECT card_uid FROM game_cards WHERE session_id=? "
-                        "AND card_uid<>? AND location IN ('warzone','CastSpells')",
-                        (session_id, src)).fetchall()]
+                    candidates = [r[0] for r in db_static_card_rows(
+                        session_id, ("warzone", "CastSpells"))
+                                  if r[0] != src]
                 if not candidates:
-                    candidates = [r[0] for r in _db.execute(
-                        "SELECT card_uid FROM game_cards WHERE session_id=? "
-                        "AND location='warzone' LIMIT 1",
-                        (session_id,)).fetchall()]
+                    candidates = [r[0] for r in db_static_card_rows(
+                        session_id, ("warzone",))[:1]]
                 if candidates:
                     _transaction(player_handlers[chooser_pid], session,
                                  b"SetAbilityActivationDataTransaction;" +
                                  _mk_uid_bytes(candidates[0]))
                     continue
-            if phase in (3, 4):
+            if phase in OPENING_SETUP_PHASES:
                 # Setup phases are driven above; a stray pass should not loop.
                 break
             if phase == game_engine.ETurnPhases.EndTurn:
@@ -298,47 +313,28 @@ def _play_one_game(seed, turns_cap=60):
                 _transaction(player_handlers[opp_pid], session,
                              b"PassPriorityTransaction;")
                 h = player_handlers[turn_pid]
-                res = _db.execute(
-                    "SELECT gc.card_uid FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.user_id=? "
-                    "AND gc.location='hand' AND ct.card_type='Resource' "
-                    "ORDER BY gc.position LIMIT 1",
-                    (session_id, turn_pid)).fetchone()
-                if res and not _db.execute(
-                        "SELECT 1 FROM game_cards WHERE session_id=? "
-                        "AND user_id=? AND location='PlayedResources'",
-                        (session_id, turn_pid)).fetchone():
-                    _transaction(h, session, _card_play_bytes(res[0]))
+                res_rows = db_hand_resources_with_template(session_id, turn_pid)
+                if res_rows and not db_zone_card_count(
+                        session_id, turn_pid, "PlayedResources"):
+                    _transaction(h, session, _card_play_bytes(res_rows[0][1]))
                     _transaction(player_handlers[opp_pid], session,
                                  b"PassPriorityTransaction;")
-                troop = _db.execute(
-                    "SELECT gc.card_uid, ct.cost, ct.threshold_json FROM "
-                    "game_cards gc JOIN card_templates ct "
-                    "ON ct.guid=gc.template_guid WHERE gc.session_id=? "
-                    "AND gc.user_id=? AND gc.location='hand' "
-                    "AND ct.card_type LIKE '%Troop%' "
-                    "ORDER BY gc.position LIMIT 1",
-                    (session_id, turn_pid)).fetchone()
+                troop = next((row for row in db_ai_hand_playables(
+                    session_id, turn_pid, "permanent")
+                    if "Troop" in str(row[4])), None)
                 if troop:
-                    _transaction(h, session, _card_play_bytes(troop[0]))
+                    _transaction(h, session, _card_play_bytes(troop[1]))
                     _transaction(player_handlers[opp_pid], session,
                                  b"PassPriorityTransaction;")
                 _transaction(h, session, b"PassPriorityTransaction;")
                 continue
             # DeclareAttack: the turn player swings with all eligible troops.
             if phase == game_engine.ETurnPhases.DeclareAttack:
-                rows = _db.execute(
-                    "SELECT gc.card_uid, ct.attributes, gc.card_attributes, "
-                    "gc.card_state FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.user_id=? "
-                    "AND gc.location='warzone' AND gc.card_type LIKE '%Troop%'",
-                    (session_id, turn_pid)).fetchall()
+                rows = db_warzone_troop_attributes(session_id, turn_pid)
                 attackers = []
-                for cu, t_a, c_a, cstate in rows:
+                for cu, cstate, c_a, temporary_a, t_a, abilities in rows:
                     cstate = cstate or 0
-                    attrs = (t_a or 0) | (c_a or 0)
+                    attrs = (t_a or 0) | (c_a or 0) | (temporary_a or 0)
                     if (cstate & game_engine.ECardStates.Tapped) \
                             or (attrs & game_engine.ECardAttributes.CantAttack):
                         continue
@@ -361,20 +357,17 @@ def _play_one_game(seed, turns_cap=60):
                 att_state = state
                 attacker_uids = [int(k) for k in
                                  (att_state.get("attackers") or {})]
-                blocker_rows = _db.execute(
-                    "SELECT gc.card_uid, ct.attributes, gc.card_attributes, "
-                    "gc.card_state, ct.attack, ct.defense, gc.card_defense_mod, "
-                    "gc.card_damage FROM game_cards gc "
-                    "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                    "WHERE gc.session_id=? AND gc.user_id=? "
-                    "AND gc.location='warzone' AND gc.card_type LIKE '%Troop%'",
-                    (session_id, opp_pid)).fetchall()
+                blocker_rows = db_warzone_troop_stats(session_id, opp_pid)
+                blocker_attrs = {
+                    row[0]: (row[2] or 0) | (row[3] or 0) | (row[4] or 0)
+                    for row in db_warzone_troop_attributes(session_id, opp_pid)
+                }
                 avail = []
-                for cu, t_a, c_a, cstate, atk, bdef, dmod, dmg in blocker_rows:
+                for cu, atk, bdef, dmod, dmg, cstate, position in blocker_rows:
                     cstate = cstate or 0
-                    attrs = (t_a or 0) | (c_a or 0)
-                    if (cstate & game_engine.ECardStates.Tapped) \
-                            or (attrs & game_engine.ECardAttributes.CantBlock):
+                    if (cstate & game_engine.ECardStates.Tapped) or (
+                            blocker_attrs.get(cu, 0)
+                            & game_engine.ECardAttributes.CantBlock):
                         continue
                     avail.append((int(cu), atk or 0,
                                   (bdef or 0) + (dmod or 0) - (dmg or 0)))
@@ -384,12 +377,8 @@ def _play_one_game(seed, turns_cap=60):
                 blockers = []
                 att_stats = {}
                 for a_uid in attacker_uids:
-                    row = _db.execute(
-                        "SELECT ct.attack FROM game_cards gc "
-                        "JOIN card_templates ct ON ct.guid=gc.template_guid "
-                        "WHERE gc.session_id=? AND gc.card_uid=?",
-                        (session_id, int(a_uid))).fetchone()
-                    att_stats[int(a_uid)] = int(row[0] or 0) if row else 0
+                    row = db_card_combat_identity(session_id, int(a_uid))
+                    att_stats[int(a_uid)] = int(row[3] or 0) if row else 0
                 for a_uid in sorted(attacker_uids,
                                     key=lambda u: -att_stats.get(int(u), 0)):
                     a_atk = att_stats.get(int(a_uid), 0)
@@ -426,9 +415,9 @@ def _play_one_game(seed, turns_cap=60):
     return turns, None
 
 
-def main(games=5):
+def main(games=DEFAULT_AUTOPLAY_GAMES):
     ok = 0
-    for seed in range(1, games + 1):
+    for seed in range(FIRST_AUTOPLAY_SEED, games + FIRST_AUTOPLAY_SEED):
         turns, err = _play_one_game(seed)
         if err:
             print(f"game {seed}: CRASH after {turns} turns")
@@ -440,4 +429,4 @@ def main(games=5):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 5)
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_AUTOPLAY_GAMES)

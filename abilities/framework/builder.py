@@ -16,6 +16,71 @@ from gamedata.play_plan import (AbilityInstance, ActivationData, CardPlayCost,
 
 
 @dataclass(frozen=True)
+class AbilityContinuation:
+    """JSON-safe activation data required to resume an ability.
+
+    A prompt/conversation may persist while an effect is resolving.  This is
+    the only representation allowed to cross that boundary: runtime graph,
+    store, and builder objects are intentionally excluded.
+    """
+
+    ability_guid: str
+    source_uid: int | None
+    owner_id: int
+    target_map: dict[str, Any]
+    variables: dict[str, Any]
+    resume_effect_order: int = 0
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any] | None, *,
+                   ability_guid: str | None = None,
+                   source_uid: int | None = None,
+                   owner_id: int | None = None,
+                   target_map=None, variables=None,
+                   resume_effect_order: int | None = None):
+        state = state or {}
+        if ability_guid is None:
+            ability_guid = state.get("resolving_ability", "")
+        if source_uid is None:
+            source_uid = state.get("resolving_source_uid")
+        if owner_id is None:
+            owner_id = state.get("resolving_owner_id", 0)
+        if target_map is None:
+            target_map = state.get("ability_target_map") or {}
+        if variables is None:
+            variables = state.get("ability_variables") or {}
+        if resume_effect_order is None:
+            resume_effect_order = int(
+                state.get("resolving_effect_order", 0) or 0) + 1
+        return cls(
+            ability_guid=str(ability_guid or "").lower(),
+            source_uid=(int(source_uid) if source_uid is not None else None),
+            owner_id=int(owner_id or 0),
+            target_map={str(key): value for key, value in
+                        dict(target_map or {}).items()},
+            variables=dict(variables or {}),
+            resume_effect_order=int(resume_effect_order or 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the persisted continuation and reject runtime values early."""
+        import json
+
+        value = {
+            "ability_guid": self.ability_guid,
+            "source_uid": self.source_uid if self.source_uid is not None else 0,
+            "owner_id": self.owner_id,
+            "target_map": dict(self.target_map),
+            "variables": dict(self.variables),
+            "resume_effect_order": self.resume_effect_order,
+        }
+        # Persisting must fail here, at the activation boundary, rather than
+        # later inside an unrelated card movement/save call.
+        json.dumps(value)
+        return value
+
+
+@dataclass(frozen=True)
 class TargetRef:
     """Named view of one metadata target template."""
 
@@ -69,6 +134,11 @@ class CostRef:
     @property
     def maximum(self) -> int:
         return self.target.maximum if self.target is not None else 1
+
+    @property
+    def allow_best_effort_minimum(self) -> bool:
+        return bool(self.target and
+                    self.target.spec.allow_best_effort_minimum)
 
     @property
     def requires_input(self) -> bool:
@@ -363,8 +433,16 @@ class AbilityBuilder:
                 if str(spec.guid).lower() == str(guid).lower():
                     target = TargetRef(target_index, spec)
                     break
-            if target is None and self.instance.store is not None:
-                record = self.instance.store.get(
+            if target is None:
+                store = self.instance.store
+                if store is None:
+                    # Additional-cost templates such as m_ExhaustTarget are
+                    # not always repeated in m_AbilityTargetTemplateIds.
+                    # A lightweight handler may not bind a PlayPlan store, but
+                    # the authored Records snapshot is still authoritative.
+                    from gamedata import DEFAULT_RECORD_STORE
+                    store = DEFAULT_RECORD_STORE
+                record = store.get(
                     "AbilityTargetTemplate", str(guid).lower())
                 if record is not None:
                     target = TargetRef(-1, record.target_spec)
@@ -389,7 +467,13 @@ class AbilityBuilder:
         metadata predicate is identical. Keeping that conversion here prevents
         activation handlers from becoming a second targeting implementation.
         """
-        from .targeting import legal_targets_for
+        # Target legality is a RulesPort rule in every live mode.  The old
+        # targeting module remains available only to an explicit rollback
+        # caller, never because the session happens to be Practice/PvE.
+        if (battle_state or {}).get("_rules_port_allow_legacy_backend"):
+            from .targeting import legal_targets_for
+        else:
+            from rules_port.targeting import legal_targets_for
 
         if isinstance(target, TargetRef):
             target_ref = target
@@ -445,7 +529,14 @@ class AbilityBuilder:
         existing card-play activation contract.
         """
         result = []
-        for spec in self.card_cost_instances:
+        for index, spec in enumerate(self.card_cost_instances):
+            # Keep this server-side compatibility hint out of the public
+            # PlayPlan CostInstance descriptor, while still making it
+            # available to the legacy card-play payment adapter.
+            cost_ref = self.cost_targets[index] if index < len(self.cost_targets) else None
+            if cost_ref and cost_ref.allow_best_effort_minimum:
+                spec = dict(spec)
+                spec["allow_best_effort_minimum"] = True
             if spec["auto"]:
                 candidates = (() if source_uid is None else (int(source_uid),))
             else:
@@ -473,6 +564,23 @@ class AbilityBuilder:
     def compile(self) -> AbilityInstance:
         """Return the normalized instance consumed by the common resolver."""
         return self.instance
+
+    def continuation(self, *, resume_effect_order: int | None = None,
+                     source_uid: int | None = None,
+                     owner_id: int | None = None,
+                     target_map=None, variables=None) -> dict[str, Any]:
+        """Serialize this activation for a prompt or a later transaction."""
+        return AbilityContinuation.from_state(
+            {}, ability_guid=self.guid,
+            source_uid=(self.instance.source_uid if source_uid is None
+                        else source_uid),
+            owner_id=(self.instance.owner_id if owner_id is None else owner_id),
+            target_map=(self.activation.target_map if target_map is None
+                        else target_map),
+            variables=(self.activation.variables if variables is None
+                       else variables),
+            resume_effect_order=resume_effect_order or 0,
+        ).to_dict()
 
     def bind(self, activation: ActivationData | None = None,
              **values) -> "AbilityBuilder":

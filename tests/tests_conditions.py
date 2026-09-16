@@ -17,6 +17,7 @@ from abilities.framework.condition_engine import (
     evaluate_effect_condition,
     trigger_condition_met,
 )
+from abilities.framework.targeting import evaluate_card_filter
 
 SRC = os.environ.get(
     "HEX_TEST_SOURCE_DB",
@@ -31,6 +32,7 @@ INC_COUNTER = "12a1bb1f-6308-650c-4d75-35a12cb4c5cd"
 DROO = "6a095431-820f-5d7c-dd9f-2eef65ce4e7c"
 VILEFANG = "0ead517d-9926-d1ff-becf-fada9afc6f31"
 RIDGE_RAIDER_DEATH = "3b79c597-7b6e-0896-7128-fd6b1df48f03"
+GORTEZUMA_COND = "180773b3-b10b-5633-f60c-42eb3556fd9d"
 
 
 class SessionStub:
@@ -74,7 +76,11 @@ def make_db():
             db.execute(
                 "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
     for row in src.execute(
-            "SELECT * FROM ability_effect_conditions WHERE condition_id=?", (INC_COND,)):
+        "SELECT * FROM ability_effect_conditions WHERE condition_id=?", (INC_COND,)):
+        db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
+    for row in src.execute(
+        "SELECT * FROM ability_effect_conditions WHERE condition_id=?",
+        (GORTEZUMA_COND,)):
         db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
     for row in src.execute(
             "SELECT * FROM card_counter_templates WHERE template_id=?", (INC_COUNTER,)):
@@ -298,6 +304,75 @@ def test_ridge_raider_requires_dead_warzone_troop(db):
         assert not trigger_condition_met(raw(db, RIDGE_RAIDER_DEATH), buried)
 
 
+def test_common_trigger_conditions_are_metadata_faithful(db):
+    add_card(db, 700, 5, "Troop")
+    combat = ctx(db, event_type="CardDealtDamageEvent",
+                 ability_source_uid=700, ability_source_owner_id=5,
+                 trigger_uid=700)
+    assert trigger_condition_met({
+        "m_TriggerCondition": {
+            "_t": "TriggerEventIsCombatDamage"}}, combat)
+    noncombat = ctx(db, event_type="CardWouldBeDamagedEvent",
+                    ability_source_uid=700, ability_source_owner_id=5,
+                    trigger_uid=700)
+    assert not trigger_condition_met({
+        "m_TriggerCondition": {
+            "_t": "TriggerEventIsCombatDamage"}}, noncombat)
+
+    phase = ctx(db, bstate={"phase": game_engine.ETurnPhases.FirstMainPhase})
+    assert trigger_condition_met({
+        "m_TriggerCondition": {
+            "_t": "TurnPhaseCondition",
+            "m_TurnPhase": "FirstMainPhase"}}, phase)
+
+    discarded = ctx(db, bstate={"player_cards_discarded_this_turn": 2},
+                    ability_source_owner_id=5)
+    assert trigger_condition_met({
+        "m_TriggerCondition": {
+            "_t": "CardsDiscardedThisTurn",
+            "m_RequiredQuantity": 2,
+            "m_ComparisonOp": "GreaterThanOrEqual"}}, discarded)
+
+
+def test_has_source_resource_cost_compares_live_source(db):
+    source = {"card_uid": 1, "card_type": "Troop", "cost": 3}
+    cheaper = {"card_uid": 2, "card_type": "Troop", "cost": 2}
+    pricier = {"card_uid": 3, "card_type": "Troop", "cost": 4}
+    filt = {"_t": "HasSourceResourceCost", "m_ComparisonOp": "GreaterThan"}
+    assert not evaluate_card_filter(cheaper, filt, 1, source_card=source)
+    assert evaluate_card_filter(pricier, filt, 1, source_card=source)
+
+
+def test_champion_health_condition_honors_controller_and_opponent(db):
+    """Gortezuma checks the opposing champion, in PvE and persisted PvP."""
+    pve = ctx(db, ability_source_uid=700, ability_source_owner_id=5,
+              bstate={"player_health": 20, "ai_health": 20})
+    assert not evaluate_effect_condition(db, GORTEZUMA_COND, pve)
+    pve.bstate["ai_health"] = 10
+    assert evaluate_effect_condition(db, GORTEZUMA_COND, pve)
+
+    pvp = ctx(db, ability_source_uid=700, ability_source_owner_id=1001,
+              bstate={"pvp": True, "pids": [1001, 1002],
+                      "hp_1001": 20, "hp_1002": 20})
+    assert not evaluate_effect_condition(db, GORTEZUMA_COND, pvp)
+    pvp.bstate["hp_1002"] = 10
+    assert evaluate_effect_condition(db, GORTEZUMA_COND, pvp)
+
+
+def test_tac_trigger_condition_matches_threshold_event_tac(db):
+    condition = {
+        "m_TriggerCondition": {
+            "_t": "TACTriggerCondition",
+            "m_Conditions": {
+                "data": "AgBAsJ4iBQga/hhxdo8BAAAAAAAAAAAAAAAAAAAA"}}}
+    matching = ctx(db, bstate={
+        "gain_threshold_color": game_engine.ECardShards.Diamond})
+    assert trigger_condition_met(condition, matching)
+    wrong_color = ctx(db, bstate={
+        "gain_threshold_color": game_engine.ECardShards.Ruby})
+    assert not trigger_condition_met(condition, wrong_color)
+
+
 if __name__ == "__main__":
     run("Scrivener fires for troop entry", test_scrivener_troop_vs_artifact)
     run("Scrivener blocked for artifact entry", test_scrivener_artifact_blocked)
@@ -311,3 +386,11 @@ if __name__ == "__main__":
         test_dead_card_persistent_modifiers_reported)
     run("Vilefang trigger fails closed for unknown hand card", test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card)
     run("Ridge Raider only triggers for dead warzone troops", test_ridge_raider_requires_dead_warzone_troop)
+    run("Common trigger conditions are metadata faithful",
+        test_common_trigger_conditions_are_metadata_faithful)
+    run("HasSourceResourceCost compares live source",
+        test_has_source_resource_cost_compares_live_source)
+    run("Champion health condition honors opponent",
+        test_champion_health_condition_honors_controller_and_opponent)
+    run("TAC trigger matches threshold event TAC",
+        test_tac_trigger_condition_matches_threshold_event_tac)

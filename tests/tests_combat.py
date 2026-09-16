@@ -92,7 +92,10 @@ def make_db():
             "('eb7e48cd-1c85-813f-6635-d43f50cf7809', "
             "'0ad94887-419c-9e99-7946-74c4f72cdd2e', "
             "'c35dd13a-71e2-b244-847a-d887a0666210', "
-            "'190a4d8c-7c2c-10d0-6429-99c5aeb0791f')").fetchall():
+            "'190a4d8c-7c2c-10d0-6429-99c5aeb0791f', "
+            # Corinth Shifted Paradigm auto-targets: your hand / your crypt.
+            "'8d16143b-2216-3f1d-5fc9-397f15c9bbb2', "
+            "'b02ed2f0-4f09-6139-ee99-40c6239e2df9')").fetchall():
         db.execute("INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                    trow)
     for tpl, name, atk, deff, abjson in (
@@ -391,6 +394,13 @@ def test_deploy_never_fires_as_deathcry(db):
     assert len(moves) == 1, len(moves)
     assert updates[0].collection == game_engine.ECardCollections.Discard
     assert bstate["ai_health"] == 20 and bstate["player_health"] == 20
+    # CardRepresentation.Update synthesizes a move when the collection
+    # changes; the explicit move must arrive first to avoid a duplicate
+    # animation (and the client's "view was destroyed and then moved" path).
+    event_types = [type(ev).__name__ for ev in game.events
+                   if getattr(ev, "session_card_id", None) == updates[0].session_card_id]
+    assert event_types.index("CardMovedSessionEventArgs") < event_types.index(
+        "CardUpdatedSessionEventArgs"), event_types
 
 
 def test_threshold_count_two_ruby(db):
@@ -541,6 +551,9 @@ def test_game_started_chain_is_auto_passed(db):
 
     handler._resolve_stack_item = resolve_item
     session = mock.Mock(session_id=1)
+    # An ordinary legacy fixture must not accidentally look like an attached
+    # RulesPort session: Mock returns another Mock for unspecified attributes.
+    session._rules_port_session = None
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
     game = game_engine.Game(1, pl_t, ai_t)

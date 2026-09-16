@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import game_engine
 
 from tests.tests_cards_fixes import _copy_card, _copy_ability
-from tests.tests_combat import make_db, add_card, HandlerStub, SessionStub
+from tests.tests_combat import (make_db, add_card, HandlerStub, SessionStub,
+                                TPL_GLADIATOR)
 
 SRC = os.environ.get(
     "HEX_TEST_SOURCE_DB",
@@ -52,12 +53,72 @@ TPL_INFILTRATOR = "cad6307e-bafc-492f-84f6-3b914071d5d3"
 TPL_INCANT_FEAR = "f8103511-772f-40ea-8599-04d520508bac"
 AG_INCANT_FEAR = "1026a613-0814-a633-0869-3d35aaa8dd72"
 TPL_STRENGTH_REDWOOD = "27e20321-3e24-4802-8ffe-b4579616ff5c"
+AG_HARDSHELL_LOSE_LIFE = "3c64eeac-7953-d876-67c1-445b90b8ccbc"
 
 
 def _pl_ai():
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
     return pl_t, ai_t
+
+
+def test_cards_attacked_dispatch_uses_group_count_once(db):
+    """The attack-group event carries NumAttackers and is not replayed."""
+    from unittest import mock
+    from abilities.framework import triggers
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"turn_number": 4}
+    source_uid = int(handler._player_champ_scid.uid.uid64)
+    with mock.patch.object(triggers, "resolve_triggers",
+                           return_value="fired") as dispatch:
+        assert triggers.resolve_cards_attacked(
+            db, handler, game, SessionStub(), pl_t, ai_t, bstate,
+            source_uid, 5, [103, 101, 102]) == "fired"
+        assert triggers.resolve_cards_attacked(
+            db, handler, game, SessionStub(), pl_t, ai_t, bstate,
+            source_uid, 5, [101, 102, 103]) == ""
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[7:9] == (
+        "CardsAttackedEvent", source_uid)
+    assert dispatch.call_args.kwargs["event_tac"]
+    from abilities.framework.tac import _tac_attr_hash
+    assert dispatch.call_args.kwargs["event_tac"][_tac_attr_hash(
+        "NumAttackers")] == 3
+
+
+def test_card_battled_dispatch_is_directional(db):
+    """A card battle gives each participant its own trigger perspective."""
+    from unittest import mock
+    from abilities.framework import triggers
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    with mock.patch.object(triggers, "resolve_triggers",
+                           return_value="fired") as dispatch:
+        assert triggers.resolve_card_battled(
+            db, handler, game, SessionStub(), pl_t, ai_t, {},
+            101, 5, 202, 0) == "fired"
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[7:9] == ("CardBattledEvent", 101)
+    assert dispatch.call_args.kwargs["extra_target"] == 202
+
+
+def test_lose_life_modifier_is_not_damage(db):
+    """LoseLifeModifier must not recursively fire damage replacement hooks."""
+    from tests.tests_cards_fixes import _copy_ability
+    from abilities.framework.resolution import resolve_ability
+
+    _copy_ability(db, AG_HARDSHELL_LOSE_LIFE)
+    pl_t, ai_t = _pl_ai()
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+    source_uid = int(handler._player_champ_scid.uid.uid64)
+    resolve_ability(handler, game_engine.Game(1, pl_t, ai_t), SessionStub(),
+                    db, pl_t, ai_t, bstate, AG_HARDSHELL_LOSE_LIFE,
+                    source_uid, 5, {0: source_uid})
+    assert bstate["player_health"] == 19, bstate
 
 
 def test_generated_card_uid_is_independent_of_row_id(db):
@@ -856,8 +917,336 @@ def test_incantation_of_fear_counter_on_opposing_crypt_entry(db):
     assert counters.get("incantation", 0) >= 1, counters
 
 
+def test_pvp_champion_trigger_discovery_uses_raw_participant_id(db):
+    """PvP champion triggers must resolve from the raw participant id.
+
+    ``champion_holders`` compared the PvP owner against the local
+    ``user_profile["id"]``, so Corinth's end-of-turn ability (daf1ed04) was
+    never discovered and ``Shifted Paradigm`` never fired.  In PvP the owner
+    is the raw participant id, matching the C# ``EndPhaseState.OnEntry``
+    champion source.
+    """
+    from rules_port.trigger_discovery import RecordsTriggerDiscovery
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="warzone")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    db.commit()
+    session = SessionStub()
+    handler = HandlerStub(db)
+    # The local DB id deliberately differs from the raw participant id.
+    handler.user_profile = {"id": 999999}
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002}}
+    candidates = RecordsTriggerDiscovery(
+        db, handler, session, game_engine.UID.make(244, 1001),
+        game_engine.UID.make(244, 1002), bstate).discover(
+            "TurnEndedEvent", 9001, 1001)
+    found = {int(c.source_uid): list(c.ability_guids) for c in candidates}
+    assert ability_guid in found.get(9001, []), found
+
+
+def test_pvp_champion_trigger_condition_uses_raw_participant_owner(db):
+    """The champion trigger condition must see the raw PvP owner.
+
+    ``handler._champion_targets`` reports the local ``user_profile["id"]`` for
+    the player's champion and ``0`` for the AI.  ``ConditionContext.card``
+    handed that compatibility identity to
+    ``TriggerPlayerControlsAbilitySource``, which compares it against the raw
+    PvP participant id, so the condition failed and Corinth's ``Shifted
+    Paradigm`` was dropped even though discovery found it.
+    """
+    from rules_port.triggers import dispatch_native_trigger
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="champion")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    db.commit()
+
+    class ChampionTargetHandler(HandlerStub):
+        def _champion_targets(self):
+            # The compatibility identity the real handler reports: local
+            # profile id for the human, 0 for the AI — never the raw pid.
+            return [(9001, 999999, "Player", 28), (9002, 0, "AI", 28)]
+
+    handler = ChampionTargetHandler(db)
+    handler.user_profile = {"id": 999999}
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002},
+              "stack": [], "turn_pid": 1001}
+    pl_t = game_engine.UID.make(244, 1001)
+    ai_t = game_engine.UID.make(244, 1002)
+    game = game_engine.Game(1, pl_t, ai_t)
+    result = dispatch_native_trigger(
+        db=db, handler=handler, game=game,
+        session=SessionStub(), player_uid=pl_t, ai_uid=ai_t,
+        battle_state=bstate, event_type="TurnEndedEvent",
+        source_card_id=9001, source_player_id=1001)
+    assert "daf1ed04" in result, result
+    assert any(item.get("ability_guid") == ability_guid
+               for item in (bstate.get("stack") or [])), bstate
+    # The trigger's source is a champion; it must NOT be re-projected as a
+    # warzone card.  ``push_source`` passed the zone ("champion") as the
+    # template GUID and ``card_collection_for_location`` defaulted unknown
+    # zones to Warzone, moving Corinth onto the board client-side.
+    warzone_champion = [
+        ev for ev in game.events
+        if isinstance(ev, game_engine.CardUpdatedSessionEventArgs)
+        and ev.collection == game_engine.ECardCollections.Warzone
+        and int(ev.session_card_id.uid.uid64) == 9001]
+    assert not warzone_champion, warzone_champion
+
+
+def test_shifted_paradigm_never_moves_champion_when_crypt_empty(db):
+    """Shifted Paradigm moves hand/crypt, never the champion.
+
+    Both MoveCardToZone effects use auto-targets ("your hand"/"your crypt").
+    When the crypt is empty the auto-target resolved to no cards, the resolver
+    substituted ``(None,)``, and ``move_card_to_zone`` fell back to
+    ``resolving_source_uid`` — moving Corinth from the champion zone into the
+    deck.  An empty auto-target must skip the effect.
+    """
+    from rules_port.triggers import dispatch_native_trigger
+    from rules_port.resolution import resolve_port_trigger
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="champion")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    # A hand card to move, an intentionally EMPTY discard, and enough deck
+    # cards that the trailing "draw four" has a deterministic count.
+    add_card(db, 9003, 1001, TPL_GLADIATOR, loc="hand")
+    for uid in range(9100, 9106):
+        add_card(db, uid, 1001, TPL_GLADIATOR, loc="deck")
+    db.commit()
+
+    handler = HandlerStub(db)
+    handler.user_profile = {"id": 1001}
+    # The live HCPHandler supplies this deck-out projection; the focused
+    # fixture only needs the draw to stop cleanly once the deck empties.
+    handler._rules_port_deck_out = lambda *args, **kwargs: None
+    pl_t = game_engine.UID.make(244, 1001)
+    ai_t = game_engine.UID.make(244, 1002)
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002},
+              "stack": [], "turn_pid": 1001}
+    game = game_engine.Game(1, pl_t, ai_t)
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=SessionStub(),
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="TurnEndedEvent", source_card_id=9001,
+        source_player_id=1001)
+    item = next(item for item in (bstate.get("stack") or [])
+                if item.get("ability_guid") == ability_guid)
+    resolve_port_trigger(handler, game, SessionStub(), db, pl_t, ai_t,
+                         bstate, item)
+    locations = dict(db.execute(
+        "SELECT card_uid, location FROM game_cards").fetchall())
+    assert locations[9001] == "champion", locations
+    # The ability resolves: hand -> deck, (empty) crypt skipped, draw 4.
+    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
+             for ev in game.events
+             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    drawn = [ev for ev in game.events
+             if isinstance(ev, game_engine.CardDrawnSessionEventArgs)]
+    assert len(drawn) == 4, drawn
+
+
+def test_corinth_end_of_turn_ability_resolves_inline(db):
+    """Merry-Melee-Corinth resolves the end-of-turn ability without a chain.
+
+    ``force_ignores_chain`` is the format rule: the ability must not be
+    pushed onto the chain, so no priority window is created and the effects
+    run immediately (hand shuffled into the deck, four drawn).
+    """
+    from rules_port.triggers import dispatch_native_trigger
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="champion")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    add_card(db, 9003, 1001, TPL_GLADIATOR, loc="hand")
+    for uid in range(9100, 9106):
+        add_card(db, uid, 1001, TPL_GLADIATOR, loc="deck")
+    db.commit()
+
+    class ChampionTargetHandler(HandlerStub):
+        def _champion_targets(self):
+            return [(9001, 1001, "Player", 28), (9002, 0, "AI", 28)]
+
+    handler = ChampionTargetHandler(db)
+    handler.user_profile = {"id": 1001}
+    handler._rules_port_deck_out = lambda *args, **kwargs: None
+    pl_t = game_engine.UID.make(244, 1001)
+    ai_t = game_engine.UID.make(244, 1002)
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002},
+              "stack": [], "turn_pid": 1001}
+    game = game_engine.Game(1, pl_t, ai_t)
+    # Force the shuffled slot past the top of the deck so the following draw
+    # cannot return the hand card.  Without the shuffle it lands at position 0
+    # and the draw hands it straight back.
+    from unittest import mock
+    with mock.patch("random.randrange", return_value=5):
+        result = dispatch_native_trigger(
+            db=db, handler=handler, game=game, session=SessionStub(),
+            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+            event_type="TurnEndedEvent", source_card_id=9001,
+            source_player_id=1001, force_ignores_chain=True)
+    # Resolved inline: no chain item, and the hand already moved to the deck.
+    assert not (bstate.get("stack") or []), bstate.get("stack")
+    assert "daf1ed04" in result, result
+    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
+             for ev in game.events
+             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    # It was shuffled into the deck, not left on top where the draw would
+    # immediately recover it.
+    locations = dict(db.execute(
+        "SELECT card_uid, location FROM game_cards").fetchall())
+    assert locations[9003] == "deck", locations
+
+
+def test_native_chain_resolves_trigger_without_legacy_fallback(db):
+    """A chain-queued trigger must resolve through the native chain resolver.
+
+    Regression: ``resolve_port_chain_item`` handled only ability/troop/spell
+    descriptors and raised ``RuntimeError`` for ``kind='trigger'``.  A
+    GameStarted/first-turn trigger queued by ``queue_projected_chain`` then
+    aborted the mulligan-keep transaction, so PvE games failed to start.
+    """
+    from rules_port.triggers import dispatch_native_trigger
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="champion")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    add_card(db, 9003, 1001, TPL_GLADIATOR, loc="hand")
+    for uid in range(9100, 9106):
+        add_card(db, uid, 1001, TPL_GLADIATOR, loc="deck")
+    db.commit()
+
+    handler = HandlerStub(db)
+    handler.user_profile = {"id": 1001}
+    handler._rules_port_deck_out = lambda *args, **kwargs: None
+    pl_t = game_engine.UID.make(244, 1001)
+    ai_t = game_engine.UID.make(244, 1002)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002},
+              "stack": [], "turn_pid": 1001}
+    # Discovery queues the chain descriptor; the native chain resolver must
+    # then handle kind='trigger' instead of refusing it.
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=SessionStub(),
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="TurnEndedEvent", source_card_id=9001,
+        source_player_id=1001)
+    item = next(item for item in (bstate.get("stack") or [])
+                if item.get("ability_guid") == ability_guid)
+    import hconnect_server as hcs
+    import db as dbmod
+    old_db, old_hcs = dbmod._db, hcs._db
+    dbmod._db, hcs._db = db, db
+    try:
+        hcs.HCPHandler._resolve_native_trigger_chain_item(
+            handler, SessionStub(), pl_t, ai_t, bstate, item, game)
+    finally:
+        dbmod._db, hcs._db = old_db, old_hcs
+    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
+             for ev in game.events
+             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    resolved = [e for e in game.events
+                if isinstance(e, game_engine.TopOfChainResolvedSessionEventArgs)]
+    removed = [e for e in game.events
+               if isinstance(e, game_engine.RemovedTopOfChainSessionEventArgs)]
+    assert resolved and removed, game.events
+
+
 def _main():
     tests = (test_brood_creeper_damage_to_opposing_champion_summons,
+             test_cards_attacked_dispatch_uses_group_count_once,
+             test_card_battled_dispatch_is_directional,
+             test_lose_life_modifier_is_not_damage,
              test_brood_creeper_does_not_fire_on_own_champion,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,
@@ -877,7 +1266,12 @@ def _main():
              test_state_based_death_includes_static_defense,
              test_troop_artifact_can_attack,
              test_unblockable_attacker_cannot_be_blocked,
-             test_incantation_of_fear_counter_on_opposing_crypt_entry)
+             test_incantation_of_fear_counter_on_opposing_crypt_entry,
+             test_pvp_champion_trigger_discovery_uses_raw_participant_id,
+             test_pvp_champion_trigger_condition_uses_raw_participant_owner,
+             test_shifted_paradigm_never_moves_champion_when_crypt_empty,
+             test_corinth_end_of_turn_ability_resolves_inline,
+             test_native_chain_resolves_trigger_without_legacy_fallback)
     failed = 0
     for fn in tests:
         db = make_db()

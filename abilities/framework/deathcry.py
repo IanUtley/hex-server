@@ -29,12 +29,22 @@ def _resolve_deathcry_effect(game, session, db, handler, pl_t, ai_t, bstate,
     engine (effect groups, gamedata conditions, ability variables, target
     templates, and ActivateAbility recursion)."""
     from ._shared import _log
-    from .resolution import resolve_ability
     bstate = bstate or {}
     bstate["resolving_owner_id"] = owner_user_id
     bstate["resolving_source_uid"] = card_uid
-    out = resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
-                          ag, card_uid, owner_user_id, {})
+    if (getattr(session, "_rules_port_session", None) is not None or
+            (bstate or {}).get("_rules_port_attached")):
+        from rules_port.resolution import resolve_port_ability
+        def resolve(handler, game, session, db, pl_t, ai_t, bstate,
+                   ability_guid, source_uid, owner_id, target_map):
+            return resolve_port_ability(
+                handler, game, session, db, pl_t, ai_t, bstate,
+                ability_guid, source_uid, owner_id, target_map=target_map)
+    else:
+        from .resolution import resolve_ability
+        resolve = resolve_ability
+    out = resolve(handler, game, session, db, pl_t, ai_t, bstate,
+                  ag, card_uid, owner_user_id, {})
     _log(f"    Deathcry {ag[:8]} resolved from stack")
     return out
 
@@ -52,18 +62,18 @@ def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid,
     """
     from .condition_engine import ConditionContext, trigger_condition_met
 
-    trow = db.execute(
-        "SELECT abilities_json FROM card_templates WHERE guid=?",
-        (tpl_guid,)).fetchone()
-    irow = db.execute(
-        "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(card_uid))).fetchone()
+    from pvp_db import (db_template_ability_payload, db_card_ability_payload,
+                        db_card_owner_id, db_ability_trigger_metadata,
+                        db_ability_game_text, db_ability_activation_metadata,
+                        db_set_card_abilities)
+    template_payload = db_template_ability_payload(tpl_guid, conn=db)
+    instance_payload = db_card_ability_payload(
+        session.session_id, int(card_uid), conn=db)
+    trow = (template_payload,) if template_payload is not None else None
+    irow = (instance_payload,) if instance_payload is not None else None
     if not trow and not irow:
         return
-    row2 = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(card_uid))).fetchone()
-    owner_id = row2[0] if row2 else 0
+    owner_id = db_card_owner_id(session.session_id, int(card_uid), conn=db) or 0
     import json as _json
     ability_lists = []
     for raw_list in ((trow[0] if trow else "[]"),
@@ -82,9 +92,11 @@ def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid,
                 aguids.append(ability_guid)
     trigger_guids = []
     for ag in aguids:
-        mrow = db.execute(
-            "SELECT trigger_event_type, game_text, raw_json FROM card_abilities_meta "
-            "WHERE ability_guid=?", (ag,)).fetchone()
+        trigger_meta = db_ability_trigger_metadata(ag, conn=db)
+        activation_meta = db_ability_activation_metadata(ag, conn=db)
+        mrow = ((trigger_meta[2], db_ability_game_text(ag, conn=db),
+                 activation_meta[5] if activation_meta else None)
+                if trigger_meta else None)
         if not mrow or not mrow[0]:
             continue
         if "CardEnteredZone" in (mrow[0] or ""):
@@ -127,10 +139,8 @@ def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid,
                 from ._shared import _log
                 _log(f"    One-shot Deathcry cleanup failed for {ag[:8]}: {exc}")
         else:
-            meta = db.execute(
-                "SELECT uses_per_game FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ag,)).fetchone()
-            if meta and int(meta[0] or 0) == 1 and irow:
+            meta = db_ability_activation_metadata(ag, conn=db)
+            if meta and int(meta[1] or 0) == 1 and irow:
                 current = []
                 try:
                     current = _json.loads(irow[0] or "[]")
@@ -138,8 +148,7 @@ def resolve_deathcry(game, session, db, handler, pl_t, ai_t, card_uid, tpl_guid,
                     pass
                 current = [value for value in current
                            if str(value).lower() != ag]
-                db.execute(
-                    "UPDATE game_cards SET card_abilities=? "
-                    "WHERE session_id=? AND card_uid=?",
-                    (_json.dumps(current), session.session_id, int(card_uid)))
+                db_set_card_abilities(
+                    session.session_id, int(card_uid), _json.dumps(current),
+                    conn=db)
                 db.commit()

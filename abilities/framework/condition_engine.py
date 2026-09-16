@@ -17,6 +17,7 @@ from .targeting import (
     ZONE_MAP,
     _side_of,
     shards_from_threshold,
+    template_faction,
 )
 
 
@@ -43,6 +44,101 @@ def _compare(value, op, target):
 
 def _side_of(user_id):
     return "ai" if not user_id else "player"
+
+
+def _champion_owner_ids(ctx, source_owner):
+    """Return the champion owners visible to a health condition.
+
+    Practice/FRA state uses ``player_health``/``ai_health`` while persisted
+    PvP state uses ``hp_<pid>``. Health conditions need the owner IDs as well
+    as the side labels so ``SingleOpponent`` can be evaluated from the same
+    metadata in both modes.
+    """
+    state = ctx.bstate or {}
+    try:
+        source_owner = int(source_owner)
+    except (TypeError, ValueError):
+        source_owner = 0
+    owners = {source_owner}
+    if state.get("pvp"):
+        for value in state.get("pids") or []:
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        for value in (state.get("champ_map") or {}).keys():
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        for value in (state.get("pvp_health_map") or {}).keys():
+            try:
+                owners.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    else:
+        # The AI champion is conventionally owner 0. The player owner is
+        # discoverable from live cards or explicit champion tuples.
+        owners.add(0)
+        for _c_uid, owner, _name, _health in ctx.champions:
+            try:
+                owners.add(int(owner))
+            except (TypeError, ValueError):
+                pass
+        try:
+            from pvp_db import db_session_user_ids
+            for owner in db_session_user_ids(ctx.session.session_id, conn=ctx.db):
+                owners.add(int(owner))
+        except Exception:
+            pass
+    return owners
+
+
+def _champion_health(ctx, owner):
+    """Read a champion's current health from either battle-state shape."""
+    try:
+        owner = int(owner)
+    except (TypeError, ValueError):
+        return 20
+    state = ctx.bstate or {}
+    if state.get("pvp"):
+        health_map = state.get("pvp_health_map") or {}
+        key = health_map.get(owner)
+        if key is None:
+            key = health_map.get(str(owner))
+        if key is None:
+            key = f"hp_{owner}"
+        if key in state:
+            try:
+                return int(state[key] or 0)
+            except (TypeError, ValueError):
+                return 20
+    else:
+        key = "player_health" if owner else "ai_health"
+        if key in state:
+            try:
+                return int(state[key] or 0)
+            except (TypeError, ValueError):
+                return 20
+    for _c_uid, c_owner, _name, health in ctx.champions:
+        try:
+            if int(c_owner) == owner:
+                return int(health or 0)
+        except (TypeError, ValueError):
+            continue
+    # A complete battle state always carries health. Keep malformed or
+    # partial state from turning every <= health condition into true.
+    return 20
+
+
+def _opposing_champion_healths(ctx, source_owner):
+    owners = _champion_owner_ids(ctx, source_owner)
+    try:
+        source_owner = int(source_owner)
+    except (TypeError, ValueError):
+        source_owner = 0
+    return [_champion_health(ctx, owner)
+            for owner in owners if owner != source_owner]
 
 
 def _filter_zones(node):
@@ -72,7 +168,8 @@ class ConditionContext:
                  champions=None, ability_source_card_owner=None,
                  trigger_owner_id=None, event_source_collection=None,
                  event_destination_collection=None, event_previous_state=None,
-                 uses_previous_state=False):
+                 uses_previous_state=False, event_int_attribute=None,
+                 event_tac=None):
         self.db = db
         self.session = session
         self.bstate = bstate or {}
@@ -89,6 +186,12 @@ class ConditionContext:
         self.event_source_collection = event_source_collection
         self.event_destination_collection = event_destination_collection
         self.event_previous_state = event_previous_state
+        self.event_int_attribute = event_int_attribute
+        # Trigger events carry a transient TAC in the original client.  Keep
+        # it on the evaluation context rather than mutating the shared battle
+        # state, since nested triggers can otherwise overwrite one another's
+        # event payload.
+        self.event_tac = event_tac or {}
         self.uses_previous_state = bool(uses_previous_state)
         # The ability SOURCE CARD's actual owner (its game_cards.user_id) —
         # distinct from the EVENT's source owner.  IsControlledBy /
@@ -151,18 +254,8 @@ class ConditionContext:
                 "src_owner_side": self._src_side,
             }
         if key not in self._cards:
-            row = self.db.execute(
-                "SELECT gc.card_uid, COALESCE(gc.card_type, ct.card_type), "
-                "gc.location, gc.user_id, gc.card_state, "
-                "COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-                "gc.template_guid, ct.name, COALESCE(ct.cost,0), "
-                "ct.subtype, ct.threshold_json, gc.card_attributes, ct.attributes, "
-                "gc.card_attack_mod, gc.card_defense_mod, "
-                "COALESCE(gc.permanent_buffs,'{}') "
-                "FROM game_cards gc LEFT JOIN card_templates ct "
-                "ON ct.guid = gc.template_guid "
-                "WHERE gc.session_id=? AND gc.card_uid=?",
-                (self.session.session_id, key)).fetchone()
+            from pvp_db import db_condition_card_row
+            row = db_condition_card_row(self.session.session_id, key, conn=self.db)
             if row:
                 base_atk = int(row[5] or 0)
                 base_def = int(row[6] or 0)
@@ -190,8 +283,12 @@ class ConditionContext:
                     "defense": defense, "template_guid": row[7],
                     "name": row[8] or "", "cost": row[9] or 0,
                     "subtype": row[10] or "",
+                    "faction": template_faction(row[7]),
                     "shards": shards_from_threshold(row[11]),
                     "attributes": int(row[12] or 0) | int(row[13] or 0),
+                    "int_attrs": (permanent.get("int_attrs", {})
+                                  if isinstance(permanent.get("int_attrs", {}), dict)
+                                  else {}),
                     "counters": counters,
                     "counter_guids": counter_guids,
                     "damaged_opponent_this_turn": list(
@@ -220,11 +317,9 @@ class ConditionContext:
     def _game_card_counter_counts(self, card_uid):
         """Return a game card's persisted counter names and GUIDs."""
         try:
-            row = self.db.execute(
-                "SELECT permanent_buffs FROM game_cards WHERE session_id=? "
-                "AND card_uid=?", (self.session.session_id, int(card_uid))
-            ).fetchone()
-            data = json.loads((row[0] if row else "{}") or "{}")
+            from pvp_db import db_card_permanent_buffs
+            data = json.loads(db_card_permanent_buffs(
+                self.session.session_id, int(card_uid), conn=self.db) or "{}")
         except Exception:
             data = {}
         if not isinstance(data, dict):
@@ -235,24 +330,30 @@ class ConditionContext:
                 guids if isinstance(guids, dict) else {})
 
     def _zones(self, flags):
+        # Records use the literal ``None`` sentinel for an unrestricted
+        # source/destination collection (for example, Minion of Yazukan's
+        # "when this goes underground" trigger).  Treat it as no filter;
+        # interpreting it as a real zone suppresses otherwise valid zone
+        # transitions because ``warzone``/``underground`` can never equal
+        # ``none``.
         return {ZONE_MAP.get(z, z.lower())
-                for z in (flags or "").split("|") if z}
+                for z in (flags or "").split("|")
+                if z and str(z).lower() not in {"none", "null"}}
 
     def _cards_in_zones(self, zones, user_id=None):
-        sql = ("SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-               "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-               "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
-               "gc.card_attributes, ct.attributes "
-               "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-               "WHERE gc.session_id=? AND gc.location IN (%s)"
-               % ",".join("?" * len(zones)))
-        params = [self.session.session_id] + list(zones)
-        if user_id is not None:
-            sql += " AND gc.user_id=?"
-            params.append(user_id)
+        from pvp_db import db_condition_cards_in_zones
+        rows = db_condition_cards_in_zones(
+            self.session.session_id, zones, user_id=user_id, conn=self.db)
         out = []
-        for r in self.db.execute(sql, params):
+        for r in rows:
             counters, counter_guids = self._game_card_counter_counts(r[0])
+            try:
+                saved = json.loads(r[14] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                saved = {}
+            int_attrs = saved.get("int_attrs", {}) if isinstance(saved, dict) else {}
+            if not isinstance(int_attrs, dict):
+                int_attrs = {}
             out.append({"card_uid": int(r[0]), "card_type": r[1],
                         "location": r[2], "user_id": r[3],
                         "state": int(r[4] or 0), "attack": r[5],
@@ -261,6 +362,8 @@ class ConditionContext:
                         "subtype": r[9] or "",
                         "shards": shards_from_threshold(r[10]),
                         "attributes": int(r[11] or 0) | int(r[12] or 0),
+                        "faction": template_faction(r[13]),
+                        "int_attrs": int_attrs,
                         "counters": counters,
                         "counter_guids": counter_guids,
                         "damaged_opponent_this_turn": list(
@@ -308,19 +411,18 @@ class ConditionContext:
                         pass
             return total
         try:
-            row = self.db.execute(
-                "SELECT name FROM card_counter_templates WHERE template_id=?",
-                (counter_guid,)).fetchone()
+            from pvp_db import db_counter_template_name
+            name = db_counter_template_name(counter_guid, conn=self.db)
         except Exception:
             return 0
-        if not row:
+        if not name:
             return 0
-        name = row[0]
-        prow = self.db.execute(
-            "SELECT permanent_buffs FROM game_cards WHERE session_id=? AND card_uid=?",
-            (self.session.session_id, card["card_uid"])).fetchone()
+        from pvp_db import db_card_mutation_field
+        permanent_value = db_card_mutation_field(
+            self.session.session_id, card["card_uid"], "permanent_buffs",
+            conn=self.db)
         try:
-            data = json.loads((prow[0] if prow else "{}") or "{}")
+            data = json.loads(permanent_value or "{}")
             counters = data.get("counters") or {}
             return int(counters.get((name or "").lower(), 0) or 0)
         except Exception:
@@ -373,16 +475,12 @@ def evaluate_condition(node, ctx):
         activated = (ctx.bstate or {}).get("activated_ability_guid")
         if not activated:
             return False
-        for table in ("champion_abilities", "talent_abilities"):
-            try:
-                row = ctx.db.execute(
-                    "SELECT charge_cost FROM %s WHERE ability_guid=? "
-                    "LIMIT 1" % table, (str(activated).lower(),)).fetchone()
-            except Exception:
-                row = None
-            if row is not None:
-                return int(row[0] or 0) > 0
-        return False
+        from pvp_db import db_charge_ability_cost
+        try:
+            cost = db_charge_ability_cost(activated, conn=ctx.db)
+        except Exception:
+            cost = None
+        return cost is not None and int(cost or 0) > 0
     if t == "TriggerPlayerControlsCard":
         card = ctx.card(ctx.trigger_uid)
         if card is None:
@@ -410,8 +508,9 @@ def evaluate_condition(node, ctx):
         card = ctx.card(uid)
         if card is None:
             return True
-        return evaluate_card_filter(card, node.get("m_CardFilter"),
-                                    ctx.ability_source_uid)
+        return evaluate_card_filter(
+            card, node.get("m_CardFilter"), ctx.ability_source_uid,
+            source_card=ctx.card(ctx.ability_source_uid))
     if t == "TriggerCardEnteredZone":
         card = ctx.card(ctx.trigger_uid)
         if card is None:
@@ -434,6 +533,12 @@ def evaluate_condition(node, ctx):
         # crypt-entry triggers intentionally leave this flag unset. Require
         # the transient Dead bit from the pre-move state so cards buried from
         # hand/deck cannot masquerade as deaths.
+        if (ctx.uses_previous_state and source_zones and source is None):
+            # A previous-state death trigger cannot be proven from the
+            # post-move row alone. Older discard callers that omit the
+            # transition metadata must fail closed rather than treating a
+            # hand/deck burial as a troop death.
+            return False
         if (ctx.uses_previous_state and source_zones
                 and source in ctx._zones("Warzone")
                 and destination in ctx._zones("Discard")):
@@ -455,6 +560,109 @@ def evaluate_condition(node, ctx):
         side = _side_of(ctx.ability_source_owner_id)
         drawn = int(ctx.bstate.get(f"{side}_draws_this_turn", 0))
         return drawn == nth
+    if t == "TriggerEventIsCombatDamage":
+        # The combat resolver emits CardDealtDamageEvent. Ability damage uses
+        # CardWouldBeDamagedEvent and must not satisfy this condition. A
+        # replacement event carries the original combat flag in its event
+        # TAC, matching the client's CardWouldDealDamageEvent.IDamage data.
+        if _last(ctx.event_type) == "CardDealtDamageEvent":
+            return True
+        return (_last(ctx.event_type) == "CardWouldDealDamageEvent" and
+                bool((ctx.event_tac or {}).get("is_combat_damage")))
+    if t == "TriggerEventIntAttribute":
+        return (_last(ctx.event_type) == "CardGainedIntAttrEvent" and
+                str(node.get("m_Attribute") or "") == str(
+                    ctx.event_int_attribute or ""))
+    if t == "TurnPhaseCondition":
+        wanted = str(node.get("m_TurnPhase") or "")
+        try:
+            wanted_value = int(getattr(game_engine.ETurnPhases, wanted))
+        except (AttributeError, TypeError, ValueError):
+            wanted_value = None
+        current = (ctx.bstate or {}).get("phase")
+        if current is None:
+            try:
+                import battle_engine
+                current = battle_engine.current_phase(ctx.bstate)
+            except Exception:
+                current = None
+        return (str(current) == wanted or
+                (wanted_value is not None and int(current or -1) == wanted_value))
+    if t == "CardsDiscardedThisTurn":
+        owner = ctx.ability_source_owner_id
+        if (ctx.bstate or {}).get("pvp"):
+            value = int(ctx.bstate.get(
+                f"cards_discarded_this_turn_{int(owner or 0)}", 0) or 0)
+        else:
+            value = int(ctx.bstate.get(
+                f"{_side_of(owner)}_cards_discarded_this_turn", 0) or 0)
+        required = int(node.get("m_RequiredQuantity", node.get(
+            "m_Amount", node.get("m_Value", 1))) or 1)
+        return _compare(value, node.get("m_ComparisonOp", "GreaterThanOrEqual"),
+                        required)
+    if t == "IntAttrFilter":
+        attr_name = str(node.get("m_Attribute") or "")
+        if attr_name.startswith("AbilityTAC>"):
+            from .tac import _tac_attr_hash
+            actual = int((ctx.event_tac or {}).get(
+                _tac_attr_hash(attr_name.split(">", 1)[1]), 0) or 0)
+            rhs = int(node.get("m_Value", 0) or 0)
+            return _compare(actual, node.get("m_ComparisonOp", "Equals"), rhs)
+        target = ctx.card(ctx.trigger_uid) or ctx.card(ctx.ability_source_uid)
+        return evaluate_card_filter(target, node, ctx.ability_source_uid) \
+            if target is not None else True
+    if t == "TACTriggerCondition":
+        serialized = node.get("m_Conditions") or {}
+        data = serialized.get("data") if isinstance(serialized, dict) else None
+        if not data:
+            return True
+        try:
+            from .tac import decode_tac_tree, _tac_attr_hash
+            required = decode_tac_tree(data)
+        except (TypeError, ValueError):
+            return True
+        # GainThresholdEvent carries exactly one shard IntAttr with value 1.
+        # Other event TAC fields can be supplied by callers through the same
+        # transient map, keeping this evaluator independent of card names.
+        event_tac = dict(ctx.event_tac or
+                         (ctx.bstate or {}).get("event_tac") or {})
+        color = (ctx.bstate or {}).get("gain_threshold_color")
+        if color is not None:
+            for name, flag in game_engine.SHARD_TO_FLAG.items():
+                if int(flag) == int(color):
+                    event_tac[_tac_attr_hash(name.title())] = 1
+                    break
+
+        def _matches(condition):
+            if not isinstance(condition, dict):
+                return True
+            minimum_hash = _tac_attr_hash("MinimumValues")
+            subset_hash = _tac_attr_hash("HasAsSubset")
+            for key, value in (condition.get(minimum_hash) or {}).items():
+                if int(event_tac.get(key, 0) or 0) < int(value or 0):
+                    return False
+            for key, value in (condition.get(subset_hash) or {}).items():
+                if isinstance(value, dict):
+                    if not _matches_nested(event_tac, key, value):
+                        return False
+                elif event_tac.get(key) != value:
+                    return False
+            return True
+
+        def _matches_nested(actual, key, expected):
+            # Nested event TACs are represented with the same hash-keyed
+            # mapping.  This helper intentionally requires the expected
+            # values rather than treating missing data as a wildcard.
+            value = actual.get(key)
+            if not isinstance(value, dict):
+                return False
+            return all(value.get(k) == v for k, v in expected.items())
+
+        conditions_hash = _tac_attr_hash("Conditions")
+        conditions = required.get(conditions_hash)
+        if not conditions:
+            conditions = [required]
+        return all(_matches(condition) for condition in conditions)
     if t == "TriggerPlayerIsActivePlayer":
         return ctx.bstate.get("turn_player") == _side_of(ctx.ability_source_owner_id)
     if t == "TriggerCardSameNameInZone":
@@ -465,12 +673,9 @@ def evaluate_condition(node, ctx):
                            or node.get("m_CollectionFlags", ""))
         if not zones:
             return True
-        rows = ctx.db.execute(
-            "SELECT 1 FROM game_cards WHERE session_id=? AND template_guid=? "
-            "AND location IN (%s) LIMIT 1"
-            % ",".join("?" * len(zones)),
-            [ctx.session.session_id, card["template_guid"]] + list(zones)).fetchone()
-        return bool(rows)
+        from pvp_db import db_template_in_zones
+        return db_template_in_zones(
+            ctx.session.session_id, card["template_guid"], zones, conn=ctx.db)
     if t == "TriggerCardIsStoredTargetOfAbilitySource":
         if ctx.trigger_uid is None:
             return False
@@ -589,24 +794,51 @@ def evaluate_condition(node, ctx):
                 return False
         return True
     if t == "CardFilterAbilityCondition":
-        zones = ctx._zones(node.get("m_CollectionFlags", "")
-                           or node.get("m_CardCollection", ""))
-        if not zones:
-            return True
+        # This is an ability-source condition: "if this is underground",
+        # "if this is in your hand", etc.  It must test the source card, not
+        # whether any card anywhere in the filtered zone matches.  The latter
+        # incorrectly allowed Grave Nibbler's underground one-shot to fire
+        # merely because another card was underground.
         fjson = node.get("m_CardFilter") or {}
-        return any(evaluate_card_filter(card, fjson, ctx.ability_source_uid)
-                   for card in ctx._cards_in_zones(zones))
+        source = ctx.card(ctx.ability_source_uid)
+        return (evaluate_card_filter(
+                    source, fjson, ctx.ability_source_uid,
+                    source_card=source)
+                if source is not None else True)
     if t == "RequiresSourcePassesFilterCondition":
         card = ctx.card(ctx.ability_source_uid)
         if card is None:
             return True
         return evaluate_card_filter(card, node.get("m_Filter") or {},
                                     ctx.ability_source_uid)
-    if t in ("RequiresChampionHealth", "RequiresChampionCharges",
+    if t == "RequiresChampionHealth":
+        source_owner = ctx.ability_source_owner_id
+        player_filter = (node.get("m_PlayerFilter") or "Self")
+        source_health = _champion_health(ctx, source_owner)
+        opposing = _opposing_champion_healths(ctx, source_owner)
+        if node.get("m_QuantityIsHighestOpposingChampionsHealth"):
+            if not opposing:
+                return False
+            value = source_health
+            target = max(opposing)
+        elif player_filter in ("SingleOpponent", "MultipleOpponents"):
+            if not opposing:
+                return False
+            # The current game modes have one opposing champion. ``max`` is
+            # the safe extension for authored multi-opponent conditions and
+            # matches the meaning of the highest-opposing flag above.
+            value = max(opposing)
+            target = int(node.get("m_RequiredQuantity", 0) or 0)
+        else:
+            value = source_health
+            target = int(node.get("m_RequiredQuantity", 0) or 0)
+        return _compare(value, node.get("m_ComparisonOp", "GreaterThanOrEqual"),
+                        target)
+
+    if t in ("RequiresChampionCharges",
              "RequiresResourceThreshold", "RequiresTotalResources"):
         side = _side_of(ctx.ability_source_owner_id)
-        key = {"RequiresChampionHealth": f"{side}_health",
-               "RequiresChampionCharges": f"{side}_charges",
+        key = {"RequiresChampionCharges": f"{side}_charges",
                "RequiresTotalResources": f"{side}_total_resources",
                "RequiresResourceThreshold": None}.get(t)
         if key is None:
@@ -662,15 +894,14 @@ def evaluate_effect_condition(db, condition_id, ctx):
     if not condition_id:
         return True
     try:
-        row = db.execute(
-            "SELECT condition_json FROM ability_effect_conditions "
-            "WHERE condition_id=?", (condition_id,)).fetchone()
+        from pvp_db import db_effect_condition_json
+        condition_json = db_effect_condition_json(condition_id, conn=db)
     except Exception:
         return True
-    if not row or not row[0]:
+    if not condition_json:
         return True
     try:
-        node = json.loads(row[0])
+        node = json.loads(condition_json)
     except Exception:
         return True
     return evaluate_condition(node, ctx)

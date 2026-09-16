@@ -672,6 +672,53 @@ The four **completeness gates** (mirror `AbilityTemplate`):
 Effect ordering must follow `sort by m_EffectGroupId, then m_EffectInstanceId`,
 and effects in the same group are simultaneous (no server yields between them).
 
+### RulesPort hand-off and UI continuations
+
+In a live battle, `rules_port.wire` receives the already-classified typed
+transaction and creates one authoritative `AbilityInstance`. Before the BOM
+walk it checks phase/priority, source collection, activation and X costs,
+thresholds, and every metadata target. A rejected typed intent is acknowledged
+and is not retried through the legacy dispatcher.
+
+The resolver then performs the same ordered hand-off as the client:
+
+```text
+typed activation
+  -> AbilityBuilder/AbilityGraph
+  -> ApplyEffectGroup (conditions, contingencies, targets, leaf)
+  -> SQLite + Game event projection
+  -> continuation or next GreenLight/option packet
+```
+
+Explicit targets, discard/sacrifice costs, choice cards, deck searches,
+conversations, and triggered-ability responses are checkpoints. When one is
+needed, the port persists the ability instance ID, source card, target map,
+variables, and resume effect order. The next matching typed response resumes
+that instance; it must not create a duplicate trigger or restart earlier effect
+groups. A completed mutation updates the card row and emits the corresponding
+`CardMoved`/`CardUpdated` (and `CardDiscarded` for removal) before the client
+receives rebuilt options and priority.
+
+Player-level visibility modifiers follow the same projection contract. The
+`CanSeeOpponentsHand` flag is persisted by the RulesPort host, and each fresh
+checkpoint resends complete viewer-scoped hand `CardUpdated` events. A later
+face-down placeholder cannot overwrite that definition, so cards revealed by
+Subterranean Spy remain rendered with their real template instead of a black
+rectangle; clients without the permission still receive nulling updates.
+
+Choice-card abilities use the authored target/filter graph. A generated Choice
+card is played from `Choosing` for free, then its automatic ability resolves
+against the parent source card. This is the resource-choice contract used by
+Shard of Cunning: the AI selects a legal Blood or Sapphire token according to
+its threshold state and the selected token's typed `ThresholdModifier` emits
+the threshold event. No card-name or display-text rule is required.
+
+Resource modifier leaves distinguish `CurrentResourceModifier` from
+`TotalResourceModifier`. Current-resource changes are temporary pool grants;
+total-resource changes raise the maximum pool. Thus Hideous Conversion's
+authored `[L1][R0]` operation grants one temporary current resource, and its
+post-resolution options use that updated pool.
+
 ---
 
 ## 14. Support matrix — what the Python framework currently implements
@@ -697,7 +744,7 @@ data-driven today vs. what is inferred from game text vs. what is missing.
 | `DoubleChoiceAbilityEffectTemplate` | implemented | Creates the metadata-defined random Choice cards, exposes the built-in Choose-and-Play picker, supports the second-choice stage, and resumes the parent ability after selection in PvE and PvP. |
 | `TransformCardAbilityEffectTemplate` | implemented | Target from bstate; template GUID from game-text link or `effect_guid`. |
 | `ActivateAbilityEffectTemplate` | implemented | Recurses via `param` (m_AbilityToInvoke). |
-| `TACAbilityEffectTemplate` | partial | Decodes operation + GUID; only `ShiftAbility` handled. |
+| `TACAbilityEffectTemplate` | implemented | `EffectContext` executes every TAC operation present in the current Records snapshot: list append, art cycle, resource depletion, escalation, stored-target cleanup, threshold gain, deck movement, collection replacement, base-ability revocation, power shift, and tame. |
 | `RandomizeVariableEffectTemplate` | implemented | Uses typed min/max fields (including dynamic max fields) and stores the result in the active ability-variable map; the stale historical alias remains only for direct legacy callers. |
 | `GrantAbilityEffectTemplate`, `PlayCardAbilityEffectTemplate`, `RevertPermanentModificationsAbilityEffectTemplate`, `RevealCardsAbilityEffectTemplate`, `StoreTargetsAbilityEffectTemplate` | implemented | Metadata-driven state/event paths; simple state effects use `EffectContext`, while play/reveal/grant retain their required orchestration. |
 
@@ -710,7 +757,7 @@ The same adapter boundary now covers the prompt- and combat-heavy
 `DoubleChoiceAbilityEffectTemplate` and `BlockEffectTemplate`; their
 continuation and combat contracts remain in named context operations rather
 than being compressed into artificial simple leaves.
-| `FireEventEffectTemplate`, `VerdictAbilityEffectTemplate` | partial | Registered compatibility leaves; still require their authored event/verdict contracts before they can be treated as complete. |
+| `FireEventEffectTemplate`, `VerdictAbilityEffectTemplate` | implemented | Dispatch typed authored event names through the shared trigger resolver in both PvE and PvP. |
 
 `RepeatingAbilityEffectTemplate` is resolved by the main resolver because it
 contains a nested typed ability and loop-count field rather than a normal
@@ -718,11 +765,12 @@ per-target leaf. Random target templates are likewise resolved from their
 metadata filter and count, even when the template is not marked as an
 auto-target in the extracted record.
 
-`ConversationAbilityEffectTemplate` is the remaining unregistered effect
-family. It is deliberately left for human guidance because it starts authored
-campaign/UI conversations rather than changing card state; implementing it
-requires deciding which campaign conversation and client presentation each
-record should invoke.
+`ConversationAbilityEffectTemplate` has an explicit continuation path. Its
+typed `ConversationId` is emitted as the client's class-55 conversation dialog
+event; the ability remains paused until the matching
+`EncounterModDialogTransaction` resumes the same effect chain. This keeps
+campaign/UI conversations separate from ordinary card-state effects while
+allowing metadata-defined records to invoke them in both game modes.
 
 ### Triggered-ability handling (`abilities/framework/triggers.py`, `deathcry.py`)
 `resolve_triggers` fires abilities whose `card_abilities_meta.trigger_event_type`

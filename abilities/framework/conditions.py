@@ -30,22 +30,14 @@ def register_condition(name):
 
 @register_condition("pregame_shards_in_deck")
 def _cond_shards_in_deck(db, session, user_id, color, count):
-    row = db.execute(
-        "SELECT COUNT(*) FROM game_cards gc "
-        "JOIN card_templates ct ON ct.guid = gc.template_guid "
-        "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='deck' "
-        "AND ct.name LIKE ?",
-        (session.session_id, user_id, f"%{color} Shard%")).fetchone()
-    return (row[0] if row else 0) >= int(count)
+    from pvp_db import db_deck_shard_count
+    return db_deck_shard_count(session.session_id, user_id, color, conn=db) >= int(count)
 
 
 @register_condition("pregame_cards_in_deck")
 def _cond_cards_in_deck(db, session, user_id, count):
-    row = db.execute(
-        "SELECT COUNT(*) FROM game_cards "
-        "WHERE session_id=? AND user_id=? AND location='deck'",
-        (session.session_id, user_id)).fetchone()
-    return (row[0] if row else 0) >= int(count)
+    from pvp_db import db_deck_card_count
+    return db_deck_card_count(session.session_id, user_id, conn=db) >= int(count)
 
 
 @register_condition("pregame_is_dungeon")
@@ -57,11 +49,13 @@ def _cond_is_dungeon(db, session, user_id):
 
 
 def _has_previous_dungeon_win(db, session):
-    """Return whether this dungeon has a completed encounter win already.
+    """Return whether the previous encounter in this dungeon was won.
 
     Ruthlessly Efficient is a dungeon-run bonus, not a general dungeon
     opening bonus.  The extracted ability row lost its nested condition, so
-    use the campaign's persisted win count to recover the intended timing.
+    use the campaign's persisted consecutive-win streak to recover the
+    intended timing.  The streak is reset to 0 on a dungeon loss and
+    incremented on each dungeon win (see ``campaign._apply_gameend``).
     """
     session_name = (session.session_name or "") if session else ""
     if not session_name.startswith("camp_"):
@@ -70,17 +64,17 @@ def _has_previous_dungeon_win(db, session):
         camp_id = int(session_name[5:].split("_", 1)[0])
     except (TypeError, ValueError):
         return False
-    row = db.execute(
-        "SELECT campaign_type, state_json FROM campaigns WHERE id=?",
-        (camp_id,)).fetchone()
-    if not row or (row[0] or "").upper() != "DUNGEON":
+    from pve_db import db_campaign_runtime_row
+    # ``db_campaign_runtime_row`` returns ``(state_json, campaign_type)``.
+    row = db_campaign_runtime_row(camp_id, conn=db)
+    if not row or (row[1] or "").upper() != "DUNGEON":
         return False
     try:
-        state = json.loads(row[1] or "{}")
+        state = json.loads(row[0] or "{}")
     except (TypeError, ValueError):
         return False
     try:
-        return int(state.get("Wins", 0) or 0) > 0
+        return int(state.get("dungeon_win_count", 0) or 0) > 0
     except (TypeError, ValueError):
         return False
 
@@ -102,10 +96,14 @@ def evaluate_condition(condition, db, session, user_id):
 
 def _effect_rows(db, ability_guid):
     """Return direct BOM rows for an ability in authored effect order."""
-    return db.execute(
-        "SELECT effect_guid, effect_type, param FROM ability_effects "
-        "WHERE ability_guid=? ORDER BY effect_order",
-        (ability_guid,)).fetchall()
+    from pvp_db import db_ability_effect_type_params, db_ability_effect_rows
+    rows = db_ability_effect_rows(ability_guid, conn=db)
+    ordered = db_ability_effect_type_params(ability_guid, conn=db)
+    by_type = {}
+    for effect_guid, effect_type, param in rows:
+        by_type.setdefault((effect_type, param), effect_guid)
+    return [(by_type.get((effect_type, param)), effect_type, param)
+            for effect_type, param in ordered]
 
 
 def _effect_params(db, ability_guid):
@@ -149,13 +147,12 @@ def _target_filter_flags(value):
 
 
 def _target_template_flags_for_id(db, target_id):
-    row = db.execute(
-        "SELECT filter_json FROM target_templates WHERE template_id=?",
-        (str(target_id),)).fetchone()
-    if not row:
+    from pvp_db import db_target_template_filter
+    value = db_target_template_filter(str(target_id), conn=db)
+    if not value:
         return set(), set()
     try:
-        value = json.loads(row[0] or "{}")
+        value = json.loads(value or "{}")
     except (TypeError, ValueError):
         return set(), set()
     return _target_filter_flags(value)
@@ -168,13 +165,13 @@ def _effect_target_flags(db, ability_guid, effect_guid, effect_order):
     SQLite.  Read the target index from the authoritative Records graph first
     so existing databases still resolve a target index of zero correctly.
     """
-    row = db.execute(
-        "SELECT target_template_ids FROM talent_abilities "
-        "WHERE ability_guid=? LIMIT 1", (ability_guid,)).fetchone()
-    if not row:
+    from pvp_db import (db_talent_target_template_ids,
+                        db_ability_effect_target_index)
+    payload = db_talent_target_template_ids(ability_guid, conn=db)
+    if not payload:
         return set(), set()
     try:
-        target_ids = json.loads(row[0] or "[]")
+        target_ids = json.loads(payload or "[]")
     except (TypeError, ValueError):
         target_ids = []
     if not isinstance(target_ids, list):
@@ -194,13 +191,11 @@ def _effect_target_flags(db, ability_guid, effect_guid, effect_order):
     except (AttributeError, TypeError, ValueError, RuntimeError):
         target_index = None
     if target_index is None:
-        db_row = db.execute(
-            "SELECT target_index FROM ability_effects WHERE ability_guid=? "
-            "AND effect_guid=? AND effect_order=?",
-            (ability_guid, effect_guid, effect_order)).fetchone()
-        if db_row:
+        db_row = db_ability_effect_target_index(
+            ability_guid, effect_guid, conn=db)
+        if db_row is not None:
             try:
-                target_index = int(db_row[0])
+                target_index = int(db_row)
             except (TypeError, ValueError):
                 target_index = -1
     if target_index is None or target_index < 0 or target_index >= len(target_ids):
@@ -210,13 +205,12 @@ def _effect_target_flags(db, ability_guid, effect_guid, effect_order):
 
 def _legacy_target_template_flags(db, ability_guid):
     """Return aggregate target flags for older callers."""
-    row = db.execute(
-        "SELECT target_template_ids FROM talent_abilities WHERE ability_guid=? "
-        "LIMIT 1", (ability_guid,)).fetchone()
-    if not row:
+    from pvp_db import db_talent_target_template_ids
+    payload = db_talent_target_template_ids(ability_guid, conn=db)
+    if not payload:
         return set(), set()
     try:
-        target_guids = json.loads(row[0] or "[]")
+        target_guids = json.loads(payload or "[]")
     except (TypeError, ValueError):
         target_guids = []
     card_types, zones = set(), set()
@@ -273,10 +267,9 @@ def pregame_modifiers(db, session, user_id, ability_guids):
         "maximum_hand": 0,
         "starting_hand_effects": [],
     }
+    from pvp_db import db_talent_ability_condition, db_talent_description
     for guid in ability_guids or []:
-        row = db.execute(
-            "SELECT talent_guid, condition FROM talent_abilities "
-            "WHERE ability_guid=? LIMIT 1", (str(guid),)).fetchone()
+        row = db_talent_ability_condition(str(guid), conn=db)
         if not row:
             # Signature champion powers are not PreGame talent abilities.
             continue
@@ -285,10 +278,7 @@ def pregame_modifiers(db, session, user_id, ability_guids):
         if condition and not evaluate_condition(condition, db, session, user_id):
             continue
 
-        talent = db.execute(
-            "SELECT description FROM talent_data WHERE talent_guid=?",
-            (talent_guid,)).fetchone()
-        description = talent[0] if talent else ""
+        description = db_talent_description(talent_guid, conn=db) or ""
         # Ruthlessly Efficient is authored as a dungeon-only pre-game ability,
         # but older extracted rows have no condition field. Its bonus starts
         # only after a previous win in this same dungeon.
@@ -310,43 +300,43 @@ def pregame_modifiers(db, session, user_id, ability_guids):
                     amount = _text_number(text, r"gain\s+([a-z]+|\d+)\s+charges?")
                 result["charges"] += amount
             elif prop == "intattr":
-                result["starting_hand"] += _text_number(
-                    text, r"starting hand size is increased by\s+([a-z]+|\d+)")
-                result["maximum_hand"] += _text_number(
-                    text, r"maximum hand size is increased by\s+([a-z]+|\d+)")
+                # IntAttrModifier.m_Attribute/m_Value are the rules fields;
+                # game text is localized presentation and may be absent.
+                attr = str(param.get("attribute") or "").rsplit(".", 1)[-1]
+                amount = int(param.get("amount") or 0)
+                if attr == "StartingHandSizeModifiers":
+                    result["starting_hand"] += amount
+                elif attr == "MaximumHandSizeModifiers":
+                    result["maximum_hand"] += amount
+                else:
+                    result["starting_hand"] += _text_number(
+                        text, r"starting hand size is increased by\s+([a-z]+|\d+)")
+                    result["maximum_hand"] += _text_number(
+                        text, r"maximum hand size is increased by\s+([a-z]+|\d+)")
 
         if re.search(r"random troop in your starting hand", description or "",
                      re.IGNORECASE):
-            if any("rage" in (param.get("text") or "").lower()
-                   for param in effect_params):
+            rage_params = [param for param in effect_params
+                           if str(param.get("attribute") or "").rsplit(
+                               ".", 1)[-1].lower() == "rage"]
+            if not rage_params:
+                rage_params = [param for param in effect_params
+                               if "rage" in (param.get("text") or "").lower()]
+            if rage_params:
                 result["starting_hand_effects"].append({
                     "ability_guid": str(guid).lower(),
                     "rage": max(
-                        _text_number(param.get("text") or "",
-                                     r"rage\s+([a-z]+|\d+)")
-                        for param in effect_params
-                        if "rage" in (param.get("text") or "").lower()),
+                        int(param.get("amount") or _text_number(
+                            param.get("text") or "", r"rage\s+([a-z]+|\d+)"))
+                        for param in rage_params),
                 })
 
-        target_types, target_zones = _target_template_flags(db, str(guid))
-        if (target_zones and "Hand" in target_zones
-                and target_types & {"BasicAction", "QuickAction"}
-                and re.search(r"starting hand", description or "",
-                              re.IGNORECASE)):
-            for param in effect_params:
-                if ((param.get("property") or "").lower() != "cardcost"
-                        or str(param.get("duration") or "").lower()
-                        != "permanent"):
-                    continue
-                delta = _card_cost_delta(param)
-                if delta:
-                    result["starting_hand_effects"].append({
-                        "ability_guid": str(guid).lower(),
-                        "card_cost_mod": delta,
-                        "card_types": sorted(target_types &
-                                              {"BasicAction", "QuickAction"}),
-                    })
-                    break
+        # Starting-hand cost modifiers (e.g. Devoted) are authored as
+        # GameStartedEvent triggered abilities.  They are discovered and
+        # resolved by the normal trigger dispatcher, so applying their
+        # ``cardcost`` leaf here as well would reduce the cost twice.  The
+        # rage variant below stays because its trigger leaf is an ``intattr``
+        # with no attribute and therefore does not apply natively.
     return result
 
 
@@ -359,19 +349,16 @@ def passive_talent_starting_health_modifier(db, talent_guids):
     the only extracted modifier available to battle setup.  Ignore talents
     that do have an ability row here so their modifier is not counted twice.
     """
+    from pvp_db import db_talent_description, db_talent_has_ability
     total = 0
     for talent_guid in talent_guids or []:
-        row = db.execute(
-            "SELECT description FROM talent_data WHERE talent_guid=?",
-            (str(talent_guid),)).fetchone()
-        if not row:
+        description = db_talent_description(talent_guid, conn=db)
+        if not description:
             continue
-        if db.execute(
-                "SELECT 1 FROM talent_abilities WHERE talent_guid=? LIMIT 1",
-                (str(talent_guid),)).fetchone():
+        if db_talent_has_ability(talent_guid, conn=db):
             continue
         for match in re.finditer(
-                r"([+-]?\d+)\s+starting health\b", row[0] or "",
+                r"([+-]?\d+)\s+starting health\b", description or "",
                 re.IGNORECASE):
             total += int(match.group(1))
     return total
@@ -383,10 +370,8 @@ def _apply_bom_health(db, ability_guid):
     "gain 1 health".  Attribute/damage/stat leaves are NOT health gains."""
     import json as _json
     import re as _re
-    rows = db.execute(
-        "SELECT effect_guid, effect_type, param FROM ability_effects "
-        "WHERE ability_guid=? ORDER BY effect_order",
-        (ability_guid,)).fetchall()
+    from pvp_db import db_ability_effect_rows
+    rows = db_ability_effect_rows(ability_guid, conn=db)
     total = 0
     for _eg, et, param in rows:
         if et != "CardModifierAbilityEffectTemplate":
@@ -453,23 +438,16 @@ def apply_pregame_abilities(game, session, db, handler, player_uid, user_id, abi
     bstate[charge_field] = int(game.__dict__.get(charge_field, 0) or 0)
     counts = bstate.setdefault("pregame_initial_deck_counts", {})
     if str(user_id) not in counts:
-        row = db.execute(
-            "SELECT COUNT(*) FROM game_cards WHERE session_id=? "
-            "AND user_id=? AND location='deck'",
-            (session.session_id, user_id)).fetchone()
-        counts[str(user_id)] = int(row[0] if row else 0)
+        from pvp_db import db_deck_card_count
+        counts[str(user_id)] = db_deck_card_count(
+            session.session_id, user_id, conn=db)
 
     # The current seed stores the complete parent-level effect metadata, so
     # selecting these by effect type covers every authored PreGame token/deck
     # grant without individual champion/card-name rules.
     selected = {str(guid).lower() for guid in (ability_guids or [])}
-    rows = []
-    if selected:
-        placeholders = ",".join("?" * len(selected))
-        rows = db.execute(
-            "SELECT DISTINCT ability_guid, condition FROM talent_abilities "
-            "WHERE ability_guid IN ({}) AND (activatable_phases & 4) != 0"
-            .format(placeholders), tuple(selected)).fetchall()
+    from pvp_db import db_pregame_talent_rows
+    rows = db_pregame_talent_rows(selected, conn=db)
     source_attr = "_player_champ_scid" if user_id else "_ai_champ_scid"
     source_scid = getattr(handler, source_attr, None)
     source_uid = (int(source_scid.uid.uid64) if source_scid is not None
@@ -492,9 +470,17 @@ def apply_pregame_abilities(game, session, db, handler, player_uid, user_id, abi
         if not deck_effect:
             continue
         try:
-            result = resolve_ability(
-                handler, game, session, db, pl_t, ai_t, bstate,
-                str(ability_guid).lower(), source_uid, int(user_id or 0), {})
+            if getattr(session, "_rules_port_session", None) is not None:
+                from rules_port.resolution import resolve_port_ability
+                result = resolve_port_ability(
+                    handler, game, session, db, pl_t, ai_t, bstate,
+                    str(ability_guid).lower(), source_uid,
+                    int(user_id or 0), target_map={})
+            else:
+                result = resolve_ability(
+                    handler, game, session, db, pl_t, ai_t, bstate,
+                    str(ability_guid).lower(), source_uid,
+                    int(user_id or 0), {})
             if result:
                 logs.append(f"{ability_guid}: {result}")
         except Exception as exc:

@@ -32,6 +32,14 @@ except ImportError:  # pragma: no cover - deployment fallback
     yaml = None
 
 from encoder import encode_objfmt_response, encode_datawrapper, compress_gzip
+import pve_db
+import pvp_db
+from profile_db import (db_add_collection, db_add_inventory,
+                        db_inventory_item, db_next_inventory_client_uid,
+                        db_upsert_inventory_item, db_reward_card_template,
+                        db_grant_card_instance,
+                        db_adjust_user_currency, db_champion_reward_profile,
+                        db_update_champion_xp, db_create_treasure_chest)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,8 +52,7 @@ def _make_camp_uid(lo, hi=0):
 
 def _new_camp_id(db):
     """Generate a unique campaign UID for our DB."""
-    row = db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM campaigns").fetchone()
-    cid = row[0]
+    cid = pve_db.db_next_campaign_id(db)
     # Return as JSON-friendly ulong (just an int, since Python ints are arbitrary-precision
     # and Newtonsoft.Json on the client can parse them from JSON numbers)
     return cid
@@ -56,21 +63,19 @@ def _generate_inst_id():
     return abs(hash(uuid.uuid4())) % (2**63)
 
 
+def _save_campaign_state(db, campaign_id, state):
+    """Persist campaign state through the PVE domain boundary."""
+    pve_db.db_campaign_update_state(campaign_id, json.dumps(state), db)
+
+
 def _get_champion(db, champion_id):
     """Get champion info from the DB."""
-    return db.execute(
-        "SELECT id, user_id, race, champion_name, level FROM champions WHERE id=?",
-        (champion_id,)
-    ).fetchone()
+    return pve_db.db_campaign_champion(champion_id, db)
 
 
 def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
     """Find (or create) a campaign for a champion."""
-    row = db.execute(
-        "SELECT id, camp_uid_lo, camp_uid_hi, is_started, state_json "
-        "FROM campaigns WHERE champion_id=? AND campaign_type=?",
-        (champion_id, campaign_type)
-    ).fetchone()
+    row = pve_db.db_campaign_for_champion(champion_id, campaign_type, db)
     if not row:
         cid = _new_camp_id(db)
         inst_id = _generate_inst_id()
@@ -79,18 +84,13 @@ def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
         champ_name = champ[3] if champ else ""
         state = _build_initial_gameplay_state(cid, champion_id, campaign_type, race)
         template_name = "Crayburn Castle" if campaign_type == "DUNGEON" else "AZ1"
-        db.execute(
-            "INSERT INTO campaigns (id, camp_uid_lo, camp_uid_hi, champion_id, user_id, "
-            "champion_name, template_name, campaign_type, is_started, state_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (cid, inst_id, 0, champion_id,
-             db.execute("SELECT user_id FROM champions WHERE id=?", (champion_id,)).fetchone()[0],
-             champ_name, template_name, campaign_type, 0, json.dumps(state))
-        )
+        pve_db.db_create_campaign(
+            cid, inst_id, champion_id, pve_db.db_campaign_user_id(champion_id, db),
+            champ_name, template_name, campaign_type, json.dumps(state), db)
         db.commit()
         # Keep the champion's LastCampaignID in sync so the client can jump
         # straight into this campaign after selecting the champion on the globe.
-        db.execute("UPDATE champions SET last_campaign_id=? WHERE id=?", (cid, champion_id))
+        pve_db.db_campaign_set_last_campaign(champion_id, cid, db)
         db.commit()
         # A DUNGEON campaign always drives a journal quest (the client's
         # QuestMgr queries getactive with CampType=QUEST and resolves the quest
@@ -117,17 +117,16 @@ def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
             race = champ[2] if champ else None
             existing_state = _build_initial_gameplay_state(
                 row[0], champion_id, "PANORAMA", race)
-            db.execute(
-                "UPDATE campaigns SET template_name='AZ1', is_started=0, state_json=? WHERE id=?",
-                (json.dumps(existing_state), row[0]))
+            pve_db.db_campaign_update_state(
+                row[0], json.dumps(existing_state), db, started=False,
+                template_name="AZ1")
             db.commit()
         champ = _get_champion(db, champion_id)
         cfg = _az0_config(champ[2]) if champ else None
         if cfg and _normalize_starter_panorama_state(existing_state, cfg):
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(existing_state), row[0]))
+            pve_db.db_campaign_update_state(row[0], json.dumps(existing_state), db)
             db.commit()
-    db.execute("UPDATE champions SET last_campaign_id=? WHERE id=?", (row[0], champion_id))
+    pve_db.db_campaign_set_last_campaign(champion_id, row[0], db)
     db.commit()
     if campaign_type == "DUNGEON":
         _ensure_quest_campaign(db, champion_id, "DUNGEON")
@@ -136,12 +135,7 @@ def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
 
 def _get_existing_campaign_for_champion(db, champion_id, campaign_type):
     """Return the newest stored campaign of *campaign_type*, without creating one."""
-    row = db.execute(
-        "SELECT id, camp_uid_lo, camp_uid_hi, is_started, state_json "
-        "FROM campaigns WHERE champion_id=? AND campaign_type=? "
-        "ORDER BY id DESC LIMIT 1",
-        (champion_id, campaign_type)
-    ).fetchone()
+    row = pve_db.db_latest_campaign_for_champion(champion_id, campaign_type, db)
     if not row:
         return None
     return (row[0], row[1], row[2], row[3],
@@ -201,12 +195,7 @@ def _quest_objective_conversation_guids(db, champ_id, quest_script,
     champion = _get_champion(db, champ_id)
     race = _RACE_NAMES.get(champion[2]) if champion else None
     race_key = re.sub(r"[^a-z0-9]", "", str(race or "").lower())
-    rows = db.execute(
-        "SELECT conversation_guid, role, faction, conversation_name "
-        "FROM quest_conversations WHERE quest_script=? AND enabled=1 "
-        "ORDER BY priority, conversation_guid",
-        (str(quest_script),),
-    ).fetchall()
+    rows = pve_db.db_quest_conversations(quest_script, db)
     faction_neutral = {str(guid) for guid, _role, row_faction, _name in rows
                        if not row_faction}
     matching_complete = [
@@ -257,15 +246,12 @@ def _quest_objective_scene_guid(db, quest_script, objective):
         return None
     explicit = str(objective.get("encounter") or "").strip()
     if explicit and explicit != "00000000-0000-0000-0000-000000000000":
-        if db.execute("SELECT 1 FROM encounter_scenes WHERE guid=?", (explicit,)).fetchone():
+        if pve_db.db_encounter_scene_exists(explicit, db):
             return explicit
     objective_type = str(objective.get("type") or "").lower()
     if objective_type not in {"encounter", "dungeon"}:
         return None
-    rows = db.execute(
-        "SELECT guid, name, title FROM encounter_scenes "
-        "WHERE name LIKE 'AZ 1 - NODE %' ORDER BY name"
-    ).fetchall()
+    rows = pve_db.db_az1_scene_rows(db)
     if not rows:
         return None
     script_tokens = set(re.findall(r"[a-z0-9]+", str(quest_script or "").lower()))
@@ -326,18 +312,8 @@ def _materialize_quest_objectives(db, champ_id, quest_script, objectives):
 
 def _quest_template(db, quest_script=None, campaign_group=None):
     """Select a QuestTemplate from the server-owned metadata table."""
-    sql = ("SELECT script_name, title, objectives_json, campaign_group, "
-           "start_hook FROM quest_templates WHERE enabled=1")
-    params = []
-    if quest_script:
-        sql += " AND script_name=?"
-        params.append(quest_script)
-    if campaign_group:
-        sql += " AND campaign_group=?"
-        params.append(campaign_group)
-    sql += " ORDER BY script_name LIMIT 1"
     try:
-        row = db.execute(sql, params).fetchone()
+        row = pve_db.db_quest_template(quest_script, campaign_group, db)
     except Exception:
         # Small protocol fixtures may predate quest metadata.  Real databases
         # are seeded by static.ensure_schema before campaign requests arrive.
@@ -364,11 +340,9 @@ def _ensure_quest_campaign(db, champ_id, campaign_group, quest_script=None):
     # encounter links before copying objectives into persistent quest state.
     q["objectives"] = _materialize_quest_objectives(
         db, champ_id, script_name, q.get("objectives"))
-    row = db.execute(
-        "SELECT id FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND template_name=?", (champ_id, script_name)).fetchone()
-    if row:
-        return row[0]
+    existing_id = pve_db.db_quest_campaign_id(champ_id, script_name, db)
+    if existing_id:
+        return existing_id
     cid = _new_camp_id(db)
     inst_id = _generate_inst_id()
     champ = _get_champion(db, champ_id)
@@ -416,9 +390,8 @@ def _ensure_quest_campaign(db, champ_id, campaign_group, quest_script=None):
             {"Name": guid, "Data": {"encscene": guid}}
             for guid in dict.fromkeys(
                 obj.get("encounter") for obj in q["objectives"]
-                if obj.get("encounter") and db.execute(
-                    "SELECT 1 FROM encounter_scenes WHERE guid=?", (obj["encounter"],)
-                ).fetchone()
+                if obj.get("encounter") and pve_db.db_encounter_scene_exists(
+                    obj["encounter"], db)
             )
         ],
         "Champions": [],
@@ -429,13 +402,9 @@ def _ensure_quest_campaign(db, champ_id, campaign_group, quest_script=None):
         "Wins": 0, "Losses": 0, "Score": 0, "HealthAdj": 0, "DungeonLifeAdj": 0,
         "Flags": {"_quest_objective_idx": 0, "_quest_objectives": q["objectives"]},
     }
-    db.execute(
-        "INSERT INTO campaigns (id, camp_uid_lo, camp_uid_hi, champion_id, user_id, "
-        "champion_name, template_name, campaign_type, is_started, state_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (cid, inst_id, 0, champ_id,
-         db.execute("SELECT user_id FROM champions WHERE id=?", (champ_id,)).fetchone()[0],
-         champ_name, script_name, "QUEST", 1, json.dumps(state)))
+    pve_db.db_create_campaign(
+        cid, inst_id, champ_id, pve_db.db_campaign_user_id(champ_id, db),
+        champ_name, script_name, "QUEST", json.dumps(state), db, is_started=True)
     db.commit()
     return cid
 
@@ -453,14 +422,11 @@ def _advance_quest_campaign(db, champ_id, quest_script=None, scene_guid=None):
         quest_script = template["script_name"] if template else None
     if not quest_script:
         return None
-    row = db.execute(
-        "SELECT id, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND template_name=?",
-        (champ_id, quest_script)).fetchone()
-    if not row:
+    rows = pve_db.db_campaign_state_rows(
+        champ_id, "QUEST", db, template_name=quest_script)
+    if not rows:
         return None
-    qid, state_json = row
+    qid, state_json = rows[0]
     state = json.loads(state_json) if state_json else None
     if not state:
         return None
@@ -528,7 +494,7 @@ def _advance_quest_campaign(db, champ_id, quest_script=None, scene_guid=None):
         state["FinishReason"] = "Complete"
         state["ALoc"] = None
         state["CurState"] = "EXPLORE"
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?", (json.dumps(state), qid))
+    _save_campaign_state(db, qid, state)
     db.commit()
     return state
 
@@ -541,11 +507,8 @@ def _active_area_encounter_guid(db, champ_id):
     ``ActiveEncounterGuid`` while the battle is resolving, so use that
     authoritative active encounter as the compatibility link.
     """
-    rows = db.execute(
-        "SELECT state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='AREA' "
-        "AND state_json IS NOT NULL ORDER BY id DESC",
-        (champ_id,)).fetchall()
+    rows = [(row[1],) for row in pve_db.db_campaign_state_rows(
+        champ_id, "AREA", db, newest_first=True)]
     for (raw_state,) in rows:
         try:
             state = json.loads(raw_state or "{}")
@@ -568,11 +531,9 @@ def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
     if not scene_guid:
         return []
     active_area_scene = _active_area_encounter_guid(db, champ_id)
-    rows = db.execute(
-        "SELECT template_name FROM campaigns WHERE champion_id=? "
-        "AND campaign_type='QUEST' AND template_name<>? AND state_json IS NOT NULL",
-        (champ_id, "az01_tamed"),
-    ).fetchall()
+    rows = [(pve_db.db_campaign_template_name(row[0], conn=db),)
+            for row in pve_db.db_campaign_state_rows(
+                champ_id, "QUEST", db, exclude_template="az01_tamed")]
     advanced = []
     for (script,) in rows:
         _qid, state = _quest_state_row(db, champ_id, script)
@@ -583,10 +544,7 @@ def _advance_quest_encounter_objectives(db, champ_id, scene_guid):
             db, champ_id, script, flags.get("_quest_objectives") or [])
         if objectives != (flags.get("_quest_objectives") or []):
             flags["_quest_objectives"] = objectives
-            db.execute(
-                "UPDATE campaigns SET state_json=? WHERE id=?",
-                (json.dumps(state), _qid),
-            )
+            _save_campaign_state(db, _qid, state)
             db.commit()
         try:
             index = int(flags.get("_quest_objective_idx", 0))
@@ -617,11 +575,7 @@ def _consume_pending_quest_progress(db, champ_id):
     Keep that notify pending in the quest state until the champion next asks
     for campaign state, then consume it after persisting the corrected state.
     """
-    rows = db.execute(
-        "SELECT id, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND state_json IS NOT NULL ORDER BY id",
-        (champ_id,)).fetchall()
+    rows = pve_db.db_campaign_state_rows(champ_id, "QUEST", db)
     for quest_id, raw_state in rows:
         try:
             state = json.loads(raw_state or "{}")
@@ -629,8 +583,7 @@ def _consume_pending_quest_progress(db, champ_id):
             continue
         if not state.pop("_quest_progress_notify_pending", False):
             continue
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), quest_id))
+        _save_campaign_state(db, quest_id, state)
         db.commit()
         state.setdefault("CampID", quest_id)
         state.setdefault("ChampID", champ_id)
@@ -649,10 +602,8 @@ def _advance_quest_conversation_objectives(db, champ_id, conversation_guid):
     if not champ_id or not conversation_guid:
         return []
     guid = str(conversation_guid)
-    rows = db.execute(
-        "SELECT template_name FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND state_json IS NOT NULL", (champ_id,)).fetchall()
+    rows = [(pve_db.db_campaign_template_name(row[0], conn=db),)
+            for row in pve_db.db_campaign_state_rows(champ_id, "QUEST", db)]
     advanced = []
     for (script,) in rows:
         _qid, state = _quest_state_row(db, champ_id, script)
@@ -663,10 +614,7 @@ def _advance_quest_conversation_objectives(db, champ_id, conversation_guid):
             db, champ_id, script, flags.get("_quest_objectives") or [])
         if objectives != (flags.get("_quest_objectives") or []):
             flags["_quest_objectives"] = objectives
-            db.execute(
-                "UPDATE campaigns SET state_json=? WHERE id=?",
-                (json.dumps(state), _qid),
-            )
+            _save_campaign_state(db, _qid, state)
             db.commit()
         try:
             index = int(flags.get("_quest_objective_idx", 0) or 0)
@@ -703,10 +651,8 @@ def _quest_encounter_is_pending(db, champ_id, scene_guid):
     """
     if not champ_id or not scene_guid:
         return False
-    rows = db.execute(
-        "SELECT state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND state_json IS NOT NULL", (champ_id,)).fetchall()
+    rows = [(row[1],) for row in pve_db.db_campaign_state_rows(
+        champ_id, "QUEST", db)]
     for (raw_state,) in rows:
         try:
             state = json.loads(raw_state or "{}")
@@ -915,13 +861,7 @@ def _gaal_camp_nodes(db, campaign_template):
     branch in the campaign engine.
     """
     try:
-        rows = db.execute(
-            "SELECT DISTINCT node_id FROM campaign_node_conversations "
-            "WHERE campaign_template=? AND enabled=1 "
-            "AND lower(conversation_name) LIKE '%gaal%' "
-            "AND lower(conversation_name) NOT LIKE '%already has fortune%'",
-            (str(campaign_template or ""),),
-        ).fetchall()
+        rows = pve_db.db_gaal_nodes(campaign_template, db)
     except Exception:
         return set()
     return {str(row[0]) for row in rows if row and row[0]}
@@ -1026,10 +966,7 @@ def _activate_az1_transition(db, champ_id, cfg):
     """
     if not cfg or not cfg.get("transition_conv"):
         return None
-    row = db.execute(
-        "SELECT id, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='PANORAMA' "
-        "ORDER BY id DESC LIMIT 1", (champ_id,)).fetchone()
+    row = pve_db.db_latest_campaign_state(champ_id, "PANORAMA", db)
     if not row:
         return None
     pano_id, state_json = row
@@ -1056,8 +993,8 @@ def _activate_az1_transition(db, champ_id, cfg):
     state["PostCrayburnReport"] = True
     state["ALoc"] = None
     state["CurState"] = "EXPLORE"
-    db.execute("UPDATE campaigns SET is_started=1, state_json=? WHERE id=?",
-               (json.dumps(state), pano_id))
+    pve_db.db_campaign_update_state(
+        pano_id, json.dumps(state), db, started=True)
     db.commit()
     return pano_id, state
 
@@ -1112,10 +1049,8 @@ def _prepare_post_crayburn_report(db, champ_id, state):
 
 def _activate_az1_area(db, champ_id):
     """Create/activate the AZ1 overworld campaign at Into The Woods."""
-    row = db.execute(
-        "SELECT id, camp_uid_lo, camp_uid_hi, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='AREA' AND template_name='AZ1' "
-        "ORDER BY id DESC LIMIT 1", (champ_id,)).fetchone()
+    row = pve_db.db_latest_campaign_state(
+        champ_id, "AREA", db, template_name="AZ1")
     if row:
         cid, lo, hi, raw = row
         state = json.loads(raw) if raw else {}
@@ -1125,10 +1060,9 @@ def _activate_az1_area(db, champ_id):
         champ = _get_champion(db, champ_id)
         user_id = champ[1] if champ else 0
         champ_name = champ[3] if champ else ""
-        db.execute("INSERT INTO campaigns (id,camp_uid_lo,camp_uid_hi,champion_id,user_id,"
-                   "champion_name,template_name,campaign_type,is_started,state_json) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                   (cid,lo,hi,champ_id,user_id,champ_name,"AZ1","AREA",1,"{}"))
+        pve_db.db_create_campaign(
+            cid, lo, champ_id, user_id, champ_name, "AZ1", "AREA", "{}",
+            db, is_started=True)
     previous_state = state if row and isinstance(state, dict) else {}
     previous_locations = {
         (item.get("Data") or {}).get("node"): item.get("Data") or {}
@@ -1145,10 +1079,7 @@ def _activate_az1_area(db, champ_id):
     # Resolve every authored AZ1 encounter by its NODE number.  The map node
     # owns the encounter reference; scene metadata supplies the GUID,
     # rewards, and scene type (including all Shroom Haus locations).
-    scenes = db.execute(
-        "SELECT guid, name, rewards_json FROM encounter_scenes "
-        "WHERE name LIKE 'AZ 1 - NODE %'"
-    ).fetchall()
+    scenes = pve_db.db_az1_scene_metadata(db)
     _hydrate_az1_area_scene_metadata(db, area_locs, champ_id=champ_id,
                                      state={"VisLocs": area_locs,
                                             "PublicState": {"Data": {}}})
@@ -1180,9 +1111,7 @@ def _activate_az1_area(db, champ_id):
     area_encounters = []
     for loc in area_locs:
         guid = (loc.get("Data") or {}).get("encounter")
-        if guid and db.execute(
-                "SELECT 1 FROM encounter_scenes WHERE guid=?", (guid,)
-        ).fetchone():
+        if guid and pve_db.db_encounter_scene_exists(guid, db):
             if guid not in {x["Name"] for x in area_encounters}:
                 area_encounters.append({"Name": guid, "Data": {"encscene": guid}})
     state.update({"CampID": cid, "ChampID": champ_id, "TempType": "AREA",
@@ -1207,26 +1136,20 @@ def _activate_az1_area(db, champ_id):
     _sync_az1_quest_gates(db, champ_id, state)
     _apply_az1_quest_markers(db, champ_id, state)
     _az1_reveal_neighbors(db, state, state.get("LastNode") or "Node001")
-    db.execute("UPDATE campaigns SET is_started=1,state_json=? WHERE id=?",
-               (json.dumps(state), cid))
+    pve_db.db_campaign_update_state(
+        cid, json.dumps(state), db, started=True)
     # LastCampaignID is the client's reconnect entry point. Returning from a
     # panorama must move it back to the AREA campaign; otherwise a later
     # qcur4champ query can reopen the panorama the player just left.
-    db.execute("UPDATE champions SET last_campaign_id=? WHERE id=?",
-               (cid, champ_id))
+    pve_db.db_campaign_set_last_campaign(champ_id, cid, db)
     db.commit()
     return cid, state
 
 
 def _panorama_npc_for_conversation(db, conversation_guid, node):
     """Return the authored NPC for a quest conversation at an area node."""
-    row = db.execute(
-        "SELECT npc, role FROM quest_conversations "
-        "WHERE campaign_template='AZ1' AND node_id=? "
-        "AND conversation_guid=? AND enabled=1 "
-        "ORDER BY priority, rowid LIMIT 1",
-        (node, str(conversation_guid or "")),
-    ).fetchone()
+    row = pve_db.db_panorama_conversation_npc(
+        node, conversation_guid, db)
     return (row[0], row[1]) if row and row[0] else (None, None)
 
 
@@ -1234,11 +1157,7 @@ def _panorama_champion_guid(db, npc):
     """Resolve a panorama NPC's client portrait from authored champion data."""
     if not npc:
         return None
-    row = db.execute(
-        "SELECT guid FROM champion_templates_extended "
-        "WHERE lower(name)=lower(?) LIMIT 1", (npc,)
-    ).fetchone()
-    return row[0] if row else None
+    return pve_db.db_champion_template_guid_by_name(npc, db)
 
 
 def _panorama_npc_from_conversation_name(conversation_name):
@@ -1270,16 +1189,7 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
     )
     faction = _quest_faction_for_champion(db, champion_id)
     candidates = {}
-    rows = db.execute(
-        "SELECT qc.quest_script, qc.conversation_guid, qc.role, qc.faction, "
-        "qc.npc, qc.priority, COALESCE(NULLIF(qc.start_hook, ''), "
-        "NULLIF(qt.start_hook, ''), '') "
-        "FROM quest_conversations qc "
-        "LEFT JOIN quest_templates qt ON qt.script_name=qc.quest_script "
-        "WHERE qc.campaign_template='AZ1' AND qc.node_id=? "
-        "AND qc.enabled=1 ORDER BY qc.priority, qc.rowid",
-        (str(node),),
-    ).fetchall()
+    rows = pve_db.db_panorama_quest_rows(node, db)
     for (script, conversation_guid, role, row_faction, npc, priority,
          start_hook) in rows:
         if not npc or not conversation_guid or not _quest_row_matches_faction(
@@ -1348,13 +1258,7 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
     # provide the animal-taming hints and the faction-specific Sea Hag/other
     # NPC follow-ups.  Include one authored repeat conversation when no more
     # specific quest conversation currently owns that NPC.
-    generic_rows = db.execute(
-        "SELECT conversation_guid, trigger_json, conversation_name, priority "
-        "FROM campaign_node_conversations "
-        "WHERE campaign_template='AZ1' AND node_id=? AND enabled=1 "
-        "ORDER BY priority, conversation_guid",
-        (str(node),),
-    ).fetchall()
+    generic_rows = pve_db.db_panorama_generic_rows(node, db)
     for conversation_guid, raw_trigger, conversation_name, priority in generic_rows:
         try:
             trigger = json.loads(raw_trigger or "{}")
@@ -1371,12 +1275,7 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
         # even before their quest has been introduced.  Associate the NPC
         # with its authored quest rows and expose the repeat only after one
         # of those quest campaigns exists (active or finished).
-        npc_quest_scripts = db.execute(
-            "SELECT DISTINCT quest_script FROM quest_conversations "
-            "WHERE campaign_template='AZ1' AND node_id=? AND npc=? "
-            "AND enabled=1",
-            (str(node), str(npc)),
-        ).fetchall()
+        npc_quest_scripts = pve_db.db_panorama_npc_quest_scripts(node, npc, db)
         if (npc_quest_scripts and not any(
                 _quest_state_row(db, champion_id, script)[1] is not None
                 for (script,) in npc_quest_scripts)):
@@ -1473,14 +1372,9 @@ def _activate_az1_panorama(db, champion_id, scene_guid, node, area_state):
         db, champion_id, "PANORAMA")
     state = _build_az1_panorama_state(
         db, pano_id, champion_id, scene_guid, node, area_state)
-    db.execute(
-        "UPDATE campaigns SET is_started=1, state_json=? WHERE id=?",
-        (json.dumps(state), pano_id),
-    )
-    db.execute(
-        "UPDATE champions SET last_campaign_id=? WHERE id=?",
-        (pano_id, champion_id),
-    )
+    pve_db.db_campaign_update_state(
+        pano_id, json.dumps(state), db, started=True)
+    pve_db.db_campaign_set_last_campaign(champion_id, pano_id, db)
     db.commit()
     return pano_id, state
 
@@ -1504,10 +1398,7 @@ def _az1_scene_for_node(db, node):
     wanted = node_key(node)
     if not wanted:
         return None
-    rows = db.execute(
-        "SELECT guid, name, rewards_json FROM encounter_scenes "
-        "WHERE name LIKE 'AZ 1 - NODE %'"
-    ).fetchall()
+    rows = pve_db.db_az1_scene_metadata(db)
     for row in rows:
         match = re.search(
             r"\bNODE\s*-?\s*([0-9A-Z_]+(?:\s+[A-Z0-9_]+)?)\s*-",
@@ -1556,13 +1447,8 @@ def _az1_node_conversation_rows(db, node, campaign_template="AZ1"):
     try:
         rows = []
         for node_id in node_ids:
-            rows = db.execute(
-                "SELECT conversation_guid, trigger_json, priority, conversation_name "
-                "FROM campaign_node_conversations "
-                "WHERE campaign_template=? AND node_id=? AND enabled=1 "
-                "ORDER BY priority, conversation_guid",
-                (str(campaign_template or "AZ1"), node_id),
-            ).fetchall()
+            rows = pve_db.db_node_conversation_rows(
+                node_id, campaign_template, db)
             if rows:
                 break
     except Exception:
@@ -1804,10 +1690,7 @@ def _az1_outcome_conversation(db, node, won, champ_id=None):
 def _az1_path_fork_ids(db):
     """Return authored AZ1 path-fork nodes from the persisted map topology."""
     try:
-        rows = db.execute(
-            "SELECT from_node, to_node FROM campaign_node_edges "
-            "WHERE campaign_template='AZ1'"
-        ).fetchall()
+        rows = pve_db.db_az1_edges(db)
     except Exception:
         return set()
     return {
@@ -2174,11 +2057,8 @@ def _az1_neighbors(db, node):
     """Return AZ1 node IDs directly connected to *node* in the map graph."""
     if not node:
         return set()
-    rows = db.execute(
-        "SELECT to_node FROM campaign_node_edges "
-        "WHERE campaign_template='AZ1' AND from_node=?",
-        (str(node),),
-    ).fetchall()
+    rows = [(row[1],) for row in pve_db.db_az1_edges(db)
+            if str(row[0]) == str(node)]
     return {str(row[0]) for row in rows if row and row[0]}
 
 
@@ -2282,10 +2162,7 @@ def _az1_locked_paths(db, state, visited=None):
     def unvisited(node):
         return node not in path_forks and node not in visited
 
-    rows = db.execute(
-        "SELECT from_node, to_node, path_name FROM campaign_node_edges "
-        "WHERE campaign_template='AZ1'"
-    ).fetchall()
+    rows = pve_db.db_az1_edges(db)
     # A path is represented by two directed rows.  Evaluate it once so a
     # blank legacy row cannot produce a different lock name from its reverse.
     grouped = {}
@@ -2357,22 +2234,9 @@ def _az1_is_adjacent(db, start_node, end_node):
         return False
     if not start_node or not end_node or start_node == end_node:
         return start_node == end_node
-    if db.execute(
-        "SELECT 1 FROM campaign_node_edges "
-        "WHERE campaign_template='AZ1' AND from_node=? AND to_node=?",
-        (str(start_node), str(end_node)),
-    ).fetchone():
+    if pve_db.db_az1_edge_exists(start_node, end_node, db):
         return True
-    return bool(db.execute(
-        "SELECT 1 FROM campaign_node_edges first "
-        "JOIN campaign_node_edges second "
-        "  ON second.campaign_template=first.campaign_template "
-        " AND second.from_node=first.to_node "
-        "WHERE first.campaign_template='AZ1' "
-        "  AND first.from_node=? AND second.to_node=? "
-        "  AND lower(first.to_node) LIKE 'fork%'",
-        (str(start_node), str(end_node)),
-    ).fetchone())
+    return pve_db.db_az1_fork_edge_exists(start_node, end_node, db)
 
 
 def _az1_has_safe_visited_route(db, state, destination, visited=None):
@@ -2603,10 +2467,10 @@ def _az1_set_quest_route(db, state, visible_node, hidden_node):
 
 
 def _quest_state_row(db, champ_id, quest_script):
-    row = db.execute(
-        "SELECT id, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' AND template_name=? "
-        "ORDER BY id DESC LIMIT 1", (champ_id, quest_script)).fetchone()
+    rows = pve_db.db_campaign_state_rows(
+        champ_id, "QUEST", db, template_name=quest_script,
+        newest_first=True)
+    row = rows[0] if rows else None
     if not row:
         return None, None
     try:
@@ -2667,12 +2531,10 @@ def _quest_hook_az1_tamed_start(db, champ_id, state):
     _az1_set_node_gate(state, "Node005", True)
     # Shadowgrove is the first objective of Cross the Zodiac River. Keep it
     # hidden until Wallace actually starts that quest.
-    zodiac_row = db.execute(
-        "SELECT state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND template_name='az01_q_cross_the_river_part2' "
-        "AND is_started=1 ORDER BY id DESC LIMIT 1", (champ_id,)
-    ).fetchone()
+    zodiac_rows = pve_db.db_campaign_state_rows(
+        champ_id, "QUEST", db, template_name="az01_q_cross_the_river_part2",
+        require_state=True, newest_first=True)
+    zodiac_row = zodiac_rows[0][1:2] if zodiac_rows else None
     try:
         zodiac_active = bool(
             zodiac_row and not json.loads(zodiac_row[0] or "{}").get("Finished")
@@ -2951,10 +2813,7 @@ def _run_quest_start_hook(db, champ_id, hook_name):
     hook = _QUEST_START_HOOKS.get(str(hook_name or ""))
     if hook is None:
         return False
-    row = db.execute(
-        "SELECT id, state_json FROM campaigns WHERE champion_id=? "
-        "AND campaign_type='AREA' AND template_name='AZ1' "
-        "ORDER BY id DESC LIMIT 1", (champ_id,)).fetchone()
+    row = pve_db.db_active_area_campaign(champ_id, conn=db)
     if not row:
         return False
     try:
@@ -2963,8 +2822,7 @@ def _run_quest_start_hook(db, champ_id, hook_name):
         return False
     changed = bool(hook(db, champ_id, state))
     if changed:
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), row[0]))
+        _save_campaign_state(db, row[0], state)
         db.commit()
     return changed
 
@@ -2981,18 +2839,11 @@ def _sync_az1_quest_gates(db, champ_id, state):
     if not isinstance(state, dict):
         return False
     before = json.dumps(state, sort_keys=True)
-    hooks = db.execute(
-        "SELECT c.id, qt.start_hook FROM campaigns c "
-        "JOIN quest_templates qt ON qt.script_name=c.template_name "
-        "WHERE c.champion_id=? AND c.campaign_type='QUEST' "
-        "AND c.state_json IS NOT NULL AND c.is_started=1 "
-        "AND qt.enabled=1 AND qt.start_hook<>'' ORDER BY c.id",
-        (champ_id,)).fetchall()
+    hooks = pve_db.db_active_quest_hooks(champ_id, conn=db)
     for _quest_id, hook_name in hooks:
         try:
             hook_state = json.loads(
-                db.execute("SELECT state_json FROM campaigns WHERE id=?",
-                           (_quest_id,)).fetchone()[0] or "{}")
+                pve_db.db_campaign_state(_quest_id, conn=db) or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         if hook_state.get("Finished"):
@@ -3011,14 +2862,8 @@ def _grant_quests_for_conversation(db, champ_id, campaign_template,
     if not conversation_guid:
         return [], []
     faction = _quest_faction_for_champion(db, champ_id)
-    rows = db.execute(
-        "SELECT qc.quest_script, COALESCE(NULLIF(qt.start_hook, ''), "
-        "NULLIF(qc.start_hook, ''), ''), qc.faction, "
-        "COALESCE(qt.campaign_group, 'AREA') FROM quest_conversations qc "
-        "LEFT JOIN quest_templates qt ON qt.script_name=qc.quest_script "
-        "WHERE qc.conversation_guid=? AND qc.campaign_template=? "
-        "AND qc.role='start' AND qc.enabled=1 ORDER BY qc.priority, qc.quest_script",
-        (str(conversation_guid), str(campaign_template))).fetchall()
+    rows = pve_db.db_quest_start_rows(
+        conversation_guid, campaign_template, conn=db)
     spawned, hooks = [], []
     for script, hook, row_faction, campaign_group in rows:
         if not _quest_row_matches_faction(row_faction, faction):
@@ -3028,11 +2873,9 @@ def _grant_quests_for_conversation(db, champ_id, campaign_template,
         if not quest_id:
             continue
         if existing_id is None:
-            qrow = db.execute(
-                "SELECT state_json FROM campaigns WHERE id=?", (quest_id,)
-            ).fetchone()
-            if qrow and qrow[0]:
-                spawned.append((quest_id, script, json.loads(qrow[0])))
+            qstate = pve_db.db_campaign_state(quest_id, conn=db)
+            if qstate:
+                spawned.append((quest_id, script, json.loads(qstate)))
             if hook:
                 hooks.append(hook)
     for hook in hooks:
@@ -3084,10 +2927,7 @@ def _apply_az1_quest_markers(db, champ_id, state):
     # Node012).  Resolve every authored conversation GUID as well so quest
     # markers and active-objective overrides use the source catalog.
     try:
-        authored_rows = db.execute(
-            "SELECT node_id, conversation_guid FROM campaign_node_conversations "
-            "WHERE campaign_template='AZ1' AND enabled=1"
-        ).fetchall()
+        authored_rows = pve_db.db_az1_node_conversation_ids(conn=db)
     except Exception:
         authored_rows = []
     for node, conversation in authored_rows:
@@ -3096,12 +2936,7 @@ def _apply_az1_quest_markers(db, champ_id, state):
 
     quest_nodes = set()
     active_objective_conversations = set()
-    quest_rows = db.execute(
-        "SELECT template_name, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND is_started=1 AND state_json IS NOT NULL",
-        (champ_id,),
-    ).fetchall()
+    quest_rows = pve_db.db_started_quest_states(champ_id, conn=db)
     for quest_script, raw_state in quest_rows:
         try:
             quest_state = json.loads(raw_state or "{}")
@@ -3115,11 +2950,10 @@ def _apply_az1_quest_markers(db, champ_id, state):
             db, champ_id, quest_script, old_objectives)
         if objectives != old_objectives:
             flags["_quest_objectives"] = objectives
-            db.execute(
-                "UPDATE campaigns SET state_json=? WHERE template_name=? "
-                "AND champion_id=? AND campaign_type='QUEST'",
-                (json.dumps(quest_state), quest_script, champ_id),
-            )
+            quest_id = pve_db.db_quest_campaign_id(
+                champ_id, quest_script, conn=db)
+            if quest_id:
+                _save_campaign_state(db, quest_id, quest_state)
             db.commit()
         try:
             objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
@@ -3171,11 +3005,7 @@ def _apply_az1_quest_markers(db, champ_id, state):
         node = data.get("node") or data.get("name")
         if not node or str(node).lower().startswith("node") is False:
             continue
-        rows = db.execute(
-            "SELECT quest_script, conversation_guid, role, faction "
-            "FROM quest_conversations WHERE campaign_template='AZ1' "
-            "AND node_id=? AND enabled=1 ORDER BY priority, conversation_guid",
-            (str(node),)).fetchall()
+        rows = pve_db.db_quest_node_rows(node, conn=db)
         give = False
         turnin = False
         selected = None
@@ -3644,12 +3474,10 @@ def _advance_crayburn(state, race_name, from_node, won):
     return None
 
 def _race_name_for_campaign(db, camp_id):
-    row = db.execute(
-        "SELECT ch.race FROM campaigns c JOIN champions ch ON c.champion_id=ch.id "
-        "WHERE c.id=?", (camp_id,)).fetchone()
-    if not row:
+    race = pve_db.db_campaign_champion_race(camp_id, conn=db)
+    if race is None:
         return "Necrotic"
-    return _RACE_NAMES.get(row[0], "Necrotic")
+    return _RACE_NAMES.get(race, "Necrotic")
 
 def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
                           target, instance, conh, uid, auto_activate=True):
@@ -3663,9 +3491,7 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
     uncompleted so an encounter loss retries the same battle.
     """
     log = getattr(handler, "_log_req", print)
-    row = db.execute(
-        "SELECT state_json, campaign_type FROM campaigns WHERE id=?",
-        (camp_id,)).fetchone()
+    row = pve_db.db_campaign_runtime_row(camp_id, conn=db)
     if not row:
         return None
     state_json, ctype = row
@@ -3673,8 +3499,7 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
         return None
     state = json.loads(state_json) if state_json else None
     if state is None:
-        champ_row = db.execute(
-            "SELECT champion_id FROM campaigns WHERE id=?", (camp_id,)).fetchone()
+        champ_row = pve_db.db_campaign_identity_state(camp_id, conn=db)
         state = _build_initial_gameplay_state(
             camp_id, champ_row[0] if champ_row else 0, "DUNGEON",
             _race_name_for_campaign(db, camp_id))
@@ -3707,8 +3532,7 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
                 state["ALoc"] = current
                 state["LastNode"] = current
                 state["CurState"] = "EXPLORE"
-                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                           (json.dumps(state), camp_id))
+                _save_campaign_state(db, camp_id, state)
                 db.commit()
                 push_campupdate(handler, db, camp_id,
                                 state.get("ChampID") or 0,
@@ -3735,8 +3559,7 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
                 state["ALoc"] = current
                 state["LastNode"] = current
                 state["CurState"] = "EXPLORE"
-                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                           (json.dumps(state), camp_id))
+                _save_campaign_state(db, camp_id, state)
                 db.commit()
                 push_campupdate(handler, db, camp_id,
                                 state.get("ChampID") or 0,
@@ -3770,13 +3593,12 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
                 _find_campaign_for_champion(db, champ_id, "PANORAMA")
             if panorama_state is not None:
                 _prepare_post_crayburn_report(db, champ_id, panorama_state)
-                db.execute("UPDATE campaigns SET is_started=1, state_json=? WHERE id=?",
-                           (json.dumps(panorama_state), panorama_id))
+                pve_db.db_campaign_update_state(
+                    panorama_id, json.dumps(panorama_state), db, started=True)
                 db.commit()
         if next_node:
             _reveal_crayburn_node(state, next_node)
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), camp_id))
+        _save_campaign_state(db, camp_id, state)
         db.commit()
         champ_id = state.get("ChampID") or 0
         push_campupdate(handler, db, camp_id, champ_id, "crayburn_travel",
@@ -3798,8 +3620,7 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
     from_node = state.get("ALoc") or state.get("LastNode") or "Entrance"
     step = _advance_crayburn(state, race_name, from_node, won)
 
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-               (json.dumps(state), camp_id))
+    _save_campaign_state(db, camp_id, state)
     db.commit()
 
     if not step:
@@ -3821,11 +3642,9 @@ def advance_crayburn_step(handler, db, camp_id, won, comp, session_id,
                         instance, conh, uid)
         return step
 
-    champ = db.execute("SELECT id, last_deck_id FROM champions WHERE id=?",
-                       (state.get("ChampID") or 0,)).fetchone()
-    deck_db_id = champ[1] if champ and champ[1] else None
+    champ_id = state.get("ChampID") or 0
+    deck_db_id = pve_db.db_champion_last_deck_id(champ_id, conn=db)
     deck_uid64 = (deck_db_id << 8) | 17 if deck_db_id else 0
-    champ_id = champ[0] if champ else (state.get("ChampID") or 0)
     log(f"    Crayburn: launching encounter {value} (camp={camp_id})")
     _launch_encounter(handler, db, camp_id, champ_id, value, deck_uid64,
                       comp, session_id, target, instance, conh, uid)
@@ -4464,8 +4283,7 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
             d_state = _prepare_dungeon_state(
                 d_state, _race_name_for_campaign(db, d_cid))
             if json.dumps(d_state, sort_keys=True) != original:
-                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                           (json.dumps(d_state), d_cid))
+                _save_campaign_state(db, d_cid, d_state)
                 db.commit()
             resp = _build_input_response(d_cid, d_state, success=True)
             return _send_response(handler, json.dumps(resp), comp, session_id,
@@ -4477,11 +4295,9 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
     # back into the panorama rather than reopening the map.
     authored_panorama = _get_existing_campaign_for_champion(
         db, champ_id, "PANORAMA")
-    last_campaign = db.execute(
-        "SELECT last_campaign_id FROM champions WHERE id=?", (champ_id,)
-    ).fetchone()
-    if (authored_panorama and last_campaign and
-            last_campaign[0] == authored_panorama[0] and
+    last_campaign_id = pve_db.db_champion_last_campaign_id(
+        champ_id, conn=db)
+    if (authored_panorama and last_campaign_id == authored_panorama[0] and
             authored_panorama[4] and
             authored_panorama[4].get("PanoramaSceneGuid")):
         area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
@@ -4490,8 +4306,8 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
             p_state = _build_az1_panorama_state(
                 db, p_cid, champ_id, p_state.get("PanoramaSceneGuid"),
                 p_state.get("PanoramaNode"), area[4])
-            db.execute("UPDATE campaigns SET is_started=1,state_json=? WHERE id=?",
-                       (json.dumps(p_state), p_cid))
+            pve_db.db_campaign_update_state(
+                p_cid, json.dumps(p_state), db, started=True)
             db.commit()
             resp = _build_input_response(p_cid, p_state, success=True)
             return _send_response(handler, json.dumps(resp), comp, session_id,
@@ -4506,10 +4322,8 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
         pending_quest = _get_existing_campaign_for_champion(db, champ_id, "QUEST")
         if pending_quest:
             q_cid, _qi, _qh, _qs, q_state = pending_quest
-            qrow = db.execute(
-                "SELECT template_name FROM campaigns WHERE id=?", (q_cid,)
-            ).fetchone()
-            q_metadata = _quest_template(db, qrow[0]) if qrow else None
+            q_template = pve_db.db_campaign_template_name(q_cid, conn=db)
+            q_metadata = _quest_template(db, q_template) if q_template else None
             q_flags = (q_state or {}).get("Flags", {})
             q_idx = q_flags.get("_quest_objective_idx")
             q_objectives = q_flags.get("_quest_objectives") or []
@@ -4526,9 +4340,8 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
                     p_cid, _pi, _ph, _ps, p_state = panorama
                     if p_state and _prepare_post_crayburn_report(
                             db, champ_id, p_state):
-                        db.execute(
-                            "UPDATE campaigns SET is_started=1, state_json=? "
-                            "WHERE id=?", (json.dumps(p_state), p_cid))
+                        pve_db.db_campaign_update_state(
+                            p_cid, json.dumps(p_state), conn=db, started=True)
                         db.commit()
                     if p_state:
                         resp = _build_input_response(p_cid, p_state, success=True)
@@ -4543,9 +4356,7 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
     quest = _get_existing_campaign_for_champion(db, champ_id, "QUEST")
     if quest:
         q_cid, _q_inst_id, _q_inst_hi, _q_started, q_state = quest
-        q_template = db.execute(
-            "SELECT template_name FROM campaigns WHERE id=?", (q_cid,)
-        ).fetchone()
+        q_template = pve_db.db_campaign_template_name(q_cid, conn=db)
         if q_state and not q_state.get("Finished"):
             q_aloc = q_state.get("ALoc")
             q_idx = q_state.get("Flags", {}).get("_quest_objective_idx")
@@ -4581,8 +4392,7 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
                 _az1_reveal_neighbors(db, a_state,
                                        a_state.get("LastNode") or a_state.get("ALoc"))
                 if json.dumps(a_state, sort_keys=True) != before:
-                    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                               (json.dumps(a_state), a_cid))
+                    _save_campaign_state(db, a_cid, a_state)
                     db.commit()
             pending_quest_progress = _consume_pending_quest_progress(db, champ_id)
             resp = _build_input_response(a_cid, a_state, success=True)
@@ -4622,38 +4432,9 @@ def _handle_getactive(handler, db, env_json, comp, session_id,
     template = (env_json.get("Template", "") or "")
     tname = template.lower()
 
-    # Find matching campaigns - try exact match then by template name
-    rows = []
-    if template:
-        rows = db.execute(
-            "SELECT id, camp_uid_lo, campaign_type, template_name FROM campaigns "
-            "WHERE champion_id=? AND campaign_type=? AND lower(template_name)=lower(?)",
-            (champ_id, ctype, template)).fetchall()
-    if not rows and template:
-        rows = db.execute(
-            "SELECT id, camp_uid_lo, campaign_type, template_name FROM campaigns "
-            "WHERE champion_id=? AND lower(template_name)=lower(?)",
-            (champ_id, template)).fetchall()
-    if not rows:
-        rows = db.execute(
-            "SELECT id, camp_uid_lo, campaign_type, template_name FROM campaigns "
-            "WHERE champion_id=? AND campaign_type=?",
-            (champ_id, ctype)).fetchall()
-    if not rows and (not ctype or ctype == "ANY"):
-        rows = db.execute(
-            "SELECT id, camp_uid_lo, campaign_type, template_name FROM campaigns "
-            "WHERE champion_id=?", (champ_id,)).fetchall()
-    # getactive is an active-status query. Completed campaign rows are kept
-    # for history, but returning them here makes the client emit stale
-    # "Quest Complete" notifications while selecting another campaign.
-    active_rows = []
-    for row in rows:
-        finished = db.execute(
-            "SELECT json_extract(state_json, '$.Finished') FROM campaigns WHERE id=?",
-            (row[0],)).fetchone()
-        if not finished or finished[0] is None:
-            active_rows.append(row)
-    rows = active_rows
+    # Preserve the exact protocol fallback order while keeping SQL in pve_db.
+    rows = pve_db.db_active_campaign_candidates(
+        champ_id, ctype, template, conn=db)
     templates = [_build_template_info(row[0], row[1], row[2] or "AREA", row[3] or "AZ1") for row in rows]
     return _send_response(handler, json.dumps(templates), comp, session_id,
                           reqid, target, instance, conh, uid)
@@ -4696,11 +4477,7 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
                           reqid, target, instance, conh, uid):
     """QueryCampState: return full GameplayState for a campaign."""
     camp_id = env_json.get("CampID", 0)
-    row = db.execute(
-        "SELECT champion_id, is_started, state_json, campaign_type, template_name "
-        "FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_query_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
         resp["Errors"] = ["Campaign not found"]
@@ -4719,8 +4496,7 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
         champ = _get_champion(db, champ_id)
         cfg = _az0_config(champ[2]) if champ else None
         if cfg and _normalize_starter_panorama_state(state, cfg):
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
         # Rebuild authored AZ1 panoramas from the source AREA state whenever
         # they are queried. Older handoffs contain only one NPC, use the wrong
@@ -4733,8 +4509,7 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
                     db, camp_id, champ_id, state.get("PanoramaSceneGuid"),
                     state.get("PanoramaNode"), area[4])
                 state = repaired
-                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                           (json.dumps(state), camp_id))
+                _save_campaign_state(db, camp_id, state)
                 db.commit()
     if ((ctype or "").upper() == "AREA" and
             str(template_name or "").upper() == "AZ1"):
@@ -4744,15 +4519,13 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
         _az1_reveal_neighbors(db, state,
                                state.get("LastNode") or state.get("ALoc"))
         if json.dumps(state, sort_keys=True) != before:
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
     if (ctype or "").upper() == "DUNGEON":
         before = json.dumps(state, sort_keys=True)
         state = _prepare_dungeon_state(state, _race_name_for_campaign(db, camp_id))
         if json.dumps(state, sort_keys=True) != before:
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
     resp = _build_input_response(camp_id, state, success=True)
     ret = _send_response(handler, json.dumps(resp), comp, session_id,
@@ -4770,11 +4543,7 @@ def _handle_startcamp(handler, db, env_json, comp, session_id,
                        reqid, target, instance, conh, uid):
     """StartCamp: mark a campaign as started, return updated state."""
     camp_id = env_json.get("CampID", 0)
-    row = db.execute(
-        "SELECT champion_id, state_json, campaign_type, template_name "
-        "FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_protocol_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
         resp["Errors"] = ["Campaign not found"]
@@ -4806,10 +4575,8 @@ def _handle_startcamp(handler, db, env_json, comp, session_id,
         _az1_reveal_neighbors(db, state,
                               state.get("LastNode") or state.get("ALoc"))
 
-    db.execute(
-        "UPDATE campaigns SET is_started=1, state_json=? WHERE id=?",
-        (json.dumps(state), camp_id)
-    )
+    pve_db.db_campaign_update_state(
+        camp_id, json.dumps(state), conn=db, started=True)
     db.commit()
     resp = _build_input_response(camp_id, state, success=True)
     return _send_response(handler, json.dumps(resp), comp, session_id,
@@ -4825,12 +4592,7 @@ def _handle_getcampsum(handler, db, env_json, comp, session_id,
 
     summaries = []
     for cid in camp_ids:
-        row = db.execute(
-            "SELECT c.camp_uid_lo, c.campaign_type, c.template_name, ch.race, "
-            "c.state_json "
-            "FROM campaigns c JOIN champions ch ON c.champion_id = ch.id WHERE c.id=?",
-            (cid,)
-        ).fetchone()
+        row = pve_db.db_campaign_summary_row(cid, conn=db)
         if row:
             panorama_scene = None
             panorama_node = None
@@ -4861,11 +4623,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
     log = getattr(handler, "_log_req", print)
     log(f"    Campaign SendEvent: camp={camp_id} event={event_name} params={o_params}")
 
-    row = db.execute(
-        "SELECT champion_id, state_json, campaign_type, template_name "
-        "FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_protocol_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
         resp["Errors"] = ["Campaign not found"]
@@ -4975,8 +4733,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 state.get("PanoramaNode"), area[4])
             rebuilt["Flags"] = previous_flags
             state = rebuilt
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), camp_id))
+        _save_campaign_state(db, camp_id, state)
         db.commit()
         resp = _build_input_response(camp_id, state, success=True,
                                      applied=conversation_applied)
@@ -5215,8 +4972,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             state["LastNode"] = return_node
             state["CurState"] = "EXPLORE"
             _reveal_crayburn_node(state, return_node)
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
         elif active_conversation_node or pending_success:
             # Ordinary dungeon conversations and the explicitly pending
@@ -5230,15 +4986,13 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             # has already restored the encounter.  In particular, do not use
             # LastNode as evidence that an encounter was won.
             state["CurState"] = "EXPLORE"
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
         # advance_crayburn_step already persisted the updated state; reload
         # it so we return the post-advance state, not the stale pre-advance
         # copy that would otherwise be saved back and undo the advance.
-        row2 = db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (camp_id,)).fetchone()
-        state = json.loads(row2[0]) if row2 and row2[0] else state
+        saved_state = pve_db.db_campaign_state(camp_id, conn=db)
+        state = json.loads(saved_state) if saved_state else state
         resp = _build_input_response(camp_id, state, success=True)
         return _send_response(handler, json.dumps(resp), comp, session_id,
                               reqid, target, instance, conh, uid)
@@ -5265,11 +5019,9 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             # A completed Haus is one-time; do not award a second copy if a
             # client retries the selection or manually reopens the location.
             if choice in choices and not current_data.get("completed"):
-                user_row = db.execute(
-                    "SELECT user_id FROM champions WHERE id=?", (champ_id,)
-                ).fetchone()
+                user_id = pve_db.db_campaign_user_id(champ_id, conn=db)
                 granted = _grant_card_reward(
-                    handler, db, user_row[0] if user_row else None, choice)
+                    handler, db, user_id, choice)
                 if not granted:
                     log(f"    Shroom Haus reward card not found: {choice}")
                 if current and granted:
@@ -5307,9 +5059,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 state["FinishReason"] = "Complete"
                 state["ALoc"] = None
                 state["CurState"] = "EXPLORE"
-                db.execute(
-                    "UPDATE campaigns SET state_json=? WHERE id=?",
-                    (json.dumps(state), camp_id))
+                _save_campaign_state(db, camp_id, state)
                 db.commit()
             resp = _build_input_response(camp_id, state, success=True)
             return _send_response(handler, json.dumps(resp), comp, session_id,
@@ -5452,8 +5202,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     current_data["autostart"] = False
                     state["ALoc"] = current_data.get("name") or current_data.get("node")
                     state["CurState"] = "EXPLORE"
-                    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                               (json.dumps(state), camp_id))
+                    _save_campaign_state(db, camp_id, state)
                     db.commit()
                     resp = _build_input_response(camp_id, state, success=True)
                     return _send_response(handler, json.dumps(resp), comp,
@@ -5500,8 +5249,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     _az1_reveal_neighbors(
                         db, state, current_data.get("node"))
             state["CurState"] = "EXPLORE"
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
             resp = _build_input_response(camp_id, state, success=True,
                                          applied=conversation_applied)
@@ -5537,10 +5285,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             transition = _activate_az1_transition(db, champ_id, cfg)
             if transition:
                 _pano_id, state = transition
-            qrow = db.execute(
-                "SELECT id, state_json FROM campaigns "
-                "WHERE champion_id=? AND campaign_type='QUEST' "
-                "ORDER BY id DESC LIMIT 1", (champ_id,)).fetchone()
+            qrow = pve_db.db_latest_quest_state(champ_id, conn=db)
             if qrow and qrow[1]:
                 qstate = json.loads(qrow[1])
                 qcurrent = qstate.get("ALoc")
@@ -5550,8 +5295,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 qstate["FinishReason"] = "Complete"
                 qstate["ALoc"] = None
                 qstate["CurState"] = "EXPLORE"
-                db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                           (json.dumps(qstate), qrow[0]))
+                _save_campaign_state(db, qrow[0], qstate)
                 db.commit()
             resp = _build_input_response(camp_id, state, success=True,
                                          applied=report_applied)
@@ -5620,12 +5364,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             dungeon_state["ChampID"] = champ_id
             dungeon_state["Started"] = dungeon_state.get("Started") or _now_utc()
             dungeon_state["CurState"] = "EXPLORE"
-            db.execute(
-                "UPDATE campaigns SET campaign_type='DUNGEON', "
-                "template_name='Crayburn Castle', is_started=1, state_json=? "
-                "WHERE id=?",
-                (json.dumps(dungeon_state), dungeon_id)
-            )
+            pve_db.db_promote_campaign_to_dungeon(
+                dungeon_id, json.dumps(dungeon_state), conn=db)
             # Ensure the dungeon's journal quest campaign exists (the client's
             # QuestMgr queries getactive with CampType=QUEST and resolves the
             # quest template by this campaign's TemplateName = script name).
@@ -5663,21 +5403,16 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         # battle result can resolve the authored scene rewards.  Reload the
         # state before the common response write below; otherwise this handler
         # would overwrite that field with its stale pre-launch snapshot.
-        saved = db.execute(
-            "SELECT state_json FROM campaigns WHERE id=?", (camp_id,)
-        ).fetchone()
-        if saved and saved[0]:
+        saved_state = pve_db.db_campaign_state(camp_id, conn=db)
+        if saved_state:
             try:
-                state = json.loads(saved[0])
+                state = json.loads(saved_state)
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
 
     resp = _build_input_response(camp_id, state, success=True,
                                  applied=conversation_applied)
-    db.execute(
-        "UPDATE campaigns SET state_json=? WHERE id=?",
-        (json.dumps(state), camp_id)
-    )
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     ret = _send_response(handler, json.dumps(resp), comp, session_id,
                          reqid, target, instance, conh, uid)
@@ -5715,10 +5450,8 @@ def _mark_quest_objective_retryable(db, champion_id, scene_guid):
     """Keep a quest encounter available when its optional condition failed."""
     if not champion_id or not scene_guid:
         return
-    rows = db.execute(
-        "SELECT id, state_json FROM campaigns "
-        "WHERE champion_id=? AND campaign_type='QUEST' "
-        "AND template_name='az01_tamed'", (champion_id,)).fetchall()
+    rows = pve_db.db_campaign_state_rows(
+        champion_id, "QUEST", conn=db, template_name="az01_tamed")
     for quest_id, raw in rows:
         try:
             state = json.loads(raw or "{}")
@@ -5734,8 +5467,7 @@ def _mark_quest_objective_retryable(db, champion_id, scene_guid):
                 data["visible"] = True
                 changed = True
         if changed:
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), quest_id))
+            _save_campaign_state(db, quest_id, state)
     db.commit()
 
 
@@ -5745,11 +5477,7 @@ def _apply_gameend(db, camp_id, won):
     On a win of the training encounter, reveals the quest-giver NPC on the
     panorama. Returns (camp_id, GameplayState) or (None, None) if not found.
     """
-    row = db.execute(
-        "SELECT champion_id, state_json, campaign_type, template_name "
-        "FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_protocol_row(camp_id, conn=db)
     if not row:
         return None, None
 
@@ -5808,12 +5536,23 @@ def _apply_gameend(db, camp_id, won):
                 state["VisLocs"].append(_convo_location(
                     quest_npc, cfg["quest_conv"], givequest=True))
         state["Wins"] = state.get("Wins", 0) + 1
+        if is_dungeon:
+            # Consecutive dungeon wins.  The "if you won the last encounter in
+            # this dungeon" PreGame talents read this streak rather than the
+            # cumulative ``Wins`` counter, which also counts non-dungeon
+            # battles and therefore fired on the first dungeon encounter.
+            state["dungeon_win_count"] = int(
+                state.get("dungeon_win_count", 0) or 0) + 1
         # The training battle has been won: stop treating the campaign as the
         # tutorial so later battles randomize the turn player instead of always
         # giving the player first turn.
         state["TutorialDone"] = True
     else:
         state["Losses"] = state.get("Losses", 0) + 1
+        if is_dungeon:
+            # A loss breaks the dungeon streak; the next encounter must not
+            # grant the previous-win PreGame bonuses.
+            state["dungeon_win_count"] = 0
         # Training encounters have an authored defeat conversation.  Return
         # to the trainer's panorama node with that conversation queued so the
         # client can play it immediately; the encounter remains retryable.
@@ -5947,10 +5686,7 @@ def _apply_gameend(db, camp_id, won):
     if not is_dungeon and not outcome_pending:
         state["ALoc"] = ""
 
-    db.execute(
-        "UPDATE campaigns SET state_json=? WHERE id=?",
-        (json.dumps(state), camp_id)
-    )
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     return camp_id, state
 
@@ -6043,12 +5779,11 @@ def _scene_reward_records(db, scene_guid):
     """
     if not scene_guid:
         return []
-    row = db.execute("SELECT rewards_json FROM encounter_scenes WHERE guid=?",
-                     (str(scene_guid),)).fetchone()
-    if not row or not row[0]:
+    rewards_json = pve_db.db_encounter_scene_rewards(scene_guid, db)
+    if not rewards_json:
         return []
     try:
-        data = json.loads(row[0])
+        data = json.loads(rewards_json)
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     if not isinstance(data, dict):
@@ -6072,12 +5807,11 @@ def _scene_reward_metadata(db, scene_guid):
     """Return the complete authored rewards_json object for a scene."""
     if not scene_guid:
         return {}
-    row = db.execute("SELECT rewards_json FROM encounter_scenes WHERE guid=?",
-                     (str(scene_guid),)).fetchone()
-    if not row or not row[0]:
+    rewards_json = pve_db.db_encounter_scene_rewards(scene_guid, db)
+    if not rewards_json:
         return {}
     try:
-        value = json.loads(row[0])
+        value = json.loads(rewards_json)
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -6096,16 +5830,8 @@ def _evaluate_encounter_condition(db, session_id, player_user_id, condition):
     if ctype != "void_tamed_troop":
         return None
     owner = str(condition.get("owner") or "opponent").strip().lower()
-    owner_sql = "gc.user_id<>?"
-    if owner in ("player", "self", "champion"):
-        owner_sql = "gc.user_id=?"
-    rows = db.execute(
-        "SELECT gc.template_guid, gc.permanent_buffs "
-        "FROM game_cards gc "
-        "WHERE gc.session_id=? AND LOWER(COALESCE(gc.location,''))='void' "
-        "AND LOWER(COALESCE(gc.card_type,'')) LIKE '%troop%' "
-        "AND " + owner_sql + " ORDER BY gc.card_uid",
-        (int(session_id), int(player_user_id))).fetchall()
+    rows = pve_db.db_void_tamed_troop_rows(
+        session_id, player_user_id, owner, db)
     for template_guid, permanent_buffs in rows:
         try:
             buffs = json.loads(permanent_buffs or "{}")
@@ -6147,32 +5873,13 @@ def _grant_card_reward(handler, db, user_id, template_guid, quantity=1,
     except (TypeError, ValueError):
         quantity = 1
     template_guid = str(template_guid)
-    template = db.execute(
-        "SELECT name, cost, attack, defense FROM card_templates WHERE guid=?",
-        (template_guid,)).fetchone()
+    template = db_reward_card_template(template_guid, conn=db)
     if not template:
         return []
     granted = []
     for _ in range(quantity):
-        existing = db.execute(
-            "SELECT id FROM collections "
-            "WHERE user_id=? AND card_template_id=?",
-            (user_id, template_guid)).fetchone()
-        if existing:
-            db.execute("UPDATE collections SET quantity=quantity+1 WHERE id=?",
-                       (existing[0],))
-        else:
-            db.execute(
-                "INSERT INTO collections (user_id, card_template_id, quantity) "
-                "VALUES (?,?,1)", (user_id, template_guid))
-        max_row = db.execute(
-            "SELECT COALESCE(MAX(instance_id), 5000) FROM card_instances "
-            "WHERE user_id=?", (user_id,)).fetchone()
-        instance_id = int(max_row[0] or 5000) + 1
-        db.execute(
-            "INSERT OR IGNORE INTO card_instances "
-            "(user_id, instance_id, template_guid) VALUES (?,?,?)",
-            (user_id, instance_id, template_guid))
+        instance_id = db_grant_card_instance(
+            user_id, template_guid, conn=db)
         granted.append({
             "guid": template_guid, "name": template[0] or "Card",
             "cost": template[1] or 0, "attack": template[2] or 0,
@@ -6206,10 +5913,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     applied = _empty_applied_updates()
     if not conversation_guid:
         return applied
-    row = db.execute(
-        "SELECT reward_json, one_time, enabled FROM conversation_rewards "
-        "WHERE conversation_guid=?", (str(conversation_guid),)
-    ).fetchone()
+    row = pve_db.db_conversation_reward(conversation_guid, conn=db)
     if not row or not row[2]:
         return applied
     reward_raw, one_time, _enabled = row
@@ -6246,13 +5950,8 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
         xp = 0
 
     if gold:
-        urow = db.execute(
-            "SELECT gold, platinum FROM users WHERE id=?", (user_id,)
-        ).fetchone()
-        old_gold = int(urow[0] or 0) if urow else 0
-        platinum = int(urow[1] or 0) if urow else 0
-        new_gold = old_gold + gold
-        db.execute("UPDATE users SET gold=? WHERE id=?", (new_gold, user_id))
+        new_gold, platinum = db_adjust_user_currency(
+            user_id, gold_delta=gold, conn=db)
         applied["Accounts"].append({"Account": {
             "Gold": new_gold, "Platinum": platinum,
         }})
@@ -6262,11 +5961,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
         })
 
     if xp:
-        crow = db.execute(
-            "SELECT id, champion_name, level, xp, champion_class, race, gender, "
-            "last_campaign_id, last_deck_id, is_deleted, pet_name "
-            "FROM champions WHERE id=?", (champ_id,)
-        ).fetchone()
+        crow = db_champion_reward_profile(champ_id, conn=db)
         if crow:
             new_xp = int(crow[3] or 0) + xp
             thresholds = (0, 1000, 2800, 5000, 8000, 12000, 17500,
@@ -6274,8 +5969,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
                           92000, 110000)
             new_level = max(1, min(len(thresholds),
                                    1 + sum(new_xp >= n for n in thresholds[1:])))
-            db.execute("UPDATE champions SET xp=?, level=? WHERE id=?",
-                       (new_xp, new_level, champ_id))
+            db_update_champion_xp(champ_id, new_xp, new_level, conn=db)
             applied["Champions"].append({"Champ": {
                 "Id": int(crow[0]), "Name": crow[1] or "",
                 "Level": new_level, "CurrentXP": new_xp,
@@ -6362,35 +6056,21 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
             quantity = max(1, int(spec.get("quantity", 1) or 1))
         except (TypeError, ValueError):
             quantity = 1
-        existing = db.execute(
-            "SELECT id, quantity, client_item_uid FROM player_inventory "
-            "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
-            (user_id, str(template_guid))).fetchone()
+        existing = db_inventory_item(user_id, str(template_guid), conn=db)
         if existing:
             item_row_id, old_quantity, item_uid = existing
             new_quantity = int(old_quantity or 0) + quantity
             if not item_uid:
-                item_uid = int(db.execute(
-                    "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
-                    "FROM player_inventory WHERE user_id=?", (user_id,)
-                ).fetchone()[0] or 1)
-                db.execute(
-                    "UPDATE player_inventory SET quantity=?, client_item_uid=? "
-                    "WHERE id=?", (new_quantity, item_uid, item_row_id))
-            else:
-                db.execute("UPDATE player_inventory SET quantity=? WHERE id=?",
-                           (new_quantity, item_row_id))
+                item_uid = db_next_inventory_client_uid(user_id, conn=db)
+            db_upsert_inventory_item(
+                user_id, str(template_guid), quantity,
+                client_item_uid=item_uid, conn=db)
         else:
-            item_uid = int(db.execute(
-                "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
-                "FROM player_inventory WHERE user_id=?", (user_id,)
-            ).fetchone()[0] or 1)
+            item_uid = db_next_inventory_client_uid(user_id, conn=db)
             new_quantity = quantity
-            db.execute(
-                "INSERT INTO player_inventory "
-                "(user_id, template_guid, quantity, client_item_uid) "
-                "VALUES (?,?,?,?)",
-                (user_id, str(template_guid), new_quantity, item_uid))
+            db_upsert_inventory_item(
+                user_id, str(template_guid), new_quantity,
+                client_item_uid=item_uid, conn=db)
         applied["Items"].append({"Item": {
             "Id": item_uid,
             "TemplateID": str(template_guid),
@@ -6413,13 +6093,9 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
                   or reward.get("pack_guid"))
     if chest_guid:
         chest_guid = str(chest_guid)
-        chest_row = db.execute(
-            "INSERT INTO treasure_chests "
-            "(user_id, set_guid, chest_rarity, opened, template_guid) "
-            "VALUES (?, ?, 'Promo', 0, ?)",
-            (user_id, "00000000-0000-0000-0000-000000000000", chest_guid),
-        )
-        chest_id = int(chest_row.lastrowid)
+        chest_id = int(db_create_treasure_chest(
+            user_id, "00000000-0000-0000-0000-000000000000", "Promo", db,
+            template_guid=chest_guid))
         inventory_id = 9000 + chest_id
         applied["Items"].append({"Item": {
             "Id": inventory_id,
@@ -6437,8 +6113,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
 
     if bool(one_time):
         claims[claim_key] = True
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-               (json.dumps(state), camp_id))
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     getattr(handler, "_log_req", print)(
         f"    Conversation reward: conversation={conversation_guid} "
@@ -6451,13 +6126,11 @@ def _scene_card_choices(db, scene_guid):
     """Return card GUIDs offered by a scene's authored card_choice reward."""
     if not scene_guid:
         return []
-    row = db.execute(
-        "SELECT rewards_json FROM encounter_scenes WHERE guid=?",
-        (str(scene_guid),)).fetchone()
-    if not row or not row[0]:
+    rewards_json = pve_db.db_encounter_scene_rewards(scene_guid, db)
+    if not rewards_json:
         return []
     try:
-        rewards = json.loads(row[0])
+        rewards = json.loads(rewards_json)
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     if not isinstance(rewards, dict):
@@ -6480,10 +6153,8 @@ def _area_scene_guid(db, state):
             node = data.get("node") or current
             match = re.search(r"NODE[_ ]?0*(\d+)", str(node), re.I)
             if match:
-                rows = db.execute(
-                    "SELECT guid, name FROM encounter_scenes "
-                    "WHERE name LIKE 'AZ 1 - NODE %'"
-                ).fetchall()
+                rows = [(row[0], row[1])
+                        for row in pve_db.db_az1_scene_rows(conn=db)]
                 for guid, name in rows:
                     if re.search(r"NODE[_ ]?0*%s\b" % int(match.group(1)),
                                  name or "", re.I):
@@ -6501,9 +6172,7 @@ def _apply_encounter_end_rewards_legacy(handler, db, session, camp_id, won):
     """
     if not won:
         return []
-    row = db.execute(
-        "SELECT champion_id, state_json FROM campaigns WHERE id=?",
-        (camp_id,)).fetchone()
+    row = pve_db.db_campaign_identity_state(camp_id, db)
     if not row:
         return []
     champion_id, state_json = row
@@ -6570,8 +6239,7 @@ def _apply_encounter_end_rewards_legacy(handler, db, session, camp_id, won):
             claims[claim_key] = True
     if not granted:
         return []
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-               (json.dumps(state), camp_id))
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     cards = [(x["guid"], x["name"], x["cost"], x["attack"], x["defense"],
               x["instance_id"], 0) for x in granted]
@@ -6599,8 +6267,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
               "condition_met": False, "scene_guid": None}
     if not won:
         return result
-    row = db.execute("SELECT champion_id, state_json FROM campaigns WHERE id=?",
-                     (camp_id,)).fetchone()
+    row = pve_db.db_campaign_identity_state(camp_id, db)
     if not row:
         return result
     champion_id, state_json = row
@@ -6689,13 +6356,11 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         chest = None
         if chest_guid and (not condition or context):
             chest_guid = str(chest_guid)
-            chest_row = db.execute(
-                "INSERT INTO treasure_chests "
-                "(user_id, set_guid, chest_rarity, opened, template_guid) "
-                "VALUES (?, ?, 'Promo', 0, ?)",
-                (player_user_id,
-                 "00000000-0000-0000-0000-000000000000", chest_guid))
-            chest = {"id": int(chest_row.lastrowid),
+            chest_id = db_create_treasure_chest(
+                player_user_id,
+                "00000000-0000-0000-0000-000000000000", "Promo", db,
+                template_guid=chest_guid)
+            chest = {"id": int(chest_id),
                      "template": chest_guid}
         items = []
         item_specs = reward_obj.get("items") or []
@@ -6726,35 +6391,24 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                     quantity = max(1, int(spec.get("quantity", 1) or 1))
                 except (TypeError, ValueError):
                     quantity = 1
-                existing = db.execute(
-                    "SELECT id, quantity, client_item_uid FROM player_inventory "
-                    "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
-                    (player_user_id, str(template_guid))).fetchone()
+                existing = db_inventory_item(
+                    player_user_id, str(template_guid), conn=db)
                 if existing:
-                    item_row_id, old_quantity, item_uid = existing
+                    _item_row_id, old_quantity, item_uid = existing
                     new_quantity = int(old_quantity or 0) + quantity
                     if not item_uid:
-                        item_uid = int(db.execute(
-                            "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
-                            "FROM player_inventory WHERE user_id=?",
-                            (player_user_id,)).fetchone()[0] or 1)
-                        db.execute(
-                            "UPDATE player_inventory SET quantity=?, client_item_uid=? "
-                            "WHERE id=?", (new_quantity, item_uid, item_row_id))
-                    else:
-                        db.execute("UPDATE player_inventory SET quantity=? WHERE id=?",
-                                   (new_quantity, item_row_id))
+                        item_uid = db_next_inventory_client_uid(
+                            player_user_id, conn=db)
+                    db_upsert_inventory_item(
+                        player_user_id, str(template_guid), quantity,
+                        client_item_uid=item_uid, conn=db)
                 else:
-                    item_uid = int(db.execute(
-                        "SELECT COALESCE(MAX(client_item_uid), 0) + 1 "
-                        "FROM player_inventory WHERE user_id=?",
-                        (player_user_id,)).fetchone()[0] or 1)
+                    item_uid = db_next_inventory_client_uid(
+                        player_user_id, conn=db)
                     new_quantity = quantity
-                    db.execute(
-                        "INSERT INTO player_inventory "
-                        "(user_id, template_guid, quantity, client_item_uid) "
-                        "VALUES (?,?,?,?)",
-                        (player_user_id, str(template_guid), new_quantity, item_uid))
+                    db_upsert_inventory_item(
+                        player_user_id, str(template_guid), new_quantity,
+                        client_item_uid=item_uid, conn=db)
                 items.append({"id": item_uid, "template": str(template_guid),
                               "quantity": new_quantity, "granted": quantity})
         if not cards and not gold and not xp and not chest and not items:
@@ -6771,22 +6425,13 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
 
     account = None
     if total_gold:
-        urow = db.execute("SELECT gold, platinum FROM users WHERE id=?",
-                          (player_user_id,)).fetchone()
-        old_gold = int(urow[0] or 0) if urow else 0
-        platinum = int(urow[1] or 0) if urow else 0
-        new_gold = old_gold + total_gold
-        db.execute("UPDATE users SET gold=? WHERE id=?",
-                   (new_gold, player_user_id))
+        new_gold, platinum = db_adjust_user_currency(
+            player_user_id, gold_delta=total_gold, conn=db)
         account = {"Gold": new_gold, "Platinum": platinum}
 
     champion_bits = None
     if total_xp:
-        crow = db.execute(
-            "SELECT id, champion_name, level, xp, champion_class, race, gender, "
-            "last_campaign_id, last_deck_id, is_deleted, pet_name "
-            "FROM champions WHERE id=?",
-            (champion_id,)).fetchone()
+        crow = db_champion_reward_profile(champion_id, conn=db)
         if crow:
             new_xp = int(crow[3] or 0) + total_xp
             thresholds = (0, 1000, 2800, 5000, 8000, 12000, 17500,
@@ -6794,8 +6439,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                           92000, 110000)
             new_level = max(1, min(len(thresholds),
                                    1 + sum(new_xp >= n for n in thresholds[1:])))
-            db.execute("UPDATE champions SET xp=?, level=? WHERE id=?",
-                       (new_xp, new_level, champion_id))
+            db_update_champion_xp(champion_id, new_xp, new_level, conn=db)
             champion_bits = {
                 "Id": int(crow[0]), "Name": crow[1] or "",
                 "Level": new_level, "CurrentXP": new_xp,
@@ -6863,13 +6507,11 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     if (not granted and not total_gold and not total_xp and
             not result["chests"] and not result["items"]):
         state["_last_encounter_condition_met"] = bool(result["condition_met"])
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(state), camp_id))
+        _save_campaign_state(db, camp_id, state)
         db.commit()
         return result
     state["_last_encounter_condition_met"] = bool(result["condition_met"])
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-               (json.dumps(state), camp_id))
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     result.update({"cards": granted, "gold": total_gold, "xp": total_xp})
     getattr(handler, "_log_req", print)(
@@ -6889,7 +6531,8 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
     """
     try:
         session_name = session.session_name or ""
-        from db import db_record_arena_fight, db_delete_game_session
+        from pve_db import db_record_arena_fight
+        from pvp_db import db_delete_game_session
         if not session_name.startswith("camp_"):
             profile = getattr(handler, "user_profile", None)
             if not session_name.startswith("tourney-") and profile:
@@ -6903,9 +6546,7 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
         reward_result = _apply_encounter_end_rewards(
             handler, db, session, camp_id, won)
         advanced_quest_states = []
-        camp_row = db.execute(
-            "SELECT champion_id FROM campaigns WHERE id=?", (camp_id,)
-        ).fetchone()
+        camp_row = pve_db.db_campaign_identity_state(camp_id, conn=db)
         if reward_result.get("condition_met"):
             # Taming objectives are separate QUEST campaign entries linked by
             # encounter GUID. Advance that objective only after the finished
@@ -6969,9 +6610,7 @@ def _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
     import base64
 
     log = getattr(handler, "_log_req", print)
-    scene_row = db.execute(
-        "SELECT guid, name, title, gameboard, ai_deck_guid FROM encounter_scenes WHERE guid=?",
-        (encounter_guid,)).fetchone()
+    scene_row = pve_db.db_encounter_scene_runtime(encounter_guid, conn=db)
     if scene_row:
         log(f"    Launch encounter: {encounter_guid} scene={scene_row[1]} board={scene_row[3]}")
     else:
@@ -6983,16 +6622,15 @@ def _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
     # Persist the scene on the campaign row as well.  The LoadBalancer later
     # consumes the in-memory launch hint while resolving battle setup, but the
     # end-game reward evaluator needs the authored scene after that point.
-    camp_row = db.execute(
-        "SELECT state_json FROM campaigns WHERE id=?", (camp_id,)).fetchone()
+    saved_state = pve_db.db_campaign_state(camp_id, conn=db)
+    camp_row = (saved_state,) if saved_state is not None else None
     if camp_row:
         try:
             camp_state = json.loads(camp_row[0] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             camp_state = {}
         camp_state["ActiveEncounterGuid"] = encounter_guid
-        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                   (json.dumps(camp_state), camp_id))
+        _save_campaign_state(db, camp_id, camp_state)
         db.commit()
     gs_bytes = encode_campaign_session_state(
         0, session_name, encounter_guid,
@@ -7019,29 +6657,23 @@ _AZ1_FORTUNE_SET_GUID = "ccde3b6a-3425-4403-b366-dba0e2358fae"
 
 def _fortune_card_guids(db):
     """Return the authored AZ1 Fortune card templates in stable order."""
-    rows = db.execute(
-        "SELECT guid FROM card_templates WHERE set_guid=? "
-        "AND card_type='Choice' AND no_pvp=1 AND name LIKE 'Fortune of %' "
-        "ORDER BY guid", (_AZ1_FORTUNE_SET_GUID,)).fetchall()
+    rows = pve_db.db_fortune_card_guids(_AZ1_FORTUNE_SET_GUID, conn=db)
     return [str(row[0]).lower() for row in rows if row[0]]
 
 
 def _fortune_ability_guid(db, card_guid):
     """Return the first ability authored on a Fortune card."""
-    row = db.execute(
-        "SELECT abilities_json FROM card_templates WHERE guid=?",
-        (str(card_guid).lower(),)).fetchone()
-    if not row:
+    raw_abilities = pvp_db.db_template_ability_payload(
+        str(card_guid).lower(), conn=db)
+    if raw_abilities is None:
         return None
     try:
-        abilities = json.loads(row[0] or "[]")
+        abilities = json.loads(raw_abilities or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         abilities = []
     for ability in abilities if isinstance(abilities, list) else []:
         guid = str(ability or "").lower()
-        if guid and db.execute(
-                "SELECT 1 FROM card_abilities_meta WHERE ability_guid=?",
-                (guid,)).fetchone():
+        if guid and pvp_db.db_ability_metadata(guid, conn=db):
             return guid
     return None
 
@@ -7050,9 +6682,8 @@ def _fortune_starting_hand_bonus(db, ability_guid):
     """Read a Fortune's typed starting-hand modifier from BOM metadata."""
     if not ability_guid:
         return 0
-    for _effect_type, raw_param in db.execute(
-            "SELECT effect_type, param FROM ability_effects "
-            "WHERE ability_guid=? ORDER BY effect_order", (ability_guid,)):
+    for _effect_type, raw_param in pvp_db.db_ability_effect_type_params(
+            ability_guid, conn=db):
         try:
             param = json.loads(raw_param or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -7071,12 +6702,11 @@ def consume_fortune(db, camp_id, fortune_guid):
     """Consume the stored reading once its next campaign battle starts."""
     if not camp_id or not fortune_guid:
         return False
-    row = db.execute(
-        "SELECT state_json FROM campaigns WHERE id=?", (camp_id,)).fetchone()
-    if not row:
+    raw_state = pve_db.db_campaign_state(camp_id, conn=db)
+    if raw_state is None:
         return False
     try:
-        state = json.loads(row[0] or "{}")
+        state = json.loads(raw_state or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     data = ((state.get("PublicState") or {}).get("Data") or {})
@@ -7086,8 +6716,7 @@ def consume_fortune(db, camp_id, fortune_guid):
     data.pop("gaal_fortune", None)
     data.pop("gaal_fortune_guid", None)
     state.setdefault("PublicState", {})["Data"] = data
-    db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-               (json.dumps(state), camp_id))
+    _save_campaign_state(db, camp_id, state)
     db.commit()
     return True
 
@@ -7115,11 +6744,7 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     fortune_ability_guid = None
     fortune_starting_hand_bonus = 0
     if camp_id:
-        row = db.execute(
-            "SELECT c.champion_name, ch.last_deck_id, ch.race, "
-            "ch.champion_class, ch.gender, c.state_json, ch.talents "
-            "FROM campaigns c JOIN champions ch ON ch.id=c.champion_id "
-            "WHERE c.id=?", (camp_id,)).fetchone()
+        row = pve_db.db_campaign_battle_profile(camp_id, conn=db)
         if row:
             player_champ_name, deck_db_id = row[0], row[1]
             race_num, cls_num, gnd_num = row[2], row[3], row[4]
@@ -7139,10 +6764,8 @@ def resolve_battle_config(handler, db, camp_id, session_name):
                 is_tutorial = True
     profile = getattr(handler, "user_profile", None) or {}
     if not deck_db_id and profile:
-        row = db.execute(
-            "SELECT id FROM decks WHERE user_id=? ORDER BY id LIMIT 1",
-            (profile.get("id"),)).fetchone()
-        deck_db_id = row[0] if row else None
+        deck_db_id = pve_db.db_first_deck_id_for_user(
+            profile.get("id"), conn=db)
 
     race_name = _RACE_DECK_MAP.get(race_num)
     cls_name = {1: "Mage", 2: "Warrior", 3: "Cleric", 4: "Rogue",
@@ -7150,16 +6773,12 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     gnd_name = {1: "Male", 2: "Female"}.get(gnd_num, "")
     player_champ_guid = None
     if race_name and cls_name:
-        row = db.execute(
-            "SELECT guid FROM champion_templates WHERE race=? "
-            "AND champion_class=? AND gender=? AND is_player=1 LIMIT 1",
-            (race_name, cls_name, gnd_name)).fetchone()
-        player_champ_guid = row[0] if row else None
+        player_champ_guid = pve_db.db_player_champion_template(
+            race_name, cls_name, gnd_name, conn=db)
     player_champ_guid = player_champ_guid or \
         "1d462ffb-0744-4996-804c-ba61b2c5c2f1"
-    if db.execute(
-            "SELECT 1 FROM champion_template_data WHERE guid=?",
-            (player_champ_guid,)).fetchone():
+    if pve_db.db_champion_template_data_exists(
+            player_champ_guid, conn=db):
         player_starting_health = handler._champion_health_by_guid(
             player_champ_guid)
     else:
@@ -7213,22 +6832,16 @@ def player_cannot_choose_play_first(db, camp_id):
     """
     if not camp_id:
         return False
-    row = db.execute(
-        "SELECT ch.talents FROM campaigns c "
-        "JOIN champions ch ON ch.id=c.champion_id WHERE c.id=?",
-        (camp_id,)).fetchone()
-    if not row:
+    raw_talents = pve_db.db_campaign_talents(camp_id, conn=db)
+    if raw_talents is None:
         return False
     try:
-        talent_guids = json.loads(row[0] or "[]")
+        talent_guids = json.loads(raw_talents or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     if not isinstance(talent_guids, list) or not talent_guids:
         return False
-    placeholders = ",".join("?" for _ in talent_guids)
-    descriptions = db.execute(
-        "SELECT description FROM talent_data WHERE talent_guid IN ("
-        + placeholders + ")", tuple(talent_guids)).fetchall()
+    descriptions = pve_db.db_talent_descriptions(talent_guids, conn=db)
     for (description,) in descriptions:
         text = str(description or "").casefold().replace("’", "'")
         if ("can't choose to go first" in text or
@@ -7246,11 +6859,9 @@ def resolve_opening_hand_config(db, session, player_id, race_name, cls_name,
     ``ability_guids`` may be ResourceId objects or strings; the metadata
     condition evaluator consumes their canonical GUID text.
     """
-    class_row = db.execute(
-        "SELECT starting_hand_size FROM champion_class_data "
-        "WHERE race=? AND champion_class=?",
-        (race_name, cls_name)).fetchone()
-    base_hand = (int(class_row[0]) if class_row and class_row[0] is not None
+    class_hand_size = pve_db.db_starting_hand_size(
+        race_name, cls_name, conn=db)
+    base_hand = (int(class_hand_size) if class_hand_size is not None
                  else 7)
     from abilities.framework.conditions import pregame_modifiers
     guids = []
@@ -7284,19 +6895,9 @@ def apply_starting_hand_talents(handler, db, session, game, pl_t, effects):
         card_types = effect.get("card_types") or []
         if rage <= 0 and not cost_mod:
             continue
-        if cost_mod and card_types:
-            placeholders = ",".join("?" for _ in card_types)
-            candidates = db.execute(
-                "SELECT card_uid, template_guid, permanent_buffs "
-                "FROM game_cards WHERE session_id=? AND user_id=? "
-                "AND location='hand' AND card_type IN (" + placeholders + ")",
-                (session.session_id, owner_id, *card_types)).fetchall()
-        else:
-            candidates = db.execute(
-                "SELECT card_uid, template_guid, permanent_buffs FROM game_cards "
-                "WHERE session_id=? AND user_id=? AND location='hand' "
-                "AND card_type LIKE '%Troop%'",
-                (session.session_id, owner_id)).fetchall()
+        candidates = pvp_db.db_starting_hand_candidates(
+            session.session_id, owner_id,
+            card_types if cost_mod and card_types else None, conn=db)
         if not candidates:
             continue
         card_uid, template_guid, raw_buffs = random.choice(candidates)
@@ -7310,16 +6911,9 @@ def apply_starting_hand_talents(handler, db, session, game, pl_t, effects):
         buffs["def"] = int(buffs.get("def", 0) or 0)
         if rage > 0:
             buffs["rage"] = int(buffs.get("rage", 0) or 0) + rage
-        if cost_mod:
-            db.execute(
-                "UPDATE game_cards SET card_cost_mod=COALESCE(card_cost_mod, 0) + ? "
-                "WHERE session_id=? AND card_uid=?",
-                (cost_mod, session.session_id, int(card_uid)))
-        if rage > 0:
-            db.execute(
-                "UPDATE game_cards SET permanent_buffs=? WHERE session_id=? "
-                "AND card_uid=?", (json.dumps(buffs), session.session_id,
-                                      int(card_uid)))
+        pvp_db.db_apply_starting_hand_effect(
+            session.session_id, int(card_uid), cost_mod=cost_mod,
+            permanent_buffs=json.dumps(buffs) if rage > 0 else None, conn=db)
         db.commit()
         scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
         _tpl, ct, _name, cost, atk, defense, gem = handler._card_full_data(
@@ -7349,14 +6943,11 @@ def _handle_campaign_start(handler, db, env_json, champ_id, cfg,
     camp_id = env_json.get("CampID", 0)
 
     # Player's deck for this champion (the auto-created race starter deck).
-    champ = db.execute("SELECT last_deck_id FROM champions WHERE id=?",
-                       (champ_id,)).fetchone()
-    deck_db_id = champ[0] if champ and champ[0] else None
+    deck_db_id = pve_db.db_champion_last_deck_id(champ_id, conn=db)
     deck_uid64 = (deck_db_id << 8) | 17 if deck_db_id else 0
 
-    row = db.execute(
-        "SELECT state_json, campaign_type FROM campaigns WHERE id=?",
-        (camp_id,)).fetchone()
+    campaign_row = pve_db.db_campaign_runtime_row(camp_id, conn=db)
+    row = campaign_row
     campaign_type = (row[1] or "").upper() if row else ""
     encounter_guid = None
 
@@ -7366,8 +6957,7 @@ def _handle_campaign_start(handler, db, env_json, champ_id, cfg,
         active_node = _resolve_node(
             state, state.get("ALoc") or state.get("LastNode") or "")
         if campaign_type == "DUNGEON" and _normalize_crayburn_encounters(state, race_name):
-            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
-                       (json.dumps(state), camp_id))
+            _save_campaign_state(db, camp_id, state)
             db.commit()
         for loc in state.get("VisLocs", []):
             data = loc.get("Data", {}) or {}
@@ -7413,19 +7003,17 @@ def resolve_encounter(db, camp_id, scene_guid=None):
     ai_deck_guid, ai_champ_guid, ai_name, ai_charge_power, ai_personality,
     ai_deck_personality) or (None,)*7 if unresolved.
     """
-    row = db.execute(
-        "SELECT champion_id FROM campaigns WHERE id=?", (camp_id,)).fetchone()
-    if not row:
+    champion_id = pve_db.db_campaign_identity_state(camp_id, conn=db)
+    if not champion_id:
         return None, None, None, None, None, None, None
-    champ = db.execute(
-        "SELECT race FROM champions WHERE id=?", (row[0],)).fetchone()
-    if not champ:
+    race = pve_db.db_campaign_champion_race(camp_id, conn=db)
+    if race is None:
         return None, None, None, None, None, None, None
-    cfg = _az0_config(champ[0])
+    cfg = _az0_config(race)
     if not cfg:
         return None, None, None, None, None, None, None
     if scene_guid:
-        race_name = _RACE_NAMES.get(champ[0], "Necrotic")
+        race_name = _RACE_NAMES.get(race, "Necrotic")
         race_data = _CRAYBURN_CASTLE.get("races", {}).get(race_name, {})
         ai_decks = race_data.get("ai_decks", {})
         enc_node_names = ["Castle Gatehouse", "Tower Gatehouse",
@@ -7449,21 +7037,17 @@ def resolve_encounter(db, camp_id, scene_guid=None):
                 }
                 route_scene = _crayburn_scene_for_node(
                     race_name, route_nodes.get(node_name, node_name))
-                row = db.execute(
-                    "SELECT ai_deck_guid FROM encounter_scenes "
-                    "WHERE guid=?", (route_scene,)).fetchone()
-                if row and row[0]:
-                    return row[0]
+                row = pve_db.db_encounter_scene_runtime(route_scene, conn=db)
+                if row and row[4]:
+                    return row[4]
             except (KeyError, TypeError, ValueError):
                 pass
             return fallback
 
         def _scene_deck_personality(scene_id):
             try:
-                row = db.execute(
-                    "SELECT ai_deck_personality FROM encounter_scenes "
-                    "WHERE guid=?", (scene_id,)).fetchone()
-                return row[0] if row else None
+                row = pve_db.db_encounter_scene_runtime(scene_id, conn=db)
+                return row[6] if row else None
             except Exception:
                 return None
 
@@ -7505,11 +7089,8 @@ def resolve_encounter(db, camp_id, scene_guid=None):
                 deck_data.get("ai_deck_personality") or
                 _scene_deck_personality(scene_guid))
         # Fallback: encounter_scenes lookup.
-        scene = db.execute(
-            "SELECT ai_deck_guid, name, title, ai_champion_guid, "
-            "ai_deck_personality FROM encounter_scenes WHERE guid=?",
-            (scene_guid,)).fetchone()
-        ai_deck_guid = scene[0] if scene else None
+        scene = pve_db.db_encounter_scene_runtime(scene_guid, conn=db)
+        ai_deck_guid = scene[4] if scene else None
         # The training scene's internal name is AZ0_Orc, but the campaign
         # encounter is presented by the configured trainer NPC, Moqui.  Keep
         # the scene's deck while using the campaign-facing name.
@@ -7522,26 +7103,23 @@ def resolve_encounter(db, camp_id, scene_guid=None):
             # the banner; the battle setup supplies its generic AI champion
             # fallback when no champion is authored on the scene.
             ai_name = (scene[2] or scene[1]) if scene else "AI Opponent"
-            ai_champion_guid = scene[3] if scene and len(scene) > 3 else None
+            ai_champion_guid = scene[5] if scene else None
             if ai_champion_guid:
-                name_row = db.execute(
-                    "SELECT name FROM card_templates WHERE guid=?",
-                    (ai_champion_guid,)).fetchone()
-                if name_row and name_row[0]:
-                    ai_name = name_row[0]
+                template_name = pvp_db.db_template_name(
+                    ai_champion_guid, conn=db)
+                if template_name:
+                    ai_name = template_name
         return scene_guid, ai_deck_guid, ai_champion_guid, \
             ai_name, cfg.get("ai_charge_power"), cfg.get("ai_personality"), \
-            scene[4] if scene and len(scene) > 4 else None
+            scene[6] if scene else None
     scene_guid = cfg.get("training_encounter")
-    scene = db.execute(
-        "SELECT ai_deck_guid, name, ai_deck_personality "
-        "FROM encounter_scenes WHERE guid=?",
-        (scene_guid,)).fetchone() if scene_guid else None
-    ai_deck_guid = scene[0] if scene else None
+    scene = (pve_db.db_encounter_scene_runtime(scene_guid, conn=db)
+             if scene_guid else None)
+    ai_deck_guid = scene[4] if scene else None
     ai_name = cfg.get("trainer_npc") or (scene[1] if scene else None)
     return scene_guid, ai_deck_guid, cfg.get("ai_champion_guid"), ai_name, \
         cfg.get("ai_charge_power"), cfg.get("ai_personality"), \
-        scene[2] if scene and len(scene) > 2 else None
+        scene[6] if scene else None
 
 
 def _handle_gameend(handler, db, env_json, comp, session_id,
@@ -7585,11 +7163,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
     action = "StartLoc" if ract == 0 else "FinishLoc"
     log(f"    Campaign {action}: camp={camp_id} loc={location_name}")
 
-    row = db.execute(
-        "SELECT champion_id, state_json, campaign_type, template_name "
-        "FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_protocol_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
         resp["Errors"] = ["Campaign not found"]
@@ -7861,10 +7435,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                 _note_visited(state, ld.get("node") or location_name)
                 break
 
-    db.execute(
-        "UPDATE campaigns SET state_json=? WHERE id=?",
-        (json.dumps(state), camp_id)
-    )
+    _save_campaign_state(db, camp_id, state)
     db.commit()
 
     resp = _build_input_response(camp_id, state, success=True)
@@ -7883,10 +7454,7 @@ def _handle_forfeit(handler, db, env_json, comp, session_id,
                      reqid, target, instance, conh, uid):
     """Forfeit: forfeit a campaign."""
     camp_id = env_json.get("CampID", 0)
-    row = db.execute(
-        "SELECT champion_id, state_json, campaign_type FROM campaigns WHERE id=?",
-        (camp_id,)
-    ).fetchone()
+    row = pve_db.db_campaign_forfeit_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
         resp["Errors"] = ["Campaign not found"]
@@ -7903,10 +7471,7 @@ def _handle_forfeit(handler, db, env_json, comp, session_id,
     state["FinishReason"] = "Forfeit"
     state["CurState"] = "FINISHED"
 
-    db.execute(
-        "UPDATE campaigns SET state_json=? WHERE id=?",
-        (json.dumps(state), camp_id)
-    )
+    _save_campaign_state(db, camp_id, state)
     db.commit()
 
     resp = _build_input_response(camp_id, state, success=True)
@@ -7932,15 +7497,11 @@ def _handle_cheat(handler, db, env_json, comp, session_id,
     if len(namevals) >= 2 and namevals[0].lower() == "encounter":
         encounter_guid = namevals[1]
         # Player's deck for this champion.
-        champ = db.execute("SELECT last_deck_id FROM champions WHERE id=?",
-                           (champ_id,)).fetchone()
-        deck_db_id = champ[0] if champ and champ[0] else None
+        deck_db_id = pve_db.db_champion_last_deck_id(champ_id, conn=db)
         deck_uid64 = (deck_db_id << 8) | 17 if deck_db_id else 0
         # Find the campaign for this champion to get its CampID.
-        row = db.execute(
-            "SELECT id FROM campaigns WHERE champion_id=? ORDER BY id DESC LIMIT 1",
-            (champ_id,)).fetchone()
-        camp_id = row[0] if row else 0
+        latest = pve_db.db_latest_campaign_any(champ_id, conn=db)
+        camp_id = latest[0] if latest else 0
         try:
             _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
                               deck_uid64, comp, session_id, target, instance,
@@ -7956,14 +7517,9 @@ def _handle_cheat(handler, db, env_json, comp, session_id,
         # transition to the scene, then advance the castle chain one step from
         # the Entrance (which shows the first node's conversation).
         try:
-            row = db.execute(
-                "SELECT id, champion_id, state_json FROM campaigns "
-                "WHERE champion_id=? ORDER BY id DESC LIMIT 1",
-                (champ_id,)).fetchone()
+            row = pve_db.db_latest_campaign_any(champ_id, conn=db)
             if not row:
-                champ_row = db.execute(
-                    "SELECT id FROM champions WHERE id=?", (champ_id,)).fetchone()
-                if not champ_row:
+                if not pve_db.db_campaign_champion(champ_id, conn=db):
                     raise ValueError("no champion for dungeon cheat")
                 camp_id, _inst, _started, _st = _find_campaign_for_champion(
                     db, champ_id, "DUNGEON")
@@ -7972,8 +7528,7 @@ def _handle_cheat(handler, db, env_json, comp, session_id,
                 camp_id, camp_champ_id, _ = row
             # Always rebuild a fresh dungeon state — stale _pending_travel /
             # completed-node data from a previous run skips conversations.
-            db.execute("UPDATE campaigns SET state_json=NULL WHERE id=?",
-                       (camp_id,))
+            pve_db.db_campaign_clear_state(camp_id, db)
             db.commit()
             champ = _get_champion(db, camp_champ_id)
             cfg = _az0_config(champ[2]) if champ else _az0_config(1)
@@ -7982,9 +7537,8 @@ def _handle_cheat(handler, db, env_json, comp, session_id,
             state = _build_initial_gameplay_state(camp_id, camp_champ_id,
                                                   "DUNGEON", _race_for_cfg(cfg))
             _transition_to_dungeon(state, cfg)
-            db.execute(
-                "UPDATE campaigns SET campaign_type='DUNGEON', template_name='Crayburn Castle', state_json=? WHERE id=?",
-                (json.dumps(state), camp_id))
+            pve_db.db_promote_campaign_to_dungeon(
+                camp_id, json.dumps(state), conn=db)
             db.commit()
             # Ensure the dungeon's journal quest campaign exists.
             _ensure_quest_campaign(db, camp_champ_id, "DUNGEON")

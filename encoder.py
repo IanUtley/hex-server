@@ -186,19 +186,22 @@ def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, i
     return sidx
 
 
-def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did, card_guids, idx):
+def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did,
+                     card_guids, idx, pvp_champion_guid=None):
     """Encode one deck_bits inline WITH element header (for use in cardlist/decklist)."""
     f = buf.tell(); sizes.append(0)
     sidx = len(sizes) - 1
     w = lambda s: buf.write(s.encode("utf-8"))
     sep = lambda: buf.write(b";")
     w(str(idx)); sep(); w(str(sidx)); sep(); w(str(ft("Game.Shared.Domain.deck_bits"))); sep(); w("25"); sep()
-    encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did, card_guids)
+    encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
+                            card_guids, pvp_champion_guid)
     sizes[sidx] = buf.tell() - f
     return sidx
 
 
-def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did, card_guids):
+def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
+                            card_guids, pvp_champion_guid=None):
     """Encode the 25 deck_bits fields directly (no element wrapper)."""
     w = lambda s: buf.write(s.encode("utf-8"))
     sep = lambda: buf.write(b";")
@@ -227,25 +230,52 @@ def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did, card
     w("PVEChampionId"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
     w(hexlify(struct.pack("<Q", champ_did)).decode("ascii")); sep()
     sizes[-1] = buf.tell() - f3
-    # 4. PVPChampionId
-    wf_rid("PVPChampionId", b"00000000-0000-0000-0000-000000000000")
+    # 4. PVPChampionId.  Tournament-only decks may carry a fixed champion
+    # without having a profile deck/champion database ID.
+    wf_rid("PVPChampionId", pvp_champion_guid or
+           b"00000000-0000-0000-0000-000000000000")
     # 5-9. Talents 1-5
     for tn in ("talent_1","talent_2","talent_3","talent_4","talent_5"):
         wf_rid(tn, b"00000000-0000-0000-0000-000000000000")
     # 10-15. Equipment 1-6
     for en in ("equipment_1","equipment_2","equipment_3","equipment_4","equipment_5","equipment_6"):
         wf_rid(en, b"00000000-0000-0000-0000-000000000000")
-    # 16. CardsInDeck (empty)
+    # 16. CardsInDeck.  Tournament construction snapshots may provide a
+    # fixed starting deck separately from the sideboard/pool.  Ordinary
+    # callers still pass a flat GUID list and retain the empty default.
+    deck_cards = []
+    sideboard_cards = []
+    if isinstance(card_guids, dict):
+        deck_cards = [entry for entry in (card_guids.get("main") or [])
+                      if isinstance(entry, (tuple, list)) and len(entry) >= 6]
+        sideboard_cards = [entry for entry in
+                           (card_guids.get("sideboard") or [])
+                           if isinstance(entry, (tuple, list)) and len(entry) >= 6]
     f_cd = buf.tell(); sizes.append(0)
     w("CardsInDeck"); sep(); w(str(len(sizes)-1)); sep()
     w(str(ft("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits"))); sep(); w("0"); sep()
-    w("0"); sep()
+    w(str(len(deck_cards))); sep()
+    for i, entry in enumerate(deck_cards):
+        encode_card_instance(buf, sizes, ft, entry[0], entry[1],
+                             int(entry[2]), int(entry[3]), int(entry[4]),
+                             int(entry[5]), i)
     sizes[-1] = buf.tell() - f_cd
-    # 17. CardsInSideboard (empty)
+    # 17. CardsInSideboard.  Tournament construction uses this list as the
+    # player's limited pool.  Entries are optional six-tuples accepted by
+    # encode_card_instance: (template_guid, name, instance_id, cost, atk,
+    # defense).  Ordinary profile deck encodings still pass GUID strings and
+    # therefore retain the historical empty sideboard.
     f_cs = buf.tell(); sizes.append(0)
     w("CardsInSideboard"); sep(); w(str(len(sizes)-1)); sep()
     w(str(ft("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits"))); sep(); w("0"); sep()
-    w("0"); sep()
+    pool = sideboard_cards if isinstance(card_guids, dict) else [
+        entry for entry in (card_guids or [])
+        if isinstance(entry, (tuple, list)) and len(entry) >= 6]
+    w(str(len(pool))); sep()
+    for i, entry in enumerate(pool):
+        encode_card_instance(buf, sizes, ft, entry[0], entry[1],
+                             int(entry[2]), int(entry[3]), int(entry[4]),
+                             int(entry[5]), i)
     sizes[-1] = buf.tell() - f_cs
     # 18. ActiveGems — Dictionary<ulong, EGemTypesNew> (empty)
     f_ag = buf.tell(); sizes.append(0)
@@ -556,8 +586,11 @@ def encode_objfmt_response(type_names, fields):
             for i, (did, dname, did_val, champ_did, cards_json, card_guids) in enumerate(deck_data):
                 encode_deck_bits(buf, sizes, find_type, did, dname, did_val, champ_did, card_guids, i)
         elif tcode == "deckbits":
-            did, dname, did_val, champ_did, card_guids = val
-            encode_deck_bits_fields(buf, sizes, find_type, did, dname, did_val, champ_did, card_guids)
+            did, dname, did_val, champ_did, card_guids = val[:5]
+            pvp_champion_guid = val[5] if len(val) > 5 else None
+            encode_deck_bits_fields(
+                buf, sizes, find_type, did, dname, did_val, champ_did,
+                card_guids, pvp_champion_guid)
         elif tcode == "champlist":
             w(str(ecount))
             sep()

@@ -107,11 +107,12 @@ $ClientData = 'C:\Program Files (x86)\Steam\steamapps\common\HEX SHARDS OF FATE\
 New-Item -ItemType Directory -Force $HexState | Out-Null
 docker run --rm `
   -p 9933:9933 -p 8081:8081 `
+  --user 1001:1001 `
   -v "${HexState}:/hex/state" `
   -v "${ClientData}:/client-data:ro" `
   -e HEX_DB_PATH='/hex/state/hconnect.db' `
   -e HEX_GAMEDATA='/client-data/gamedata' `
-  ghcr.io/ianutley/hex-server:0.2.0
+  ghcr.io/ianutley/hex-server:0.3.0
 ```
 
 ```bash
@@ -119,15 +120,17 @@ HEX_STATE=$HOME/HexServer
 CLIENT_DATA='location of Hex Client Data directory'
 
 mkdir -p $HEX_STATE
-chmod 666 $HEX_STATE
+# The container runs as UID 1001 and must be able to traverse and write here.
+chmod 777 -- "$HEX_STATE"
 
-docker run --rm `
-  -p 9933:9933 -p 8081:8081 `
-  -v "${HEX_STATE}:/hex/state" `
-  -v "${CLIENT_DATA}:/client-data:ro" `
-  -e HEX_DB_PATH='/hex/state/hconnect.db' `
-  -e HEX_GAMEDATA='/client-data/gamedata' `
-  ghcr.io/ianutley/hex-server:0.2.0
+docker run --rm \
+  -p 9933:9933 -p 8081:8081 \
+  --user 1001:1001 \
+  -v "${HEX_STATE}:/hex/state" \
+  -v "${CLIENT_DATA}:/client-data:ro" \
+  -e HEX_DB_PATH='/hex/state/hconnect.db' \
+  -e HEX_GAMEDATA='/client-data/gamedata' \
+  ghcr.io/ianutley/hex-server:0.3.0
 ```
 
 You can try using the `latest` tag to be on the bleeding edge. But you may

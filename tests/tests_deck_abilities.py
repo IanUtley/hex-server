@@ -45,6 +45,8 @@ TPL = {
     "gladiator": "33f03766-e38e-4a77-ac1e-bbc78a55ddbb",
     "wretched_wrangler": "638e079b-7d0a-4c9e-a81f-ca29e918731c",
     "lifeweaver": "410c66bb-243b-489f-b2d2-c3a96089a717",
+    "reece": "eef7e012-f355-4f36-ae99-89b7ebd0ee25",
+    "minion_of_yazukan": "e976d596-f915-4a9e-bb95-2276292ae288",
 }
 
 ABILITIES = [
@@ -64,6 +66,7 @@ ABILITIES = [
     "81712882-30ed-c365-1d90-211966640219",  # Burn champion-or-troop
     "b95fdd81-2eca-f2cb-b28b-c5ec70307ca0",  # Shamed Gladiator deploy "you"
     "7ad2af0a-7e18-ee3d-e8e0-7c050844770d",  # Lifeweaver Shaman health gain
+    "598fe8be-5c04-918c-e0aa-82e88aee3d28",  # Reese the Crustcrawler tunnel
 ]
 
 
@@ -439,6 +442,81 @@ def test_prairie_scout_activation_gating(db):
     db.commit()
     aff = HCPHandler._affordable_troop_abilities(h, SessionStub(), bstate2)
     assert (101, TPL["prairie"]) in aff, aff
+
+
+def test_hand_tunnel_activation_gating(db):
+    """Hand Tunnel uses its authored threshold and activation cost.
+
+    Minion of Yazukan is the exact BasicAction regression: it tunnels itself
+    from hand for one Blood threshold and two resources.
+    """
+    import battle_engine as be
+    import hconnect_server as hcs
+    from gamedata import DEFAULT_RECORD_STORE
+    from hconnect_server import HCPHandler
+
+    add_card(db, 110, 5, "reece", "hand")
+    add_card(db, 111, 5, "minion_of_yazukan", "hand")
+
+    class ReeseHandler:
+        user_profile = {"id": 5}
+        _play_plan_store = DEFAULT_RECORD_STORE
+
+        def __init__(self, conn):
+            self._db = conn
+
+        def _card_ability_list(self, session, card_uid):
+            row = self._db.execute(
+                "SELECT card_abilities FROM game_cards "
+                "WHERE session_id=? AND card_uid=?",
+                (session.session_id, card_uid)).fetchone()
+            return [g.lower() for g in json.loads(row[0] or "[]")]
+
+        def _card_uses(self, session, card_uid):
+            return {}
+
+        def _champion_targets(self):
+            return []
+
+    def state(resources, sapphire):
+        value = be.default_state()
+        value.update({
+            "player_resources": resources,
+            "player_threshold": {game_engine.SHARD_TO_FLAG["sapphire"]: sapphire},
+            "phase_idx": be.BASE_TURN_PHASES.index(
+                game_engine.ETurnPhases.FirstMainPhase),
+        })
+        return value
+
+    handler = ReeseHandler(db)
+    old_db = hcs._db
+    hcs._db = db
+    try:
+        available = HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), state(2, 1))
+        assert available == {
+            (110, TPL["reece"]): ["598fe8be-5c04-918c-e0aa-82e88aee3d28"]
+        }, available
+
+        blood_state = state(2, 0)
+        blood_state["player_threshold"] = {
+            game_engine.SHARD_TO_FLAG["blood"]: 1}
+        assert HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), blood_state) == {
+                (111, TPL["minion_of_yazukan"]): [
+                    "95474d1e-ac9b-6c02-cb95-0305ebec42dc"]
+            }
+
+        assert not HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), state(1, 1))
+        no_blood = state(2, 0)
+        assert not HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), no_blood)
+
+        assert not HCPHandler._affordable_troop_abilities(
+            handler, SessionStub(), state(2, 0))
+    finally:
+        hcs._db = old_db
 
 
 def test_pregame_health_counts_only_heals(db):
@@ -1092,6 +1170,7 @@ if __name__ == "__main__":
         test_lifeweaver_shamans_stack_on_each_health_gain)
     run("Dimmid starts at 19 from champion table", test_dimmid_starting_health)
     run("Prairie Scout gated to combat + attacking troop", test_prairie_scout_activation_gating)
+    run("Hand Tunnel uses its own threshold and cost", test_hand_tunnel_activation_gating)
     run("PreGame health counts only heal leaves", test_pregame_health_counts_only_heals)
     run("Escalation preview scales with uses", test_escalation_preview_value)
     run("Void uses the chosen trigger target", test_void_uses_trigger_target)

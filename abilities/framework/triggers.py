@@ -24,13 +24,16 @@ from gamedata import DEFAULT_RECORD_STORE, ability_graph
 from ._shared import (
     _log,
     apply_attribute_grant,
+    card_collection_for_location,
     owner_uid,
 )
 from .effects.counters import (
     card_counters, add_card_counter, remove_card_counters,
     push_card_counters, counter_name_from_text,
+    TUNNELING_ABILITY_GUID,
 )
 from .stat_mod import apply_card_stat_mod
+from .targeting import _side_of
 
 
 _RECORD_STORE = DEFAULT_RECORD_STORE
@@ -43,14 +46,12 @@ def _card_uses_variable(db, session_id, card_uid, variable_type):
     Mimic-created copies are evaluated from their instance metadata rather
     than from a card-name special case.
     """
-    row = db.execute(
-        "SELECT card_abilities FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
-    if not row or not row[0]:
+    from pvp_db import db_card_ability_payload
+    payload = db_card_ability_payload(session_id, int(card_uid), conn=db)
+    if not payload:
         return False
     try:
-        ability_guids = json.loads(row[0])
+        ability_guids = json.loads(payload)
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     for ability_guid in ability_guids or []:
@@ -69,10 +70,8 @@ def _refresh_variable_cards(db, handler, game, session, pl_t, ai_t,
     if not hasattr(handler, "_card_full_data"):
         return
     handler._current_bstate = bstate
-    rows = db.execute(
-        "SELECT card_uid, template_guid, user_id, card_state, card_type "
-        "FROM game_cards WHERE session_id=? AND location='warzone'",
-        (session.session_id,)).fetchall()
+    from pvp_db import db_warzone_display_rows
+    rows = db_warzone_display_rows(session.session_id, conn=db)
     for card_uid, template_guid, user_id, card_state, card_type in rows:
         if not _card_uses_variable(db, session.session_id, card_uid,
                                    variable_type):
@@ -110,12 +109,9 @@ def _warzone_ability_holders(db, session_id, controller_uid, zones=("warzone",))
     # driven and also covers setup abilities on cards created by encounters.
     zone_values = list(dict.fromkeys(
         list(zones) + (["mod"] if "warzone" in zones else [])))
-    placeholders = ",".join("?" * len(zone_values))
-    rows = db.execute(
-        ("SELECT card_uid, card_abilities FROM game_cards "
-         "WHERE session_id=? AND user_id=? AND location IN (%s) "
-         "AND card_abilities IS NOT NULL AND card_abilities != ''") % placeholders,
-        (session_id, controller_uid) + tuple(zone_values)).fetchall()
+    from pvp_db import db_cards_in_zones_with_abilities
+    rows = db_cards_in_zones_with_abilities(
+        session_id, controller_uid, zone_values, conn=db)
     for cu, ab_json in rows:
         try:
             ags = [g.lower() for g in json.loads(ab_json or "[]")]
@@ -128,14 +124,12 @@ def _warzone_ability_holders(db, session_id, controller_uid, zones=("warzone",))
 
 def _card_ability_guids(db, session_id, card_uid):
     """Ability GUIDs currently on a specific card instance."""
-    row = db.execute(
-        "SELECT card_abilities FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
-    if not row or not row[0]:
+    from pvp_db import db_card_ability_payload
+    payload = db_card_ability_payload(session_id, int(card_uid), conn=db)
+    if not payload:
         return []
     try:
-        return [g.lower() for g in json.loads(row[0])]
+        return [g.lower() for g in json.loads(payload)]
     except (ValueError, TypeError):
         return []
 
@@ -224,7 +218,7 @@ def _public_effect_groups_ready(db, handler, session, pl_t, ai_t, bstate,
                                 graph, source_uid, source_owner_uid,
                                 public_groups, trigger_target_uid):
     """Whether the first public group has an effect that can resolve now."""
-    from .condition_engine import ConditionContext, evaluate_effect_condition
+    from rules_port.conditions import ConditionContext, evaluate_effect_condition
     champions = []
     champ_fn = getattr(handler, "_champion_targets", None)
     if callable(champ_fn):
@@ -267,10 +261,21 @@ def manually_trigger_abilities(db, handler, game, session, pl_t, ai_t,
     ags = _card_ability_guids(db, session.session_id, target_uid)
     if not ags:
         return ""
-    row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
-    owner_id = int(row[0]) if row else 0
+    from pvp_db import db_card_owner_id
+    owner_id = int(db_card_owner_id(
+        session.session_id, int(target_uid), conn=db) or 0)
+    port_session = getattr(session, "_rules_port_session", None)
+    if (port_session is not None or
+            bstate.get("_rules_port_attached")):
+        from rules_port.resolution import resolve_port_ability
+        results = []
+        for ag in ags:
+            if not ability_matches_keyword(db, ag, keyword):
+                continue
+            results.append(resolve_port_ability(
+                handler, game, session, db, pl_t, ai_t, bstate, ag,
+                int(target_uid), owner_id))
+        return "; ".join(str(result) for result in results if result)
     from .resolution import resolve_ability
     results = []
     for ag in ags:
@@ -306,12 +311,8 @@ def _champion_ability_holders(db, handler, controller_uid):
         return {}
     abilities = []
     if guid:
-        rows = db.execute(
-            "SELECT ca.ability_guid FROM champion_abilities ca "
-            "JOIN card_abilities_meta cam ON cam.ability_guid=ca.ability_guid "
-            "WHERE ca.champion_guid=? AND cam.trigger_event_type IS NOT NULL "
-            "AND cam.trigger_event_type != '' ORDER BY ca.ability_guid",
-            (str(guid),)).fetchall()
+        from pvp_db import db_champion_trigger_ability_guids
+        rows = db_champion_trigger_ability_guids(str(guid), conn=db)
         abilities.extend(str(row[0]).lower() for row in rows)
     # Player champion abilities include both signature powers and the
     # selected talent abilities. Talent abilities are indexed in
@@ -363,10 +364,9 @@ def _entering_card_is_troop(db, session_id, card_uid):
     """True if the CardEnteredZone source card is a Troop instance."""
     if card_uid is None:
         return False
-    row = db.execute(
-        "SELECT card_type FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
-    return bool(row and (row[0] or "") == "Troop")
+    from pvp_db import db_card_mutation_info
+    row = db_card_mutation_info(session_id, int(card_uid), conn=db)
+    return bool(row and (row[2] or "") == "Troop")
 
 
 def _ai_battle_target(db, session, source_uid, ability_guid, candidates):
@@ -379,29 +379,16 @@ def _ai_battle_target(db, session, source_uid, ability_guid, candidates):
     """
     if not candidates:
         return None
-    effect = db.execute(
-        "SELECT 1 FROM ability_effects WHERE ability_guid=? "
-        "AND effect_type='Battle2CardsAbilityEffectTemplate' LIMIT 1",
-        (ability_guid,)).fetchone()
+    from pvp_db import (db_ability_has_effect, db_card_combat_identity,
+                        db_battle_target_stats)
+    effect = db_ability_has_effect(ability_guid, conn=db)
     if not effect:
         return candidates[0]
-    source = db.execute(
-        "SELECT COALESCE(ct.attack,0) + COALESCE(gc.card_attack_mod,0) "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session.session_id, int(source_uid))).fetchone()
-    damage = max(0, int(source[0] or 0)) if source else 0
+    source = db_card_combat_identity(session.session_id, int(source_uid), conn=db)
+    damage = max(0, int(source[3] or 0)) if source else 0
     if damage <= 0:
         return random.choice(candidates)
-    placeholders = ",".join("?" * len(candidates))
-    rows = db.execute(
-        "SELECT gc.card_uid, (COALESCE(ct.attributes,0) | "
-        "COALESCE(gc.card_attributes,0)), "
-        "COALESCE(ct.defense,0) + COALESCE(gc.card_defense_mod,0) "
-        "- COALESCE(gc.card_damage,0) "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
-        f"WHERE gc.session_id=? AND gc.card_uid IN ({placeholders})",
-        (session.session_id, *[int(uid) for uid in candidates])).fetchall()
+    rows = db_battle_target_stats(session.session_id, candidates, conn=db)
     by_uid = {int(uid): (int(attrs or 0), int(health or 0))
               for uid, attrs, health in rows}
     fliers = [uid for uid in candidates
@@ -422,17 +409,14 @@ def _ai_trigger_target(db, session, ability_guid, source_uid, owner_id,
 
     graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
     target_ids = [target.guid for target in graph.targets] if graph else []
-    effects = db.execute(
-        "SELECT target_index, effect_type FROM ability_effects "
-        "WHERE ability_guid=? AND target_index>=0 ORDER BY effect_order",
-        (ability_guid,)).fetchall()
+    from pvp_db import db_ability_target_effect_rows, db_target_template_info
+    effects = db_ability_target_effect_rows(ability_guid, conn=db)
     for target_index, effect_type in effects:
         if int(target_index) >= len(target_ids):
             continue
         target_id = target_ids[int(target_index)]
-        template = db.execute(
-            "SELECT is_auto_target, target_kind FROM target_templates "
-            "WHERE template_id=?", (target_id,)).fetchone()
+        template = db_target_template_info(target_id, conn=db)
+        template = ((template[2], template[1]) if template else None)
         if not template or int(template[0] or 0) or template[1] in (
                 "PlayerTargetTemplate", "AbilitySourceCardTargetTemplate",
                 "SourceRevealedTargetTemplate", "SourceDrawnTargetTemplate",
@@ -552,6 +536,16 @@ def _resolve_ability_bom(db, handler, game, session, pl_t, ai_t, bstate,
     bstate.pop("player_spell_target", None)
     bstate.pop("player_mod_target", None)
     try:
+        if bstate.get("_rules_port_native_effect"):
+            # A trigger raised while a native effect is resolving must remain
+            # inside the RulesPort lifecycle.  This preserves nested ability
+            # identity/continuations and prevents the legacy resolver from
+            # becoming an invisible second rules engine.
+            from rules_port.resolution import resolve_port_ability
+            return resolve_port_ability(
+                handler, game, session, db, pl_t, ai_t, bstate,
+                ability_guid, source_uid, source_owner_uid or 0,
+                target_map=target_map)
         from .resolution import resolve_ability
         return resolve_ability(
             handler, game, session, db, pl_t, ai_t, bstate,
@@ -578,24 +572,22 @@ def _resolve_move_zone(db, handler, game, session, pl_t, ai_t, bstate,
         # into play." The voided card UIDs were recorded by the void leaf.
         voided = ((bstate or {}).get("voided_by") or {}).get(str(int(source_uid))) or []
         returned = 0
+        from pvp_db import (db_card_owner_zone_state, db_restore_card_to_warzone,
+                            db_card_zone_details)
         for vu in list(voided):
-            row = db.execute(
-                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(vu))).fetchone()
+            row = db_card_owner_zone_state(
+                session.session_id, int(vu), conn=db)
             if not row:
                 continue
             owner = pl_t if row[0] != 0 else ai_t
-            db.execute(
-                "UPDATE game_cards SET location='warzone', position=0, "
-                "card_state = card_state & ~? "
-                "WHERE session_id=? AND card_uid=?",
-                (game_engine.ECardStates.Dead, session.session_id, int(vu)))
+            db_restore_card_to_warzone(
+                session.session_id, int(vu), game_engine.ECardStates.Dead, 0,
+                conn=db)
             db.commit()
             scid = game_engine.SessionCardId(game_engine.UID(int(vu)))
-            tpl_row = db.execute(
-                "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(vu))).fetchone()
-            tpl_guid = tpl_row[0] if tpl_row else None
+            details = db_card_zone_details(
+                session.session_id, int(vu), conn=db)
+            tpl_guid = details[0] if details else None
             _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, tpl_guid)
             game.push_card_moved(scid, owner, game_engine.ECardCollections.Warzone,
                                  game_engine.ECardLocations.Top, 0)
@@ -608,38 +600,34 @@ def _resolve_move_zone(db, handler, game, session, pl_t, ai_t, bstate,
     if "put target troop into its controller's hand" in low:
         # Bounce — for AI cards, auto-pick an opposing warzone troop
         if target_uid is None:
-            src_row = db.execute(
-                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(source_uid))).fetchone()
-            if src_row and src_row[0] == 0:
+            from pvp_db import db_card_owner_id, db_warzone_troop_uids_except_owner
+            source_owner = db_card_owner_id(
+                session.session_id, int(source_uid), conn=db)
+            if source_owner == 0:
                 # AI-controlled: auto-pick a player warzone troop
-                bounce_row = db.execute(
-                    "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id!=0 "
-                    "AND location='warzone' AND card_type LIKE '%Troop%' "
-                    "ORDER BY position LIMIT 1",
-                    (session.session_id,)).fetchone()
-                if bounce_row:
-                    target_uid = bounce_row[0]
+                bounce_rows = db_warzone_troop_uids_except_owner(
+                    session.session_id, 0, conn=db)
+                if bounce_rows:
+                    target_uid = bounce_rows[0][0]
             if target_uid is None:
                 return "bounce: no target"
         # Store the target so subsequent effects (e.g. cardcost) in the same BOM can find it
         bstate["player_spell_target"] = target_uid
         bstate["player_mod_target"] = target_uid
-        row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
+        from pvp_db import (db_card_owner_zone_state, db_move_card_to_location,
+                            db_card_zone_details)
+        row = db_card_owner_zone_state(
+            session.session_id, int(target_uid), conn=db)
         if not row:
             return "bounce: target not found"
         owner = pl_t if row[0] != 0 else ai_t
-        db.execute(
-            "UPDATE game_cards SET location='hand', position=100 WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid)))
+        db_move_card_to_location(
+            session.session_id, int(target_uid), "hand", position=100, conn=db)
         db.commit()
         scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
-        tpl_row = db.execute(
-            "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
-        tpl_guid = tpl_row[0] if tpl_row else None
+        details = db_card_zone_details(
+            session.session_id, int(target_uid), conn=db)
+        tpl_guid = details[0] if details else None
         _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, tpl_guid)
         game.push_card_moved(scid, owner, game_engine.ECardCollections.Hand,
                              game_engine.ECardLocations.Top, 0)
@@ -653,25 +641,23 @@ def _resolve_move_zone(db, handler, game, session, pl_t, ai_t, bstate,
         # Raise from crypt
         if target_uid is None:
             return "raise: no target"
-        row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
+        from pvp_db import (db_card_owner_zone_state, db_restore_card_to_warzone,
+                            db_card_zone_details)
+        row = db_card_owner_zone_state(
+            session.session_id, int(target_uid), conn=db)
         if not row:
             return "raise: target not found"
         owner = pl_t if row[0] != 0 else ai_t
-        db.execute(
-            "UPDATE game_cards SET location='warzone', position=0, "
-            "card_state = (card_state & ~?) | ? WHERE session_id=? AND card_uid=?",
-            (game_engine.ECardStates.StartedATurnOnYourSide |
-             game_engine.ECardStates.Dead,
-             game_engine.ECardStates.CameOutThisTurn,
-             session.session_id, int(target_uid)))
+        db_restore_card_to_warzone(
+            session.session_id, int(target_uid),
+            game_engine.ECardStates.StartedATurnOnYourSide |
+            game_engine.ECardStates.Dead,
+            game_engine.ECardStates.CameOutThisTurn, conn=db)
         db.commit()
         scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
-        tpl_row = db.execute(
-            "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
-        tpl_guid = tpl_row[0] if tpl_row else None
+        details = db_card_zone_details(
+            session.session_id, int(target_uid), conn=db)
+        tpl_guid = details[0] if details else None
         _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(game, scid, tpl_guid)
         game.push_card_moved(scid, owner, game_engine.ECardCollections.Warzone,
                              game_engine.ECardLocations.Top, 0)
@@ -690,13 +676,12 @@ def _resolve_counter_spell(db, handler, game, session, pl_t, ai_t, bstate,
     target_uid = (bstate or {}).get("player_spell_target")
     if target_uid is None:
         return "counter: no target on chain"
-    row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
-    owner = row[0] if row else 0
+    from pvp_db import db_card_owner_id, db_card_chain_info
+    owner = db_card_owner_id(
+        session.session_id, int(target_uid), conn=db) or 0
     from ._shared import owner_uid
     owner_sid = owner_uid(owner, pl_t, ai_t, bstate)
-    from db import db_discard_card
+    from pvp_db import db_discard_card
     db_discard_card(session.session_id, int(target_uid), connection=db)
     scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
     # Remove the countered card's own item from underneath Countermagic on the
@@ -707,18 +692,18 @@ def _resolve_counter_spell(db, handler, game, session, pl_t, ai_t, bstate,
                     if int(item.get("source_uid") or 0) != int(target_uid)]
     # A full discard update keeps the client's cached representation out of the
     # hand/chain after the authoritative zone move.
-    tpl_row = db.execute(
-        "SELECT template_guid, card_type FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
+    tpl_row = db_card_chain_info(
+        session.session_id, int(target_uid), conn=db)
+    card_type = "Troop"
     if tpl_row:
         _tpl, card_type, _name, _cost, _atk, _def, _gems = \
             handler._card_full_data(game, scid, tpl_row[0])
+    game.push_card_moved(scid, owner_sid, game_engine.ECardCollections.Discard,
+                         game_engine.ECardLocations.Top, 0)
+    if tpl_row:
         game.push_card_updated(
             scid, owner_sid, game_engine.ECardCollections.Discard,
             game_engine.card_type_from_db(card_type), template_id=tpl_row[0])
-    game.push_card_moved(scid, owner_sid, game_engine.ECardCollections.Discard,
-                         game_engine.ECardLocations.Top, 0)
     _log(f"    Countered {hex(int(target_uid))}")
     return f"countered {hex(int(target_uid))}"
 
@@ -755,7 +740,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                      extra_target=None, zones=None,
                      event_source_collection=None,
                      event_destination_collection=None,
-                     event_previous_state=None):
+                     event_previous_state=None, event_int_attribute=None,
+                     event_tac=None):
     """Fire every card ability whose trigger_event_type == event_type.
 
     ``source_uid`` is the card that entered / attacked / blocked / died.
@@ -764,9 +750,113 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     """
     from db import log_req
     bstate = bstate or {}
+
+    # RulesPort owns the live trigger lifecycle. Projection and mode adapters
+    # still call this historical function name, so route every attached-session
+    # event through the typed dispatcher, including recursive native events.
+    port_session = getattr(session, "_rules_port_session", None)
+    if port_session is not None:
+        from rules_port.triggers import NativeTriggerBackend, TriggerEvent
+        return NativeTriggerBackend()(
+            db=db, handler=handler, game=game, session=session,
+            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+            event=TriggerEvent(
+                str(event_type).rsplit(".", 1)[-1], source_uid,
+                source_owner_uid, extra_target,
+                data={"zones": zones,
+                      "event_source_collection": event_source_collection,
+                      "event_destination_collection": event_destination_collection,
+                      "event_previous_state": event_previous_state,
+                      "event_int_attribute": event_int_attribute,
+                      "event_tac": dict(event_tac or {})}))
+
     bstate["event_type"] = event_type
 
+    # Keep this event-local counter in the same authoritative battle state
+    # used by the client TAC condition CardsDiscardedThisTurn. Increment before
+    # evaluating triggers so the discard that caused the event is included.
+    if event_type == "CardDiscardedEvent":
+        try:
+            discarded_owner = int(source_owner_uid or 0)
+        except (TypeError, ValueError):
+            discarded_owner = 0
+        if bstate.get("pvp"):
+            key = f"cards_discarded_this_turn_{discarded_owner}"
+        else:
+            key = f"{_side_of(discarded_owner)}_cards_discarded_this_turn"
+        bstate[key] = int(bstate.get(key, 0) or 0) + 1
+    elif event_type == "TurnStartedEvent":
+        try:
+            turn_owner = int(source_owner_uid or 0)
+        except (TypeError, ValueError):
+            turn_owner = 0
+        if bstate.get("pvp"):
+            bstate[f"cards_discarded_this_turn_{turn_owner}"] = 0
+        else:
+            bstate[f"{_side_of(turn_owner)}_cards_discarded_this_turn"] = 0
+
     logs = []
+    inspired_events = set()
+
+    def _publish_chain_source(source_uid):
+        """Ensure a public trigger source is in the viewer card cache.
+
+        A triggered constant can already be on the board while a reconnecting
+        client has never received its CardUpdated in the current event stream.
+        The chain event only carries a SessionCardId, so Unity drops the card
+        image when GetCardView returns null.  Re-publish the authoritative
+        public source representation immediately before its chain event; the
+        normal underground redaction still applies per recipient.
+        """
+        if source_uid is None or not hasattr(handler, "_card_full_data"):
+            return
+        from pvp_db import db_card_source_info
+        row = db_card_source_info(session.session_id, int(source_uid), conn=db)
+        if not row or str(row[2] or "").lower() in {
+                "hand", "deck", "choosing", "void"}:
+            return
+        try:
+            scid = game_engine.SessionCardId(game_engine.UID(int(source_uid)))
+            tpl, ctype, _name, cost, attack, defense, gems = \
+                handler._card_full_data(game, scid, row[0])
+            game.push_card_updated(
+                scid, owner_uid(row[3], pl_t, ai_t, bstate),
+                card_collection_for_location(row[2]), ctype,
+                template_id=tpl, cost=cost, attack=attack,
+                defense=defense, gems=gems)
+        except Exception as exc:
+            _log(f"    trigger source CardUpdated failed for {source_uid}: {exc}")
+
+    def _chain_targets(target_uid):
+        if target_uid is None:
+            return []
+        try:
+            return [game_engine.SessionCardId(game_engine.UID(int(target_uid)))]
+        except (TypeError, ValueError):
+            return []
+
+    def _emit_inspired_event(inspirer_uid, entering_uid, inspirer_owner):
+        """Emit the client CardInspiredEvent once per successful inspirer.
+
+        ``AsEntersPlayEvent`` is the shared metadata event used to resolve an
+        Inspire ability.  The original client also enqueues a second,
+        separate event so abilities such as ``When this inspires a troop``
+        can react.  Keep the two events distinct and guard multiple Inspire
+        abilities on one card from producing duplicate notifications.
+        """
+        if entering_uid is None or int(inspirer_uid) == int(entering_uid):
+            return
+        key = (int(inspirer_uid), int(entering_uid))
+        if key in inspired_events:
+            return
+        inspired_events.add(key)
+        result = resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardInspiredEvent", int(inspirer_uid),
+            source_owner_uid=int(inspirer_owner or 0),
+            extra_target=int(entering_uid))
+        if result:
+            logs.append(result)
 
     def _opposing_owner(player_id):
         # Practice uses 0 for AI and one non-zero human id. PvP has two
@@ -791,7 +881,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
 
     # Gather candidate abilities: the source card's own triggers + any warzone
     # card (same owner) with a matching trigger (Inspire/Deathcry).
-    cand = {}
+    cand = bstate.pop("_rules_port_trigger_candidates", None)
+    if cand is None:
+        cand = {}
     if source_uid is not None:
         for ag in _card_ability_guids(db, session.session_id, source_uid):
             cand.setdefault(int(source_uid), []).append(ag)
@@ -802,10 +894,10 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             cand.setdefault(int(extra_target), []).append(ag)
     owner_id = source_owner_uid
     if owner_id is None and source_uid is not None:
-        row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(source_uid))).fetchone()
-        owner_id = row[0] if row else 0
+        from pvp_db import db_card_owner_id
+        owner_id = db_card_owner_id(session.session_id, int(source_uid), conn=db)
+        if owner_id is None:
+            owner_id = 0
     # Champion passives live on the champion source, not in game_cards.  Add
     # the matching side's metadata-defined triggered abilities to the same
     # candidate pool used for warzone/hand cards.
@@ -826,7 +918,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
         # remain authoritative for callers such as GameStartedEvent.
         if (zones is None
                 and event_type in ("TurnStartedEvent", "TurnEndedEvent")):
-            zone_sets = [("warzone", "hand", "deck", "discard")]
+            zone_sets = [("warzone", "hand", "deck", "discard",
+                          "underground")]
         if event_type == "CardDrawnEvent":
             # Both sides' cards react to a draw ("when you draw" vs "when an
             # opposing champion draws") — the trigger conditions gate the side.
@@ -842,17 +935,37 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             # A card entered a zone — both sides' cards react ("when a card
             # enters your/opposing crypt/warzone" e.g. Incantation of Fear);
             # the trigger conditions gate the side.
+            # Underground permanents are also persistent trigger sources. In
+            # particular, Subterranean Spy and Monsuun listen while buried;
+            # the authored trigger collection flags below still decide
+            # whether a particular source is legal.
+            zone_sets.append(("underground",))
             other = _opposing_owner(owner_id)
             if other is None:
                 other = 0 if (owner_id or 0) != 0 else (
                     handler.user_profile["id"] if handler.user_profile else 0)
             sides.append(other)
+        if event_type == "CombatEndedEvent":
+            # Combat-ended triggers have no source card.  The client gathers
+            # persistent triggers from both controllers after the combat
+            # object is removed, so scan both sides here rather than dropping
+            # the event because source_uid is None.
+            other = _opposing_owner(owner_id)
+            if other is not None:
+                sides.append(other)
         for h in sides:
             for zs in zone_sets:
                 for cu, ags in _warzone_ability_holders(
                         db, session.session_id, h, zs).items():
-                    if (cu != int(source_uid or 0)
-                            and cu != int(extra_target or 0)):
+                    # CardEnteredZone includes self triggers (Deploy and
+                    # Deathcry).  The old exclusion dropped the entering
+                    # Minion of Yazukan's follow-up Underground buff before
+                    # its trigger condition was even evaluated.  Other event
+                    # types retain the source/extra-target exclusion because
+                    # their trigger holders are observers of the event.
+                    if (event_type == "CardEnteredZoneEvent" or
+                            (cu != int(source_uid or 0)
+                             and cu != int(extra_target or 0))):
                         cand.setdefault(cu, []).extend(ags)
         # "When a troop you control deals damage, if THIS is in your hand, this
         # gets cost -1" (Fury of the Mountain God) — hand-card triggers fire
@@ -865,9 +978,27 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     cand.setdefault(cu, []).extend(ags)
 
     for cu, ags in cand.items():
+        # Records can contain duplicate ability-list entries after a client
+        # card projection is rehydrated.  The C# AbilityManager keys these by
+        # (source, template) and fires one instance; dedupe before evaluating
+        # self CardEnteredZone triggers so a single Deploy/Deathcry cannot
+        # grant its mutation twice.
+        seen_ability_guids = set()
         for ag in list(ags):
+            ag_key = str(ag).lower()
+            if ag_key in seen_ability_guids:
+                continue
+            seen_ability_guids.add(ag_key)
             graph = ability_graph(_RECORD_STORE, str(ag).lower())
             if graph is None:
+                continue
+            # The universal Tunneling keyword is advanced by the shared
+            # turn-boundary counter service.  Its extracted Records graph is
+            # still useful metadata, but must not also resolve as a normal
+            # TurnStarted trigger (which used to create a phantom chain item
+            # and duplicate the counter increment).
+            if (event_type == "TurnStartedEvent" and
+                    str(ag).lower() == TUNNELING_ABILITY_GUID):
                 continue
             trigger_type = graph.trigger_event_type or ""
             # Encounter setup can add a card whose permanent GrantAbility
@@ -890,12 +1021,11 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 source_in_mod_zone = False
                 if cu is not None:
                     try:
-                        source_row = db.execute(
-                            "SELECT location FROM game_cards "
-                            "WHERE session_id=? AND card_uid=?",
-                            (session.session_id, int(cu))).fetchone()
+                        from pvp_db import db_card_location
+                        source_row = db_card_location(
+                            session.session_id, int(cu), conn=db)
                         source_in_mod_zone = bool(
-                            source_row and str(source_row[0]).lower() == "mod")
+                            source_row and str(source_row).lower() == "mod")
                     except Exception:
                         source_in_mod_zone = False
                 static_grant = any(
@@ -912,7 +1042,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 # Triggers/Conditions + Abilities.Conditions): the ability fires
                 # only when its m_AbilityCondition + m_TriggerCondition trees
                 # hold.  Unknown condition types default to True.
-                from .condition_engine import (
+                from rules_port.conditions import (
                     trigger_condition_met,
                     ConditionContext,
                 )
@@ -930,12 +1060,10 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 _src_card = None
                 src_card_owner = None
                 if cu is not None:
-                    _orow = db.execute(
-                        "SELECT user_id FROM game_cards "
-                        "WHERE session_id=? AND card_uid=?",
-                        (session.session_id, int(cu))).fetchone()
-                    if _orow:
-                        src_card_owner = _orow[0]
+                    from pvp_db import db_card_owner_id
+                    _orow = db_card_owner_id(session.session_id, int(cu), conn=db)
+                    if _orow is not None:
+                        src_card_owner = _orow
                 # The event source owner is the player who drew/played/damaged
                 # the card.  A warzone trigger can belong to the other side,
                 # however (for example, an opponent's Twisted Fate reacting to
@@ -967,6 +1095,35 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     "Champions" if _src_card is not None and
                     _src_card.get("card_type") == "Champion" else
                     ("Warzone" if src_loc == "mod" else src_loc))
+                # A zone-entry event is emitted at the mutation boundary;
+                # callers may still be holding a pre-move card projection.
+                # When the ability source is the card entering, use the
+                # authored destination collection for TriggerCollectionFlags
+                # (e.g. Minion of Yazukan's Underground trigger).
+                if (event_type == "CardEnteredZoneEvent" and
+                        event_destination_collection):
+                    # ObjFmt callers may supply a SessionCardId/UID wrapper
+                    # while DB rows use the integer card UID.  Normalize both
+                    # sides before deciding whether this is the entering
+                    # card's self-trigger; otherwise Underground triggers are
+                    # incorrectly checked against the stale pre-move zone.
+                    try:
+                        event_uid = int(getattr(source_uid, "uid64", source_uid))
+                        candidate_uid = int(getattr(cu, "uid64", cu))
+                    except (TypeError, ValueError):
+                        event_uid = candidate_uid = None
+                    if event_uid is not None and event_uid == candidate_uid:
+                        # Deploy/self-enter abilities inspect the destination
+                        # collection.  Deathcry-style abilities explicitly
+                        # carry ``uses_previous_state`` and inspect the
+                        # collection the card occupied before the move (the
+                        # card is already underground/discard by the time
+                        # this dispatcher runs).
+                        trigger_location = (
+                            event_source_collection
+                            if graph.uses_previous_state and
+                            event_source_collection else
+                            event_destination_collection)
                 if not _trigger_collection_allows(
                         graph.trigger_collection_flags, trigger_location):
                     log_req(f"    {event_type} {ag[:8]} -> source in "
@@ -984,7 +1141,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     event_source_collection=event_source_collection,
                     event_destination_collection=event_destination_collection,
                     event_previous_state=event_previous_state,
-                    uses_previous_state=uses_previous_state)
+                    uses_previous_state=uses_previous_state,
+                    event_int_attribute=event_int_attribute,
+                    event_tac=event_tac)
                 if not trigger_condition_met(raw, cond_ctx):
                     continue
                 chance = _chance_to_happen(graph)
@@ -998,7 +1157,14 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 # AbilityTriggerCardTargetTemplate even when no explicit
                 # target was supplied by the event caller.
                 event_target = extra_target
-                if event_target is None and event_type == "CardCastEvent":
+                # Most card lifecycle events identify their triggering card
+                # as the source. Preserve that as the activation target for
+                # AbilityTriggerCardTargetTemplate (Monsuun's decoy trigger
+                # is the important case); CardDrawnEvent supplies its drawn
+                # card separately through extra_target.
+                if event_target is None and source_uid is not None \
+                        and event_type not in ("TurnStartedEvent",
+                                               "TurnEndedEvent"):
                     event_target = source_uid
                 resolution_target = (extra_target if extra_target is not None
                                      else event_target)
@@ -1045,15 +1211,29 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     # resolution target when the event did not provide one.
                     if resolution_target is None:
                         resolution_target = extra_target
+                if event_type == "AsEntersPlayEvent":
+                    _emit_inspired_event(cu, source_uid, ability_owner_id)
                 # Check if this ability ignores the chain (Deploy/Inspire/Deathcry
                 # have m_IgnoresChain=1 — execute immediately, no priority window)
-                ignores = graph.ignores_chain
+                # Turn-start triggers are automatic phase-entry work. The
+                # client resolves them during StartTurn even when an older
+                # Records graph incorrectly reports m_IgnoresChain=0; leave
+                # no phantom resolve prompt on the public chain.
+                ignores = (graph.ignores_chain or
+                           event_type == "TurnStartedEvent")
                 src_scid = game_engine.SessionCardId(game_engine.UID(cu))
-                hidden_battleboard = bool(db.execute(
-                    "SELECT 1 FROM game_cards gc JOIN card_templates ct "
-                    "ON ct.guid=gc.template_guid WHERE gc.session_id=? "
-                    "AND gc.card_uid=? AND LOWER(COALESCE(ct.subtype,''))='battleboard' "
-                    "LIMIT 1", (session.session_id, int(cu))).fetchone())
+                from pvp_db import db_card_is_battleboard, db_card_location
+                hidden_battleboard = bool(db_card_is_battleboard(
+                    session.session_id, int(cu), conn=db))
+                # Underground trigger effects are hidden state maintenance
+                # (for example a tunneled troop's self-buff).  The client does
+                # not put these on the public chain; resolving them there
+                # would expose a hidden card and steal a priority window.
+                underground_trigger = (str(db_card_location(
+                    session.session_id, int(cu), conn=db) or "").lower()
+                    == "underground")
+                if underground_trigger:
+                    ignores = True
                 secret_groups = _secret_counter_effect_groups(graph)
                 if secret_groups:
                     # The counter accumulation is a secret, immediate part of
@@ -1093,23 +1273,32 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                             bstate.get("activated_target_uid")
                             if event_type == "CardActivatedEvent" else None),
                     })
+                    _publish_chain_source(cu)
                     game.push_ability_on_chain(
                         src_scid, game_engine.ResourceId.from_str(ag),
-                        ability_instance_id=inst_id, ignores_chain=False)
+                        ability_instance_id=inst_id,
+                        target_card_ids=_chain_targets(resolution_target),
+                        ignores_chain=False)
                     logs.append(f"{event_type} {ag[:8]} -> chain")
                 elif ignores:
                     # Tell the client the ability fired so it plays the card's
                     # activation animation (UIBattle.OnAbilityPushedOnChain,
                     # BattleAnimationPlayCardEvent for IgnoresChain=true).
-                    if not hidden_battleboard:
+                    if not hidden_battleboard and not underground_trigger:
                         game.push_ability_on_chain(
                             src_scid, game_engine.ResourceId.from_str(ag),
                             ignores_chain=True)
+                    old_trigger_src = bstate.get("resolving_source_uid")
+                    old_trigger_owner = bstate.get("resolving_owner_id")
+                    bstate["resolving_source_uid"] = cu
+                    bstate["resolving_owner_id"] = ability_owner_id
                     res = _resolve_ability_bom(db, handler, game, session, pl_t, ai_t,
                                                bstate, ag, cu, gtext,
                                                target_uid=resolution_target,
                                                source_owner_uid=ability_owner_id,
                                                trigger_target_uid=source_uid)
+                    bstate["resolving_source_uid"] = old_trigger_src
+                    bstate["resolving_owner_id"] = old_trigger_owner
                     logs.append(f"{event_type} {ag[:8]} -> {res}")
                 else:
                     # Push to chain stack for opponent priority window
@@ -1132,13 +1321,116 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                             bstate.get("activated_target_uid")
                             if event_type == "CardActivatedEvent" else None),
                     })
+                    _publish_chain_source(cu)
                     game.push_ability_on_chain(src_scid, game_engine.ResourceId.from_str(ag),
                                                ability_instance_id=inst_id,
+                                               target_card_ids=_chain_targets(
+                                                   resolution_target),
                                                ignores_chain=False)
                     logs.append(f"{event_type} {ag[:8]} -> chain")
     if logs:
         log_req("    Triggers (pushed to chain): " + "; ".join(logs))
     return "; ".join(logs)
+
+
+def resolve_cards_attacked(db, handler, game, session, pl_t, ai_t, bstate,
+                           source_uid, source_owner_uid, attacker_uids):
+    """Emit the metadata ``CardsAttackedEvent`` once for an attack group.
+
+    The client raises this champion-scoped event after all attackers are
+    declared, not once per card.  Its TAC payload carries the attack count;
+    this is what cards such as Diligent Counselor test.  Attack declaration
+    has separate PvE/PvP and human/AI entry points, so keep the lifecycle
+    boundary here and deduplicate reconnect/replay of the same declaration.
+    """
+    uids = sorted({int(uid) for uid in (attacker_uids or [])})
+    if not uids:
+        return ""
+    try:
+        turn = int((bstate or {}).get("turn_number", 0) or 0)
+    except (TypeError, ValueError):
+        turn = 0
+    marker = "%d:%d:%s" % (
+        turn, int(source_owner_uid or 0), ",".join(str(uid) for uid in uids))
+    if (bstate or {}).get("_cards_attacked_event_marker") == marker:
+        return ""
+    bstate["_cards_attacked_event_marker"] = marker
+    from .tac import _tac_attr_hash
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardsAttackedEvent", int(source_uid),
+        source_owner_uid=int(source_owner_uid or 0),
+        event_tac={_tac_attr_hash("NumAttackers"): len(uids)})
+
+
+def resolve_card_battled(db, handler, game, session, pl_t, ai_t, bstate,
+                         source_uid, source_owner_uid, target_uid,
+                         target_owner_uid):
+    """Raise one directional metadata event for a card-to-card battle."""
+    if source_uid is None or target_uid is None:
+        return ""
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardBattledEvent", int(source_uid),
+        source_owner_uid=int(source_owner_uid or 0),
+        extra_target=int(target_uid))
+
+
+def resolve_turn_phase_triggers(db, handler, game, session, pl_t, ai_t,
+                                bstate, phase, owner_id):
+    """Dispatch one metadata-defined TurnPhaseEvent on phase entry.
+
+    The original client enqueues this event from TurnPhaseState.OnEntry. The
+    server has several phase drivers (PvE human, PvE AI, and PvP), so keep the
+    once-per-phase guard here instead of duplicating it in each driver.
+    """
+    try:
+        phase = int(phase)
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        return ""
+    marker = (int(bstate.get("turn_number", 0) or 0), phase, owner_id)
+    if bstate.get("_last_turn_phase_event") == marker:
+        return ""
+    bstate["_last_turn_phase_event"] = marker
+    if bstate.get("pvp"):
+        # Tournament PvP owns packet projection, but phase-entry trigger
+        # discovery/resolution must use the same native RulesPort backend as
+        # Practice and the AI path.
+        from rules_port.triggers import dispatch_native_trigger
+        return dispatch_native_trigger(
+            db=db, handler=handler, game=game, session=session,
+            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+            event_type="TurnPhaseEvent", source_card_id=None,
+            source_player_id=owner_id, data={"phase": phase})
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "TurnPhaseEvent", None, source_owner_uid=owner_id)
+
+
+def resolve_turn_ended_triggers(db, handler, game, session, pl_t, ai_t,
+                                 bstate, owner_id):
+    """Dispatch one ``TurnEndedEvent`` for the owning turn.
+
+    EndTurn is a retryable checkpoint while its triggered chain waits for
+    priority.  Calling the raw dispatcher on every retry re-discovers the
+    same persistent triggers (notably Verdant Wyldeboar), pushing an
+    unbounded number of identical chain items.  Mirror the phase-entry guard
+    above with a turn/owner marker; a new turn gets a new turn number and can
+    trigger normally again.
+    """
+    try:
+        turn = int(bstate.get("turn_number", 0) or 0)
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        return ""
+    marker = (turn, owner_id)
+    if bstate.get("_last_turn_ended_event") == marker:
+        return ""
+    bstate["_last_turn_ended_event"] = marker
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "TurnEndedEvent", None, source_owner_uid=owner_id)
 
 
 def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
@@ -1164,6 +1456,65 @@ def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
         "GainChargeEvent", int(champ.uid.uid64), owner_id)
 
 
+def resolve_gain_threshold_triggers(db, handler, game, session, pl_t, ai_t,
+                                    bstate, owner_id, color=None):
+    """Dispatch the metadata-defined event for a gained threshold."""
+    try:
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    champ = (getattr(handler, "_ai_champ_scid", None)
+             if owner_id == 0 else
+             getattr(handler, "_player_champ_scid", None))
+    if champ is None:
+        return ""
+    old = bstate.get("gain_threshold_color")
+    if color is not None:
+        bstate["gain_threshold_color"] = int(color)
+    try:
+        return resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "GainThresholdEvent", int(champ.uid.uid64), owner_id)
+    finally:
+        if old is None:
+            bstate.pop("gain_threshold_color", None)
+        else:
+            bstate["gain_threshold_color"] = old
+
+
+def resolve_champion_would_lose(db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id):
+    """Fire the metadata replacement event before ending a game.
+
+    ``ChampionWouldLoseEvent`` is a champion-source event, not a game-card
+    event.  Keeping it behind this helper gives PvE and PvP the same source
+    UID/owner semantics and prevents repeated health checks from retriggering
+    a one-shot survival ability.
+    """
+    try:
+        owner_id = int(owner_id or 0)
+    except (TypeError, ValueError):
+        owner_id = 0
+    seen = bstate.setdefault("_champion_would_lose_seen", [])
+    if owner_id in seen:
+        return ""
+    if owner_id == 0:
+        champion = getattr(handler, "_ai_champ_scid", None)
+    elif (bstate or {}).get("pvp"):
+        champion_uid = ((bstate.get("champ_map") or {}).get(str(owner_id)) or
+                        (bstate.get("champ_map") or {}).get(owner_id))
+        champion = (game_engine.SessionCardId(game_engine.UID(int(champion_uid)))
+                    if champion_uid is not None else None)
+    else:
+        champion = getattr(handler, "_player_champ_scid", None)
+    if champion is None:
+        return ""
+    seen.append(owner_id)
+    return resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "ChampionWouldLoseEvent", int(champion.uid.uid64), owner_id)
+
+
 def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
     """Resolve a triggered ability that was pushed onto the chain."""
     ag = item.get("ability_guid", "")
@@ -1185,11 +1536,10 @@ def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
     if src_owner is None:
         src_owner = 0
     if cu is not None:
-        orow = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(cu))).fetchone()
-        if orow:
-            src_owner = orow[0]
+        from pvp_db import db_card_owner_id
+        orow = db_card_owner_id(session.session_id, int(cu), conn=db)
+        if orow is not None:
+            src_owner = orow
         elif src_owner == 0:
             # Champion sources are represented by handler-held SessionCardIds,
             # not game_cards rows. Preserve their controller for effects such
@@ -1208,13 +1558,58 @@ def resolve_stack_trigger(handler, game, session, db, pl_t, ai_t, bstate, item):
             "source_uid": item.get("activated_source_uid"),
             "target_uid": item.get("activated_target_uid"),
         }
-    return _resolve_ability_bom(db, handler, game, session, pl_t, ai_t,
-                                bstate, ag, cu, gtext,
-                                target_uid=target_uid,
-                                source_owner_uid=src_owner,
-                                trigger_target_uid=item.get(
-                                    "trigger_target_uid"),
-                                effect_groups=item.get("effect_groups"))
+    old_src = bstate.get("resolving_source_uid")
+    old_owner = bstate.get("resolving_owner_id")
+    old_trigger_target = bstate.get("resolving_trigger_target_uid")
+    bstate["resolving_source_uid"] = cu
+    bstate["resolving_owner_id"] = src_owner
+    bstate["resolving_trigger_target_uid"] = item.get(
+        "trigger_target_uid", target_uid)
+    if (getattr(session, "_rules_port_session", None) is not None or
+            bstate.get("_rules_port_attached")):
+        from rules_port.resolution import resolve_port_ability
+        target_map = ({0: int(target_uid)} if target_uid is not None else {})
+        result = resolve_port_ability(
+            handler, game, session, db, pl_t, ai_t, bstate, ag, cu,
+            src_owner, target_map=target_map,
+            effect_groups=item.get("effect_groups"))
+    else:
+        result = _resolve_ability_bom(
+            db, handler, game, session, pl_t, ai_t, bstate, ag, cu, gtext,
+            target_uid=target_uid, source_owner_uid=src_owner,
+            trigger_target_uid=item.get("trigger_target_uid"),
+            effect_groups=item.get("effect_groups"))
+    bstate["resolving_source_uid"] = old_src
+    bstate["resolving_owner_id"] = old_owner
+    if old_trigger_target is None:
+        bstate.pop("resolving_trigger_target_uid", None)
+    else:
+        bstate["resolving_trigger_target_uid"] = old_trigger_target
+    # Some legacy trigger continuations can lose the source target while
+    # reattaching the RulesPort session.  If the authored graph explicitly
+    # contains PutThisIntoYourDeck and the source is still in play, replay the
+    # source-bound mutation (never a card-name special case).
+    if cu is not None and any(
+            e.concrete_type == "MoveCardToZoneEffectTemplate" and
+            (str(e.name).lower() == "putthisintoyourdeck" or
+             "deck" in str(e.name).lower())
+            for e in graph.effects):
+        from pvp_db import db_card_mutation_snapshot, db_move_card_to_deck
+        row = db_card_mutation_snapshot(session.session_id, int(cu), conn=db)
+        if row and str(row[2]).lower() == "warzone":
+            from pvp_db import db_randomly_insert_deck_cards
+            db_move_card_to_deck(session.session_id, int(cu), 0, conn=db)
+            db.commit()
+            db_randomly_insert_deck_cards(session.session_id, int(row[1] or 0),
+                                          [int(cu)], connection=db)
+            scid = game_engine.SessionCardId(game_engine.UID(int(cu)))
+            owner = owner_uid(row[1], pl_t, ai_t, bstate)
+            game.push_card_moved(scid, owner, game_engine.ECardCollections.Deck,
+                                 game_engine.ECardLocations.Unknown, 0)
+            game.push_card_updated(scid, owner, game_engine.ECardCollections.Deck,
+                                   game_engine.card_type_from_db("Troop"),
+                                   template_id=row[0], state=0, nulling=True)
+    return result
 
 
 def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
@@ -1223,17 +1618,23 @@ def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
     """Fire Deploy (self CardEnteredZone) + Inspire (other troops' AsEntersPlay)."""
     from db import log_req
     logs = []
+    # The entering card's own Deploy trigger is evaluated after its zone
+    # mutation.  Carry that authoritative destination into the collection
+    # gate; relying on a stale pre-move projection suppresses Underground
+    # triggers such as Minion of Yazukan's +1 ATK effect.
+    from pvp_db import db_card_location, db_card_cost
+    destination_row = db_card_location(
+        session.session_id, int(entering_uid), conn=db)
+    destination_collection = (str(destination_row).lower()
+                              if destination_row
+                              else "warzone")
     # Callers that move a permanent into play often do not have to carry the
     # cost separately (and tokens may legitimately cost zero).  Resolve it
     # from the entering card's template here so every game mode evaluates the
     # same data-defined Inspire condition.
     if entering_cost is None or int(entering_cost or 0) <= 0:
-        crow = db.execute(
-            "SELECT ct.cost FROM game_cards gc "
-            "JOIN card_templates ct ON ct.guid=gc.template_guid "
-            "WHERE gc.session_id=? AND gc.card_uid=?",
-            (session.session_id, int(entering_uid))).fetchone()
-        entering_cost = int(crow[0] or 0) if crow else 0
+        crow = db_card_cost(session.session_id, int(entering_uid), conn=db)
+        entering_cost = int(crow or 0)
     else:
         entering_cost = int(entering_cost)
     # SourcePlayerBriarLegionVariable is a typed card variable. The match-wide
@@ -1264,7 +1665,8 @@ def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
     logs.append(resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                                  "CardEnteredZoneEvent", entering_uid,
                                  entering_owner_id,
-                                 extra_target=extra_target))
+                                 extra_target=extra_target,
+                                 event_destination_collection=destination_collection))
     # Deploy and Inspire are both the data-defined AsEntersPlay event.  The
     # old hand-written Inspire loop intentionally skipped the entering card,
     # which meant a self-trigger such as Honeycap's "as this enters play"
@@ -1275,6 +1677,13 @@ def resolve_enters_play_triggers(db, handler, game, session, pl_t, ai_t,
                                  "AsEntersPlayEvent", entering_uid,
                                  entering_owner_id,
                                  extra_target=entering_uid))
+    # Hand/stack play and the tunneling Surface path both converge here. A
+    # permission granted by an underground source (for example Subterranean
+    # Spy) must be recalculated after the source changes zones, otherwise the
+    # controller keeps seeing the opponent's hand after the Spy is played.
+    from .effects.visibility import refresh_player_visibility
+    refresh_player_visibility(
+        db, session, handler, game, pl_t, ai_t, bstate)
     if logs:
         log_req("    Enters-play triggers: " + "; ".join(str(l) for l in logs if l))
     return "; ".join(str(l) for l in logs if l)

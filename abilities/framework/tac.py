@@ -33,6 +33,108 @@ def _tac_attr_hash(name):
 _TAC_GUID_HASH = _tac_attr_hash("Guid")
 _TAC_FUNC_HASH = _tac_attr_hash("FunctionName")
 
+# These are the structural TAC attributes used by authored trigger
+# conditions.  Ordinary unknown attributes are integer values in the event
+# TACs we currently receive; keeping the structural names explicit preserves
+# the metadata-driven decoder without turning card names into rules.
+_TAC_CONTAINER_HASHES = {
+    _tac_attr_hash(name) for name in (
+        "CardStatsThisTurn", "CardStatsWithSpecificDuration", "CardGameStats",
+        "Condition", "DataToAppend", "HasAsSubset", "MinimumValues",
+        "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
+        "PermanentData", "ThisTurnsData")}
+_TAC_LIST_HASHES = {_tac_attr_hash(name) for name in (
+    "Conditions", "RequiredEquipment", "RequiredTalents", "AlternateVersions",
+    "Abilities")}
+_TAC_STRING_HASHES = {
+    _tac_attr_hash("Guid"),
+    _tac_attr_hash("FunctionName"),
+    _tac_attr_hash("ListName"),
+    _tac_attr_hash("Where"),
+    _tac_attr_hash("SourceCardGuid"),
+    _tac_attr_hash("GainedCounterType"),
+    _tac_attr_hash("RemovedCounterType"),
+    _tac_attr_hash("CompareWith"),
+    _tac_attr_hash("Name"),
+}
+
+
+def tac_int(data_b64, name, default=0):
+    """Return an integer flag/value from a serialized mechanics TAC.
+
+    Card and ability metadata uses the same TAC encoding for flags such as
+    ``Scrounge``.  Keep this lookup in the shared decoder so callers do not
+    need to identify cards by name or inspect the serialized bytes directly.
+    """
+    if not data_b64 or not name:
+        return default
+    value = decode_tac_tree(data_b64).get(_tac_attr_hash(str(name)))
+    return value if isinstance(value, int) else default
+
+
+def tac_string(data_b64, name, default=""):
+    """Return a string TAC attribute, such as a TACFilter template name."""
+    if not data_b64 or not name:
+        return default
+    value = decode_tac_tree(data_b64).get(_tac_attr_hash(str(name)))
+    return value if isinstance(value, str) else default
+
+
+def decode_tac_tree(data_b64):
+    """Decode TAC while retaining nested TAC/list structure.
+
+    ``decode_tac`` remains the flat compatibility API used for simple ability
+    flags. Trigger conditions need the client's nested ``MinimumValues`` and
+    ``HasAsSubset`` structure, so expose a small structural decoder alongside
+    it. Unknown leaf attributes are read as IntAttrs, matching TriggerEvent
+    TAC payloads such as GainThresholdEvent.
+    """
+    try:
+        b = _b64.b64decode(data_b64)
+    except Exception:
+        return {}
+    if len(b) < 2:
+        return {}
+    i = 2
+
+    def parse_body():
+        nonlocal i
+        out = {}
+        while i + 4 <= len(b):
+            attr = _st.unpack_from("<I", b, i)[0]
+            i += 4
+            if attr == 0:
+                break
+            if attr in _TAC_CONTAINER_HASHES:
+                out[attr] = parse_body()
+            elif attr in _TAC_LIST_HASHES:
+                out.setdefault(attr, []).append(parse_body())
+            elif attr in _TAC_STRING_HASHES:
+                if i >= len(b):
+                    break
+                length = 0
+                shift = 0
+                while i < len(b):
+                    byte = b[i]
+                    i += 1
+                    length |= (byte & 0x7f) << shift
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+                out[attr] = b[i:i + length].decode("utf-8", "replace")
+                i += length
+            else:
+                if i + 4 > len(b):
+                    break
+                out[attr] = _st.unpack_from("<i", b, i)[0]
+                i += 4
+        return out
+
+    try:
+        return parse_body()
+    except (IndexError, _st.error, ValueError):
+        return {}
+
 
 def decode_tac(data_b64):
     """Decode a serialized TAC (base64 str) into {name_hash: value}.

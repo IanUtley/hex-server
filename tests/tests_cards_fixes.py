@@ -381,7 +381,11 @@ def test_ingenuity_engine_exhaust_cost_is_encoded_as_a_card_picker(db):
             game, SessionStub(), state, pl_t, opp_t, 1001,
             {(321, engine_tpl): [engine_ag]})
         opt = game.events[-1].options[-1]
-        inst = opt.instances[0]
+        # Play and Activate are intentionally merged into one card option. The
+        # activation instance is identified by its authored ability GUID, not by
+        # whichever position the client option builder happens to use.
+        inst = next(instance for instance in opt.instances
+                    if str(instance.opt_id.guid).lower() == engine_ag)
         costs = [x for x in inst.target_instances
                  if isinstance(x, game_engine.CostInstanceSessionEventArgs)]
         assert costs and [int(x.uid.uid64) for x in costs[0].targets] == [322], costs
@@ -1219,6 +1223,72 @@ def test_shards_of_fate_detection_and_ai_threshold(db):
         hcs._db = old_hcs_db
 
 
+def test_shard_of_cunning_ai_plays_choice_and_gains_threshold(db):
+    """The AI's nested Shard of Cunning choice resolves its token ability.
+
+    The resource ability creates Blood/Sapphire Choice cards, invokes the
+    authored free-play child, and must apply the selected token's typed
+    ThresholdModifier.  The selected token leaves ``Choosing`` and the AI
+    receives exactly one threshold event; the parent Shard is not replayed.
+    """
+    import ai
+    _copy_card(db, "229c8038-3226-432f-a9a1-30d078241444")  # Shard of Cunning
+    _copy_card(db, "defcf1c9-b06d-4a33-91cd-b7242c6b9f42")  # Choose Blood
+    _copy_card(db, "8cd3251f-2d73-44f1-8874-84d88fea809a")  # Choose Sapphire
+    for column in ("current_resources_granted", "max_resources_granted"):
+        db.execute(f"ALTER TABLE card_templates ADD COLUMN {column} INTEGER DEFAULT 0")
+    db.execute(
+        "UPDATE card_templates SET current_resources_granted=0, "
+        "max_resources_granted=1 WHERE guid=?",
+        ("229c8038-3226-432f-a9a1-30d078241444",))
+    add_card(db, 350, 0, "229c8038-3226-432f-a9a1-30d078241444", loc="hand")
+    db.execute("UPDATE game_cards SET card_type='Resource' WHERE card_uid=350")
+    db.commit()
+
+    class AIHandler(HandlerStub):
+        def _template_by_guid(self, guid):
+            return self._db.execute(
+                "SELECT guid, name, card_type, cost, attack, defense "
+                "FROM card_templates WHERE guid=?", (guid,)).fetchone()
+
+    handler = AIHandler(db)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {
+        "pvp": False,
+        "ai_threshold": {}, "ai_resources": 0,
+        "ai_total_resources": 0, "ai_charges": 0,
+        "player_threshold": {}, "player_resources": 0,
+        "player_total_resources": 0, "player_charges": 0,
+        "turn_number": 1,
+    }
+    old_db = ai._db
+    ai._db = db
+    try:
+        with mock.patch("battle_engine.save_state"):
+            ai.ai_play_resource(handler, game, SessionStub(), ai_t, bstate)
+    finally:
+        ai._db = old_db
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=350").fetchone()[0] \
+        == "PlayedResources"
+    assert bstate["ai_threshold"] in ({4: 1}, {16: 1}), bstate
+    threshold_events = [
+        event for event in game.events
+        if isinstance(event,
+                      game_engine.PlayerResourceThresholdChangedSessionEventArgs)
+    ]
+    assert len(threshold_events) == 1, threshold_events
+    assert threshold_events[0].new_value == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM game_cards WHERE session_id=1 "
+        "AND user_id=0 AND location='PlayedResources' "
+        "AND template_guid IN (?,?)",
+        ("defcf1c9-b06d-4a33-91cd-b7242c6b9f42",
+         "8cd3251f-2d73-44f1-8874-84d88fea809a")).fetchone()[0] == 1
+
+
 def test_resource_grant_columns_from_gamedata(db):
     """The resource-grant fields are populated from the gamedata template:
     basic shards grant 1/1 current/max; Shards of Fate grants 0/1 (it
@@ -1447,6 +1517,37 @@ def test_shards_randomly_reinsert_into_deck(db):
         assert non_shards == [501, 502, 504, 505, 507, 509], non_shards
         assert set(positions[uid] for uid in candidates) == {6, 7, 8, 9}, positions
         assert ordered == [508, 506, 503, 500], ordered
+    finally:
+        dbmod._db = old_db
+
+
+def test_single_card_reinsert_stays_within_deck(db):
+    """Re-randomizing an already-in-deck card must keep it in range.
+
+    The "put into deck" leaf moves the card into the deck before calling
+    ``db_randomly_insert_deck_cards``, so the single-card fast path must
+    exclude it before choosing a slot instead of leaving a gap past the end.
+    """
+    import db as dbmod
+    old_db = dbmod._db
+    dbmod._db = db
+    try:
+        for uid in range(600, 605):
+            add_card(db, uid, 5, "00e13fdf-b2c3-4fe7-a064-ce4481b24e8d",
+                     loc="deck")
+        db.executemany(
+            "UPDATE game_cards SET position=? WHERE card_uid=?",
+            [(uid - 600, uid) for uid in range(600, 605)])
+        db.commit()
+        for _ in range(100):
+            dbmod.db_randomly_insert_deck_cards(1, 5, [602])
+            rows = db.execute(
+                "SELECT card_uid, position FROM game_cards "
+                "WHERE session_id=1 AND user_id=5 AND location='deck' "
+                "ORDER BY position").fetchall()
+            positions = sorted(int(pos) for _uid, pos in rows)
+            assert positions == list(range(len(rows))), positions
+            assert any(int(uid) == 602 for uid, _pos in rows), rows
     finally:
         dbmod._db = old_db
 
@@ -1771,6 +1872,8 @@ def main():
          test_countermagic_modifies_all_same_name_opposing_cards),
         ("Shards of Fate detection + AI threshold",
          test_shards_of_fate_detection_and_ai_threshold),
+        ("Shard of Cunning AI choice threshold",
+         test_shard_of_cunning_ai_plays_choice_and_gains_threshold),
         ("Incubation Slave egg summon + sacrifice",
          test_incubation_slave_egg_summon_and_sacrifice),
         ("Bun'jitsu charge power summon + buff",
@@ -1795,6 +1898,8 @@ def main():
          test_chlorophyllia_pvp_view_persists_resource_state),
         ("Shards randomly reinsert into deck",
          test_shards_randomly_reinsert_into_deck),
+        ("Single-card reinsert stays within deck",
+         test_single_card_reinsert_stays_within_deck),
     ]
     failed = 0
     for name, fn in tests:

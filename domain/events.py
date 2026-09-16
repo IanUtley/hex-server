@@ -97,6 +97,29 @@ class GameEndedSessionEventArgs(SessionEventArgs):
         return self.end_write()
 
 
+class EncounterModDialogSessionEventArgs(SessionEventArgs):
+    """Game.Shared.EncounterModDialogSessionEventArgs (class 55).
+
+    The client opens the campaign conversation identified by
+    ``conversation_template_id`` and answers with an
+    ``EncounterModDialogTransaction``.  This is deliberately a session event
+    rather than a card-specific UI shortcut: ConversationAbilityEffectTemplate
+    uses the same wire contract for every authored ability.
+    """
+    CLASS_ID = 55
+
+    def __init__(self):
+        super().__init__()
+        self.player_id = UID.invalid()
+        self.conversation_template_id = ResourceId.invalid()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_uid(self.player_id)
+        self.ser.add_resource_id(self.conversation_template_id)
+        return self.end_write()
+
+
 class TurnPhaseUpdatedSessionEventArgs(SessionEventArgs):
     CLASS_ID = 3
 
@@ -1103,6 +1126,25 @@ class ChainEmptySessionEventArgs(SessionEventArgs):
         return self.end_write()
 
 
+class WaitingOnPlayerSessionEventArgs(SessionEventArgs):
+    """Tell clients which participant the game is waiting on (class 79).
+
+    The client (``UIBattle.OnWaitingOnPlayer``) shows its "waiting for
+    opponent" state only when the named player is not the local player, so the
+    same event is broadcast to both participants.
+    """
+    CLASS_ID = 79
+
+    def __init__(self):
+        super().__init__()
+        self.player_id = UID.invalid()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_uid(self.player_id)
+        return self.end_write()
+
+
 class ShowTipSessionEventArgs(SessionEventArgs):
     CLASS_ID = 80
 
@@ -1409,6 +1451,20 @@ class CardCollectionsMergedSessionEventArgs(SessionEventArgs):
         self.ser.add_uid(self.player_id)
         self.ser.add_enum_int(self.source)
         self.ser.add_enum_int(self.destination)
+        return self.end_write()
+
+
+class CycleCardArtSessionEventArgs(SessionEventArgs):
+    """Game.Shared.CycleCardArtSessionEventArgs (client class 72)."""
+    CLASS_ID = 72
+
+    def __init__(self):
+        super().__init__()
+        self.session_card_id = SessionCardId()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_scid(self.session_card_id)
         return self.end_write()
 
 

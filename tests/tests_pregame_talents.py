@@ -159,7 +159,63 @@ def test_expendable_lives_grants_and_resolves_one_shot_deathcry():
         os.unlink(path)
 
 
+def test_devoted_cost_talent_applies_once_via_trigger():
+    """Devoted's -1 cost is a GameStarted trigger, not a pregame helper.
+
+    Regression: the pregame helper and the trigger dispatcher both applied the
+    ``cardcost`` leaf, so the chosen action dropped by 2 once the native chain
+    resolved the trigger.
+    """
+    db, path = _database_copy()
+    try:
+        from abilities.framework.conditions import pregame_modifiers
+        from rules_port.resolution import resolve_port_trigger
+        from tests.tests_combat import HandlerStub, SessionStub
+        import game_engine
+
+        devoted = "119a0394-c94f-ce4c-1357-36b9d8ff579b"
+        # The helper must not report a starting-hand cost effect for the
+        # triggered talent; the trigger dispatcher owns it.
+        mods = pregame_modifiers(db, SessionStub(), 5, [devoted])
+        assert not [effect for effect in mods["starting_hand_effects"]
+                    if effect.get("card_cost_mod")], mods
+
+        # Seed a random action in hand; the trigger picks it via the target
+        # template and applies exactly one -1.
+        template_guid, card_type = db.execute(
+            "SELECT guid, card_type FROM card_templates "
+            "WHERE card_type='QuickAction' LIMIT 1").fetchone()
+        db.execute(
+            "INSERT INTO game_cards "
+            "(user_id,session_id,card_uid,card_template_id,location,position,"
+            "card_type,template_guid,card_state,card_abilities,card_attributes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (5, 1, 12001, template_guid, "hand", 0, card_type,
+             template_guid, 0, "[]", 0))
+        db.commit()
+
+        handler = HandlerStub(db)
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+                  "_next_instance_id": 1}
+        resolve_port_trigger(
+            handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+            {"kind": "trigger", "ability_guid": devoted,
+             "source_uid": int(handler._player_champ_scid.uid.uid64),
+             "source_owner_uid": 5, "instance_id": 1})
+        mod = db.execute(
+            "SELECT card_cost_mod FROM game_cards WHERE card_uid=12001"
+        ).fetchone()[0]
+        assert mod == -1, mod
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     test_skylak_uses_original_deck_size_for_both_talents()
     test_expendable_lives_grants_and_resolves_one_shot_deathcry()
+    test_devoted_cost_talent_applies_once_via_trigger()
     print("PASS Skylak PreGame deck insertions")

@@ -44,11 +44,10 @@ def _deck_owner_for_target(db, handler, session, bstate, target):
     """Resolve a target champion to the DB owner of that champion's deck."""
     if target is None:
         return None
-    row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    if row:
-        return int(row[0])
+    from pvp_db import db_card_owner_id
+    card_owner = db_card_owner_id(session.session_id, int(target), conn=db)
+    if card_owner is not None:
+        return int(card_owner)
     if (bstate or {}).get("pvp"):
         # PvP champion cards are represented by champ_map rather than rows in
         # game_cards.  Both pids are nonzero, so do not collapse the opponent
@@ -68,6 +67,20 @@ def _deck_owner_for_target(db, handler, session, bstate, target):
     return None
 
 
+def _reveal_owner_for_target(db, handler, session, bstate, default_owner,
+                             target_kind, ability_guid):
+    """Resolve the player whose cards a metadata target asks us to reveal."""
+    if target_kind != "MatchSecondaryTargetTemplate":
+        return default_owner
+    stored = ((bstate or {}).get("stored_targets", {})
+              .get(ability_guid) or [])
+    if not stored:
+        return default_owner
+    target_owner = _deck_owner_for_target(
+        db, handler, session, bstate, stored[-1])
+    return default_owner if target_owner is None else int(target_owner)
+
+
 # ---------------------------------------------------------------------------
 #  Leaf executors
 # ---------------------------------------------------------------------------
@@ -76,6 +89,12 @@ def _deck_owner_for_target(db, handler, session, bstate, target):
 def _leaf_draw(effect):
     """Draw the typed count for the resolved target or caster."""
     return effect.draw_effect()
+
+
+@effect("ConversationAbilityEffectTemplate")
+def _leaf_conversation(effect):
+    """Open the authored encounter conversation and suspend the BOM."""
+    return effect.conversation()
 
 
 @effect("PutTopOfDeckIntoHandAbilityEffectTemplate")
@@ -123,30 +142,26 @@ def _champion_target_uid(handler, bstate, db, session):
     ag = (bstate or {}).get("resolving_ability")
     if not ag:
         return None
-    row = db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta WHERE ability_guid=?",
-        (ag,)).fetchone()
-    if not row or not row[0]:
+    from pvp_db import (db_ability_target_template_ids, db_target_template_info,
+                        db_card_owner_id)
+    target_ids = db_ability_target_template_ids(ag, conn=db)
+    if not target_ids:
         return None
     try:
-        tids = json.loads(row[0])
+        tids = json.loads(target_ids)
     except Exception:
         return None
     if not tids:
         return None
-    trow = db.execute(
-        "SELECT target_kind FROM target_templates WHERE template_id=?",
-        (tids[0],)).fetchone()
-    if not trow or (trow[0] or "") != "PlayerTargetTemplate":
+    trow = db_target_template_info(tids[0], conn=db)
+    if not trow or (trow[1] or "") != "PlayerTargetTemplate":
         return None
     owner = (bstate or {}).get("resolving_owner_id")
     if owner is None:
         owner = (bstate or {}).get("resolving_source_uid")
         if owner is not None:
-            orow = db.execute(
-                "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(owner))).fetchone()
-            owner = orow[0] if orow else 0
+            owner = db_card_owner_id(
+                session.session_id, int(owner), conn=db) or 0
     if (bstate or {}).get("pvp"):
         champ_uid = pvp_champion_uid(bstate, owner)
         return int(champ_uid) if champ_uid is not None else None
@@ -165,13 +180,13 @@ def _opposing_champion_uid(handler, bstate, db, session):
     ag = (bstate or {}).get("resolving_ability", "")
     if not ag:
         return None
-    row = db.execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (ag,)).fetchone()
-    if not row or not row[0]:
+    from pvp_db import (db_ability_target_template_ids,
+                        db_target_template_targeting_info)
+    target_ids = db_ability_target_template_ids(ag, conn=db)
+    if not target_ids:
         return None
     try:
-        tids = _j.loads(row[0])
+        tids = _j.loads(target_ids)
     except Exception:
         return None
 
@@ -186,13 +201,11 @@ def _opposing_champion_uid(handler, bstate, db, session):
         return False
 
     for tid in (tids or []):
-        trow = db.execute(
-            "SELECT game_text, player_filter, filter_json FROM target_templates "
-            "WHERE template_id=?", (tid,)).fetchone()
+        trow = db_target_template_targeting_info(tid, conn=db)
         if not trow:
             continue
         try:
-            target_filter = _j.loads(trow[2] or "{}")
+            target_filter = _j.loads(trow[0] or "{}")
         except (TypeError, ValueError, _j.JSONDecodeError):
             target_filter = {}
         # MultiplePlayers alone is not enough: it can describe a target pool
@@ -255,67 +268,52 @@ def _apply_resource_property(game, session, db, handler, pl_t, ai_t, bstate,
         sides = ["player", "ai"]
     logs = []
     prop = pm.get("property")
+    from rules_port.resources import project_resource_change
     color_flag = 0
     if prop == "threshold":
-        m = _re.search(r'\[([A-Za-z]+)\]', text)
-        if m:
-            color_flag = game_engine.SHARD_TO_FLAG.get(m.group(1).lower(), 0)
+        shard = str(pm.get("shard") or "").rsplit(".", 1)[-1]
+        if shard and shard.lower() not in ("unknown", "none"):
+            color_flag = game_engine.SHARD_TO_FLAG.get(shard.lower(), 0)
         elif "random threshold" in text:
             color_flags = list({int(flag) for flag in
                                 game_engine.SHARD_TO_FLAG.values() if flag})
             if color_flags:
                 color_flag = random.choice(color_flags)
+        else:
+            # Compatibility with pre-metadata BOM rows.
+            m = _re.search(r'\[([A-Za-z]+)\]', text)
+            if m:
+                color_flag = game_engine.SHARD_TO_FLAG.get(m.group(1).lower(), 0)
     for side in sides:
         if prop == "currentresource":
-            key = f"{side}_resources"
-            cur = int(bstate.get(key, 0))
-            bstate[key] = max(0, cur + amount)
-            ev = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
-            ev.player_id = pl_t if side == "player" else ai_t
-            ev.operation = 1 if amount >= 0 else 2
-            ev.delta = amount
-            ev.new_value = bstate[key]
-            game._push(ev)
-            logs.append(f"{side} resources {cur}->{bstate[key]}")
+            change = project_resource_change(
+                game, session, bstate, pl_t, ai_t, side, prop, amount)
+            logs.append(f"{side} resources {change.old_value}->{change.new_value}")
         elif prop == "chargepoints":
-            key = f"{side}_charges"
-            cur = int(bstate.get(key, 0))
-            bstate[key] = max(0, cur + amount)
-            if side == "player":
-                game.player_charges = bstate[key]
-            else:
-                game.ai_charges = bstate[key]
-            ev = game_engine.ChampionChargePointsChangedSessionEventArgs()
-            ev.player_id = pl_t if side == "player" else ai_t
-            ev.operation = 1 if amount >= 0 else 2
-            ev.delta = amount
-            ev.new_value = bstate[key]
-            game._push(ev)
-            logs.append(f"{side} charges {cur}->{bstate[key]}")
+            change = project_resource_change(
+                game, session, bstate, pl_t, ai_t, side, prop, amount)
+            logs.append(f"{side} charges {change.old_value}->{change.new_value}")
         elif prop == "totalresource":
-            key = f"{side}_total_resources"
-            cur = int(bstate.get(key, 0))
-            bstate[key] = max(0, cur + amount)
-            ev = game_engine.PlayerTotalResourcePoolChangedSessionEventArgs()
-            ev.player_id = pl_t if side == "player" else ai_t
-            ev.operation = 1 if amount >= 0 else 2
-            ev.delta = amount
-            ev.new_value = bstate[key]
-            game._push(ev)
-            logs.append(f"{side} total {cur}->{bstate[key]}")
+            change = project_resource_change(
+                game, session, bstate, pl_t, ai_t, side, prop, amount)
+            logs.append(f"{side} total {change.old_value}->{change.new_value}")
         elif prop == "threshold" and color_flag:
-            key = f"{side}_threshold"
-            th = bstate.setdefault(key, {})
-            cur = int(th.get(color_flag, 0))
-            th[color_flag] = max(0, cur + amount)
-            ev = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
-            ev.player_id = pl_t if side == "player" else ai_t
-            ev.color = color_flag
-            ev.operation = 1 if amount >= 0 else 2
-            ev.delta = amount
-            ev.new_value = th[color_flag]
-            game._push(ev)
-            logs.append(f"{side} threshold {color_flag} {cur}->{th[color_flag]}")
+            # PvP state is JSON round-tripped between priority windows, so
+            # threshold keys may be strings even though the live view uses
+            # integer shard flags.  Normalize the addressed key before
+            # incrementing; otherwise a selected Shard of Cunning choice
+            # silently creates a second ``8``/``"8"`` entry and the client
+            # never sees the additional threshold.
+            change = project_resource_change(
+                game, session, bstate, pl_t, ai_t,
+                side, prop, amount, color=color_flag)
+            # ``PlayerUpdated``/main-phase option packets are built from the
+            # transient Game projection, while RulesPort persists the same
+            # value in battle_state. Keep both views synchronized so an AI
+            # choice (for example Shard of Cunning's Blood/Sapphire token)
+            # is visible immediately instead of only after the next reload.
+            logs.append(f"{side} threshold {color_flag} "
+                        f"{change.old_value}->{change.new_value}")
     return "; ".join(logs)
 
 
@@ -351,6 +349,8 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             pm.setdefault("property", typed_modifier["property"])
         if typed_modifier.get("input_value") and not pm.get("amount"):
             pm["amount"] = typed_modifier["input_value"]
+        if "value" in typed_modifier:
+            pm["amount"] = typed_modifier["value"]
         if typed_modifier.get("input_variable"):
             pm["input_variable"] = typed_modifier["input_variable"]
         if typed_modifier.get("attributeflags"):
@@ -363,14 +363,25 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             pm["counter_template_guid"] = typed_modifier[
                 "counter_template_guid"]
         for key in ("removeallcounters", "removehalfroundedup",
-                    "replaceexistingvalue"):
+                    "replaceexistingvalue", "iscombatdamage",
+                    "combatdamageonly", "noncombatdamageonly",
+                    "onlypreventfromdamagedealer",
+                    "damagedealeradditionaltarget", "oneshot",
+                    "lastsindefinitely", "cardfilter", "subtype",
+                    "copysourcecard", "setthresholds", "shard"):
             if key in typed_modifier:
                 pm[key] = typed_modifier[key]
     if pm and pm.get("property") in ("attack", "defense", "healhero",
                                       "attribute", "counter", "damage",
                                       "currentresource", "totalresource",
                                       "threshold", "chargepoints", "cardcost",
-                                      "intattr"):
+                                      "intattr", "loselife", "setherohealth",
+                                      "spellpoints", "cardthreshold",
+                                      "damagemultiplier", "damageshield",
+                                      "damageimmunity", "blockimmunity",
+                                      "blockimmunityexception", "blockrestriction",
+                                      "targetingimmunity", "attackimmunity",
+                                      "subtype"):
         target_uid = ((bstate or {}).get("player_mod_target")
                       or (bstate or {}).get("player_spell_target"))
         # Resolve numeric values from the ability's serialized variables.  In
@@ -411,19 +422,65 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             amount = pm.get("amount")
             if (amount is None or int(amount or 0) == 0) and typed_modifier:
                 amount = typed_modifier.get("value", 0)
+            if (amount is None or int(amount or 0) == 0) and pm.get("input_variable"):
+                from .statics import ability_variable_value
+                resolved = ability_variable_value(
+                    db, session.session_id, bstate,
+                    (bstate or {}).get("resolving_ability", ""),
+                    str(pm["input_variable"]), src_owner,
+                    int(src_uid) if src_uid is not None else 0)
+                if resolved is not None:
+                    amount = int(resolved)
             try:
                 amount = int(amount or 0)
             except (TypeError, ValueError):
                 amount = 0
             if not attr:
                 return "intattr: missing attribute"
-            row = db.execute(
-                "SELECT template_guid, user_id, location, card_state, "
-                "permanent_buffs FROM game_cards WHERE session_id=? "
-                "AND card_uid=?", (session.session_id, int(target_uid))
-            ).fetchone()
+            from pvp_db import db_card_modifier_state, db_tame_card
+            row = db_card_modifier_state(
+                session.session_id, int(target_uid), conn=db)
             if not row:
-                return f"intattr: target {hex(int(target_uid))} missing"
+                # PlayerTargetTemplate modifiers are represented by the
+                # target player's champion SessionCardId, not by a
+                # game_cards row.  Keep these values in battle state so the
+                # client-facing PlayerUpdated projection can expose them.
+                target_owner = _controller_id_for_target(
+                    db, session, handler, bstate, target_uid)
+                if target_owner is None:
+                    return f"intattr: target {hex(int(target_uid))} missing"
+                player_attrs = (bstate.setdefault("player_int_attrs", {})
+                                .setdefault(str(int(target_owner)), {}))
+                current = int(player_attrs.get(attr, 0) or 0)
+                if operation in ("add", "increment"):
+                    value = current + amount
+                elif operation in ("remove", "subtract"):
+                    value = current - amount
+                else:
+                    value = amount
+                if value:
+                    player_attrs[attr] = value
+                else:
+                    player_attrs.pop(attr, None)
+                if attr.lower() == "canseeopponentshand":
+                    visibility = bstate.setdefault("player_visibility", {})
+                    if value:
+                        visibility.setdefault(str(int(target_owner)), {})[
+                            "CanSeeOpponentsHand"] = value
+                    else:
+                        visibility.pop(str(int(target_owner)), None)
+                    from .effects.visibility import apply_player_visibility_to_game
+                    apply_player_visibility_to_game(game, bstate)
+                owner_player_uid = owner_uid(
+                    target_owner, pl_t, ai_t, bstate)
+                champion = (game.player_champion_card_id
+                            if owner_player_uid == game.player_uid
+                            else game.ai_champion_card_id)
+                if champion and getattr(champion, "uid", None) is not None:
+                    game.push_player_updated(
+                        owner_player_uid, champ_id=champion)
+                return (f"intattr {attr}={value} "
+                        f"player={int(target_owner)}")
             try:
                 saved = json.loads(row[4] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -435,6 +492,16 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                 markers = {}
                 saved["int_attrs"] = markers
             current = int(markers.get(attr, 0) or 0)
+            # Tunneling's printed value is the initial counter threshold.
+            # Instance IntAttrModifier values are persisted as the current
+            # threshold, so the first Add must start at the TAC value rather
+            # than at zero.  Other IntAttrs retain their ordinary marker
+            # semantics.
+            if (attr.lower() == "tunneling" and
+                    attr not in markers and
+                    operation in ("add", "increment")):
+                from abilities.framework.effects.counters import tunneling_value
+                current = tunneling_value(db, row[0], {})
             if operation in ("add", "increment"):
                 value = current + amount
             elif operation in ("remove", "subtract"):
@@ -445,10 +512,10 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                 markers[attr] = value
             else:
                 markers.pop(attr, None)
-            db.execute(
-                "UPDATE game_cards SET permanent_buffs=? WHERE session_id=? "
-                "AND card_uid=?", (json.dumps(saved), session.session_id,
-                                    int(target_uid)))
+            from pvp_db import db_set_card_mutation_field
+            db_set_card_mutation_field(
+                session.session_id, int(target_uid), "permanent_buffs",
+                json.dumps(saved), conn=db)
             db.commit()
             # Tamed and Untamed markers are mutually exclusive.  Keep the
             # original static Untamed ability attached for metadata/aura
@@ -463,13 +530,9 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                 # guaranteed branch behave identically.  Failed random
                 # branches never apply this modifier and therefore leave the
                 # target in its original zone.
-                db.execute(
-                    "UPDATE game_cards SET permanent_buffs=?, location='void', "
-                    "position=0, card_state=? WHERE session_id=? "
-                    "AND card_uid=?", (json.dumps(saved),
-                                       state_after_zone_exit(row[3]),
-                                       session.session_id,
-                                       int(target_uid)))
+                db_tame_card(
+                    session.session_id, int(target_uid), json.dumps(saved),
+                    state_after_zone_exit(row[3]), conn=db)
                 db.commit()
             scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
             _tpl, ct, _name, cost, atk, defense, gem = handler._card_full_data(
@@ -500,6 +563,12 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                     db, handler, game, session, pl_t, ai_t, bstate,
                     "CardExitedZoneEvent", int(target_uid),
                     source_owner_uid=row[1])
+            if current <= 0 < value:
+                from .triggers import resolve_triggers
+                resolve_triggers(
+                    db, handler, game, session, pl_t, ai_t, bstate,
+                    "CardGainedIntAttrEvent", int(target_uid),
+                    source_owner_uid=row[1], event_int_attribute=attr)
             return f"intattr {attr}={value} target={hex(int(target_uid))}"
 
         if pm.get("property") == "cardcost":
@@ -522,18 +591,15 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                 # value comes from the ability's m_Variables.  Store the
                 # parsed formula on the instance and evaluate it on demand.
                 from .cost_mod import formula_from_raw
-                raw_row = db.execute(
-                    "SELECT raw_json FROM card_abilities_meta "
-                    "WHERE ability_guid=?",
-                    ((bstate or {}).get("resolving_ability", ""),)).fetchone()
-                formula = formula_from_raw(raw_row[0] if raw_row else "")
+                from pvp_db import db_ability_raw_json
+                formula = formula_from_raw(db_ability_raw_json(
+                    (bstate or {}).get("resolving_ability", ""), conn=db) or "")
                 if formula:
-                    existing = db.execute(
-                        "SELECT cost_mod_json FROM game_cards "
-                        "WHERE session_id=? AND card_uid=?",
-                        (session.session_id, int(cost_target))).fetchone()
+                    from pvp_db import db_card_cost_state, db_set_card_cost_formulas
+                    existing = db_card_cost_state(
+                        session.session_id, int(cost_target), conn=db)
                     try:
-                        entries = json.loads(existing[0] or "[]") if existing else []
+                        entries = json.loads(existing[4] or "[]") if existing else []
                     except Exception:
                         entries = []
                     # CardCreatedEvent can be replayed during setup/reconnect.
@@ -542,37 +608,27 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                     # twice when the card is later displayed in the warzone.
                     if formula not in entries:
                         entries.append(formula)
-                    db.execute(
-                        "UPDATE game_cards SET cost_mod_json=? "
-                        "WHERE session_id=? AND card_uid=?",
-                        (json.dumps(entries), session.session_id,
-                         int(cost_target)))
+                    db_set_card_cost_formulas(
+                        session.session_id, int(cost_target), json.dumps(entries),
+                        conn=db)
                     db.commit()
                     return (f"CardModifier cardcost dynamic "
                             f"zones={formula.get('zones')} "
                             f"x{formula.get('multiplier')} "
                             f"target={hex(int(cost_target))}")
-            db.execute(
-                "UPDATE game_cards SET card_cost_mod = "
-                "COALESCE(card_cost_mod, 0) + ? "
-                "WHERE session_id=? AND card_uid=?",
-                (delta, session.session_id, int(cost_target)))
+            from pvp_db import db_add_card_cost_modifier, db_card_zone_details
+            db_add_card_cost_modifier(
+                session.session_id, int(cost_target), delta, conn=db)
             db.commit()
             c_scid = game_engine.SessionCardId(game_engine.UID(int(cost_target)))
-            c_trow = db.execute(
-                "SELECT template_guid, card_template_id FROM game_cards "
-                "WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(cost_target))).fetchone()
+            c_trow = db_card_zone_details(
+                session.session_id, int(cost_target), conn=db)
             c_tpl = c_trow[0] if c_trow else None
             _tpl3, ct3, _n3, cost3, atk3, def3, _g3 = handler._card_full_data(
                 game, c_scid, c_tpl, c_trow[1] if c_trow else None)
-            card_row = db.execute(
-                "SELECT user_id, location FROM game_cards "
-                "WHERE session_id=? AND card_uid=?",
-                (session.session_id, int(cost_target))).fetchone()
-            card_owner = (card_row[0] if card_row
+            card_owner = (c_trow[2] if c_trow
                           else (bstate or {}).get("resolving_owner_id", 0))
-            card_location = card_row[1] if card_row else "hand"
+            card_location = c_trow[3] if c_trow else "hand"
             collection = {
                 "deck": game_engine.ECardCollections.Deck,
                 "hand": game_engine.ECardCollections.Hand,
@@ -614,12 +670,9 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             source_owner = None
             src_uid = (bstate or {}).get("resolving_source_uid")
             if src_uid is not None:
-                orow = db.execute(
-                    "SELECT user_id FROM game_cards "
-                    "WHERE session_id=? AND card_uid=?",
-                    (session.session_id, int(src_uid))).fetchone()
-                if orow:
-                    source_owner = orow[0]
+                from pvp_db import db_card_owner_id
+                source_owner = db_card_owner_id(
+                    session.session_id, int(src_uid), conn=db)
             if source_owner is None:
                 source_owner = (bstate or {}).get("resolving_owner_id",
                                                   handler.user_profile["id"]
@@ -651,21 +704,19 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             if ("cantreadyautomatically" in attribute_text.lower()
                     and target_uid is not None):
                 source_owner = (bstate or {}).get("resolving_owner_id", 0)
-                attribute_targets = [r[0] for r in db.execute(
-                    "SELECT card_uid FROM game_cards WHERE session_id=? "
-                    "AND user_id<>? AND location='warzone' "
-                    "AND card_type LIKE '%Troop%'",
-                    (session.session_id, source_owner)).fetchall()]
+                from pvp_db import db_warzone_troop_uids_except_owner
+                attribute_targets = [r[0] for r in db_warzone_troop_uids_except_owner(
+                    session.session_id, source_owner, conn=db)]
             attribute_owner = (bstate or {}).get("resolving_owner_id", 0)
             # "AfterCardsReadyOnPlayersTurn" expires at the affected troop's
             # controller's next Prep, not at the source champion's Prep (the
             # Nazhk Webguard power targets opposing troops).
             if pm.get("duration") == "AfterCardsReadyOnPlayersTurn" and target_uid:
-                owner_row = db.execute(
-                    "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-                    (session.session_id, int(target_uid))).fetchone()
-                if owner_row:
-                    attribute_owner = owner_row[0]
+                from pvp_db import db_card_owner_id
+                owner = db_card_owner_id(
+                    session.session_id, int(target_uid), conn=db)
+                if owner is not None:
+                    attribute_owner = owner
             bits = 0
             for attribute_target in attribute_targets:
                 bits |= apply_attribute_grant(
@@ -677,15 +728,47 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             return f"attribute grant +{bits:b} target={hex(int(target_uid)) if target_uid else 'none'}"
         if pm.get("property") == "damage":
             return effect_ctx.damage_modifier(pm, typed_modifier)
+        if pm.get("property") == "loselife":
+            amount = effect_ctx.modifier_value(pm, typed_modifier, "loselife")
+            return effect_ctx.lose_life(
+                target_uid or effect_ctx.modifier_target(), amount,
+                typed_modifier)
+        if pm.get("property") == "setherohealth":
+            amount = effect_ctx.modifier_value(
+                pm, typed_modifier, "setherohealth")
+            return effect_ctx.set_hero_health(
+                target_uid or effect_ctx.modifier_target(), amount)
+        if pm.get("property") == "spellpoints":
+            amount = effect_ctx.modifier_value(
+                pm, typed_modifier, "spellpoints")
+            return effect_ctx.spell_points(
+                target_uid or effect_ctx.modifier_target(), amount)
+        if pm.get("property") == "cardthreshold":
+            return effect_ctx.card_threshold(
+                target_uid or effect_ctx.resolved_target(), typed_modifier)
+        if pm.get("property") == "subtype":
+            return effect_ctx.subtype_modifier(
+                target_uid or effect_ctx.resolved_target(), typed_modifier)
+        if pm.get("property") == "damageshield":
+            amount = effect_ctx.modifier_value(
+                pm, typed_modifier, "damageshield")
+            return effect_ctx.damage_shield(
+                target_uid or effect_ctx.modifier_target(), amount,
+                typed_modifier)
+        if pm.get("property") in (
+                "damagemultiplier", "damageimmunity", "blockimmunity",
+                "blockimmunityexception", "blockrestriction",
+                "targetingimmunity", "attackimmunity"):
+            return effect_ctx.rule_modifier(
+                target_uid or effect_ctx.modifier_target(), pm,
+                typed_modifier)
         if pm.get("property") == "counter":
             cname = ""
             counter_guid = pm.get("counter_template_guid")
             if counter_guid:
                 try:
-                    crow = db.execute(
-                        "SELECT name FROM card_counter_templates "
-                        "WHERE template_id=?", (counter_guid,)).fetchone()
-                    cname = crow[0] if crow else ""
+                    from pvp_db import db_counter_template_name
+                    cname = db_counter_template_name(counter_guid, conn=db) or ""
                 except Exception:
                     # Minimal unit fixtures predate the extracted counter
                     # catalog.  The typed GUID remains authoritative in live
@@ -770,10 +853,9 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                 # effect's gamedata condition already gated this leaf.
                 from .effects.counters import card_counters as _card_counters
                 owner_id = (bstate or {}).get("resolving_owner_id", 0)
-                rows = db.execute(
-                    "SELECT card_uid, location FROM game_cards "
-                    "WHERE session_id=? AND user_id=?",
-                    (session.session_id, owner_id)).fetchall()
+                from pvp_db import db_owner_card_locations
+                rows = db_owner_card_locations(
+                    session.session_id, owner_id, conn=db)
                 cleared = []
                 pending = []
                 for cu, loc in rows:
@@ -797,10 +879,11 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             return f"counter {cname}: no target"
         return effect_ctx.stat_modifier(pm, typed_modifier)
 
-    name = db.execute(
-        "SELECT effect_type FROM ability_effects WHERE effect_guid=? LIMIT 1",
-        (effect_guid,)).fetchone()
-    eff_name = name[0] if name else ""
+    from pvp_db import (db_effect_type, db_ability_game_text,
+                        db_champion_ability_game_text,
+                        db_effect_param_for_ability_types,
+                        db_ability_raw_json)
+    eff_name = db_effect_type(effect_guid, conn=db) or ""
     if eff_name != "CardModifierAbilityEffectTemplate":
         # The row is the parent ability, not the effect — skip
         pass
@@ -809,21 +892,15 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     game_text = ""
     ability_guid = bstate.get("resolving_ability", "")
     if ability_guid:
-        ca_row = db.execute(
-            "SELECT game_text FROM champion_abilities WHERE ability_guid=? LIMIT 1",
-            (ability_guid,)).fetchone()
-        if ca_row:
-            game_text = ca_row[0] or ""
+        game_text = db_champion_ability_game_text(ability_guid, conn=db) or ""
     value = 1
     ability_guid = bstate.get("resolving_ability", "")
     if ability_guid:
-        var_row = db.execute(
-            "SELECT param FROM ability_effects WHERE ability_guid=? "
-            "AND effect_type IN ('RandomizeVariableEffectTemplate', "
-            "'RandomizeVariableAbilityEffectTemplate')",
-            (ability_guid,)).fetchone()
-        if var_row:
-            val = _parse_constant(var_row[0])
+        var_param = db_effect_param_for_ability_types(
+            ability_guid, ("RandomizeVariableEffectTemplate",
+                           "RandomizeVariableAbilityEffectTemplate"), conn=db)
+        if var_param:
+            val = _parse_constant(var_param)
             if val:
                 value = val
         else:
@@ -898,15 +975,13 @@ def _ability_text(db, bstate):
     ag = (bstate or {}).get("resolving_ability", "")
     if not ag:
         return ""
-    for tbl in ("card_abilities_meta", "champion_abilities"):
-        try:
-            row = db.execute(
-                "SELECT game_text FROM %s WHERE ability_guid=?" % tbl,
-                (ag,)).fetchone()
-        except Exception:
-            continue
-        if row:
-            return row[0] or ""
+    from pvp_db import db_ability_game_text, db_champion_ability_game_text
+    text = db_ability_game_text(ag, conn=db)
+    if text is not None:
+        return text or ""
+    text = db_champion_ability_game_text(ag, conn=db)
+    if text is not None:
+        return text or ""
     return ""
 
 
@@ -920,10 +995,8 @@ def _linked_template_guids_from_metadata(db, bstate):
     """
     import re as _re
     ag = (bstate or {}).get("resolving_ability", "")
-    row = db.execute(
-        "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-        (ag,)).fetchone()
-    raw = row[0] if row else ""
+    from pvp_db import db_ability_raw_json
+    raw = db_ability_raw_json(ag, conn=db) or ""
     if not raw:
         return []
     links = _re.findall(
@@ -932,7 +1005,8 @@ def _linked_template_guids_from_metadata(db, bstate):
     out = []
     for guid in links:
         guid = guid.lower()
-        if db.execute("SELECT 1 FROM card_templates WHERE guid=?", (guid,)).fetchone():
+        from pvp_db import db_template_exists
+        if db_template_exists(guid, conn=db):
             if guid not in out:
                 out.append(guid)
     return out
@@ -978,9 +1052,9 @@ def _push_card_state(game, session, db, handler, pl_t, ai_t, uid, new_state,
                      bstate=None):
     """Push a CardUpdated in the card's authoritative current collection."""
     from ._shared import card_collection_for_location
-    trow = db.execute(
-        "SELECT template_guid, user_id, location FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(uid))).fetchone()
+    from pvp_db import db_card_zone_details
+    details = db_card_zone_details(session.session_id, int(uid), conn=db)
+    trow = (details[0], details[2], details[3]) if details else None
     if not trow:
         return
     scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
@@ -1003,19 +1077,18 @@ def _push_card_state(game, session, db, handler, pl_t, ai_t, uid, new_state,
 
 
 def _state_of(db, session, uid):
-    row = db.execute(
-        "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(uid))).fetchone()
-    return int(row[0]) if row else 0
+    from pvp_db import db_card_state_value
+    value = db_card_state_value(session.session_id, int(uid), conn=db)
+    return int(value) if value is not None else 0
 
 
 def _controller_id_for_target(db, session, handler, bstate, target_uid):
     """Return the DB player id that controls a card or champion target."""
-    row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
-    if row:
-        return int(row[0])
+    from pvp_db import db_card_owner_id
+    card_owner = db_card_owner_id(
+        session.session_id, int(target_uid), conn=db)
+    if card_owner is not None:
+        return int(card_owner)
     if (bstate or {}).get("pvp"):
         for pid, cuid in ((bstate or {}).get("champ_map") or {}).items():
             try:
@@ -1023,6 +1096,19 @@ def _controller_id_for_target(db, session, handler, bstate, target_uid):
                     return int(pid)
             except (TypeError, ValueError):
                 continue
+        # Headless PvP fixtures can have the handler's champion SessionCardIds
+        # before the live session has populated champ_map.  Resolve ownership
+        # from the fixture's player order in that narrow fallback case.
+        pids = (bstate or {}).get("pids") or []
+        if len(pids) >= 2:
+            player_champ = getattr(handler, "_player_champ_scid", None)
+            ai_champ = getattr(handler, "_ai_champ_scid", None)
+            if player_champ is not None and int(
+                    player_champ.uid.uid64) == int(target_uid):
+                return int(pids[0])
+            if ai_champ is not None and int(ai_champ.uid.uid64) == int(
+                    target_uid):
+                return int(pids[1])
     for attr, owner in (("_player_champ_scid", handler.user_profile["id"]
                          if handler.user_profile else 0),
                         ("_ai_champ_scid", 0)):
@@ -1077,6 +1163,20 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             db, bstate, effect_guid, "m_DestinationCollection")
         if typed_dest:
             dest = str(typed_dest).rsplit(".", 1)[-1].lower()
+    # Choice-card abilities begin by clearing the previous temporary choices.
+    # The client represents this as the typed
+    # ``PutAllCardsInTheChoiceZoneIntoThePlayedResourcesZone`` effect.  It is
+    # not a normal single-card zone move: leaving the generated cards behind
+    # makes an old Choose Wild token a legal candidate for a later Shard of
+    # Cunning activation.  Keep this keyed to the authoritative effect
+    # metadata, not to a card name.
+    typed_name = str((effect_template(effect_guid) or {}).get("m_Name") or
+                     p.get("name") or "").lower()
+    if (dest in ("playedresources", "playedresource") and
+            "choicezone" in typed_name and "allcards" in typed_name):
+        from .effects.choices import _clear_choice_zone
+        _clear_choice_zone(game, session, db, pl_t, ai_t, handler, bstate)
+        return "cleared choice zone"
     forced_target = None
     # Bane's generated move effect deliberately has no fixed destination:
     # "put the top card of your deck into #DESTINATION_ZONE#" means the zone
@@ -1088,17 +1188,13 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             "PutTheTopCardOfYourDeckIntoDestinationZone"):
         if src_uid is None:
             return "bane move: no source"
-        source_row = db.execute(
-            "SELECT user_id, location FROM game_cards "
-            "WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
+        from pvp_db import db_card_owner_zone_state, db_deck_top_card
+        source_row = db_card_owner_zone_state(
+            session.session_id, int(src_uid), conn=db)
         if not source_row or source_row[1] not in ("hand", "discard"):
             return "bane move: source is not in hand or discard"
-        top_row = db.execute(
-            "SELECT card_uid FROM game_cards "
-            "WHERE session_id=? AND user_id=? AND location='deck' "
-            "ORDER BY position, card_uid LIMIT 1",
-            (session.session_id, int(source_row[0]))).fetchone()
+        top_row = db_deck_top_card(
+            session.session_id, int(source_row[0]), conn=db)
         if not top_row:
             return "bane move: deck empty"
         dest = source_row[1]
@@ -1119,10 +1215,12 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     if dest == "deck":
         if src_uid is None:
             return "move card: no source"
-        source_row = db.execute(
-            "SELECT user_id FROM game_cards "
-            "WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
+        from pvp_db import (db_card_owner_id, db_set_card_owner,
+                            db_move_card_to_deck, db_card_position,
+                            db_card_zone_details)
+        source_owner = db_card_owner_id(
+            session.session_id, int(src_uid), conn=db)
+        source_row = (source_owner,) if source_owner is not None else None
         if not source_row:
             return f"put {hex(int(src_uid))} into deck: card not found"
         deck_owner = int(source_row[0])
@@ -1145,32 +1243,26 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                     db, session, handler, bstate, previous_target)
                 if target_owner is not None:
                     deck_owner = int(target_owner)
-                    db.execute(
-                        "UPDATE game_cards SET user_id=? "
-                        "WHERE session_id=? AND card_uid=?",
-                        (deck_owner, session.session_id, int(src_uid)))
+                    db_set_card_owner(
+                        session.session_id, int(src_uid), deck_owner, conn=db)
                     db.commit()
-        db.execute(
-            "UPDATE game_cards SET location='deck', position=0, card_state=? "
-            "WHERE session_id=? AND card_uid=?",
-            (state_after_zone_exit(0), session.session_id, int(src_uid)))
+        db_move_card_to_deck(
+            session.session_id, int(src_uid), state_after_zone_exit(0), conn=db)
         db.commit()
         # Draws leave gaps in the persisted position values.  Choosing a
         # random absolute position therefore biases a returned card toward
         # the top of the deck.  Reinsert against the current ordered deck so
         # every slot is equally likely and only this player's deck is used.
-        from db import db_randomly_insert_deck_cards
+        from pvp_db import db_randomly_insert_deck_cards
         db_randomly_insert_deck_cards(
             session.session_id, deck_owner, [int(src_uid)], connection=db)
-        pos_row = db.execute(
-            "SELECT position FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
-        pos = int(pos_row[0]) if pos_row else 0
+        pos_value = db_card_position(
+            session.session_id, int(src_uid), conn=db)
+        pos = int(pos_value) if pos_value is not None else 0
         scid = game_engine.SessionCardId(game_engine.UID(int(src_uid)))
-        trow = db.execute(
-            "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(src_uid))).fetchone()
-        tpl = trow[0] if trow else None
+        details = db_card_zone_details(
+            session.session_id, int(src_uid), conn=db)
+        tpl = details[0] if details else None
         _tpl, ct, _n, cost, atk, def_, _g = handler._card_full_data(game, scid, tpl)
         deck_player = owner_uid(deck_owner, pl_t, ai_t, bstate)
         game.push_card_moved(scid, deck_player, game_engine.ECardCollections.Deck,
@@ -1182,61 +1274,68 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     # Other destinations: move the resolved target (or the source card).
     target = (forced_target if forced_target is not None
               else _resolve_leaf_target(bstate))
+    # Some authored MoveCardToZone effects are source-target operations (for
+    # example a self-tunnel trigger) and do not carry an explicit target in
+    # the activation payload.  Underground is a real destination, not a
+    # synonym for Warzone; bind that source only when no target was supplied.
+    if target is None and dest == "underground":
+        target = src_uid
     if target is None:
         return "move card: no target/source"
     zone = {"hand": ("hand", game_engine.ECardCollections.Hand),
             "deck_target": ("deck", game_engine.ECardCollections.Deck),
             "warzone": ("warzone", game_engine.ECardCollections.Warzone),
+            "underground": ("underground", game_engine.ECardCollections.Underground),
             "discard": ("discard", game_engine.ECardCollections.Discard),
             "void": ("void", game_engine.ECardCollections.Void)}.get(dest)
     if not zone:
         return "move card between zones"
     loc, coll = zone
-    old_row = db.execute(
-        "SELECT location, card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    old_loc = old_row[0] if old_row else None
-    old_state = int(old_row[1] or 0) if old_row else 0
+    from pvp_db import (db_card_owner_zone_state, db_move_card_for_effect,
+                        db_card_zone_details, db_card_state_value)
+    old_row = db_card_owner_zone_state(
+        session.session_id, int(target), conn=db)
+    old_loc = old_row[1] if old_row else None
+    old_state = int(old_row[2] or 0) if old_row else 0
     if loc == "warzone":
-        db.execute(
-            "UPDATE game_cards SET location=?, position=0, "
-            "card_state = card_state & ~? "
-            "WHERE session_id=? AND card_uid=?",
-            (loc, game_engine.ECardStates.Dead, session.session_id, int(target)))
+        db_move_card_for_effect(
+            session.session_id, int(target), loc, 0, old_state,
+            clear_dead=True, clear_bits=game_engine.ECardStates.Dead, conn=db)
+    elif loc == "underground":
+        # Tunnel is a zone change that preserves the card's controller and
+        # clears transient surface/combat flags.  Do not rewrite user_id:
+        # Practice AI cards remain user_id=0 and are projected with ai_t.
+        db_move_card_for_effect(
+            session.session_id, int(target), loc, 0, state_after_zone_exit(0),
+            conn=db)
     else:
-        db.execute(
-            "UPDATE game_cards SET location=?, position=?, card_state=? "
-            "WHERE session_id=? AND card_uid=?",
-            (loc, 100 if loc == "hand" else 0, state_after_zone_exit(0),
-             session.session_id, int(target)))
+        db_move_card_for_effect(
+            session.session_id, int(target), loc,
+            100 if loc == "hand" else 0, state_after_zone_exit(0), conn=db)
     db.commit()
     scid = game_engine.SessionCardId(game_engine.UID(int(target)))
-    trow = db.execute(
-        "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    tpl = trow[0] if trow else None
+    details = db_card_zone_details(
+        session.session_id, int(target), conn=db)
+    tpl = details[0] if details else None
     _tpl, ct, _n, cost, atk, def_, _g = handler._card_full_data(game, scid, tpl)
     # The selected/revealed card is now a normal hand card.  Re-materialize
     # its full definition from the authoritative template_guid and publish the
     # hand transition as a draw so the client's CardRepresentation cannot
     # retain the source Oakhenge instance's art/definition.
-    owner_row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
-    owner = owner_uid(owner_row[0] if owner_row else 0, pl_t, ai_t, bstate)
+    card_owner = details[2] if details else 0
+    owner = owner_uid(card_owner, pl_t, ai_t, bstate)
     game.push_card_moved(scid, owner, coll,
                          game_engine.ECardLocations.Unknown if loc == "deck"
                          else game_engine.ECardLocations.Top,
                          1 if loc == "hand" else 0)
     if loc == "hand" and old_loc == "deck":
         game.push_card_drawn(scid, owner, 1)
-    current_state = db.execute(
-        "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
+    current_state = db_card_state_value(
+        session.session_id, int(target), conn=db)
     game.push_card_updated(
         scid, owner, coll, ct, template_id=tpl, cost=cost,
-        attack=atk, defense=def_, state=int(current_state[0] or 0)
-        if current_state else 0, nulling=(loc == "deck"))
+        attack=atk, defense=def_, state=int(current_state or 0),
+        nulling=(loc == "deck"))
     if loc == "warzone" and old_loc != "warzone":
         # Moving a card into play through a BOM (including a one-shot
         # Deathcry) is still an enters-play event.  The normal card-cast path
@@ -1245,23 +1344,48 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         from .triggers import resolve_enters_play_triggers
         resolve_enters_play_triggers(
             db, handler, game, session, pl_t, ai_t, bstate,
-            int(target), int(owner_row[0]) if owner_row else 0, 0)
+            int(target), int(card_owner or 0), 0)
+    if loc == "underground" and old_loc != "underground":
+        # Underground has public zone movement but hidden card identity for
+        # the opposing viewer.  Keep both trigger halves so authored
+        # “when this goes underground” abilities resolve through the same
+        # metadata path as the dedicated TunnelCard leaf.
+        from .triggers import resolve_triggers
+        source_owner = int(card_owner or 0)
+        resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardExitedZoneEvent", int(target),
+            source_owner_uid=source_owner,
+            event_source_collection=old_loc,
+            event_destination_collection=loc)
+        resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardEnteredZoneEvent", int(target),
+            source_owner_uid=source_owner,
+            event_source_collection=old_loc,
+            event_destination_collection=loc,
+            event_previous_state=old_state)
     # Zone entry is an event in its own right.  Draw helpers emit this for
     # normal draws, while generic BOM moves must emit it here so Hand|Discard
     # triggers (for example a Reginald buried into its controller's discard)
     # fire regardless of which effect moved the card.
     if loc in ("hand", "discard"):
-        owner_id = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target))).fetchone()
         from .triggers import resolve_triggers
         resolve_triggers(
             db, handler, game, session, pl_t, ai_t, bstate,
             "CardEnteredZoneEvent", int(target),
-            source_owner_uid=(int(owner_id[0]) if owner_id else 0),
+            source_owner_uid=int(card_owner or 0),
             event_source_collection=old_loc,
             event_destination_collection=loc,
             event_previous_state=old_state)
+        if loc == "discard":
+            resolve_triggers(
+                db, handler, game, session, pl_t, ai_t, bstate,
+                "CardDiscardedEvent", int(target),
+                source_owner_uid=int(card_owner or 0),
+                event_source_collection=old_loc,
+                event_destination_collection=loc,
+                event_previous_state=old_state)
     if loc == "deck" and dest == "deck_target":
         # A revealed-card choice such as Oakhenge returns the unchosen cards
         # to the deck.  Merely changing their location leaves all of them at
@@ -1271,13 +1395,10 @@ def _move_card_to_zone_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         # the rest of the deck order.
         revealed = [int(uid) for uid in
                     (bstate or {}).get("revealed_cards", [])]
-        owner_row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target))).fetchone()
-        if revealed and owner_row:
-            from db import db_randomly_insert_deck_cards
+        if revealed and card_owner is not None:
+            from pvp_db import db_randomly_insert_deck_cards
             db_randomly_insert_deck_cards(
-                session.session_id, int(owner_row[0]), revealed,
+                session.session_id, int(card_owner), revealed,
                 connection=db)
     return f"moved {hex(int(target))} to {'deck' if dest == 'deck_target' else dest}"
 
@@ -1292,27 +1413,24 @@ def _return_voided_cards(game, session, db, handler, pl_t, ai_t, bstate,
     vby = (bstate or {}).get("voided_by") or {}
     uids = list(vby.get(str(int(src_uid)), []))
     returned = 0
+    from pvp_db import (db_card_owner_zone_state, db_restore_card_to_warzone,
+                        db_card_zone_details)
     for target_uid in uids:
-        row = db.execute(
-            "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
+        row = db_card_owner_zone_state(
+            session.session_id, int(target_uid), conn=db)
         if not row:
             continue
         owner = pl_t if row[0] != 0 else ai_t
-        db.execute(
-            "UPDATE game_cards SET location='warzone', position=0, "
-            "card_state = (card_state & ~?) | ? "
-            "WHERE session_id=? AND card_uid=?",
-            (game_engine.ECardStates.StartedATurnOnYourSide |
-             game_engine.ECardStates.Dead,
-             game_engine.ECardStates.CameOutThisTurn,
-             session.session_id, int(target_uid)))
+        db_restore_card_to_warzone(
+            session.session_id, int(target_uid),
+            game_engine.ECardStates.StartedATurnOnYourSide |
+            game_engine.ECardStates.Dead,
+            game_engine.ECardStates.CameOutThisTurn, conn=db)
         db.commit()
         scid = game_engine.SessionCardId(game_engine.UID(int(target_uid)))
-        trow = db.execute(
-            "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-            (session.session_id, int(target_uid))).fetchone()
-        tpl_guid = trow[0] if trow else None
+        details = db_card_zone_details(
+            session.session_id, int(target_uid), conn=db)
+        tpl_guid = details[0] if details else None
         _tpl, ct, _n, _c, atk, def_, _g = handler._card_full_data(
             game, scid, tpl_guid)
         game.push_card_moved(scid, owner, game_engine.ECardCollections.Warzone,
@@ -1361,10 +1479,9 @@ def _leaf_untap(effect):
         uids = [int(target)]
     elif "each" in (text or "").lower():
         owner = int((effect.bstate or {}).get("resolving_owner_id", 0))
-        uids = [r[0] for r in effect.db.execute(
-            "SELECT card_uid FROM game_cards WHERE session_id=? "
-            "AND location='warzone' AND card_type LIKE '%Troop%' AND user_id=?",
-            (effect.session.session_id, owner)).fetchall()]
+        from pvp_db import db_warzone_troop_uids_for_owner
+        uids = [r[0] for r in db_warzone_troop_uids_for_owner(
+            effect.session.session_id, owner, conn=effect.db)]
     else:
         return "untap: no target"
     for u in uids:
@@ -1383,10 +1500,9 @@ def _leaf_tap(effect):
         uids = [int(target)]
     elif "each" in (text or "").lower():
         owner = int((effect.bstate or {}).get("resolving_owner_id", 0))
-        uids = [r[0] for r in effect.db.execute(
-            "SELECT card_uid FROM game_cards WHERE session_id=? "
-            "AND location='warzone' AND card_type LIKE '%Troop%' AND user_id!=?",
-            (effect.session.session_id, owner)).fetchall()]
+        from pvp_db import db_warzone_troop_uids_except_owner
+        uids = [r[0] for r in db_warzone_troop_uids_except_owner(
+            effect.session.session_id, owner, conn=effect.db)]
     else:
         return "tap: no target"
     for u in uids:
@@ -1443,9 +1559,8 @@ def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             random_target = bool(target_meta.get("is_random_target"))
     if 0 <= effect_target_index < len(target_ids):
         tid = target_ids[effect_target_index]
-        frow = db.execute(
-            "SELECT filter_json, target_kind, is_random_target FROM target_templates "
-            "WHERE template_id=?", (str(tid),)).fetchone()
+        from pvp_db import db_target_template_resolution_info
+        frow = db_target_template_resolution_info(str(tid), conn=db)
         filt = json.loads(frow[0]) if frow and frow[0] else {}
         target_kind = (frow[1] or "") if frow else ""
         random_target = bool(frow[2]) if frow else random_target
@@ -1461,10 +1576,10 @@ def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     reveal_zone = "deck"
     tid = (target_ids[effect_target_index]
            if 0 <= effect_target_index < len(target_ids) else None)
-    frow = db.execute(
-        "SELECT filter_json FROM target_templates WHERE template_id=?",
-        (str(tid),)).fetchone() if tid else None
-    filt = json.loads(frow[0]) if frow and frow[0] else {}
+    from pvp_db import db_target_template_filter
+    filter_json = (db_target_template_filter(str(tid), conn=db)
+                   if tid else None)
+    filt = json.loads(filter_json) if filter_json else {}
     stack = [filt]
     while stack:
         node = stack.pop()
@@ -1492,16 +1607,20 @@ def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         source_target = _resolve_leaf_target(bstate)
         row = None
         if source_target is not None:
-            row = db.execute(
-                "SELECT card_uid, position, template_guid, user_id, card_state, "
-                "location FROM game_cards WHERE session_id=? AND card_uid=? "
-                "AND user_id=?",
-                (session.session_id, int(source_target), owner)).fetchone()
+            from pvp_db import db_reveal_owned_card
+            row = db_reveal_owned_card(
+                session.session_id, int(source_target), owner, conn=db)
         rows = [row[:5]] if row else []
         if row:
             from ._shared import card_collection_for_location
             reveal_collection = card_collection_for_location(row[5])
     else:
+        # Subterranean Spy's optional surface ability stores an opposing
+        # champion, then targets that champion's deck.  The stored target is
+        # the authority for which player's deck is revealed; using the
+        # resolving owner here would reveal the Spy controller's own deck.
+        owner = _reveal_owner_for_target(
+            db, handler, session, bstate, owner, target_kind, ability_guid)
         if random_target and target_template_id:
             # A random reveal is not the top card. Resolve the typed target
             # filter, then choose one instance. The selected card remains in
@@ -1515,21 +1634,36 @@ def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             selected_uid = random.choice(candidates) if candidates else None
             rows = []
             if selected_uid is not None:
-                row = db.execute(
-                    "SELECT card_uid, position, template_guid, user_id, "
-                    "card_state FROM game_cards WHERE session_id=? "
-                    "AND card_uid=? AND user_id=? AND location=?",
-                    (session.session_id, int(selected_uid), owner,
-                     reveal_zone)).fetchone()
+                from pvp_db import db_reveal_card_row
+                row = db_reveal_card_row(
+                    session.session_id, int(selected_uid), owner, reveal_zone,
+                    conn=db)
                 rows = [row] if row else []
         else:
-            rows = db.execute(
-                "SELECT card_uid, position, template_guid, user_id, card_state "
-                "FROM game_cards WHERE session_id=? "
-                "AND user_id=? AND location=? ORDER BY position LIMIT ?",
-                (session.session_id, owner, reveal_zone, count)).fetchall()
-            if reveal_zone == "hand" and rows:
-                rows = [random.choice(rows)]
+            # A hand reveal can carry a typed target filter.  The target
+            # metadata determines whether the reveal is random; a filter by
+            # itself does not make it random.  In particular, Withering Touch
+            # reveals every matching hand instance so the later choice can
+            # offer two copies of the same card as two distinct cards.
+            if reveal_zone == "hand" and target_template_id:
+                from .targeting import legal_targets
+                candidates = legal_targets(
+                    db, session.session_id, owner, target_template_id,
+                    (bstate or {}).get("resolving_source_uid"),
+                    both_players=False, champions=[], battle_state=bstate)
+                if random_target:
+                    candidates = ([random.choice(candidates)]
+                                  if candidates else [])
+                from pvp_db import db_reveal_cards
+                rows = db_reveal_cards(
+                    session.session_id, owner, "hand", count,
+                    candidates, conn=db)
+            else:
+                from pvp_db import db_reveal_cards
+                rows = db_reveal_cards(
+                    session.session_id, owner, reveal_zone, count, conn=db)
+                if reveal_zone == "hand" and rows:
+                    rows = [random.choice(rows)]
     uids = [int(r[0]) for r in rows]
     bstate["revealed_cards"] = uids
     if uids:
@@ -1555,6 +1689,10 @@ def _reveal_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                     meta.get("player_reveal_targets") or "Everyone")
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
+        # AI reveals are public game information: the human client must see
+        # the same CardsRevealed checkpoint as the AI controller.
+        if int(owner or 0) == 0:
+            reveal_targets = "Everyone"
         private = False
         if (bstate or {}).get("pvp") and reveal_targets.lower() in (
                 "self", "you", "controller"):
@@ -1684,12 +1822,11 @@ def _battle_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     # form "previous target deals damage equal to its ATK to you".  Use the
     # resolved card types rather than display/game text (talent abilities do
     # not always have a card_abilities_meta game_text row).
-    source_row = db.execute(
-        "SELECT card_type FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, a)).fetchone()
-    target_row = db.execute(
-        "SELECT card_type FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, d)).fetchone()
+    from pvp_db import db_card_mutation_info
+    source_info = db_card_mutation_info(session.session_id, a, conn=db)
+    target_info = db_card_mutation_info(session.session_id, d, conn=db)
+    source_row = (source_info[2],) if source_info else None
+    target_row = (target_info[2],) if target_info else None
     source_is_champion = source_row is None or str(source_row[0]).lower() == "champion"
     target_is_troop = target_row is not None and "troop" in str(target_row[0]).lower()
     if source_is_champion and target_is_troop:
@@ -1707,12 +1844,27 @@ def _battle_cards_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         logs.append(f"{hex(d)} deals {datk} to you -> {result}")
         return "; ".join(logs)
     atk = _card_atk(db, session, a, bstate)
-    logs.append(f"{hex(a)} deals {atk} to {hex(d)} -> "
-                f"{_deal_damage(game, session, db, handler, pl_t, ai_t, bstate, d, atk)}")
+    result = _deal_damage(game, session, db, handler, pl_t, ai_t, bstate,
+                          d, atk)
+    logs.append(f"{hex(a)} deals {atk} to {hex(d)} -> {result}")
+    from .triggers import resolve_triggers
+    resolve_triggers(
+        db, handler, game, session, pl_t, ai_t, bstate,
+        "CardBattledEvent", a,
+        source_owner_uid=_deck_owner_for_target(
+            db, handler, session, bstate, a) or 0,
+        extra_target=d)
     if "battles" in low:
         datk = _card_atk(db, session, d, bstate)
-        logs.append(f"{hex(d)} deals {datk} to {hex(a)} -> "
-                    f"{_deal_damage(game, session, db, handler, pl_t, ai_t, bstate, a, datk)}")
+        result = _deal_damage(game, session, db, handler, pl_t, ai_t, bstate,
+                              a, datk)
+        logs.append(f"{hex(d)} deals {datk} to {hex(a)} -> {result}")
+        resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "CardBattledEvent", d,
+            source_owner_uid=_deck_owner_for_target(
+                db, handler, session, bstate, d) or 0,
+            extra_target=a)
     return "; ".join(logs)
 
 
@@ -1749,9 +1901,9 @@ def _create_token_copy_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     target = _resolve_leaf_target(bstate)
     if target is None:
         return "copy: no target"
-    trow = db.execute(
-        "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
+    from pvp_db import (db_card_zone_details, db_copy_template_payload,
+                        db_next_game_card_row_id, db_insert_generated_card)
+    trow = db_card_zone_details(session.session_id, int(target), conn=db)
     if not trow:
         return "copy: target template missing"
     words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
@@ -1762,24 +1914,17 @@ def _create_token_copy_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     into_hand = "into your hand" in text.lower()
     owner = int((bstate or {}).get("resolving_owner_id", 0))
     tpl = trow[0]
-    tpl_row = db.execute(
-        "SELECT card_type, abilities_json, attributes FROM card_templates WHERE guid=?",
-        (tpl,)).fetchone()
+    tpl_row = db_copy_template_payload(tpl, conn=db)
     created = 0
     created_uids = []
     for i in range(count):
-        next_id = db.execute(
-            "SELECT COALESCE(MAX(id), 10000) + 1 FROM game_cards WHERE session_id=?",
-            (session.session_id,)).fetchone()[0]
+        next_id = db_next_game_card_row_id(session.session_id, conn=db)
         card_uid = next_game_card_uid(db, session.session_id)
         created_uids.append(card_uid)
         loc = "hand" if into_hand else "warzone"
-        db.execute(
-            "INSERT INTO game_cards (id, session_id, user_id, card_uid, template_guid, "
-            "card_template_id, location, position, card_state, card_abilities, "
-            "card_type, card_attributes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (next_id, session.session_id, owner, card_uid, tpl, tpl, loc, 0, 0,
-             tpl_row[1], tpl_row[0], tpl_row[2]))
+        db_insert_generated_card(
+            session.session_id, owner, card_uid, tpl, loc, tpl_row[0],
+            tpl_row[1], tpl_row[2], next_id, conn=db)
         scid = game_engine.SessionCardId(game_engine.UID(card_uid))
         _tpl2, ct2, _n2, cost2, atk2, def2, _g2 = handler._card_full_data(
             game, scid, tpl)
@@ -1795,6 +1940,8 @@ def _create_token_copy_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     if created:
         from .triggers import resolve_triggers
         for card_uid in created_uids:
+            resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
+                             "OtherCardCreatedEvent", int(card_uid), owner)
             resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                              "CardCreatedEvent", int(card_uid), owner,
                              zones=())
@@ -1822,28 +1969,21 @@ def _create_and_cast_spell_legacy(game, session, db, handler, pl_t, ai_t,
               or _resolve_leaf_target(bstate))
     if target is None:
         return "copy spell: no target"
-    trow = db.execute(
-        "SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target))).fetchone()
+    from pvp_db import (db_card_zone_details, db_copy_template_payload,
+                        db_next_game_card_row_id, db_insert_generated_card)
+    trow = db_card_zone_details(session.session_id, int(target), conn=db)
     if not trow:
         return "copy spell: target template missing"
     tpl = trow[0]
-    tpl_row = db.execute(
-        "SELECT card_type, abilities_json, attributes FROM card_templates WHERE guid=?",
-        (tpl,)).fetchone()
+    tpl_row = db_copy_template_payload(tpl, conn=db)
     if not tpl_row:
         return "copy spell: template not found"
     owner = int((bstate or {}).get("resolving_owner_id", 0))
-    next_id = db.execute(
-        "SELECT COALESCE(MAX(id), 10000) + 1 FROM game_cards WHERE session_id=?",
-        (session.session_id,)).fetchone()[0]
+    next_id = db_next_game_card_row_id(session.session_id, conn=db)
     card_uid = next_game_card_uid(db, session.session_id)
-    db.execute(
-        "INSERT INTO game_cards (id, session_id, user_id, card_uid, template_guid, "
-        "card_template_id, location, position, card_state, card_abilities, "
-        "card_type, card_attributes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (next_id, session.session_id, owner, card_uid, tpl, tpl, "CastSpells",
-         0, 0, tpl_row[1], tpl_row[0], tpl_row[2]))
+    db_insert_generated_card(
+        session.session_id, owner, card_uid, tpl, "CastSpells", tpl_row[0],
+        tpl_row[1], tpl_row[2], next_id, conn=db)
     db.commit()
     try:
         ags = _json.loads(tpl_row[1] or "[]")
@@ -1858,9 +1998,9 @@ def _create_and_cast_spell_legacy(game, session, db, handler, pl_t, ai_t,
     game.push_card_updated(scid, pl_t if owner else ai_t,
                            game_engine.ECardCollections.CastSpells, ct2,
                            template_id=tpl, cost=cost2, attack=atk2, defense=def2)
-    from .triggers import resolve_played_spell as _resolve_spell
+    from abilities import resolve_played_spell as _resolve_spell
     logs = _resolve_spell(game, session, db, handler, pl_t, ai_t, bstate, ags)
-    from db import db_discard_card
+    from pvp_db import db_discard_card
     db_discard_card(session.session_id, card_uid, connection=db)
     return f"copied+cast {tpl[:8]}: {logs}"
 
@@ -1895,13 +2035,9 @@ def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
     if not isinstance(filter_json, dict):
         return "transform random: no typed filter"
     source_uid = (bstate or {}).get("resolving_source_uid")
-    target_row = db.execute(
-        "SELECT gc.template_guid, gc.card_type, gc.location, gc.user_id, "
-        "gc.card_state, gc.permanent_buffs, ct.name, ct.cost, ct.rarity, "
-        "ct.threshold_json, ct.subtype, ct.attributes, gc.card_attributes "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session.session_id, int(target))).fetchone()
+    from pvp_db import db_transform_target_info, db_transform_candidate_templates
+    target_row = db_transform_target_info(
+        session.session_id, int(target), conn=db)
 
     def card_record(row, uid):
         data = {
@@ -1958,10 +2094,8 @@ def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
     if source_card:
         ability_guid = (bstate or {}).get("resolving_ability", "")
         try:
-            raw_row = db.execute(
-                "SELECT raw_json FROM card_abilities_meta "
-                "WHERE ability_guid=?", (ability_guid,)).fetchone()
-            raw = json.loads(raw_row[0] or "{}") if raw_row else {}
+            from pvp_db import db_ability_raw_json
+            raw = json.loads(db_ability_raw_json(ability_guid, conn=db) or "{}")
             source_card["ability_variables"] = {
                 str(v.get("m_Name")): int(v.get("m_DefaultValue", 0) or 0)
                 for v in raw.get("m_Variables", [])
@@ -1979,18 +2113,7 @@ def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
             if variable:
                 source_card["cost_delta"] = int(
                     source_card["ability_variables"].get(variable, 0))
-    try:
-        rows = db.execute(
-            "SELECT guid, name, card_type, cost, rarity, threshold_json, "
-            "subtype, attributes FROM card_templates WHERE is_pve=0").fetchall()
-    except Exception:
-        # Focused test adapters from before the PvP/PvE eligibility column
-        # was materialized have no is_pve field.  Production always uses the
-        # filtered query above; the fallback keeps the leaf testable without
-        # changing its candidate semantics.
-        rows = db.execute(
-            "SELECT guid, name, card_type, cost, rarity, threshold_json, "
-            "subtype, attributes FROM card_templates").fetchall()
+    rows = db_transform_candidate_templates(conn=db)
     candidates = []
     cant_same = bool(typed.get("m_CantBeSameCard"))
     for row in rows:
@@ -2036,11 +2159,8 @@ def _transform_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     ability_guid = (bstate or {}).get("resolving_ability", "")
     game_text = ""
     if ability_guid:
-        g_row = db.execute(
-            "SELECT game_text FROM card_abilities_meta WHERE ability_guid=?",
-            (ability_guid,)).fetchone()
-        if g_row:
-            game_text = g_row[0] or ""
+        from pvp_db import db_ability_game_text
+        game_text = db_ability_game_text(ability_guid, conn=db) or ""
     # The transform effect carries the destination template directly in
     # m_CardTemplateId.  This is what the client applies; use the display link
     # only for old extracted rows that predate that field.
@@ -2065,6 +2185,7 @@ def _transform_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     pending = (bstate or {}).get("pending_transform_cards") or []
     if pending:
         count = 0
+        loc = None
         for entry in pending:
             tuid = entry[0] if isinstance(entry, (tuple, list)) else entry
             loc = entry[1] if isinstance(entry, (tuple, list)) and len(entry) > 1 else None
@@ -2132,10 +2253,10 @@ def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     ability_is_unique = bool(grant_template.get("m_AbilityIsUnique", 1))
 
     # Append to target card's abilities.
-    row = db.execute(
-        "SELECT card_abilities, template_guid, user_id, location, card_state "
-        "FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(target_uid))).fetchone()
+    from pvp_db import (db_card_grant_info, db_ability_metadata_exists,
+                        db_set_card_abilities)
+    row = db_card_grant_info(
+        session.session_id, int(target_uid), conn=db)
     if not row:
         # Champions are not represented by game_cards in the live session.
         # Still retain the granted ability on the handler and immediately
@@ -2153,9 +2274,8 @@ def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             current = dynamic.setdefault(champ_key, [])
             added = []
             for granted_guid in granted_guids:
-                if not db.execute(
-                        "SELECT 1 FROM card_abilities_meta WHERE ability_guid=?",
-                        (granted_guid,)).fetchone() and not ability_record(
+                if not db_ability_metadata_exists(
+                        granted_guid, conn=db) and not ability_record(
                             db, granted_guid):
                     _log(f"    GrantAbility: {granted_guid[:8]} not in metadata")
                     continue
@@ -2188,10 +2308,7 @@ def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         ab_list = []
     added = []
     for granted_guid in granted_guids:
-        exists = db.execute(
-            "SELECT 1 FROM card_abilities_meta WHERE ability_guid=?",
-            (granted_guid,)).fetchone()
-        if not exists:
+        if not db_ability_metadata_exists(granted_guid, conn=db):
             _log(f"    GrantAbility: {granted_guid[:8]} not in DB — extraction may be stale")
             continue
         if ability_is_unique and granted_guid in ab_list:
@@ -2202,9 +2319,8 @@ def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
         # resolution fire once per grant.
         ab_list.append(granted_guid)
         added.append(granted_guid)
-    db.execute(
-        "UPDATE game_cards SET card_abilities=? WHERE session_id=? AND card_uid=?",
-        (_json.dumps(ab_list), session.session_id, int(target_uid)))
+    db_set_card_abilities(
+        session.session_id, int(target_uid), _json.dumps(ab_list), conn=db)
     db.commit()
 
     # Push CardUpdated so the client renders the new ability button.
@@ -2280,11 +2396,32 @@ def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
     chain item.
     """
     import battle_engine as _be
-    from db import db_set_card_played_to_zone
+    from pvp_db import db_set_card_played_to_zone
 
     card_uid = int(card_uid)
     owner = owner_uid(owner_id, pl_t, ai_t, bstate)
     scid = game_engine.SessionCardId(game_engine.UID(card_uid))
+    from pvp_db import db_card_location, db_add_temporary_attributes
+    previous_location = db_card_location(
+        session.session_id, card_uid, conn=db)
+    surfaced_from_underground = bool(
+        previous_location and
+        str(previous_location).lower() == "underground")
+    db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells")
+    if surfaced_from_underground:
+        # A troop that untunnels has Speed for the turn it surfaces.  Persist
+        # this as a temporary instance attribute so targeting, attack-option
+        # generation, combat validation, and CardUpdated all agree; the
+        # normal end-turn expiry clears it.
+        db_add_temporary_attributes(
+            session.session_id, card_uid, game_engine.ECardAttributes.Speed,
+            conn=db)
+        db.commit()
+        # Reese's typed replacement is granted by the authored Underground ->
+        # CastSpells transition. It must not be active while he is buried.
+        from .effects.tokens import activate_creation_replacements_for_card
+        activate_creation_replacements_for_card(
+            db, session.session_id, card_uid)
     _tpl, card_type_bits, _name, cost, attack, defense, gems = \
         handler._card_full_data(game, scid, template_guid)
     # Production handlers return ECardTypes, while lightweight handlers may
@@ -2292,14 +2429,13 @@ def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
     # bit flags or serializing the free-play event.
     if isinstance(card_type_bits, str):
         card_type_bits = game_engine.card_type_from_db(card_type_bits)
-    db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells")
+    game.push_card_moved(
+        scid, owner, game_engine.ECardCollections.CastSpells,
+        game_engine.ECardLocations.Top, 0)
     game.push_card_updated(
         scid, owner, game_engine.ECardCollections.CastSpells,
         card_type_bits, template_id=template_guid, cost=cost,
         attack=attack, defense=defense, gems=gems, nulling=False)
-    game.push_card_moved(
-        scid, owner, game_engine.ECardCollections.CastSpells,
-        game_engine.ECardLocations.Top, 0)
 
     permanent = bool(card_type_bits & (
         game_engine.ECardTypes.Troop | game_engine.ECardTypes.Artifact |
@@ -2317,13 +2453,12 @@ def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
         game.push_spell_card_cast(scid, owner, free=True)
         kind = "spell"
 
-    abilities_row = db.execute(
-        "SELECT card_abilities FROM game_cards "
-        "WHERE session_id=? AND card_uid=?",
-        (session.session_id, card_uid)).fetchone()
+    from pvp_db import db_card_ability_payload
+    abilities_payload = db_card_ability_payload(
+        session.session_id, card_uid, conn=db)
     try:
         ability_guids = [str(value).lower() for value in json.loads(
-            abilities_row[0] or "[]") if value] if abilities_row else []
+            abilities_payload or "[]") if value] if abilities_payload else []
     except (TypeError, ValueError, json.JSONDecodeError):
         ability_guids = []
     instance_id = int((bstate or {}).get("_next_instance_id", 1))
@@ -2355,20 +2490,18 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
     drawn), so resolve the target template first and use the normal resource
     play events/state changes for a selected resource.
     """
-    parent = db.execute(
-        "SELECT ability_guid FROM ability_effects "
-        "WHERE effect_guid=? AND effect_type='PlayCardAbilityEffectTemplate' "
-        "LIMIT 1", (effect_guid,)).fetchone()
-    target_ability_guid = (parent[0] if parent else
+    from pvp_db import (db_effect_parent_ability,
+                        db_ability_effect_target_index,
+                        db_ability_target_template_ids,
+                        db_card_zone_details)
+    target_ability_guid = (db_effect_parent_ability(effect_guid, conn=db) or
                            (bstate or {}).get("resolving_ability"))
     target_index = 0
     if target_ability_guid:
-        current_effect = db.execute(
-            "SELECT target_index FROM ability_effects "
-            "WHERE ability_guid=? AND effect_guid=? LIMIT 1",
-            (target_ability_guid, effect_guid)).fetchone()
-        if current_effect and current_effect[0] is not None:
-            target_index = int(current_effect[0])
+        current_effect = db_ability_effect_target_index(
+            target_ability_guid, effect_guid, conn=db)
+        if current_effect is not None:
+            target_index = int(current_effect)
         else:
             record = ability_record(db, target_ability_guid)
             for entry in record.get("m_AbilityEffectList") or []:
@@ -2381,11 +2514,11 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                         target_index = int(entry["m_TargetTemplateIndex"])
                     break
     if target_ability_guid:
-        target_row = db.execute(
-            "SELECT target_template_ids FROM card_abilities_meta "
-            "WHERE ability_guid=?", (target_ability_guid,)).fetchone()
+        target_ids_payload = db_ability_target_template_ids(
+            target_ability_guid, conn=db)
         try:
-            target_ids = json.loads(target_row[0] or "[]") if target_row else []
+            target_ids = json.loads(target_ids_payload or "[]") \
+                if target_ids_payload else []
         except (TypeError, ValueError, json.JSONDecodeError):
             target_ids = []
         if not target_ids:
@@ -2411,6 +2544,41 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                          else target_ids[0])
             target = target_template(db, target_id)
             target_kind = (target or {}).get("target_kind") or ""
+
+            # ``PlayACardInTheChoiceZoneForFree`` is an authored child
+            # ability used by resources such as Shard of Cunning.  Its
+            # target is a real temporary Choice card in the Choosing zone,
+            # not a random deck card and not the parent source card.  The
+            # client plays that selected token immediately, then resolves its
+            # automatic threshold/ability against the real parent.  Treat the
+            # resolved target as a first-class free-play operation here so the
+            # nested RulesPort path cannot fall back to replaying the Shard
+            # itself (which leaves the threshold ungranted).
+            resolved_uid = _resolve_leaf_target(bstate)
+            if resolved_uid is not None:
+                choice_details = db_card_zone_details(
+                    session.session_id, int(resolved_uid), conn=db)
+                choice_row = ((choice_details[0], choice_details[2],
+                               choice_details[3])
+                              if choice_details else None)
+                if choice_row and str(choice_row[2]).lower() == "choosing":
+                    from .effects.choices import (
+                        play_choice_card, resolve_choice_card_abilities)
+                    choice_owner = int((bstate or {}).get(
+                        "resolving_owner_id", 0) or 0)
+                    if play_choice_card(
+                            game, session, db, handler, pl_t, ai_t, bstate,
+                            int(resolved_uid), choice_owner):
+                        choice_logs = resolve_choice_card_abilities(
+                            game, session, db, handler, pl_t, ai_t, bstate,
+                            int(resolved_uid),
+                            (bstate or {}).get("resolving_source_uid"),
+                            choice_owner)
+                        suffix = ("; " + "; ".join(str(item)
+                                  for item in choice_logs if item)
+                                  if choice_logs else "")
+                        return (f"played choice card {int(resolved_uid)}"
+                                f" for free{suffix}")
             is_random_deck_target = False
             if target_kind == "AbilityTargetTemplate" and target:
                 try:
@@ -2452,14 +2620,14 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                              ((bstate or {}).get("revealed_cards") or [])}
             selected_uid = None
             if resolved_uid is not None and int(resolved_uid) in revealed_uids:
-                selected_row = db.execute(
-                    "SELECT card_uid FROM game_cards WHERE session_id=? "
-                    "AND card_uid=? AND user_id=? AND location='deck'",
-                    (session.session_id, int(resolved_uid),
-                     int((bstate or {}).get("resolving_owner_id", 0) or 0))
-                ).fetchone()
-                if selected_row:
-                    selected_uid = int(selected_row[0])
+                from pvp_db import db_card_owner_location_position
+                selected_row = db_card_owner_location_position(
+                    session.session_id, int(resolved_uid), conn=db)
+                if (selected_row and
+                        int(selected_row[0]) == int((bstate or {}).get(
+                            "resolving_owner_id", 0) or 0) and
+                        str(selected_row[1]).lower() == "deck"):
+                    selected_uid = int(resolved_uid)
 
             if selected_uid is None and is_random_deck_target:
 
@@ -2473,32 +2641,10 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             if selected_uid is not None:
                 owner_id = int((bstate or {}).get("resolving_owner_id", 0) or 0)
                 try:
-                    try:
-                        selected = db.execute(
-                            "SELECT gc.template_guid, gc.card_template_id, "
-                            "ct.card_type, ct.current_resources_granted, "
-                            "ct.max_resources_granted, ct.threshold_json, "
-                            "ct.abilities_json "
-                            "FROM game_cards gc JOIN card_templates ct "
-                            "ON ct.guid=gc.template_guid "
-                            "WHERE gc.session_id=? AND gc.card_uid=? ",
-                            (session.session_id, selected_uid)).fetchone()
-                    except Exception as exc:
-                        # A few focused test databases predate the grant columns;
-                        # production/static.py always has them.  Keep the test
-                        # harness compatible without weakening the live query.
-                        if "current_resources_granted" not in str(exc):
-                            raise
-                        selected = db.execute(
-                            "SELECT gc.template_guid, gc.card_template_id, "
-                            "ct.card_type, ct.threshold_json, ct.abilities_json "
-                            "FROM game_cards gc JOIN card_templates ct "
-                            "ON ct.guid=gc.template_guid "
-                            "WHERE gc.session_id=? AND gc.card_uid=? ",
-                            (session.session_id, selected_uid)).fetchone()
-                        if selected:
-                            selected = (selected[0], selected[1], selected[2],
-                                        1, 1, selected[3], selected[4])
+                    from pvp_db import (db_resource_selection_card,
+                                        db_move_card_to_played_resources)
+                    selected = db_resource_selection_card(
+                        session.session_id, selected_uid, conn=db)
                     # The target template chooses the candidate; the card's
                     # authoritative type determines whether this resolver
                     # branch should apply resource-pool bookkeeping.
@@ -2512,10 +2658,8 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                         # normal basic shard.
                         if not current_grant and not max_grant:
                             current_grant = max_grant = 1
-                        db.execute(
-                            "UPDATE game_cards SET location='PlayedResources', "
-                            "position=9999 WHERE session_id=? AND card_uid=?",
-                            (session.session_id, selected_uid))
+                        db_move_card_to_played_resources(
+                            session.session_id, selected_uid, conn=db)
                         db.commit()
 
                         pvp = bool((bstate or {}).get("pvp"))
@@ -2534,10 +2678,9 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                         except (TypeError, ValueError, json.JSONDecodeError):
                             resource_ability_guids = []
                         for resource_ability in resource_ability_guids:
-                            for effect in db.execute(
-                                    "SELECT effect_type, param FROM ability_effects "
-                                    "WHERE ability_guid=? ORDER BY effect_order",
-                                    (str(resource_ability).lower(),)).fetchall():
+                            from pvp_db import db_ability_effect_type_params
+                            for effect in db_ability_effect_type_params(
+                                    str(resource_ability).lower(), conn=db):
                                 if effect[0] != "CardModifierAbilityEffectTemplate":
                                     continue
                                 try:
@@ -2604,6 +2747,10 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                             ev_th.delta = amount
                             ev_th.new_value = threshold[flag]
                             game._push(ev_th)
+                            from .triggers import resolve_gain_threshold_triggers
+                            resolve_gain_threshold_triggers(
+                                db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id, color=flag)
                         if side == "player":
                             game.player_threshold = dict(threshold)
                         else:
@@ -2639,22 +2786,18 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
 
                 return "play for free: no matching target in deck"
 
-    from db import db_set_card_played_to_zone
+    from pvp_db import db_set_card_played_to_zone
     src_uid = (bstate or {}).get("resolving_source_uid")
     if src_uid is None:
         return "play for free: no source"
-    row = db.execute(
-        "SELECT template_guid, card_type FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(src_uid))).fetchone()
+    from pvp_db import db_card_zone_details
+    row = db_card_zone_details(session.session_id, int(src_uid), conn=db)
     if not row:
         return "play for free: source not found"
-    tpl_guid, ctype = row
+    tpl_guid, _instance_id, source_owner, ctype = row
     owner_id = int((bstate or {}).get("resolving_owner_id", 0) or 0)
-    owner_row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session.session_id, int(src_uid))).fetchone()
-    if owner_row:
-        owner_id = int(owner_row[0] or 0)
+    if source_owner is not None:
+        owner_id = int(source_owner or 0)
     # Source-card PlayCard effects use the same free CastSpells/stack path as
     # random deck cards. This preserves the normal response window and avoids
     # resolving a permanent immediately inside its parent's ability.
@@ -2679,19 +2822,6 @@ def _fire_event_legacy(game, session, db, handler, pl_t, ai_t, bstate,
 def _leaf_fire_event(effect):
     """Fire an event through the named orchestration boundary."""
     return effect.fire_event()
-
-
-def _activate_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
-                             effect_guid, param):
-    logs = []
-    if param:
-        for sub in _walk_bom(db, param):
-            fn = _LEAFS.get(sub["effect_type"])
-            if fn:
-                logs.append(fn(EffectContext.from_legacy(
-                    game, session, db, handler, pl_t, ai_t, bstate,
-                    sub["effect_guid"], sub["param"])))
-    return "invoke: " + "; ".join(str(l) for l in logs if l)
 
 
 @effect("ActivateAbilityEffectTemplate")
@@ -2741,7 +2871,9 @@ def _shift_power(game, session, db, handler, pl_t, ai_t, bstate, ability_guid):
     target_uid = (bstate or {}).get("player_shift_target")
     if not source_uid or not target_uid:
         return f"shift: missing source/target (source={source_uid} target={target_uid})"
-    handler._shift_ability_between(session, pl_t, ai_t, int(source_uid), int(target_uid), ability_guid, game)
+    handler._shift_ability_between(
+        session, pl_t, ai_t, int(source_uid), int(target_uid), ability_guid,
+        game, bstate=bstate)
     return f"shift {ability_guid[:8]} {hex(int(source_uid))} -> {hex(int(target_uid))}"
 
 

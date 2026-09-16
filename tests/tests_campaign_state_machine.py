@@ -1478,6 +1478,32 @@ def test_crayburn_locked_future_node_does_not_replace_tower_gate_start():
         os.unlink(path)
 
 
+def test_dungeon_win_count_tracks_streak_for_pregame_talents():
+    """The "won the last encounter" dungeon talent uses a win streak.
+
+    The PreGame talent must not fire on the first dungeon encounter merely
+    because an unrelated non-dungeon battle was won earlier (the cumulative
+    ``Wins`` counter).  ``_apply_gameend`` maintains a consecutive dungeon
+    win streak in the campaign state, reset on a loss; the PreGame condition
+    reads that streak.
+    """
+    from abilities.framework.conditions import _has_previous_dungeon_win
+    db, path = cloned_db()
+    try:
+        camp_id = dungeon_fixture(db)
+        session = SimpleNamespace(session_name=f"camp_{camp_id}")
+        assert _has_previous_dungeon_win(db, session) is False
+        campaign._apply_gameend(db, camp_id, True)
+        assert _has_previous_dungeon_win(db, session) is True
+        campaign._apply_gameend(db, camp_id, True)
+        assert _has_previous_dungeon_win(db, session) is True
+        campaign._apply_gameend(db, camp_id, False)
+        assert _has_previous_dungeon_win(db, session) is False
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     tests = [
         test_cross_zila_objective_is_linked_to_savage_lord,
@@ -1506,6 +1532,7 @@ if __name__ == "__main__":
         test_az1_repeated_path_from_cave_in_does_not_reopen_panorama,
         test_crayburn_defeat_conversation_keeps_encounter_retryable,
         test_crayburn_locked_future_node_does_not_replace_tower_gate_start,
+        test_dungeon_win_count_tracks_streak_for_pregame_talents,
     ]
     for test in tests:
         test()

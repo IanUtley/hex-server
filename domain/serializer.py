@@ -28,10 +28,26 @@ class Serializer:
     def add_ulong(self, v: int): self.w.write_uint64(v)
     def add_bool(self, v: bool): self.w.write_bool(v)
     def add_string(self, s: str): self.w.write_string(s)
-    def add_uid(self, uid: UID): uid.write(self.w)
+    def add_uid(self, uid: UID):
+        # RulesPort keeps player identities numeric internally; normalize at
+        # the ObjFmt boundary so every legacy event writer receives the typed
+        # UID object expected by the fixed client.
+        if isinstance(uid, int):
+            uid = UID(int(uid))
+        uid.write(self.w)
     def add_resource_id(self, rid: ResourceId): rid.write(self.w)
     def add_scid(self, scid: SessionCardId): scid.write(self.w)
-    def add_combat_id(self, cid: CombatId): cid.write(self.w)
+    def add_combat_id(self, cid: CombatId):
+        # Two CombatId classes exist: this wire type (UID attacker + serial)
+        # and ``rules_port.combat.CombatId`` (raw-uid64 attacker_id +
+        # serial_number).  A projection that crosses the namespaces used to
+        # crash here with "'int' object has no attribute 'write'".  Normalize
+        # at the ObjFmt boundary exactly as add_uid does.
+        if not isinstance(cid, CombatId):
+            cid = CombatId(
+                getattr(cid, "attacker_id", getattr(cid, "attacker", None)),
+                getattr(cid, "serial_number", getattr(cid, "serial", 0)))
+        cid.write(self.w)
     def add_enum_int(self, v): self.w.write_int32(int(v))
     def add_enum_ulong(self, v): self.w.write_uint64(int(v))
 

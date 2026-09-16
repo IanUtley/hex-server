@@ -78,15 +78,9 @@ def _card_dict(row):
 
 
 def _cards_in_zones(db, session_id, owner_uid, zones):
-    placeholders = ",".join("?" * len(zones))
-    rows = db.execute(
-        "SELECT gc.card_uid, gc.card_type, gc.location, gc.user_id, "
-        "gc.card_state, COALESCE(ct.attack,0), COALESCE(ct.defense,0), "
-        "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json "
-        "FROM game_cards gc JOIN card_templates ct ON ct.guid = gc.template_guid "
-        "WHERE gc.session_id=? AND gc.user_id=? AND gc.location IN (%s)"
-        % placeholders,
-        [session_id, owner_uid] + list(zones)).fetchall()
+    from pvp_db import db_condition_cards_in_zones
+    rows = db_condition_cards_in_zones(
+        session_id, zones, user_id=owner_uid, conn=db)
     return [_card_dict(r) for r in rows]
 
 
@@ -98,10 +92,8 @@ def cost_mod_delta(db, session_id, card_uid, cost_mod_json):
         return 0
     if not entries:
         return 0
-    owner_row = db.execute(
-        "SELECT user_id FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
-    owner = owner_row[0] if owner_row else 0
+    from pvp_db import db_card_owner_id
+    owner = db_card_owner_id(session_id, int(card_uid), conn=db) or 0
     total = 0
     for entry in entries:
         zones = [ZONE_MAP.get(z, z.lower()) for z in entry.get("zones") or []]
@@ -126,10 +118,12 @@ def dynamic_cost_mod_delta(db, session_id, card_uid):
     derive the formula from the card's own current ability list when the
     displayed/charged cost is requested.
     """
-    row = db.execute(
-        "SELECT user_id, card_abilities, template_guid FROM game_cards "
-        "WHERE session_id=? AND card_uid=?", (session_id, int(card_uid))
-    ).fetchone()
+    from pvp_db import (db_card_source_info, db_card_ability_payload,
+                        db_template_ability_payload, db_any_ability_raw_json,
+                        db_ability_effect_type_params)
+    source = db_card_source_info(session_id, int(card_uid), conn=db)
+    payload = db_card_ability_payload(session_id, int(card_uid), conn=db)
+    row = (source[3], payload, source[0]) if source else None
     if not row:
         return 0
     owner, abilities_json, template_guid = row
@@ -138,28 +132,23 @@ def dynamic_cost_mod_delta(db, session_id, card_uid):
     except Exception:
         abilities = []
     if not abilities:
-        trow = db.execute(
-            "SELECT abilities_json FROM card_templates WHERE guid=?",
-            (template_guid,)).fetchone()
         try:
-            abilities = json.loads(trow[0] or "[]") if trow else []
+            abilities = json.loads(
+                db_template_ability_payload(template_guid, conn=db) or "[]")
         except Exception:
             abilities = []
     entries = []
     for ability_guid in abilities:
-        mrow = db.execute(
-            "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-            (str(ability_guid).lower(),)).fetchone()
-        if not mrow:
+        raw_json = db_any_ability_raw_json(ability_guid, conn=db)
+        if not raw_json:
             continue
-        formula = formula_from_raw(mrow[0] or "")
+        formula = formula_from_raw(raw_json)
         if not formula:
             continue
-        effect = db.execute(
-            "SELECT param FROM ability_effects "
-            "WHERE ability_guid=? AND effect_type='CardModifierAbilityEffectTemplate'",
-            (str(ability_guid).lower(),)).fetchall()
-        for (param,) in effect:
+        effect = db_ability_effect_type_params(ability_guid, conn=db)
+        for effect_type, param in effect:
+            if effect_type != "CardModifierAbilityEffectTemplate":
+                continue
             try:
                 modifier = json.loads(param or "{}")
             except Exception:

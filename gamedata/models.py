@@ -406,6 +406,27 @@ class AbilityTargetTemplate(RecordObject):
     def maximum(self) -> int:
         return _value(self.field("m_MaxTargetCount"), 0)
 
+    @staticmethod
+    def _count_variable(field: Any) -> str:
+        """Return the ability-variable name for a TargetVariable count."""
+        if isinstance(field, RecordObject):
+            kind = str(field.short_type or "")
+            if kind == "TargetVariable":
+                return str(field.field("m_AbilityVariableName", "") or "")
+        elif isinstance(field, Mapping):
+            kind = str(field.get("_t", "")).rsplit(".", 1)[-1]
+            if kind == "TargetVariable":
+                return str(field.get("m_AbilityVariableName", "") or "")
+        return ""
+
+    @property
+    def min_variable(self) -> str:
+        return self._count_variable(self.field("m_MinTargetCount"))
+
+    @property
+    def max_variable(self) -> str:
+        return self._count_variable(self.field("m_MaxTargetCount"))
+
     @property
     def allow_best_effort_minimum(self) -> bool:
         return bool(_int(self.field("m_AllowBestEffortMinimumTargetCount")))
@@ -430,6 +451,8 @@ class AbilityTargetTemplate(RecordObject):
             card_filter=self.field("m_CardFilter"),
             allow_best_effort_minimum=self.allow_best_effort_minimum,
             target_kind=self.target_kind,
+            min_variable=self.min_variable,
+            max_variable=self.max_variable,
         )
 
 
@@ -549,6 +572,26 @@ class TargetSpec:
     card_filter: Any = None
     allow_best_effort_minimum: bool = False
     target_kind: str = "AbilityTargetTemplate"
+    min_variable: str = ""
+    max_variable: str = ""
+
+    def resolved_minimum(self, variables=None):
+        """Resolve a TargetVariable min count against the ability variables."""
+        if self.min_variable and variables:
+            try:
+                return max(0, int(variables.get(self.min_variable, self.minimum) or 0))
+            except (TypeError, ValueError):
+                return self.minimum
+        return self.minimum
+
+    def resolved_maximum(self, variables=None):
+        """Resolve a TargetVariable max count against the ability variables."""
+        if self.max_variable and variables:
+            try:
+                return max(0, int(variables.get(self.max_variable, self.maximum) or 0))
+            except (TypeError, ValueError):
+                return self.maximum
+        return self.maximum
 
     @property
     def requires_input(self) -> bool:

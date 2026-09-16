@@ -148,6 +148,7 @@ def test_random_variable_conditions_and_recursion(db):
 
     with mock.patch("random.randint", return_value=1):
         assert run(1)["player_health"] == 21, run(1)
+
     with mock.patch("random.randint", return_value=2):
         assert run(2)["player_health"] == 22, run(2)
 
@@ -270,6 +271,25 @@ def test_empty_revealed_troop_target_does_not_move_stale_card(db):
         "SELECT card_uid, location FROM game_cards "
         "WHERE card_uid IN (301,302) ORDER BY card_uid").fetchall()
     assert rows == [(301, "deck"), (302, "deck")], rows
+
+
+def test_secondary_target_ignores_missing_source_uid(db):
+    """A source-less nested activation must not expose ``None`` as a target."""
+    from abilities.framework.resolution import resolve_ability
+
+    ability = _ag("source-less-secondary")
+    _insert_ability(db, ability, [], [
+        {"order": 0, "type": "RevealCardsAbilityEffectTemplate",
+         "instance_id": 0},
+        {"order": 1, "type": "StoreTargetsAbilityEffectTemplate",
+         "instance_id": 1, "secondary": 0},
+    ])
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    resolve_ability(
+        HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(),
+        db, pl_t, ai_t, {"player_health": 20, "ai_health": 20},
+        ability, None, 5, {})
 
 
 def test_deck_search_prompt_pauses_before_second_effect(db):
@@ -507,6 +527,46 @@ def test_summon_choosing_collection_stays_out_of_warzone(db):
         for ev in game.events)
 
 
+def test_native_choice_target_opens_one_picker_for_all_options(db):
+    """Native Choosing summons defer to their authored child target."""
+    from rules_port.context import EffectContext
+
+    target = SimpleNamespace(
+        requires_input=True,
+        target_kind="AbilityTargetTemplate",
+        collection_flags="Deck|Choosing",
+        player_filter="MultiplePlayers",
+        guid=_ag("choice-target"))
+    child = SimpleNamespace(targets=(target,))
+    ability = SimpleNamespace(
+        instance_id=9,
+        continuation=lambda **kwargs: {
+            "ability_guid": "parent",
+            "source_uid": 77,
+            "owner_id": 5,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": kwargs["resume_effect_order"],
+        })
+    prompts = []
+    handler = SimpleNamespace(
+        _prompt_choice_cards=lambda *args: prompts.append(args[-1]))
+    context = EffectContext.from_rules_port(
+        object(), SimpleNamespace(session_id=1), db, handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"resolving_source_uid": 77, "resolving_owner_id": 5,
+         "resolving_effect_order": 3}, "effect", _ag("child"),
+        ability=ability)
+    with mock.patch("gamedata.ability_graph", return_value=child), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=[101, 102]):
+        result = context.activate_ability()
+    assert "awaiting choice of 2" in result, result
+    assert len(prompts) == 1
+    assert prompts[0]["kind"] == "choice_zone_target"
+    assert prompts[0]["choice_uids"] == [101, 102]
+
+
 def test_choice_ability_transforms_real_parent(db):
     """Playing a Choice token applies its automatic ability to its parent."""
     import db as db_module
@@ -577,6 +637,37 @@ def test_choice_ability_transforms_real_parent(db):
         (choice_uid,)).fetchone()[0] == "PlayedResources"
 
 
+def test_records_target_filter_dict_is_parsed_for_choice_prompt(db):
+    """Records TargetSpecs are typed dicts, not only legacy JSON strings."""
+    from abilities.framework import resolution
+
+    filter_data = {
+        "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+        "m_Collection": "Choosing",
+    }
+    assert resolution._filter_has_exact_zone(
+        resolution._parse_param(filter_data), "Choosing")
+
+
+def test_attached_session_rejects_legacy_walker_even_with_native_dispatch(_db):
+    """Passing a native leaf callback must not re-enable the legacy walker."""
+    from abilities.framework.resolution import resolve_ability
+
+    class AttachedSession:
+        session_id = 9
+        _rules_port_session = object()
+
+    try:
+        resolve_ability(
+            object(), object(), AttachedSession(), object(), 1, 2,
+            {"_rules_port_attached": True}, "not-a-live-ability", 101, 5,
+            {}, native_effect=lambda *_args: "native")
+    except RuntimeError as exc:
+        assert "bypassed RulesPort" in str(exc)
+    else:
+        raise AssertionError("attached session entered legacy resolver")
+
+
 def main():
     from abilities.framework import resolution
 
@@ -589,6 +680,8 @@ def main():
          test_shared_activation_map_feeds_single_explicit_leaf),
         ("Empty revealed troop target is a no-op",
          test_empty_revealed_troop_target_does_not_move_stale_card),
+        ("Source-less secondary target is empty",
+         test_secondary_target_ignores_missing_source_uid),
         ("Deck search pauses after one prompt",
          test_deck_search_prompt_pauses_before_second_effect),
         ("Deck search detection uses the zone filter",
@@ -601,8 +694,14 @@ def main():
          test_double_choice_creates_random_choices_and_clears_before_second),
         ("Choosing summon creates option cards",
          test_summon_choosing_collection_stays_out_of_warzone),
+        ("Native choice target opens one picker",
+         test_native_choice_target_opens_one_picker_for_all_options),
         ("Choice transforms its real parent",
          test_choice_ability_transforms_real_parent),
+        ("Records choice filter preserves typed target data",
+         test_records_target_filter_dict_is_parsed_for_choice_prompt),
+        ("Attached session rejects legacy walker",
+         test_attached_session_rejects_legacy_walker_even_with_native_dispatch),
     ]
     failed = 0
     for name, fn in tests:

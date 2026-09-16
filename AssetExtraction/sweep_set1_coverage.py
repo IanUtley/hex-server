@@ -40,6 +40,30 @@ DISPATCHED_EVENTS = {
     "Game.Shared.Mechanics.CardWouldBeDrawnEvent",
     "Game.Shared.Mechanics.CardWouldBeDamagedEvent",
     "Game.Shared.Mechanics.CardCreatedEvent",
+    "Game.Shared.Mechanics.CardDiscardedEvent",
+    "Game.Shared.Mechanics.CardReadiedEvent",
+    "Game.Shared.Mechanics.CardTransformedEvent",
+    "Game.Shared.Mechanics.CardTransformsEvent",
+    "Game.Shared.Mechanics.FateweavedEvent",
+    "Game.Shared.Mechanics.IlluminatedEvent",
+    "Game.Shared.Mechanics.VerdictEvent",
+    "Game.Shared.Mechanics.ProphesiedEvent",
+    "Game.Shared.Mechanics.GainThresholdEvent",
+    "Game.Shared.Mechanics.ConscriptEvent",
+    "Game.Shared.Mechanics.CardActivatedEvent",
+    "Game.Shared.Mechanics.CardDealtDamageEvent",
+    "Game.Shared.Mechanics.CardTappedEvent",
+    "Game.Shared.Mechanics.CardGainedIntAttrEvent",
+    "Game.Shared.Mechanics.TurnPhaseEvent",
+    "Game.Shared.Mechanics.PowerShiftedEvent",
+    "Game.Shared.Mechanics.CardScroungedEvent",
+    "Game.Shared.Mechanics.GainChargeEvent",
+    "Game.Shared.Mechanics.CardsAttackedEvent",
+    "Game.Shared.Mechanics.CardBattledEvent",
+    "Game.Shared.Mechanics.CombatEndedEvent",
+    "Game.Shared.Mechanics.ChampionWouldLoseEvent",
+    "Game.Shared.Mechanics.OtherCardCreatedEvent",
+    "Game.Shared.Mechanics.HiddenCardEnteredZoneEvent",
 }
 
 # Condition types the condition_engine models (last segment).
@@ -51,6 +75,9 @@ MODELED_CONDITIONS = {
     "TriggerPlayerControlsCard", "TriggerPlayerControlsTarget",
     "TriggerCardMatchesFilter", "TriggerCardEnteredZone",
     "TriggerCardIsNthCardDrawnThisTurnByThisPlayer",
+    "TriggerEventIsCombatDamage", "TriggerEventIntAttribute",
+    "TurnPhaseCondition", "CardsDiscardedThisTurn", "IntAttrFilter",
+    "TriggerAbilityIsChargePower",
     "TriggerPlayerIsActivePlayer", "TriggerCardSameNameInZone",
     "TriggerCardCounter", "TriggerPlayerHealth",
     "AbilityControllerHasThresholdAbilityCondition",
@@ -63,6 +90,19 @@ MODELED_CONDITIONS = {
     "ChampionActionsCastThisTurn",
     "TriggerCardIsStoredTargetOfAbilitySource",
     "RequiresSourcePassesFilterCondition",
+    "RequiresDateTime", "AbilityVariableCondition",
+    "NotContingentAbilityCondition", "NotContingentEffectCondition",
+    "TriggerPlayerIsActivePlayer", "TriggerCardSameNameInZone",
+    "TriggerCardIsStoredTargetOfAbilitySource", "TriggerCardCounter",
+    "TriggerPlayerHealth", "ChampionActionsCastThisTurn",
+    "AbilityControllerHasThresholdAbilityCondition",
+    "AbilityControllerIsActiveAbilityCondition",
+    "AbilityControllerHasPriorityAbilityCondition",
+    "SourceCardHasCounters", "RequiresCardsControlled",
+    "CardFilterAbilityCondition", "RequiresChampionHealth",
+    "RequiresChampionCharges", "RequiresResourceThreshold",
+    "RequiresTotalResources", "RequiresDateTime",
+    "NotContingentAbilityCondition", "NotContingentEffectCondition",
 }
 
 # Card-filter types the targeting layer can evaluate (last segment).
@@ -71,8 +111,25 @@ MODELED_FILTERS = {
     "IsType", "IsTroop", "IsArtifact", "IsResource", "IsHero",
     "IsSubType", "IsAttacking", "IsTapped", "IsAbilitySource",
     "IsCardName", "IsNotControlledBy", "HasSourceCastingCostFilter",
+    "HasSourceResourceCost", "HasResourceCost", "InFaction", "IntAttrFilter",
     "IsColor", "DamagedOpponentThisTurn", "InZone", "IsControlledBy",
     "HasAttackValue", "HasDefenseValue",
+    "IsNotType", "IsRarity", "IsSocketable", "IsBlocking",
+    "IsDamagedThisTurn", "BlockingFilter", "BeingBlockedByFilter",
+    "HasAnyAttributeFlags", "HasName", "IsNotControlledBy",
+    "NameContainsFilter", "HasSourceTypeFilter",
+    "HasASharedShardWithSourceFilter", "HasASharedRarityWithSourceFilter",
+    "HasASharedSubtypeWithSourceFilter",
+    "HasASharedClassWithSourceChampionFilter",
+    "HasASharedSubtypeWithSourceChampionFilter", "HasKeywordAbility",
+    "IsMercenaryFilter", "IsSocketable", "IsEquippedCardFilter",
+    "InCollection", "IsStoredCardFilter", "IsChildOfAbilitySource",
+    "IsChildOfAbilitySourceFilter", "IsParentOfAbilitySourceFilter",
+    "OtherTroops", "PlayersWhoControlMatchingFilter", "TACFilter",
+    "CompareAttackToHighestFilter", "CompareAttackToLowestFilter",
+    "CompareResourceCostToHighestFilter", "CompareResourceCostToMyHighestFilter",
+    "CompareHealthToHighestFilter", "CompareCastingCostToSourceCountersFilter",
+    "HasCountersValue", "TopNOfDeck",
 }
 
 
@@ -129,8 +186,7 @@ def main():
                     "TransformCardAbilityEffectTemplate",
                     "ActivateAbilityEffectTemplate"}
     # Leaves registered but effectively no-ops.
-    stubs = {"DiscardCardAbilityEffectTemplate", "VerdictAbilityEffectTemplate",
-             "FireEventEffectTemplate"}
+    stubs = set()
 
     cards = db.execute(
         "SELECT guid, name, abilities_json FROM card_templates "

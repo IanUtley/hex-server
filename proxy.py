@@ -13,6 +13,9 @@ from functools import partial
 # Local helpers
 import encryption  # hash_password / verify_password
 import db as db_layer
+from profile_db import (db_auth_user_by_id, db_auth_user_by_name,
+                        db_create_auth_user, db_set_auth_flags,
+                        db_set_auth_password)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 DB_PATH = os.environ.get(
@@ -107,6 +110,19 @@ def _player_id_from_name(name):
     return int(digest[:16], 16) % (2 ** 63)
 
 
+def _nonsteam_identity(user):
+    """Return the canonical non-Steam identity without a discriminator."""
+    return str(user or "TestPlayer")
+
+
+def _legacy_nonsteam_uid(user):
+    """Keep old ``Name#1234`` CZE accounts login-compatible."""
+    identity = _nonsteam_identity(user)
+    disc = str(int(hashlib.md5(identity.encode("utf-8")).hexdigest(), 16) %
+               10000).zfill(4)
+    return _player_id_from_name(f"{identity}#{disc}")
+
+
 def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=None,
                       password=None):
     """Create the user if needed and set their admin/moderator flags.
@@ -114,9 +130,8 @@ def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=
     Flags are stored as a JSON dict in users.flags so the HConnect server's
     auth:req handler can read them back when the client logs in. The user's
     id is the Steam account ID (the authoritative key) when a steam_id is
-    given, otherwise a stable hash of the full identity string
-    ("Display#Discriminator"), matching hconnect_server.player_id_from_steam
-    / player_id_from_name so both sides agree.
+    given, otherwise a stable hash of the canonical non-Steam username,
+    matching hconnect_server.player_id_from_steam / player_id_from_name.
     """
     db = db_layer.connect(DB_PATH)
     if steam_id:
@@ -125,27 +140,24 @@ def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=
         uid = None
     row = None
     if uid is not None:
-        row = db.execute("SELECT id, flags FROM users WHERE id=?", (uid,)).fetchone()
+        row = db_auth_user_by_id(uid, conn=db)
     if not row:
-        row = db.execute("SELECT id, flags FROM users WHERE name=?", (username,)).fetchone()
+        row = db_auth_user_by_name(username, conn=db)
     if row:
         uid = row[0]
         try:
-            flags = json.loads(row[1]) if row[1] else {}
+            flags = json.loads(row[2]) if row[2] else {}
         except (ValueError, TypeError):
             flags = {}
     else:
         if uid is None:
             digest = hashlib.md5(username.encode("utf-8")).hexdigest()
             uid = int(digest[:16], 16) % (2 ** 63)
-        db.execute(
-            "INSERT OR IGNORE INTO users (id, name, gold, platinum, last_login, flags, password_hash) "
-            "VALUES (?, ?, 10000, 10000, datetime('now'), '{}', ?)",
-            (uid, username, password))
+        db_create_auth_user(uid, username, password, conn=db)
         flags = {}
     # Update password if provided (for register or password change on existing user).
     if password and uid:
-        db.execute("UPDATE users SET password_hash=? WHERE id=?", (password, uid))
+        db_set_auth_password(uid, password, conn=db)
     if admin:
         flags["admin"] = "true"
     else:
@@ -158,7 +170,7 @@ def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=
         flags["founder"] = "true"
     else:
         flags.pop("founder", None)
-    db.execute("UPDATE users SET flags=? WHERE id=?", (json.dumps(flags), uid))
+    db_set_auth_flags(uid, json.dumps(flags), conn=db)
     db.commit()
     db.close()
     return flags
@@ -449,16 +461,15 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 user = _query_str(params.get("user", [None]), "TestPlayer")
                 password = _query_str(params.get("pass", [None]), "")
-                disc = str(int(hashlib.md5(
-                    user.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
-                username = f"{user}#{disc}"
+                username = _nonsteam_identity(user)
                 uid = _player_id_from_name(username)
 
                 # Look up the user record to check password (if set).
                 db = db_layer.connect(DB_PATH)
-                row = db.execute(
-                    "SELECT id, password_hash FROM users WHERE id=?",
-                    (uid,)).fetchone()
+                row = db_auth_user_by_id(uid, conn=db)
+                if not row:
+                    uid = _legacy_nonsteam_uid(user)
+                    row = db_auth_user_by_id(uid, conn=db)
                 if row:
                     stored_hash = row[1]
                     if stored_hash:
@@ -487,14 +498,14 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 user = _query_str(params.get("user", [None]), "TestPlayer")
                 password = _query_str(params.get("pass", [None]), "")
-                disc = str(int(hashlib.md5(
-                    user.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
-                username = f"{user}#{disc}"
+                username = _nonsteam_identity(user)
                 uid = _player_id_from_name(username)
 
                 db = db_layer.connect(DB_PATH)
-                existing = db.execute("SELECT id FROM users WHERE id=?",
-                                      (uid,)).fetchone()
+                existing = db_auth_user_by_id(uid, conn=db)
+                if not existing:
+                    existing = db_auth_user_by_id(
+                        _legacy_nonsteam_uid(user), conn=db)
                 if existing:
                     db.close()
                     print(f"  -> HEXREGISTER: user {username} already exists")
@@ -512,9 +523,7 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
             elif "auth/hextransition" in path or "auth/hextotp" in path:
                 params = parse_qs(parsed.query)
                 user = _query_str(params.get("user", [None]), "TestPlayer")
-                disc = str(int(hashlib.md5(
-                    user.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
-                username = f"{user}#{disc}"
+                username = _nonsteam_identity(user)
                 uid = _player_id_from_name(username)
                 token = f"steam:{uid}"
                 db_set_user_flags(username, steam_id=str(uid), password=None)
@@ -529,15 +538,14 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                 user = _query_str(params.get("user", [None]), "")
                 old_pass = _query_str(params.get("pass", [None]), "")
                 new_pass = _query_str(params.get("newp", [None]), "")
-                disc = str(int(hashlib.md5(
-                    user.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
-                username = f"{user}#{disc}"
+                username = _nonsteam_identity(user)
                 uid = _player_id_from_name(username)
 
                 db = db_layer.connect(DB_PATH)
-                row = db.execute(
-                    "SELECT id, password_hash FROM users WHERE id=?",
-                    (uid,)).fetchone()
+                row = db_auth_user_by_id(uid, conn=db)
+                if not row:
+                    uid = _legacy_nonsteam_uid(user)
+                    row = db_auth_user_by_id(uid, conn=db)
                 if not row:
                     db.close()
                     print(f"  -> HEXCHANGEPASS: user {username} not found")
@@ -555,7 +563,7 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                     self._json({"result": "INVALID_REQUEST"})
                     return
                 new_hash = encryption.hash_password(new_pass)
-                db.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, uid))
+                db_set_auth_password(uid, new_hash, conn=db)
                 db.commit()
                 db.close()
                 token = f"steam:{uid}"
@@ -591,27 +599,22 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                             error="Password must be at least 4 characters."))
                         return
 
-                    disc = str(int(hashlib.md5(
-                        user.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
-                    username = f"{user}#{disc}"
+                    username = _nonsteam_identity(user)
                     uid = _player_id_from_name(username)
                     password_hash = encryption.hash_password(password)
 
                     db = db_layer.connect(DB_PATH)
-                    existing = db.execute(
-                        "SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+                    existing = db_auth_user_by_id(uid, conn=db)
+                    if not existing:
+                        existing = db_auth_user_by_id(
+                            _legacy_nonsteam_uid(user), conn=db)
                     if existing:
                         db.close()
                         self._serve_html(REGISTER_ERROR_HTML.format(
                             error="This account name is already taken."))
                         return
-                    db.execute(
-                        "INSERT OR IGNORE INTO users "
-                        "(id, name, gold, platinum, last_login, flags, "
-                        "password_hash, email, created_at) "
-                        "VALUES (?, ?, 10000, 10000, datetime('now'), '{}', "
-                        "?, ?, datetime('now'))",
-                        (uid, username, password_hash, email or None))
+                    db_create_auth_user(uid, username, password_hash,
+                                        email or None, conn=db)
                     db.commit()
                     db.close()
                     print(f"  -> WEB REGISTER: {username} uid={uid} email={email}")

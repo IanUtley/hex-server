@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import game_engine
 from domain.events import (
+    EncounterModDialogSessionEventArgs,
     ChessTimerUpdatedSessionEventArgs,
     CardDestroyedSessionEventArgs,
     CardVoidedSessionEventArgs,
@@ -50,7 +51,18 @@ def test_missing_events_have_client_class_ids_and_serialize():
         ev.session_id = game_engine.UID(123)
         raw = ev.to_byte_array()
         assert int.from_bytes(raw[:4], "little", signed=True) == expected_id
-        assert len(raw) >= 12, cls.__name__
+    assert len(raw) >= 12, cls.__name__
+
+
+def test_encounter_mod_dialog_event_uses_client_class_55_wire_order():
+    ev = EncounterModDialogSessionEventArgs()
+    ev.session_id = game_engine.UID(123)
+    ev.player_id = game_engine.UID.make(244, 7)
+    ev.conversation_template_id = game_engine.ResourceId.from_str(
+        "11111111-2222-3333-4444-555555555555")
+    raw = ev.to_byte_array()
+    assert int.from_bytes(raw[:4], "little", signed=True) == 55
+    assert len(raw) == 4 + 8 + 8 + 4 + 16
 
 
 def test_game_spell_events_are_cast_then_played():

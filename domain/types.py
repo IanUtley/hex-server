@@ -136,6 +136,15 @@ class SessionCardId:
 class CombatId:
     """Identifies one attacker's combat. Wire format: UID + int64 serial."""
     def __init__(self, attacker: UID = None, serial: int = 0):
+        # ``RulesPort`` has its own ``rules_port.combat.CombatId`` whose
+        # ``attacker_id`` is a raw uid64 int.  Callers that cross the two
+        # namespaces (notably the combat-listing projection) can hand that
+        # integer to this wire type; ``write`` then crashed with
+        # "'int' object has no attribute 'write'".  Normalize the attacker to a
+        # UID here, at the wire boundary, exactly as ``UID.__init__`` does for
+        # SessionCardId/UID wrappers.
+        if attacker is not None and not isinstance(attacker, UID):
+            attacker = UID(int(getattr(attacker, "uid64", attacker)))
         self.attacker = attacker or UID.invalid()
         self.serial = serial
 

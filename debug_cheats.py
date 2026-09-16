@@ -19,6 +19,12 @@ import struct
 
 import game_engine as _ge
 from db import _db, log_req
+from pvp_db import (
+    db_card_basic, db_card_cost, db_card_template_thresholds,
+    db_debug_template, db_deck_top_card_details, db_insert_debug_card,
+    db_debug_nonchampion_cards, db_move_card_to_location, db_next_card_uid,
+    db_ordered_zone_rows, db_gencard_template,
+)
 
 
 ACTION_NAMES = {
@@ -143,6 +149,24 @@ def _pvp_context(session):
     return state, pids
 
 
+def _attached_practice_state(session):
+    """Load the native Practice checkpoint for an attached session."""
+    if getattr(session, "_rules_port_session", None) is None:
+        return None
+    from rules_port.persistence import load_state
+    state = load_state(session)
+    if not state or state.get("pvp"):
+        return None
+    state["_rules_port_attached"] = True
+    return state
+
+
+def _save_attached_practice_state(session, state):
+    if state is not None:
+        from rules_port.persistence import save_state
+        save_state(session, state)
+
+
 def _target_pid(handler, session, raw):
     """Return the transaction's player pid, constrained to this game."""
     state, pids = _pvp_context(session) if _pvp(session) else (None, None)
@@ -171,20 +195,13 @@ def _champion_scid(state, pid):
 
 
 def _new_card_uid(session_id):
-    row = _db.execute(
-        "SELECT COALESCE(MAX(card_uid >> 8), 0) FROM game_cards WHERE session_id=?",
-        (int(session_id),),
-    ).fetchone()
-    return _ge.UID.make(1, int(row[0] or 0) + 1).uid64
+    return db_next_card_uid(session_id, conn=_db)
 
 
 def _template(guid):
     if not guid:
         return None
-    return _db.execute(
-        "SELECT guid, card_type, name, cost, attack, defense, abilities_json "
-        "FROM card_templates WHERE guid=?", (str(guid).lower(),)
-    ).fetchone()
+    return db_debug_template(guid, conn=_db)
 
 
 def _find_card_template(guid):
@@ -267,9 +284,7 @@ def _add_card_requirements(state, pid, tpl):
     if extra:
         _apply_pool_change(state, pid, "res", extra)
     added = {}
-    row = _db.execute(
-        "SELECT threshold_json FROM card_templates WHERE guid=?", (tpl[0],)
-    ).fetchone()
+    row = db_card_template_thresholds(tpl[0], conn=_db)
     try:
         values = json.loads(row[0] or "{}").get("values", []) if row else []
     except (TypeError, ValueError):
@@ -298,29 +313,14 @@ def _insert_card(handler, session, state, pid, guid, location):
         log_req(f"    Debug cheat: refusing to create champion card {guid}")
         return None
     card_uid = _new_card_uid(session.session_id)
-    owner = int(pid)
-    row = _db.execute(
-        "SELECT COALESCE(MAX(position), -1) + 1 FROM game_cards "
-        "WHERE session_id=? AND user_id=? AND location=?", (session.session_id, owner, location)
-    ).fetchone()
-    position = int(row[0] or 0)
-    if location == "deck":
-        _db.execute("UPDATE game_cards SET position=position+1 WHERE session_id=? AND user_id=? AND location='deck'", (session.session_id, owner))
-        position = 0
-    _db.execute(
-        "INSERT INTO game_cards (user_id, session_id, card_uid, card_template_id, location, position, "
-        "is_champion, card_type, template_guid, owner_user_id, original_template_guid) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
-        (owner, session.session_id, int(card_uid), 0, location, position, tpl[1], tpl[0], owner, tpl[0]),
-    )
-    _db.commit()
-    return int(card_uid), tpl
+    return db_insert_debug_card(session.session_id, pid, card_uid, tpl,
+                                 location, conn=_db)
 
 
 def _card_event(handler, session, state, pid, card_uid, collection, location, index=0):
     game, me, _ = _game(handler, session, state, pid)
     scid = _ge.SessionCardId(_ge.UID(int(card_uid)))
-    row = _db.execute("SELECT template_guid FROM game_cards WHERE session_id=? AND card_uid=?", (session.session_id, int(card_uid))).fetchone()
+    row = db_card_basic(session.session_id, card_uid, conn=_db)
     guid = row[0] if row else None
     tpl, ct, _name, cost, atk, defense, gems = handler._card_full_data(game, scid, guid)
     game.push_card_updated(scid, _owner_uid(pid) if state and state.get("pvp") else me,
@@ -330,10 +330,10 @@ def _card_event(handler, session, state, pid, card_uid, collection, location, in
 
 
 def _move_to_zone(handler, session, state, pid, card_uid, zone, collection):
-    row = _db.execute("SELECT id FROM game_cards WHERE session_id=? AND card_uid=?", (session.session_id, int(card_uid))).fetchone()
-    if not row:
+    if not db_card_basic(session.session_id, card_uid, conn=_db):
         return None
-    _db.execute("UPDATE game_cards SET location=?, position=0 WHERE id=?", (zone, row[0]))
+    db_move_card_to_location(session.session_id, card_uid, zone, position=0,
+                             conn=_db)
     _db.commit()
     return _card_event(handler, session, state, pid, card_uid, collection, _ge.ECardLocations.Top)
 
@@ -342,7 +342,7 @@ def _draw(handler, session, state, pid, count):
     game, me, _ = _game(handler, session, state, pid)
     drawn = 0
     for _ in range(max(0, int(count))):
-        before = _db.execute("SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? AND location='deck' ORDER BY position LIMIT 1", (session.session_id, pid)).fetchone()
+        before = db_deck_top_card_details(session.session_id, pid, conn=_db)
         if not before:
             break
         result = handler._player_draw_card(
@@ -385,12 +385,19 @@ def _set_life(handler, session, state, pid, value, game):
         pvp_save_state(session, state)
         _sync_player(handler, session, state, pid, game)
         return
-    # Practice's regular health path is represented in the battle state; the
-    # HUD refresh below is sufficient for the server's cheat operation.
-    import battle_engine
-    bstate = battle_engine.load_state(session)
+    # Practice's regular health path is represented in the battle state; use
+    # the native checkpoint whenever this is an attached RulesPort session.
+    native = state if state is not None and state.get("_rules_port_attached") else None
+    if native is not None:
+        bstate = native
+    else:
+        import battle_engine
+        bstate = battle_engine.load_state(session)
     bstate["player_health"] = max(0, int(value))
-    battle_engine.save_state(session, bstate)
+    if native is not None:
+        _save_attached_practice_state(session, bstate)
+    else:
+        battle_engine.save_state(session, bstate)
     game.player_health = bstate["player_health"]
     game.push_player_updated(game.player_uid, champ_id=getattr(handler, "_player_champ_scid", None))
 
@@ -403,6 +410,8 @@ def _handle(handler, session, raw):
     action = int(action)
     name = ACTION_NAMES.get(action, f"Unknown({action})")
     state, pids = _pvp_context(session) if _pvp(session) else (None, None)
+    if state is None:
+        state = _attached_practice_state(session)
     pid = _target_pid(handler, session, raw)
     count = _int32(handler, raw, "Count", 1)
     guid = _resource_id(raw, "CardTemplateId")
@@ -429,8 +438,13 @@ def _handle(handler, session, raw):
                     pvp_save_state(session, state)
                     _sync_player(handler, session, state, pid, game)
                 elif action == 1:
-                    import battle_engine
-                    bstate = battle_engine.load_state(session)
+                    native_practice = bool(
+                        state is not None and state.get("_rules_port_attached"))
+                    if native_practice:
+                        bstate = state
+                    else:
+                        import battle_engine
+                        bstate = battle_engine.load_state(session)
                     cost = int(tpl[3] or 0)
                     bstate["player_resources"] = max(
                         int(bstate.get("player_resources", 0)), cost)
@@ -438,9 +452,8 @@ def _handle(handler, session, raw):
                         int(bstate.get("player_total_resources", 0)), cost)
                     try:
                         values = json.loads(
-                            (_db.execute(
-                                "SELECT threshold_json FROM card_templates WHERE guid=?",
-                                (tpl[0],)).fetchone() or ["{}"]) [0] or "{}"
+                            (db_card_template_thresholds(tpl[0], conn=_db)
+                             or ["{}"]) [0] or "{}"
                         ).get("values", [])
                     except (TypeError, ValueError, IndexError):
                         values = []
@@ -452,7 +465,10 @@ def _handle(handler, session, raw):
                         if index < len(values):
                             thresholds[color] = max(
                                 int(thresholds.get(color, 0)), int(values[index] or 0))
-                    battle_engine.save_state(session, bstate)
+                    if native_practice:
+                        _save_attached_practice_state(session, bstate)
+                    else:
+                        battle_engine.save_state(session, bstate)
                     game.player_resources = int(bstate["player_resources"])
                     game.player_total_resources = int(bstate["player_total_resources"])
                     game.player_threshold = dict(thresholds)
@@ -478,12 +494,8 @@ def _handle(handler, session, raw):
     if action == 13 and target_card:
         if state and state.get("pvp") and pid == int(handler.client_reck_id):
             from services.tournament_game import pvp_handle_transaction, pvp_save_state
-            row = _db.execute(
-                "SELECT ct.cost FROM game_cards gc JOIN card_templates ct "
-                "ON ct.guid=gc.template_guid WHERE gc.session_id=? AND gc.card_uid=?",
-                (session.session_id, int(target_card)),
-            ).fetchone()
-            extra = max(0, int(row[0] or 0) - int(state.get(f"res_{pid}", 0))) if row else 0
+            cost = db_card_cost(session.session_id, target_card, conn=_db)
+            extra = max(0, int(cost or 0) - int(state.get(f"res_{pid}", 0)))
             if extra:
                 _apply_pool_change(state, pid, "res", extra)
                 pvp_save_state(session, state)
@@ -514,13 +526,21 @@ def _handle(handler, session, raw):
             _sync_player(handler, session, state, pid, game)
             _send(handler, session, game, me, True)
         else:
-            import battle_engine
-            bstate = battle_engine.load_state(session)
+            native_practice = bool(
+                state is not None and state.get("_rules_port_attached"))
+            if native_practice:
+                bstate = state
+            else:
+                import battle_engine
+                bstate = battle_engine.load_state(session)
             key = {"res": "player_resources", "chg": "player_charges", "sp": "player_spell_points"}[field]
             bstate[key] = max(0, int(bstate.get(key, 0)) + count)
             if field == "res":
                 bstate["player_total_resources"] = max(0, int(bstate.get("player_total_resources", 0)) + count)
-            battle_engine.save_state(session, bstate)
+            if native_practice:
+                _save_attached_practice_state(session, bstate)
+            else:
+                battle_engine.save_state(session, bstate)
             game, me, _ = _game(handler, session, state, pid)
             game.player_resources = int(bstate.get("player_resources", 0))
             game.player_total_resources = int(bstate.get("player_total_resources", 0))
@@ -546,8 +566,13 @@ def _handle(handler, session, raw):
             _sync_player(handler, session, state, pid, game)
             _send(handler, session, game, me, True)
         else:
-            import battle_engine
-            bstate = battle_engine.load_state(session)
+            native_practice = bool(
+                state is not None and state.get("_rules_port_attached"))
+            if native_practice:
+                bstate = state
+            else:
+                import battle_engine
+                bstate = battle_engine.load_state(session)
             if action == 5:
                 for key in ("player_resources", "player_total_resources",
                             "player_charges", "player_spell_points"):
@@ -558,7 +583,10 @@ def _handle(handler, session, raw):
             thresholds = bstate.setdefault("player_threshold", {})
             for color in colors:
                 thresholds[color] = max(0, int(thresholds.get(color, thresholds.get(str(color), 0))) + count)
-            battle_engine.save_state(session, bstate)
+            if native_practice:
+                _save_attached_practice_state(session, bstate)
+            else:
+                battle_engine.save_state(session, bstate)
             game, me, _ = _game(handler, session, state, pid)
             game.player_resources = int(bstate.get("player_resources", 0))
             game.player_total_resources = int(bstate.get("player_total_resources", 0))
@@ -570,13 +598,12 @@ def _handle(handler, session, raw):
         return True
 
     if action in (8, 10):
-        rows = _db.execute(
-            "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? AND location=? ORDER BY position",
-            (session.session_id, pid, "deck" if action == 8 else "hand"),
-        ).fetchall()
+        rows = db_ordered_zone_rows(
+            session.session_id, pid, "deck" if action == 8 else "hand",
+            conn=_db)
         targets = rows[:max(0, count)] if action == 8 else rows
         game = None
-        for (card_uid,) in targets:
+        for _row_id, card_uid in targets:
             moved = _move_to_zone(handler, session, state, pid, card_uid, "discard", _ge.ECardCollections.Discard)
             if moved:
                 game = moved[0]
@@ -600,12 +627,12 @@ def _handle(handler, session, raw):
         owners = pids if state and pids else [pid]
         game = None
         for owner in owners:
-            rows = _db.execute("SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? AND is_champion=0 AND location!='void'", (session.session_id, owner)).fetchall()
+            rows = db_debug_nonchampion_cards(session.session_id, owner, conn=_db)
             for (card_uid,) in rows:
                 moved = _move_to_zone(handler, session, state, owner, card_uid, "void", _ge.ECardCollections.Void)
                 if moved:
                     game = moved[0]
-            wild = _db.execute("SELECT guid FROM card_templates WHERE lower(name)='wild shard' LIMIT 1").fetchone()
+            wild = db_gencard_template("Wild Shard", conn=_db)
             if wild:
                 for _ in range(10):
                     made = _insert_card(handler, session, state, owner, wild[0], "deck")

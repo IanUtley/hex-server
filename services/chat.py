@@ -4,8 +4,8 @@ import json, time
 import sys
 from datetime import datetime
 
-import db as _db_mod
-from db import _db, log_req, db_store_chat, db_get_recent_chat, display_name_from_identity
+from db import log_req
+from chat_db import db_store_chat, db_get_recent_chat, display_name_from_identity
 from gamemodes.tournament_engine import push_tournament_room_data
 
 
@@ -75,7 +75,14 @@ def _handle_rjoin(handler, room, chat_data):
                 "action": "rchat",
                 "room": room,
                 "rflg": "",
-                "user": f"{msg['user']} {time_str}",
+                # ChatManager compares Sender with ClientConnection.PlayerName
+                # to select the right-aligned/own-message bubble.  Persisted
+                # rows may contain the identity discriminator, so normalize
+                # it before sending history back to the client.
+                # Keep this field exactly equal to the client's PlayerName;
+                # ChatManager uses an exact comparison to choose the local
+                # (right-aligned and differently coloured) bubble.
+                "user": display_name_from_identity(msg['user']),
                 "msg": msg["msg"],
                 "flags": msg.get("flags", ""),
                 "icon": msg.get("icon", ""),
@@ -142,6 +149,7 @@ def _handle_rchat(handler, room, chat_data):
     flags = chat_data.get("flags", "")
     username = (handler.user_profile.get("name", "Unknown")
                 if handler.user_profile else "Unknown")
+    display_name = display_name_from_identity(username)
     user_id = handler.user_profile.get("id", 0) if handler.user_profile else 0
     log_req(f">>> Chat msg room={room} from={username} msg={msg_text[:50]}")
 
@@ -159,11 +167,11 @@ def _handle_rchat(handler, room, chat_data):
             }, body=cmd_echo.encode("utf-8"))
     else:
         if user_id:
-            db_store_chat(user_id, username, room, msg_text, icon, flags)
+            db_store_chat(user_id, display_name, room, msg_text, icon, flags)
         # Echo
         echo = json.dumps({
             "action": "rchat", "room": room, "rflg": "",
-            "user": f"{username} [{time.strftime('%H:%M')}]",
+            "user": display_name,
             "msg": msg_text, "flags": flags, "icon": icon,
         })
         handler.scnt += 1

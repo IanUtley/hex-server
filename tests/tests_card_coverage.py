@@ -129,9 +129,10 @@ def test_effect_inventory_has_no_unexpected_unregistered_types():
                 "SELECT DISTINCT effect_type FROM ability_effects")
             if effect_type not in _LEAFS and effect_type not in special
         }
-        # Conversation remains an explicit UI/narrative mechanic; it is not
-        # silently mistaken for an ordinary card effect.
-        assert unknown == {"ConversationAbilityEffectTemplate"}, sorted(unknown)
+        # Narrative conversations have an explicit continuation path; they
+        # must not be silently mistaken for an ordinary card effect or fall
+        # out of the registry without coverage.
+        assert unknown == set(), sorted(unknown)
     finally:
         db.close()
 

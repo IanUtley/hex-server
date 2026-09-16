@@ -42,6 +42,45 @@ requirements, activation validation, and client effect ordering/groups. It
 must not become a second card-data source: Records and the resulting
 `AbilityGraph` remain authoritative.
 
+## RulesPort resolution contract
+
+Battle transactions enter the ability framework through `rules_port.wire` as
+typed activation data. The port validates the phase, priority, source-card
+collection, activation cost, thresholds, and metadata-defined targets before
+an ability is allowed to resolve. An accepted activation creates one
+`AbilityInstance` on the RulesPort action stack; it is not reinterpreted by a
+legacy card handler.
+
+`abilities.framework.resolution.resolve_ability` then mirrors the client
+`AbilityInstance.ApplyEffectGroup` sequence:
+
+1. Read the `AbilityGraph` and walk effect groups/instances in authored order.
+2. Resolve auto, explicit, secondary, and created-card targets from the typed
+   target templates.
+3. Evaluate effect conditions and contingencies, then execute the registered
+   BOM leaf through `EffectContext`.
+4. If a UI decision is required, persist the continuation (instance, source,
+   targets, variables, and resume order) and wait for the matching typed
+   response. The response resumes that same instance rather than starting a
+   second ability.
+5. When the chain is complete, the host projection commits the SQLite
+   mutation, emits the matching Unity events, and rebuilds options/priority.
+
+The host projection is deliberately narrow: it applies an accepted mutation
+and publishes `CardMoved`, `CardUpdated`, `CardDiscarded`, resource, threshold,
+and priority events. It does not choose cards or infer rules from `card_text`.
+For example, a discard cost uses the normal hand discard transaction, and a
+choice-card ability plays the generated token before resolving its authored
+threshold effect against the parent card. This is also how an AI-controlled
+Shard of Cunning selects a legal Blood/Sapphire option and emits the threshold
+event without opening a human picker.
+
+Resource modifiers retain the client distinction between `currentresource`
+and `totalresource`: the former is a temporary/current pool grant and the
+latter increases the maximum pool. Hideous Conversion's authored `[L1][R0]`
+therefore grants one temporary current resource; it is not life gain or a
+permanent maximum-resource increase.
+
 ## Adding a new card ability
 
 1. Create a file in `abilities/cards/` named after the ability, e.g.
