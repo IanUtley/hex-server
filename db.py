@@ -201,6 +201,11 @@ def connect(database_path=None, *, check_same_thread=True):
         timeout=30.0,
         factory=RetryingConnection,
         check_same_thread=check_same_thread,
+        # Autocommit: a write releases SQLite's write lock immediately, so a
+        # helper that forgets to commit can no longer pin the database and
+        # block the other processes.  Operations that must be atomic use the
+        # explicit ``transaction()`` context manager (BEGIN IMMEDIATE).
+        isolation_level=None,
     )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = _named_row_factory
@@ -483,6 +488,66 @@ def log(msg):
     with log_lock:
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {msg}", flush=True)
+
+
+# --- Idle-transaction watchdog -------------------------------------------
+# SQLite allows one writer at a time.  A connection that starts a write
+# transaction and never commits/rolls it back pins the database's write lock
+# until some later commit on that same connection, blocking every other
+# process ("database is locked").  The shared connection runs in autocommit
+# mode so a forgotten commit cannot do this; this watchdog is a belt-and-
+# braces guard for any explicit BEGIN that is left open.
+_idle_tx_guard = threading.Lock()
+_idle_tx_seen = {}
+_LOCK_WATCHDOG_INTERVAL = 10.0
+_LOCK_WATCHDOG_MAX_IDLE = 30.0
+_lock_watchdog_started = False
+
+
+def rollback_idle_transaction(conn=None, *, max_idle_seconds=_LOCK_WATCHDOG_MAX_IDLE):
+    """Roll back a connection left inside a transaction for too long."""
+    conn = conn if conn is not None else _db
+    key = id(conn)
+    now = time.monotonic()
+    with _idle_tx_guard:
+        if getattr(conn, "in_transaction", False):
+            first = _idle_tx_seen.setdefault(key, now)
+            idle = now - first
+        else:
+            _idle_tx_seen.pop(key, None)
+            idle = 0.0
+    if idle < max_idle_seconds:
+        return False
+    try:
+        conn.rollback()
+    except sqlite3.Error as exc:
+        log(f"db: idle-transaction rollback failed: {exc}")
+        return False
+    with _idle_tx_guard:
+        _idle_tx_seen.pop(key, None)
+    log(f"db: rolled back a transaction left open {idle:.0f}s "
+        f"on {getattr(conn, 'database', '?')}")
+    return True
+
+
+def _lock_watchdog_loop():
+    while True:
+        try:
+            rollback_idle_transaction(_db)
+        except Exception as exc:  # never let the watchdog die
+            log(f"db: lock watchdog error: {exc}")
+        time.sleep(_LOCK_WATCHDOG_INTERVAL)
+
+
+def start_lock_watchdog():
+    """Start the process-wide idle-transaction watchdog (idempotent)."""
+    global _lock_watchdog_started
+    if _lock_watchdog_started:
+        return
+    _lock_watchdog_started = True
+    threading.Thread(target=_lock_watchdog_loop, daemon=True,
+                     name="db-lock-watchdog").start()
+
 
 
 # === SQLite connection ===
@@ -2245,6 +2310,37 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
     if not rows:
         return []
 
+    if len(wanted) == 1:
+        card_uid = next(iter(wanted))
+        exists = conn.execute(
+            "SELECT 1 FROM game_cards WHERE session_id=? AND user_id=? "
+            "AND card_uid=? LIMIT 1",
+            (session_id, user_id, card_uid)).fetchone()
+        if not exists:
+            return []
+        # Rebuild the deck order with the card at a uniformly random slot.
+        # ``rows`` already contains the card when the caller moved it into the
+        # deck before randomizing its slot (the "put into deck" leaf does
+        # exactly this), so exclude it before choosing the slot.  Shifting the
+        # in-place positions instead left a gap and could place the card at
+        # ``deck_count`` (past the end).
+        deck_uids = [int(card_uid_value) for card_uid_value, _position in rows]
+        others = [uid for uid in deck_uids if uid != int(card_uid)]
+        insert_position = _shuf_rnd.randrange(len(others) + 1)
+        ordered = (others[:insert_position] + [int(card_uid)]
+                   + others[insert_position:])
+        assignments = " ".join("WHEN ? THEN ?" for _uid in ordered)
+        params = []
+        for position, uid in enumerate(ordered):
+            params.extend((uid, position))
+        marks = ",".join("?" for _ in ordered)
+        conn.execute(
+            "UPDATE game_cards SET location='deck', position=CASE card_uid "
+            + assignments + " ELSE position END "
+            "WHERE session_id=? AND user_id=? AND card_uid IN (" + marks + ")",
+            (*params, session_id, user_id, *ordered))
+        conn.commit()
+        return [card_uid]
     selected = [int(card_uid) for card_uid, _position in rows
                 if int(card_uid) in wanted]
     if not selected:
@@ -2268,26 +2364,20 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
         else:
             deck.append(next(remaining_iter))
 
-    # Use temporary positions so this remains safe if a future schema adds a
-    # uniqueness constraint on (session_id, position).
-    offset = len(rows) + 1
-    conn.executemany(
-        "UPDATE game_cards SET position=position+? "
+    # Assign the complete permutation in one set-based statement.  The CASE
+    # expression gives each card its final position without issuing one UPDATE
+    # per card through executemany().
+    assignments = " ".join("WHEN ? THEN ?" for _card_uid in deck)
+    params = []
+    for position, uid in enumerate(deck):
+        params.extend((uid, position))
+    conn.execute(
+        "UPDATE game_cards SET position=CASE card_uid "
+        + assignments + " END "
         "WHERE session_id=? AND user_id=? AND location='deck'",
-        [(offset, session_id, user_id)])
-    conn.executemany(
-        "UPDATE game_cards SET position=? "
-        "WHERE session_id=? AND card_uid=?",
-        [(position, session_id, uid) for position, uid in enumerate(deck)])
+        (*params, session_id, user_id))
     conn.commit()
-
-    ordered = conn.execute(
-        "SELECT card_uid FROM game_cards "
-        "WHERE session_id=? AND user_id=? AND location='deck' "
-        "AND card_uid IN ({}) ORDER BY position".format(
-            ",".join("?" * len(selected))),
-        (session_id, user_id, *selected)).fetchall()
-    return [int(row[0]) for row in ordered]
+    return [card_uid for card_uid in deck if card_uid in set(selected)]
 
 
 # --- Friend system helpers -------------------------------------------------

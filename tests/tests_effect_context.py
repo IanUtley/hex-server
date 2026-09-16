@@ -734,11 +734,13 @@ def test_context_randomize_variable_uses_typed_bounds():
             context, "template_value",
             side_effect=lambda name, default=None: {
                 "m_VariableName": "RandomNumber",
-                "m_MinValue": 2,
-                "m_MaxValue": 5,
-                "m_MaxValueField": None,
-            }.get(name, default)), mock.patch(
-                "random.randint", return_value=4) as randint:
+            }.get(name, default)), mock.patch.object(
+                context, "value",
+                side_effect=lambda name, default=0: {
+                    "m_MinValue": 2,
+                    "m_MaxValue": 5,
+                }.get(name, default)), mock.patch(
+                    "random.randint", return_value=4) as randint:
         assert context.randomize_variable() == "randomized RandomNumber=4"
     assert context.bstate["ability_variables"]["RandomNumber"] == 4
     randint.assert_called_once_with(2, 5)

@@ -2369,7 +2369,8 @@ def db_target_candidate_rows(session_id, zones, controller_uid=None,
         "gc.template_guid, gc.card_state, COALESCE(ct.attack,0), "
         "COALESCE(ct.defense,0), ct.name, COALESCE(ct.cost,0), ct.subtype, "
         "ct.threshold_json, gc.card_abilities, gc.permanent_buffs, "
-        + rarity + ", " + sockets + ", " + gems + ", " + original + " "
+        + rarity + ", " + sockets + ", " + gems + ", " + original + ", "
+        + "COALESCE(gc.card_attributes,0) "
         + "FROM game_cards gc JOIN card_templates ct ON ct.guid=gc.template_guid "
         + "WHERE gc.session_id=? AND gc.location IN (" + marks + ")"
     )
@@ -2618,6 +2619,38 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
         "ORDER BY position", (session_id, user_id)).fetchall()
     if not rows:
         return []
+    if len(wanted) == 1:
+        card_uid = next(iter(wanted))
+        exists = connection.execute(
+            "SELECT 1 FROM game_cards WHERE session_id=? AND user_id=? "
+            "AND card_uid=? LIMIT 1",
+            (session_id, user_id, card_uid)).fetchone()
+        if not exists:
+            return []
+        # Rebuild the deck order with the card at a uniformly random slot.
+        # ``rows`` already contains the card when the caller moved it into the
+        # deck before randomizing its slot (the "put into deck" leaf does
+        # exactly this), so exclude it before choosing the slot.  Shifting the
+        # in-place positions instead left a gap and could place the card at
+        # ``deck_count`` (past the end).
+        deck_uids = [int(row[0]) for row in rows]
+        others = [uid for uid in deck_uids if uid != int(card_uid)]
+        insert_position = _shuf_rnd.randrange(len(others) + 1)
+        ordered = (others[:insert_position] + [int(card_uid)]
+                   + others[insert_position:])
+        assignments = " ".join("WHEN ? THEN ?" for _uid in ordered)
+        params = []
+        for position, uid in enumerate(ordered):
+            params.extend((uid, position))
+        marks = ",".join("?" for _ in ordered)
+        connection.execute(
+            "UPDATE game_cards SET location='deck', position=CASE card_uid "
+            + assignments + " ELSE position END "
+            "WHERE session_id=? AND user_id=? AND card_uid IN (" + marks + ")",
+            (*params, session_id, user_id, *ordered))
+        if connection is _db_layer._db:
+            connection.commit()
+        return [card_uid]
     selected = [int(row[0]) for row in rows if int(row[0]) in wanted]
     if not selected:
         return []
@@ -2631,10 +2664,19 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
     for rank in range(len(rows)):
         ordered.append(selected_by_slot[rank] if rank in selected_by_slot
                        else next(remaining_iter))
-    connection.executemany(
-        "UPDATE game_cards SET position=? WHERE session_id=? AND card_uid=?",
-        [(position, session_id, card_uid)
-         for position, card_uid in enumerate(ordered)])
+    # Assign the complete permutation in one set-based statement.  The CASE
+    # expression gives each card its final position without issuing one UPDATE
+    # per card through executemany().
+    assignments = " ".join(
+        "WHEN ? THEN ?" for _card_uid in ordered)
+    params = []
+    for position, card_uid in enumerate(ordered):
+        params.extend((card_uid, position))
+    connection.execute(
+        "UPDATE game_cards SET position=CASE card_uid "
+        + assignments + " END "
+        "WHERE session_id=? AND user_id=? AND location='deck'",
+        (*params, session_id, user_id))
     if connection is _db_layer._db:
         connection.commit()
     return [card_uid for card_uid in ordered if card_uid in wanted]

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .session import AuthoritativeSession, _json_value
+from .session import (AuthoritativeSession, _json_value,
+                      projected_ability_ignores_chain)
 from .actions import ResolveTopOfChainAction
 from .kernel import PriorityWindowAction, TurnPhasePlayers
 from .phases import phase_name
@@ -391,7 +392,7 @@ class ProjectedChainAbility:
 
     @property
     def ignores_chain(self):
-        return False
+        return projected_ability_ignores_chain(self.descriptor)
 
     @property
     def is_triggered(self):

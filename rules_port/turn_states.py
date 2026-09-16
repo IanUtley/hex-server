@@ -119,6 +119,42 @@ class ConditionalPhaseState(TurnPhaseState):
         return self._selector(session)
 
 
+def _live_has_legal_blockers(session):
+    """Port of the ``DeclareAttackPriorityWindow`` blocker scan.
+
+    C# scans the defending players' warzone troops with
+    ``Card.CanBlock(attacker)``.  The port previously read a ``has_legal_blockers``
+    attribute that was never assigned, so the native phase graph could never
+    enter ``DeclareDefense``.
+    """
+    if getattr(session, "has_legal_blockers", False):
+        return True
+    facts = getattr(session, "runtime_facts", None)
+    session_id = getattr(facts, "session_id", None) if facts is not None else None
+    if session_id is None:
+        return False
+    from .combat_rules import can_block
+    from .runtime_adapter import _raw_player_id
+    from pvp_db import db_warzone_troop_attributes
+    state = getattr(facts, "battle_state", {}) or {}
+    for combat in session.combat_manager.combats:
+        attacker = combat.attacker
+        attacker_uid = int(getattr(attacker, "session_card_id",
+                                   getattr(attacker, "uid", 0)) or 0)
+        if not attacker_uid:
+            continue
+        for participant in session.player_ids:
+            raw = _raw_player_id(participant)
+            try:
+                rows = db_warzone_troop_attributes(session_id, raw, conn=None)
+            except Exception:
+                continue
+            for row in rows:
+                if can_block(None, session_id, state, attacker_uid, int(row[0])):
+                    return True
+    return False
+
+
 def default_phase_states(enum) -> dict[str, TurnPhaseState]:
     """Build state objects keyed by C# phase name from ``game_engine.ETurnPhases``."""
     states = {}
@@ -136,9 +172,14 @@ def default_phase_states(enum) -> dict[str, TurnPhaseState]:
     for name in ("StartGame", "Checksum", "EndGame"):
         states[name] = TurnPhaseState(
             getattr(enum, name), priority_players=TurnPhasePlayers.NONE)
-    for name in ("PickGoesFirst", "Mulligan", "AssignFirstStrikeDamage",
+    for name in ("Mulligan", "AssignFirstStrikeDamage",
                  "AssignDamage", "EndTurn"):
         states[name] = TurnPhaseState(getattr(enum, name))
+    # C# PickGoesFirstState.GetNextTurnPhase always advances to Mulligan.
+    # Modelling it as a plain TurnPhaseState raised "PickGoesFirst must select
+    # a next phase" because it permits both PreGame and Mulligan.
+    states["PickGoesFirst"] = ConditionalPhaseState(
+        enum.PickGoesFirst, lambda session: "Mulligan")
     states["DeclareAttack"] = TurnPhaseState(
         enum.DeclareAttack, chain_can_resolve=False)
     states["DeclareDefense"] = TurnPhaseState(
@@ -173,7 +214,7 @@ def default_phase_states(enum) -> dict[str, TurnPhaseState]:
         chain_can_resolve=False)
     states["DeclareAttackPriorityWindow"] = ConditionalPhaseState(
         enum.DeclareAttackPriorityWindow,
-        lambda session: ("DeclareDefense" if getattr(session, "has_legal_blockers", False)
+        lambda session: ("DeclareDefense" if _live_has_legal_blockers(session)
                          else ("DeclareDefensePriorityWindow" if getattr(
                              session, "has_combats", False) else "SecondMainPhase")),
         priority_players=TurnPhasePlayers.ALL)

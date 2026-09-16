@@ -103,34 +103,77 @@ class RecordsTriggerDiscovery:
 
         def champion_holders(owner):
             owner = int(owner or 0)
-            profile = getattr(self.handler, "user_profile", None) or {}
-            player_id = int(profile.get("id", 0) or 0) if owner else 0
-            if owner != player_id:
+            if not owner:
                 return {}
-            guid = (getattr(self.handler, "_ai_champ_guid", None)
-                    if owner == 0 else
-                    getattr(self.handler, "_player_champ_guid", None))
-            scid = (getattr(self.handler, "_ai_champ_scid", None)
-                    if owner == 0 else
-                    getattr(self.handler, "_player_champ_scid", None))
-            if scid is None:
-                return {}
+            # PvP owners are raw participant ids, which are also the
+            # game_cards owner.  ``user_profile["id"]`` is the local database
+            # id, so the PvE identity check below rejects every PvP
+            # champion.  The client resolves champion triggers from the
+            # active player's champion card (EndPhaseState.OnEntry), so
+            # resolve the champion straight from the session for either
+            # participant.
+            if self.battle_state.get("pvp"):
+                from pvp_db import db_card_basic
+                champion_uid = int(
+                    (self.battle_state.get("champ_map") or {}).get(
+                        str(owner), 0) or 0)
+                if not champion_uid:
+                    return {}
+                champion_basic = db_card_basic(
+                    self.session.session_id, champion_uid, conn=self.db)
+                if not champion_basic:
+                    return {}
+                guid = champion_basic[0]
+                configured = getattr(
+                    self.handler, "_player_champ_abilities", [])
+            else:
+                profile = getattr(self.handler, "user_profile", None) or {}
+                player_id = int(profile.get("id", 0) or 0)
+                if owner != player_id:
+                    return {}
+                guid = (getattr(self.handler, "_ai_champ_guid", None)
+                        if owner == 0 else
+                        getattr(self.handler, "_player_champ_guid", None))
+                scid = (getattr(self.handler, "_ai_champ_scid", None)
+                        if owner == 0 else
+                        getattr(self.handler, "_player_champ_scid", None))
+                if scid is None:
+                    return {}
+                champion_uid = int(scid.uid.uid64)
+                configured = (getattr(self.handler, "_ai_champ_ability_guids", [])
+                              if owner == 0 else
+                              getattr(self.handler, "_player_champ_abilities", []))
             abilities = []
             if guid:
                 abilities.extend(str(row[0]).lower() for row in
                                  db_champion_trigger_ability_guids(
                                      str(guid), conn=self.db))
-            configured = (getattr(self.handler, "_ai_champ_ability_guids", [])
-                          if owner == 0 else
-                          getattr(self.handler, "_player_champ_abilities", []))
             for value in configured or ():
                 key = str(getattr(value, "guid", value)).lower()
                 graph = ability_graph(DEFAULT_RECORD_STORE, key)
                 if graph is not None and graph.trigger_event_type:
                     abilities.append(key)
-            return {int(scid.uid.uid64): list(dict.fromkeys(abilities))}
+            return {champion_uid: list(dict.fromkeys(abilities))}
 
         event_type = str(event_type)
+
+        def _uid_int(value):
+            """Coerce a raw id, UID, or SessionCardId to its uint64 value."""
+            if value is None:
+                return None
+            try:
+                return int(getattr(value, "uid64", value))
+            except (TypeError, ValueError):
+                inner = getattr(value, "value", None)
+                if inner is not None and inner is not value:
+                    try:
+                        return int(getattr(inner, "uid64", inner))
+                    except (TypeError, ValueError):
+                        return None
+                return None
+
+        source_uid = _uid_int(source_uid)
+        extra_target = _uid_int(extra_target)
         candidates: dict[int, list[str]] = {}
         if source_uid is not None:
             uid = int(source_uid)

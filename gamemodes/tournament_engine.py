@@ -136,7 +136,11 @@ def retire_completed_corinth_runs():
             db_tournament_discard_match(
                 40004, match.get("session_id"), conn=_db)
             db_delete_game_session(match.get("session_id"), conn=_db)
-            _db.commit()
+            try:
+                _db.commit()
+            except BaseException:
+                _db.rollback()
+                raise
             log_req(f"  Corinth run retirement removed unfinished match "
                     f"session={match.get('session_id')}")
         retired = _retire_finished_async_runs(40004, (pid,))
@@ -697,6 +701,11 @@ def _return_async_players_to_deckbuilder(tid, player_uids, retired=()):
         if len(pool) != len(CORINTH_SHARD_GUIDS) * 4:
             db_seed_tournament_pool(
                 tid, player_uid, CORINTH_SHARD_GUIDS * 4, conn=_db)
+            # ``db_seed_tournament_pool`` only commits when it owns the
+            # connection.  Commit here or this shared ``_db`` is left holding
+            # an open write transaction (SQLite write lock), which blocks the
+            # scheduler's refill and the main server with "database is locked".
+            _db.commit()
             pool = db_tournament_pool(tid, player_uid, conn=_db)
         _push_corinth_deck_construction(handler, tid, pool)
         log_req(f"  Corinth async result: returned pid={player_uid} "
@@ -1269,6 +1278,11 @@ def try_start_corinth_match(room_id, handler_override=None):
         for pid in pids:
             db_tournament_signup_set_async_state(
                 room_id, pid, searching=False, conn=_db)
+        try:
+            _db.commit()
+        except BaseException:
+            _db.rollback()
+            raise
         handlers = {}
         if handler_override is not None:
             handlers[int(getattr(handler_override, "client_reck_id", 0) or 0)] = handler_override

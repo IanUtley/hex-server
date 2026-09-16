@@ -91,6 +91,7 @@ from domain.events import (
     ShowTipSessionEventArgs,
     SkipSetupSessionEventArgs,
     DisableInterfaceSessionEventArgs,
+    WaitingOnPlayerSessionEventArgs,
     NetworkPacketSessionEventArgs,
     AnimationTriggerSessionEventArgs,
     make_game_ended_packet,

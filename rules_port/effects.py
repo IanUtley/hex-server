@@ -120,6 +120,8 @@ def dispatch(effect_type, context, effect=None):
         return _lose_threshold(context, effect)
     if effect_type == "CardModifierAbilityEffectTemplate":
         return _card_modifier(context, effect)
+    if effect_type == "RepeatingAbilityEffectTemplate":
+        return _repeating(context, effect)
     if effect_type == "UntapCardAbilityEffectTemplate":
         return _untap(context)
     if effect_type == "TapCardAbilityEffectTemplate":
@@ -291,11 +293,34 @@ def _animation_trigger(context):
     return f"animation trigger {trigger}"
 
 
-def _lose_threshold(context, effect):
+def _repeating(context, effect):
+    """Port of ``RepeatingAbilityEffectTemplate``.
+
+    The effect repeats a nested effect ``m_LoopCount`` times.  The extractor
+    records the nested effect GUID in ``param``; when the nested template
+    cannot be resolved the repeat is skipped rather than raising and aborting
+    the whole ability (the port previously had no handler at all).
+    """
     try:
-        names = json.loads((effect or {}).get("param") or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        names = []
+        loops = int(context.value("m_LoopCount", 1) or 1)
+    except (TypeError, ValueError):
+        loops = 1
+    child = str(getattr(effect, "param", "") or "").strip()
+    if not child:
+        return "repeat: no nested effect"
+    return f"repeat {child[:8]} x{max(0, loops)}"
+
+
+def _lose_threshold(context, effect):
+    # The authored shard list lives on the effect template (m_Thresholds), not
+    # in the flattened ``param`` (which is empty for this type), so the
+    # previous read silently lost nothing.
+    names = context.template_value("m_Thresholds", None)
+    if names is None:
+        try:
+            names = json.loads((effect or {}).get("param") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            names = []
     if not isinstance(names, (list, tuple)):
         names = []
     return context.lose_thresholds(names)

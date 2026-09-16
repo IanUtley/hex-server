@@ -1126,6 +1126,25 @@ class ChainEmptySessionEventArgs(SessionEventArgs):
         return self.end_write()
 
 
+class WaitingOnPlayerSessionEventArgs(SessionEventArgs):
+    """Tell clients which participant the game is waiting on (class 79).
+
+    The client (``UIBattle.OnWaitingOnPlayer``) shows its "waiting for
+    opponent" state only when the named player is not the local player, so the
+    same event is broadcast to both participants.
+    """
+    CLASS_ID = 79
+
+    def __init__(self):
+        super().__init__()
+        self.player_id = UID.invalid()
+
+    def to_byte_array(self) -> bytes:
+        self.begin_write()
+        self.ser.add_uid(self.player_id)
+        return self.end_write()
+
+
 class ShowTipSessionEventArgs(SessionEventArgs):
     CLASS_ID = 80
 

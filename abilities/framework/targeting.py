@@ -1008,7 +1008,7 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     candidate_cards = []
     top_n_by_owner = {}
     for cu, ctype, loc, uid, template_guid, state, atk, def_, name, cost, subtype, thresh, card_abs, raw_buffs, rarity, socket_count, gems, original_template_guid \
-            in candidate_rows:
+            in (tuple(row)[:18] for row in candidate_rows):
         int_attrs = {}
         counters = {}
         counter_guids = {}

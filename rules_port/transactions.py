@@ -120,7 +120,10 @@ class PlayerIsActiveRequirement:
     player_id: object
 
     def is_valid(self, session, player_id) -> bool:
-        return self.player_id == player_id == session.active_player_id
+        # Compare across raw/typed UID domains; a strict ``==`` rejected a
+        # valid activation when the wire carried the raw participant id.
+        return (_same_player_id(session, self.player_id, player_id) and
+                _same_player_id(session, player_id, session.active_player_id))
 
 
 @dataclass(frozen=True)
@@ -128,9 +131,13 @@ class PlayerIsInactiveRequirement:
     player_id: object
 
     def is_valid(self, session, player_id) -> bool:
+        if not _same_player_id(session, self.player_id, player_id):
+            return False
         checker = getattr(session, "is_inactive_player", None)
-        return (self.player_id == player_id and bool(checker(self.player_id))
-                if callable(checker) else self.player_id != session.active_player_id)
+        if callable(checker):
+            return bool(checker(self.player_id))
+        return not _same_player_id(session, player_id,
+                                   session.active_player_id)
 
 
 @dataclass(frozen=True)

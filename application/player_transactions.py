@@ -505,33 +505,42 @@ def typed_payload_from_decoded(command, decoded):
 
     if getattr(command, "is_commit_attack", False):
         declarations = find("Attacks", "m_Attacks", "declarations") or ()
-        payload["declarations"] = tuple(
-            (target, attackers)
-            for item in declarations if isinstance(item, Mapping)
-            for target in (numeric_id(item.get("DefendingCardId",
-                                               item.get("defending_card_id"))),)
-            for attackers in (id_list(item.get("AttackingCardIds",
-                                                item.get("attacking_card_ids"))),)
-            if target is not None)
+        # Only override the raw-recovered declarations when the typed parser
+        # actually produced a declaration.  The nested AttackDeclaration does
+        # not decode through the generic ObjFmt walker, so ``find`` returns
+        # nothing; assigning an empty tuple here then clobbered the recovered
+        # declaration in the ``raw_payload.update(payload)`` merge below and
+        # the client's attack was silently dropped (stuck in Select Attackers).
+        if declarations:
+            payload["declarations"] = tuple(
+                (target, attackers)
+                for item in declarations if isinstance(item, Mapping)
+                for target in (numeric_id(item.get("DefendingCardId",
+                                                   item.get("defending_card_id"))),)
+                for attackers in (id_list(item.get("AttackingCardIds",
+                                                    item.get("attacking_card_ids"))),)
+                if target is not None)
     elif getattr(command, "is_commit_defense", False):
         declarations = find("DefenseDeclarations", "m_DefenseDeclarations",
                             "declarations") or ()
-        payload["declarations"] = tuple(
-            (attacker, blockers)
-            for item in declarations if isinstance(item, Mapping)
-            for attacker in (numeric_id(item.get("AttackerId",
-                                               item.get("attacker_id"))),)
-            for blockers in (id_list(item.get("DefendingCardIds",
-                                              item.get("defending_card_ids"))),)
-            if attacker is not None)
+        if declarations:
+            payload["declarations"] = tuple(
+                (attacker, blockers)
+                for item in declarations if isinstance(item, Mapping)
+                for attacker in (numeric_id(item.get("AttackerId",
+                                                   item.get("attacker_id"))),)
+                for blockers in (id_list(item.get("DefendingCardIds",
+                                                  item.get("defending_card_ids"))),)
+                if attacker is not None)
     elif getattr(command, "is_assign_damage", False):
         assignments = find("AssignedDamageOrder", "m_AssignedDamageOrder",
                            "DamageOrder", "assignments") or ()
-        payload["assignments"] = tuple(
-            (numeric_id(item.get("CombatId", item.get("combat_id"))),
-             id_list(item.get("CardIds", item.get("card_ids"))))
-            for item in assignments if isinstance(item, Mapping)
-            if numeric_id(item.get("CombatId", item.get("combat_id"))) is not None)
+        if assignments:
+            payload["assignments"] = tuple(
+                (numeric_id(item.get("CombatId", item.get("combat_id"))),
+                 id_list(item.get("CardIds", item.get("card_ids"))))
+                for item in assignments if isinstance(item, Mapping)
+                if numeric_id(item.get("CombatId", item.get("combat_id"))) is not None)
     if raw_payload:
         raw_payload.update(payload)
         payload = raw_payload

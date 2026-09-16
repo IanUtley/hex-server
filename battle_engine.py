@@ -109,7 +109,6 @@ OPP_ALWAYS_STOPS = {
 SELF_DEFAULT_STOPS = {
     game_engine.ETurnPhases.FirstMainPhase,
     game_engine.ETurnPhases.SecondMainPhase,
-    game_engine.ETurnPhases.DeclareCombatPriorityWindow,
     game_engine.ETurnPhases.DeclareAttackPriorityWindow,
     game_engine.ETurnPhases.DeclareDefensePriorityWindow,
 }

@@ -30,3 +30,14 @@ def apply_rage(context, card_uid):
     context.db.commit()
     context._push_modifier_card(uid)
     return rage
+
+
+def block(context):
+    """Port of ``BlockEffectTemplate``.
+
+    Despite the name, the C# leaf relocates the effect's mapped target to
+    ``m_DestinationLocation`` (it is the generic "move card to a new zone"
+    leaf).  The native branch previously imported a function that did not
+    exist, raising ImportError.  Route through the shared zone transition.
+    """
+    return context.move_card_to_zone()

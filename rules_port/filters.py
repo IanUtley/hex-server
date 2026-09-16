@@ -14,6 +14,47 @@ def _v(card, *names, default=None):
         if hasattr(card, name): return getattr(card, name)
     return default
 
+
+def _attribute_bits(value):
+    """Convert an ``ECardAttributes`` bitmask or '|'-joined enum names to bits.
+
+    Records serializes attribute flags as a display string such as
+    ``"Flight"`` or ``"Flight|SpellShield"``.  The client's
+    ``HasAll/AnyAttributeFlags`` compare the decoded bitmask, so the adapter
+    must decode the names rather than pass the string to ``int()``.
+    """
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return int(value)
+    import game_engine
+    total = 0
+    for name in str(value).split("|"):
+        name = name.strip()
+        if not name:
+            continue
+        total |= int(getattr(game_engine.ECardAttributes, name, 0) or 0)
+    return total
+
+
+def _shard_bits(value):
+    """Convert an ``ECardShards`` bitmask or '|'-joined enum names to bits."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, int):
+        return int(value)
+    import game_engine
+    total = 0
+    for name in str(value).split("|"):
+        name = name.strip()
+        if not name:
+            continue
+        total |= int(getattr(game_engine.ECardShards, name, 0) or 0)
+    return total
+
+
 def _cmp(lhs, operation, rhs):
     op = str(getattr(operation, "name", operation)).replace("_", "").replace(" ", "").lower()
     return {"lessthan": lhs < rhs, "lessthanorequal": lhs <= rhs,
@@ -73,17 +114,19 @@ class InCollection:
 
 @dataclass(frozen=True)
 class HasAnyAttributeFlags:
-    attribute_flags: int
+    attribute_flags: int = 0
     def matches(self, card, **kwargs):
-        try: return bool(int(_v(card, "attributes", "attribute_flags", default=0)) & int(self.attribute_flags))
+        try: return bool(int(_v(card, "attributes", "attribute_flags", default=0)) & _attribute_bits(self.attribute_flags))
         except (TypeError, ValueError): return False
 
 @dataclass(frozen=True)
 class HasAllAttributeFlags:
-    attribute_flags: int
+    attribute_flags: int = 0
     def matches(self, card, **kwargs):
         try:
-            flags = int(self.attribute_flags)
+            flags = _attribute_bits(self.attribute_flags)
+            if not flags:
+                return True
             return (int(_v(card, "attributes", "attribute_flags", default=0)) & flags) == flags
         except (TypeError, ValueError):
             return False
@@ -128,11 +171,32 @@ class IsMultiThresholdCard:
 
 @dataclass(frozen=True)
 class HasResourceCost:
-    cost: int
+    cost: int = 0
     comparison: object = "Equals"
-    def matches(self, card, **kwargs):
-        try: return _cmp(int(_v(card, "resource_cost", "cost", default=-1)), self.comparison, int(self.cost))
-        except (TypeError, ValueError): return False
+    add_x: bool = False
+    add_attack: bool = False
+    add_defense: bool = False
+    add_card_integer_variable: str = ""
+    add_variable: str = ""
+    def matches(self, card, *, source=None, **kwargs):
+        # C# HasResourceCost compares the card's ResourceCost + paid X against
+        # the authored ResourceCost plus the Add* modifiers.  Only the base
+        # value was ported, so cost-scaling cards (313 AddCardIntegerVariable
+        # uses) always compared the wrong number.
+        if card is None:
+            return False
+        lhs = int(_v(card, "resource_cost", "cost", default=0) or 0)
+        lhs += int(_v(card, "resource_x_cost_paid", "x_cost", default=0) or 0)
+        rhs = int(self.cost or 0)
+        if self.add_attack:
+            rhs += int(_v(source, "attack", "attack_value", default=0) or 0)
+        if self.add_defense:
+            rhs += int(_v(source, "defense", "defense_value", default=0) or 0)
+        if self.add_card_integer_variable and source is not None:
+            attrs = _v(source, "int_attrs", default={}) or {}
+            if isinstance(attrs, dict):
+                rhs += int(attrs.get(self.add_card_integer_variable, 0) or 0)
+        return _cmp(lhs, self.comparison, rhs)
 
 @dataclass(frozen=True)
 class HasAttackValue:
@@ -195,17 +259,27 @@ class IsRarity:
 class IsColor:
     color: object
     def matches(self, card, **kwargs):
-        value = _v(card, "color", "color_flags", "shard", default=None)
-        try: return bool(int(value) & int(self.color))
-        except (TypeError, ValueError): return value == self.color
+        wanted = _shard_bits(self.color)
+        shards = _v(card, "shards", "card_shards", default=None)
+        if isinstance(shards, (list, tuple, set)):
+            actual = 0
+            for item in shards:
+                actual |= _shard_bits(item)
+        else:
+            actual = _shard_bits(_v(
+                card, "color", "color_flags", "shard", "shard_bits", default=0))
+        return bool(actual & wanted)
 
 @dataclass(frozen=True)
 class InFaction:
     faction: object
     def matches(self, card, **kwargs):
         value = _v(card, "faction", "faction_flags", default=None)
-        try: return bool(int(value) & int(self.faction))
-        except (TypeError, ValueError): return value == self.faction
+        # C# EFactions is a plain enum, compared with equality (not flags).
+        try:
+            return int(value) == int(self.faction)
+        except (TypeError, ValueError):
+            return value == self.faction
 
 class IsToken:
     def matches(self, card, **kwargs): return bool(_v(card, "is_token", "token", default=False))
@@ -425,16 +499,28 @@ class HasSourceTypeFilter:
         return _v(card, "card_type", "type", default=0) == _v(source, "card_type", "type", default=0)
 
 class DifferentOwners:
-    def matches(self, card, *, source=None, **kwargs):
-        if card is None or source is None:
+    def matches(self, card, *, source=None, player=None, **kwargs):
+        if card is None:
             return False
-        return _v(card, "owner_id", "controller_id", default=None) != _v(source, "owner_id", "controller_id", default=None)
+        # C# DifferentOwners: card.m_ControllingPlayer != responsiblePlayer.
+        # It does not require a source card.
+        expected = player
+        if expected is None and source is not None:
+            expected = _v(source, "controller_id", "owner_id", default=None)
+        controller = _v(card, "controller_id", "owner_id", default=None)
+        if expected is None:
+            return False
+        return controller != expected
 
 @dataclass(frozen=True)
 class HasASharedFactionWithSourceFilter:
     def matches(self, card, *, source=None, **kwargs):
-        try: return bool(int(_v(card, "faction", "faction_flags", default=0)) & int(_v(source, "faction", "faction_flags", default=0)))
-        except (TypeError, ValueError): return False
+        # C# Card.SharesFaction: faction equality (EFactions is not flags).
+        try:
+            return int(_v(card, "faction", "faction_flags", default=0)) == int(
+                _v(source, "faction", "faction_flags", default=0))
+        except (TypeError, ValueError):
+            return False
 
 @dataclass(frozen=True)
 class HasASharedRarityWithSourceFilter:
@@ -573,9 +659,21 @@ class IntAttrFilter:
     value: int = 0
     compare_to_cost: bool = False
     def matches(self, card, **kwargs):
-        lhs = _attr_path(card, self.attribute, 0)
-        try: return _cmp(int(lhs or 0), self.comparison, int(self.value))
-        except (TypeError, ValueError): return False
+        attr = str(self.attribute or "")
+        values = _v(card, "int_attrs", "intattrs", default=None)
+        if isinstance(values, dict) and values:
+            lhs = values.get(
+                attr, values.get(attr.lower(),
+                                 values.get(attr.capitalize(),
+                                            _attr_path(card, attr, 0))))
+        else:
+            lhs = _attr_path(card, attr, 0)
+        try:
+            rhs = (int(_v(card, "cost", "casting_cost", default=0) or 0)
+                   if self.compare_to_cost else int(self.value))
+            return _cmp(int(lhs or 0), self.comparison, rhs)
+        except (TypeError, ValueError):
+            return False
 
 @dataclass(frozen=True)
 class StringAttrFilter:
@@ -827,12 +925,13 @@ def _records_filter_spec(spec):
     if not isinstance(spec, dict):
         return spec
     kind = str(spec.get("_t", spec.get("type", ""))).rsplit(".", 1)[-1]
-    if kind in ("AndCardFilter", "OrCardFilter"):
+    if kind in ("AndCardFilter", "OrCardFilter", "StaticAndCardFilter",
+                "StaticOrCardFilter"):
         return {"type": kind, "filters": [
             _records_filter_spec(value)
             for value in spec.get("m_TargetFilters", spec.get("filters", ()))
         ]}
-    if kind == "NotCardFilter":
+    if kind in ("NotCardFilter", "StaticNotCardFilter"):
         child = spec.get("m_TargetFilter", spec.get("filter", {}))
         return {"type": kind, "filter": _records_filter_spec(child)}
     result = {"type": kind}
@@ -847,11 +946,13 @@ def records_filter_from_metadata(spec: Any) -> CardFilter:
     """Build a RulesPort filter from the client's serialized Records tree."""
     normalized = _records_filter_spec(spec)
     kind = str(normalized.get("type", "")).rsplit(".", 1)[-1].lower()
-    if kind in ("andcardfilter", "orcardfilter"):
+    if kind in ("andcardfilter", "orcardfilter",
+                "staticandcardfilter", "staticorcardfilter"):
         children = tuple(records_filter_from_metadata(item)
                          for item in normalized.get("filters", ()))
-        return AndCardFilter(children) if kind == "andcardfilter" else OrCardFilter(children)
-    if kind == "notcardfilter":
+        is_or = "or" in kind
+        return OrCardFilter(children) if is_or else AndCardFilter(children)
+    if kind in ("notcardfilter", "staticnotcardfilter"):
         return NotCardFilter(records_filter_from_metadata(normalized.get("filter", {})))
     if kind == "tacfilter":
         # TACFilter stores its operation in the client's compact binary blob;
@@ -913,6 +1014,28 @@ def records_filter_matches(card, spec, *, source=None, context=None,
             value.setdefault("tapped", bool(
                 state & int(ECardStates.Tapped)))
             value.setdefault("is_tapped", value["tapped"])
+            # C# derives these turn-history predicates from the same
+            # authoritative bitmask (Card.CameOutThisTurn / Damaged / Healed /
+            # HasAttacked).  Without them the Is*ThisTurn filters always
+            # matched nothing.
+            value.setdefault("played_this_turn", bool(
+                state & int(ECardStates.CameOutThisTurn)))
+            value.setdefault("came_out_this_turn", value["played_this_turn"])
+            value.setdefault("damaged_this_turn", bool(
+                state & int(ECardStates.Damaged)))
+            value.setdefault("healed_this_turn", bool(
+                state & int(ECardStates.Healed)))
+            value.setdefault("attacked_this_turn", bool(
+                state & int(ECardStates.HasAttacked)))
+            value.setdefault("has_attacked_this_turn",
+                             value["attacked_this_turn"])
+            if (value.get("template_guid") and
+                    value.get("original_template_guid")):
+                value.setdefault(
+                    "is_transformed",
+                    value["original_template_guid"] != value["template_guid"])
+            if isinstance(value.get("shards"), (list, tuple, set)):
+                value.setdefault("thresholds", list(value["shards"]))
         return value
 
     value = dict(card or {})
@@ -995,11 +1118,11 @@ def filter_from_metadata(spec: Any) -> CardFilter:
         raise TypeError("filter metadata must be a mapping")
     kind = str(spec.get("type", spec.get("class", spec.get("filter_type", ""))))
     kind = kind.rsplit(".", 1)[-1].replace("Filter", "").lower()
-    if kind in {"and", "andcard"}:
+    if kind in {"and", "andcard", "staticand", "staticandcard"}:
         return AndCardFilter(tuple(filter_from_metadata(item) for item in spec.get("filters", ())))
-    if kind in {"or", "orcard"}:
+    if kind in {"or", "orcard", "staticor", "staticorcard"}:
         return OrCardFilter(tuple(filter_from_metadata(item) for item in spec.get("filters", ())))
-    if kind in {"not", "notcard"}:
+    if kind in {"not", "notcard", "staticnot", "staticnotcard"}:
         return NotCardFilter(filter_from_metadata(spec["filter"]))
     cls = _FILTER_TYPES.get(kind)
     if cls is None:
@@ -1025,6 +1148,27 @@ def filter_from_metadata(spec: Any) -> CardFilter:
                "comparetoabilitysourcedefense": "compare_to_ability_source_defense",
                "compare_to_ability_source_attack": "compare_to_ability_source_attack",
                "comparetoabilitysourceattack": "compare_to_ability_source_attack",
+               "comparetoabilitysource": "compare_to_source",
+               "comparetocost": "compare_to_cost",
+               "addx": "add_x",
+               "addattack": "add_attack",
+               "adddefense": "add_defense",
+               "addcardintegervariable": "add_card_integer_variable",
+               "addvariable": "add_variable",
+               "cardattributeflags": "attribute_flags",
+               "usestoredname": "use_stored_name",
+               "socketedvalue": "socketed_value",
+               "testagainstactiveplayer": "test_against_active_player",
+               "dontexactlymatchoriginal": "dont_exactly_match_original",
+               "onlycombatdamage": "only_combat_damage",
+               "onlynoncombatdamage": "only_non_combat_damage",
+               "usesource": "use_source",
+               "addvalue": "add_value",
+               "targetindex": "target_index",
+               "matchname": "match_name",
+               "includeresources": "include_resources",
+               "exactmatch": "exact_match",
+               "storedshard": "stored_shard",
                "failuncontrolledcards": "fail_uncontrolled_cards"}
     kwargs = {aliases.get(str(key).lower(), str(key).lower()): value
               for key, value in values.items()}

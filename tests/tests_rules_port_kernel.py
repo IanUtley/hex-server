@@ -52,7 +52,7 @@ from rules_port.async_bridge import (AsyncActivationPublisher,
 from rules_port.adapter import (_native_participant_ids, rules_session_for,
                                 session_from_persisted_game)
 from rules_port.pvp_session import PvpAuthoritativeSession
-from rules_port.combat import (CombatId, CombatManager, CombatPhase,
+from rules_port.combat import (Combat, CombatId, CombatManager, CombatPhase,
                                CombatResolver)
 from rules_port.combat import CombatDamageBackend
 from rules_port.combat_damage import _Combatant
@@ -715,6 +715,52 @@ def test_pvp_projected_chain_round_trips_and_rehydrates_native_window():
     assert restored.snapshot()["projected_chain"] == []
 
 
+def test_chain_resolution_keeps_first_main_phase():
+    """Resolving the last chain item must return priority to the active
+    player in the same main phase; the phase must not advance.
+
+    Playing a card in FirstMainPhase puts it on the chain.  Once both players
+    pass and the item resolves, C# re-enters the interrupted phase
+    ``PriorityWindowAction``; the turn phase stays FirstMainPhase.
+    """
+    player = game_engine.UID.make(244, 21)
+    ai = game_engine.UID.make(3, 1000)
+    session = AuthoritativeSession(70, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    phase_window = PriorityWindowAction(TurnPhasePlayers.ALL)
+    phase_window._rules_port_phase = "FirstMainPhase"
+    session.push_game_action(phase_window)
+    assert session.action_stack.update() is False
+    session.set_ability_resolver(
+        lambda item: AbilityResolutionState.COMPLETED)
+    session.queue_projected_chain(
+        {"kind": "spell", "source_uid": 905, "instance_id": 90,
+         "ability_guids": []},
+        player, first_player_id=player)
+    chain_window = session.action_stack.peek()
+    assert isinstance(chain_window, PriorityWindowAction)
+    assert chain_window.ability_responding_to is not None
+    assert session.pass_player_priority(player)
+    assert chain_window.priority_player_id is None
+    # The response window is now consumed; one tick pops it and leaves only
+    # the resolver above the interrupted phase window.
+    assert session.tick()
+    assert isinstance(session.action_stack.peek(), ResolveTopOfChainAction)
+    # A re-attach during the pass (sync_checkpoint calls this) must NOT clear
+    # the stack just because the top is the resolver rather than a response
+    # window, or the interrupted FirstMainPhase window is lost.
+    assert not session.ensure_projected_chain_action()
+    assert session.current_turn_phase == game_engine.ETurnPhases.FirstMainPhase
+    for _ in range(12):
+        if not session.tick():
+            break
+    assert session.current_turn_phase == game_engine.ETurnPhases.FirstMainPhase
+    top = session.action_stack.peek()
+    assert isinstance(top, PriorityWindowAction)
+    assert top.ability_responding_to is None
+    assert top.priority_player_id == player
+
+
 def test_generic_projected_card_chain_is_owned_by_native_action_stack():
     player = game_engine.UID.make(244, 13)
     ai = game_engine.UID.make(3, 14)
@@ -927,6 +973,157 @@ def test_persisted_game_factory_accepts_explicit_card_mutation_adapter():
     assert port.event_sink.mutation_adapter is mutation
 
 
+def test_records_filter_state_history_and_faction():
+    """Turn-history predicates derive from card_state; factions compare equal."""
+    from rules_port.filters import records_filter_matches
+    card = {"card_uid": 1, "state": 8192, "faction": 3}  # CameOutThisTurn
+    assert records_filter_matches(card, {"type": "IsPlayedThisTurn"})
+    assert not records_filter_matches(card, {"type": "IsDamagedThisTurn"})
+    # EFactions is a plain enum: InFaction compares by equality, not bitwise.
+    assert records_filter_matches(card, {"type": "InFaction", "m_Faction": 3})
+    assert not records_filter_matches(card, {"type": "InFaction", "m_Faction": 1})
+
+
+def test_records_filters_decode_enum_names_and_card_state():
+    """Filters must decode Records enum-name fields and read dynamic state.
+
+    Records serializes attribute/shard flags as display strings and stores
+    int-attributes dynamically; the port previously passed the strings to
+    ``int()`` (crashing) and never read ``int_attrs``/``shards``.
+    """
+    from rules_port.filters import (records_filter_from_metadata,
+                                    records_filter_matches)
+
+    card = {"card_uid": 1, "int_attrs": {"Trained": 3}, "shards": [16],
+            "attributes": 2, "location": "warzone", "cost": 2}
+    assert records_filter_from_metadata(
+        {"type": "HasAllAttributeFlags", "m_CardAttributeFlags": "Flight"})
+    assert records_filter_matches(
+        card, {"type": "HasAllAttributeFlags",
+               "m_CardAttributeFlags": "Flight"})
+    assert not records_filter_matches(
+        card, {"type": "HasAllAttributeFlags",
+               "m_CardAttributeFlags": "SpellShield"})
+    # Static wrappers must be accepted rather than raising ValueError.
+    assert records_filter_from_metadata(
+        {"type": "StaticAndCardFilter", "m_TargetFilters": []}) is not None
+    assert records_filter_matches(
+        card, {"type": "IntAttrFilter", "m_Attribute": "Trained",
+               "m_ComparisonOp": "GreaterThanOrEqual", "m_Value": 1})
+    assert records_filter_matches(
+        card, {"type": "IsColor", "m_ColorFlags": "Sapphire"})
+
+
+def test_commit_attack_recovery_survives_typed_merge():
+    """A raw-recovered attack declaration must survive the typed merge.
+
+    ``CommitTroopsToAttack``'s nested AttackDeclaration does not decode through
+    the generic ObjFmt walker, so the typed parser produces nothing; assigning
+    an empty tuple then clobbered the recovered declaration and the client was
+    stuck in Select Attackers.
+    """
+    from application.player_transactions import (classify_player_transaction,
+                                                 typed_payload_from_decoded)
+    raw = (b";0;0;2;PlayerId;1;1;1;m_UID64;2;2;0;F490FB3351F3D606;"
+           b"Transaction;3;3;3;m_Attacks;4;4;0;1;0;5;5;2;DefendingCardId;6;6;1;"
+           b"value;7;1;1;m_UID64;8;2;0;0102000000000000;"
+           b"AttackingCardIds;9;7;0;1;0;10;6;1;value;11;1;1;m_UID64;12;2;0;"
+           b"0107000000000000;m_PlayerId;13;1;1;m_UID64;14;2;0;"
+           b"F490FB3351F3D606;m_TransactionId;15;8;0;32000000;"
+           b"Game.Shared.Mechanics.Transactions."
+           b"CommitTroopsToAttackTransaction")
+    command = classify_player_transaction(raw)
+    assert command.is_commit_attack
+    payload = typed_payload_from_decoded(command, {"__raw__": raw})
+    assert payload is not None
+    assert payload.get("declarations") == ((0x0201, (0x0701,)),)
+
+
+def test_target_spec_resolves_variable_counts():
+    """TargetVariable min/max resolve from the ability variable map."""
+    from gamedata.models import TargetSpec
+    spec = TargetSpec(guid="t", name="n", is_auto=False, is_random=False,
+                      player_filter="Self", collection_flags="Warzone",
+                      minimum=1, maximum=1, optional=False, explicit=True,
+                      min_variable="toAffect", max_variable="toAffect")
+    assert spec.resolved_maximum({"toAffect": 3}) == 3
+    assert spec.resolved_minimum({"toAffect": 2}) == 2
+    assert spec.resolved_maximum({}) == 1
+
+
+def test_finish_playing_cards_drains_queue():
+    player = game_engine.UID.make(244, 93)
+    session = AuthoritativeSession(93, (player,), seed_z=1, seed_w=2)
+    seen = []
+    session.set_card_finisher(
+        lambda item: seen.append(item["card_uid"]) or True)
+    session.queue_card_ready_to_play(101, player)
+    assert session.finish_playing_cards() is True
+    assert seen == [101]
+    assert session.finish_playing_cards() is False
+
+
+def test_chain_can_resolve_per_phase():
+    """C# ChainCanResolve is false in Draw/DeclareAttack/DeclareDefense/Discard."""
+    player = game_engine.UID.make(244, 92)
+    session = AuthoritativeSession(92, (player,), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    assert session.chain_can_resolve()
+    session.current_turn_phase = game_engine.ETurnPhases.Draw
+    assert not session.chain_can_resolve()
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareAttack
+    assert not session.chain_can_resolve()
+    session.current_turn_phase = game_engine.ETurnPhases.Discard
+    assert not session.chain_can_resolve()
+
+
+def test_pick_goes_first_advances_to_mulligan():
+    """C# PickGoesFirstState.GetNextTurnPhase always returns Mulligan.
+
+    Modelling it as a plain TurnPhaseState raised "PickGoesFirst must select
+    a next phase" because it permits both PreGame and Mulligan.
+    """
+    player = game_engine.UID.make(244, 91)
+    session = AuthoritativeSession(91, (player,), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.PickGoesFirst
+    assert session.advance_turn_phase() == game_engine.ETurnPhases.Mulligan
+
+
+def test_combat_damage_order_requires_every_blocker():
+    from rules_port.combat import _has_juggernaut
+    combat = Combat("instigator", "defender", CombatId(1, 1))
+    combat.declare_blockers([CombatCardStub(20, 1), CombatCardStub(30, 1)])
+    assert not combat.assign_damage_order([20])
+    assert combat.assign_damage_order([20, 30])
+    # Crush (rule flag) must count as Juggernaut even when the attribute is
+    # absent; the previous getattr fallback never reached ``crush``.
+    assert _has_juggernaut(SimpleNamespace(crush=True))
+    assert not _has_juggernaut(SimpleNamespace(crush=False))
+
+
+def test_legal_targets_excludes_spell_shielded_opponent_permanent():
+    """A non-auto target must not offer an opposing Spell-Shielded permanent."""
+    from unittest import mock
+    import rules_port.targeting as T
+
+    row = (101, "Troop", "warzone", 0, "tpl", 0, 1, 1, "Shielded", 1, "", "{}",
+           "[]", "{}", "", 0, 0, "tpl", 128)  # ECardAttributes.SpellShield
+    template = {"template_id": "t", "is_auto_target": 0, "is_random_target": 0,
+                "optional": 0, "explicit": 0,
+                "player_filter": "MultipleOpponents",
+                "collection_flags": "Warzone", "min_target_count": 1,
+                "max_target_count": 1, "filter_json": "{}",
+                "target_kind": "AbilityTargetTemplate"}
+    with mock.patch.object(T, "target_template", return_value=template), \
+            mock.patch("pvp_db.db_target_candidate_rows", return_value=[row]), \
+            mock.patch.object(
+                T, "_source_card",
+                return_value={"card_uid": 999, "user_id": 5}):
+        assert T.legal_targets(
+            object(), 1, 5, "t", 999, both_players=True,
+            battle_state={"_rules_port_suppress_card_properties": True}) == []
+
+
 def test_random_target_sample_bounds_the_pool():
     """A random auto-target must resolve to a bounded sample.
 
@@ -944,8 +1141,10 @@ def test_random_target_sample_bounds_the_pool():
     assert _random_target_sample(pool, 1, {"_rules_rng": _Rng()}) == (11,)
     two = _random_target_sample(pool, 2, {"_rules_rng": _Rng()})
     assert len(two) == 2 and all(value in pool for value in two)
-    # A pool at or below the requested count is returned unchanged.
-    assert _random_target_sample([7], 1, {}) == (7,)
+    # count <= 0 is "unlimited": the whole pool is returned (shuffled).
+    assert sorted(_random_target_sample(pool, 0, {"_rules_rng": _Rng()})) == sorted(pool)
+    # Without a session RNG a plain random sample of the requested size is used.
+    assert len(_random_target_sample([7, 8, 9], 1, {})) == 1
 
 
 def test_records_filter_matches_keeps_card_with_threshold_context():
@@ -981,6 +1180,27 @@ def test_combat_manager_accepts_wire_combat_id():
     assert combat.combat_id.serial_number == 9
     assert manager.contains(wire)
     assert manager.get(combat.combat_id) is combat
+
+
+def test_wire_combat_id_coerces_port_attacker_integer():
+    """The wire ``CombatId`` must accept the port's raw-uid64 attacker.
+
+    ``rules_port.combat.CombatId.attacker_id`` is an int; a combat-listing
+    projection that crossed the namespaces crashed on serialization with
+    ``'int' object has no attribute 'write'``.
+    """
+    raw = int(game_engine.UID.make(244, 7).uid64)
+    cid = game_engine.CombatId(raw, 3)
+    assert isinstance(cid.attacker, game_engine.UID)
+    assert cid.attacker.uid64 == raw
+    assert cid.serial == 3
+    # Round-trips through the wire writer without raising.
+    from domain.serializer import Serializer
+    ser = Serializer()
+    ser.begin_write()
+    ser.add_combat_id(cid)
+    payload = ser.end_write()
+    assert payload
 
 
 def test_combat_port_preserves_blocker_order_and_crush_damage_routing():
@@ -1172,6 +1392,48 @@ def test_commit_attack_transaction_validates_then_creates_session_combat():
     assert session.handle_transaction()
     assert len(session.combat_manager.combats) == 1
     assert session.combat_manager.combats[0].attacker is attacker
+
+
+def test_commit_attack_passes_priority_like_csharp_transaction():
+    """C# ``CommitTroopsToAttackTransaction.Resolve`` ends with
+    ``session.DoPassPriorityTransaction()``.
+
+    The live host registers an ``attack_transaction`` projection, and the port
+    used to consume the ``DeclareAttack`` window only in the no-resolver
+    branch.  The window then stayed open, the phase never advanced to
+    ``DeclareAttackPriorityWindow``, and the client was stuck in Select
+    Attackers.
+    """
+    attacker = type("Card", (), {"collection": game_engine.ECardCollections.Warzone,
+                                  "session_card_id": 10})()
+    defender = type("Card", (), {"collection": game_engine.ECardCollections.Champions,
+                                  "session_card_id": 99})()
+    facts = type("Facts", (), {
+        "get_card": lambda self, card_id: {10: attacker, 99: defender}.get(card_id),
+        "can_attack": lambda self, source, target, player: (
+            source is attacker and target is defender and player == "p"),
+    })()
+    session = AuthoritativeSession(55, ("p",), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareAttack
+    session.set_runtime_facts(facts)
+    window = PriorityWindowAction(TurnPhasePlayers.ACTIVE)
+    window._rules_port_phase = "DeclareAttack"
+    session.push_game_action(window)
+    assert session.action_stack.update() is False
+    seen = []
+    session.set_attack_transaction_resolver(
+        lambda tx: seen.append(tx) or True)
+    tx = RulesTransaction.commit_troops_to_attack(
+        "p", game_engine.ETurnPhases.DeclareAttack, ((99, (10,)),))
+    assert session.submit_transaction(tx)
+    assert session.handle_transaction()
+    assert seen
+    assert window.priority_player_id is None
+    for _ in range(8):
+        if not session.tick():
+            break
+    assert session.current_turn_phase == (
+        game_engine.ETurnPhases.DeclareAttackPriorityWindow)
 
 
 def test_commit_defense_transaction_validates_atomically_then_sets_blockers():
@@ -1728,7 +1990,12 @@ def test_shared_source_filters_and_owner_filter():
     source = {"owner_id": 1, "faction": 3, "rarity": "Rare", "subtypes": ("Elf",)}
     card = {"owner_id": 2, "faction": 1, "rarity": "Rare", "subtypes": ("Elf", "Warrior")}
     assert filter_from_metadata({"type": "DifferentOwners"}).matches(card, source=source)
-    assert filter_from_metadata({"type": "HasASharedFactionWithSourceFilter"}).matches(card, source=source)
+    # EFactions is a plain enum: sharing is equality, not bitwise overlap.
+    assert not filter_from_metadata(
+        {"type": "HasASharedFactionWithSourceFilter"}).matches(card, source=source)
+    assert filter_from_metadata(
+        {"type": "HasASharedFactionWithSourceFilter"}).matches(
+            dict(card, faction=3), source=source)
     assert filter_from_metadata({"type": "HasASharedRarityWithSourceFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasASharedSubtypeWithSourceFilter"}).matches(card, source=source)
 
@@ -3009,6 +3276,32 @@ def test_projected_chain_replaces_stale_phase_action_before_pass():
     assert restored.action_stack.priority_player_id == player
 
 
+def test_projected_chain_resolves_ignores_chain_ability_without_a_window():
+    """An authored IgnoresChain ability must not wait on a priority window.
+
+    The client's PriorityWindowAction.Update completes immediately for an
+    IgnoresChain chain top, so the native scheduler has to match or the
+    ability (and any picker inside its BOM) never resolves.  Corinth's charge
+    power is the canonical case: its BOM creates three Choosing cards and
+    invokes a copy-to-hand child.
+    """
+    from rules_port.session import (
+        ProjectedChainAbility, projected_ability_ignores_chain)
+
+    # Explicit descriptor flag wins without a Records lookup.
+    assert projected_ability_ignores_chain(
+        {"ability_guid": "does-not-exist", "ignores_chain": True})
+    # The real authored Corinth charge power is IgnoresChain in Records.
+    charge_power = "286f1891-4404-585e-4fb6-bd9f783f222b"
+    assert projected_ability_ignores_chain({"ability_guid": charge_power})
+    ability = ProjectedChainAbility(
+        3, {"kind": "ability", "ability_guid": charge_power}, 7)
+    assert ability.ignores_chain
+    # An ordinary chain ability still opens a response window.
+    assert not projected_ability_ignores_chain({"ability_guid": ""})
+    assert not projected_ability_ignores_chain(None)
+
+
 def test_projected_chain_keeps_rehydrated_response_window_by_instance_id():
     """A reload must not reset an in-progress response window to its opener."""
     from rules_port.session import ProjectedChainAbility
@@ -3314,6 +3607,31 @@ def test_pvp_runtime_facts_use_raw_player_checkpoint_keys():
     assert not facts.can_play_card(card, opponent)
 
 
+def test_can_attack_resolves_profile_owner_domain():
+    """``can_attack`` must map the wire UID onto the ``game_cards`` owner.
+
+    ``game_cards.user_id`` stores the profile id for the human, but the
+    CommitTroopsToAttack transaction carries the typed ServicePlayer UID;
+    comparing the raw decoded id rejected the owner's own troop and the client
+    stayed stuck in Select Attackers.
+    """
+    profile_id = 6175190558117173535
+    reck_id = 1925190388022160
+    player = game_engine.UID.make(244, reck_id)
+    opponent = game_engine.UID.make(3, 1000)
+    facts = PvpRuntimeFacts(1, {}, player_uid=player, ai_uid=opponent)
+    facts.player_owner_id = profile_id
+    facts.ai_owner_id = 0
+    facts.client_player_uid = player
+    ready = int(game_engine.ECardStates.StartedATurnOnYourSide)
+    attacker = RuntimeCard(
+        1793, "template", profile_id, "warzone",
+        game_engine.ECardCollections.Warzone,
+        int(game_engine.ECardTypes.Troop), ready, 0, 2, (), ())
+    assert facts.can_attack(attacker, None, player)
+    assert not facts.can_attack(attacker, None, opponent)
+
+
 def test_pvp_runtime_facts_price_ability_from_metadata_owner():
     """Cached two-human facts must not use the original attaching player."""
     state = {"pvp": True, "res_7": 0, "res_8": 3,
@@ -3447,6 +3765,28 @@ def test_sync_checkpoint_canonicalizes_raw_priority_for_native_pass():
     assert port.active_player_id == ai
     assert port.action_stack.priority_player_id == player
     assert port.pass_player_priority(player)
+
+
+def test_default_stops_match_client_set_default_turn_phases():
+    """The default self/opponent stop sets must mirror the client's
+    ``Player.SetDefaultTurnPhases``.
+
+    That method does NOT add ``DeclareCombatPriorityWindow`` to either list,
+    so the active player must auto-pass the pre-combat window and land in
+    ``DeclareAttack`` where the attack UI lives.  The server previously listed
+    it as a self stop, which halted the client in the "Declare Combat" window
+    with no way to declare attackers.
+    """
+    from rules_port import lifecycle
+    combat_window = game_engine.ETurnPhases.DeclareCombatPriorityWindow
+    assert combat_window not in lifecycle.SELF_DEFAULT_STOPS
+    assert combat_window not in lifecycle.OPP_DEFAULT_STOPS
+    assert not lifecycle.is_self_stop({}, combat_window)
+    assert not lifecycle.is_opp_stop({}, combat_window)
+    assert practice_priority_players(
+        {}, combat_window, active_is_player=True) is TurnPhasePlayers.NONE
+    assert game_engine.ETurnPhases.FirstMainPhase in lifecycle.SELF_DEFAULT_STOPS
+    assert game_engine.ETurnPhases.SecondMainPhase in lifecycle.OPP_DEFAULT_STOPS
 
 
 def test_practice_stop_matrix_keeps_both_passes_native():

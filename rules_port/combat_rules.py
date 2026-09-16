@@ -68,6 +68,23 @@ def _rules(db, session_id, battle_state, uid):
     return values
 
 
+def card_int_attr(db, session_id, uid, name):
+    """Sum a dynamic int-attribute across a card's permanent/temporary buffs."""
+    from pvp_db import db_card_mutation_field
+    total = 0
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            data = json.loads(db_card_mutation_field(
+                session_id, int(uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            data = {}
+        if isinstance(data, dict):
+            attrs = data.get("int_attrs")
+            if isinstance(attrs, dict):
+                total += int(attrs.get(name, attrs.get(name.lower(), 0)) or 0)
+    return total
+
+
 def can_block(db, session_id, battle_state, attacker_uid, blocker_uid):
     """Evaluate the client CanBlock baseline and typed block restrictions."""
     attacker, attacker_attrs, _ = _combat_card(

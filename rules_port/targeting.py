@@ -13,11 +13,44 @@ import json
 from rules_port.filters import records_filter_matches
 
 
+# ECardAttributes.SpellShield (Mechanics/ECardAttributes.cs).
+_SPELL_SHIELD_ATTR = 128
+
+
 class _FilterContext(dict):
     """Dict state with client-shaped attributes for native filter leaves."""
 
     def __getattr__(self, name):
         return self.get(name)
+
+
+def _targeting_immune(db, session_id, battle_state, card, source):
+    """Port of ``AbilityTargetTemplate.IsTargetImmune``.
+
+    A card may carry authored ``TargetingImmunityModifier`` rules whose filter
+    matches the ability source.  Non-auto opposing permanents covered by such a
+    rule are not legal targets.
+    """
+    try:
+        from .static_rules import rule_modifiers
+        rules = rule_modifiers(
+            db, session_id, battle_state or {}, int(card.get("card_uid") or 0))
+    except Exception:
+        return False
+    for rule in rules or ():
+        if str(rule.get("property") or "") != "targetingimmunity":
+            continue
+        spec = rule.get("filter") or rule.get("cardfilter")
+        if not spec:
+            return True
+        try:
+            if records_filter_matches(
+                    source or {}, spec, source=source or {},
+                    context=dict(battle_state or {})):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _last(value):
@@ -152,9 +185,16 @@ def implicit_champion_target(db, session, handler, battle_state, *,
 
 
 def _card(row, battle_state=None, db=None, session_id=None):
-    (uid, card_type, location, owner, template_guid, state, attack, defense,
-     name, cost, subtype, threshold, abilities, buffs, rarity, sockets, gems,
-     original_guid) = row
+    row = tuple(row)
+    if len(row) >= 19:
+        (uid, card_type, location, owner, template_guid, state, attack, defense,
+         name, cost, subtype, threshold, abilities, buffs, rarity, sockets, gems,
+         original_guid, card_attributes) = row[:19]
+    else:
+        (uid, card_type, location, owner, template_guid, state, attack, defense,
+         name, cost, subtype, threshold, abilities, buffs, rarity, sockets, gems,
+         original_guid) = row[:18]
+        card_attributes = 0
     try:
         saved = json.loads(buffs or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -169,7 +209,8 @@ def _card(row, battle_state=None, db=None, session_id=None):
             "attack": int(attack or 0), "defense": int(defense or 0),
             "name": name or "", "cost": int(cost or 0),
             "subtype": saved.get("subtype", subtype or ""),
-            "attributes": int(saved.get("attributes", 0) or 0),
+            "attributes": int(saved.get("attributes", 0) or 0)
+            | int(card_attributes or 0),
             "int_attrs": attrs, "shards": _shards(threshold),
             "rarity": rarity or "", "socket_count": int(sockets or 0),
             "gems": int(gems or 0), "card_abilities": json.loads(abilities or "[]")
@@ -214,6 +255,30 @@ def _source_card(db, session_id, source_uid, controller_uid):
             "card_type": "Champion", "attack": 0, "defense": 0}
 
 
+def evaluate_card_filter(card, spec, source_uid=None, *, ability_state=None,
+                         db=None):
+    """Evaluate one Records card filter against a projected card dict.
+
+    Companion to :func:`legal_targets` for leaves that count filtered cards
+    (``SetCardCountVariable``).  The native context imports this from
+    ``rules_port.targeting``; it previously did not exist there and raised
+    ImportError.
+    """
+    if not spec:
+        return True
+    source = None
+    if source_uid is not None:
+        try:
+            source = {"card_uid": int(source_uid)}
+        except (TypeError, ValueError):
+            source = None
+    try:
+        return records_filter_matches(
+            card, spec, source=source, context=ability_state or {})
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
 def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                   both_players=False, champions=None, battle_state=None):
     template = target_template(db, template_id)
@@ -244,7 +309,9 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     player_filter = str(template["player_filter"]).lower()
     self_only = player_filter in {"self", "you", "controller"}
     opposing = player_filter in {"opponent", "opposing", "singleopponent", "multipleopponents"}
+    is_auto = bool(template.get("is_auto_target"))
     source = _source_card(db, session_id, source_uid, controller_uid)
+    source_owner = int((source or {}).get("user_id", controller_uid) or 0)
     cards = []
     by_owner = {}
     for row in rows:
@@ -252,6 +319,20 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
         if self_only and card["user_id"] != int(controller_uid or 0):
             continue
         if opposing and card["user_id"] == int(controller_uid or 0):
+            continue
+        # C# AbilityTargetTemplate.IsCardValidTarget: a non-auto target on an
+        # opposing permanent must not be Spell-Shielded, Spectral, or covered
+        # by a TargetingImmunity rule.  Without these the picker/AI offered
+        # untargetable cards as legal.
+        permanent = str(card.get("location") or "").lower() in (
+            "warzone", "champions")
+        if (not is_auto and permanent and card["user_id"] != source_owner):
+            if int(card.get("attributes", 0) or 0) & _SPELL_SHIELD_ATTR:
+                continue
+            if _targeting_immune(db, session_id, battle_state, card, source):
+                continue
+        if (int((card.get("int_attrs") or {}).get("Spectral", 0) or 0) >= 1
+                and int(card["card_uid"]) != int(source_uid or 0)):
             continue
         cards.append(card)
         by_owner.setdefault(card["user_id"], []).append(card)

@@ -200,29 +200,27 @@ class EffectContext:
 
     def randomize_variable(self) -> str:
         """Roll a typed random variable into the active ability state."""
-        import random
-
         template = self.template_value("m_VariableName", "RandomNumber")
         name = str(template or "RandomNumber")
-        minimum = self.template_value("m_MinValue", 1)
-        maximum = self.template_value("m_MaxValue", minimum)
-        maximum_field = self.template_value("m_MaxValueField")
-        if maximum_field:
-            from rules_port.fields import resolve_field
-
-            variables = dict(self.bstate.get("ability_variables") or {})
-            maximum = resolve_field(
-                maximum_field, variables, self.bstate.get("effect_outputs") or
-                {}, self.bstate, maximum)
         try:
-            minimum = int(minimum or 0)
+            minimum = int(self.value("m_MinValue", 1) or 0)
         except (TypeError, ValueError):
             minimum = 0
         try:
-            maximum = int(maximum or minimum)
+            maximum = int(self.value("m_MaxValue", minimum) or minimum)
         except (TypeError, ValueError):
             maximum = minimum
-        value = random.randint(minimum, max(minimum, maximum))
+        # C# swaps inverted bounds rather than clamping.
+        if minimum > maximum:
+            minimum, maximum = maximum, minimum
+        span = max(0, maximum - minimum) + 1
+        rng = self.bstate.get("_rules_rng")
+        if rng is not None and hasattr(rng, "next"):
+            # Use the session RNG so replays match the client.
+            value = minimum + int(rng.next(span)) % span
+        else:
+            import random
+            value = random.randint(minimum, maximum)
         self.bstate.setdefault("ability_variables", {})[name] = value
         return f"randomized {name}={value}"
 
@@ -1565,9 +1563,18 @@ class EffectContext:
         position = 100 if destination == "hand" else 0
         clear_dead = destination == "warzone"
         clear_bits = game_engine.ECardStates.Dead if clear_dead else 0
+        new_state = old_state if destination == "warzone" else 0
+        if destination == "warzone":
+            # C# MoveCardToZone honors EntersPlayExhausted / EntersPlayAttacking.
+            new_state |= game_engine.ECardStates.CameOutThisTurn
+            if self.template_value("m_EntersPlayExhausted", False):
+                new_state |= game_engine.ECardStates.Tapped
+            if self.template_value("m_EntersPlayAttacking", False):
+                new_state |= (game_engine.ECardStates.Attacking |
+                              game_engine.ECardStates.HasAttacked)
         db_move_card_for_effect(
             self.session.session_id, target, destination, position,
-            0 if destination != "warzone" else old_state,
+            new_state,
             clear_dead=clear_dead, clear_bits=clear_bits, conn=self.db)
         self.db.commit()
         details = db_card_zone_details(
@@ -1629,11 +1636,24 @@ class EffectContext:
             _clear_choice_zone(self)
             return "cleared choice zone"
         if destination not in {"hand", "discard", "void", "warzone",
-                               "underground"}:
+                               "underground", "deck"}:
             return None
         target = self.resolved_target()
         if target is None and destination == "underground":
             target = self.bstate.get("resolving_source_uid")
+        # Authored control transfer (m_AbilityOwnerTakesControl / etc.).  The
+        # port previously ignored it, so "move to an opponent's zone" left the
+        # card under its original controller.
+        if target is not None and self.template_value(
+                "m_AbilityOwnerTakesControl", False):
+            try:
+                from pvp_db import db_set_card_owner
+                owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
+                db_set_card_owner(
+                    self.session.session_id, int(target), owner, conn=self.db)
+                self.db.commit()
+            except (TypeError, ValueError):
+                pass
         return self._move_simple_zone(target, destination)
 
     def target_player_takes_control(self) -> str:
@@ -2053,8 +2073,19 @@ class EffectContext:
         target = self.resolved_target() if target is None else target
         if target is None:
             return "store targets: none"
-        self.bstate.setdefault("stored_targets", {}).setdefault(
-            self.ability_guid, []).append(int(target))
+        # C# StoreTargets honors m_SetTargets (replace the list) and
+        # m_OnlyUntilEndOfTurn (store in ThisTurnsData rather than
+        # PermanentData), and de-duplicates.
+        set_targets = bool(self.template_value("m_SetTargets", False))
+        only_turn = bool(self.template_value("m_OnlyUntilEndOfTurn", False))
+        key = "stored_targets_this_turn" if only_turn else "stored_targets"
+        store = self.bstate.setdefault(key, {})
+        if set_targets:
+            store[self.ability_guid] = [int(target)]
+        else:
+            values = store.setdefault(self.ability_guid, [])
+            if int(target) not in values:
+                values.append(int(target))
         return f"stored {hex(int(target))}"
 
     def store_name(self, target: int | None = None) -> str:
@@ -2410,7 +2441,11 @@ class EffectContext:
         """Conscript cards through the shared token/zone helper."""
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
             from rules_port.token_effects import summon_token
-            return summon_token(self, {"collection": "Hand",
+            try:
+                amount = int(self.value("m_Amount", 1) or 0)
+            except (TypeError, ValueError):
+                amount = 1
+            return summon_token(self, {"collection": "Hand", "amount": amount,
                 "card_filter": self.template_value("m_CardFilter", {})})
         from abilities.framework.effects.tokens import conscript_cards
 

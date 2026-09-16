@@ -103,6 +103,45 @@ def _project(context, uid, owner, guid, old, new, champion=False):
         private_player_uid=recipient)
 
 
+def counter_spell(context):
+    """Port of ``CounterSpellAbilityEffectTemplate`` / ``Session.CounterCard``.
+
+    The effect only counters a card still held on the chain (CastSpells) and
+    must respect the authored ``CantBeInterrupted`` int-attribute.  The Python
+    native branch previously imported a function that did not exist and
+    raised ImportError for every counter spell (43 Records rows).
+    """
+    target = context.resolved_target()
+    if target is None:
+        return "counter spell: no target"
+    target = int(target)
+    from pvp_db import db_card_location
+    location = str(db_card_location(
+        context.session.session_id, target, conn=context.db) or "").lower()
+    if location != "castspells":
+        return "counter spell: target not on chain"
+    from rules_port.combat_rules import card_int_attr
+    if card_int_attr(context.db, context.session.session_id, target,
+                     "CantBeInterrupted") > 0:
+        return "counter spell: cannot be interrupted"
+    # Session.CounterCard removes the ability from the chain; the card itself
+    # is discarded by the resolution boundary.
+    port = getattr(context.session, "_rules_port_session", None)
+    if port is not None:
+        try:
+            port.chain.remove_ability(target)
+            port.forget_projected_chain(target)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    result = context.discard(target)
+    context._emit_trigger(
+        "CardCounteredEvent", target,
+        context.bstate.get("resolving_owner_id", 0),
+        event_source_collection="CastSpells",
+        event_destination_collection="discard")
+    return f"countered {hex(target)}; {result}"
+
+
 def change_counter(context, target, name, counter_guid, amount, operation):
     """Apply one typed counter operation and emit its client projection."""
     from pvp_db import db_card_mutation_field, db_set_card_mutation_field

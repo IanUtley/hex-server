@@ -202,6 +202,36 @@ def run(name, fn):
         db.close()
 
 
+def test_idle_transaction_watchdog(db):
+    """The shared connection autocommits, and an explicit transaction left
+    open is rolled back by the watchdog so it cannot pin SQLite's write lock."""
+    import time as _time
+    import db as dbmod
+
+    conn = dbmod.connect(":memory:")
+    try:
+        assert not conn.in_transaction
+        # A plain write must not leave an implicit transaction open.
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        assert not conn.in_transaction, \
+            "write left an implicit transaction open (autocommit off?)"
+        # An explicit BEGIN is held until it looks idle, then rolled back.
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO t VALUES (2)")
+        assert conn.in_transaction
+        assert not dbmod.rollback_idle_transaction(conn, max_idle_seconds=999)
+        with dbmod._idle_tx_guard:
+            dbmod._idle_tx_seen[id(conn)] = _time.monotonic() - 1000
+        assert dbmod.rollback_idle_transaction(conn, max_idle_seconds=30)
+        assert not conn.in_transaction
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+    finally:
+        with dbmod._idle_tx_guard:
+            dbmod._idle_tx_seen.pop(id(conn), None)
+        conn.close()
+
+
 def test_lightning_armada(db):
     card(db, 101, 5, "11111111-1111-1111-1111-111111111112", "warzone",
          json.dumps([LIGHT]))
@@ -702,6 +732,8 @@ if __name__ == "__main__":
     run("Air Superiority buffs only Flyers", test_air_superiority_flight_aura)
     run("Oath of Valor uses stored name", test_oath_of_valor_stored_name)
     run("High Tomb Lord counts both crypts", test_high_tomb_lord_both_crypts)
+    run("Idle transaction watchdog rolls back open transaction",
+        test_idle_transaction_watchdog)
     run("Endbringer scales Rage with champions", test_endbringer_scaled_rage)
     run("Gortezuma checks opposing champion health",
         test_gortezuma_invincible_uses_opponent_health)

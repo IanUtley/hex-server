@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -676,7 +677,7 @@ def test_mulligan_priority_is_sent_to_both_clients():
         tournament_game.player_handlers = {1001: object(), 1002: object()}
         tournament_game._pvp_populate_game_state = lambda *args: None
         tournament_game._send_pvp_packet = lambda h, s, g, uid, label: \
-            packets.append(g)
+            packets.append((int(uid.uid64) >> 8, g))
         state = {"pvp": True, "pids": [1001, 1002], "champ_map": {}}
         tournament_game._pvp_push_mulligan_prompt(session, state, 1002)
     finally:
@@ -685,16 +686,98 @@ def test_mulligan_priority_is_sent_to_both_clients():
         tournament_game._pvp_populate_game_state = previous_populate
         tournament_game._send_pvp_packet = previous_send
 
-    assert len(packets) == 2
-    for game in packets:
+    # 2 mulligan packets + 2 "waiting on player" packets.
+    assert len(packets) == 4, [(pid, len(g.events)) for pid, g in packets]
+    mulligan_packets = [
+        (pid, game) for pid, game in packets
+        if any(isinstance(ev, game_engine.GreenLightSessionEventArgs)
+               for ev in game.events)]
+    assert len(mulligan_packets) == 2
+    for _pid, game in mulligan_packets:
         greenlights = [
             ev for ev in game.events
             if isinstance(ev, game_engine.GreenLightSessionEventArgs)
         ]
         assert len(greenlights) == 1
         assert int(greenlights[0].player_id.uid64) == ((1002 << 8) | 244)
+    # The opponent (1001) is told to wait on 1002; the actor (1002) gets a
+    # clear so its own dialog is not covered by the wait state.
+    waiting_by_target = {}
+    for pid, game in packets:
+        for ev in game.events:
+            if isinstance(ev, game_engine.WaitingOnPlayerSessionEventArgs):
+                waiting_by_target[pid] = int(ev.player_id.uid64)
+    assert waiting_by_target.get(1001) == ((1002 << 8) | 244), \
+        waiting_by_target
+    assert waiting_by_target.get(1002) == 0, waiting_by_target
     assert state["priority_pid"] == 1002
     print("PASS PvP mulligan priority broadcast")
+
+
+def test_mulligan_completion_reenables_both_clients():
+    """Finishing the mulligan must re-enable input for the client that was
+    disabled while waiting; otherwise its charge/pass buttons are dead."""
+    class Session:
+        session_id = 1
+        server_id = 100
+        turn_order = {}
+
+        def _persist(self):
+            pass
+
+    class Port:
+        def begin_pvp_turn(self):
+            pass
+
+    session = Session()
+    state = {"pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+             "champ_map": {}}
+    previous = {
+        "pids": tournament_game.db_game_session_pids,
+        "handlers": tournament_game.player_handlers,
+        "transition": tournament_game.port_mulligan_transition,
+        "attach": tournament_game.attach_pvp_rules_port,
+        "save": tournament_game.pvp_save_state,
+        "load": tournament_game.pvp_load_state,
+        "watchdog": tournament_game.pvp_start_priority_watchdog,
+        "send": tournament_game._send_pvp_packet,
+    }
+    packets = []
+    try:
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        tournament_game.player_handlers = {1001: object(), 1002: object()}
+        tournament_game.port_mulligan_transition = lambda *a, **k: {
+            "action": "start_turn", "next_player": None}
+        tournament_game.attach_pvp_rules_port = lambda *a, **k: Port()
+        tournament_game.pvp_save_state = lambda *a, **k: None
+        tournament_game.pvp_load_state = lambda _s: state
+        tournament_game.pvp_start_priority_watchdog = lambda _s: None
+        tournament_game._send_pvp_packet = lambda h, s, g, uid, label: \
+            packets.append((int(uid.uid64) >> 8, g))
+        assert tournament_game.pvp_mulligan_next(session, state, 1002) is False
+    finally:
+        tournament_game.db_game_session_pids = previous["pids"]
+        tournament_game.player_handlers = previous["handlers"]
+        tournament_game.port_mulligan_transition = previous["transition"]
+        tournament_game.attach_pvp_rules_port = previous["attach"]
+        tournament_game.pvp_save_state = previous["save"]
+        tournament_game.pvp_load_state = previous["load"]
+        tournament_game.pvp_start_priority_watchdog = previous["watchdog"]
+        tournament_game._send_pvp_packet = previous["send"]
+
+    disable_packets = [
+        (pid, game) for pid, game in packets
+        if any(isinstance(ev, game_engine.DisableInterfaceSessionEventArgs)
+               for ev in game.events)]
+    assert {pid for pid, _game in disable_packets} == {1001, 1002}
+    for _pid, game in disable_packets:
+        disables = [
+            ev for ev in game.events
+            if isinstance(ev, game_engine.DisableInterfaceSessionEventArgs)
+        ]
+        assert len(disables) == 1
+        assert disables[0].disabled is False
+    print("PASS PvP mulligan completion re-enables both clients")
 
 
 def test_phase_start_resolves_defender_before_turn_phase_triggers():
@@ -950,6 +1033,105 @@ def test_pvp_steadfast_attacker_stays_untapped():
     print("PASS PvP Steadfast attackers stay untapped")
 
 
+def test_pvp_choice_zone_target_resolves_child_then_parent():
+    """A charge-power Choosing pick targets its authored child, not a play.
+
+    ``rules_port.context.activate_ability`` pauses on the child's
+    "a card in the choice zone" target and stores a ``choice_zone_target``
+    continuation.  The PvP answer must resolve that child against the selected
+    token and then resume the enclosing ability — never route the token through
+    PlayChoiceCard (which would put it into PlayedResources instead of copying
+    it to hand).
+    """
+    class Session:
+        session_id = 1
+        server_id = 100
+        turn_order = {}
+
+        def _persist(self):
+            pass
+
+    pending = {
+        "kind": "choice_zone_target",
+        "choice_uids": [201, 202, 203],
+        "source_uid": 9001,
+        "owner_id": 1001,
+        "instance_id": 5,
+        "ability_guid": "d5b56bd5-child",
+        "continuation": {
+            "ability_guid": "d5b56bd5-child",
+            "source_uid": 9001,
+            "owner_id": 1001,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": 0,
+            "target_index": 0,
+        },
+        "parent": {
+            "ability_guid": "286f1891-parent",
+            "source_uid": 9001,
+            "owner_id": 1001,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": 3,
+        },
+    }
+    session = Session()
+    state = {"pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+             "phase": game_engine.ETurnPhases.EndTurn,
+             "pending_choice": pending}
+    session._rules_port_battle_state = state
+    calls = []
+
+    def _resolve(handler, game, sess, view, pl_t, ai_t, guid, source,
+                 owner, **kwargs):
+        calls.append((str(guid), source, int(owner),
+                      dict(kwargs.get("target_map") or {}),
+                      int(kwargs.get("resume_from_order", 0) or 0)))
+
+    previous = {
+        "pids": tournament_game.db_game_session_pids,
+        "resolve": tournament_game._pvp_resolve_ability,
+        "populate": tournament_game._pvp_populate_game_state,
+        "sync": tournament_game._pvp_sync_view_to_state,
+        "send": tournament_game._pvp_send_same_events,
+        "save": tournament_game.pvp_save_state,
+        "charge": tournament_game._pvp_gain_charge_trigger_game,
+    }
+    try:
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        tournament_game._pvp_resolve_ability = _resolve
+        tournament_game._pvp_populate_game_state = lambda *_a, **_k: None
+        tournament_game._pvp_sync_view_to_state = lambda *_a, **_k: None
+        tournament_game._pvp_send_same_events = lambda *_a, **_k: None
+        tournament_game.pvp_save_state = lambda *_a, **_k: None
+        tournament_game._pvp_gain_charge_trigger_game = lambda *_a, **_k: None
+        with mock.patch(
+                "rules_port.choice_effects.extract_card_uids",
+                return_value=[202]), \
+                mock.patch(
+                    "rules_port.context.EffectContext.from_rules_port",
+                    return_value=SimpleNamespace()):
+            handled = tournament_game._pvp_resolve_choice(
+                HandlerStub(tournament_game._db), session, b"", 1001)
+    finally:
+        tournament_game.db_game_session_pids = previous["pids"]
+        tournament_game._pvp_resolve_ability = previous["resolve"]
+        tournament_game._pvp_populate_game_state = previous["populate"]
+        tournament_game._pvp_sync_view_to_state = previous["sync"]
+        tournament_game._pvp_send_same_events = previous["send"]
+        tournament_game.pvp_save_state = previous["save"]
+        tournament_game._pvp_gain_charge_trigger_game = previous["charge"]
+    assert handled
+    assert [call[0] for call in calls] == [
+        "d5b56bd5-child", "286f1891-parent"], calls
+    # The selected token is bound to the authored child target index.
+    assert calls[0][3] == {0: 202}, calls
+    assert calls[1][4] == 3, calls
+    assert state.get("pending_choice") is None
+    print("PASS PvP choice-zone target resolves child then parent")
+
+
 if __name__ == "__main__":
     test_parity()
     test_pvp_combat_trigger_stays_on_authoritative_stack()
@@ -962,6 +1144,8 @@ if __name__ == "__main__":
     test_pvp_activation_summoning_sickness_only_applies_to_troops()
     test_pvp_hand_refresh_pushes_current_dynamic_cost()
     test_mulligan_priority_is_sent_to_both_clients()
+    test_mulligan_completion_reenables_both_clients()
     test_phase_start_resolves_defender_before_turn_phase_triggers()
     test_pvp_quick_action_handoff_updates_both_clients()
     test_pvp_steadfast_attacker_stays_untapped()
+    test_pvp_choice_zone_target_resolves_child_then_parent()

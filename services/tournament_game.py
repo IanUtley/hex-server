@@ -227,6 +227,36 @@ def pvp_discard_session_lock(session):
         _session_locks.pop(sid, None)
 
 
+# The C# ``AuthoritativeSession`` is a single per-game object shared by both
+# participants.  HConnect materializes a fresh ``GameSession`` wrapper per
+# request, so storing the native port on that wrapper (``_rules_port_session``)
+# gave each connection its own scheduler: the two threads restored separate
+# snapshots and clobbered each other's phase/priority (the first shard/card
+# play after mulligan was rejected).  Keep one shared port per game session so
+# both connections drive the same scheduler, exactly like the client.
+_pvp_ports = {}
+_pvp_ports_guard = threading.Lock()
+
+
+def pvp_shared_port(session):
+    sid = int(session.session_id)
+    with _pvp_ports_guard:
+        return _pvp_ports.get(sid)
+
+
+def set_pvp_shared_port(session, port):
+    sid = int(session.session_id)
+    with _pvp_ports_guard:
+        if port is None:
+            _pvp_ports.pop(sid, None)
+        else:
+            _pvp_ports[sid] = port
+
+
+def pvp_discard_shared_port(session):
+    set_pvp_shared_port(session, None)
+
+
 def _pvp_locked(fn):
     """Decorator: run `fn(...)` holding the per-session mutation lock, so both
     players' threads serialize their PvP state read-modify-write cycles for
@@ -303,6 +333,26 @@ def pvp_mulligan_next(session, state, just_acted_pid):
         # Start the server-side priority watchdog for clock flushing and
         # inactivity expiry. It does not send periodic client events.
         pvp_start_priority_watchdog(session)
+        # No dialog is open now; clear any "opponent is mulliganing" state.
+        _pvp_push_waiting_on(session, None)
+        # The sequential mulligan prompt disabled every client that was not the
+        # active mulliganer (_pvp_push_mulligan_prompt ->
+        # push_disable_interface).  Nothing else re-enables them, so the player
+        # who kept first is left with m_DisabledInput=true and every
+        # button-driven action (charge power, Pass) is silently dropped by
+        # UIBattle.HandleInputs until the inactivity timeout.  The first turn
+        # is live now, so re-enable both clients.
+        for pid in pids:
+            h = player_handlers.get(int(pid))
+            if not h:
+                continue
+            pt = _ge.UID.make(244, int(pid))
+            opp = _ge.UID.make(
+                244, int(pids[0]) if int(pid) == int(pids[1]) else int(pids[1]))
+            enable = _ge.Game(int(session.session_id), pt, opp)
+            enable.push_disable_interface(False)
+            _send_pvp_packet(h, session, enable, pt,
+                             "mulligan-end-enable-input")
         return False
     # Only one (or neither) has kept.  Ask the other player if they haven't
     # kept yet; otherwise (the other player already kept) re-ask the player
@@ -356,13 +406,22 @@ def _pvp_push_mulligan_prompt(session, state, ask_pid):
     pvp_save_state(session, state)
     log_req(f"    PvP mulligan: greenlight to pid {ask_pid} "
             f"(opponent {opp_pid} waiting)")
+    # Tell the other client the opponent is mulliganing.
+    _pvp_push_waiting_on(session, ask_pid)
 
 
 def pvp_load_state(session):
-    # Once RulesPort is attached, its shared battle-state dictionary is the
-    # object that SQLiteRulesSnapshot mutates during native persistence.  Read
-    # that same object here; preferring session.turn_order can resurrect an
-    # older projection after a native phase transition.
+    # A live game has ONE authoritative checkpoint shared by both connections.
+    # HConnect builds a fresh ``GameSession`` wrapper per request, so reading
+    # the wrapper's own ``_rules_port_battle_state``/``turn_order`` makes the
+    # two players diverge (a shard's charge/threshold landed in one wrapper's
+    # dict while the options refresh read another).  Resolve through the shared
+    # port when it exists so every wrapper sees the same dict.
+    port = getattr(session, "_rules_port_session", None)
+    if port is not None:
+        state = getattr(port, "_pvp_state", None)
+        if isinstance(state, dict) and state.get("pvp"):
+            return state
     shared = getattr(session, "_rules_port_battle_state", None)
     if isinstance(shared, dict) and shared.get("pvp"):
         return shared
@@ -371,6 +430,11 @@ def pvp_load_state(session):
 
 def pvp_save_state(session, state):
     if isinstance(state, dict) and state.get("pvp"):
+        # Publish to the shared port so both connections and every per-request
+        # wrapper operate on this one dict.
+        port = getattr(session, "_rules_port_session", None)
+        if port is not None:
+            port._pvp_state = state
         # Keep the PvP projection and the RulesPort snapshot on one mutable
         # root.  Without this assignment, SQLiteRulesSnapshot.save() can
         # persist a stale pre-rotation root and overwrite turn_order after a
@@ -581,8 +645,13 @@ def attach_pvp_rules_port(handler, session, game, state):
         state = authoritative
     if not isinstance(state, dict) or not state.get("pvp"):
         return None
-    cached = getattr(session, "_rules_port_session", None)
+    cached = (pvp_shared_port(session) or
+              getattr(session, "_rules_port_session", None))
     if cached is not None:
+        # Point this request wrapper at the shared port FIRST so
+        # ``pvp_load_state`` resolves the one authoritative checkpoint dict.
+        session._rules_port_session = cached
+        set_pvp_shared_port(session, cached)
         # A reconnect can materialize a fresh turn_order dictionary while the
         # native PvP session object remains cached. Refresh both its phase /
         # priority view and runtime facts before accepting another request;
@@ -590,9 +659,22 @@ def attach_pvp_rules_port(handler, session, game, state):
         live_state = pvp_load_state(session) or state
         live_state["_rules_port_attached"] = True
         session._rules_port_battle_state = live_state
-        sync = getattr(cached, "sync_from_pvp_state", None)
-        if callable(sync):
-            sync(live_state)
+        cached._pvp_state = live_state
+        # Record the request-scoped dispatch identity: the port's projections
+        # must attribute cost/resource/threshold changes to THIS handler, not
+        # the handler that happened to create the shared port.
+        cached._pvp_current_handler = handler
+        cached._pvp_current_session = session
+        # The shared port is the single live scheduler for this game, so its
+        # in-memory phase/priority are authoritative.  A request-scoped
+        # wrapper can have loaded ``turn_order`` before the other connection
+        # advanced the phase (e.g. the mulligan completion's first-turn
+        # drive); syncing the port FROM that stale checkpoint rolled it back
+        # to Ready/Prep and rejected the first shard/card play.  Project the
+        # port OUT to the checkpoint instead.
+        sync_out = getattr(cached, "sync_to_pvp_state", None)
+        if callable(sync_out):
+            sync_out(live_state)
         sink = getattr(cached, "event_sink", None)
         if sink is not None:
             sink.game = game
@@ -607,6 +689,11 @@ def attach_pvp_rules_port(handler, session, game, state):
                     if int(pid) != int(handler.client_reck_id)))
             except (AttributeError, StopIteration, TypeError, ValueError):
                 pass
+        # Keep the snapshot store pointed at the current wrapper, or persist()
+        # would write through a stale request-scoped session object.
+        snapshot = getattr(cached, "snapshot_store", None)
+        if snapshot is not None:
+            snapshot.game_session = session
         return cached
     from rules_port import (GameEngineEventSink, PvpAuthoritativeSession,
                             SQLiteRulesSnapshot, attach_pvp_runtime_facts)
@@ -660,7 +747,12 @@ def attach_pvp_rules_port(handler, session, game, state):
                                  if int(pid) != int(handler.client_reck_id)))
 
     def current_handler():
-        return getattr(session, "_rules_port_dispatch_handler", None) or handler
+        # The port is shared by both connections, so the request-scoped
+        # handler captured at creation is stale for the other player.  Use the
+        # handler recorded for the transaction currently being projected.
+        return (getattr(port, "_pvp_current_handler", None)
+                or getattr(session, "_rules_port_dispatch_handler", None)
+                or handler)
 
     def raw_transaction():
         command = getattr(session, "_rules_port_dispatch_command", None)
@@ -839,6 +931,23 @@ def attach_pvp_rules_port(handler, session, game, state):
         if plan.life:
             state[f"hp_{owner_id}"] = max(
                 0, int(state.get(f"hp_{owner_id}", 20) or 0) - int(plan.life))
+        # The PvE payer emits the pool-change events the client HUD listens
+        # for.  The native PvP payer only mutated the checkpoint, so a paid
+        # charge/spell point never animated (and the charge power button stayed
+        # lit).  Record the deltas and project them with the resolution events.
+        if (plan.resource or plan.charge_points or plan.spell_points or
+                plan.life):
+            state.setdefault("_pvp_paid_costs", []).append({
+                "owner_id": int(owner_id),
+                "resource": int(plan.resource or 0),
+                "charge": int(plan.charge_points or 0),
+                "spell": int(plan.spell_points or 0),
+                "life": int(plan.life or 0),
+                "res_new": int(state.get(f"res_{owner_id}", 0) or 0),
+                "chg_new": int(state.get(f"chg_{owner_id}", 0) or 0),
+                "sp_new": int(state.get(f"sp_{owner_id}", 0) or 0),
+                "hp_new": int(state.get(f"hp_{owner_id}", 20) or 0),
+            })
         if bool(getattr(costs, "exhausts_card_on_use", False)):
             source_uid = int(getattr(metadata, "source_uid", 0) or 0)
             db_set_card_state_or(session.session_id, source_uid,
@@ -883,6 +992,15 @@ def attach_pvp_rules_port(handler, session, game, state):
         # route_pvp_pass: that would create a second priority/chain authority.
         from rules_port.kernel import PriorityWindowAction
         live = pvp_load_state(session) or {}
+        # While an interactive prompt is open (e.g. Corinth's charge-power
+        # picker) the only valid client input is the answer.  A stray pass
+        # must not advance the phase out from under the picker.
+        if any(live.get(key) for key in (
+                "pending_choice", "pending_deck_search", "pending_trigger",
+                "pending_conversation", "pending_discard_ability")):
+            log_req("    PvP pass ignored while an interactive prompt is "
+                    "pending")
+            return True
         previous_phase = int(live.get("phase", 0) or 0)
         previous_priority = int(live.get("priority_pid", 0) or 0)
         if (port.action_stack.peek() is None and live.get("stack") and
@@ -920,6 +1038,27 @@ def attach_pvp_rules_port(handler, session, game, state):
             # chain, or entered the next phase. Project that result once.
             port.sync_to_pvp_state(live)
             pvp_save_state(session, live)
+            # Keep the native scheduler checkpoint in lockstep with the PvP
+            # projection.  Without this, the wire handoff can name the next
+            # player while a reconnect or the next transaction rehydrates the
+            # old PriorityWindowAction owner and rejects that player's pass.
+            try:
+                port.persist()
+            except Exception as exc:
+                log_req(f"    PvP RulesPort post-pass persistence failed: {exc}")
+            # A chain resolution can suspend on an interactive prompt (for
+            # example Corinth's charge power picks a card in the Choosing
+            # zone).  The prompt helper already sent the private picker and
+            # owns the next green light.  Pushing the ordinary priority
+            # handoff/phase options here would immediately tear that picker
+            # down, so leave priority with the pending input.
+            if any(live.get(key) for key in (
+                    "pending_choice", "pending_deck_search", "pending_trigger",
+                    "pending_conversation", "pending_discard_ability")):
+                pvp_save_state(session, live)
+                log_req("    PvP pass paused for pending input; priority "
+                        "handoff skipped")
+                return True
             # RulesPort owns the queue mutation, but the host still owns the
             # historical client event projection. Without this handoff the
             # next player never receives GreenLight after the first pass and
@@ -1061,6 +1200,8 @@ def attach_pvp_rules_port(handler, session, game, state):
                 session, original))
             if handled:
                 session._rules_port_mutation_emitted = True
+                # The play/draw choice is made; clear the opponent's wait.
+                _pvp_push_waiting_on(session, None)
             return handled
         except Exception as exc:
             log_req(f"    PvP setup mutation failed: {exc}")
@@ -1090,7 +1231,21 @@ def attach_pvp_rules_port(handler, session, game, state):
 
     def options(_transaction):
         live = pvp_load_state(session) or state
-        phase = int(live.get("phase", 0) or 0)
+        # The native scheduler owns the phase.  A client asking for a resync
+        # must be answered from the authoritative port, never by echoing a
+        # stale checkpoint back (that is how the client and server drifted).
+        # Align the checkpoint to the port so the projection and any reconnect
+        # agree.
+        phase = int(getattr(port, "current_turn_phase",
+                            live.get("phase", 0)) or 0)
+        live["phase"] = phase
+        priority = getattr(port.action_stack, "priority_player_id", None)
+        if priority is not None:
+            raw_priority = int(getattr(priority, "uid64", priority))
+            live["priority_pid"] = (raw_priority >> 8
+                                    if (raw_priority & 0xFF) == 244
+                                    else raw_priority)
+        pvp_save_state(session, live)
         if phase in (int(_ge.ETurnPhases.FirstMainPhase),
                      int(_ge.ETurnPhases.SecondMainPhase)):
             pvp_push_main_phase_options(session, live)
@@ -1142,7 +1297,11 @@ def attach_pvp_rules_port(handler, session, game, state):
     # that the native chain resolver is wired, rebuild the current projected
     # response window if this handler was materialized by reconnect.
     port.rehydrate_projected_chain()
+    port._pvp_current_handler = handler
+    port._pvp_current_session = session
+    port._pvp_state = state
     session._rules_port_session = port
+    set_pvp_shared_port(session, port)
     # ``restore_snapshot`` may have loaded a pre-migration native owner while
     # the PvP checkpoint has the current owner.  Persist the reconciled native
     # snapshot immediately so reconnect cannot resurrect that stale turn
@@ -1292,6 +1451,49 @@ def _pvp_populate_game_state(game, state, player_pid, opponent_pid):
     game.player_threshold = _pvp_state_thresholds(state, player_pid)
     game.ai_threshold = _pvp_state_thresholds(state, opponent_pid)
     game.turn_number = int(state.get("turn_number", 1))
+
+
+def _pvp_emit_paid_cost_events(game, state):
+    """Project deferred activation-cost pool changes onto the event stream.
+
+    ``native_activation_cost_payer`` pays the cost while the transaction is
+    still being classified, before the mode creates the resolution Game.  The
+    deltas are parked in the checkpoint and emitted here so both clients get
+    the ChampionChargePointsChanged / resource / spell-point HUD events.
+    """
+    pending = state.pop("_pvp_paid_costs", None)
+    if not pending:
+        return
+    for paid in pending:
+        uid = _ge.UID.make(244, int(paid.get("owner_id") or 0))
+        if paid.get("resource"):
+            ev = _ge.PlayerCurrentResourcePoolChangedSessionEventArgs()
+            ev.player_id = uid
+            ev.operation = 2
+            ev.delta = int(paid["resource"])
+            ev.new_value = int(paid.get("res_new", 0) or 0)
+            game._push(ev)
+        if paid.get("charge"):
+            ev = _ge.ChampionChargePointsChangedSessionEventArgs()
+            ev.player_id = uid
+            ev.operation = 2
+            ev.delta = int(paid["charge"])
+            ev.new_value = int(paid.get("chg_new", 0) or 0)
+            game._push(ev)
+        if paid.get("spell"):
+            ev = _ge.ChampionSpellPointsChangedSessionEventArgs()
+            ev.player_id = uid
+            ev.operation = 2
+            ev.delta = int(paid["spell"])
+            ev.new_value = int(paid.get("sp_new", 0) or 0)
+            game._push(ev)
+        if paid.get("life"):
+            ev = _ge.ChampionHealthChangedSessionEventArgs()
+            ev.player_id = uid
+            ev.operation = 2
+            ev.delta = int(paid["life"])
+            ev.new_value = int(paid.get("hp_new", 0) or 0)
+            game._push(ev)
 
 
 def _pvp_sync_view_to_state(state, view, player_pid, opponent_pid):
@@ -1840,13 +2042,16 @@ def _pvp_run_phase_start(session, state, phase):
             # phase notification.  Native PvP reaches EndPhase through the
             # RulesPort scheduler, so fire the semantic event here before
             # Discard/EndTurn and let the ordinary projected chain resolve.
+            # Mirrors C# ``EndPhaseState.OnEntry``: the event source is the
+            # active player's champion card.
             if (phase == _ge.ETurnPhases.EndPhase and
                     not state.get("turn_end_trigger_fired")):
+                end_champion_uid = int(champ_map.get(str(turn_uid), 0) or 0)
                 _pvp_dispatch_triggers(
                     phase_h, phase_game, session, phase_view,
                     _ge.UID.make(244, turn_uid),
-                    _ge.UID.make(244, defender_pid), "TurnEndedEvent", None,
-                    turn_uid)
+                    _ge.UID.make(244, defender_pid), "TurnEndedEvent",
+                    end_champion_uid or None, turn_uid)
                 state["turn_end_trigger_fired"] = True
             state["_last_turn_phase_event"] = phase_view.get(
                 "_last_turn_phase_event")
@@ -5583,6 +5788,7 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
     ai_t = _ge.UID.make(244, opponent_id)
     state.pop("pending_choice", None)
     state.pop("resolution_paused", None)
+    choice_zone_target = pending.get("kind") == "choice_zone_target"
     choice_zone_copy = pending.get("kind") == "choice_zone_copy"
     if choice_zone_copy:
         # Keep the selected original in Choosing while the child ability
@@ -5600,28 +5806,65 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
     choice_context = EffectContext.from_rules_port(
         g, session, _db, handler, pl_t, ai_t, view,
         "choice", ability=None)
-    if not choice_zone_copy and not _play_choice_card(
-            choice_context, chosen_uid, owner_id):
-        log_req(f"    PvP choice card no longer selectable: {chosen_uid}")
-        state["pending_choice"] = pending
-        state["resolution_paused"] = True
-        pvp_save_state(session, state)
-        return True
-    # The charge-power choices are templates to copy, not cards whose printed
-    # abilities should be cast while answering the picker.  Resolving those
-    # abilities here can require unrelated targets (for example GrantAbility)
-    # and abort the parent before its copy-to-hand effect runs.
-    if not choice_zone_copy:
-        _resolve_choice_card_abilities(
-            choice_context, chosen_uid, pending.get("source_uid"), owner_id)
+    if choice_zone_target:
+        # The authored child target opened the picker (e.g. Corinth's charge
+        # power, "a card in the choice zone").  Resolve that child against the
+        # selected token, then resume the enclosing ability so its later
+        # effect groups still run.  Mirrors the PvE choice_zone_target
+        # continuation; the selected card is only targeted, never "played".
+        continuation = pending.get("continuation") or {}
+        child_guid = str(continuation.get("ability_guid") or
+                         pending.get("ability_guid") or "").lower()
+        child_source = int(continuation.get(
+            "source_uid", pending.get("source_uid", 0)) or 0)
+        child_owner = int(continuation.get("owner_id", owner_id) or owner_id)
+        child_targets = {int(key): value for key, value in
+                         (continuation.get("target_map") or {}).items()}
+        child_targets[int(continuation.get("target_index", 0) or 0)] = \
+            int(chosen_uid)
+        _pvp_resolve_ability(
+            handler, g, session, view, pl_t, ai_t, child_guid,
+            child_source, child_owner, target_map=child_targets,
+            variables=continuation.get("variables") or {},
+            resume_from_order=int(
+                continuation.get("resume_effect_order", 0) or 0))
+        parent = pending.get("parent") or {}
+        parent_guid = str(parent.get("ability_guid") or "").lower()
+        if parent_guid and not state.get("pending_choice"):
+            _pvp_resolve_ability(
+                handler, g, session, view, pl_t, ai_t, parent_guid,
+                parent.get("source_uid"),
+                int(parent.get("owner_id", owner_id) or owner_id),
+                target_map={int(key): value for key, value in
+                            (parent.get("target_map") or {}).items()},
+                variables=parent.get("variables") or {},
+                resume_from_order=int(
+                    parent.get("resume_effect_order", 0) or 0))
+    else:
+        if not choice_zone_copy and not _play_choice_card(
+                choice_context, chosen_uid, owner_id):
+            log_req(f"    PvP choice card no longer selectable: {chosen_uid}")
+            state["pending_choice"] = pending
+            state["resolution_paused"] = True
+            pvp_save_state(session, state)
+            return True
+        # The charge-power choices are templates to copy, not cards whose
+        # printed abilities should be cast while answering the picker.
+        # Resolving those abilities here can require unrelated targets (for
+        # example GrantAbility) and abort the parent before its copy-to-hand
+        # effect runs.
+        if not choice_zone_copy:
+            _resolve_choice_card_abilities(
+                choice_context, chosen_uid, pending.get("source_uid"),
+                owner_id)
 
-    target_map = {int(key): value for key, value in
-                  (pending.get("target_map") or {}).items()}
-    _pvp_resolve_ability(
-        handler, g, session, view, pl_t, ai_t,
-        pending["ability_guid"], pending.get("source_uid"), owner_id,
-        target_map=target_map, variables=pending.get("variables") or {},
-        resume_from_order=int(pending.get("resume_effect_order", 0)))
+        target_map = {int(key): value for key, value in
+                      (pending.get("target_map") or {}).items()}
+        _pvp_resolve_ability(
+            handler, g, session, view, pl_t, ai_t,
+            pending["ability_guid"], pending.get("source_uid"), owner_id,
+            target_map=target_map, variables=pending.get("variables") or {},
+            resume_from_order=int(pending.get("resume_effect_order", 0)))
     if choice_zone_copy:
         view.pop("choice_copy_to_hand", None)
         from rules_port.choice_effects import _clear_choice_zone
@@ -5649,6 +5892,9 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid):
         log_req(f"    PvP choice selected: {hex(int(chosen_uid))}; "
                 "second choice pending")
         return True
+
+    # The chooser answered; clear the opponent's "opponent is choosing" state.
+    _pvp_push_waiting_on(session, None)
 
     if charge_trigger_game and state.get("stack"):
         _pvp_offer_trigger_response(session, state, owner_id)
@@ -6280,6 +6526,36 @@ def _send_pvp_packet(h, session, g, pl_uid, label):
         return False
 
 
+def _pvp_push_waiting_on(session, waiting_pid):
+    """Tell each client who the game is waiting on (class 79).
+
+    The acting player receives an invalid id (which clears their own waiting
+    state and must not cover their open dialog), while the other client is
+    told to wait on the acting player.  Pass ``None`` to clear both.
+    """
+    pids = [int(pid) for pid in
+            (db_game_session_pids(session.session_id) or [])]
+    if len(pids) < 2:
+        return
+    waiting_uid = (_ge.UID.make(244, int(waiting_pid))
+                   if waiting_pid else _ge.UID.invalid())
+    for pid in pids:
+        h = player_handlers.get(pid)
+        if not h:
+            continue
+        opp = next((value for value in pids if value != pid), pid)
+        g = _ge.Game(int(session.session_id), _ge.UID.make(244, pid),
+                     _ge.UID.make(244, opp))
+        # The acting player must not push BattleStateWait over their own
+        # picker; send them an explicit clear instead of the matching id.
+        if waiting_pid is not None and int(pid) == int(waiting_pid):
+            g.push_waiting_on_player(None)
+        else:
+            g.push_waiting_on_player(waiting_uid)
+        _send_pvp_packet(h, session, g, _ge.UID.make(244, pid),
+                         f"waiting-on-player(wait={waiting_pid or 'clear'})")
+
+
 def _pvp_push_reconnect_snapshot(handler, session, pid):
     """Restore the persisted PvP view for a reconnecting client.
 
@@ -6751,9 +7027,14 @@ def _pvp_end_game(session, state, winner_pid, loser_pid, reason=""):
         session.set_state("ended")
     except Exception:
         pass
-    # Free the per-session mutation lock now that the game is over.
+    # Free the per-session mutation lock and shared port now that the game is
+    # over.
     try:
         pvp_discard_session_lock(session)
+    except Exception:
+        pass
+    try:
+        pvp_discard_shared_port(session)
     except Exception:
         pass
     if tournament_complete:
@@ -7192,6 +7473,18 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
                 view["resolving_ability"] = ag
                 view["resolving_source_uid"] = src_uid
                 view["resolving_owner_id"] = owner_id
+                # Pay-cost HUD events (charge/resource/spell) must reach the
+                # client BEFORE any picker this BOM opens.  The client
+                # re-evaluates ability options when the charge changes and
+                # would otherwise close the chooser it just opened (the picker
+                # showed for ~1s then vanished).  Mirrors the client's own
+                # ordering where the cost is paid at activation, before the
+                # ability resolves.
+                cost_game = _ge.Game(int(session.session_id), pl_t, ai_t)
+                _pvp_populate_game_state(cost_game, state, owner_id, opp_pid)
+                _pvp_emit_paid_cost_events(cost_game, state)
+                if cost_game.events:
+                    _pvp_send_same_events(session, cost_game, pl_t, ai_t)
                 ability_event_start = len(g.events)
                 ability_player_health_before = int(view.get("player_health", 20))
                 ability_ai_health_before = int(view.get("ai_health", 20))
@@ -7330,6 +7623,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
         state["stack"] = view.get("stack") or []
         _pvp_sync_view_to_state(state, view, owner_id, opp_pid)
         pvp_save_state(session, state)
+    _pvp_emit_paid_cost_events(g, state)
     _pvp_send_same_events(session, g, pl_t, ai_t)
     if chain_empty and pending_discard:
         _pvp_push_discard_prompt(

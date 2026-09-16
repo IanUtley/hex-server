@@ -124,7 +124,13 @@ def summon_token(context, payload=None):
         # such as the charge power's AbilityConstant "Three".
         count = context.value("m_AmountField", default=None)
     if count is None:
-        count = context.template_value("m_Amount", 1)
+        # ``m_Amount`` is a typed EffectField (EffectInputVariable/Constant);
+        # resolve it rather than reading the raw template value, which is a
+        # dict for Conscript and made the count collapse to 0.
+        try:
+            count = context.value("m_Amount", 1)
+        except (TypeError, ValueError):
+            count = 1
     try:
         count = max(0, int(count or 0))
     except (TypeError, ValueError):
@@ -282,9 +288,16 @@ def create_token_copy(context):
     if count is None:
         count = context.template_value("m_NumberOfCards", None)
     if count is None:
+        # Records stores the typed count in m_InputValue (EffectConstant /
+        # EffectInputVariable, e.g. "Two"/"Four").  It was never read, so every
+        # "create two/four copies" created one.
+        try:
+            count = context.value("m_InputValue", None)
+        except (TypeError, ValueError):
+            count = None
+    if count is None:
         # The authored single-copy form omits a count field; the typed
-        # CreateTokenCopy contract defaults it to one.  Counted variants
-        # still provide m_Count/m_NumberOfCards and remain data-driven.
+        # CreateTokenCopy contract defaults it to one.
         count = 1
     try:
         count = max(1, int(count))

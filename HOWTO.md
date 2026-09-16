@@ -262,6 +262,12 @@ cost, target, and transaction identity before mutating state.
 - Hidden zones are filtered per recipient. The opponent must not receive card
   identity, hand contents, or private deck information unless an explicit game
   rule reveals it.
+- `DisableInterface(true)` latches client-side (`UIBattle.m_DisabledInput`) and
+  is only cleared by a later `DisableInterface(false)`. While latched,
+  `HandleInputs` silently drops every button action (charge power, Pass), though
+  mouse card clicks still work. Any flow that disables a client (e.g. the PvP
+  mulligan waiting player) must send `DisableInterface(false)` before handing
+  back control.
 
 ### ObjFmt minimum rules
 

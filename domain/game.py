@@ -657,6 +657,16 @@ class Game:
         self.interface_disabled = disabled
         self._push(ev)
 
+    def push_waiting_on_player(self, player_uid: UID):
+        """Publish which participant the game is waiting on (class 79).
+
+        The client shows its "waiting for opponent" state when the named
+        player is not the local player, so the same event reaches both.
+        """
+        ev = self._make_event(WaitingOnPlayerSessionEventArgs)
+        ev.player_id = player_uid if player_uid is not None else UID.invalid()
+        self._push(ev)
+
     def push_animation_trigger(self, trigger: int):
         """Queue the class-76 animation event consumed by the client."""
         ev = self._make_event(AnimationTriggerSessionEventArgs)

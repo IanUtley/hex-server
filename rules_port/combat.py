@@ -120,7 +120,12 @@ class Combat:
 
     def assign_damage_order(self, damage_order: Iterable[object]) -> bool:
         """Match C# swap-in-place behavior and reject foreign/extra blockers."""
-        for index, card_id in enumerate(damage_order):
+        order = list(damage_order)
+        # C# Session.AssignDamageOrder rejects an order that does not name
+        # every blocker exactly once before applying it.
+        if len(order) != len(self.blockers):
+            return False
+        for index, card_id in enumerate(order):
             if index >= len(self.blockers):
                 return False
             found = next((position for position, blocker in enumerate(self.blockers)
@@ -236,7 +241,14 @@ def _combat_damage(card) -> int:
 
 
 def _has_juggernaut(card) -> bool:
-    return bool(getattr(card, "juggernaut", getattr(card, "crush", False)))
+    """Trample/excess damage applies for the Juggernaught attribute or Crush.
+
+    ``_Combatant.juggernaut`` is a property that returns False when the
+    attribute is absent, so the previous ``getattr(card, "juggernaut",
+    getattr(card, "crush", False))`` never consulted the ``crush`` rule flag.
+    """
+    return bool(getattr(card, "juggernaut", False) or
+                getattr(card, "crush", False))
 
 
 class CombatResolver:

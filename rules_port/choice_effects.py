@@ -177,7 +177,10 @@ def double_choice(context):
         choices = _resource_guids(context.template_value("m_Choices", []))
         if not choices:
             return "double choice: no choices"
-        count = max(0, min(int(context.template_value("m_NumOptions", 0) or 0),
+        # ``m_NumOptions`` is an EffectConstant/EffectInputVariable, so it must
+        # be resolved through ``value`` (int(dict) raised TypeError and aborted
+        # the effect).
+        count = max(0, min(int(context.value("m_NumOptions", 0) or 0),
                            len(choices)))
         random_source = context.bstate.get("_rules_rng")
         remaining = list(choices)

@@ -537,8 +537,15 @@ class HCPHandler(ProfileStreamMixin):
         if session is not None and str(
                 getattr(session, "session_name", "") or "").startswith(
                     "tourney-"):
-            from services.tournament_game import attach_pvp_rules_port
-            return attach_pvp_rules_port(self, session, game, battle_state)
+            from services.tournament_game import (
+                attach_pvp_rules_port, pvp_session_lock)
+            # Serialize native port creation/sync with the mulligan
+            # completion's first-turn drive (which holds this same lock).
+            # Otherwise the other client can observe ``_rules_port_session``
+            # as None mid-drive and materialize a second port from a stale
+            # checkpoint, rolling the phase back to Ready/Prep.
+            with pvp_session_lock(session):
+                return attach_pvp_rules_port(self, session, game, battle_state)
         # Practice/PvE checkpoints always carry both champion health values.
         # A few re-entrant projections used to save a partial compatibility
         # dictionary (the observed row had ``player_health=0`` and no
@@ -824,6 +831,25 @@ class HCPHandler(ProfileStreamMixin):
                     live_state = load_state(
                         session, default=lambda: dict(battle_state))
                     facts.battle_state = live_state
+                    # Champion SessionCardIds are represented in the native
+                    # runtime facts, but they are not ordinary game_cards
+                    # ability-option rows.  Keep their authored catalog as
+                    # the source of truth; cost, threshold, phase, and
+                    # payment checks remain RulesPort-owned requirements.
+                    if db_is_champion_template(
+                            str(getattr(card, "template_guid", "")),
+                            conn=_db):
+                        from pvp_db import db_champion_ability_guids
+                        from gamedata import DEFAULT_RECORD_STORE, ability_graph
+                        guid = str(ability_guid).lower()
+                        champion_guids = {
+                            str(value).lower() for value in
+                            db_champion_ability_guids(
+                                str(card.template_guid), conn=_db)
+                        }
+                        graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+                        return (guid in champion_guids and graph is not None
+                                and bool(getattr(graph, "manual", False)))
                     affordable = self._affordable_troop_abilities(
                         session, live_state)
                     key = (int(card.session_card_id), str(card.template_guid))
@@ -1673,6 +1699,26 @@ class HCPHandler(ProfileStreamMixin):
             clear_stat_buffs=clear_stat_buffs)
 
     def _dispatch_rules_port_transaction(self, session, command, player_uid):
+        """Serialize tournament PvP dispatch under the per-session lock.
+
+        Both clients run on their own connection thread and mutate the same
+        native RulesPort object.  Without this lock a mulligan completion's
+        first-turn phase drive (which holds the lock) can interleave with the
+        other client's transaction, which then reads a mid-drive checkpoint and
+        rolls the durable phase back — the first shard/card play is rejected by
+        ``MainPhaseRequirement``/``PlayerHasPriorityRequirement``.
+        """
+        if session is not None and str(
+                getattr(session, "session_name", "") or "").startswith(
+                    "tourney-"):
+            from services.tournament_game import pvp_session_lock
+            with pvp_session_lock(session):
+                return self._dispatch_rules_port_transaction_locked(
+                    session, command, player_uid)
+        return self._dispatch_rules_port_transaction_locked(
+            session, command, player_uid)
+
+    def _dispatch_rules_port_transaction_locked(self, session, command, player_uid):
         """Resolve one explicitly typed command through the opt-in host."""
         port = getattr(session, "_rules_port_session", None)
         payload = getattr(command, "typed_payload", None)
@@ -1686,6 +1732,17 @@ class HCPHandler(ProfileStreamMixin):
         if port is None:
             log_req("    RulesPort skipped: no attached session host")
             return False
+        # The port is shared by both connections.  Pin the dispatch identity
+        # for the whole locked transaction so every projection (resource,
+        # threshold, charge, cost) is attributed to THIS player.
+        if session is not None and str(
+                getattr(session, "session_name", "") or "").startswith(
+                    "tourney-"):
+            try:
+                port._pvp_current_handler = self
+                port._pvp_current_session = session
+            except (AttributeError, TypeError):
+                pass
         # The shared battle checkpoint keeps ``phase_idx`` at the beginning
         # of the turn while the client is in the pre-game dialogs.  Mulligan
         # and play/draw requests are nevertheless authoritative phase
@@ -1944,7 +2001,11 @@ class HCPHandler(ProfileStreamMixin):
                     except Exception as exc:
                         failed.append(f"{type(requirement).__name__}:{exc}")
             log_req("    RulesPort rejected classified transaction"
-                    f" requirements={failed or 'phase/player/handler'}")
+                    f" requirements={failed or 'phase/player/handler'}"
+                    f" native_phase={port.current_turn_phase!r}"
+                    f" native_priority="
+                    f"{port.action_stack.priority_player_id!r}"
+                    f" active={port.active_player_id!r}")
             if getattr(rejected, "kind", "") == "pass_priority":
                 try:
                     action = port.action_stack.peek()
@@ -2031,6 +2092,56 @@ class HCPHandler(ProfileStreamMixin):
             session._rules_port_mutation_emitted = False
             if game is not None and not emitted:
                     self._send_battle_events(session, game, player_uid)
+            # A manual champion activation leaves a chain item pending.  The
+            # native resolver emits the mutation packet, but the PvP adapter
+            # still owns the client-facing response window.  Project the
+            # current ResolveTopOfChain GreenLight to both clients or the
+            # charge is paid while neither client receives a pass window.
+            if (getattr(command, "is_ability_activate", False) and
+                    (session.session_name or "").startswith("tourney-")):
+                try:
+                    from services.tournament_game import (
+                        _pvp_populate_game_state, _send_pvp_packet,
+                        player_handlers, pvp_load_state,
+                    )
+                    live_pvp = pvp_load_state(session) or {}
+                    if live_pvp.get("stack") or not port.chain.is_empty:
+                        pids = [int(value) for value in
+                                (live_pvp.get("pids") or ())]
+                        priority_pid = int(live_pvp.get("priority_pid") or 0)
+                        if len(pids) == 2 and priority_pid in pids:
+                            phase = port.current_turn_phase
+                            turn_pid = int(live_pvp.get("turn_pid") or
+                                            priority_pid)
+                            for target_pid in pids:
+                                target_h = player_handlers.get(target_pid)
+                                if not target_h:
+                                    continue
+                                other_pid = next(pid for pid in pids
+                                                 if pid != target_pid)
+                                target_uid = game_engine.UID.make(244, target_pid)
+                                other_uid = game_engine.UID.make(244, other_pid)
+                                window = game_engine.Game(
+                                    int(session.session_id), target_uid,
+                                    other_uid)
+                                _pvp_populate_game_state(
+                                    window, live_pvp, target_pid, other_pid)
+                                window.push_turn_phase(
+                                    phase,
+                                    game_engine.UID.make(244, turn_pid),
+                                    game_engine.UID.make(244, priority_pid))
+                                window.push_green_light(
+                                    game_engine.UID.make(244, priority_pid),
+                                    game_engine.EPriorityContext.ResolveTopOfChain)
+                                _send_pvp_packet(
+                                    target_h, session, window, target_uid,
+                                    "rules-port-ability-priority")
+                            log_req(
+                                f"    PvP RulesPort ability priority window: "
+                                f"pid={priority_pid} phase={phase}")
+                except Exception as exc:
+                    log_req(
+                        f"    PvP RulesPort ability priority projection failed: {exc}")
             # A completed manual ability returns to the same main-phase
             # priority window.  The legacy ability handler rebuilt the
             # PlayerOptionList at that boundary, but the RulesPort action
@@ -4447,6 +4558,9 @@ class HCPHandler(ProfileStreamMixin):
             if prompt_handler is not None:
                 _send_pvp_packet(prompt_handler, session, private, chooser,
                                  "choice")
+            # Tell the opponent this player is choosing a card.
+            from services.tournament_game import _pvp_push_waiting_on
+            _pvp_push_waiting_on(session, chooser_id)
             return
         _be.save_state(session, bstate)
         build_prompt(game, pl_t)
@@ -17559,7 +17673,13 @@ class HCPHandler(ProfileStreamMixin):
         # SpinWheelOfFate (2049) — chest spinning
         elif data_type == 2049:
             chest_id_raw = inner_obj.get("ChestID", "0")
-            chest_uid = int(chest_id_raw) if chest_id_raw.isdigit() else 0
+            # ObjFmt may decode the integer ChestID as either a Python int or
+            # a string, depending on the request shape.  Normalize both forms
+            # at the protocol boundary instead of calling string-only APIs.
+            try:
+                chest_uid = int(chest_id_raw)
+            except (TypeError, ValueError):
+                chest_uid = 0
             chest_db_id = chest_uid - 9000 if chest_uid >= 9000 else 0
             log_req(f">>> SpinWheelOfFate: ChestID={chest_uid} db_id={chest_db_id}")
 
@@ -17979,6 +18099,11 @@ bind_runtime_globals(globals())
 def main():
     global _reload_requested
     enable_debugpy(log)
+    try:
+        from db import start_lock_watchdog
+        start_lock_watchdog()
+    except Exception as _exc:
+        log(f"Could not start DB lock watchdog: {_exc}")
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

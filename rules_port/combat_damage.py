@@ -50,6 +50,8 @@ class _Combatant:
     is_troop: bool = True
     in_warzone: bool = True
     damage_champion_multiplier: int = 1
+    damage_multiplier: int = 1
+    combat_damage_multiplier: int = 1
     rule_flags: set = None
 
     @property
@@ -58,7 +60,12 @@ class _Combatant:
 
     @property
     def combat_damage(self):
-        return self.attack
+        # C# Card.CalculateTotalCombatDamageToDeal: attack x DamageMultiplier
+        # x CombatDamageMultiplier (card and champion).  The champion factors
+        # are folded in by the caller when known.
+        return max(0, int(self.attack) *
+                   max(0, int(self.damage_multiplier or 1)) *
+                   max(0, int(self.combat_damage_multiplier or 1)))
 
     @property
     def firststrike(self):
@@ -90,12 +97,17 @@ class _Combatant:
 def _fact(db, session_id, uid, battle_state=None):
     from pvp_db import db_card_location, db_card_source_info
     from .static_rules import effective_stats
+    from .combat_rules import card_int_attr
     values = effective_stats(db, session_id, battle_state or {}, int(uid))
     if not db_card_source_info(session_id, int(uid), conn=db):
         return None
     return _Combatant(
         int(uid), attack=max(0, int(values[0] or 0)),
         attributes=int(values[2] or 0), rule_flags=set(values[3] or ()),
+        damage_multiplier=max(0, card_int_attr(
+            db, session_id, int(uid), "DamageMultiplier")) or 1,
+        combat_damage_multiplier=max(0, card_int_attr(
+            db, session_id, int(uid), "CombatDamageMultiplier")) or 1,
         in_warzone=str(db_card_location(session_id, int(uid), conn=db) or "").lower() == "warzone")
 
 
@@ -141,11 +153,15 @@ def resolve(context, *, first_strike=False, attacker_key="player_attackers",
         old_source = context.bstate.get("resolving_source_uid")
         old_combat = context.bstate.get("combat_damage")
 
-        def damage(source, target, amount, _minimum):
+        def damage(source, target, amount, only_minimum):
             source_uid = int(getattr(source, "uid", source))
             target_uid = int(getattr(target, "uid", target))
             allocated = int(amount or 0)
-            if getattr(target, "is_troop", False):
+            # C# DamageCard(onlyDoMinimumToKill): the attacker's excess damage
+            # is held back only while more blockers remain.  For the last
+            # blocker (or a Juggernaut) the full remaining damage is dealt, so
+            # clamping unconditionally under-reported the damage event.
+            if getattr(target, "is_troop", False) and only_minimum:
                 from .static_rules import effective_stats
                 stats = effective_stats(
                     context.db, context.session.session_id,

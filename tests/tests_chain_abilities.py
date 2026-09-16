@@ -916,6 +916,51 @@ def test_incantation_of_fear_counter_on_opposing_crypt_entry(db):
     assert counters.get("incantation", 0) >= 1, counters
 
 
+def test_pvp_champion_trigger_discovery_uses_raw_participant_id(db):
+    """PvP champion triggers must resolve from the raw participant id.
+
+    ``champion_holders`` compared the PvP owner against the local
+    ``user_profile["id"]``, so Corinth's end-of-turn ability (daf1ed04) was
+    never discovered and ``Shifted Paradigm`` never fired.  In PvP the owner
+    is the raw participant id, matching the C# ``EndPhaseState.OnEntry``
+    champion source.
+    """
+    from rules_port.trigger_discovery import RecordsTriggerDiscovery
+    champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS champion_abilities ("
+        "champion_guid TEXT, champion_name TEXT, ability_guid TEXT, "
+        "ability_name TEXT DEFAULT '', charge_cost INTEGER DEFAULT 0, "
+        "spell_cost INTEGER DEFAULT 0, threshold_colors TEXT DEFAULT '', "
+        "game_text TEXT DEFAULT '', casting_behavior INTEGER DEFAULT 0, "
+        "thresholds_json TEXT DEFAULT '[]', "
+        "target_template_ids TEXT DEFAULT '[]')")
+    db.execute(
+        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "ability_guid) VALUES (?,?,?)",
+        (champion_guid, "Corinth the Iconoclast", ability_guid))
+    db.execute(
+        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "VALUES (?,?)",
+        (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
+    add_card(db, 9001, 1001, champion_guid, loc="warzone")
+    db.execute("UPDATE game_cards SET is_champion=1 WHERE card_uid=9001")
+    db.commit()
+    session = SessionStub()
+    handler = HandlerStub(db)
+    # The local DB id deliberately differs from the raw participant id.
+    handler.user_profile = {"id": 999999}
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 9001, "1002": 9002}}
+    candidates = RecordsTriggerDiscovery(
+        db, handler, session, game_engine.UID.make(244, 1001),
+        game_engine.UID.make(244, 1002), bstate).discover(
+            "TurnEndedEvent", 9001, 1001)
+    found = {int(c.source_uid): list(c.ability_guids) for c in candidates}
+    assert ability_guid in found.get(9001, []), found
+
+
 def _main():
     tests = (test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
@@ -940,7 +985,8 @@ def _main():
              test_state_based_death_includes_static_defense,
              test_troop_artifact_can_attack,
              test_unblockable_attacker_cannot_be_blocked,
-             test_incantation_of_fear_counter_on_opposing_crypt_entry)
+             test_incantation_of_fear_counter_on_opposing_crypt_entry,
+             test_pvp_champion_trigger_discovery_uses_raw_participant_id)
     failed = 0
     for fn in tests:
         db = make_db()

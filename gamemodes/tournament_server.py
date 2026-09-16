@@ -298,6 +298,11 @@ def _scheduler_loop():
 
 def start():
     global _scheduler_running
+    try:
+        from db import start_lock_watchdog
+        start_lock_watchdog()
+    except Exception as _exc:
+        print(f"[tournament_server] Could not start DB lock watchdog: {_exc}")
     _cleanup_old_state(force=True)
     cleared = _tournament_db.db_tournament_clear_orphaned_searches()
     if cleared:

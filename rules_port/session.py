@@ -367,6 +367,30 @@ class RulesTransaction:
                        *(XCostRequirement(item) for item in data)))
 
 
+def projected_ability_ignores_chain(descriptor) -> bool:
+    """Resolve authored ``m_IgnoresChain`` for a projected chain item.
+
+    A projected ability carries only its activation projection, not the
+    Records graph.  The client's ``PriorityWindowAction.Update`` completes
+    immediately when the chain's top ability ignores the chain, so the native
+    scheduler must agree: otherwise the ability waits on a response window the
+    client will never service and its BOM (and any picker) never resolves.
+    """
+    if not isinstance(descriptor, Mapping):
+        return False
+    if "ignores_chain" in descriptor:
+        return bool(descriptor.get("ignores_chain"))
+    guid = str(descriptor.get("ability_guid") or "").lower()
+    if not guid:
+        return False
+    try:
+        from gamedata import DEFAULT_RECORD_STORE, ability_graph
+        graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+    except Exception:
+        return False
+    return bool(graph and getattr(graph, "ignores_chain", False))
+
+
 @dataclass
 class ProjectedChainAbility:
     """Native chain identity for a mode-owned card projection.
@@ -393,7 +417,7 @@ class ProjectedChainAbility:
 
     @property
     def ignores_chain(self):
-        return False
+        return projected_ability_ignores_chain(self.descriptor)
 
     @property
     def is_triggered(self):
@@ -622,6 +646,10 @@ class AuthoritativeSession:
         self._transaction_handlers: Dict[str, Callable[[RulesTransaction], bool]] = {}
         self._trigger_handler: Optional[Callable[[object], None]] = None
         self._state_based_handler: Optional[Callable[[], bool]] = None
+        # C# Session.cardsReadyToPlay: cards a host/effect chose to play
+        # without an ordinary client transaction, finalized on the next tick.
+        self._cards_ready_to_play: list[dict[str, Any]] = []
+        self._card_finisher: Optional[Callable[[dict[str, Any]], bool]] = None
         self._turn_start_resolver: Optional[Callable[[], object]] = None
         self._turn_boundary_resolver: Optional[Callable[[object], object]] = None
         self._turn_phase_entry_resolver: Optional[Callable[[object], object]] = None
@@ -1322,6 +1350,40 @@ class AuthoritativeSession:
             if self._trigger_handler is not None:
                 self._trigger_handler(event)
 
+    def set_card_finisher(self, resolver) -> None:
+        """Register the host finalizer for queued ready-to-play cards."""
+        self._card_finisher = resolver
+
+    def queue_card_ready_to_play(self, card_uid, player_id, ability=None) -> None:
+        """Port of ``Session.PrepareToPlayCard`` (queue a deferred play)."""
+        self._cards_ready_to_play.append({
+            "card_uid": int(card_uid),
+            "player_id": player_id,
+            "ability": ability,
+        })
+
+    def finish_playing_cards(self) -> bool:
+        """Port of ``Session.FinishPlayingCards``.
+
+        A card put into the ready-to-play queue is finalized here on the next
+        scheduler tick, so its zone/state projection matches the C# ordering.
+        """
+        if not self._cards_ready_to_play:
+            return False
+        queue = list(self._cards_ready_to_play)
+        self._cards_ready_to_play.clear()
+        finisher = self._card_finisher
+        if finisher is None:
+            return False
+        progressed = False
+        for item in queue:
+            try:
+                if finisher(item):
+                    progressed = True
+            except Exception:
+                continue
+        return progressed
+
     def handle_transaction(self) -> bool:
         if not self._transactions:
             return False
@@ -1435,6 +1497,16 @@ class AuthoritativeSession:
                 if combat is None:
                     return False
                 staged.append(combat)
+        # C# ``CommitTroopsToAttackTransaction.Resolve`` declares the attacks,
+        # sorts the combats, then calls ``session.DoPassPriorityTransaction()``.
+        # The declarations are already staged in the combat manager above, so
+        # consume the active player's ``DeclareAttack`` priority window BEFORE
+        # the host projection drives the phase boundary.  Passing only in the
+        # no-resolver branch left the window waiting in the live host, so the
+        # phase never advanced to ``DeclareAttackPriorityWindow`` and the client
+        # stayed stuck in Select Attackers.
+        if self.action_stack.priority_player_id == transaction.player_id:
+            self.pass_player_priority(transaction.player_id)
         resolver = self.projection("attack_transaction")
         if resolver is not None:
             handled = bool(resolver(transaction))
@@ -1442,8 +1514,6 @@ class AuthoritativeSession:
                 for combat in staged:
                     self.combat_manager.remove_combat(combat.combat_id)
             return handled
-        if self.action_stack.priority_player_id == transaction.player_id:
-            return self.pass_player_priority(transaction.player_id)
         return True
 
     def _resolve_commit_troops_to_defense(self, transaction: RulesTransaction) -> bool:
@@ -1461,6 +1531,12 @@ class AuthoritativeSession:
                 if not combat.declare_blockers(blockers):
                     return False
                 staged.append((combat, tuple(blockers)))
+        # C# ``CommitTroopsToDefenseTransaction.Resolve`` commits the blockers
+        # and then calls ``session.DoPassPriorityTransaction()``; the defender's
+        # ``DeclareDefense`` window must be consumed before the host projection
+        # drives the next boundary (see ``_resolve_commit_troops_to_attack``).
+        if self.action_stack.priority_player_id == transaction.player_id:
+            self.pass_player_priority(transaction.player_id)
         resolver = self.projection("defense_transaction")
         if resolver is not None:
             handled = bool(resolver(transaction))
@@ -1471,18 +1547,6 @@ class AuthoritativeSession:
                                       CombatFlags.ATTACK_BLOCKED |
                                       CombatFlags.DAMAGE_ASSIGNED)
             return handled
-        for attacker_id, blocker_ids in transaction.payload.get("declarations", ()):
-            attacker = self.get_card(attacker_id)
-            combats = self.combat_manager.combats_with_attacker(attacker)
-            if not combats:
-                return False
-            blockers = tuple(self.get_card(card_id) for card_id in blocker_ids)
-            if any(card is None for card in blockers):
-                return False
-            for combat in combats:
-                combat.declare_blockers(blockers)
-        if self.action_stack.priority_player_id == transaction.player_id:
-            return self.pass_player_priority(transaction.player_id)
         return True
 
     def _resolve_card_transaction(self, transaction: RulesTransaction) -> bool:
@@ -1686,6 +1750,9 @@ class AuthoritativeSession:
         once validated, combat identity and declaration belong to the shared
         combat manager rather than the transport handler.
         """
+        # Compare across raw/typed UID domains; a strict ``!=`` rejected the
+        # client's CommitTroopsToAttack when the wire carried the raw id.
+        player_id = self.coerce_transaction_player_id(player_id)
         if player_id != self.active_player_id:
             return None
         existing = self.combat_manager.combat_for_attacker(attacking_card)
@@ -2080,6 +2147,23 @@ class AuthoritativeSession:
                 same_chain_item = False
             if same_chain_item:
                 return False
+        elif isinstance(top, ResolveTopOfChainAction):
+            # The chain item is already in its resolve lifecycle: the response
+            # window above it was consumed by the last pass and only the
+            # resolver remains.  The interrupted phase window BENEATH it must
+            # be preserved.  Clearing the stack here dropped FirstMainPhase, so
+            # once the item resolved the stack was empty and
+            # ``advance_turn_phase`` moved the turn on even though the player
+            # had merely resolved their own spell.
+            try:
+                same_chain_item = (
+                    int(getattr(getattr(top, "ability", None),
+                                "instance_id", -1)) ==
+                    int(getattr(ability, "instance_id", -2)))
+            except (TypeError, ValueError):
+                same_chain_item = False
+            if same_chain_item:
+                return False
 
         # The chain is authoritative here; any ordinary phase action is stale
         # relative to it. Recreate the same LIFO pair used by
@@ -2133,12 +2217,27 @@ class AuthoritativeSession:
             first_player_id=self.action_stack.priority_player_id)
         return instance_id in self.chain._instance_ids
 
+    def chain_can_resolve(self) -> bool:
+        """Port of ``TurnPhaseState.ChainCanResolve`` for the live phase."""
+        state = self.phase_states.get(phase_name(self.current_turn_phase))
+        return True if state is None else state.chain_can_resolve()
+
     def tick(self) -> bool:
         """Perform one C#-ordered scheduler step; never await a UI callback."""
         if self.terminated or phase_name(self.current_turn_phase) == "NotPlaying":
             return False
         if self._state_based_handler is not None and self._state_based_handler():
             return True
+        # C# InternalTick2 drains the trigger queue and finishes queued plays
+        # only when the phase permits chain resolution and no chain action owns
+        # the top of the stack.
+        from .kernel import PriorityWindowAction
+        if (self.chain_can_resolve() and
+                (self.action_stack.count == 0 or
+                 isinstance(self.action_stack.peek(), PriorityWindowAction))):
+            self.handle_game_event()
+            if self.finish_playing_cards():
+                return True
         if self.action_stack.count == 0:
             return self.advance_turn_phase() is not None
         if self.action_stack.update():

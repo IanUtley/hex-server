@@ -1521,6 +1521,37 @@ def test_shards_randomly_reinsert_into_deck(db):
         dbmod._db = old_db
 
 
+def test_single_card_reinsert_stays_within_deck(db):
+    """Re-randomizing an already-in-deck card must keep it in range.
+
+    The "put into deck" leaf moves the card into the deck before calling
+    ``db_randomly_insert_deck_cards``, so the single-card fast path must
+    exclude it before choosing a slot instead of leaving a gap past the end.
+    """
+    import db as dbmod
+    old_db = dbmod._db
+    dbmod._db = db
+    try:
+        for uid in range(600, 605):
+            add_card(db, uid, 5, "00e13fdf-b2c3-4fe7-a064-ce4481b24e8d",
+                     loc="deck")
+        db.executemany(
+            "UPDATE game_cards SET position=? WHERE card_uid=?",
+            [(uid - 600, uid) for uid in range(600, 605)])
+        db.commit()
+        for _ in range(100):
+            dbmod.db_randomly_insert_deck_cards(1, 5, [602])
+            rows = db.execute(
+                "SELECT card_uid, position FROM game_cards "
+                "WHERE session_id=1 AND user_id=5 AND location='deck' "
+                "ORDER BY position").fetchall()
+            positions = sorted(int(pos) for _uid, pos in rows)
+            assert positions == list(range(len(rows))), positions
+            assert any(int(uid) == 602 for uid, _pos in rows), rows
+    finally:
+        dbmod._db = old_db
+
+
 def test_incubation_slave_egg_summon_and_sacrifice(db):
     """Incubation Slave's manual ability (cost 6, auto 'You' target): remove
     all egg counters, sacrifice the slave, summon one Spiderspawn per egg."""
@@ -1867,6 +1898,8 @@ def main():
          test_chlorophyllia_pvp_view_persists_resource_state),
         ("Shards randomly reinsert into deck",
          test_shards_randomly_reinsert_into_deck),
+        ("Single-card reinsert stays within deck",
+         test_single_card_reinsert_stays_within_deck),
     ]
     failed = 0
     for name, fn in tests:

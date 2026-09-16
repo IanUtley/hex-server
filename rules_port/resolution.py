@@ -9,28 +9,177 @@ def _random_target_sample(candidates, count, battle_state):
     """Port of ``AbilityTargetTemplate.FilterRandomTargets``.
 
     A random auto-target resolves from the full legal pool but the effect
-    applies to at most ``count`` cards chosen with the session RNG.  The C#
-    client does a partial Fisher-Yates: for ``i`` from ``n`` down to
-    ``n - count + 1`` it picks ``rng.Next(i)``, swaps that slot with slot
-    ``i-1`` and keeps the picked card.  Reproducing the swap (rather than a
-    plain ``pop``) keeps the RNG call sequence and pool state identical to the
-    client for replay parity.
+    applies to at most ``count`` cards chosen with the session RNG.  ``count``
+    of 0 or less means "unlimited" (C# ``GetMaximumTargetCount`` returns
+    ``int.MaxValue`` when unset).  The C# client does a partial Fisher-Yates:
+    for ``i`` from ``n`` down to ``n - count + 1`` it picks ``rng.Next(i)``,
+    swaps that slot with slot ``i-1`` and keeps the picked card.  The loop
+    always runs (even when it consumes the whole pool), so the RNG call
+    sequence matches the client for replay parity.
     """
     pool = list(candidates)
     total = len(pool)
-    count = max(1, int(count or 1))
-    if total <= count:
-        return tuple(pool)
+    if total == 0:
+        return ()
+    count = int(count or 0)
+    wanted = total if count <= 0 else min(total, count)
     rng = (battle_state or {}).get("_rules_rng")
-    if rng is not None and hasattr(rng, "next"):
-        picked = []
-        for i in range(total, total - count, -1):
-            index = int(rng.next(i)) % i
-            picked.append(pool[index])
-            pool[index] = pool[i - 1]
-        return tuple(picked)
-    import random
-    return tuple(random.sample(pool, count))
+    if rng is None or not hasattr(rng, "next"):
+        import random
+        return tuple(random.sample(pool, wanted))
+    picked = []
+    for i in range(total, total - wanted, -1):
+        index = int(rng.next(i)) % i
+        picked.append(pool[index])
+        pool[index] = pool[i - 1]
+    return tuple(picked)
+
+
+_LIST_ATTR_BY_KIND = {
+    "SourceDrawnTargetTemplate": "DrawnCards",
+    "SourceBuriedTargetTemplate": "BuriedCards",
+    "AbilityCreatedTargetTemplate": "CreatedCards",
+    "VoidedTargetTemplate": "VoidedCards",
+}
+
+
+def _uids(values):
+    out = []
+    for value in values or ():
+        try:
+            if value is not None:
+                out.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return tuple(out)
+
+
+def _list_target_values(battle_state, ability, kind, source_uid):
+    """Resolve the per-ability stored/drawn/buried/voided/created card lists.
+
+    C# SourceStored/Drawn/Buried/Created/VoidedTargetTemplate enumerate the
+    authored ``ListAttrs`` recorded on the ability instance (or the card).
+    The port previously left these kinds empty, so "the card you stored /
+    voided / created" resolved to no target.
+    """
+    state = battle_state or {}
+    raw_guid = str(getattr(ability, "ability_template_id", "") or "")
+    guid = raw_guid.lower()
+    if kind == "SourceStoredTargetTemplate":
+        stored = state.get("stored_targets") or {}
+        turn = state.get("stored_targets_this_turn") or {}
+        values = stored.get(guid, stored.get(raw_guid, ()))
+        if not values:
+            values = turn.get(guid, turn.get(raw_guid, ()))
+        return _uids(values)
+    list_name = _LIST_ATTR_BY_KIND.get(kind, "")
+    lists = state.get("list_attrs") or {}
+    entries = (lists.get(guid) or {}).get(list_name) or []
+    out = []
+    for entry in entries:
+        uid = (entry.get("source_uid", entry.get("Id", entry.get("id")))
+               if isinstance(entry, dict) else entry)
+        try:
+            if uid is not None:
+                out.append(int(uid))
+        except (TypeError, ValueError):
+            continue
+    if not out and kind == "VoidedTargetTemplate":
+        voided = state.get("voided_by") or {}
+        for uid, sources in voided.items():
+            try:
+                if int(source_uid or 0) in {int(s) for s in (sources or ())}:
+                    out.append(int(uid))
+            except (TypeError, ValueError):
+                continue
+    return tuple(out)
+
+
+def _shares_subtype(left, right):
+    left = {part.strip().lower() for part in str(left or "").split() if part.strip()}
+    right = {part.strip().lower() for part in str(right or "").split() if part.strip()}
+    return bool(left & right)
+
+
+def _match_secondary_values(db, session_id, ability, effect, target_spec,
+                            battle_state):
+    """Port of ``MatchSecondaryTargetTemplate.EnumerateLegalTargets``.
+
+    Emits the legal cards that are related to the contingent effect's resolved
+    target under the authored SameCost/SameOwner/SharesRace/DoesntShareRace/
+    SameName/CantBePreviousTarget flags.  The port previously resolved this
+    template as "every card in the collection".
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    rec = DEFAULT_RECORD_STORE.get("AbilityTargetTemplate", target_spec.guid)
+    if rec is None:
+        return ()
+
+    def flag(name):
+        try:
+            return bool(rec.field(name))
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    same_cost = flag("m_SameCost")
+    same_owner = flag("m_SameOwner")
+    shares_race = flag("m_SharesRace")
+    doesnt_share_race = flag("m_DoesntShareRace")
+    same_name = flag("m_SameName")
+    cant_be_prev = flag("m_CantBePreviousTarget")
+    if not (same_cost or same_owner or shares_race or doesnt_share_race or
+            same_name or cant_be_prev):
+        return ()
+    sec = int(effect.get("secondary_target_index", -1) or -1) \
+        if isinstance(effect, dict) else int(
+            getattr(effect, "secondary_target_index", -1) or -1)
+    if sec < 0:
+        return ()
+    raw = ability.activation.target_map.get(
+        sec, ability.activation.target_map.get(str(sec), ()))
+    if not isinstance(raw, (tuple, list, set)):
+        raw = (raw,)
+    from .targeting import legal_targets, _source_card
+    secondary = []
+    for value in raw:
+        if value is None:
+            continue
+        view = _source_card(db, session_id, int(value),
+                            ability.responsible_player_id)
+        if view:
+            secondary.append((int(value), view))
+    if not secondary:
+        return ()
+    candidates = legal_targets(
+        db, session_id, ability.responsible_player_id, target_spec.guid,
+        ability.source_uid, both_players=True, battle_state=battle_state)
+    out = []
+    for uid in candidates:
+        view = _source_card(db, session_id, int(uid),
+                            ability.responsible_player_id)
+        if not view:
+            continue
+        for other_uid, other in secondary:
+            if cant_be_prev and int(uid) == other_uid:
+                continue
+            if same_cost and int(view.get("cost") or 0) != int(
+                    other.get("cost") or 0):
+                continue
+            if same_owner and int(view.get("user_id") or 0) != int(
+                    other.get("user_id") or 0):
+                continue
+            if same_name and str(view.get("name") or "").lower() != str(
+                    other.get("name") or "").lower():
+                continue
+            if shares_race and not _shares_subtype(
+                    view.get("subtype"), other.get("subtype")):
+                continue
+            if doesnt_share_race and _shares_subtype(
+                    view.get("subtype"), other.get("subtype")):
+                continue
+            out.append(int(uid))
+            break
+    return tuple(out)
 
 
 class NativeEffectBackend:
@@ -132,21 +281,49 @@ class NativeEffectBackend:
                             if target_spec.is_random:
                                 candidates = _random_target_sample(
                                     candidates,
-                                    max(1, int(target_spec.maximum or 1)),
+                                    int(target_spec.resolved_maximum(
+                                        ability.activation.variables) or 0),
                                     battle_state)
                                 target_values = candidates
                             else:
-                                maximum = int(target_spec.maximum or 0)
+                                maximum = int(target_spec.resolved_maximum(
+                                    ability.activation.variables) or 0)
                                 target_values = (candidates[:maximum]
                                                  if maximum > 0 else candidates[:1])
-                        elif kind in ("AbilityTriggerCardTargetTemplate",
-                                      "SourceDrawnTargetTemplate",
-                                      "SourceBuriedTargetTemplate"):
+                        elif kind == "AbilityTriggerCardTargetTemplate":
                             target_values = (battle_state.get(
                                 "resolving_trigger_target_uid"),)
+                        elif kind in ("SourceDrawnTargetTemplate",
+                                      "SourceBuriedTargetTemplate",
+                                      "SourceStoredTargetTemplate",
+                                      "AbilityCreatedTargetTemplate",
+                                      "VoidedTargetTemplate"):
+                            target_values = _list_target_values(
+                                battle_state, ability, kind,
+                                ability.source_uid)
+                        elif kind == "SecondaryTargetTemplate":
+                            # C# SecondaryTargetTemplate: the input cards are
+                            # the resolved outputs of the contingent effect's
+                            # target (m_SecondaryTargetIndex), filtered by the
+                            # template card filter.
+                            sec = int(field(effect, "secondary_target_index", -1))
+                            raw = ()
+                            if sec >= 0:
+                                raw = ability.activation.target_map.get(
+                                    sec, ability.activation.target_map.get(
+                                        str(sec), ()))
+                            if not isinstance(raw, (tuple, list, set)):
+                                raw = (raw,)
+                            target_values = tuple(
+                                int(value) for value in raw if value is not None)
+                        elif kind == "MatchSecondaryTargetTemplate":
+                            target_values = _match_secondary_values(
+                                db, session.session_id, ability, effect,
+                                target_spec, battle_state)
                         elif target_spec.is_auto:
-                            both_players = str(target_spec.player_filter or "").lower() in (
-                                "multipleplayers", "allplayers")
+                            from .targeting import target_uses_both_players
+                            both_players = target_uses_both_players(
+                                db, target_spec.guid)
                             candidates = tuple(legal_targets(
                                 db, session.session_id,
                                 int(ability.responsible_player_id or 0),
@@ -163,13 +340,16 @@ class NativeEffectBackend:
                                 # moved the entire deck into hand.
                                 candidates = _random_target_sample(
                                     candidates,
-                                    max(1, int(target_spec.maximum or 1)),
+                                    int(target_spec.resolved_maximum(
+                                        ability.activation.variables) or 0),
                                     battle_state)
-                            elif int(target_spec.maximum or 0) > 0 and \
-                                    len(candidates) > int(target_spec.maximum):
-                                # C# GetAutoTargets truncates a non-random
-                                # auto-target to GetMaximumTargetCount.
-                                candidates = candidates[:int(target_spec.maximum)]
+                            else:
+                                _max = int(target_spec.resolved_maximum(
+                                    ability.activation.variables) or 0)
+                                if _max > 0 and len(candidates) > _max:
+                                    # C# GetAutoTargets truncates a non-random
+                                    # auto-target to GetMaximumTargetCount.
+                                    candidates = candidates[:_max]
                             target_values = candidates
                         elif target_spec.target_kind == "SourceRevealedTargetTemplate":
                             from .targeting import revealed_target_uids

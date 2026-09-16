@@ -66,7 +66,6 @@ OPP_ALWAYS_STOPS = {game_engine.ETurnPhases.DeclareDefense}
 SELF_DEFAULT_STOPS = {
     game_engine.ETurnPhases.FirstMainPhase,
     game_engine.ETurnPhases.SecondMainPhase,
-    game_engine.ETurnPhases.DeclareCombatPriorityWindow,
     game_engine.ETurnPhases.DeclareAttackPriorityWindow,
     game_engine.ETurnPhases.DeclareDefensePriorityWindow,
 }
@@ -195,7 +194,6 @@ def is_self_stop(state, phase):
     defaults = {
         game_engine.ETurnPhases.FirstMainPhase,
         game_engine.ETurnPhases.SecondMainPhase,
-        game_engine.ETurnPhases.DeclareCombatPriorityWindow,
         game_engine.ETurnPhases.DeclareAttackPriorityWindow,
         game_engine.ETurnPhases.DeclareDefensePriorityWindow,
     }

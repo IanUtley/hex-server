@@ -388,8 +388,28 @@ class PvpRuntimeFacts:
         )
         return plan is not None
 
+    def _resolved_owner_id(self, player_id) -> int:
+        """Map a transaction participant onto the ``game_cards.user_id`` domain.
+
+        ``game_cards`` stores the profile/reckoning id for the human (and 0
+        for the Practice AI) while the transaction carries the typed
+        ServicePlayer UID, so a raw ``_raw_player_id`` comparison rejects the
+        owner's own troops.  The attach seam supplies both ids; fall back to
+        the raw UID for standalone kernel tests.
+        """
+        if self.battle_state.get("pvp"):
+            return _raw_player_id(player_id)
+        request_uid = getattr(self, "client_player_uid", self.player_uid)
+        owner_id = getattr(self, "player_owner_id", None)
+        if _raw_player_id(player_id) != _raw_player_id(request_uid):
+            owner_id = getattr(self, "ai_owner_id", None)
+        if owner_id is None:
+            owner_id = _raw_player_id(player_id)
+        return int(owner_id)
+
     def can_attack(self, attacker: RuntimeCard, defender: RuntimeCard, player_id) -> bool:
-        return (attacker.owner_id == _raw_player_id(player_id) and
+        from .combat_rules import card_int_attr
+        if not (attacker.owner_id == self._resolved_owner_id(player_id) and
                 attacker.in_warzone and attacker.is_troop and
                 not attacker.is_tapped() and
                 # Summoned troops carry CameOutThisTurn until the next turn;
@@ -399,16 +419,40 @@ class PvpRuntimeFacts:
                 not bool(attacker.attributes & ECardAttributes.CantAttack) and
                 # Champion SessionCardIds are synthetic (not game_cards
                 # rows), so ``defender`` is None for the normal face.
-                (defender is None or defender.owner_id != attacker.owner_id))
+                (defender is None or defender.owner_id != attacker.owner_id)):
+            return False
+        # C# Card.CanAttack: a Defensive troop cannot attack unless it carries
+        # the IgnoresDefensive int-attribute.
+        if (bool(attacker.attributes & ECardAttributes.Defensive) and
+                card_int_attr(None, self.session_id,
+                              attacker.session_card_id,
+                              "IgnoresDefensive") <= 0):
+            return False
+        return True
 
     def validate_blocks(self, session, declarations, player_id) -> bool:
-        """Conservative equivalent of C# ``AreDefenseDeclarationsLegal``."""
+        """Port of ``Session.AreDefenseDeclarationsLegal``.
+
+        Each declared pair must satisfy the full ``Card.CanBlock(attacker)``
+        predicate (Flight/SkyGuard, block restrictions and immunities) and the
+        Feral "two or more troops" restriction.  The previous conservative
+        check accepted flying/restricted blocks.
+        """
+        from .combat_rules import can_block, card_int_attr
+        state = self.battle_state or {}
         seen: set[int] = set()
+        declared: dict[int, int] = {}
         for attacker_id, blocker_ids in declarations:
             attacker = session.get_card(attacker_id)
             if attacker is None or not session.combat_manager.combats_with_attacker(attacker):
                 return False
-            for blocker_id in blocker_ids:
+            try:
+                attacker_key = int(getattr(attacker_id, "uid64", attacker_id))
+            except (TypeError, ValueError):
+                return False
+            blockers = list(blocker_ids)
+            declared[attacker_key] = declared.get(attacker_key, 0) + len(blockers)
+            for blocker_id in blockers:
                 try:
                     blocker_key = int(getattr(blocker_id, "uid64", blocker_id))
                 except (TypeError, ValueError):
@@ -420,7 +464,15 @@ class PvpRuntimeFacts:
                         blocker.is_tapped() or
                         bool(blocker.attributes & ECardAttributes.CantBlock)):
                     return False
+                if not can_block(None, self.session_id, state,
+                                 attacker_key, blocker_key):
+                    return False
                 seen.add(blocker_key)
+        # C# Feral (IntAttrs): an attacker can only be blocked by 2+ troops.
+        for attacker_key, count in declared.items():
+            if 0 < count < 2 and card_int_attr(
+                    None, self.session_id, attacker_key, "Feral") > 0:
+                return False
         return True
 
     def validate_x_cost(self, player_id, activation_data) -> bool:
