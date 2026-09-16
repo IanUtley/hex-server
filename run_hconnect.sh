@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="/home/ianutley/Hex"
+# Resolve the repository/image root from this launcher so the same script works
+# both from the checkout and from the Docker image (where it lives under /hex).
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 if [[ "${HEX_DEBUGPY:-0}" =~ ^(1|true|yes|on)$ ]]; then
     DEBUGPY_BIN="${HEX_DEBUGPY_BIN:-}"
