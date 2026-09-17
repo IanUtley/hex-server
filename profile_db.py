@@ -111,6 +111,35 @@ def db_get_or_create_user(name, steam_id=None, conn=None):
             "level": 1, "flags": "{}"}
 
 
+def db_reset_account(user_id, conn=None):
+    """Reset mutable account/game state and apply fresh-player grants."""
+    import new_player
+    connection = _profile_connection(conn)
+    uid = int(user_id)
+    connection.execute(
+        "DELETE FROM game_sessions WHERE owner_uid=? OR players_json LIKE ? OR session_id IN "
+        "(SELECT DISTINCT session_id FROM game_cards WHERE user_id=? OR owner_user_id=?)",
+        (str(uid), f"%{uid}%", uid, uid))
+    connection.execute(
+        "DELETE FROM game_cards WHERE user_id=? OR owner_user_id=?", (uid, uid))
+    for table in ("arena_state", "campaigns", "card_instances", "champions",
+                  "collections", "decks", "emails", "fra_challengers",
+                  "friend_requests", "friends", "ignored_players",
+                  "player_inventory", "stardust", "store_purchases",
+                  "treasure_chests", "user_prefs", "chat_messages",
+                  "tournament_decks", "tournament_signups"):
+        try:
+            connection.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+        except Exception:
+            pass
+    connection.execute(
+        "UPDATE users SET gold=0, platinum=0, experience=0, level=1, flags='{}' "
+        "WHERE id=?", (uid,))
+    new_player.grant_new_player(connection, uid)
+    if conn is None:
+        connection.commit()
+
+
 # --- Social persistence ----------------------------------------------------
 
 def db_get_friends(user_id, conn=None):
@@ -658,6 +687,17 @@ def db_get_decks(user_id, conn=None):
             for row in rows]
 
 
+def db_deck_sleeve(deck_id, user_id=None, conn=None):
+    """Return the selected sleeve for a saved deck."""
+    sql = "SELECT deck_sleeve_guid FROM decks WHERE id=?"
+    params = [int(deck_id)]
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(int(user_id))
+    row = _profile_connection(conn).execute(sql, params).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def db_find_mail_recipient(name, conn=None):
     """Find a mail recipient by full identity or display name."""
     if not name:
@@ -1126,9 +1166,10 @@ def db_redeem_code(code, conn=None):
         "SELECT id, gold_delta, platinum_delta, uses, max_uses "
         "FROM redeem_codes WHERE code=?", (code,)).fetchone()
     if not row:
-        return {"redeemed": False, "error_message": "invalid-code"}
+        return {"redeemed": False, "error_message": "Invalid redeem code."}
     if _row_value(row, "uses", 3) >= _row_value(row, "max_uses", 4):
-        return {"redeemed": False, "error_message": "expired-code"}
+        return {"redeemed": False,
+                "error_message": "This redeem code has already been redeemed or expired."}
     connection.execute("UPDATE redeem_codes SET uses=uses+1 WHERE id=?",
                        (_row_value(row, "id", 0),))
     if conn is None:

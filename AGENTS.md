@@ -9,6 +9,11 @@ stashing all changes.**  Doing so will silently discard all in-progress work
 across the entire file, requiring careful re-application of every edit.  Always
 `git stash` or `git commit` first.
 
+Limit the amount of tests you write to only cover key areas. Do not create test
+cases per card.
+
+Do not run all tests. Try and limit tests to just the single test created.
+
 Key files:
 - `hconnect_server.py` — Main HConnect protocol server (port 9933)
 - `proxy.py` — HTTP proxy for Steam auth (port 8081)
@@ -39,6 +44,8 @@ block).
 Note, try not to hard code logic for individual cards in the engine, but rather be data driven from the game_card table, and any and all options and event arguments be based upon the amility/targetting and other fields from within the gamedata for the card and stored in card_template, or against a dynamic version of the card currently in game_card. ONLY USE card_text AS A LAST RESORT.
 
 When fixing a card in either PVP or PVE mode, consider how it should work in the alternate mode, and if a choice is involved, ask the user how it should work in the other mode, then implement the fix for both PVP and PVE.
+
+Ensure any code blocks/functions implemented are thread-safe.
 
 Use `bash restart.sh` to restart the server after changes to
 `hconnect_server.py`. If changes only touched reloadable modules (e.g.

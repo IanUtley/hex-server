@@ -350,7 +350,15 @@ def _resource_modifier(context, effect):
     owner = context.target_owner(target, default=None)
     if owner is None:
         owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
-    side = "player" if owner else "ai"
+    # Practice uses ``0`` for the AI owner, while PvP uses raw participant
+    # IDs for both players.  Truthiness therefore cannot identify the side in
+    # a PvP effect view; map the resolved owner against the view's ordered
+    # participant IDs instead.
+    if context.bstate.get("pvp"):
+        pids = [int(pid) for pid in (context.bstate.get("pids") or ())]
+        side = "player" if pids and int(owner) == pids[0] else "ai"
+    else:
+        side = "player" if owner else "ai"
     color = 0
     if property_name == "threshold":
         shard = str(param.get("shard") or "").rsplit(".", 1)[-1].lower()
@@ -363,6 +371,23 @@ def _resource_modifier(context, effect):
         context.game, context.session, context.bstate,
         context.player_uid, context.ai_uid, side, property_name, amount,
         color=color)
+    # TurnStarted triggers resolve before the following Prep refill. Preserve
+    # positive temporary current-resource gains so Prep restores the normal
+    # total and then reapplies the authored bonus (for example Lithe
+    # Lyricist's +1 current resource).
+    if property_name == "currentresource" and amount > 0:
+        import game_engine
+        phase = context.bstate.get("phase")
+        if phase == game_engine.ETurnPhases.StartTurn:
+            owner_id = int(owner or 0)
+            if context.bstate.get("pvp"):
+                bonus_key = f"start_turn_resource_bonus_{owner_id}"
+            else:
+                bonus_key = ("start_turn_resource_bonus_player"
+                             if owner_id else
+                             "start_turn_resource_bonus_ai")
+            context.bstate[bonus_key] = int(
+                context.bstate.get(bonus_key, 0) or 0) + int(amount)
     label = {"currentresource": "resources",
              "totalresource": "total",
              "chargepoints": "charges",
@@ -484,6 +509,7 @@ def _heal_hero(context, target, param):
         event.old_damage_value = current
         event.new_damage_value = new_value
         context.game._push(event)
+        context.emit_champion_healed(owner, current, new_value)
     return f"healed {side} {current}->{new_value}"
 
 
@@ -583,9 +609,22 @@ def _tap(context):
     targets = _targets(context)
     if targets is None:
         return None
+    from pvp_db import db_card_owner_id
+    from .combat_rules import card_int_attr
+    resolving = int(context.bstate.get("resolving_owner_id", 0) or 0)
+    tapped = 0
     for target in targets:
+        # C# TapCardAbilityEffectTemplate: CantBeExhaustedByOpponent blocks an
+        # opponent-authored exhaust.
+        if card_int_attr(context.db, context.session.session_id, int(target),
+                         "CantBeExhaustedByOpponent") > 0:
+            owner = db_card_owner_id(
+                context.session.session_id, int(target), conn=context.db)
+            if owner is not None and int(owner) != resolving:
+                continue
         context.update_card_state(
             target, add=game_engine.ECardStates.Tapped,
             trigger="CardTappedEvent", commit=False)
+        tapped += 1
     context.db.commit()
-    return f"tapped {len(targets)}"
+    return f"tapped {tapped}"

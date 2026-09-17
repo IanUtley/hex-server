@@ -241,6 +241,34 @@ def test_malfunctioning_war_bot_hits_a_random_champion_at_turn_start(db):
                for ev in game.events)
 
 
+def test_native_resource_modifier_maps_pvp_owner_to_effect_view_side(db):
+    """A PvP owner ID is not an AI sentinel; map it through the view pids."""
+    from types import SimpleNamespace
+    from rules_port.effects import _resource_modifier
+    from rules_port import resources
+
+    calls = []
+
+    def project(*args, **kwargs):
+        calls.append((args[5], args[6], args[7]))
+        return SimpleNamespace(old_value=0, new_value=1)
+
+    context = SimpleNamespace(
+        bstate={"pvp": True, "pids": [1001, 1002],
+                "resolving_owner_id": 1002},
+        effect_guid="c002e375-b897-4d97-431a-4a16217659c3",
+        game=object(), session=object(), db=object(), player_uid=object(),
+        ai_uid=object(),
+        resolved_target=lambda: 1002,
+        target_owner=lambda target, default=None: 1002,
+        modifier_value=lambda *args: 1,
+    )
+    with mock.patch.object(resources, "project_resource_change", project):
+        _resource_modifier(context, {"param": json.dumps(
+            {"property": "currentresource", "amount": 1})})
+    assert calls == [("ai", "currentresource", 1)]
+
+
 def test_argus_hand_trigger_fires_at_turn_start(db):
     """Argus's hand-based start-of-turn trigger must be discovered in PvP."""
     from abilities.framework.triggers import resolve_triggers
@@ -1838,6 +1866,8 @@ def main():
          test_twisted_fate_buries_opposing_pvp_deck),
         ("Malfunctioning War Bot turn-start damage",
          test_malfunctioning_war_bot_hits_a_random_champion_at_turn_start),
+        ("Native PvP resource modifier owner mapping",
+         test_native_resource_modifier_maps_pvp_owner_to_effect_view_side),
         ("Argus reveals itself and gets cost reduction",
          test_argus_hand_trigger_fires_at_turn_start),
         ("Charge Bot Deploy gains a charge",

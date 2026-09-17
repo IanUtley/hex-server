@@ -59,6 +59,33 @@ def surface_source_is_underground(db, session, card_uid):
         session.session_id, card_uid, conn=db) or "").lower() == "underground"
 
 
+def resolve_surface(context, card_uid):
+    """Resolve the client-built-in Surface ability through free card play.
+
+    Surface is not an authored Records graph.  Its client definition grants
+    the buried card Speed for the turn and plays that same card for free, so
+    it must enter the normal free-play chain rather than the metadata resolver.
+    """
+    if not surface_source_is_underground(context.db, context.session, card_uid):
+        return "surface: source is no longer underground"
+    from pvp_db import db_card_chain_info, db_card_owner_zone_state
+    try:
+        card_uid = int(card_uid)
+    except (TypeError, ValueError):
+        return "surface: invalid source"
+    row = db_card_chain_info(
+        context.session.session_id, card_uid, conn=context.db)
+    owner_zone = db_card_owner_zone_state(
+        context.session.session_id, card_uid, conn=context.db)
+    if not row or not owner_zone:
+        return "surface: source not found"
+    from .host_mutations import queue_free_played_card
+    return queue_free_played_card(
+        context.handler, context.game, context.session, context.db,
+        context.player_uid, context.ai_uid, context.bstate, card_uid,
+        int(owner_zone[0] or 0), row[0], row[1])
+
+
 def _saved_int_attrs(db, session_id, card_uid):
     from pvp_db import db_card_mutation_field
     try:

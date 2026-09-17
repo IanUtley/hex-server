@@ -204,6 +204,12 @@ class CombatManager:
         """C# ``CombatManager.CombatCaresAboutPhase`` over live combatants."""
         for combat in self.combats:
             combatants = ((combat.attacker,) + tuple(combat.blockers))
+            # A declared combat always has a normal damage step.  Runtime
+            # facts can lag the DB projection for an AI declaration and report
+            # the attacker as outside the warzone; using that stale location
+            # to remove AssignDamage skips the attack entirely.
+            if phase == CombatPhase.STANDARD and combat.attacker is not None:
+                return True
             if any(card is not None and _in_warzone(card) and
                    _cares_about_phase(card, phase) for card in combatants):
                 return True

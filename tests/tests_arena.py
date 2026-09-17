@@ -63,6 +63,23 @@ def test_fixed_elite_positions_and_known_bosses():
     assert len({encounter_family(item) for item in selected.values()}) == 20
 
 
+def test_empty_round_challenge_is_encoded_as_zero_guid():
+    import services.arena as arena_service
+    import encoder
+
+    fields = {
+        name: value
+        for name, _type_name, value in arena_service._arena_fight_fields(
+            {"round_challenge": ""})
+    }
+    guid_fields = {
+        name: value
+        for name, _type_name, value in fields["RoundChallenge"][1]
+    }
+    assert guid_fields["m_Guid"] == arena_service._ZERO_GUID
+    assert encoder._wire_guid("") == arena_service._ZERO_GUID
+
+
 def test_cashout_sends_empty_roster_refresh():
     """Cash-out must clear ArenaClient's persistent fighter-list cache."""
     import services.arena as arena_service

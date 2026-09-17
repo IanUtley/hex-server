@@ -109,6 +109,34 @@ def test_typed_activation_target_instances_become_port_target_lists():
     assert player_payload["activation_data"][0]["target_map"] == {0: [0xF401]}
 
 
+def test_typed_activation_keeps_raw_sacrifice_when_target_map_decodes_first():
+    """A separate XCostData sacrifice must survive TargetMap decoding.
+
+    The generic ObjFmt walker can expose the effect target and stop before
+    ``CardsToSacrifice``.  Raw recovery still sees both labelled card lists;
+    merging those views must leave the cost target distinct from the +2/+2
+    target.
+    """
+    from types import SimpleNamespace
+
+    raw = (
+        b"AbilityActivationData;SourceCardId;m_UID64;0;0;0;0101000000000000;"
+        b"AbilityTemplateId;eac96648-be59-4f36-0ba3-59117efc8138;"
+        b"TargetMap;m_UID64;0;0;0;0102000000000000;"
+        b"CardsToSacrifice;m_UID64;0;0;0;0103000000000000;"
+    )
+    command = SimpleNamespace(is_ability_activate=True)
+    payload = typed_payload_from_decoded(command, {
+        "__raw__": raw,
+        "AbilityActivationData": {
+            "TargetMap": {"0": [0x201]},
+        },
+    })
+    activation = payload["activation_data"]
+    assert activation["target_map"] == {0: [0x201]}
+    assert activation["cost_target_map"] == {0: [0x301]}
+
+
 def test_typed_activation_x_cost_data_maps_resource_cost():
     payload = typed_payload_from_decoded(None, {
         "m_AbilityActivationData": [{

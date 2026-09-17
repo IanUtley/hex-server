@@ -5,6 +5,7 @@ All commands receive the handler instance (self) for DB access, event sending, e
 import struct as _struct
 import json as _json
 import sys as _sys
+from pathlib import Path as _Path
 
 import game_engine
 import game_session
@@ -92,6 +93,24 @@ def reload_runtime_modules():
     hc = _sys.modules.get("__main__")
     if hc is None or not hasattr(hc, "player_handlers"):
         import hconnect_server as hc
+    # hconnect_server.py itself is intentionally not reloaded while clients
+    # are connected. Rebind profile helpers added to its legacy handler so a
+    # SIGUSR1 reload can still expose newly imported DB APIs.
+    hc.db_get_store_item = profile_db_module.db_get_store_item
+    # HCPHandler inherits ProfileStreamMixin at server import time. Reloading
+    # application.profile_stream alone creates a new mixin class, but cannot
+    # change methods already copied onto the live handler class. Rebind those
+    # methods explicitly so SIGUSR1 fixes profile-stream code without a full
+    # socket restart.
+    profile_stream_module = importlib.import_module("application.profile_stream")
+    handler_cls = getattr(hc, "HCPHandler", None)
+    mixin_cls = getattr(profile_stream_module, "ProfileStreamMixin", None)
+    rebound = 0
+    if handler_cls is not None and mixin_cls is not None:
+        for name, value in vars(mixin_cls).items():
+            if not name.startswith("__") and callable(value):
+                setattr(handler_cls, name, value)
+                rebound += 1
     hc.tournament_server = ts
     hc.campaign = campaign
     hc.player_handlers = te.player_handlers
@@ -105,8 +124,9 @@ def reload_runtime_modules():
     hc.start_waiting_room_game = te.start_waiting_room_game
     hc._encode_enter_tournament_error = te._encode_enter_tournament_error
     hc._make_deck_data = te._make_deck_data
-    return (f"Reloaded {len(reloaded)} runtime modules + tournament globals "
-            "rebound: " + ", ".join(reloaded))
+    return (f"Reloaded {len(reloaded)} runtime modules + {rebound} "
+            "ProfileStream methods + tournament globals rebound: "
+            + ", ".join(reloaded))
 
 
 def _chat_card_link(name, template_guid):
@@ -115,15 +135,98 @@ def _chat_card_link(name, template_guid):
             f"CardLink_Tooltip);][{name}][/url]")
 
 
+def _version_command():
+    """Return the repository version without requiring the debug console."""
+    try:
+        return (_Path(__file__).with_name("VERSION").read_text(
+            encoding="utf-8").strip())
+    except OSError:
+        return "Version unavailable"
+
+
+def _arena_clear_command(handler):
+    """Reset the caller's Frost Ring Arena run outside debug mode."""
+    from pve_db import db_clear_arena_run
+    db_clear_arena_run(handler.user_profile["id"], conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return "Arena run cleared"
+
+
+def _account_cleanup_command(handler):
+    from profile_db import db_reset_account
+    user_id = int(handler.user_profile["id"])
+    db_reset_account(user_id, conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    # Keep this live handler consistent with the reset profile.
+    handler.user_profile.update({
+        "gold": 10000, "platinum": 10000, "experience": 0,
+        "level": 1, "flags": "{}"})
+    return "Account reset to new-player state"
+
+
+def _public_help_command():
+    return "Available commands: !help, !version, !arena-cleanup, !account-cleanup"
+
+
+def _full_help_lines():
+    """Return the developer command help without requiring a game session."""
+    return [
+        "=== Commands ===",
+        "!version — show the server version",
+        "!arena-cleanup — clear your Frost Ring Arena run",
+        "!game_end victory|defeat — end the campaign battle (test win/loss)",
+        "!hand — list cards in hand (name [id])",
+        "!playable [id|name ...] — set golden outlines (no args = all)",
+        "!gencard <name> — generate a copy of a card template to your hand",
+        "!addcard <name|id> — draw the next copy of that card from your deck",
+        "!threshold[/thresholds] [me|opp] C B R S W D — set 6 threshold counts",
+        "!resource [/resource] [me|opp] <current> <maximum> — set resources",
+        "!charge [me|opp] <N> — set champion charges",
+        "!spellpoints [me|opp] <N> — set champion spell points",
+        "!health [me|opp] <N> — set champion health",
+        "!pass — advance turn phase",
+        "!phase <Name> — jump to phase",
+        "!draw N — draw N cards",
+        "!top <id|name> — put a card from your hand on top of your deck",
+        "!zones — list cards by zone",
+        "!move <id> <zone> — move card to zone",
+        "!state <id> <flags> — set card state (Tapped|Attacking|...)",
+        "!attr <id> <flags> — set card attributes (Flight|Speed|...)",
+        "!update <id> — resend CardUpdated for a card",
+        "!help — this list",
+    ]
+
+
 def handle_command(handler, cmd: str, room: str, username: str) -> str:
+    parts = cmd.strip().split()
+    action = parts[0].lower().lstrip("!/") if parts else ""
+    if action == "version":
+        return _version_command()
+    if action == "arena-cleanup":
+        try:
+            return _arena_clear_command(handler)
+        except Exception as exc:
+            return f"Error: {exc}"
+    if action == "account-cleanup":
+        try:
+            return _account_cleanup_command(handler)
+        except Exception as exc:
+            return f"Error: {exc}"
+    if action == "help" and "allowcon" not in getattr(
+            hconnect_server, "PROFILE_FEATURE_FLAGS", ()):
+        return _public_help_command()
+    # Help is informational and must remain available from chat while the
+    # client is on the panorama.  It should not fall through to the active
+    # game/session gate used by state-mutating debug commands.
+    if action == "help":
+        return "\n".join(_full_help_lines())
     # The profile flag controls both the client's console UI and the server
     # endpoint.  Do not rely on the client hiding the backtick console: a
     # client can still submit a chat command directly.
     if "allowcon" not in getattr(hconnect_server, "PROFILE_FEATURE_FLAGS", ()):
         return "Developer console is disabled"
-    parts = cmd.strip().split()
     if not parts:
-        return ("Commands: !help !game_end !encounter !hand !zones !playable !gencard "
+        return ("Commands: !version !arena-cleanup !help !game_end !encounter !hand !zones !playable !gencard "
                 "!update !threshold !resource !pass !phase !draw !discard "
                 "!addcard !top")
 
@@ -1034,29 +1137,7 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         return f"Generated card: {name} ({tpl_guid})"
 
     elif action == "help":
-        lines = [
-            "=== Commands ===",
-            "!game_end victory|defeat — end the campaign battle (test win/loss)",
-            "!hand — list cards in hand (name [id])",
-            "!playable [id|name ...] — set golden outlines (no args = all)",
-            "!gencard <name> — generate a copy of a card template to your hand",
-            "!addcard <name|id> — draw the next copy of that card from your deck",
-            "!threshold[/thresholds] [me|opp] C B R S W D — set 6 threshold counts",
-            "!resource [/resource] [me|opp] <current> <maximum> — set resources",
-            "!charge [me|opp] <N> — set champion charges",
-            "!spellpoints [me|opp] <N> — set champion spell points",
-            "!health [me|opp] <N> — set champion health",
-            "!pass — advance turn phase",
-            "!phase <Name> — jump to phase",
-            "!draw N — draw N cards",
-            "!top <id|name> — put a card from your hand on top of your deck",
-            "!zones — list cards by zone",
-            "!move <id> <zone> — move card to zone",
-            "!state <id> <flags> — set card state (Tapped|Attacking|...)",
-            "!attr <id> <flags> — set card attributes (Flight|Speed|...)",
-            "!update <id> — resend CardUpdated for a card",
-            "!help — this list",
-        ]
+        lines = _full_help_lines()
         for line in lines:
             _send_chat(handler, line, room, username)
         return ""

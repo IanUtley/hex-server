@@ -162,6 +162,19 @@ def deal_damage(context, target, amount):
         return "damage: prevention prevented"
     amount *= _damage_multiplier(context, dealer, combat)
 
+    def emit_dealt_damage():
+        # The client raises CardDealtDamageEvent after damage has actually
+        # been applied.  This event drives follow-up abilities such as Welf's
+        # champion power; the replacement events above must not count as
+        # damage dealt.
+        if dealer is None:
+            return
+        context._emit_trigger(
+            "CardDealtDamageEvent", int(dealer), int(dealer_owner),
+            target_card_id=target,
+            event_tac={"damage": int(amount),
+                       "is_combat_damage": int(combat)})
+
     if is_champion:
         key = ((context.bstate.get("pvp_health_map") or {}).get(int(owner))
                if context.bstate.get("pvp") else
@@ -179,6 +192,7 @@ def deal_damage(context, target, amount):
         event.old_damage_value = current
         event.new_damage_value = new
         context.game._push(event)
+        emit_dealt_damage()
         return f"champion {current}->{new}"
 
     from .static_rules import effective_stats
@@ -192,6 +206,7 @@ def deal_damage(context, target, amount):
     # update_card_state provides the complete card projection; no state bits
     # are changed, so this is an intentional projection-only call.
     context.update_card_state(target, commit=False)
+    emit_dealt_damage()
     remaining = int(effective_stats(
         context.db, context.session.session_id, context.bstate, target)[1] or 0)
     if remaining <= 0:

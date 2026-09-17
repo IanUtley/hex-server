@@ -290,10 +290,12 @@ def begin_turn_resources_for_player(state: MutableMapping,
     total_key = f"res_total_{pid}"
     old = int(state.get(current_key, 0) or 0)
     total = int(state.get(total_key, 0) or 0)
-    state[current_key] = total
+    bonus_key = f"start_turn_resource_bonus_{pid}"
+    bonus = int(state.pop(bonus_key, 0) or 0)
+    state[current_key] = total + max(0, bonus)
     state[f"res_played_{pid}"] = 0
-    return ResourceChange(str(pid), "currentresource", total - old,
-                          old, total)
+    return ResourceChange(str(pid), "currentresource", total + max(0, bonus) - old,
+                          old, total + max(0, bonus))
 
 
 def pay_resource(state: MutableMapping, side: str, amount: int) -> ResourceChange:
@@ -329,9 +331,10 @@ def begin_turn_resources(state: MutableMapping, side: str) -> ResourceChange:
     normalized = "player" if str(side).lower() == "player" else "ai"
     state[f"{normalized}_resource_played_this_turn"] = False
     total = int(state.get(f"{normalized}_total_resources", 0) or 0)
+    bonus = int(state.pop(f"start_turn_resource_bonus_{normalized}", 0) or 0)
     return apply_resource_change(
         state, normalized, "currentresource",
-        total - int(state.get(f"{normalized}_resources", 0) or 0))
+        total + max(0, bonus) - int(state.get(f"{normalized}_resources", 0) or 0))
 
 
 def project_resource_change(game, session, state: MutableMapping, player_uid,
@@ -344,9 +347,14 @@ def project_resource_change(game, session, state: MutableMapping, player_uid,
     """
     change = apply_resource_change(
         state, side, property, amount, color=color)
+    # Every resource mutation, including thresholds, must reach the durable
+    # RulesPort checkpoint before the client can submit the next transaction.
+    # Previously only current-resource changes were saved here; a native
+    # choice such as Shard of Cunning could emit the threshold event and then
+    # have the updated threshold replaced by the older persisted snapshot.
+    from .persistence import save_state
+    save_state(session, state)
     if property == "currentresource":
-        from .persistence import save_state
-        save_state(session, state)
         setattr(game, f"{change.side}_resources", change.new_value)
         event_type = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs
     elif property == "totalresource":

@@ -112,7 +112,7 @@ docker run --rm `
   -v "${ClientData}:/client-data:ro" `
   -e HEX_DB_PATH='/hex/state/hconnect.db' `
   -e HEX_GAMEDATA='/client-data/gamedata' `
-  ghcr.io/ianutley/hex-server:0.3.0
+  ghcr.io/ianutley/hex-server:0.3.1
 ```
 
 ```bash
@@ -130,7 +130,7 @@ docker run --rm \
   -v "${CLIENT_DATA}:/client-data:ro" \
   -e HEX_DB_PATH='/hex/state/hconnect.db' \
   -e HEX_GAMEDATA='/client-data/gamedata' \
-  ghcr.io/ianutley/hex-server:0.3.0
+  ghcr.io/ianutley/hex-server:0.3.1
 ```
 
 You can try using the `latest` tag to be on the bleeding edge. But you may

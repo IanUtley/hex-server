@@ -40,6 +40,7 @@ def _apply_lifelink(context, source_uid, amount):
     event.old_damage_value = current
     event.new_damage_value = new_value
     context.game._push(event)
+    context.emit_champion_healed(owner, current, new_value)
 
 
 @dataclass

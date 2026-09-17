@@ -1930,6 +1930,14 @@ def _pvp_run_phase_start(session, state, phase):
                     turn_h, warm, session, st_view, turn_uid_p, opp_uid_st,
                     "TurnStartedEvent", None, turn_uid)
                 tunnel_surfaces = queue_surfaces(tunnel_context, turn_uid)
+                # Start-turn triggers execute against the FRA-shaped PvP
+                # view.  Persist their typed resource/counter/threshold
+                # mutations before the next phase is entered (Lithe
+                # Lyricist's authored CurrentResourceModifier is one such
+                # trigger).
+                _pvp_sync_view_to_state(
+                    state, st_view, turn_uid,
+                    pids[1] if turn_uid == pids[0] else pids[0])
                 state["_next_instance_id"] = st_view.get(
                     "_next_instance_id", state.get("_next_instance_id", 1))
                 # Persist trigger mutations before re-pushing champion card
@@ -2386,6 +2394,10 @@ def pvp_push_attack_options(session, state):
             state[f"hp_{turn_pid}"] = int(view["player_health"])
         if view.get("ai_health") is not None:
             state[f"hp_{opp_pid}"] = int(view["ai_health"])
+        # Trigger effects execute against the FRA-shaped PvP view.  Copy
+        # resource/threshold/charge changes (for example Ashwood Soloist's
+        # authored CurrentResourceModifier) back before checkpointing.
+        _pvp_sync_view_to_state(state, view, turn_pid, opp_pid)
         pvp_save_state(session, state)
     if combats:
         g.push_combat_listing(pl_t, combats)
@@ -2740,6 +2752,48 @@ def _pvp_auto_pass_chain_priority(session, state, pid):
     return True
 
 
+def _pvp_drive_f10_priority(session, state=None, *, max_steps=32):
+    """Drain native priority windows for the player who pressed F10.
+
+    ``SetAutoPass`` is a preference that lasts through the current turn.  A
+    native phase transition can create a fresh ``PriorityWindowAction`` after
+    the original pass has completed, so consuming only that first pass leaves
+    the game waiting at the next main/end phase.  Mandatory input phases are
+    represented by non-priority actions and therefore remain untouched.
+    """
+    from rules_port.kernel import PriorityWindowAction
+
+    live = state if isinstance(state, dict) else pvp_load_state(session)
+    if not isinstance(live, dict):
+        return False
+    autopass_pid = int(live.get("autopass_pid", 0) or 0)
+    if not autopass_pid:
+        return False
+    port = getattr(session, "_rules_port_session", None)
+    if port is None:
+        return False
+    progressed = False
+    for _ in range(max(1, int(max_steps))):
+        action = port.action_stack.peek()
+        if not isinstance(action, PriorityWindowAction):
+            break
+        priority = action.priority_player_id
+        if priority is None:
+            break
+        raw_priority = int(getattr(priority, "uid64", priority))
+        priority_pid = (raw_priority >> 8
+                        if (raw_priority & 0xFF) == 244 else raw_priority)
+        if priority_pid != autopass_pid:
+            break
+        if not port.pass_priority_and_drive(priority):
+            break
+        progressed = True
+        port.sync_to_pvp_state(live)
+        pvp_save_state(session, live)
+        live = pvp_load_state(session) or live
+    return progressed
+
+
 @_pvp_locked
 def set_pvp_auto_pass(handler, session, passing_state=2):
     """Enable F10 auto-pass for one PvP client and consume its current pass.
@@ -2758,6 +2812,7 @@ def set_pvp_auto_pass(handler, session, passing_state=2):
     pvp_save_state(session, state)
     current_priority = state.get("priority_pid")
     route_pvp_pass(handler, session)
+    _pvp_drive_f10_priority(session, state)
     log_req(f"    PvP SetAutoPass: pid={pid} state={passing_state} "
             f"priority_was={current_priority}")
     return True
@@ -4606,6 +4661,21 @@ def push_pvp_game_start(handler, session, log_req=log_req):
                 owner_handler, game2, session, state, pl_t, opp_t,
                 "PreGameEvent", None, int(owner_pid), zones=("deck",))
         state["pvp_pregame_done"] = True
+
+    # The client-facing GameStarted packet is emitted before this setup pass,
+    # but the native trigger dispatcher still needs the matching rules event.
+    # FRA champions such as Storm Cloud use GameStartedEvent to apply
+    # persistent modifiers to the opposing deck. Keep this separate from
+    # PreGameEvent so authored trigger types remain authoritative.
+    if not state.get("pvp_game_started_done"):
+        for owner_pid in pids:
+            owner_handler = player_handlers.get(int(owner_pid)) or handler
+            owner_handler._current_bstate = state
+            _pvp_dispatch_triggers(
+                owner_handler, game2, session, state, pl_t, opp_t,
+                "GameStartedEvent", None, int(owner_pid),
+                zones=("hand", "champions", "warzone"))
+        state["pvp_game_started_done"] = True
         pvp_save_state(session, state)
 
     # PickGoesFirst with correct turn player.  GreenLight must precede the
@@ -4699,6 +4769,11 @@ def route_pvp_pass(handler, session):
                         f"(no opponent stop or quick action)")
         native_port.sync_to_pvp_state(live_native)
         pvp_save_state(session, live_native)
+        # A phase transition may have opened another priority window for the
+        # same player who enabled F10.  Drain it before returning so the
+        # client's one-transaction gate is not left waiting on a pass it
+        # expected the server to perform.
+        _pvp_drive_f10_priority(session, live_native)
         return True
     my_pid = int(handler.client_reck_id) if hasattr(handler, 'client_reck_id') else 0
     pids = db_game_session_pids(session.session_id)
@@ -8784,6 +8859,7 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
             state[f"hp_{my_pid}"] = int(view["player_health"])
         if view.get("ai_health") is not None:
             state[f"hp_{opp_pid}"] = int(view["ai_health"])
+        _pvp_sync_view_to_state(state, view, my_pid, opp_pid)
         pvp_save_state(session, state)
     if attackers:
         # One champion-scoped event represents the whole declaration; do not

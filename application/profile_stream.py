@@ -1,5 +1,7 @@
 """Profile/reward output projection mixin for HConnect connections."""
 
+from profile_db import db_get_unopened_chests
+
 
 def bind_runtime_globals(namespace):
     """Bind legacy protocol/DB symbols after the server module is initialized."""
@@ -75,16 +77,23 @@ class ProfileStreamMixin:
         
         # Build inventory items from DB (only purchased items, no stardust/chests)
         inv_items = []
-        item_id = 1
         
         # Add purchased items from DB
         purchased = db_get_inventory(p["id"])
         for tguid, qty in purchased:
-            inv_items.append((tguid, item_id, qty))
-            # Store client item UID in the DB so we can reference it later
-            from profile_db import db_set_inventory_client_uid
-            db_set_inventory_client_uid(p["id"], tguid, item_id)
-            item_id += 1
+            # The client replaces an inventory row when its UID and template
+            # match.  Keep the UID stable across profile pushes and purchase
+            # responses so ItemQuantity remains an authoritative total.
+            row = db_inventory_item(p["id"], tguid, conn=_db)
+            client_uid = row[2] if row and row[2] else None
+            if not client_uid:
+                client_uid = db_next_inventory_client_uid(p["id"], conn=_db)
+                db_set_inventory_client_uid(
+                    p["id"], tguid, client_uid, conn=_db)
+            inv_items.append((tguid, client_uid, qty))
+        # Persist any newly allocated client UIDs before later service calls
+        # use them for quantity updates.
+        _db.commit()
 
         # Add unopened chests as inventory items. The client expects the chest
         # to be BOTH a chest_bits entry (m_InventoryChests, via the chest
@@ -92,7 +101,6 @@ class ProfileStreamMixin:
         # CommonTreasureChest template, keyed by the same InventoryId so the
         # pack list can match them up (see UIPackListViewModel.DoUpdateCardPackList
         # and UIPackContentViewModel.openPackResponseHandler).
-            from profile_db import db_get_unopened_chests
         chest_rows = db_get_unopened_chests(p["id"])
         for crow in chest_rows:
             # Named promotional chests retain their inventory template; old
@@ -641,5 +649,3 @@ class ProfileStreamMixin:
             db_set_inventory_client_uid(
                 self.user_profile["id"], template_guid, item_id, conn=_db)
             _db.commit()
-
-

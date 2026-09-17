@@ -6,6 +6,17 @@ import json
 import random
 
 
+def _field(item, name, default=None):
+    value = getattr(item, name, None)
+    if value is not None:
+        return value
+    if isinstance(item, dict):
+        aliases = {"guid": "effect_guid", "concrete_type": "effect_type",
+                   "condition_guid": "condition_id"}
+        return item.get(name, item.get(aliases.get(name, ""), default))
+    return default
+
+
 def _target_metadata(context):
     """Return the Records target metadata referenced by this effect."""
     ability = getattr(context, "ability", None)
@@ -14,16 +25,16 @@ def _target_metadata(context):
     effects = getattr(metadata, "effects", ()) if metadata is not None else ()
     target_index = -1
     for effect in effects:
-        guid = str(getattr(effect, "guid", "") or
-                   getattr(effect, "effect_guid", "")).lower()
+        guid = str(_field(effect, "guid", "") or "").lower()
         if guid == str(context.effect_guid or "").lower():
-            target_index = int(getattr(effect, "target_index", -1) or -1)
+            value = _field(effect, "target_index", -1)
+            target_index = int(value) if value is not None else -1
             break
     if 0 <= target_index < len(targets):
         target = targets[target_index]
-        return (str(getattr(target, "guid", "") or "").lower(),
-                str(getattr(target, "target_kind", "") or ""),
-                bool(getattr(target, "is_random", False)))
+        return (str(_field(target, "guid", "") or "").lower(),
+                str(_field(target, "target_kind", "") or ""),
+                bool(_field(target, "is_random", False)))
     return "", "", False
 
 
@@ -177,5 +188,9 @@ def reveal_cards(context):
         event.collections = [reveal_collection] * len(uids)
         event.owning_players = [event.player_id] * len(uids)
         event.positions = [int(row[1] or 0) for row in rows]
+        # C# AuthoritativeSessionBase.RevealCards always sends Inactive=true:
+        # the Coverflow shows the cards temporarily and does not keep them
+        # revealed after a follow-up move puts them back into a hidden zone.
+        event.inactive = True
         context.game._push(event)
     return f"revealed {len(uids)}"

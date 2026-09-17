@@ -35,6 +35,14 @@ def push_card_state(game, session, db, handler, player_uid, ai_uid, card_uid,
         if isinstance(abilities, list):
             cdef.abilities = [game_engine.ResourceId.from_str(str(guid))
                               for guid in abilities if guid]
+    # Transaction ingress may carry the numeric service UID while the Game
+    # projection normally carries a typed UID wrapper.  Normalize at this
+    # wire boundary so ownership and PvP namespace checks do not depend on
+    # which path constructed the projection Game.
+    player_uid = game_engine.UID(
+        int(getattr(player_uid, "uid64", player_uid)))
+    ai_uid = game_engine.UID(
+        int(getattr(ai_uid, "uid64", ai_uid)))
     if ((battle_state and battle_state.get("pvp")) or
             ((int(player_uid.uid64) & 0xff) == 244 and
              (int(ai_uid.uid64) & 0xff) == 244)):

@@ -4,7 +4,19 @@ import struct
 import time
 import gzip
 import json
+import uuid
 from binascii import hexlify
+
+
+_ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _wire_guid(value):
+    """Return a valid GUID string for optional protocol identifiers."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return _ZERO_GUID
 
 
 # =============================================================================
@@ -633,9 +645,8 @@ def encode_objfmt_response(type_names, fields):
                     ("FightResults", "string", str(fight.get("result", "NONE"))),
                     ("ChallengeResponse", "string", str(fight.get("challenge_response", ""))),
                     ("RoundChallenge", "struct", ("Game.Shared.ResourceId", [
-                        ("m_Guid", "guid", str(fight.get(
-                            "round_challenge",
-                            "00000000-0000-0000-0000-000000000000")))
+                        ("m_Guid", "guid", _wire_guid(
+                            fight.get("round_challenge")))
                     ])),
                 ):
                     encode_field(name, stcode, sval)
@@ -655,9 +666,8 @@ def encode_objfmt_response(type_names, fields):
                     ("IsApplied", "bool", bool(modification.get("is_applied", False))),
                     ("RoundToApply", "int", int(modification.get("round_to_apply", 0))),
                     ("ConversationId", "struct", ("Game.Shared.ResourceId", [
-                        ("m_Guid", "guid", str(modification.get(
-                            "conversation_id",
-                            "00000000-0000-0000-0000-000000000000")))
+                        ("m_Guid", "guid", _wire_guid(
+                            modification.get("conversation_id")))
                     ])),
                     ("TargetPlayer", "enum1", (
                         "Game.Shared.Mechanics.EModTarget",

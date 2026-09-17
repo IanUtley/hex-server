@@ -381,9 +381,14 @@ class NativeTriggerBackend:
                                 source_card_owner)
                         if owner_player is None:
                             owner_player = player_uid
-                        first_player = next(
-                            (value for value in port.player_ids
-                             if value != owner_player), player_uid)
+                        # C# WaitForTriggeredAbilitiesAction.OnEnter calls
+                        # UpdatePriorityPlayer(GetActivePlayer()): the active
+                        # player responds first to a triggered ability, not
+                        # the non-owner. Using the opponent stranded the
+                        # server actor with priority and left the trigger on
+                        # the chain forever.
+                        first_player = getattr(
+                            port, "active_player_id", None) or owner_player
                         queue_projected({
                             "kind": "trigger",
                             "ability_guid": key[1],

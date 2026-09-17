@@ -1929,15 +1929,45 @@ class AuthoritativeSession:
 
     @property
     def has_combats(self) -> bool:
-        return bool(self.combat_manager.combats)
+        if self.combat_manager.combats:
+            return True
+        # AI declarations are projected into the persisted battle state while
+        # the native combat object is rehydrated between client transactions.
+        # Keep the phase graph from skipping DeclareDefense/AssignDamage when
+        # that rehydration has not recreated the object yet.
+        state = getattr(getattr(self, "runtime_facts", None),
+                        "battle_state", {}) or {}
+        return bool(state.get("ai_attackers") or
+                    state.get("player_attackers"))
 
     @property
     def combat_has_first_strike(self) -> bool:
-        return self.combat_manager.combat_cares_about_phase(CombatPhase.FIRST_STRIKE)
+        if self.combat_manager.combat_cares_about_phase(CombatPhase.FIRST_STRIKE):
+            return True
+        state = getattr(getattr(self, "runtime_facts", None),
+                        "battle_state", {}) or {}
+        facts = self.runtime_facts
+        getter = getattr(facts, "get_card", None)
+        if callable(getter):
+            for raw_uid in tuple((state.get("ai_attackers") or {}).keys()) + \
+                    tuple((state.get("player_attackers") or {}).keys()):
+                try:
+                    card = getter(int(raw_uid))
+                except (TypeError, ValueError):
+                    card = None
+                if card is not None and card.cares_about_combat_phase(
+                        CombatPhase.FIRST_STRIKE):
+                    return True
+        return False
 
     @property
     def combat_has_standard_damage(self) -> bool:
-        return self.combat_manager.combat_cares_about_phase(CombatPhase.STANDARD)
+        if self.combat_manager.combat_cares_about_phase(CombatPhase.STANDARD):
+            return True
+        state = getattr(getattr(self, "runtime_facts", None),
+                        "battle_state", {}) or {}
+        return bool(state.get("ai_attackers") or
+                    state.get("player_attackers"))
 
     def can_player_pass_priority(self, player_id) -> bool:
         return player_id in self.player_ids and not self.terminated
@@ -2083,7 +2113,7 @@ class AuthoritativeSession:
         # the generic practice host; PvP overrides this method with its own
         # two-human ALL-player window.
         priority_players = (TurnPhasePlayers.ALL
-                            if descriptor.get("kind") == "ability"
+                            if descriptor.get("kind") in ("ability", "trigger")
                             else TurnPhasePlayers.ACTIVE)
         priority_action = PriorityWindowAction(priority_players, ability)
         self.push_game_action(priority_action)

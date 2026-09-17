@@ -447,7 +447,6 @@ class EffectContext:
 
         from pvp_db import db_discard_card
         from rules_port.runtime_helpers import owner_uid
-        count = self.value("m_Amount", default=1)
         target = self.resolved_target()
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
             deck_owner = self.target_owner(
@@ -461,6 +460,42 @@ class EffectContext:
             deck_owner = 0
         discard_owner = owner_uid(deck_owner, self.player_uid, self.ai_uid,
                                   self.bstate)
+        # C# BuryCardAbilityEffectTemplate: TopHalfOfDeck and Filter are
+        # mutually exclusive authored count sources alongside m_Amount.
+        count = self.value("m_Amount", default=1)
+        if self.template_value("m_TopHalfOfDeck", False):
+            from pvp_db import db_deck_card_count
+            count = (int(db_deck_card_count(
+                self.session.session_id, deck_owner, conn=self.db) or 0) + 1) // 2
+        elif self.template_value("m_Filter", None):
+            count = 0
+            from rules_port.filters import records_filter_matches
+            source = {"card_uid": int(self.bstate.get("resolving_source_uid") or 0),
+                      "user_id": int(deck_owner or 0),
+                      "owner_id": int(deck_owner or 0),
+                      "controller_id": int(deck_owner or 0)}
+            spec = self.template_value("m_Filter", {})
+            deck_rows = self.db.execute(
+                "SELECT card_uid FROM game_cards WHERE session_id=? "
+                "AND user_id=? AND location='deck' ORDER BY position",
+                (self.session.session_id, int(deck_owner or 0))).fetchall()
+            for (uid,) in deck_rows:
+                count += 1
+                from pvp_db import db_condition_card_row
+                row = db_condition_card_row(
+                    self.session.session_id, int(uid), conn=self.db)
+                if not row:
+                    continue
+                card = {"card_uid": int(row[0]), "card_type": row[1] or "",
+                        "location": row[2] or "", "user_id": int(row[3] or 0),
+                        "state": int(row[4] or 0),
+                        "name": row[8] or "", "cost": int(row[9] or 0),
+                        "subtype": row[10] or "",
+                        "attributes": int(row[12] or 0) | int(row[13] or 0)}
+                if records_filter_matches(
+                        card, spec, source=source,
+                        context=dict(self.bstate or {})):
+                    break
         total = 0
         for _ in range(max(0, int(count))):
             from pvp_db import db_deck_top_card_details
@@ -664,7 +699,34 @@ class EffectContext:
         event.old_damage_value = old_value
         event.new_damage_value = new_value
         self.game._push(event)
+        if new_value > old_value:
+            self.emit_champion_healed(owner, old_value, new_value)
         return f"set health {old_value}->{new_value}"
+
+    def champion_card_uid(self, owner: int) -> int | None:
+        """Return the persisted champion card UID for a controller."""
+        for participant, champion_uid in (self.bstate.get("champ_map") or {}).items():
+            try:
+                if int(participant) == int(owner):
+                    return int(champion_uid)
+            except (TypeError, ValueError):
+                continue
+        attr = "_ai_champ_scid" if int(owner) == 0 else "_player_champ_scid"
+        champion = getattr(self.handler, attr, None)
+        try:
+            return int(champion.uid.uid64) if champion is not None else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def emit_champion_healed(self, owner: int, old_value: int,
+                             new_value: int) -> None:
+        """Dispatch the authored gain-health trigger after health changes."""
+        champion_uid = self.champion_card_uid(owner)
+        if champion_uid is None:
+            return
+        self._emit_trigger("ChampionHealedEvent", champion_uid, int(owner),
+                           event_tac={"old_health": int(old_value),
+                                      "new_health": int(new_value)})
 
     def spell_points(self, target: int | None, amount: int) -> str:
         """Apply the typed SpellPointsModifier to the target controller."""
@@ -1128,6 +1190,31 @@ class EffectContext:
                 destroyed += 1
         return f"destroyed {destroyed}/{len(rows)}"
 
+    def _resolving_raw_json(self) -> str:
+        """Return the active ability's authored raw JSON, preferring Records.
+
+        Talent abilities (for example Fury's "gain two charges" PreGame power)
+        and champion powers are authored in gamedata but are not materialized
+        as rows in ``card_abilities_meta``.  Their typed variables
+        (``m_Variables``) must therefore be read from the live Records graph,
+        not from the DB raw-json fallback that only covers card abilities.
+        """
+        graph = getattr(getattr(self.ability, "metadata", None), "graph", None)
+        source = getattr(graph, "source", None)
+        to_dict = getattr(source, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return json.dumps(to_dict())
+            except (TypeError, ValueError):
+                pass
+        raw_attr = getattr(source, "raw", None)
+        if isinstance(raw_attr, dict):
+            try:
+                return json.dumps(raw_attr)
+            except (TypeError, ValueError):
+                pass
+        return ""
+
     def modifier_value(self, param: dict | None, metadata: dict | None,
                        property_name: str) -> int:
         """Resolve a typed CardModifier operand from Records and live state."""
@@ -1142,9 +1229,11 @@ class EffectContext:
             # variable evaluator.  Calling the historical leaf evaluator here
             # would make the effect state hybrid even when its outer resolver
             # is native.
-            from pvp_db import db_ability_raw_json
             from rules_port.static_rules import _native_leaf_value
-            raw = db_ability_raw_json(self.ability_guid, conn=self.db) or "{}"
+            raw = self._resolving_raw_json()
+            if not raw:
+                from pvp_db import db_ability_raw_json
+                raw = db_ability_raw_json(self.ability_guid, conn=self.db) or "{}"
             value = _native_leaf_value(
                 self.db, self.session.session_id, self.bstate,
                 int(self.bstate.get("resolving_source_uid") or 0),
@@ -1613,7 +1702,11 @@ class EffectContext:
             # it never shuffled).
             dest_location = str(self.template_value(
                 "m_DestinationLocation", "") or "").rsplit(".", 1)[-1].lower()
-            if dest_location in ("", "unknown", "random"):
+            random_location = int(self.template_value(
+                "m_RandomLocation", -1) or -1)
+            top_half = bool(self.template_value("m_TopHalfOfDeck", False))
+            if dest_location in ("", "unknown", "random") or \
+                    random_location >= 0 or top_half:
                 from pvp_db import db_randomly_insert_deck_cards
                 db_randomly_insert_deck_cards(
                     self.session.session_id, int(old[0] or 0), [target],
@@ -1687,19 +1780,78 @@ class EffectContext:
         if target is None and destination == "underground":
             target = self.bstate.get("resolving_source_uid")
         # Authored control transfer (m_AbilityOwnerTakesControl / etc.).  The
-        # port previously ignored it, so "move to an opponent's zone" left the
-        # card under its original controller.
-        if target is not None and self.template_value(
-                "m_AbilityOwnerTakesControl", False):
-            try:
-                from pvp_db import db_set_card_owner
-                owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
-                db_set_card_owner(
-                    self.session.session_id, int(target), owner, conn=self.db)
-                self.db.commit()
-            except (TypeError, ValueError):
-                pass
+        # port previously ignored these, so "move to an opponent's zone" left
+        # the card under its original controller.
+        if target is not None:
+            new_owner = self._move_zone_new_owner(int(target))
+            if new_owner is not None:
+                try:
+                    from pvp_db import db_card_owner_id, db_set_card_owner
+                    current = db_card_owner_id(
+                        self.session.session_id, int(target), conn=self.db)
+                    if current != new_owner:
+                        db_set_card_owner(
+                            self.session.session_id, int(target), new_owner,
+                            conn=self.db)
+                        self.db.commit()
+                except (TypeError, ValueError):
+                    pass
+        # m_AllCardsOfTargetInZone: move every card the target's controller
+        # holds in the authored zone, not just the single resolved target.
+        all_zone = self.template_value("m_AllCardsOfTargetInZone", "")
+        all_zone = str(all_zone or "").rsplit(".", 1)[-1].lower()
+        zone_map = {"hand": "hand", "warzone": "warzone", "deck": "deck",
+                    "discard": "discard", "crypt": "discard",
+                    "void": "void", "underground": "underground"}
+        if all_zone in zone_map and target is not None:
+            owner = self.target_owner(
+                target, default=self.bstate.get("resolving_owner_id", 0))
+            rows = self.db.execute(
+                "SELECT card_uid FROM game_cards WHERE session_id=? "
+                "AND user_id=? AND location=? ORDER BY position",
+                (self.session.session_id, int(owner or 0),
+                 zone_map[all_zone])).fetchall()
+            moved = 0
+            for (uid,) in rows:
+                if uid is None:
+                    continue
+                self._move_simple_zone(int(uid), destination)
+                moved += 1
+            return f"moved all {moved} {all_zone} cards to {destination}"
         return self._move_simple_zone(target, destination)
+
+    def _move_zone_new_owner(self, target: int) -> int | None:
+        """Resolve the C# MoveCardToZone control-transfer flags to an owner."""
+        resolving = int(self.bstate.get("resolving_owner_id", 0) or 0)
+        if self.template_value("m_AbilityOwnerTakesControl", False):
+            return resolving
+        if self.template_value("m_AbilityOpponentTakesControl", False):
+            profile = getattr(self.handler, "user_profile", None) or {}
+            player_owner = int(profile.get("id", 0) or 0)
+            return 0 if resolving else player_owner
+        if self.template_value("m_ArenaChampionTakesControl", False):
+            return 0
+        # m_ControlGivenToTargetIndex: give control to the controller of the
+        # card selected for that authored target index.
+        control_index = int(self.template_value(
+            "m_ControlGivenToTargetIndex", -1) or -1)
+        if control_index >= 0:
+            ability = getattr(self, "ability", None)
+            target_map = getattr(getattr(ability, "activation", None),
+                                 "target_map", {}) or {}
+            uid = target_map.get(control_index, target_map.get(
+                str(control_index)))
+            values = uid if isinstance(uid, (list, tuple, set)) else (uid,)
+            from pvp_db import db_card_owner_id
+            for value in values or ():
+                try:
+                    owner = db_card_owner_id(
+                        self.session.session_id, int(value), conn=self.db)
+                    if owner is not None:
+                        return int(owner)
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     def target_player_takes_control(self) -> str:
         """Transfer the resolving source to the target player's control."""
@@ -2806,17 +2958,29 @@ class EffectContext:
             return play_free_resource_card(
                 self.handler, self.game, self.session, self.db,
                 self.player_uid, self.ai_uid, self.bstate, int(target))
-        if int(target) != int(self.bstate.get(
-                "resolving_source_uid", target) or target):
-            raise RuntimeError(
-                "RulesPort free-play target is not the ability source")
-        from rules_port.host_mutations import queue_free_played_card
-        return queue_free_played_card(
-            self.handler, self.game, self.session, self.db,
-            self.player_uid, self.ai_uid, self.bstate, int(target),
-            int(self.target_owner(target,
-                                  default=self.bstate.get("resolving_owner_id", 0))
-                or 0), row[0], card_type)
+        # The card being played becomes the play's source.  For the built-in
+        # play-card ability the target already IS the source; for a free-play
+        # effect (e.g. Nerissa's "play revealed troops for free") the revealed
+        # troop is the source, not the champion that authored the ability.
+        old_source = self.bstate.get("resolving_source_uid")
+        self.bstate["resolving_source_uid"] = int(target)
+        try:
+            if int(target) != int(self.bstate.get(
+                    "resolving_source_uid", target) or target):
+                raise RuntimeError(
+                    "RulesPort free-play target is not the ability source")
+            from rules_port.host_mutations import queue_free_played_card
+            return queue_free_played_card(
+                self.handler, self.game, self.session, self.db,
+                self.player_uid, self.ai_uid, self.bstate, int(target),
+                int(self.target_owner(target,
+                                      default=self.bstate.get("resolving_owner_id", 0))
+                    or 0), row[0], card_type)
+        finally:
+            if old_source is None:
+                self.bstate.pop("resolving_source_uid", None)
+            else:
+                self.bstate["resolving_source_uid"] = old_source
 
     def fire_event(self):
         event_type = self.template_value("m_TriggerType", "") or ""

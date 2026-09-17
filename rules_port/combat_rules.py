@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import json
 import game_engine
+from domain.constants import AI_UID_TYPE
+
+
+def _card_owner_ids(player_id):
+    """Return persisted owner ids for a native participant.
+
+    Practice/FRA uses the typed native AI participant (type 3, instance
+    1000), while the legacy ``game_cards`` rows retain owner ``0``.  Keep
+    that compatibility mapping at the combat boundary so phase construction
+    and attack selection see the same cards without changing PvP identities.
+    """
+    value = int(getattr(player_id, "uid64", player_id))
+    ids = [value]
+    if value & 0xFF == AI_UID_TYPE:
+        ids.append(0)
+    return ids
 
 
 def player_has_eligible_attackers(db, session_id, battle_state, player_id):
@@ -16,8 +32,12 @@ def player_has_eligible_attackers(db, session_id, battle_state, player_id):
     """
     from pvp_db import db_warzone_troop_attributes
     from .static_rules import effective_attributes
-    rows = db_warzone_troop_attributes(
-        session_id, int(player_id), conn=db)
+    rows = []
+    for owner_id in _card_owner_ids(player_id):
+        rows = db_warzone_troop_attributes(
+            session_id, owner_id, conn=db)
+        if rows:
+            break
     for uid, state, card_attrs, temporary_attrs, template_attrs, _abilities in rows:
         card_state = int(state or 0)
         if card_state & int(game_engine.ECardStates.Tapped):

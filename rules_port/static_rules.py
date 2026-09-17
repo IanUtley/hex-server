@@ -493,6 +493,15 @@ def _native_leaf_value(db, session_id, battle_state, source_uid, owner, param,
             prop = str(param.get("property") or "").lower()
             if prop in {"attack", "defense", "cardcost", "intattr"}:
                 return prop, int(value)
+    # Attribute grants commonly encode their operand in typed
+    # ``attribute_flags`` while leaving CardModifier.amount at zero (for
+    # example Emberleaf Duelist's Swiftstrike). Preserve the leaf so the
+    # native static evaluator can project the keyword when its condition is
+    # met.
+    if str(param.get("property") or "").lower() == "attribute" and (
+            param.get("attribute_flags") or param.get("attributeflags") or
+            param.get("value")):
+        return "attribute", 0
     return literal
 
 
@@ -511,7 +520,11 @@ def _target_matches(db, session_id, source_uid, source_owner, target_uid,
         row = db_static_target_template(template_id, conn=db)
         if not row:
             continue
-        text = str(row[3] or "").lower()
+        # target_templates stores game_text in column 1; column 3 is the
+        # random-target flag. Reading the latter made #SELF# continuous
+        # abilities (including Emberleaf Duelist's attack-time Swiftstrike)
+        # fail their target match and silently disappear from combat stats.
+        text = str(row[1] or "").lower()
         if "this" in text or "#self#" in text or text.strip() == "you":
             if int(source_uid) == int(target_uid):
                 return True
@@ -642,7 +655,9 @@ def _native_static_deltas(db, session_id, battle_state, card_uid):
                 elif prop == "attribute":
                     from .attribute_effects import attribute_bits_from_flags
                     total["attrs"] |= attribute_bits_from_flags(
-                        param.get("attribute_flags", param.get("value", 0)))
+                        param.get("attribute_flags",
+                                  param.get("attributeflags",
+                                           param.get("value", 0))))
                 elif prop == "intattr":
                     attribute = str(param.get("attribute") or "").lower()
                     if attribute == "rage":

@@ -103,8 +103,6 @@ class RecordsTriggerDiscovery:
 
         def champion_holders(owner):
             owner = int(owner or 0)
-            if not owner:
-                return {}
             # PvP owners are raw participant ids, which are also the
             # game_cards owner.  ``user_profile["id"]`` is the local database
             # id, so the PvE identity check below rejects every PvP
@@ -129,7 +127,9 @@ class RecordsTriggerDiscovery:
             else:
                 profile = getattr(self.handler, "user_profile", None) or {}
                 player_id = int(profile.get("id", 0) or 0)
-                if owner != player_id:
+                # PvE uses owner 0 for the AI champion; it is a valid
+                # controller identity, not an absent owner.
+                if owner not in (0, player_id):
                     return {}
                 guid = (getattr(self.handler, "_ai_champ_guid", None)
                         if owner == 0 else
