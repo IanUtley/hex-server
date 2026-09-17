@@ -103,6 +103,24 @@ def _uid_in(value, participants):
     return any(_same_uid(value, participant) for participant in participants)
 
 
+def _is_practice_chain_follow_up(action, client_id, practice_window):
+    """Return whether a server-owned chain response should be auto-passed.
+
+    A completed response can expose the AI's next pass on the same ability
+    chain.  An ordinary phase transition can also expose an AI-owned priority
+    action, notably when DeclareDefensePriorityWindow enters AssignDamage.
+    Only the former belongs to this auto-pass path; phase actions must return
+    to the AI driver so phase-specific work such as combat damage runs first.
+    """
+    from rules_port.kernel import PriorityWindowAction
+    return bool(
+        practice_window and
+        isinstance(action, PriorityWindowAction) and
+        getattr(action, "ability_responding_to", None) is not None and
+        action.priority_player_id is not None and
+        not _same_uid(action.priority_player_id, client_id))
+
+
 def _profile_feature_flags():
     """Return profile-stream feature strings sent to every authenticated client.
 
@@ -149,10 +167,11 @@ from debug_runtime import enable_debugpy, trace_rules_port
 from db import (player_id_from_name, player_id_from_steam, display_name_from_identity,
                 STARDUST_TEMPLATES, CHEST_TEMPLATE)
 from profile_db import (db_find_deck_owner, db_deck_champion_name,
+                        db_deck_sleeve,
                         db_get_or_create_user, db_get_stardust, db_update_resources,
                         db_get_user, db_get_user_by_client_auth_id,
                         db_add_card, db_record_purchase, db_add_inventory,
-                        db_get_inventory, db_send_email, db_save_deck,
+                        db_get_inventory, db_get_store_item, db_send_email, db_save_deck,
                         db_update_deck, db_get_decks, db_redeem_code,
                         db_get_store_items,
                         db_get_unopened_chests, db_get_unread_mail_count,
@@ -265,6 +284,7 @@ from pve_db import (db_campaign_user_id, db_campaign_identity_state,
                     db_extended_champion_health, db_champion_template_name,
                     db_champion_talents_for_deck,
                     db_encounter_deck_personality, db_talent_ability_rows,
+                    db_encounter_deck_sleeve,
                     db_talent_data_ability_guid, db_campaign_runtime_row,
                     db_campaign_champion_race, db_campaign_state,
                     db_quest_start_rows, db_quest_node_rows,
@@ -671,6 +691,26 @@ class HCPHandler(ProfileStreamMixin):
                     checkpoint_phase_idx = battle_state.get("phase_idx", 0)
             else:
                 checkpoint_phase_idx = battle_state.get("phase_idx", 0)
+            # A card played by the AI can resolve from the human response
+            # window without re-entering the AI driver.  Refresh the native
+            # combat branch fact from the authoritative warzone before the
+            # next phase transition; otherwise FirstMain's stale
+            # ``active_player_skips_attack`` skips DeclareAttack entirely.
+            native_players = tuple(getattr(port, "player_ids", ()) or ())
+            ai_participants = tuple(
+                participant for participant in native_players
+                if int(getattr(participant, "uid64", participant)) & 0xFF == 3)
+            active_is_ai = (native_active is not None and
+                            _uid_in(native_active, ai_participants))
+            if active_is_ai:
+                self._current_bstate = battle_state
+                ai_ready = bool(self._ai_can_attack_troops(session))
+                # Keep the checkpoint fact in sync with the value consumed by
+                # the native phase graph.  The AI card may have entered the
+                # warzone while its chain was resolving, after the original
+                # FirstMain calculation saved this field as False.
+                battle_state["player_has_ready_troop"] = ai_ready
+            from rules_port.lifecycle import should_draw_for_turn
             port.sync_checkpoint(
                 phases=checkpoint_phases,
                 phase_idx=checkpoint_phase_idx,
@@ -684,11 +724,21 @@ class HCPHandler(ProfileStreamMixin):
                     "skip_mulligan": bool(battle_state.get("skip_mulligan")),
                     "all_players_ready_to_start": bool(
                         battle_state.get("all_players_ready_to_start")),
-                    "active_player_skips_draw": bool(
-                        battle_state.get("player_draws_first_turn")),
+                    # ``player_draws_first_turn`` identifies which side gets
+                    # the exceptional first-turn draw; it is not itself the
+                    # native ``Prep -> Draw`` branch fact.  Feeding it
+                    # directly here made every reattached turn skip Draw for
+                    # the AI.  Derive the branch from the active participant
+                    # and the current turn instead.
+                    "active_player_skips_draw": not should_draw_for_turn(
+                        battle_state,
+                        "player" if _same_uid(active, game.player_uid)
+                        else "ai"),
                     "active_player_skips_attack": not bool(
+                        ai_ready if active_is_ai else
                         battle_state.get("player_has_ready_troop")),
                     "has_legal_attackers": bool(
+                        ai_ready if active_is_ai else
                         battle_state.get("player_has_ready_troop")),
                     "has_forced_attackers": bool(
                         battle_state.get("forced_attackers")),
@@ -735,6 +785,23 @@ class HCPHandler(ProfileStreamMixin):
                     # no legal blocker targets (including ordinary Buffalo).
                     self._push_blocker_options(
                         _session, projection.player_uid, projection.ai_uid)
+                if (phase == game_engine.ETurnPhases.DeclareAttack and
+                        _same_uid(active_id, getattr(projection, "ai_uid", None)) and
+                        not current_state.get("ai_attackers")):
+                    # DeclareAttack is a no-input native phase.  If the AI
+                    # waits for the ordinary driver loop, RulesPort advances
+                    # immediately to AssignDamage before that loop can choose
+                    # attackers.  Declare them at phase entry so the native
+                    # combat manager is populated before the next-phase test.
+                    log_req("    Native DeclareAttack entry: invoking AI attacker selection")
+                    current_state = self._ai_declare_attackers(
+                        projection, _session, projection.ai_uid,
+                        projection.player_uid, current_state)
+                    from rules_port.persistence import save_state
+                    save_state(_session, current_state)
+                    log_req(
+                        "    Native DeclareAttack entry: AI selected "
+                        f"{len(current_state.get('ai_attackers') or {})} attacker(s)")
                 if phase == game_engine.ETurnPhases.StartTurn:
                     # The native EndTurn state rotates the active player
                     # before entering StartTurn. Keep the compatibility-shaped
@@ -1143,30 +1210,38 @@ class HCPHandler(ProfileStreamMixin):
                             owner_id = 0
                     ability_guid = str(
                         descriptor.get("ability_guid") or "").lower()
-                    graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
-                    activation_data = descriptor.get("activation_data") or {}
-                    target_map = dict(
-                        activation_data.get("target_map") or {}) \
-                        if isinstance(activation_data, dict) else {}
-                    target_uid = descriptor.get("target_uid")
-                    if (graph is not None and not target_map and
-                            target_uid is not None):
-                        for index, target_spec in enumerate(graph.targets):
-                            if getattr(target_spec, "requires_input", False):
-                                target_map[index] = int(target_uid)
-                                break
-                    live["resolving_source_uid"] = source_uid
-                    live["resolving_owner_id"] = owner_id
-                    if target_uid is not None:
-                        live["player_mod_target"] = int(target_uid)
-                    resolve_port_ability(
-                        self, projected_game, session, _db,
-                        player_uid, ai_uid, live, ability_guid, source_uid,
-                        owner_id, target_map=target_map,
-                        variables=(activation_data.get("variables") or {}
-                                   if isinstance(activation_data, dict)
-                                   else {}),
-                        instance_id=int(ability.instance_id))
+                    if ability_guid == "f2d6797b-1a24-4c3d-9239-a27a2e0de0ff":
+                        from rules_port.context import EffectContext
+                        from rules_port.tunneling import resolve_surface
+                        resolve_surface(EffectContext.from_rules_port(
+                            projected_game, session, _db, self, player_uid,
+                            ai_uid, live, ability_guid, ability=None),
+                            source_uid)
+                    else:
+                        graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
+                        activation_data = descriptor.get("activation_data") or {}
+                        target_map = dict(
+                            activation_data.get("target_map") or {}) \
+                            if isinstance(activation_data, dict) else {}
+                        target_uid = descriptor.get("target_uid")
+                        if (graph is not None and not target_map and
+                                target_uid is not None):
+                            for index, target_spec in enumerate(graph.targets):
+                                if getattr(target_spec, "requires_input", False):
+                                    target_map[index] = int(target_uid)
+                                    break
+                        live["resolving_source_uid"] = source_uid
+                        live["resolving_owner_id"] = owner_id
+                        if target_uid is not None:
+                            live["player_mod_target"] = int(target_uid)
+                        resolve_port_ability(
+                            self, projected_game, session, _db,
+                            player_uid, ai_uid, live, ability_guid, source_uid,
+                            owner_id, target_map=target_map,
+                            variables=(activation_data.get("variables") or {}
+                                       if isinstance(activation_data, dict)
+                                       else {}),
+                            instance_id=int(ability.instance_id))
                 elif descriptor.get("kind") in ("troop", "spell"):
                     # AI and host-driven card plays use the same projected
                     # RulesPort chain identity as manual plays, but their
@@ -1212,7 +1287,16 @@ class HCPHandler(ProfileStreamMixin):
                         int(ability.instance_id))
                     projected_game.push_removed_top_of_chain(
                         int(ability.instance_id))
-                    projected_game.push_chain_empty()
+                    # The compatibility stack is empty after each projected
+                    # item, but RulesPort may still own additional native
+                    # chain items (for example Nerissa's two troop summons
+                    # followed by the champion ability).  Only tell Unity
+                    # that the chain is empty when this is the final native
+                    # item; otherwise it clears the remaining chain UI.
+                    native_chain = getattr(port, "chain", None)
+                    native_ids = getattr(native_chain, "_instance_ids", ())
+                    if len(native_ids) <= 1:
+                        projected_game.push_chain_empty()
                 _native_lifecycle.save_state(session, live)
                 self._send_battle_events(session, projected_game, player_uid)
                 session._rules_port_mutation_emitted = True
@@ -1581,6 +1665,20 @@ class HCPHandler(ProfileStreamMixin):
                             # next real input window. Let the native scheduler
                             # own that entire boundary.
                             port.drive_until_input(max_steps=64)
+                            # A projected card chain can finish its resolver
+                            # and immediately expose the server actor's
+                            # follow-up priority in the same scheduler tick.
+                            # Practice has no second client transaction for
+                            # that actor; consume the native pass and continue
+                            # to the next real input boundary.
+                            follow_up = port.action_stack.peek()
+                            follow_priority = getattr(
+                                follow_up, "priority_player_id", None)
+                            if _is_practice_chain_follow_up(
+                                    follow_up, transaction.player_id,
+                                    practice_window):
+                                if port.pass_player_priority(follow_priority):
+                                    port.drive_until_input(max_steps=64)
                         next_action = port.action_stack.peek()
                         # The compatibility host used to invoke the AI from
                         # its own pass handler. Native phase actions bypass
@@ -1601,8 +1699,7 @@ class HCPHandler(ProfileStreamMixin):
                             f"priority={getattr(next_action, 'priority_player_id', None)!r} "
                             f"players={port.player_ids!r} "
                             f"state_turn={native_state.get('turn_player')!r}")
-                        if (_same_uid(port.active_player_id, ai_id) and
-                                isinstance(next_action, PriorityWindowAction) and
+                        if (isinstance(next_action, PriorityWindowAction) and
                                 _same_uid(next_action.priority_player_id, ai_id) and
                                 getattr(next_action, "ability_responding_to", None)
                                 is None):
@@ -4807,6 +4904,10 @@ class HCPHandler(ProfileStreamMixin):
             return True
         from rules_port.context import EffectContext
         bstate["_rules_port_attached"] = True
+        # Mark the lifecycle phase while TurnStarted triggers resolve so
+        # temporary current-resource gains can survive the later Prep refill.
+        _previous_phase = bstate.get("phase")
+        bstate["phase"] = game_engine.ETurnPhases.StartTurn
         choice_context = EffectContext.from_rules_port(
             g, session, _db, self, pl_t, ai_t, bstate,
             "", ability=None)
@@ -7347,12 +7448,14 @@ class HCPHandler(ProfileStreamMixin):
             ag = item.get("ability_guid", "")
             if (str(ag).lower() ==
                     "f2d6797b-1a24-4c3d-9239-a27a2e0de0ff"):
-                from rules_port.tunneling import surface_source_is_underground
-                if not surface_source_is_underground(
-                        _db, session, item.get("source_uid")):
-                    log_req(f"    Ignoring stale tunneling Surface "
-                            f"source={item.get('source_uid')}")
-                    ag = ""
+                from rules_port.context import EffectContext
+                from rules_port.tunneling import resolve_surface
+                result = resolve_surface(EffectContext.from_rules_port(
+                    game, session, _db, self, pl_t, ai_t, bstate, str(ag),
+                    ability=None), item.get("source_uid"))
+                log_req(f"    Tunneling Surface {item.get('source_uid')}: "
+                        f"{result}")
+                ag = ""
             if ag:
                 # The activation's chosen target (e.g. Dimmid's Lifedrain troop)
                 # must reach the BOM leaves.
@@ -7394,12 +7497,31 @@ class HCPHandler(ProfileStreamMixin):
                 self._resolve_champion_void_targets(
                     game, session, pl_t, ai_t, bstate, str(ag))
                 from rules_port.resolution import resolve_port_ability
+                target_map = {}
+                if item.get("target_uid") is not None:
+                    # Champion powers often contain duplicate target-template
+                    # entries: the effect mapping may refer to index 1 even
+                    # though the activation payload carries the single chosen
+                    # target at index 0. Preserve that explicit choice for
+                    # every equivalent authored target slot; otherwise the
+                    # native resolver falls back to the first legal robot.
+                    target_uid = int(item["target_uid"])
+                    try:
+                        from gamedata import DEFAULT_RECORD_STORE, ability_graph
+                        graph = ability_graph(DEFAULT_RECORD_STORE, str(ag).lower())
+                        targets = list(getattr(graph, "targets", ()) or ())
+                        first_guid = (getattr(targets[0], "guid", None)
+                                      if targets else None)
+                        for index, spec in enumerate(targets):
+                            if index == 0 or getattr(spec, "guid", None) == first_guid:
+                                target_map[index] = target_uid
+                    except Exception:
+                        target_map = {0: target_uid}
                 ability_log = resolve_port_ability(
                     self, game, session, _db, pl_t, ai_t, bstate, ag,
                     source_uid=bstate.get("resolving_source_uid"),
                     owner_id=bstate.get("resolving_owner_id", 0),
-                    target_map=({0: int(item["target_uid"])}
-                                if item.get("target_uid") is not None else {}))
+                    target_map=target_map)
                 # Damage/heal leaves normally emit class 38.  Add a fallback
                 # for ability implementations that update the battle state
                 # directly, so the champion HUD changes immediately rather
@@ -7611,7 +7733,8 @@ class HCPHandler(ProfileStreamMixin):
                     if is_player and isinstance(self.user_profile, dict) else 0)
         current = int(bstate.get(f"{side}_resources", 0) or 0)
         total = int(bstate.get(f"{side}_total_resources", 0) or 0)
-        refill = total - current
+        bonus = int(bstate.pop(f"start_turn_resource_bonus_{side}", 0) or 0)
+        refill = total + max(0, bonus) - current
         if refill:
             project_resource_change(
                 projection_game, session, bstate, pl_t, ai_t, side,
@@ -7637,9 +7760,15 @@ class HCPHandler(ProfileStreamMixin):
                     battle_state=bstate, event_type="CardReadiedEvent",
                     source_card_id=int(uid), source_player_id=owner_id,
                     data={"event_previous_state": int(previous_state)})
-        if is_player:
-            bstate["player_has_ready_troop"] = bool(
-                self._player_can_attack_troops(session))
+        # Recompute the combat branch after Prep for whichever side is
+        # active.  Previously this only ran for the human, leaving the AI's
+        # stale ``player_has_ready_troop`` value from its prior main phase;
+        # a troop such as Brightmoon Brave was ready on the next turn but
+        # RulesPort still selected SecondMainPhase.
+        self._current_bstate = bstate
+        bstate["player_has_ready_troop"] = bool(
+            self._player_can_attack_troops(session)
+            if is_player else self._ai_can_attack_troops(session))
         bstate["turn_phases"] = build_turn_phases(bstate)
         _db.commit()
         return changes
@@ -7686,8 +7815,13 @@ class HCPHandler(ProfileStreamMixin):
             game, session, _db, self, pl_t, ai_t, bstate,
             "", ability=None)
         changes = advance(context, active_owner)
+        # Mark the lifecycle phase while TurnStarted triggers resolve so
+        # temporary current-resource gains (e.g. Lithe Lyricist's +1) are
+        # recorded as a start-turn bonus that Prep reapplies after its refill.
+        _previous_phase = bstate.get("phase")
         if resolve_phase_triggers:
             from rules_port.triggers import dispatch_native_trigger
+            bstate["phase"] = game_engine.ETurnPhases.StartTurn
             dispatch_native_trigger(
                 db=_db, handler=self, game=game, session=session,
                 player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
@@ -7700,6 +7834,10 @@ class HCPHandler(ProfileStreamMixin):
                 event_type="TurnStartedEvent", source_card_id=None,
                 source_player_id=active_owner)
         surfaces = queue_surfaces(context, active_owner)
+        if _previous_phase is None:
+            bstate.pop("phase", None)
+        else:
+            bstate["phase"] = _previous_phase
         if emit_events:
             self._send_battle_events(session, game, pl_t)
         return {"tunneling": changes, "surfaces": surfaces}
@@ -10567,6 +10705,12 @@ class HCPHandler(ProfileStreamMixin):
             # leaving the session with a mixed native/legacy lifecycle from
             # the very first chain item.
             self._maybe_attach_rules_port(session, game, bstate)
+            # A re-entrant attach refreshes this fresh seed with the shared
+            # checkpoint created during setup, before PreGame modifiers ran.
+            # That snapshot has no charge count, so re-apply the PreGame seed
+            # (e.g. Fury's +2 charges) here or the starting charges are lost.
+            bstate["player_charges"] = getattr(self, "_player_starting_charges", 0)
+            bstate["ai_charges"] = getattr(self, "_ai_starting_charges", 0)
             native_port = getattr(session, "_rules_port_session", None)
             if native_port is not None:
                 # The setup packet contains the client's non-interactive
@@ -11369,7 +11513,11 @@ class HCPHandler(ProfileStreamMixin):
                     g3.push_ability_on_chain(
                         scid_played,
                         game_engine.ResourceId.from_str(
-                            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID))
+                            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
+                        target_card_ids=(
+                            [game_engine.SessionCardId(
+                                game_engine.UID(int(uid)))
+                             for uid in effect_targets]))
                     _be.save_state(session, bstate)
                 # Both card-play branches now have a visible chain item.
                 g3.push_green_light(
@@ -12292,8 +12440,16 @@ class HCPHandler(ProfileStreamMixin):
             if not pushed_state:
                 pushed_state = state
             from rules_port.host_mutations import project_attacking_card
+            # Continuous attack-time keywords (for example Emberleaf
+            # Duelist's "while this is attacking" Swiftstrike) are derived
+            # from the authoritative state. Include them in the attack
+            # CardUpdated so the client cache sees the same attributes used
+            # by combat resolution.
+            from rules_port.static_rules import effective_attributes
+            attack_attributes = effective_attributes(
+                _db, session.session_id, bstate, int(u))
             project_attacking_card(self, game, cid, pl_t, tpl_guid,
-                                   pushed_state)
+                                   pushed_state, attack_attributes)
             # Attacking normally exhausts the troop.  Emit the same typed tap
             # event used by activated and AI attacks so data-defined effects
             # such as Spider Nest's granted "when this exhausts" ability fire
@@ -14210,6 +14366,8 @@ class HCPHandler(ProfileStreamMixin):
             # Configure the client-style attitude and deck strategy once at
             # the battle boundary. Campaign attitude is the fallback when an
             # encounter deck has no explicit strategy.
+            ai_deck_sleeve_guid = db_encounter_deck_sleeve(
+                ai_deck_guid, conn=_db) if ai_deck_guid else None
             import ai as _ai
             _ai.configure_personality(
                 self,
@@ -14336,14 +14494,20 @@ class HCPHandler(ProfileStreamMixin):
             game.push_game_started(
                 champion_names=[player_name, ai_name],
                 champion_template_ids=[player_champ_guid, ai_champ_guid],
-                player_first=coin_winner_is_player)
+                player_first=coin_winner_is_player,
+                sleeve_template_ids=[
+                    db_deck_sleeve(deck_db_id, self.user_profile["id"], conn=_db),
+                    ai_deck_sleeve_guid,
+                ])
             # The AI does not receive a PickGoesFirst priority window. This
             # completes the client's coin-flip state before the automatic AI
             # Play/Draw result and Mulligan packet arrive.
             if not coin_winner_is_player:
                 game.push_first_player_dictated(ai_uid_t)
             game.push_player_updated(pl_uid_t, champ_id=getattr(self, "_player_champ_scid", None))
-            game.push_player_updated(ai_uid_t, champ_id=getattr(self, "_ai_champ_scid", None))
+            game.push_player_updated(
+                ai_uid_t, deck_sleeve_id=ai_deck_sleeve_guid,
+                champ_id=getattr(self, "_ai_champ_scid", None))
             game.push_card_updated(player_champ_id, pl_uid_t, game_engine.ECardCollections.None_,
                                    game_engine.ECardTypes.Champion, attack=0, defense=player_starting_health,
                                    template_id=player_champ_guid)
@@ -14884,7 +15048,9 @@ class HCPHandler(ProfileStreamMixin):
                     log_req(f"    AI deck: {len(ai_deck_cards)} cards from "
                             f"{source} (hands dealt after PickGoesFirst)")
             if ai_deck_cards:
-                game.push_deck_created_with_cards(ai_uid_t, ai_deck_cards)
+                game.push_deck_created_with_cards(
+                    ai_uid_t, ai_deck_cards,
+                    sleeve_guid=ai_deck_sleeve_guid)
             _db.commit()
             # CardCreatedEvent triggers fire when the deck's cards are created
             # (the client's ActivateCardCreationAbilities during deck setup) —
@@ -14986,10 +15152,17 @@ class HCPHandler(ProfileStreamMixin):
             if pl_guids:
                 try:
                     if pregame_bstate.get("_rules_port_attached"):
-                        # Native PreGameEvent dispatch above includes the
-                        # configured champion source; do not run a second
-                        # champion-specific BOM helper here.
-                        log_req("    Native PreGame: player champion handled by event dispatcher")
+                        # Native dispatch handles authored trigger/BOM effects.
+                        # Apply the remaining metadata-only modifiers (such as
+                        # Fury's -7 health/+2 charges, whose setup effect is
+                        # not reliably materialized by native discovery,
+                        # without duplicating native effects.
+                        import ability as _ability
+                        _ability.apply_pregame_abilities(
+                            game, session, _db, self, pl_uid_t,
+                            self.user_profile["id"], pl_guids,
+                            "player_health", metadata_only=True)
+                        log_req("    Native PreGame: applied non-trigger champion modifiers")
                     else:
                         import ability as _ability
                         _ability.apply_pregame_abilities(
@@ -15001,7 +15174,11 @@ class HCPHandler(ProfileStreamMixin):
             if ai_guids:
                 try:
                     if pregame_bstate.get("_rules_port_attached"):
-                        log_req("    Native PreGame: AI champion handled by event dispatcher")
+                        import ability as _ability
+                        _ability.apply_pregame_abilities(
+                            game, session, _db, self, ai_uid_t, 0,
+                            ai_guids, "ai_health", metadata_only=True)
+                        log_req("    Native PreGame: applied non-trigger AI modifiers")
                     else:
                         import ability as _ability
                         _ability.apply_pregame_abilities(
@@ -15298,10 +15475,23 @@ class HCPHandler(ProfileStreamMixin):
                         granted.append((template_guid, quantity))
                 else:
                     granted.append((template_guid, quantity))
+            # Persist the grant before encoding it.  PlayerProfile.AddInventoryItem
+            # replaces an item with the same UID, so ItemQuantity must be the
+            # authoritative post-purchase total and the UID must match the
+            # profile stream's stable row for this template.
             granted_list = []
-            for gi, (tg, qty) in enumerate(granted):
-                uid = (1000 + item_id) if gi == 0 else (900000 + item_id + gi)
-                granted_list.append((tg, uid, qty))
+            for tg, qty in granted:
+                db_add_inventory(p["id"], tg, qty, conn=_db)
+                inventory_row = db_inventory_item(
+                    p["id"], tg, conn=_db)
+                uid = inventory_row[2] if inventory_row else 0
+                if not uid:
+                    uid = db_next_inventory_client_uid(p["id"], conn=_db)
+                    db_set_inventory_client_uid(
+                        p["id"], tg, uid, conn=_db)
+                inventory_row = db_inventory_item(
+                    p["id"], tg, conn=_db)
+                granted_list.append((tg, uid, int(inventory_row[1])))
     
             resp_inner = encode_objfmt_response(
                 ["Game.Client.Network.Escrow.PurchaseItemResponse",
@@ -15351,15 +15541,6 @@ class HCPHandler(ProfileStreamMixin):
                     gname = db_store_item_name_for_template(tg, conn=_db) or tg
                 db_record_purchase(
                     p["id"], gname, tg, cost * qty, currency_type, conn=_db)
-            # Also add to player inventory for future pushes
-            for gi, (tg, qty) in enumerate(granted):
-                db_add_inventory(p["id"], tg, qty, conn=_db)
-                # Store the client-side UID used in the GrantedInventory
-                # response (1000 + store_item_id, or a distinct high UID for
-                # any additional upgraded grant).
-                uid = (1000 + item_id) if gi == 0 else (900000 + item_id + gi)
-                db_set_inventory_client_uid(
-                    p["id"], tg, uid, conn=_db)
             _db.commit()
             log_req(f"    Sent PurchaseItem response: remaining={remaining} {currency_type}")
     
@@ -16789,11 +16970,17 @@ class HCPHandler(ProfileStreamMixin):
                         self.push_inventory_to_client(qty=max(0, new_qty), template_guid=pack_guid, item_id=pack_client_uid)
     
                 # Persist new cards to card_instances and get their instance IDs
-                max_id = max(5000, db_next_card_instance_for_user(
-                    self.user_profile["id"], conn=_db) - 1)
+                # ``db_next_card_instance_for_user`` already returns the
+                # first unused instance ID.  Do not subtract one here: the
+                # old calculation reused the current maximum, and the
+                # INSERT OR IGNORE in ``db_insert_card_instance`` then kept
+                # whatever card happened to occupy that ID.  That made the
+                # first card in an opened pack appear as an unrelated card.
+                next_id = db_next_card_instance_for_user(
+                    self.user_profile["id"], conn=_db)
                 new_card_data = []
                 for i, (guid, name, cost, atk, def_) in enumerate(all_cards):
-                    cid = max_id + i
+                    cid = next_id + i
                     db_insert_card_instance(
                         self.user_profile["id"], cid, guid, conn=_db)
                     new_card_data.append((guid, name, cost, atk, def_, cid, 0))
@@ -16801,8 +16988,12 @@ class HCPHandler(ProfileStreamMixin):
                 _db.commit()
                 log_req(f"    Created {len(new_card_data)} card_instances IDs {new_card_data[0][5]}-{new_card_data[-1][5]}")
 
-                # Push these specific new cards to client via ProfileGenericUpdate (adds to CardList)
-                self.push_opened_cards_via_generic(new_card_data)
+                # OpenCardPackResponse.NewCardInstances is the authoritative
+                # collection update.  Do not also send these same instances
+                # through ProfileGenericUpdate: PlayerProfile.LoadCardsFromBits
+                # adds them to the client's CardList, and the duplicate update
+                # causes the client's dictionary to throw "same key already
+                # exists" while opening the pack.
 
                 # Campaign equipment and Stardust are InventoryItemData, not
                 # card_instance_bits.  Persist them with stable per-player
@@ -17941,7 +18132,8 @@ class HCPHandler(ProfileStreamMixin):
                     
                     # Persist cards and create instances
                     from profile_db import db_next_card_instance_id, db_create_card_instance, db_open_chest
-                    max_cid = db_next_card_instance_id()
+                    max_cid = db_next_card_instance_id(
+                        self.user_profile["id"], conn=_db)
                     reward_card_bits = []
                     for i, (guid, name, cost, atk, def_) in enumerate(chest_cards):
                         cid = max_cid + i
@@ -18190,7 +18382,8 @@ class HCPHandler(ProfileStreamMixin):
                         if len(chest_cards) > keep_count:
                             chest_cards = _rand2.sample(chest_cards, keep_count)
 
-                    max_cid = db_next_card_instance_id()
+                    max_cid = db_next_card_instance_id(
+                        self.user_profile["id"], conn=_db)
                     for offset, (guid, name, cost, atk, def_) in enumerate(
                             chest_cards):
                         cid = max_cid + offset

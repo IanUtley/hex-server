@@ -170,6 +170,53 @@ def _normalize_activation_data(value):
     return result
 
 
+def _merge_activation_data(raw_value, decoded_value):
+    """Merge decoder views of one activation without losing cost targets.
+
+    The generic ObjFmt walker can decode ``TargetMap`` while stopping before
+    the nested ``XCostData`` record.  The raw, label-aware recovery path can
+    still recover ``CardsToSacrifice`` in that case.  A shallow payload update
+    used to replace the recovered activation and left RulesPort to infer the
+    sacrifice from the effect target, which is wrong when an ability has both
+    targets (Bunoshi's charge power is the canonical shape).
+    """
+    if isinstance(raw_value, Mapping) and isinstance(decoded_value, Mapping):
+        merged = dict(raw_value)
+        for key, value in decoded_value.items():
+            if key in {"target_map", "cost_target_map", "option_map"}:
+                if isinstance(value, Mapping) and isinstance(
+                        merged.get(key), Mapping):
+                    # Keep raw-labelled entries that the typed walker did not
+                    # expose.  Decoded entries remain authoritative when both
+                    # paths supplied the same index.
+                    merged[key] = {**merged[key], **value}
+                elif value or key not in merged:
+                    merged[key] = value
+                continue
+            if key == "variables" and isinstance(value, Mapping) and isinstance(
+                    merged.get(key), Mapping):
+                merged[key] = {**merged[key], **value}
+                continue
+            merged[key] = value
+        return merged
+    if isinstance(raw_value, (list, tuple)) and isinstance(
+            decoded_value, (list, tuple)):
+        result = list(raw_value)
+        for index, value in enumerate(decoded_value):
+            if index < len(result):
+                result[index] = _merge_activation_data(result[index], value)
+            else:
+                result.append(value)
+        return type(decoded_value)(result)
+    if isinstance(raw_value, Mapping) and isinstance(decoded_value, (list, tuple)) \
+            and len(decoded_value) == 1:
+        return _merge_activation_data(raw_value, decoded_value[0])
+    if isinstance(raw_value, (list, tuple)) and isinstance(decoded_value, Mapping) \
+            and len(raw_value) == 1:
+        return _merge_activation_data(raw_value[0], decoded_value)
+    return decoded_value if decoded_value is not None else raw_value
+
+
 def _normalize_checksum_data(value):
     """Normalize the named C# ``SessionChecksumData`` record.
 
@@ -319,7 +366,7 @@ def typed_payload_from_decoded(command, decoded):
                 # length field is the fourth metadata value after m_Guid;
                 # older recovery code expected one extra value and therefore
                 # dropped otherwise valid champion activations.
-                rb"m_Guid;[^;]*;[^;]*;[^;]*;"
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;(?:[0-9]+;)?"
                 rb"([0-9a-fA-F]{32});", raw)
             if guid_match:
                 compact = guid_match.group(1).decode("ascii").lower()
@@ -341,7 +388,7 @@ def typed_payload_from_decoded(command, decoded):
             # labelled value and continue with the typed target recovery.
             dashed_guid = re.search(
                 rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
-                rb"m_Guid;[^;]*;[^;]*;[^;]*;"
+                rb"m_Guid;[^;]*;[^;]*;[^;]*;(?:[0-9]+;)?"
                 rb"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                 rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12});", raw)
             if dashed_guid:
@@ -559,7 +606,12 @@ def typed_payload_from_decoded(command, decoded):
             # AssignDamage; returning None makes the boundary reject it.
             payload["assignments"] = ()
     if raw_payload:
-        raw_payload.update(payload)
+        for key, value in payload.items():
+            if key == "activation_data" and key in raw_payload:
+                raw_payload[key] = _merge_activation_data(
+                    raw_payload[key], value)
+            else:
+                raw_payload[key] = value
         payload = raw_payload
     if getattr(command, "is_encounter_mod_dialog", False):
         conversation = find("ConversationId", "m_ConversationId",

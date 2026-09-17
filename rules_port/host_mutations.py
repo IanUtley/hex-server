@@ -92,14 +92,15 @@ def project_mulligan_cards(host, game, event_player_uid, old_rows,
 
 
 def project_attacking_card(host, game, session_card_id, player_uid,
-                           template_guid, state):
+                           template_guid, state, attributes=None):
     """Emit the complete cache refresh for a newly declared attacker."""
     _tpl, card_type, _name, _cost, _attack, _defense, _gems = \
         host._card_full_data(game, session_card_id, template_guid)
     game.push_card_updated(
         session_card_id, player_uid, game_engine.ECardCollections.Warzone,
         game_engine.ECardTypes.Troop, template_id=template_guid,
-        state=int(state or 0))
+        state=int(state or 0),
+        **({"attributes": int(attributes)} if attributes is not None else {}))
 
 
 def apply_attacking_card_state(session, card_uid, state):
@@ -123,7 +124,8 @@ def queue_free_played_card(host, game, session, db, player_uid, ai_uid,
     previous_location = db_card_location(
         session.session_id, card_uid, conn=db)
     surfaced = str(previous_location or "").lower() == "underground"
-    db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells")
+    db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells",
+                               conn=db)
     if surfaced:
         db_add_temporary_attributes(
             session.session_id, card_uid, game_engine.ECardAttributes.Speed,

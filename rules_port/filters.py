@@ -944,8 +944,14 @@ def _records_filter_spec(spec):
 
 def records_filter_from_metadata(spec: Any) -> CardFilter:
     """Build a RulesPort filter from the client's serialized Records tree."""
+    if not spec:
+        return AnyCard()
     normalized = _records_filter_spec(spec)
+    if not isinstance(normalized, dict):
+        return AnyCard()
     kind = str(normalized.get("type", "")).rsplit(".", 1)[-1].lower()
+    if not kind:
+        return AnyCard()
     if kind in ("andcardfilter", "orcardfilter",
                 "staticandcardfilter", "staticorcardfilter"):
         children = tuple(records_filter_from_metadata(item)
@@ -999,6 +1005,11 @@ def records_filter_matches(card, spec, *, source=None, context=None,
                             player=None):
     """Evaluate one Records filter using the RulesPort card predicate set."""
     from domain.enums import ECardStates, card_type_from_db
+
+    if not spec:
+        # An empty/absent filter (for example TopNOfDeck with ``m_Filter``
+        # null, used by Nerissa's reveal power) matches every candidate.
+        return True
 
     def normalize_runtime_flags(value):
         # ``game_cards.card_state`` is the authoritative mutable card state;

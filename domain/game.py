@@ -674,7 +674,7 @@ class Game:
         self._push(ev)
 
     def push_game_started(self, champion_names=None, champion_template_ids=None,
-                          player_first=None):
+                          player_first=None, sleeve_template_ids=None):
         ev = self._make_event(GameStartedSessionEventArgs)
         if player_first is None:
             ev.turn_order = [self.player_uid, self.ai_uid]
@@ -691,7 +691,9 @@ class Game:
                 ResourceId.from_str("1d462ffb-0744-4996-804c-ba61b2c5c2f1"),
                 ResourceId.from_str("f8f86969-2e47-4901-8c9e-7fbf8d859e22"),
             ]
-        ev.sleeve_template_ids = []
+        ev.sleeve_template_ids = [
+            ResourceId.from_str(value) for value in (sleeve_template_ids or [])
+            if value]
         ev.board_template_ids = []
         ev.coin_template_ids = []
         ev.divisions = [1, 1]
@@ -707,11 +709,14 @@ class Game:
         ev.session_card_id = champ_card_id
         self._push(ev)
 
-    def push_deck_created_with_cards(self, player_uid: UID, card_ids: List[SessionCardId]):
+    def push_deck_created_with_cards(self, player_uid: UID,
+                                     card_ids: List[SessionCardId],
+                                     sleeve_guid: str = None):
         ev = self._make_event(DeckCreatedSessionEventArgs)
         ev.player_id = player_uid
         ev.session_card_ids = card_ids
-        ev.deck_sleeve_id = ResourceId.from_str("c508cdd3-77ad-4dbf-b1b4-b201eae5a690")
+        ev.deck_sleeve_id = ResourceId.from_str(
+            sleeve_guid or "c508cdd3-77ad-4dbf-b1b4-b201eae5a690")
         ev.gameboard_id = ResourceId.from_str("3da4e3b7-e8e9-416a-b36c-e56cbc0aec47")
         ev.coin_id = ResourceId.from_str("c08eb0fa-8f98-43ee-afe7-25f05595cfb3")
         self._push(ev)

@@ -5,6 +5,32 @@ from __future__ import annotations
 from .actions import AbilityResolutionState
 
 
+def _log_ability_start(handler, db, ability_guid, source_uid, owner_id,
+                       target_map):
+    """Write one readable trace line for every RulesPort ability resolution."""
+    try:
+        from pvp_db import db_ability_game_text, db_ability_raw_json
+        import json
+        raw = db_ability_raw_json(ability_guid, conn=db)
+        record = json.loads(raw or "{}") if raw else {}
+        name = record.get("m_Name") or db_ability_game_text(
+            ability_guid, conn=db) or str(ability_guid)
+    except Exception:
+        name = str(ability_guid)
+    targets = []
+    for value in (target_map or {}).values():
+        if isinstance(value, dict):
+            value = value.get("value", value.get("uid64", value))
+        try:
+            targets.append(hex(int(value)))
+        except (TypeError, ValueError):
+            targets.append(str(value))
+    getattr(handler, "_log_req", print)(
+        f"    Ability resolve: {name} ({str(ability_guid)[:8]}) "
+        f"source={hex(int(source_uid)) if source_uid is not None else None} "
+        f"owner={owner_id} targets={targets}")
+
+
 def _random_target_sample(candidates, count, battle_state):
     """Port of ``AbilityTargetTemplate.FilterRandomTargets``.
 
@@ -320,6 +346,64 @@ class NativeEffectBackend:
                             target_values = _match_secondary_values(
                                 db, session.session_id, ability, effect,
                                 target_spec, battle_state)
+                        elif target_spec.target_kind == "SourceRevealedTargetTemplate":
+                            from .targeting import (revealed_target_uids,
+                                                    _target_ignore_acted_on)
+                            acted_on = ()
+                            if _target_ignore_acted_on(target_spec.guid):
+                                sec_index = int(field(
+                                    effect, "secondary_target_index", -1) or -1)
+                                if 0 <= sec_index < len(ability.metadata.targets):
+                                    sec_spec = ability.metadata.targets[sec_index]
+                                    acted_on = tuple(revealed_target_uids(
+                                        db, session.session_id,
+                                        ability.responsible_player_id,
+                                        ability.source_uid, sec_spec.guid,
+                                        battle_state.get("revealed_cards") or [],
+                                        battle_state=battle_state))
+                            candidates = revealed_target_uids(
+                                db, session.session_id,
+                                ability.responsible_player_id, ability.source_uid,
+                                target_spec.guid,
+                                battle_state.get("revealed_cards") or [],
+                                battle_state=battle_state, acted_on_uids=acted_on)
+                            if candidates and int(ability.responsible_player_id or 0) != 0:
+                                prompt = getattr(handler, "_prompt_revealed_choice", None)
+                                if callable(prompt):
+                                    continuation = {
+                                        "ability_instance_id": int(ability.instance_id),
+                                        "ability_guid": ability.ability_template_id,
+                                        "source_uid": int(ability.source_uid or 0),
+                                        "owner_id": int(ability.responsible_player_id or 0),
+                                        "target_map": {
+                                            str(key): value for key, value in
+                                            ability.activation.target_map.items()},
+                                        "variables": dict(ability.activation.variables or {}),
+                                        "resume_effect_order": int(position),
+                                        "target_index": int(target_index),
+                                    }
+                                    if battle_state.get("_choice_parent"):
+                                        continuation["parent"] = dict(
+                                            battle_state["_choice_parent"])
+                                    prompt(
+                                        game, session, player_uid, ai_uid,
+                                        battle_state, ability.ability_template_id,
+                                        int(ability.source_uid or 0),
+                                        int(ability.responsible_player_id),
+                                        candidates,
+                                        list(battle_state.get("revealed_cards") or []),
+                                        optional=bool(target_spec.optional),
+                                        continuation=continuation)
+                                    battle_state["resolution_paused"] = True
+                                    native_waiting = True
+                            else:
+                                # C# SourceRevealedTargetTemplate leaves
+                                # m_MaximumTargetCount unset (int.MaxValue),
+                                # so a 0/absent maximum means "all of them",
+                                # not a single card.
+                                _max = int(target_spec.maximum or 0)
+                                target_values = tuple(
+                                    candidates[:_max] if _max > 0 else candidates)
                         elif target_spec.is_auto:
                             from .targeting import target_uses_both_players
                             both_players = target_uses_both_players(
@@ -361,46 +445,22 @@ class NativeEffectBackend:
                                     # auto-target to GetMaximumTargetCount.
                                     candidates = candidates[:_max]
                             target_values = candidates
-                        elif target_spec.target_kind == "SourceRevealedTargetTemplate":
-                            from .targeting import revealed_target_uids
-                            candidates = revealed_target_uids(
-                                db, session.session_id,
-                                ability.responsible_player_id, ability.source_uid,
-                                target_spec.guid,
-                                battle_state.get("revealed_cards") or [],
-                                battle_state=battle_state)
-                            if candidates and int(ability.responsible_player_id or 0) != 0:
-                                prompt = getattr(handler, "_prompt_revealed_choice", None)
-                                if callable(prompt):
-                                    continuation = {
-                                        "ability_instance_id": int(ability.instance_id),
-                                        "ability_guid": ability.ability_template_id,
-                                        "source_uid": int(ability.source_uid or 0),
-                                        "owner_id": int(ability.responsible_player_id or 0),
-                                        "target_map": {
-                                            str(key): value for key, value in
-                                            ability.activation.target_map.items()},
-                                        "variables": dict(ability.activation.variables or {}),
-                                        "resume_effect_order": int(position),
-                                        "target_index": int(target_index),
-                                    }
-                                    if battle_state.get("_choice_parent"):
-                                        continuation["parent"] = dict(
-                                            battle_state["_choice_parent"])
-                                    prompt(
-                                        game, session, player_uid, ai_uid,
-                                        battle_state, ability.ability_template_id,
-                                        int(ability.source_uid or 0),
-                                        int(ability.responsible_player_id),
-                                        candidates,
-                                        list(battle_state.get("revealed_cards") or []),
-                                        optional=bool(target_spec.optional),
-                                        continuation=continuation)
-                                    battle_state["resolution_paused"] = True
-                                    native_waiting = True
-                            else:
-                                target_values = tuple(candidates[:max(
-                                    1, int(target_spec.maximum or 1))])
+                        if target_values:
+                            # Effects that share a target-template index share
+                            # one client AbilityTargetInstance.  RecalculateTargets
+                            # refreshes that instance before its first effect;
+                            # it does not choose a different random card for
+                            # every subsequent effect using the same mapping.
+                            # Keep the resolved automatic target on this
+                            # activation so a move followed by modifiers (for
+                            # example Infernal Professor) remains one atomic
+                            # card operation.
+                            resolved_targets = tuple(target_values)
+                            ability.activation.target_map[target_index] = \
+                                resolved_targets
+                            battle_state["ability_target_map"][target_index] = \
+                                resolved_targets
+                            target_values = resolved_targets
                 if native_waiting:
                     break
                 if not target_values:
@@ -566,6 +626,15 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
                          native_effect=None,
                          effect_groups=None):
     """Resolve a persisted continuation through the port-owned lifecycle."""
+    log_targets = target_map
+    if not log_targets:
+        fallback = ((battle_state or {}).get("resolving_target_uid")
+                    or (battle_state or {}).get("player_spell_target")
+                    or (battle_state or {}).get("player_mod_target"))
+        if fallback is not None:
+            log_targets = {0: fallback}
+    _log_ability_start(handler, db, ability_guid, source_uid, owner_id,
+                       log_targets)
     ability = build_port_ability(
         ability_guid, source_uid, owner_id, instance_id=instance_id,
         target_map=target_map, variables=variables)

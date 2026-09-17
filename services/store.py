@@ -193,8 +193,6 @@ def handle_purchase(handler, target, instance, reqid, comp, session_id, conh,
     else:
         p["gold"] = remaining
 
-    error_value = 0 if result["redeemed"] else 1
-    error_message = result.get("error_message", "")
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Escrow.PurchaseItemResponse",
          "System.Int32", "System.String",
@@ -269,6 +267,8 @@ def handle_redeem(handler, target, instance, reqid, comp, session_id, conh,
         log_req(f"    RedeemCode success: gold+{gold_delta} plat+{plat_delta}")
     else:
         log_req(f"    RedeemCode invalid: {redeem_code}")
+    error_value = 0 if result["redeemed"] else 1
+    error_message = result.get("error_message", "")
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Escrow.RedeemCodeResponse",
          "System.Collections.Generic.List`1#Game.Shared.ResourceId",

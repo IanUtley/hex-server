@@ -26,6 +26,8 @@ def _flags(value, text=""):
         "steadfast": game_engine.ECardAttributes.Steadfast,
         "spellshield": game_engine.ECardAttributes.SpellShield,
         "rage": game_engine.ECardAttributes.Rage,
+        "cantreadyautomatically": game_engine.ECardAttributes.CantReadyAutomatically,
+        "can't ready": game_engine.ECardAttributes.CantReadyAutomatically,
         "defensive": game_engine.ECardAttributes.Defensive,
     }
     bits = 0
@@ -38,6 +40,8 @@ def _flags(value, text=""):
                 bits |= int(flag)
     if text and "can't attack or block" in text.lower():
         bits |= int(game_engine.ECardAttributes.CantAttack | game_engine.ECardAttributes.CantBlock)
+    if text and "can't ready" in text.lower():
+        bits |= int(game_engine.ECardAttributes.CantReadyAutomatically)
     return bits
 
 

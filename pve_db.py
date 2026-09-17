@@ -126,6 +126,19 @@ def db_update_arena_state(user_id, conn=None, **kwargs):
         connection.commit()
 
 
+def db_clear_arena_run(user_id, conn=None):
+    """Reset one player's FRA run and remove its saved challenger roster."""
+    connection = _connection(conn)
+    db_get_arena_state(user_id, conn=connection)
+    db_update_arena_state(
+        user_id, conn=connection, deck_id=0, wins=0, losses=0,
+        challenger_index=0, fight_history="[]", gold_earned=0,
+        chests_earned=0, sacks_earned=0)
+    db_clear_fra_challengers(user_id, conn=connection)
+    if conn is None:
+        connection.commit()
+
+
 def db_get_active_fra_challenges(user_id, conn=None):
     """Return challenge definitions active for the current FRA run."""
     history = db_get_arena_fight_history(user_id, conn=conn)
@@ -864,6 +877,16 @@ def db_encounter_deck_personality(deck_guid, conn=None):
         "WHERE ai_deck_guid=? AND ai_deck_personality IS NOT NULL LIMIT 1",
         (deck_guid,)).fetchone()
     return row[0] if row else None
+
+
+def db_encounter_deck_sleeve(deck_guid, conn=None):
+    """Return the authored sleeve for an encounter deck."""
+    if not deck_guid:
+        return None
+    row = _connection(conn).execute(
+        "SELECT deck_sleeve_guid FROM fra_encounters "
+        "WHERE deck_guid=? LIMIT 1", (deck_guid,)).fetchone()
+    return row[0] if row and row[0] else None
 
 
 def db_default_talents(race, champion_class, gender, conn=None):

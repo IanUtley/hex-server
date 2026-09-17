@@ -253,7 +253,8 @@ def _text_number(text, expression):
         return _NUMBER_WORDS.get(value.lower(), 0)
 
 
-def pregame_modifiers(db, session, user_id, ability_guids):
+def pregame_modifiers(db, session, user_id, ability_guids,
+                      include_triggered=True):
     """Resolve the starting-game modifiers encoded by granted talent BOMs.
 
     The extracted talent table contains the ability GUID and its trigger
@@ -269,6 +270,18 @@ def pregame_modifiers(db, session, user_id, ability_guids):
     }
     from pvp_db import db_talent_ability_condition, db_talent_description
     for guid in ability_guids or []:
+        # Attached RulesPort sessions dispatch abilities with an authored
+        # trigger through the native event path.  Callers doing the small
+        # metadata fallback for those sessions must not count such an ability
+        # a second time (for example a PreGame heal BOM).
+        if not include_triggered:
+            try:
+                from gamedata import DEFAULT_RECORD_STORE, ability_graph
+                graph = ability_graph(DEFAULT_RECORD_STORE, str(guid).lower())
+                if graph is not None and graph.trigger_event_type:
+                    continue
+            except Exception:
+                pass
         row = db_talent_ability_condition(str(guid), conn=db)
         if not row:
             # Signature champion powers are not PreGame talent abilities.
@@ -291,6 +304,7 @@ def pregame_modifiers(db, session, user_id, ability_guids):
             result["health"] += int(health.group(1))
 
         effect_params = list(_effect_params(db, str(guid)))
+        charge_total = 0
         for param in effect_params:
             prop = (param.get("property") or "").lower()
             text = param.get("text") or ""
@@ -298,7 +312,7 @@ def pregame_modifiers(db, session, user_id, ability_guids):
                 amount = int(param.get("amount") or 0)
                 if not amount:
                     amount = _text_number(text, r"gain\s+([a-z]+|\d+)\s+charges?")
-                result["charges"] += amount
+                charge_total += amount
             elif prop == "intattr":
                 # IntAttrModifier.m_Attribute/m_Value are the rules fields;
                 # game text is localized presentation and may be absent.
@@ -313,6 +327,11 @@ def pregame_modifiers(db, session, user_id, ability_guids):
                         text, r"starting hand size is increased by\s+([a-z]+|\d+)")
                     result["maximum_hand"] += _text_number(
                         text, r"maximum hand size is increased by\s+([a-z]+|\d+)")
+
+        if charge_total == 0:
+            charge_total = _text_number(
+                description, r"(?:begin|start).*?with\s+([a-z]+|\d+)\s+charges?")
+        result["charges"] += charge_total
 
         if re.search(r"random troop in your starting hand", description or "",
                      re.IGNORECASE):
@@ -390,7 +409,9 @@ def _apply_bom_health(db, ability_guid):
     return total
 
 
-def apply_pregame_abilities(game, session, db, handler, player_uid, user_id, ability_guids, health_field):
+def apply_pregame_abilities(game, session, db, handler, player_uid, user_id,
+                            ability_guids, health_field,
+                            metadata_only=False):
     """Apply PreGame-triggered champion abilities for a player.
 
     For each granted ability marked PreGame in talent_abilities, evaluate its
@@ -414,15 +435,27 @@ def apply_pregame_abilities(game, session, db, handler, player_uid, user_id, abi
 
     charge_field = "player_charges" if health_field == "player_health" else "ai_charges"
     old_charges = int(game.__dict__.get(charge_field, 0) or 0)
-    new_charges = old_charges + modifiers["charges"]
+    # In an attached session native dispatch may already have applied a
+    # chargepoint leaf.  Starting charges begin at zero, so only fill the
+    # metadata amount still missing from the current pool.
+    charge_delta = modifiers["charges"]
+    if metadata_only and charge_delta > 0:
+        charge_delta = max(0, charge_delta - old_charges)
+    new_charges = old_charges + charge_delta
     if new_charges != old_charges:
         game.__dict__[charge_field] = new_charges
         ev = game_engine.ChampionChargePointsChangedSessionEventArgs()
         ev.player_id = player_uid
-        ev.operation = 1 if modifiers["charges"] >= 0 else 2
-        ev.delta = modifiers["charges"]
+        ev.operation = 1 if charge_delta >= 0 else 2
+        ev.delta = charge_delta
         ev.new_value = new_charges
         game._push(ev)
+
+    # Native dispatch owns authored trigger/BOM effects in attached sessions.
+    # The metadata-only pass above exists for abilities such as Fury whose
+    # starting modifiers are present on the talent but have no trigger event.
+    if metadata_only:
+        return
 
     # The normal battle state is created after mulligan, but the BOM resolver
     # needs the same owner/target context while it creates cards during setup.

@@ -3,6 +3,7 @@
 import sqlite3
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -22,6 +23,52 @@ class HandlerStub:
 
     def _card_full_data(self, _game, _scid, template_guid, _instance_id=None):
         return template_guid, "Troop", "Chosen Card", 1, 2, 3, 0
+
+
+def test_version_command_is_available_without_debug_console():
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
+    try:
+        with open(os.path.join(os.path.dirname(commands.__file__), "VERSION"),
+                  encoding="utf-8") as version_file:
+            expected = version_file.read().strip()
+        assert commands.handle_command(HandlerStub(), "!version", "", "") == expected
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
+
+
+def test_arena_clear_command_is_available_without_debug_console():
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
+    try:
+        with mock.patch("pve_db.db_clear_arena_run") as clear_run:
+            result = commands.handle_command(HandlerStub(), "!arena-cleanup", "", "")
+        assert result == "Arena run cleared", result
+        clear_run.assert_called_once_with(5, conn=commands.hconnect_server._db)
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
+
+
+def test_help_lists_only_public_commands_without_debug_console():
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
+    try:
+        assert commands.handle_command(HandlerStub(), "!help", "", "") == (
+            "Available commands: !help, !version, !arena-cleanup")
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
+
+
+def test_help_lists_commands_without_active_game_when_console_enabled():
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ("allowcon",)
+    try:
+        result = commands.handle_command(HandlerStub(), "!help", "", "")
+        assert result.startswith("=== Commands ===")
+        assert "!pass — advance turn phase" in result
+        assert result != "No active game"
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
 
 
 class BattleSessionStub(SessionStub):

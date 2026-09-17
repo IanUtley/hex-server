@@ -214,8 +214,70 @@ def test_devoted_cost_talent_applies_once_via_trigger():
         os.unlink(path)
 
 
+def test_starting_charges_survive_reattach_and_resource_plays():
+    """Fury's +2 starting charges must persist past the shared-checkpoint
+    reattach (mulligan keep) and then track resource plays.
+
+    Regression: enable_rules_port's re-entrant path refreshes a fresh
+    mulligan seed with the setup checkpoint (captured before PreGame
+    modifiers ran), which has no ``player_charges`` key.  Without the
+    re-apply step in _handle_mulligan_keep_transaction the +2 was dropped,
+    leaving only the per-resource +1.
+    """
+    import game_engine
+    from rules_port import lifecycle, resources
+    from rules_port.adapter import enable_rules_port
+    from rules_port.persistence import save_state
+
+    class _Game:
+        player_uid = game_engine.UID.make(244, 5)
+        ai_uid = game_engine.UID.make(3, 1000)
+
+    class _Session:
+        def __init__(self):
+            self.session_id = 174582
+            self.seed_z = 12345
+            self.seed_w = 67890
+            self._rules_port_session = None
+            self._rules_port_battle_state = None
+            self.turn_order = None
+            self.players = [(game_engine.UID.make(244, 5), 0),
+                            (game_engine.UID.make(3, 1000), 0)]
+
+        def _persist(self, *args, **kwargs):
+            pass
+
+    session = _Session()
+    setup_bstate = {"stack": [], "ability_lists": {}, "pvp": False,
+                    "turn_player": "player", "phase_idx": 0,
+                    "player_health": 24, "ai_health": 10,
+                    "player_resources": 0, "ai_resources": 0,
+                    "player_threshold": {}, "ai_threshold": {}}
+    enable_rules_port(session, _Game(), setup_bstate)
+
+    starting_charges = 2
+    bstate = lifecycle.default_state(turn_player=lifecycle.PLAYER)
+    bstate["player_charges"] = starting_charges
+    bstate["ai_charges"] = 0
+    bstate["player_health"] = 24
+    bstate["ai_health"] = 10
+    enable_rules_port(session, _Game(), bstate)
+    # Re-attach clobbered the fresh seed; the mulligan handler re-applies the
+    # PreGame charge seed and persists before handing back to the scheduler.
+    bstate["player_charges"] = starting_charges
+    bstate["ai_charges"] = 0
+    save_state(session, bstate)
+    assert session._rules_port_battle_state["player_charges"] == 2
+
+    for _turn in range(1, 4):
+        resources.begin_turn_resources(bstate, "player")
+        resources.play_resource(bstate, "player", 1, 1, threshold_color=32)
+    assert bstate["player_charges"] == starting_charges + 3, bstate
+
+
 if __name__ == "__main__":
     test_skylak_uses_original_deck_size_for_both_talents()
     test_expendable_lives_grants_and_resolves_one_shot_deathcry()
     test_devoted_cost_talent_applies_once_via_trigger()
+    test_starting_charges_survive_reattach_and_resource_plays()
     print("PASS Skylak PreGame deck insertions")

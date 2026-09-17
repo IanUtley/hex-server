@@ -235,6 +235,40 @@ def test_priority_window_is_apnap_and_requires_current_player():
     assert session.events == ["phase-update", "phase-update"]
 
 
+def test_practice_follow_up_auto_pass_only_applies_to_ability_chain():
+    """AssignDamage's AI phase window must reach the AI combat driver."""
+    from hconnect_server import _is_practice_chain_follow_up
+
+    session = SessionStub()
+    stack = GameActionStack(session)
+    phase_window = PriorityWindowAction(TurnPhasePlayers.ALL)
+    stack.push(phase_window)
+    assert phase_window.pass_priority("a")
+    assert phase_window.priority_player_id == "b"
+    assert not _is_practice_chain_follow_up(phase_window, "a", True)
+
+    phase_window.ability_responding_to = object()
+    assert _is_practice_chain_follow_up(phase_window, "a", True)
+
+
+def test_native_ai_attacker_declaration_is_idempotent_after_phase_entry():
+    """The AI loop must not erase attackers tapped by native declaration."""
+    import ai
+
+    declarations = {"17153": "257", "17665": "257"}
+    state = {"ai_attackers": declarations.copy()}
+    port = SimpleNamespace(
+        combat_manager=SimpleNamespace(combats=[object(), object()]))
+    session = SimpleNamespace(_rules_port_session=port)
+
+    result = ai.ai_declare_attackers(
+        SimpleNamespace(), SimpleNamespace(), session,
+        "ai", "player", state)
+
+    assert result is state
+    assert state["ai_attackers"] == declarations
+
+
 def test_interrupted_priority_window_restarts_with_active_player():
     session = SessionStub()
     stack = GameActionStack(session)
@@ -3139,6 +3173,50 @@ def test_native_effect_backend_walks_typed_effects_without_legacy_resolver():
         battle_state=state, ability=ability, effect_groups=(0,))
     assert state["applied_effects"] == {0: True}
     assert state["rules_port_effect_results"][0]["result"] == "no-op"
+
+
+def test_native_effect_backend_reuses_one_auto_target_mapping():
+    """A move and its follow-up effects must keep the same random card."""
+    from unittest.mock import patch
+    from rules_port.resolution import NativeEffectBackend
+    from tests.tests_combat import make_db, HandlerStub, SessionStub
+
+    target = SimpleNamespace(
+        guid="random-deck-card", target_kind="AbilityTargetTemplate",
+        is_auto=True, is_random=True, player_filter="self",
+        resolved_maximum=lambda _variables: 1)
+    effects = tuple(SimpleNamespace(
+        guid=f"effect-{index}", concrete_type="CapturedEffect",
+        target_index=0, effect_instance_id=index, effect_group_id=index,
+        contingent_effect_instance_id=-1, param="", condition_guid="")
+        for index in range(3))
+    activation = SimpleNamespace(target_map={}, variables={})
+    ability = SimpleNamespace(
+        ability_template_id="shared-auto-target", source_uid=100,
+        responsible_player_id=5, ordered_effects=effects,
+        metadata=SimpleNamespace(targets=(target,)), activation=activation)
+    db = make_db()
+    game = game_engine.Game(
+        1, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000))
+    selected, seen = [], []
+
+    def legal_targets(*_args, **_kwargs):
+        selected.append(True)
+        return (101,) if len(selected) == 1 else (202,)
+
+    def capture(_effect_type, context, _effect):
+        seen.append(context.target())
+        return "captured"
+
+    with patch("rules_port.targeting.legal_targets", legal_targets):
+        NativeEffectBackend()(
+            handler=HandlerStub(db), game=game, session=SessionStub(), db=db,
+            player_uid=game.player_uid, ai_uid=game.ai_uid, battle_state={},
+            ability=ability, native_effect=capture)
+
+    assert seen == [101, 101, 101]
+    assert len(selected) == 1
+    assert activation.target_map == {0: (101,)}
 
 
 def test_native_effect_context_rejects_legacy_helpers():

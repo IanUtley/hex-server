@@ -6,6 +6,7 @@ through :mod:`pve_db` and :mod:`profile_db`.
 """
 
 import json
+import uuid
 
 from pve_db import (db_clear_fra_challengers, db_create_fra_challengers,
                 db_get_arena_fight_history, db_get_arena_state,
@@ -26,6 +27,14 @@ _ARENA_FIGHT_LIST_TYPE = (
     "System.Collections.Generic.List`1#"
     "Reckoning.Campaign.Messages.Arena.ArenaFight"
 )
+
+
+def _wire_guid(value):
+    """Return a client-decodable GUID for optional persisted identifiers."""
+    try:
+        return str(uuid.UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return _ZERO_GUID
 
 
 def _send_response(handler, data_type, resp_inner, comp, session_id, reqid,
@@ -57,7 +66,7 @@ def _arena_fight_fields(fight):
         ("ChallengeResponse", "string",
          str(fight.get("challenge_response", "NONE") or "NONE")),
         ("RoundChallenge", "struct", ("Game.Shared.ResourceId", [
-            ("m_Guid", "guid", str(fight.get("round_challenge", _ZERO_GUID)))
+            ("m_Guid", "guid", _wire_guid(fight.get("round_challenge")))
         ])),
     ]
 
@@ -66,7 +75,7 @@ def _arena_challenger_fields(challenger):
     return [
         ("ChallengerID", "ulong", int(challenger.get("id", 1))),
         ("EncounterDeck", "struct", ("Game.Shared.ResourceId", [
-            ("m_Guid", "guid", str(challenger.get("deck", _ZERO_GUID)))
+            ("m_Guid", "guid", _wire_guid(challenger.get("deck")))
         ])),
         ("ChallengerName", "string", challenger.get("name", "")),
         ("IsBoss", "string", challenger.get("boss", "False")),
@@ -122,7 +131,7 @@ def _arena_mc_challenge_fields(challenge):
     return [
         ("ChallengeID", "ulong", int(challenge.get("challenge_order", 0) or 0)),
         ("TemplateID", "struct", ("Game.Shared.ResourceId", [
-            ("m_Guid", "guid", str(challenge.get("conversation_guid", _ZERO_GUID)))
+            ("m_Guid", "guid", _wire_guid(challenge.get("conversation_guid")))
         ])),
         ("Header", "string", str(challenge.get(
             "objective_heading", "") or challenge.get("challenge_name", ""))),

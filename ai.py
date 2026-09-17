@@ -48,7 +48,10 @@ from pvp_db import (db_set_card_state_or,
                     db_ai_deck_top_card, db_ai_hand_tunneling_cards)
 
 
-AI_PHASE_DELAY = 1.0  # pause between AI phase pushes so the client renders them
+# Keep a short pause between automatic AI phase pushes so Unity can consume the
+# phase packet and render its transition without adding a full second to every
+# combat/main phase.
+AI_PHASE_DELAY = 0.25
 
 
 def _checkpoint_engine(session, state):
@@ -415,7 +418,57 @@ def player_can_attack_troops(handler, session, user_id=None):
 
 def ai_can_attack_troops(handler, session):
     """True if the AI controls a warzone troop eligible to attack."""
-    return handler._player_can_attack_troops(session, 0)
+    result = handler._player_can_attack_troops(session, 0)
+    _log_ai_attack_readiness(
+        handler, session, getattr(handler, "_current_bstate", None),
+        "legacy predicate", result=result)
+    return result
+
+
+def _log_ai_attack_readiness(handler, session, battle_state, where, *,
+                             result=None):
+    """Log every native/legacy attack-legality gate for AI troops.
+
+    This is intentionally diagnostic only.  The same persisted card rows and
+    effective attributes used by the legality predicate are reported so a
+    phase jump to AssignDamage can be explained from one server log line.
+    """
+    try:
+        from rules_port.static_rules import effective_attributes
+        rows = db_warzone_troop_attributes(
+            session.session_id, 0, conn=_db)
+        entries = []
+        eligible = False
+        for uid, state, card_attrs, temporary_attrs, template_attrs, _abilities in rows:
+            state = int(state or 0)
+            attrs = (int(card_attrs or 0) | int(temporary_attrs or 0) |
+                     int(template_attrs or 0))
+            attrs |= int(effective_attributes(
+                _db, session.session_id, battle_state or {}, int(uid)) or 0)
+            reasons = []
+            if state & int(game_engine.ECardStates.Tapped):
+                reasons.append("tapped")
+            if attrs & int(game_engine.ECardAttributes.CantAttack):
+                reasons.append("cant-attack")
+            if attrs & int(game_engine.ECardAttributes.Defensive):
+                reasons.append("defensive")
+            if not (state & int(game_engine.ECardStates.StartedATurnOnYourSide)) and not (
+                    attrs & int(game_engine.ECardAttributes.Speed)):
+                reasons.append("summoning-sick")
+            if not reasons:
+                eligible = True
+            entries.append(
+                f"{hex(int(uid))}:state=0x{state:x},attrs=0x{attrs:x},"
+                f"{'eligible' if not reasons else '|'.join(reasons)}")
+        current_state = getattr(handler, "_current_bstate", None)
+        phase_idx = (current_state.get("phase_idx")
+                     if isinstance(current_state, dict) else None)
+        log_req(
+            f"    AI attack readiness [{where}]: result={result!r} "
+            f"eligible_scan={eligible} troops=[{'; '.join(entries) or 'none'}] "
+            f"phase={phase_idx}")
+    except Exception as exc:
+        log_req(f"    AI attack readiness [{where}] diagnostic failed: {exc!r}")
 
 
 def ai_discard_card(handler, game, session, pl_t, ai_t):
@@ -490,6 +543,21 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
     destroyed - our own losses), and hold back troops that would feed a
     blocker, unless the personality is aggressive enough to swing anyway.
     """
+    native_port = getattr(session, "_rules_port_session", None)
+    existing_attackers = (battle_state or {}).get("ai_attackers") or {}
+    if (native_port is not None and existing_attackers and
+            getattr(getattr(native_port, "combat_manager", None),
+                    "combats", None)):
+        # Native DeclareAttack phase entry already selected, persisted, and
+        # materialized these combats.  The compatibility AI loop subsequently
+        # observes the same already-entered phase; selecting again sees the
+        # now-tapped attackers as ineligible and used to overwrite the durable
+        # declarations with an empty map.  Keep declaration idempotent so the
+        # damage phases consume the same combat identity selected on entry.
+        log_req(
+            "    AI DeclareAttackers: reusing native declarations "
+            f"{[hex(int(uid)) for uid in existing_attackers]}")
+        return battle_state
     if (getattr(session, "_rules_port_session", None) is not None or
             (battle_state or {}).get("_rules_port_attached")):
         from rules_port import lifecycle as _be
@@ -503,9 +571,19 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
     attitude = battle_state.get("ai_attitude") or "Aggressive"
     min_x = {"Aggressive": 3, "Comfortable": 4, "Defensive": 5}.get(
         attitude, pers.get("min_x_value", 3))
-    player_champ_uid = getattr(handler, "_player_champ_scid", None)
+    # The handler normally owns the canonical opponent champion SessionCardId.
+    # A fresh native projection can be built before that handler field is
+    # restored, though; use the Game projection as the same authoritative
+    # fallback so an attack never gets persisted with defender UID 0.
+    player_champ_uid = (getattr(handler, "_player_champ_scid", None) or
+                        getattr(game, "player_champion_card_id", None))
     player_champ_uid64 = player_champ_uid.uid.to_uint64() if player_champ_uid else 0
+    if not player_champ_uid64:
+        log_req("    AI attack aborted: no opposing champion SessionCardId")
+        return battle_state
     rows = db_warzone_attack_candidates(session.session_id, 0, conn=_db)
+    log_req(f"    AI DeclareAttackers: candidate rows={len(rows)} "
+            f"alpha={alpha} attitude={attitude} min_value={min_x}")
     ev = None
     try:
         ev = _aieval.build_evaluator(handler, session, battle_state, ai_t, pl_t)
@@ -523,6 +601,7 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
     for card_uid, tpl_guid, t_attrs, c_attrs, cstate, atk in rows:
         cstate = cstate or 0
         if (cstate & game_engine.ECardStates.Tapped):
+            log_req(f"    AI attack hold {hex(int(card_uid))}: tapped")
             continue
         # Include dynamic/static attributes in legality and combat selection;
         # a granted keyword need not be copied into the template attributes.
@@ -531,11 +610,17 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
         attrs = (t_attrs or 0) | (c_attrs or 0) | int(eff_attrs or 0)
         if attrs & (game_engine.ECardAttributes.CantAttack |
                     game_engine.ECardAttributes.Defensive):
+            log_req(f"    AI attack hold {hex(int(card_uid))}: "
+                    f"blocked attributes=0x{attrs:x}")
             continue
         if not (cstate & game_engine.ECardStates.StartedATurnOnYourSide) and not (
                 attrs & game_engine.ECardAttributes.Speed):
+            log_req(f"    AI attack hold {hex(int(card_uid))}: summoning-sick "
+                    f"state=0x{int(cstate):x} attrs=0x{attrs:x}")
             continue
         all_attackers.append((int(card_uid), tpl_guid, attrs))
+    log_req(f"    AI DeclareAttackers: eligible={len(all_attackers)} "
+            f"blockers={len(opp_blockers)}")
     # Decide the attack set: alpha-strike wins, or per-troop combat value.
     chosen = []
     if all_attackers and not opp_blockers:
@@ -571,6 +656,8 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
                     continue
                 atk = card.effective_attack()
                 if atk <= 0:
+                    log_req(f"    AI attack hold {hex(int(uid))}: "
+                            f"non-positive attack={atk}")
                     continue
                 if attrs & game_engine.ECardAttributes.ForceAttack:
                     chosen.append((uid, tpl, attrs))
@@ -583,6 +670,10 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
                     # Aggressive still swings with value-positive attackers
                     # below the comfort threshold.
                     chosen.append((uid, tpl, attrs))
+                else:
+                    log_req(f"    AI attack hold {hex(int(uid))}: "
+                            f"combat-value damage={dmg} value={value} "
+                            f"attack={atk} min_value={min_x} alpha={alpha}")
     else:
         # Fallback (evaluator unavailable): old personality gate.
         for card_uid, tpl_guid, t_attrs, c_attrs, cstate, atk in rows:
@@ -602,6 +693,19 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
             chosen.append((int(card_uid), tpl_guid, attrs))
     attackers = {}
     combats = []
+    # The compatibility checkpoint uses this fact to build the persisted
+    # combat phase list.  Native RulesPort owns the live phase object, but the
+    # client pass can still arrive through the checkpoint adapter; without the
+    # combat list here that adapter jumps from defense priority to Second Main
+    # and never invokes AssignDamage for an AI attack.
+    if chosen:
+        battle_state["player_has_ready_troop"] = True
+        battle_state["turn_phases"] = _be.build_turn_phases(battle_state)
+        try:
+            battle_state["phase_idx"] = battle_state["turn_phases"].index(
+                game_engine.ETurnPhases.DeclareAttack)
+        except ValueError:
+            pass
     port = getattr(session, "_rules_port_session", None)
     held = 0
     ai_champ_scid = getattr(handler, "_ai_champ_scid", None) or game_engine.SessionCardId(ai_t)
@@ -664,12 +768,21 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
         combats.append(cs)
     _db.commit()
     battle_state["ai_attackers"] = attackers
+    # Native RulesPort reattachment reuses the session's shared checkpoint.
+    # Keep that object synchronized with the declaration so the next client
+    # pass cannot restore a pre-attack state and skip AssignDamage.
+    setattr(session, "_rules_port_battle_state", battle_state)
+    if port is not None and getattr(port, "runtime_facts", None) is not None:
+        port.runtime_facts.battle_state = battle_state
     _be.save_state(session, battle_state)
     if port is not None:
         port.persist()
     if combats:
         game.push_combat_listing(ai_t, combats)
-    log_req(f"    AI declares {len(attackers)} attacker(s) ({'alpha' if alpha else 'min_x=' + str(min_x)}; {held} held): {[hex(int(u)) for u in attackers]}")
+    log_req(f"    AI declares {len(attackers)} attacker(s) targeting "
+            f"{hex(player_champ_uid64)} ({'alpha' if alpha else 'min_x=' + str(min_x)}; "
+            f"eligible={len(all_attackers)} chosen={len(chosen)} held={held}): "
+            f"{[hex(int(u)) for u in attackers]}")
     return battle_state
 
 
@@ -1343,12 +1456,6 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             battle_state["ai_attitude"] = _att.personality.attitude
         except Exception:
             pass
-        # Start with the base (no-combat) phase list; combat is added after Prep
-        # when the AI has a ready troop to attack with (aggressive personality).
-        battle_state["turn_phases"] = be.BASE_TURN_PHASES
-        battle_state["player_has_ready_troop"] = False
-        battle_state.pop("ai_attackers", None)
-        be.save_state(session, battle_state)
         # Rebuild AI hand cards so the client sees them (face-down hand).
         game = handler._fresh_game(session, pl_t, ai_t, battle_state)
         rows = db_ai_hand_cards(session.session_id, conn=_db)
@@ -1384,6 +1491,29 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                 return battle_state
             native_phase = port.current_turn_phase
             trace_rules_port(log_req, "ai-loop", port, battle_state)
+            if native_phase in (game_engine.ETurnPhases.FirstMainPhase,
+                                game_engine.ETurnPhases.DeclareCombatPriorityWindow,
+                                game_engine.ETurnPhases.DeclareAttack,
+                                game_engine.ETurnPhases.DeclareAttackPriorityWindow,
+                                game_engine.ETurnPhases.DeclareDefense,
+                                game_engine.ETurnPhases.DeclareDefensePriorityWindow,
+                                game_engine.ETurnPhases.AssignFirstStrikeDamage,
+                                game_engine.ETurnPhases.FirstStrikePriorityWindow,
+                                game_engine.ETurnPhases.AssignDamage):
+                handler._current_bstate = battle_state
+                _log_ai_attack_readiness(
+                    handler, session, battle_state,
+                    f"native phase {native_phase}",
+                    result=getattr(port, "has_legal_attackers", None))
+                log_req(
+                    f"    AI native combat facts: phase={native_phase} "
+                    f"active={port.active_player_id!r} "
+                    f"has_legal_attackers={getattr(port, 'has_legal_attackers', None)!r} "
+                    f"skip_attack={getattr(port, 'active_player_skips_attack', None)!r} "
+                    f"combats={len(getattr(port.combat_manager, 'combats', ()))} "
+                    f"has_combats={getattr(port, 'has_combats', None)!r} "
+                    f"first_strike={getattr(port, 'combat_has_first_strike', None)!r} "
+                    f"standard_damage={getattr(port, 'combat_has_standard_damage', None)!r}")
             phases = be.turn_phases(battle_state)
             try:
                 idx = phases.index(native_phase)
@@ -1655,6 +1785,9 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                 continue
         elif phase == game_engine.ETurnPhases.DeclareAttack:
             battle_state = ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state)
+            log_req(
+                f"    AI attack action complete: attackers="
+                f"{list((battle_state.get('ai_attackers') or {}).keys())!r}")
         elif phase == game_engine.ETurnPhases.DeclareDefense:
             # The player (defender) auto-declines to block; emit empty
             # BlockersAssigned so the client renders the AI attacking unblocked.
@@ -2243,7 +2376,9 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     game.push_ability_on_chain(
         scid, game_engine.ResourceId.from_str(
             game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
-        ability_instance_id=inst_id)
+        ability_instance_id=inst_id,
+        target_card_ids=([game_engine.SessionCardId(game_engine.UID(
+            int(target_uid)))] if target_uid is not None else []))
     # Troops and other permanents resolve to the warzone.  Constants such as
     # Daybreak are not actions: treating them as ``spell`` items sends them to
     # the discard after resolution and silently loses their ongoing trigger.
@@ -2699,6 +2834,42 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                 if amount >= player_health:
                     worth = True
                     break
+            # Respect the authored target template before applying the AI's
+            # tactical troop preference.  Champion-only powers (for example
+            # Psychotic Anarchist's charge power) must resolve against the
+            # opposing champion even when an opposing troop is available.
+            if target_uid is None:
+                target_ids = db_champion_ability_target_template_ids(
+                    ag, conn=_db)
+                try:
+                    target_template_ids = [str(t).lower() for t in
+                                           (_j.loads(target_ids) or []) if t]
+                except (TypeError, ValueError, _j.JSONDecodeError):
+                    target_template_ids = []
+                if target_template_ids:
+                    if getattr(session, "_rules_port_session", None) is not None:
+                        from rules_port.targeting import (
+                            legal_targets, target_uses_both_players)
+                    else:
+                        from abilities.framework.targeting import (
+                            legal_targets, target_uses_both_players)
+                    champion_ids = {int(row[0]) for row in
+                                    handler._champion_targets()}
+                    authored_champions = []
+                    for target_template_id in target_template_ids:
+                        candidates = legal_targets(
+                            _db, session.session_id, 0, target_template_id,
+                            ai_champ_scid.uid.uid64,
+                            both_players=target_uses_both_players(
+                                _db, target_template_id),
+                            champions=handler._champion_targets(),
+                            battle_state=battle_state)
+                        authored_champions.extend(
+                            int(uid) for uid in candidates
+                            if int(uid) in champion_ids)
+                    if authored_champions:
+                        target_uid = authored_champions[0]
+                        worth = True
             if not worth:
                 # Kill the weakest opposing troop the damage reaches.
                 troops = db_warzone_troop_stats(
@@ -3502,7 +3673,9 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
         game.push_ability_on_chain(
             scid, game_engine.ResourceId.from_str(
                 game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID),
-            ability_instance_id=inst_id)
+            ability_instance_id=inst_id,
+            target_card_ids=([game_engine.SessionCardId(game_engine.UID(
+                int(target_uid)))] if target_uid is not None else []))
         # Hold the spell on the chain: the stack item resolves its BOM (and
         # sends it to the graveyard) when both players pass.
         _queue_stack_item(session, battle_state, {

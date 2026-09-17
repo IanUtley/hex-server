@@ -385,9 +385,28 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
     return out
 
 
+def _target_ignore_acted_on(template_id):
+    """Read C# SourceRevealedTargetTemplate.m_IgnoreActedOn from Records."""
+    from gamedata import DEFAULT_RECORD_STORE
+    rec = DEFAULT_RECORD_STORE.get("AbilityTargetTemplate", str(template_id).lower())
+    if rec is None:
+        return False
+    try:
+        data = rec.to_dict() if hasattr(rec, "to_dict") else rec
+        return bool(data.get("m_IgnoreActedOn", False))
+    except Exception:
+        return False
+
+
 def revealed_target_uids(db, session_id, owner_id, source_uid, template_id,
-                         revealed_uids, battle_state=None):
-    """Filter the authoritative reveal set through a Records target template."""
+                         revealed_uids, battle_state=None, acted_on_uids=()):
+    """Filter the authoritative reveal set through a Records target template.
+
+    ``acted_on_uids`` are the cards the secondary target already acted on
+    (C# ``SourceRevealedTargetTemplate.m_IgnoreActedOn``).  They are excluded
+    from the result so "the remaining cards" does not re-move a card that the
+    preceding play effect just put onto the chain.
+    """
     template = target_template(db, template_id)
     if not template:
         return []
@@ -395,9 +414,14 @@ def revealed_target_uids(db, session_id, owner_id, source_uid, template_id,
         spec = json.loads(template["filter_json"] or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         spec = {}
+    ignores = {int(uid) for uid in (acted_on_uids or ())}
     from pvp_db import db_condition_card_row
+    source = _source_card(db, session_id, int(source_uid or 0),
+                          int(owner_id or 0))
     result = []
     for uid in revealed_uids or ():
+        if int(uid) in ignores:
+            continue
         row = db_condition_card_row(session_id, int(uid), conn=db)
         if not row:
             continue
@@ -405,14 +429,14 @@ def revealed_target_uids(db, session_id, owner_id, source_uid, template_id,
             "card_uid": int(row[0]), "card_type": row[1] or "",
             "location": row[2] or "", "user_id": int(row[3] or 0),
             "state": int(row[4] or 0), "attack": int(row[5] or 0),
-            "defense": int(row[6] or 0), "name": row[7] or "",
-            "cost": int(row[8] or 0), "subtype": row[9] or "",
-            "shards": _shards(row[10]),
-            "attributes": int(row[11] or 0) | int(row[12] or 0),
+            "defense": int(row[6] or 0), "template_guid": row[7] or "",
+            "name": row[8] or "", "cost": int(row[9] or 0),
+            "subtype": row[10] or "", "shards": _shards(row[11]),
+            "attributes": int(row[12] or 0) | int(row[13] or 0),
             "src_owner_side": "player" if int(owner_id or 0) else "ai",
         }
         context = _FilterContext(battle_state or {})
-        if records_filter_matches(card, spec, source=source_uid,
+        if records_filter_matches(card, spec, source=source,
                                   context=context):
             result.append(int(uid))
     return result

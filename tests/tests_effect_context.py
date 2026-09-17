@@ -153,6 +153,30 @@ def test_tunnel_moves_source_to_underground_and_emits_zone_triggers():
         "CardExitedZoneEvent", "CardEnteredZoneEvent"]
 
 
+def test_surface_queues_the_buried_card_for_free_with_speed():
+    """Surface uses the shared free-play projection, not a Records graph."""
+    from rules_port.tunneling import resolve_surface
+
+    context = SimpleNamespace(
+        db=object(), session=_Session(), handler=object(), game=object(),
+        player_uid="player", ai_uid="ai", bstate={})
+    with mock.patch(
+            "rules_port.tunneling.surface_source_is_underground",
+            return_value=True), \
+            mock.patch("pvp_db.db_card_chain_info",
+                       return_value=("spy-template", "Troop", 5)), \
+            mock.patch("pvp_db.db_card_owner_zone_state",
+                       return_value=(5, "underground", 0)), \
+            mock.patch("rules_port.host_mutations.queue_free_played_card",
+                       return_value="queued troop 123 for free") as queue:
+        assert resolve_surface(context, 123) == "queued troop 123 for free"
+
+    queue.assert_called_once_with(
+        context.handler, context.game, context.session, context.db,
+        context.player_uid, context.ai_uid, context.bstate, 123, 5,
+        "spy-template", "Troop")
+
+
 def test_current_resource_modifier_persists_before_next_rules_port_cost():
     """A temporary resource grant must update all three state projections.
 
