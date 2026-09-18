@@ -56,6 +56,15 @@ def test_typed_payload_recovers_objfmt_nested_champion_activation():
     assert payload["activation_data"] == {}
 
 
+def test_player_transaction_classifier_recognizes_untyped_manual_activation():
+    """Mono can omit the concrete class after a complete activation envelope."""
+    command = classify_player_transaction(
+        b"m_AbilityActivationData;SourceCardId;m_UID64;0101000000000000;"
+        b"AbilityTemplateId;m_Guid;7cc301b8-568a-05f2-d7c2-5414f9e9d6ad;")
+    assert command.is_ability_activate is True
+    assert command.is_activate_triggered_abilities is False
+
+
 def test_typed_payload_extractor_reads_only_named_decoded_fields():
     payload = typed_payload_from_decoded(None, {
         "SourceCardId": {"UID": 77},

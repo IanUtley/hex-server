@@ -2088,9 +2088,6 @@ def _az1_node_opens_neighbors(state, node, failed_nodes=None):
     arrival-based reveal behaviour.
     """
     canonical = _resolve_node(state, str(node or ""))
-    failed_nodes = failed_nodes if failed_nodes is not None else _az1_failed_nodes(state)
-    if canonical in failed_nodes:
-        return True
     data = next(
         ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
          if _resolve_node(state, str((loc.get("Data") or {}).get("node") or
@@ -5595,7 +5592,12 @@ def _apply_gameend(db, camp_id, won):
                 .strip().lower() == "void_tamed_troop"
             for record in _scene_reward_records(db, active_scene)
         )
-        retryable = bool((quest_pending or tamed_scene) and not condition_met)
+        # An authored conditional encounter remains retryable only after a
+        # win that did not satisfy its condition.  A loss or concede leaves
+        # the encounter incomplete, so it cannot use the retryable map state
+        # that exposes outgoing paths.
+        retryable = bool(won and (quest_pending or tamed_scene) and
+                         not condition_met)
         matched_index = None
         result_node = None
         for idx, loc in enumerate(state.get("VisLocs", [])):

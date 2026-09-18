@@ -805,7 +805,11 @@ class EffectContext:
         self.game.push_card_updated(
             scid, owner_uid(row[1], self.player_uid, self.ai_uid, self.bstate),
             card_collection_for_location(row[2]), ctype, template_id=tpl,
-            cost=cost, attack=attack, defense=defense, gems=gem, **kwargs)
+            cost=cost, attack=attack, defense=defense, gems=gem,
+            # Instance modifiers can target cards still in a deck (Prophecy
+            # is one example).  Those updates refresh the modifier client-
+            # side but must not disclose the card's representation.
+            nulling=str(row[2] or "").lower() == "deck", **kwargs)
 
     def card_threshold(self, target: int | None,
                        metadata: dict | None = None) -> str:
@@ -2911,10 +2915,8 @@ class EffectContext:
         if not (self.native_context or self.bstate.get("_rules_port_native_effect")):
             return self._legacy("_grant_ability_legacy")
         target = self.bstate.get("grant_target")
-        from pvp_db import db_card_grant_info
-        if target is None or not db_card_grant_info(
-                self.session.session_id, int(target), conn=self.db):
-            return "grant: target card not found"
+        if target is None:
+            return "grant: no target"
         from rules_port.effects import grant_ability
         return grant_ability(self)
 

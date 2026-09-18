@@ -709,8 +709,18 @@ def classify_player_transaction(inner_bytes, *, typed_payload=None):
         # Both C# activation transaction types carry the same nested member.
         # Use the serialized transaction class to keep a triggered batch from
         # entering the manual ActivateAbility normalization branch first.
-        is_ability_activate=(has("ActivateAbilityTransaction") and
-                             not has("ActivateTriggeredAbiliesTransaction")),
+        # Some client builds omit the concrete transaction class from a
+        # nested AbilityActivationData envelope.  The labelled source card
+        # and ability template are still the complete manual-activation
+        # contract, so classify that shape at the protocol boundary.  Play
+        # transactions carry AbilityDataList instead, while triggered and
+        # continuation envelopes retain their explicit classes below.
+        is_ability_activate=(
+            (has("ActivateAbilityTransaction") or
+             (has("m_AbilityActivationData") and
+              has("SourceCardId") and has("AbilityTemplateId"))) and
+            not has("ActivateTriggeredAbiliesTransaction") and
+            not has("SetAbilityActivationDataTransaction")),
         is_activate_triggered_abilities=has(
             "ActivateTriggeredAbiliesTransaction"),
         is_set_ability_data=has("SetAbilityActivationDataTransaction"),

@@ -153,6 +153,28 @@ class RecordsTriggerDiscovery:
                 graph = ability_graph(DEFAULT_RECORD_STORE, key)
                 if graph is not None and graph.trigger_event_type:
                     abilities.append(key)
+            dynamic = getattr(self.handler,
+                              "_champion_granted_ability_guids", {}) or {}
+            for value in dynamic.get(int(champion_uid), ()):
+                key = str(value).lower()
+                graph = ability_graph(DEFAULT_RECORD_STORE, key)
+                if graph is None:
+                    continue
+                if graph.trigger_event_type:
+                    abilities.append(key)
+                    continue
+                # A granted permanent CardModifier is a continuous aura, not
+                # an event trigger. Revisit it only after an actual zone
+                # entry so a newly present card can receive the modifier.
+                # It must not observe would-draw/would-enter events and
+                # replace a draw with a chain item.
+                if (event_type == "CardEnteredZoneEvent" and
+                        any(effect.concrete_type ==
+                            "CardModifierAbilityEffectTemplate" and
+                            str(effect.duration).lower() == "permanent"
+                            for effect in graph.effects) and
+                        any(target.card_filter for target in graph.targets)):
+                    abilities.append(key)
             return {champion_uid: list(dict.fromkeys(abilities))}
 
         event_type = str(event_type)

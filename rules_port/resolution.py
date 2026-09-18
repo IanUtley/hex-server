@@ -281,11 +281,18 @@ class NativeEffectBackend:
                         if kind == "AbilitySourceCardTargetTemplate":
                             target_values = (ability.source_uid,)
                         elif kind.endswith("PlayerTargetTemplate"):
-                            # Player targets are typed identities, not card
-                            # filters.  Do not send a null card-filter spec
-                            # through the card-target evaluator (common for
-                            # "You" targets such as token summons).
-                            target_values = (ability.responsible_player_id,)
+                            # A PlayerTargetTemplate identifies a champion in
+                            # the client session, not the controller's raw
+                            # player id.  In PvE the AI controller is ``0``;
+                            # preserving that value made a "You get ..."
+                            # GrantAbility look for card UID 0 instead of the
+                            # AI champion's synthetic SessionCardId.
+                            from .targeting import implicit_champion_target
+                            champion = implicit_champion_target(
+                                db, session, handler, battle_state,
+                                opposing=False)
+                            target_values = ((champion,) if champion is not None
+                                             else ())
                         elif (int(ability.responsible_player_id or 0) == 0 and
                               kind.endswith("AbilityTargetTemplate")):
                             # Server-driven AI activations still need the

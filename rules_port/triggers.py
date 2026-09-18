@@ -238,8 +238,23 @@ class NativeTriggerBackend:
                         for effect in graph.effects)
                     if str(location or "").lower() == "mod" and not graph.manual:
                         static_grant = True
+                # A permanent champion ability whose CardModifier has a card
+                # filter is a continuous aura.  Re-evaluate it when a card
+                # enters play under that champion so grants made during
+                # encounter setup affect troops deployed later as well.
+                dynamic = getattr(handler,
+                                  "_champion_granted_ability_guids", {}) or {}
+                continuous_card_aura = bool(
+                    event_name == "CardEnteredZoneEvent" and
+                    source_uid in {int(uid) for uid in dynamic} and
+                    not graph.trigger_event_type and
+                    any(effect.concrete_type == "CardModifierAbilityEffectTemplate" and
+                        str(effect.duration).lower() == "permanent"
+                        for effect in graph.effects) and
+                    any(target.card_filter for target in graph.targets))
                 if (str(graph.trigger_event_type or "").rsplit(".", 1)[-1]
-                        != event_name and not static_grant):
+                        != event_name and not static_grant and
+                        not continuous_card_aura):
                     continue
                 trigger_location = (
                     "warzone" if str(location or "").lower() == "mod"
@@ -323,7 +338,8 @@ class NativeTriggerBackend:
                 ignores = bool(
                     graph.ignores_chain or force_ignores_chain or
                     event_name == "TurnStartedEvent" or
-                    str(location or "").lower() == "underground")
+                    str(location or "").lower() == "underground" or
+                    continuous_card_aura)
                 if ignores:
                     from .resolution import resolve_port_ability
                     old_source = battle_state.get("resolving_source_uid")
@@ -461,10 +477,19 @@ def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
     instead of chaining it.  Merry-Melee-Corinth uses it for the end-of-turn
     ability, which resolves without a priority window in that format.
     """
-    return NativeTriggerBackend()(
-        db=db, handler=handler, game=game, session=session,
-        player_uid=player_uid, ai_uid=ai_uid, battle_state=battle_state,
-        force_ignores_chain=force_ignores_chain,
-        event=TriggerEvent(
-            str(event_type).rsplit(".", 1)[-1], source_card_id,
-            source_player_id, target_card_id, dict(data or {})))
+    event_name = str(event_type).rsplit(".", 1)[-1]
+    previous_event_type = battle_state.get("event_type")
+    battle_state["event_type"] = event_name
+    try:
+        return NativeTriggerBackend()(
+            db=db, handler=handler, game=game, session=session,
+            player_uid=player_uid, ai_uid=ai_uid, battle_state=battle_state,
+            force_ignores_chain=force_ignores_chain,
+            event=TriggerEvent(event_name, source_card_id,
+                               source_player_id, target_card_id,
+                               dict(data or {})))
+    finally:
+        if previous_event_type is None:
+            battle_state.pop("event_type", None)
+        else:
+            battle_state["event_type"] = previous_event_type
