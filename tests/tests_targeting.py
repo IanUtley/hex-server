@@ -10,15 +10,17 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 
 from abilities.framework import triggers
 from abilities.framework.targeting import legal_targets, evaluate_card_filter
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 EXILE_DEPLOY = "952e3555-5ee1-50de-38f6-25cf34037c67"
 EXILE_TARGET = "33b1ecf2-a9de-5bae-9918-9203f43b79aa"
@@ -352,6 +354,69 @@ def test_class39_wire(db):
     assert ev.CLASS_ID == 39
 
 
+def test_pending_trigger_prompt_survives_priority_projection(db):
+    """The practice priority projection must not replace a pending picker.
+
+    Wakizashi Ambusher surfaced for free and its Deploy picker opened
+    (BattleStateTriggeredAbilities -> BattleStateConfigureAbility ->
+    BattleStateTarget), but the same pass re-announced the phase, the board
+    and the phase options, so the client popped the picker before the player
+    could answer and the -X/-X never applied.  A pending class-39/choice input
+    owns the client's UI state until its answering transaction arrives.
+    """
+    import hconnect_server as hcs
+
+    DEPLOY = "f637515d-7979-d1ef-7548-bc0aa63c8df4"
+
+    class IdleStack:
+        def peek(self):
+            return None
+
+    class RaisingStack:
+        def peek(self):
+            raise AssertionError(
+                "the native action must not be consumed while a prompt that "
+                "already owns the client UI is pending")
+
+    def make_handler(stack):
+        class Port:
+            current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+            active_player_id = game_engine.UID.make(244, 5)
+            total_turns_taken = 3
+            action_stack = stack
+
+        class Session:
+            session_id = 195830
+            _rules_port_session = Port()
+            _rules_port_battle_state = {
+                "turn_player": "player", "phase_idx": 0,
+            }
+
+        handler = object.__new__(hcs.HCPHandler)
+        pushed = []
+        handler._fresh_game = lambda *args, **kwargs: pushed.append(args)
+        return handler, Session(), pushed
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+
+    # A pending class-39 Deploy target prompt: the projection must wait.
+    handler, session, pushed = make_handler(RaisingStack())
+    session._rules_port_battle_state["pending_trigger"] = {
+        "ability_guid": DEPLOY, "source_uid": 0xB01, "instance_id": 20,
+    }
+    bstate = dict(session._rules_port_battle_state)
+    assert handler._project_rules_port_priority(
+        session, pl_t, ai_t, bstate) is True
+    assert not pushed, "the phase/board projection must not be pushed"
+
+    # With no prompt pending the same call still walks the native window.
+    handler, session, pushed = make_handler(IdleStack())
+    bstate = dict(session._rules_port_battle_state)
+    assert handler._project_rules_port_priority(
+        session, pl_t, ai_t, bstate) is False
+
+
 if __name__ == "__main__":
     run("legal targets exclude the ability source", test_legal_targets)
     run("card filter Not(IsAbilitySource)", test_filter_eval)
@@ -364,3 +429,5 @@ if __name__ == "__main__":
     run("human deploy triggers class-39 prompt", test_deploy_prompt_human)
     run("AI deploy auto-picks + chains", test_deploy_auto_ai)
     run("class-39 event serializes", test_class39_wire)
+    run("pending trigger prompt survives the priority projection",
+        test_pending_trigger_prompt_survives_priority_projection)

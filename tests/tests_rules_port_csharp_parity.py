@@ -9,6 +9,10 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from rules_port import (MultiplyWithCarryRng, permitted_next_phases,
                         validate_effect_coverage)
 from rules_port.combat import CombatId, CombatManager

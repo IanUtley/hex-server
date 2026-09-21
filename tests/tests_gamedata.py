@@ -6,6 +6,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from gamedata import (AbilityCost, AbilityGraph, AbilityInstance,
                       AbilityOptionEntry, AbilityOptionGroup,
                       AbilityTemplate, ActivationData, EffectSpec, PlayPlan,
@@ -40,6 +44,13 @@ def test_graph_resolves_costs_targets_and_effect_actions():
     assert [effect.operation for effect in graph.effects] == [
         "BuiltInPlayCard", "FinishResolvingCard"
     ]
+
+
+def test_graph_cache_reuses_immutable_records_projection():
+    store = RecordStore()
+    first = ability_graph(store, PLAY_CARD_ABILITY)
+    second = ability_graph(store, PLAY_CARD_ABILITY)
+    assert first is second
 
 
 def test_card_graph_follows_card_ability_references():
@@ -216,6 +227,7 @@ def main():
     tests = [
         test_deserialize_preserves_polymorphism_and_fields,
         test_graph_resolves_costs_targets_and_effect_actions,
+        test_graph_cache_reuses_immutable_records_projection,
         test_card_graph_follows_card_ability_references,
         test_condition_keeps_nested_typed_objects,
         test_scalar_text_is_not_parsed_as_json,

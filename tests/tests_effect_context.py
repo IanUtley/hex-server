@@ -7,6 +7,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 import game_engine
 from abilities.framework.builder import AbilityBuilder
 from abilities.framework.context import EffectContext
@@ -133,7 +137,12 @@ def test_player_target_template_uses_champion_identity_for_grants():
 
 
 def test_native_discard_creates_parent_continuation_for_hand_picker():
-    """A native discard target must pause the same typed ability instance."""
+    """A native discard target must pause the same typed ability instance.
+
+    The continuation re-enters the paused effect, not the one after it: the
+    first pass stopped before its mutation, so resuming past it discarded
+    nothing at all.
+    """
     state = {"resolving_effect_order": 3, "resolving_ability": "parent"}
 
     class Handler:
@@ -155,7 +164,7 @@ def test_native_discard_creates_parent_continuation_for_hand_picker():
         state, "effect", ability=Ability())
     assert context.discard() == "prompted"
     assert state["pending_discard_continuation"]["instance_id"] == 7
-    assert state["pending_discard_continuation"]["resume_effect_order"] == 4
+    assert state["pending_discard_continuation"]["resume_effect_order"] == 3
     assert state["resolution_paused"] is True
 
 
@@ -429,6 +438,74 @@ def test_tunneling_surface_queue_is_empty_without_underground_cards():
         EmptyDB(), Session(), Handler(), Game(), "player", "ai", bstate,
         1001) == []
     assert bstate["stack"] == []
+
+
+def test_queue_surfaces_registers_the_native_chain_item():
+    """A thresholded underground card must reach the native scheduler.
+
+    ``rules_port.tunneling.queue_surfaces`` spent the counter and pushed only
+    the wire-compatible descriptor, so the Surface stayed on the client's
+    chain with no native item to resolve: the buried card never surfaced and
+    could not be re-queued because the orphan kept the stack non-empty.
+    """
+    import json as _json
+    from rules_port.actions import ResolveTopOfChainAction
+    from rules_port.kernel import PriorityWindowAction
+    from rules_port import tunneling
+    from rules_port.context import EffectContext
+    from rules_port.session import AuthoritativeSession
+    from tests.tests_combat import (make_db, add_card, HandlerStub,
+                                    SessionStub)
+
+    db = make_db()
+    try:
+        template = "aaaaaaaa-0000-0000-0000-0000000000aa"
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, "Wakizashi Ambusher", "Troop", 4, 2, 1, 0, "[]", "[]", ""))
+        uid = game_engine.UID.make(1, 8).uid64
+        add_card(db, uid, 5, template, loc="underground")
+        db.execute(
+            "UPDATE game_cards SET permanent_buffs=? WHERE card_uid=?",
+            (_json.dumps({"counters": {"tunneling": 3}}), uid))
+        db.commit()
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        port = AuthoritativeSession(1, (pl_t, ai_t), seed_z=1, seed_w=2)
+        session = SessionStub()
+        session._rules_port_session = port
+        bstate = {"stack": []}
+        context = EffectContext.from_rules_port(
+            game, session, db, HandlerStub(db), pl_t, ai_t, bstate, "",
+            ability=None)
+        with mock.patch.object(tunneling, "tunneling_value", return_value=3):
+            queued = tunneling.queue_surfaces(context, 5)
+
+        assert queued == [int(uid)], queued
+        wire = bstate["stack"][-1]
+        assert wire["ability_guid"] == tunneling.SURFACE_ABILITY_GUID, wire
+        assert wire["source_uid"] == int(uid), wire
+        instance_id = int(wire["instance_id"])
+        assert port.chain._instance_ids == [instance_id], port.chain._instance_ids
+        assert port._projected_chain_descriptors[instance_id]["instance_id"] == \
+            instance_id, port._projected_chain_descriptors
+        top = port.action_stack.peek()
+        assert isinstance(top, PriorityWindowAction), top
+        assert int(getattr(top.ability_responding_to, "instance_id", -1)) == \
+            instance_id, top.ability_responding_to
+        assert port.action_stack.priority_player_id == pl_t, \
+            port.action_stack.priority_player_id
+        assert any(isinstance(action, ResolveTopOfChainAction)
+                   for action in port.action_stack._stack), port.action_stack._stack
+        assert _json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0]).get("counters") == {}, "counter not spent"
+    finally:
+        db.close()
 
 
 def test_resource_choice_ability_is_detected_from_metadata():
@@ -1270,6 +1347,7 @@ if __name__ == "__main__":
     test_tunnel_moves_source_to_underground_and_emits_zone_triggers()
     test_tunneling_metadata_and_underground_visibility_are_data_driven()
     test_tunneling_surface_queue_is_empty_without_underground_cards()
+    test_queue_surfaces_registers_the_native_chain_item()
     test_resource_choice_ability_is_detected_from_metadata()
     test_subterranean_spy_visibility_reveals_only_the_controller_view()
     test_match_secondary_reveal_uses_stored_target_owner()

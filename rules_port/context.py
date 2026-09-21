@@ -106,16 +106,24 @@ class EffectContext:
         except (TypeError, ValueError):
             return default
 
-    def resolved_target(self, default: int | None = None):
+    def resolved_target(self, default: int | None = None, *,
+                        source_fallback: bool = True):
         """Return the legacy BOM target precedence through one typed helper.
 
         Ordinary resolver leaves use ``resolving_target_uid``.  Older spell,
         modifier, and trigger paths still populate the two named aliases, and
         source-target effects intentionally fall back to the source card.  A
-        simple leaf should not have to know those storage details.
+        simple leaf should not have to know those storage details.  A leaf
+        whose target is a mandatory, player-chosen card passes
+        ``source_fallback=False``: the ability's own source is then not a
+        target, and the leaf can tell "nothing resolved yet" (ask the player)
+        apart from "the source is the target".
         """
-        for key in ("player_spell_target", "player_mod_target",
-                    "resolving_target_uid", "resolving_source_uid"):
+        keys = ("player_spell_target", "player_mod_target",
+                "resolving_target_uid")
+        if source_fallback:
+            keys += ("resolving_source_uid",)
+        for key in keys:
             value = self.bstate.get(key)
             if value is None:
                 continue
@@ -565,6 +573,22 @@ class EffectContext:
             cost=cost, gems=gem)
         self._emit_trigger("CardExitedZoneEvent", target, card_owner)
 
+        # The client's ``VoidCardAbilityEffectTemplate`` records the voided
+        # card on the ability's ``VoidedCards`` list attr.  Follow-up operands
+        # read it back through ``SumVariableInListAttrCardsAbilityVariable``
+        # (Mentor of the Grave's charge power: "Void target troop in a crypt.
+        # Then, gain health equal to the voided troop's [DEF]").  Only the
+        # champion-TAC void path recorded it, so the typed leaf's follow-up
+        # operand resolved to 0 and the ability healed nothing.
+        lists = self.bstate.setdefault("ability_lists", {})
+        entries = lists.get("VoidedCards")
+        if not isinstance(entries, list):
+            entries = []
+            lists["VoidedCards"] = entries
+        if int(target) not in [value for value in entries
+                               if isinstance(value, int)]:
+            entries.append(int(target))
+
         source = self.bstate.get("resolving_source_uid")
         if source is not None:
             self.bstate.setdefault("voided_by", {}).setdefault(
@@ -938,7 +962,12 @@ class EffectContext:
         """Move a hand/choosing card to discard and publish its projections."""
         import game_engine
 
-        target = self.resolved_target() if target is None else target
+        # The discarded card is always a card the resolver selected.  Never
+        # fall back to the ability source: the source is what caused the
+        # discard, not a card to discard, and the fallback silently discarded
+        # nothing (or the wrong card) instead of opening the picker.
+        target = (self.resolved_target(source_fallback=False)
+                  if target is None else target)
         if target is None:
             # A hand-discard effect is an asynchronous target request, not a
             # successful no-op.  The old BOM walker recognized this before
@@ -948,11 +977,15 @@ class EffectContext:
             if self.native_context:
                 prompt = getattr(self.handler, "_push_discard_prompt", None)
                 if callable(prompt):
-                    self.bstate["rules_port_resume_effect_order"] = int(
-                        self.bstate.get("resolving_effect_order", 0) or 0) + 1
+                    # Resume *at* this effect, not after it: the first pass
+                    # stopped before its mutation, so the continuation must
+                    # re-enter the same effect with the player's card now
+                    # bound as the resolved target.
+                    resume_order = int(
+                        self.bstate.get("resolving_effect_order", 0) or 0)
+                    self.bstate["rules_port_resume_effect_order"] = resume_order
                     pending = self.continuation(
-                            resume_effect_order=self.bstate[
-                                "rules_port_resume_effect_order"])
+                        resume_effect_order=resume_order)
                     pending["instance_id"] = int(
                         getattr(self.ability, "instance_id", 1) or 1)
                     self.bstate["pending_discard_continuation"] = pending
@@ -1070,15 +1103,22 @@ class EffectContext:
             return "matching token: no target"
         count = self.value("m_InputValue", default=1)
         collection = self.template_value("m_CardCollection", "Warzone")
+        # The authored location decides where in the collection the copies
+        # land.  Every matching-token effect currently authors Unknown, which
+        # the client implements as a random slot (shuffled into the deck).
+        deck_location = str(self.template_value(
+            "m_CardLocation", "") or "").rsplit(".", 1)[-1].lower()
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
             from rules_port.token_effects import create_matching_target
-            made = create_matching_target(self, int(target), max(1, int(count)), collection)
+            made = create_matching_target(
+                self, int(target), max(1, int(count)), collection,
+                deck_location)
         else:
             from abilities.framework.effects.utility import _create_matching_target
             made = _create_matching_target(
                 self.game, self.session, self.db, self.handler,
                 self.player_uid, self.ai_uid, self.bstate, int(target),
-                max(1, int(count)), collection)
+                max(1, int(count)), collection, deck_location)
         return f"created {made} matching token(s)"
 
     def transform_replica(self) -> str:
@@ -1668,7 +1708,8 @@ class EffectContext:
                                       label="finish resolving")
 
     def _move_simple_zone(self, target: int | None, destination: str,
-                          *, label="move") -> str:
+                          *, label="move",
+                          previous_owner_id: int | None = None) -> str:
         """Apply one ordinary zone transition and its typed event contract."""
         if target is None:
             return f"{label}: no card"
@@ -1743,7 +1784,12 @@ class EffectContext:
             event, target, int(details[2] or 0),
             event_source_collection=old_location,
             event_destination_collection=destination,
-            event_previous_state=old_state)
+            event_previous_state=old_state,
+            # The authored conditions distinguish a card that was already
+            # yours from one this move just took from another player.
+            event_previous_owner_id=(int(old[0] or 0)
+                                     if previous_owner_id is None
+                                     else int(previous_owner_id)))
         if destination == "discard":
             self._emit_trigger(
                 "CardDiscardedEvent", target, int(details[2] or 0),
@@ -1783,6 +1829,7 @@ class EffectContext:
         target = self.resolved_target()
         if target is None and destination == "underground":
             target = self.bstate.get("resolving_source_uid")
+        previous_owner_id = None
         # Authored control transfer (m_AbilityOwnerTakesControl / etc.).  The
         # port previously ignored these, so "move to an opponent's zone" left
         # the card under its original controller.
@@ -1794,6 +1841,9 @@ class EffectContext:
                     current = db_card_owner_id(
                         self.session.session_id, int(target), conn=self.db)
                     if current != new_owner:
+                        # Remember the controller the card had before this
+                        # move so the entry event can report it.
+                        previous_owner_id = int(current)
                         db_set_card_owner(
                             self.session.session_id, int(target), new_owner,
                             conn=self.db)
@@ -1822,7 +1872,8 @@ class EffectContext:
                 self._move_simple_zone(int(uid), destination)
                 moved += 1
             return f"moved all {moved} {all_zone} cards to {destination}"
-        return self._move_simple_zone(target, destination)
+        return self._move_simple_zone(target, destination,
+                                      previous_owner_id=previous_owner_id)
 
     def _move_zone_new_owner(self, target: int) -> int | None:
         """Resolve the C# MoveCardToZone control-transfer flags to an owner."""
@@ -2997,6 +3048,29 @@ class EffectContext:
             return "fire event: no authored event type"
         return self._emit_authored_event(event_type, self.resolved_target())
 
+    def inherit_child_lists(self, child_guid: str) -> None:
+        """Seed an invoked child ability with the current instance's lists.
+
+        C# ``Session.CreateAbility`` appends the parent ``AbilityInstance``
+        into the new ability instance, so a child reached through
+        ``ActivateAbility`` reads the authored lists (most importantly
+        ``StoredTargets``) the parent recorded earlier in the activation.
+        The child starts from that snapshot, exactly as a fresh instance
+        built with ``Append(parent)`` would.
+        """
+        parent = str(self.ability_guid or "").lower()
+        child = str(child_guid or "").lower()
+        if not parent or not child or parent == child:
+            return
+        for key in ("stored_targets", "stored_targets_this_turn"):
+            store = self.bstate.setdefault(key, {})
+            store[child] = list(store.get(parent) or ())
+        lists = self.bstate.setdefault("list_attrs", {})
+        lists[child] = {
+            str(name): list(entries or ())
+            for name, entries in (lists.get(parent) or {}).items()
+        }
+
     def activate_ability(self):
         """Enter a child ability through the common typed resolver.
 
@@ -3013,6 +3087,7 @@ class EffectContext:
             self.resolved_target(),
             default=self.bstate.get("resolving_owner_id", 0))
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
+            self.inherit_child_lists(child_guid)
             # A number of Records abilities materialize several temporary
             # cards in Choosing and then ActivateAbility a typed child whose
             # target is "a card in the choice zone".  The summons are not
@@ -3020,17 +3095,32 @@ class EffectContext:
             # boundary.  Detect that contract from the child graph so every
             # such effect gets one picker containing all authored options.
             from gamedata import DEFAULT_RECORD_STORE, ability_graph
-            from rules_port.targeting import legal_targets
+            from rules_port.targeting import (filter_restricts_to_zone,
+                                              legal_targets)
             from rules_port.resolution import resolve_port_ability
             child = ability_graph(DEFAULT_RECORD_STORE, child_guid)
             choice_target = None
             if child is not None:
                 for index, target in enumerate(child.targets):
+                    card_filter = getattr(target, "card_filter", None)
+                    if hasattr(card_filter, "to_dict"):
+                        card_filter = card_filter.to_dict()
+                    # Only an authored ``InZone`` filter identifies a picker
+                    # target: the child's cards come from the choice zone, or
+                    # from the deck (the class-39 search prompt).  The
+                    # ``m_CollectionFlags`` visibility mask is a union of
+                    # every collection a card could occupy, so testing it
+                    # made an ordinary "a card from your hand" child
+                    # (Bloatcap's Deathcry, Giant Corpse Fly's Deploy) look
+                    # like a choice-zone picker and the discard never reached
+                    # its class-23 hand picker.
+                    from_choosing = filter_restricts_to_zone(
+                        card_filter, "Choosing")
+                    from_deck = filter_restricts_to_zone(card_filter, "Deck")
                     if (not target.requires_input or
                             not str(target.target_kind or "").endswith(
                                 "AbilityTargetTemplate") or
-                            "choosing" not in str(
-                                target.collection_flags or "").lower()):
+                            not (from_choosing or from_deck)):
                         continue
                     candidates = legal_targets(
                         self.db, self.session.session_id, int(owner_id or 0),
@@ -3042,10 +3132,43 @@ class EffectContext:
                                    or []),
                         battle_state=self.bstate)
                     if candidates:
-                        choice_target = (index, [int(uid) for uid in candidates])
+                        choice_target = (
+                            index, [int(uid) for uid in candidates], from_deck)
                     break
             if choice_target is not None and int(owner_id or 0) != 0:
-                target_index, choice_uids = choice_target
+                target_index, choice_uids, from_deck = choice_target
+                # The chosen card can live in a hidden collection rather than
+                # in the choice zone the parent materialized: Scheme's "choose
+                # an action in your deck" keeps the card in the deck.  The
+                # ChooseAndPlay picker only lists cards the client already
+                # holds in Choosing, which left that prompt empty.  The deck
+                # search prompt projects the candidates into Choosing for the
+                # pick and puts them back untouched afterwards.
+                deck_prompt = getattr(self.handler, "_prompt_deck_search", None)
+                if from_deck and callable(deck_prompt):
+                    continuation = {
+                        "ability_guid": child_guid,
+                        "source_uid": int(source_uid or 0),
+                        "owner_id": int(owner_id),
+                        "target_map": {},
+                        "variables": dict(
+                            self.bstate.get("ability_variables") or {}),
+                        "resume_effect_order": 0,
+                        "target_index": int(target_index),
+                        "parent": self.continuation(),
+                    }
+                    # The deck is hidden, so its current order must not leak
+                    # through the picker arrangement.
+                    import random as _rnd
+                    _rnd.shuffle(choice_uids)
+                    self.bstate["resolution_paused"] = True
+                    deck_prompt(
+                        self.game, self.session, self.player_uid, self.ai_uid,
+                        self.bstate, child_guid, int(source_uid or 0),
+                        int(owner_id), choice_uids, kind="matching_target",
+                        continuation=continuation)
+                    return (f"activate ability: awaiting choice of "
+                            f"{len(choice_uids)} card(s)")
                 parent = self.continuation()
                 pending = {
                     "kind": "choice_zone_target",
@@ -3078,7 +3201,7 @@ class EffectContext:
             if choice_target is not None and int(owner_id or 0) == 0:
                 # AI choice is still resolved through the same child graph;
                 # only the client-facing picker is omitted.
-                target_index, choice_uids = choice_target
+                target_index, choice_uids, _from_deck = choice_target
                 target_map = {int(target_index): (int(choice_uids[0]),)}
                 return resolve_port_ability(
                     self.handler, self.game, self.session, self.db,

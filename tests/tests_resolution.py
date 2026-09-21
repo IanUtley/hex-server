@@ -15,6 +15,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 import game_engine
 
 from tests.tests_combat import (make_db, add_card, HandlerStub, SessionStub,
@@ -536,7 +540,13 @@ def test_native_choice_target_opens_one_picker_for_all_options(db):
         target_kind="AbilityTargetTemplate",
         collection_flags="Deck|Choosing",
         player_filter="MultiplePlayers",
-        guid=_ag("choice-target"))
+        guid=_ag("choice-target"),
+        # Every authored choice-zone target restricts to Choosing through its
+        # InZone filter; the visibility mask alone is not the zone contract.
+        card_filter={
+            "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+            "m_Collection": "Choosing",
+        })
     child = SimpleNamespace(targets=(target,))
     ability = SimpleNamespace(
         instance_id=9,
@@ -565,6 +575,180 @@ def test_native_choice_target_opens_one_picker_for_all_options(db):
     assert len(prompts) == 1
     assert prompts[0]["kind"] == "choice_zone_target"
     assert prompts[0]["choice_uids"] == [101, 102]
+
+
+def test_hand_discard_child_asks_the_controller_and_discards_on_resume(db):
+    """Bloatcap's Deathcry (and Giant Corpse Fly's Deploy) must ask to discard.
+
+    Their shared "Discard a card" child targets a card in the chosen
+    champion's hand, but the template advertises Choosing in its visibility
+    mask.  The ActivateAbility picker branch read that mask, turned the child
+    into a choice-zone picker holding the wrong cards, and the controller was
+    never asked to discard.  Answering the class-23 picker must also re-enter
+    the paused effect: resuming after it discarded nothing at all.
+    """
+    from rules_port.actions import AbilityResolutionState
+    from rules_port.resolution import resolve_port_ability
+
+    deathcry = "50a8dcb6-5733-c2d0-824b-943199bef45f"      # Bloatcap's Deathcry
+    discard_child = "06570445-27e3-fc87-2e17-a7b5e1de693d"  # "Discard a card"
+    hand_card = 401
+    db.execute(
+        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("84e4acf1-1f2e-abac-069d-8c6eb18b2b12", "a card from your hand",
+         0, 0, 0, 0, "MultiplePlayers",
+         # The authored template advertises every collection in its
+         # visibility mask while its filter is the authoritative zone.
+         "Deck|Hand|Champions|Warzone|Discard|Void|CastSpells|Underground|"
+         "Choosing", 1, 1, json.dumps({
+             "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+             "m_Collection": "Hand",
+         }), "AbilityTargetTemplate"))
+    add_card(db, hand_card, 5, TPL_GLADIATOR, loc="hand")
+    db.commit()
+
+    class Handler(HandlerStub):
+        def __init__(self, db):
+            super().__init__(db)
+            self.discard_prompts = []
+            self.choice_prompts = []
+
+        def _push_discard_prompt(self, _game, _session, _pl_t, _ai_t,
+                                 _bstate, ability_guid=None):
+            self.discard_prompts.append(ability_guid)
+            return "prompted"
+
+        def _prompt_choice_cards(self, *args):
+            self.choice_prompts.append(args)
+
+    def location():
+        return db.execute("SELECT location FROM game_cards WHERE card_uid=?",
+                          (hand_card,)).fetchone()[0]
+
+    handler = Handler(db)
+    pl_t, ai_t = game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"resolving_source_uid": 900, "resolving_owner_id": 0,
+              "resolving_effect_order": 0,
+              "_rules_port_native_effect": True}
+    # The AI's Bloatcap died; its Deathcry auto-targets the opposing champion,
+    # who then chooses a card from that champion's hand.
+    assert resolve_port_ability(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        deathcry, 900, 0, target_map={}) is AbilityResolutionState.WAITING_FOR_INPUT
+    assert handler.discard_prompts == [discard_child], handler.discard_prompts
+    assert handler.choice_prompts == [], handler.choice_prompts
+    assert bstate.get("resolution_paused") is True
+    assert location() == "hand"
+
+    continuation = bstate["pending_discard_continuation"]
+    assert continuation["resume_effect_order"] == 0, continuation
+    result = resolve_port_ability(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        discard_child, 900, 5, target_map={0: (hand_card,)},
+        resume_from_order=int(continuation["resume_effect_order"]),
+        instance_id=int(continuation["instance_id"]))
+    assert result is AbilityResolutionState.COMPLETED, result
+    assert location() == "discard"
+    assert any(ev.__class__.__name__ == "CardDiscardedSessionEventArgs"
+               for ev in game.events)
+
+
+def test_native_deck_target_opens_the_deck_search_picker(db):
+    """Scheme's "choose an action in your deck" must offer real candidates.
+
+    The child target's authoritative zone is the deck, which the ChooseAndPlay
+    picker cannot show: the client only lists cards it already holds in
+    Choosing, so that prompt arrived with nothing to select.  The deck-search
+    picker projects the candidates into Choosing and leaves them in the deck.
+    """
+    from rules_port.context import EffectContext
+
+    target = SimpleNamespace(
+        requires_input=True,
+        target_kind="AbilityTargetTemplate",
+        collection_flags="Deck|Hand|Warzone|Choosing",
+        player_filter="MultiplePlayers",
+        guid=_ag("deck-action-target"),
+        card_filter={
+            "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+            "m_Collection": "Deck",
+        })
+    child = SimpleNamespace(targets=(target,))
+    ability = SimpleNamespace(
+        instance_id=9,
+        continuation=lambda **kwargs: {
+            "ability_guid": "parent",
+            "source_uid": 77,
+            "owner_id": 5,
+            "target_map": {},
+            "variables": {},
+            "resume_effect_order": kwargs["resume_effect_order"],
+        })
+    prompts = []
+    handler = SimpleNamespace(
+        _prompt_deck_search=lambda *args, **kwargs: prompts.append(
+            (args, kwargs)))
+    context = EffectContext.from_rules_port(
+        object(), SimpleNamespace(session_id=1), db, handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"resolving_source_uid": 77, "resolving_owner_id": 5,
+         "resolving_effect_order": 0}, "effect", _ag("child"),
+        ability=ability)
+    with mock.patch("gamedata.ability_graph", return_value=child), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=[101, 102]):
+        result = context.activate_ability()
+    assert "awaiting choice of 2" in result, result
+    assert context.bstate.get("resolution_paused") is True
+    assert len(prompts) == 1
+    args, kwargs = prompts[0]
+    assert kwargs["kind"] == "matching_target"
+    assert args[5] == _ag("child"), args
+    assert sorted(args[8]) == [101, 102], args
+    continuation = kwargs["continuation"]
+    assert continuation["ability_guid"] == _ag("child")
+    assert continuation["target_index"] == 0
+    assert continuation["parent"]["ability_guid"] == "parent"
+
+
+def test_native_deck_target_ai_auto_selects_without_a_picker(db):
+    """The AI resolves the same deck-restricted child with no client picker."""
+    from rules_port.context import EffectContext
+    from rules_port import resolution as port_resolution
+
+    target = SimpleNamespace(
+        requires_input=True,
+        target_kind="AbilityTargetTemplate",
+        collection_flags="Deck|Choosing",
+        player_filter="MultiplePlayers",
+        guid=_ag("ai-deck-target"),
+        card_filter={
+            "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+            "m_Collection": "Deck",
+        })
+    child = SimpleNamespace(targets=(target,))
+    ability = SimpleNamespace(instance_id=1, continuation=lambda **kwargs: {})
+    context = EffectContext.from_rules_port(
+        object(), SimpleNamespace(session_id=1), db, SimpleNamespace(),
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"resolving_source_uid": 77, "resolving_owner_id": 0},
+        "effect", _ag("child"), ability=ability)
+    calls = {}
+
+    def fake_resolve(_handler, _game, _session, _db, _pl_t, _ai_t, _bstate,
+                     guid, _source, owner, **kwargs):
+        calls.update(guid=guid, owner=owner, target_map=kwargs.get("target_map"))
+        return "resolved"
+
+    with mock.patch("gamedata.ability_graph", return_value=child), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=[101, 102]), \
+            mock.patch.object(port_resolution, "resolve_port_ability",
+                              fake_resolve):
+        assert context.activate_ability() == "resolved"
+    assert calls == {"guid": _ag("child"), "owner": 0,
+                     "target_map": {0: (101,)}}, calls
 
 
 def test_choice_ability_transforms_real_parent(db):
@@ -696,6 +880,12 @@ def main():
          test_summon_choosing_collection_stays_out_of_warzone),
         ("Native choice target opens one picker",
          test_native_choice_target_opens_one_picker_for_all_options),
+        ("Hand discard asks then discards on resume",
+         test_hand_discard_child_asks_the_controller_and_discards_on_resume),
+        ("Native deck target opens the deck-search picker",
+         test_native_deck_target_opens_the_deck_search_picker),
+        ("Native deck target AI auto-selects",
+         test_native_deck_target_ai_auto_selects_without_a_picker),
         ("Choice transforms its real parent",
          test_choice_ability_transforms_real_parent),
         ("Records choice filter preserves typed target data",

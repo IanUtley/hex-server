@@ -28,28 +28,6 @@ def _ability_list(db, session_id, card_uid, template_guid):
     return result
 
 
-def _deathcries(context, uid, template_guid, owner):
-    from .conditions import ConditionContext, trigger_condition_met
-    from .resolution import resolve_port_ability
-    for ability_guid, condition in _ability_list(
-            context.db, context.session.session_id, uid, template_guid):
-        if condition:
-            condition_context = ConditionContext(
-                context.db, context.session, context.bstate,
-                event_type="CardEnteredZoneEvent",
-                ability_source_uid=uid, ability_source_owner_id=owner,
-                trigger_uid=uid, pl_t=context.player_uid, ai_t=context.ai_uid,
-                event_source_collection="warzone",
-                event_destination_collection="discard",
-                event_previous_state=int(game_engine.ECardStates.Dead))
-            if not trigger_condition_met(condition, condition_context):
-                continue
-        resolve_port_ability(
-            context.handler, context.game, context.session, context.db,
-            context.player_uid, context.ai_uid, context.bstate, ability_guid,
-            uid, owner, target_map={})
-
-
 def kill_troop(context, target, *, cause="effect"):
     """Move a troop to discard and resolve its typed Deathcry abilities."""
     from pvp_db import db_card_death_info, db_kill_card_to_discard
@@ -94,7 +72,14 @@ def kill_troop(context, target, *, cause="effect"):
         event_previous_state=int(game_engine.ECardStates.Dead))
     if cause == "sacrifice":
         context._emit_trigger("CardSacrificedEvent", target, owner)
-    _deathcries(context, target, template_guid, owner)
+    # Deathcry resolution belongs to the trigger engine: the warzone->discard
+    # CardEnteredZoneEvent above already discovers the card's authored
+    # Deathcry triggers and resolves them through the chain with their real
+    # condition metadata (``m_UsesPreviousState``), ONE-SHOT consumption, and
+    # response window.  Resolving them a second time here made a return-to-play
+    # Deathcry fire twice and left the queued chain item stranded, which
+    # blocked the enters-play trigger that followed the return (Moon'ariu
+    # Sensei's Deploy draw never resolved).
     return f"killed {hex(target)}"
 
 
@@ -107,6 +92,11 @@ def state_based_deaths(context):
     """
     from pvp_db import db_warzone_troop_state_rows
 
+    # Troops a Lethal source damaged this step (recorded by
+    # ``damage_effects.deal_damage``) die even when their remaining defense is
+    # above zero, exactly like the client's per-turn ``LethalDamageTaken``.
+    lethal_marks = {int(uid) for uid in
+                    (context.bstate.pop("_lethal_damage_uids", None) or ())}
     dead = []
     rows = db_warzone_troop_state_rows(
         context.session.session_id, conn=context.db)
@@ -127,12 +117,14 @@ def state_based_deaths(context):
             if (context.bstate or {}).get("_rules_port_native_effect") or \
                     (context.bstate or {}).get("_rules_port_attached"):
                 raise
-        if defense <= 0:
+        lethal = int(card_uid) in lethal_marks and defense > 0
+        if defense <= 0 or lethal:
             old_native = context.bstate.get("_rules_port_native_effect")
             context.bstate["_rules_port_native_effect"] = True
             try:
                 result = kill_troop(
-                    context, int(card_uid), cause="state")
+                    context, int(card_uid),
+                    cause="damage" if lethal else "state")
             finally:
                 if old_native is None:
                     context.bstate.pop("_rules_port_native_effect", None)

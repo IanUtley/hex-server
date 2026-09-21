@@ -56,16 +56,23 @@ def player_has_eligible_attackers(db, session_id, battle_state, player_id):
 
 
 def _combat_card(db, session_id, battle_state, uid):
-    from pvp_db import db_card_mutation_info
+    from pvp_db import db_card_location, db_card_mutation_info
     info = db_card_mutation_info(session_id, int(uid), conn=db)
     if not info:
         return None, 0, 0
     from .static_rules import effective_stats
     attack, defense, attrs, flags, damage = effective_stats(
         db, session_id, battle_state or {}, int(uid))
+    # ``db_card_mutation_info`` returns (template_guid, owner, card_type).
+    # Reading index 0 as the owner made every block-rule filter compare
+    # against a template GUID: the phase walk's blocker scan raised
+    # ``ValueError`` out of the filter player operand and dropped the
+    # connection mid-turn.
+    owner = int(info[1] or 0)
     return {"card_uid": int(uid), "card_type": info[2] or "",
-            "location": info[1] or "warzone", "user_id": info[0],
-            "owner_id": info[0], "controller_id": info[0],
+            "location": db_card_location(session_id, int(uid), conn=db)
+            or "warzone",
+            "user_id": owner, "owner_id": owner, "controller_id": owner,
             "attack": attack, "defense": defense,
             "attributes": attrs, "rule_flags": flags}, attrs, int(damage or 0)
 

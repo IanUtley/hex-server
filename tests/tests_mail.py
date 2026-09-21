@@ -6,6 +6,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 
 def test_delivered_response_has_a_parseable_size_table():
     import services.mail as mail_service

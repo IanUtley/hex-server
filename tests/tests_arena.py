@@ -7,6 +7,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from gamemodes.arena import (
     FIXED_ELITE_RANKS,
     encounter_family,

@@ -6,6 +6,7 @@ runtime cards, keeping Records/metadata outside the rules kernel.
 from __future__ import annotations
 from dataclasses import dataclass
 import inspect
+import threading
 from typing import Any, Protocol, Sequence
 
 def _v(card, *names, default=None):
@@ -1004,53 +1005,59 @@ def records_filter_from_metadata(spec: Any) -> CardFilter:
 def records_filter_matches(card, spec, *, source=None, context=None,
                             player=None):
     """Evaluate one Records filter using the RulesPort card predicate set."""
-    from domain.enums import ECardStates, card_type_from_db
+    return records_filter_evaluator(
+        spec, source=source, context=context, player=player)(card)
 
-    if not spec:
-        # An empty/absent filter (for example TopNOfDeck with ``m_Filter``
-        # null, used by Nerissa's reveal power) matches every candidate.
-        return True
 
-    def normalize_runtime_flags(value):
-        # ``game_cards.card_state`` is the authoritative mutable card state;
-        # the Records filter layer should expose the same derived predicates
-        # as CardRepresentation instead of requiring every DB adapter to
-        # duplicate them as booleans.
-        if "state" in value:
-            state = int(value.get("state") or 0)
-            value.setdefault("is_attacking", bool(
-                state & int(ECardStates.Attacking)))
-            value.setdefault("is_blocking", bool(
-                state & int(ECardStates.Blocking)))
-            value.setdefault("tapped", bool(
-                state & int(ECardStates.Tapped)))
-            value.setdefault("is_tapped", value["tapped"])
-            # C# derives these turn-history predicates from the same
-            # authoritative bitmask (Card.CameOutThisTurn / Damaged / Healed /
-            # HasAttacked).  Without them the Is*ThisTurn filters always
-            # matched nothing.
-            value.setdefault("played_this_turn", bool(
-                state & int(ECardStates.CameOutThisTurn)))
-            value.setdefault("came_out_this_turn", value["played_this_turn"])
-            value.setdefault("damaged_this_turn", bool(
-                state & int(ECardStates.Damaged)))
-            value.setdefault("healed_this_turn", bool(
-                state & int(ECardStates.Healed)))
-            value.setdefault("attacked_this_turn", bool(
-                state & int(ECardStates.HasAttacked)))
-            value.setdefault("has_attacked_this_turn",
-                             value["attacked_this_turn"])
-            if (value.get("template_guid") and
-                    value.get("original_template_guid")):
-                value.setdefault(
-                    "is_transformed",
-                    value["original_template_guid"] != value["template_guid"])
-            if isinstance(value.get("shards"), (list, tuple, set)):
-                value.setdefault("thresholds", list(value["shards"]))
-        return value
+def _normalize_runtime_flags(value):
+    # ``game_cards.card_state`` is the authoritative mutable card state;
+    # the Records filter layer should expose the same derived predicates
+    # as CardRepresentation instead of requiring every DB adapter to
+    # duplicate them as booleans.
+    from domain.enums import ECardStates
+    if "state" in value:
+        state = int(value.get("state") or 0)
+        value.setdefault("is_attacking", bool(
+            state & int(ECardStates.Attacking)))
+        value.setdefault("is_blocking", bool(
+            state & int(ECardStates.Blocking)))
+        value.setdefault("tapped", bool(
+            state & int(ECardStates.Tapped)))
+        value.setdefault("is_tapped", value["tapped"])
+        # C# derives these turn-history predicates from the same
+        # authoritative bitmask (Card.CameOutThisTurn / Damaged / Healed /
+        # HasAttacked).  Without them the Is*ThisTurn filters always
+        # matched nothing.
+        value.setdefault("played_this_turn", bool(
+            state & int(ECardStates.CameOutThisTurn)))
+        value.setdefault("came_out_this_turn", value["played_this_turn"])
+        value.setdefault("damaged_this_turn", bool(
+            state & int(ECardStates.Damaged)))
+        value.setdefault("healed_this_turn", bool(
+            state & int(ECardStates.Healed)))
+        value.setdefault("attacked_this_turn", bool(
+            state & int(ECardStates.HasAttacked)))
+        value.setdefault("has_attacked_this_turn",
+                         value["attacked_this_turn"])
+        if (value.get("template_guid") and
+                value.get("original_template_guid")):
+            value.setdefault(
+                "is_transformed",
+                value["original_template_guid"] != value["template_guid"])
+        if isinstance(value.get("shards"), (list, tuple, set)):
+            value.setdefault("thresholds", list(value["shards"]))
+    return value
 
-    value = dict(card or {})
-    normalize_runtime_flags(value)
+
+def _records_filter_card(card, *, include_collection=True):
+    """Project one runtime card dict into the Records filter card shape.
+
+    ``include_collection`` is False for the ability-source projection: the
+    source operand has never carried the derived collection bit, and folding
+    it in here would change InZone predicates evaluated against the source.
+    """
+    from domain.enums import ECardCollections, card_type_from_db
+    value = _normalize_runtime_flags(dict(card or {}))
     raw_type = value.get("card_type")
     if isinstance(raw_type, str):
         value["_card_type_name"] = raw_type
@@ -1061,23 +1068,34 @@ def records_filter_matches(card, spec, *, source=None, context=None,
         value.setdefault("owner_id", value["user_id"])
         value.setdefault("controller_id", value["user_id"])
     location = str(value.get("location", "")).lower()
-    if location:
-        from domain.enums import ECardCollections
+    if location and include_collection:
         value["collection"] = {name.lower(): number for name, number in vars(
             ECardCollections).items() if not name.startswith("_")}.get(location, 0)
-    source_value = None
-    if source is not None:
-        source_value = dict(source)
-        normalize_runtime_flags(source_value)
-        source_type = source_value.get("card_type")
-        if isinstance(source_type, str):
-            source_value["_card_type_name"] = source_type
-            source_value["card_type"] = card_type_from_db(source_type)
-            source_value["is_hero"] = "Champion" in source_type.split("|")
-            source_value["is_resource"] = "Resource" in source_type.split("|")
-        if "user_id" in source_value:
-            source_value.setdefault("owner_id", source_value["user_id"])
-            source_value.setdefault("controller_id", source_value["user_id"])
+    return value
+
+
+def _player_operand(value):
+    """Coerce a persisted resolving-player value to a player id or ``None``.
+
+    ``resolving_owner_id`` is written by the compatibility host, the native
+    effect layer, and the legacy BOM triggers.  A card identity (template
+    GUID) that reaches it is not a player, so it must not be used as a
+    threshold-pool key nor raised out of filter evaluation — doing so killed
+    the connection thread mid-AI-turn in a live Practice game.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        from db import log_req
+        log_req("    Ignoring non-player resolving_owner_id "
+                f"{value!r}; falling back to the source owner")
+        return None
+
+
+def _records_filter_player(player, source_value, context):
+    """Resolve the player/threshold operand for one filter evaluation batch."""
     source_owner = (source_value or {}).get("controller_id")
     # A typed TAC filter needs the active player's threshold pool, not the
     # numeric owner ID.  The Records adapter receives the execution context
@@ -1089,40 +1107,83 @@ def records_filter_matches(card, spec, *, source=None, context=None,
     # pool below; replacing an explicit ID with that pool makes every
     # contextual self-controlled target appear uncontrolled.
     explicit_player = player is not None
-    player = player if explicit_player else source_owner
-    if context is not None and player == source_owner:
-        state = getattr(context, "bstate", {}) or {}
-        # TAC is evaluated for the player resolving the ability.  The source
-        # card's controller is normally the same player, but generated and
-        # champion projections can omit or temporarily carry a different
-        # controller representation.
-        active_owner = state.get("resolving_owner_id", source_owner)
-        thresholds = (state.get(f"thresh_{active_owner}")
-                      if active_owner is not None else None)
-        # PvP effect execution uses the side-oriented RulesPort view rather
-        # than the raw checkpoint.  Its active/opponent pools are named
-        # player_threshold and ai_threshold respectively.
-        if thresholds is None and active_owner is not None and int(active_owner) == int(
-                state.get("resolving_owner_id", -1) or -1):
-            thresholds = state.get("player_threshold")
-        if thresholds is None:
-            thresholds = state.get("ai_threshold")
-        normalized_thresholds = {}
-        # NOTE: the loop variable must not shadow ``value`` (the card dict
-        # being filtered).  It previously did, so every Records filter
-        # evaluated with a threshold context compared against an int and
-        # returned False — e.g. Subterranean Spy's "while underground" gate
-        # (ThisIsUnderground) always failed and the hand was never revealed.
-        for threshold_key, threshold_value in (thresholds or {}).items():
-            try:
-                threshold_key = int(threshold_key)
-            except (TypeError, ValueError):
-                pass
-            normalized_thresholds[threshold_key] = int(threshold_value or 0)
-        if not explicit_player:
-            player = {"resource_thresholds": normalized_thresholds}
-    return records_filter_from_metadata(spec).matches(
-        value, source=source_value, player=player, session=context)
+    if explicit_player:
+        return player
+    player = source_owner
+    if context is None or player != source_owner:
+        return player
+    state = getattr(context, "bstate", {}) or {}
+    # TAC is evaluated for the player resolving the ability.  The source
+    # card's controller is normally the same player, but generated and
+    # champion projections can omit or temporarily carry a different
+    # controller representation.
+    has_resolving_owner = "resolving_owner_id" in state
+    raw_resolving_owner = state.get("resolving_owner_id")
+    resolving_owner = _player_operand(raw_resolving_owner)
+    active_owner = resolving_owner if has_resolving_owner else source_owner
+    thresholds = (state.get(f"thresh_{active_owner}")
+                  if active_owner is not None else None)
+    # PvP effect execution uses the side-oriented RulesPort view rather
+    # than the raw checkpoint.  Its active/opponent pools are named
+    # player_threshold and ai_threshold respectively.
+    if (thresholds is None and active_owner is not None and
+            raw_resolving_owner and resolving_owner == active_owner):
+        thresholds = state.get("player_threshold")
+    if thresholds is None:
+        thresholds = state.get("ai_threshold")
+    normalized_thresholds = {}
+    # NOTE: the loop variable must not shadow ``value`` (the card dict
+    # being filtered).  It previously did, so every Records filter
+    # evaluated with a threshold context compared against an int and
+    # returned False — e.g. Subterranean Spy's "while underground" gate
+    # (ThisIsUnderground) always failed and the hand was never revealed.
+    for threshold_key, threshold_value in (thresholds or {}).items():
+        try:
+            threshold_key = int(threshold_key)
+        except (TypeError, ValueError):
+            pass
+        normalized_thresholds[threshold_key] = int(threshold_value or 0)
+    return {"resource_thresholds": normalized_thresholds}
+
+
+def records_filter_evaluator(spec, *, source=None, context=None, player=None):
+    """Compile ``spec`` once and return a reusable ``card -> bool`` predicate.
+
+    A target scan or play-option refresh evaluates one authored filter over
+    every candidate card in the scanned zones.  The compiled filter tree and
+    the loop-invariant source/player/threshold operands are therefore resolved
+    once per batch instead of rebuilt for each candidate.
+    """
+    if not spec:
+        # An empty/absent filter (for example TopNOfDeck with ``m_Filter``
+        # null, used by Nerissa's reveal power) matches every candidate.
+        return lambda card: True
+    compiled = records_filter_from_metadata(spec)
+    source_value = (_records_filter_card(source, include_collection=False)
+                    if source is not None else None)
+    player_value = _records_filter_player(player, source_value, context)
+
+    def matches(card):
+        return compiled.matches(_records_filter_card(card),
+                                source=source_value, player=player_value,
+                                session=context)
+    return matches
+
+_FILTER_PARAMETERS: dict[type, frozenset] = {}
+_FILTER_PARAMETERS_LOCK = threading.Lock()
+
+
+def _constructor_parameters(cls) -> frozenset:
+    """Accepted keyword names for a filter class, resolved once per class."""
+    parameters = _FILTER_PARAMETERS.get(cls)
+    if parameters is None:
+        with _FILTER_PARAMETERS_LOCK:
+            parameters = _FILTER_PARAMETERS.get(cls)
+            if parameters is None:
+                parameters = frozenset(inspect.signature(cls).parameters)
+                _FILTER_PARAMETERS[cls] = parameters
+    return parameters
+
 
 def filter_from_metadata(spec: Any) -> CardFilter:
     if not isinstance(spec, dict):
@@ -1190,7 +1251,7 @@ def filter_from_metadata(spec: Any) -> CardFilter:
     # Several client filter classes are marker types with no constructor
     # fields.  Records retain unrelated serialized fields on those objects;
     # discard only fields not accepted by the port class.
-    parameters = set(inspect.signature(cls).parameters)
+    parameters = _constructor_parameters(cls)
     kwargs = {key: value for key, value in kwargs.items() if key in parameters}
     try:
         return cls(**kwargs)

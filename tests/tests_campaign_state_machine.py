@@ -13,14 +13,16 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import campaign
 from campaign_fixtures import seed_campaign_fixtures
 
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(__file__), "..", "hconnect.db"),
-)
 SAVAGE_LORD = "ab77df1e-5f13-471b-80e7-b7b4824ca280"
 CORRUPT_DRYAD = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
 GNASH_BRIDGES = "3cf073b0-47fd-4911-953a-d86902890459"

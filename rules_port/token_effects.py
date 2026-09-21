@@ -66,7 +66,8 @@ def _random_socket_gems(template_guid, connection):
     return packed
 
 
-def create_matching_target(context, target, count, collection):
+def create_matching_target(context, target, count, collection,
+                           deck_location=""):
     """Create typed copies of a resolved target in the requested collection."""
     from pvp_db import (db_card_source_info, db_copy_template_payload,
                         db_next_game_card_row_id, db_insert_generated_card)
@@ -94,6 +95,17 @@ def create_matching_target(context, target, count, collection):
             conn=context.db, owner_user_id=owner_id,
             original_template_guid=template_guid, gems=0)
         created.append(int(uid))
+    # C# MoveCardWithDispatch -> FinishMovingCard places a card moved into the
+    # deck at ``RNG.Next(deck_count + 1)`` when its location is Unknown: the
+    # copies are shuffled in and every other deck card keeps its relative
+    # order.  Inserting them without a slot left all copies tied at position
+    # 0, i.e. stacked on top of the deck, so the next draws were the copies.
+    if (location == "deck" and created and
+            str(deck_location or "").lower() in ("", "unknown", "random")):
+        from pvp_db import db_randomly_insert_deck_cards
+        db_randomly_insert_deck_cards(
+            context.session.session_id, owner_id, created,
+            connection=context.db)
     context.db.commit()
     for uid in created:
         scid = game_engine.SessionCardId(game_engine.UID(uid))
@@ -107,6 +119,129 @@ def create_matching_target(context, target, count, collection):
             template_id=template_guid, cost=cost, attack=attack,
             defense=defense, gems=gems, nulling=location == "deck")
     return len(created)
+
+
+def _authored_banned_guids(context):
+    """Return the authored banned-card set for a random creation.
+
+    Event restrictions are authoritative data, just like the typed card
+    filter.  In Iconoclast, do not offer the client-authored bans.
+    """
+    from gamemodes.tournament_engine import tournament_id_from_session_name
+    from tournament_db import (db_tournament_banned_card_guids,
+                               db_tournament_room_for_game)
+    tournament_id = tournament_id_from_session_name(
+        getattr(context.session, "session_name", ""))
+    room = (db_tournament_room_for_game(tournament_id, conn=context.db)
+            if tournament_id else None)
+    if room and int(room.get("type_id", 0) or 0) == 4:
+        return {str(guid).lower() for guid in
+                db_tournament_banned_card_guids(4, conn=context.db)}
+    return set()
+
+
+def _matching_template_candidates(context, card_filter, banned_guids=()):
+    """Return the typed templates matching one Records ``CardFilter``.
+
+    Every random generated-card effect (Conscript, the champion Choosing
+    summons, and the authored Worker Bot replacement) draws from this pool, so
+    the tournament bans and the filter semantics cannot diverge between them.
+    """
+    from pvp_db import db_transform_candidate_templates, db_card_zone_details
+    from rules_port.filters import records_filter_matches
+    banned_guids = {str(guid).lower() for guid in banned_guids or ()}
+    candidates = []
+    owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
+    active_thresholds = (context.bstate.get(f"thresh_{owner}")
+                         or context.bstate.get("player_threshold") or {})
+    source_row = db_card_zone_details(
+        context.session.session_id,
+        int(context.bstate.get("resolving_source_uid", 0) or 0),
+        conn=context.db)
+    source = {"user_id": int(source_row[2]),
+              "owner_id": int(source_row[2]),
+              "controller_id": int(source_row[2])} if source_row else None
+    for row in db_transform_candidate_templates(conn=context.db):
+        if str(row[0]).lower() in banned_guids:
+            continue
+        threshold_json = row[5] or ""
+        try:
+            threshold_data = json.loads(threshold_json) if threshold_json else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            threshold_data = {}
+        # Records' TAC filters consume the same normalized threshold entries
+        # as runtime CardRepresentations.  The SQL candidate projection is
+        # intentionally lightweight, so add that derived view here rather than
+        # making the filter depend on SQLite rows.
+        threshold_list = (threshold_data.get("list", [])
+                          if isinstance(threshold_data, dict) else [])
+        candidate_thresholds = []
+        for color in threshold_list:
+            try:
+                candidate_thresholds.append({
+                    "color_flags": {0: 0, 1: 4, 2: 8, 3: 16,
+                                    4: 32, 5: 64}.get(int(color), int(color)),
+                    "quantity": 1})
+            except (TypeError, ValueError):
+                continue
+        candidate = {"card_uid": 0, "template_guid": row[0],
+                     "name": row[1] or "", "card_type": row[2] or "",
+                     "cost": int(row[3] or 0), "rarity": row[4] or "",
+                     "shards": [], "thresholds": candidate_thresholds,
+                     "subtype": row[6] or "",
+                     "attributes": int(row[7] or 0), "user_id": owner}
+        if records_filter_matches(candidate, card_filter,
+                                  source=source, context=context,
+                                  player={"resource_thresholds":
+                                          active_thresholds}):
+            candidates.append(row[0])
+    return candidates
+
+
+def _creation_replacement_guid(context, token_guid):
+    """Return the authored template that replaces a would-be token.
+
+    The creating player's cards carry the typed IntAttr marker a replacement
+    grant writes (Reese the Crustcrawler's Surface grant is the current one),
+    and the replaced template is named in that card's Records ability graph.
+    Both halves are authored data, so the substitute comes from the same typed
+    random-creation pool every other native summon uses.
+    """
+    if not token_guid:
+        return None
+    from pvp_db import db_cards_in_zones_with_abilities, db_card_mutation_field
+    from .creation_effects import replacement_abilities, replacement_filter
+    owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
+    for card_uid, abilities_json in db_cards_in_zones_with_abilities(
+            context.session.session_id, owner,
+            ("warzone", "underground"), conn=context.db):
+        try:
+            abilities = json.loads(abilities_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            abilities = []
+        try:
+            buffs = json.loads(db_card_mutation_field(
+                context.session.session_id, int(card_uid),
+                "permanent_buffs", conn=context.db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            buffs = {}
+        markers = buffs.get("int_attrs", {}) if isinstance(buffs, dict) else {}
+        if not markers:
+            continue
+        for attribute, linked_templates in replacement_abilities(
+                context.db, abilities):
+            if not int(markers.get(attribute, 0) or 0):
+                continue
+            if str(token_guid).lower() not in linked_templates:
+                continue
+            substitute_filter = replacement_filter(attribute)
+            if substitute_filter is None:
+                continue
+            candidates = _matching_template_candidates(
+                context, substitute_filter, _authored_banned_guids(context))
+            if candidates:
+                return random.choice(candidates)
+    return None
 
 
 def summon_token(context, payload=None):
@@ -146,71 +281,13 @@ def summon_token(context, payload=None):
     card_filter = payload.get("card_filter")
     selected_guids = None
     candidate_count = None
-    banned_guids = set()
-    if not guid and card_filter is not None:
-        # Event restrictions are authoritative data, just like the typed
-        # card filter.  In Iconoclast, do not offer the client-authored bans.
-        from gamemodes.tournament_engine import tournament_id_from_session_name
-        from tournament_db import (db_tournament_banned_card_guids,
-                                   db_tournament_room_for_game)
-        tournament_id = tournament_id_from_session_name(
-            getattr(context.session, "session_name", ""))
-        room = (db_tournament_room_for_game(tournament_id, conn=context.db)
-                if tournament_id else None)
-        if room and int(room.get("type_id", 0) or 0) == 4:
-            banned_guids = db_tournament_banned_card_guids(
-                4, conn=context.db)
+    banned_guids = (_authored_banned_guids(context)
+                    if not guid and card_filter is not None else set())
     if card_filter is None:
         card_filter = context.template_value("m_CardFilter")
     if not guid and card_filter is not None:
-        from pvp_db import db_transform_candidate_templates, db_card_zone_details
-        from rules_port.filters import records_filter_matches
-        candidates = []
-        owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
-        active_thresholds = (context.bstate.get(f"thresh_{owner}")
-                            or context.bstate.get("player_threshold") or {})
-        source_row = db_card_zone_details(
-            context.session.session_id,
-            int(context.bstate.get("resolving_source_uid", 0) or 0),
-            conn=context.db)
-        source = {"user_id": int(source_row[2]),
-                  "owner_id": int(source_row[2]),
-                  "controller_id": int(source_row[2])} if source_row else None
-        for row in db_transform_candidate_templates(conn=context.db):
-            if str(row[0]).lower() in banned_guids:
-                continue
-            threshold_json = row[5] or ""
-            try:
-                threshold_data = json.loads(threshold_json) if threshold_json else {}
-            except (TypeError, ValueError, json.JSONDecodeError):
-                threshold_data = {}
-            # Records' TAC filters consume the same normalized threshold
-            # entries as runtime CardRepresentations.  The SQL candidate
-            # projection is intentionally lightweight, so add that derived
-            # view here rather than making the filter depend on SQLite rows.
-            threshold_list = (threshold_data.get("list", [])
-                              if isinstance(threshold_data, dict) else [])
-            candidate_thresholds = []
-            for color in threshold_list:
-                try:
-                    candidate_thresholds.append({
-                        "color_flags": {0: 0, 1: 4, 2: 8, 3: 16,
-                                         4: 32, 5: 64}.get(
-                                             int(color), int(color)),
-                        "quantity": 1})
-                except (TypeError, ValueError):
-                    continue
-            candidate = {"card_uid": 0, "template_guid": row[0],
-                         "name": row[1] or "", "card_type": row[2] or "",
-                         "cost": int(row[3] or 0), "rarity": row[4] or "",
-                         "shards": [], "thresholds": candidate_thresholds,
-                         "subtype": row[6] or "",
-                         "attributes": int(row[7] or 0), "user_id": owner}
-            if records_filter_matches(candidate, card_filter,
-                                      source=source, context=context,
-                                      player={"resource_thresholds":
-                                              active_thresholds}):
-                candidates.append(row[0])
+        candidates = _matching_template_candidates(
+            context, card_filter, banned_guids)
         if candidates:
             # Choice-zone effects such as the champion charge power present
             # separate options.  Select without replacement so one activation
@@ -222,6 +299,13 @@ def summon_token(context, payload=None):
         return ("summon token: no typed card template found "
                 f"(guid={guid!r}, candidates={candidate_count}, "
                 f"count={count}, filter={card_filter is not None})")
+    if selected_guids is None:
+        replacement = _creation_replacement_guid(context, guid)
+        if replacement:
+            # An authored replacement substitutes the created template, so it
+            # must happen before the talent-modified lookup and the payload
+            # copy: the substitute's own type/abilities/stats are created.
+            guid = str(replacement).lower()
     owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
     target = context.resolved_target()
     target_owner = context.target_owner(target, default=owner)

@@ -18,6 +18,12 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 
 from abilities.framework.resolution import resolve_ability
@@ -30,10 +36,6 @@ from tests.tests_set1_sweep import (
 )
 
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 
 def _champion_abilities(db):

@@ -163,11 +163,18 @@ def resolve(context, *, first_strike=False, attacker_key="player_attackers",
             # blocker (or a Juggernaut) the full remaining damage is dealt, so
             # clamping unconditionally under-reported the damage event.
             if getattr(target, "is_troop", False) and only_minimum:
-                from .static_rules import effective_stats
-                stats = effective_stats(
-                    context.db, context.session.session_id,
-                    context.bstate, target_uid)
-                allocated = min(allocated, max(0, int(stats[1] or 0)))
+                if getattr(source, "lethal", False):
+                    # A Lethal source assigns a single damage (its damage is
+                    # lethal regardless of the blocker's defense), leaving the
+                    # remainder for the next blocker or Crush/Juggernaut
+                    # overflow, matching the client's DamageCard.
+                    allocated = 1
+                else:
+                    from .static_rules import effective_stats
+                    stats = effective_stats(
+                        context.db, context.session.session_id,
+                        context.bstate, target_uid)
+                    allocated = min(allocated, max(0, int(stats[1] or 0)))
             context.bstate["resolving_source_uid"] = source_uid
             context.bstate["combat_damage"] = True
             try:

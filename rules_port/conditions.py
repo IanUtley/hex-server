@@ -429,8 +429,20 @@ def _native_condition(node, ctx):
             return False
         owner = _side(card.get("user_id"))
         source_owner = _side(ctx.ability_source_owner_id)
-        if int(node.get("m_Your", 0) or 0) and owner != source_owner:
-            return False
+        if int(node.get("m_Your", 0) or 0):
+            # C# ``TriggerCardEnteredZone.IsValid``: a "friendly zone" entry
+            # requires BOTH the card's current controller and the controller it
+            # had before the move to be the ability source's controller.
+            # Checking only the current controller made an opposing champion
+            # react to a card that came from the other player's zone: Mentor of
+            # the Grave's "when a troop enters your hand from your crypt" fired
+            # for a troop pulled out of the opponent's crypt, because the
+            # control-transferring move had already rewritten the card's owner.
+            if owner != source_owner:
+                return False
+            previous = getattr(ctx, "event_previous_owner_id", None)
+            if previous is not None and _side(previous) != source_owner:
+                return False
         if int(node.get("m_Opposing", 0) or 0) and owner == source_owner:
             return False
         return True

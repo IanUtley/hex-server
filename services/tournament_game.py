@@ -3284,6 +3284,7 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
             champ_targets.append((ccu, cpid, "Champ",
                                   int(state.get(f"hp_{cpid}", 20))))
     target_data = {}
+    blocked = set()
     for rid in all_rids:
         ag = str(rid.guid)
         graph = ability_graph(_RECORD_STORE, ag.lower())
@@ -3303,12 +3304,49 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
                     battle_state=state)
             except Exception:
                 cands = []
+            # The client refuses to activate an ability whose non-optional
+            # effect target has fewer legal cards than its authored minimum
+            # (AbilityTargetTemplate.m_AllowBestEffortMinimumTargetCount), so
+            # that ability must not be offered either.  A minimum of 0 is an
+            # "up to N" target the player may skip.
+            if (len(cands) < int(getattr(target, "minimum", 0) or 0) and not (
+                    getattr(target, "optional", False) or
+                    getattr(target, "allow_best_effort_minimum", False))):
+                blocked.add(ag)
+                continue
             if not cands:
                 continue
             entries.append((tid, cands, target.minimum or 1,
                             target.maximum if target.maximum > 0 else 1))
         if entries:
             target_data[ag] = entries
+    # Card costs (sacrifice/exhaust/void) are both an offer gate and a wire
+    # requirement: BattleStateAssignXCost reads the CostInstance, and an
+    # ability whose payment has no legal card (Bunoshi with nothing to
+    # sacrifice) must stay greyed out.
+    from rules_port.costs import ability_cost_targets, cost_type_for_kind
+    cost_data = {}
+    for rid in all_rids:
+        ag = str(rid.guid)
+        graph = ability_graph(_RECORD_STORE, ag.lower())
+        if (graph is None or
+                not hasattr(graph, "additional_cost_targets")):
+            continue
+        entries = []
+        for cost in ability_cost_targets(
+                graph, _db, session.session_id, pid, int(cu),
+                champions=champ_targets, battle_state=state):
+            if cost.is_source_auto_target:
+                continue
+            if len(cost.candidates) < int(cost.minimum or 0):
+                blocked.add(ag)
+            entries.append((cost.guid, cost_type_for_kind(cost.kind),
+                            tuple(cost.candidates), cost.minimum,
+                            cost.maximum))
+        if entries:
+            cost_data[ag] = entries
+    if blocked:
+        afford = [rid for rid in afford if str(rid.guid) not in blocked]
     # The champion definition must reach the client before the option list.
     # Otherwise the client can cache the activation against an older
     # CardRepresentation and the visible charge button becomes locally
@@ -3343,7 +3381,8 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
             len(g.events))
         g.events.insert(option_index, champion_update)
     g.add_champion_to_options(pl_t, champ_scid, afford,
-                              target_data=target_data or None)
+                              target_data=target_data or None,
+                              cost_data=cost_data or None)
     log_req(f"    PvP champion options added for {pid}: "
             f"{[str(a.guid)[:8] for a in all_rids]} (charges {charges}, "
             f"affordable {len(afford)})")
@@ -6277,6 +6316,15 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
     state["stack_player_passed"] = False
     state["stack_ai_passed"] = False
     _pvp_sync_view_to_state(state, view, owner_id, opp_pid)
+    if not view.get("resolution_paused"):
+        # Mirror the FRA continuation: the child and its enclosing activation
+        # are resolved, so release the paused-item hold and mark the BOM done.
+        # The next native pass then only finishes the card (zone change and
+        # cast events) instead of reopening the picker and creating the
+        # copies twice.
+        completed = int(state.pop("paused_chain_instance_id", 0) or 0)
+        if completed:
+            state["completed_chain_instance_id"] = completed
     persisted = pvp_load_state(session) or {}
     for key in ("pending_trigger", "pending_deck_search", "pending_choice",
                 "pending_conversation"):
@@ -7331,16 +7379,22 @@ def _pvp_resolve_native_spell(session, state, handler, item):
     instance_id = int(item.get("instance_id", 1) or 1)
     game.push_top_of_chain_resolved(instance_id)
     game.push_removed_top_of_chain(instance_id)
+    # A paused picker continuation already resolved this item's ability chain;
+    # only the card's zone/event projection is left.  Re-running the BOM here
+    # reopened the picker and applied the effects twice.
+    bom_completed = (int(state.pop("completed_chain_instance_id", 0) or 0) ==
+                     instance_id)
     if db_card_location(session.session_id, source_uid) != "CastSpells":
         log_req(f"    Native PvP spell {source_uid} already left CastSpells")
     else:
-        game.push_spell_card_played(
-            _ge.SessionCardId(_ge.UID(source_uid)), player_uid)
-        from rules_port.resolution import resolve_port_played_spell
-        resolve_port_played_spell(
-            game, session, _db, handler, player_uid, opponent_uid, view,
-            item.get("ability_guids", ()),
-            activations=item.get("activations") or {})
+        if not bom_completed:
+            game.push_spell_card_played(
+                _ge.SessionCardId(_ge.UID(source_uid)), player_uid)
+            from rules_port.resolution import resolve_port_played_spell
+            resolve_port_played_spell(
+                game, session, _db, handler, player_uid, opponent_uid, view,
+                item.get("ability_guids", ()),
+                activations=item.get("activations") or {})
         persisted = pvp_load_state(session) or {}
         for key in ("pending_choice", "pending_deck_search", "pending_trigger",
                     "pending_discard_ability"):

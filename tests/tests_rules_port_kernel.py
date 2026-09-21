@@ -8,6 +8,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from rules_port import (AbilityRegistry, Chain, GameAction, GameActionResult, GameActionStack,
                         MultiplyWithCarryRng, PriorityWindowAction,
                         AuthoritativeSession, GameEngineEventSink, RulesTransaction,
@@ -62,6 +66,7 @@ from rules_port.persistence import (current_phase as native_current_phase,
                                     persistence_state)
 from rules_port.lifecycle import (complete_turn, practice_phase_priority,
                                   practice_priority_players, should_draw_for_turn)
+from rules_port.turn_states import _live_has_legal_blockers
 from rules_port.cast_stats import record_card_cast
 from rules_port import pvp_lifecycle
 import game_engine
@@ -446,6 +451,43 @@ def test_pass_priority_accepts_equivalent_raw_wire_priority_identity():
     assert window.priority_player_id is None
 
 
+def test_checkpoint_phase_refresh_precedes_transaction_normalization():
+    """A pass must normalize against the phase it will be validated on.
+
+    Practice keeps two phase representations: the native port's
+    ``current_turn_phase`` and the compatibility checkpoint's ``phase_idx``.
+    When the AI driver advances one without the other, a client pass for the
+    checkpoint phase was normalized against the native phase and rejected as a
+    phase mismatch (the live symptom logged ``requirements=phase/player/handler``
+    while both requirements passed on re-inspection).
+    """
+    player = game_engine.UID.make(244, 91)
+    ai = game_engine.UID.make(3, 1000)
+    phases = ["FirstMainPhase", "DeclareCombatPriorityWindow", "DeclareAttack"]
+    game_session = SimpleNamespace(
+        _rules_port_battle_state={"turn_phases": phases, "phase_idx": 1,
+                                  "turn_player": "ai"})
+    session = AuthoritativeSession(
+        190, (ai, player), seed_z=1, seed_w=2,
+        snapshot=SimpleNamespace(game_session=game_session))
+    session.runtime_facts = SimpleNamespace(battle_state={})
+    # Native port advanced to DeclareAttack; the compatibility checkpoint (and
+    # the client) are still at DeclareCombatPriorityWindow.
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareAttack
+    session.active_player_id = ai
+    window = PriorityWindowAction(TurnPhasePlayers.ALL)
+    session.push_game_action(window)
+    window._priority_queue.clear()
+    window._priority_queue.append(player)
+    session.action_stack.priority_player_id = player
+    command = SimpleNamespace(is_pass_priority=True, typed_payload={},
+                              inner_bytes=b"", pass_turn_phase=None)
+    assert submit_classified_transaction(session, command, player)
+    from rules_port.phases import phase_name
+    assert phase_name(session.current_turn_phase) == (
+        "DeclareCombatPriorityWindow")
+
+
 def test_choose_draw_first_reorders_players_like_client_transaction():
     player, opponent = game_engine.UID.make(244, 1), game_engine.UID.make(3, 2)
     game = game_engine.Game(55, player, opponent)
@@ -810,6 +852,58 @@ def test_generic_projected_card_chain_is_owned_by_native_action_stack():
     assert restored.restore_snapshot(session.snapshot())
     assert restored.rehydrate_projected_chain()
     assert restored.chain._instance_ids == [78]
+
+
+def test_practice_reattach_rehydrates_every_pending_chain_item():
+    """Practice rebuilds its host for every client transaction.
+
+    A triggered ability queued in one transaction must therefore be re-created
+    from its durable descriptor in the next one.  Rebuilding only the most
+    recent descriptor (or none at all, once a fresh host had saved an empty
+    native chain) left the checkpoint ``stack`` projecting items no native
+    action owned: their effects never resolved, and ``stack_empty`` stayed
+    false for the rest of the game, which suppressed BasicAction activations
+    such as Tunnel.
+    """
+    player = game_engine.UID.make(244, 31)
+    ai = game_engine.UID.make(3, 1000)
+    stored = PersistedSessionStub()
+    stored.session_id = 74
+    stored.seed_z, stored.seed_w = 1, 2
+    stored.players = [(player, 0), (ai, 1)]
+    battle_state = {"turn_player": "player", "stack": []}
+    stored.turn_order = battle_state
+    game = game_engine.Game(74, player, ai)
+
+    source = session_from_persisted_game(stored, game)
+    for instance_id, source_uid in ((9, 101), (10, 102), (11, 103)):
+        descriptor = {
+            "kind": "trigger",
+            "ability_guid": "a9425880-fa83-e7d0-120a-bfc3c4a53ce9",
+            "source_uid": source_uid, "target_uid": 201,
+            "trigger_target_uid": 201, "source_owner_uid": 0,
+            "instance_id": instance_id,
+        }
+        source.queue_projected_chain(descriptor, 0)
+        battle_state["stack"].append(dict(descriptor))
+    source.persist()
+    assert stored.turn_order["rules_port"]["chain_instance_ids"] == [9, 10, 11]
+
+    # The next transaction's fresh host owns no ability objects, so its own
+    # save replaces the native chain with an empty one while the durable
+    # ``stack`` still projects all three items (the live strand).
+    stranded = session_from_persisted_game(
+        stored, game_engine.Game(74, player, ai))
+    stranded.persist()
+    assert stored.turn_order["rules_port"]["chain_instance_ids"] == []
+
+    restored = session_from_persisted_game(
+        stored, game_engine.Game(74, player, ai))
+    assert restored.rehydrate_projected_chain()
+    assert restored.chain._instance_ids == [9, 10, 11]
+    top = restored.action_stack.peek()
+    assert isinstance(top, PriorityWindowAction)
+    assert top.ability_responding_to.instance_id == 11
 
 
 def test_generic_ai_projected_card_can_start_with_human_response():
@@ -1197,6 +1291,52 @@ def test_records_filter_matches_keeps_card_with_threshold_context():
     spec = {"_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
             "m_Collection": "Underground"}
     assert records_filter_matches(card, spec, source=card, context=context)
+
+
+def test_records_filter_evaluator_compiles_once_per_candidate_scan():
+    """A batch scan must compile the authored filter once, not per candidate.
+
+    Target scans evaluate one Records filter against every candidate in the
+    scanned zones; rebuilding the filter tree (and re-reading the constructor
+    signature) per candidate made the opponent-turn priority window take tens
+    of seconds.
+    """
+    from unittest import mock
+    import pvp_db
+    import rules_port.filters as F
+    import rules_port.targeting as T
+
+    def row(uid, location):
+        return (uid, "Troop", location, 0, "tpl", 0, 1, 1, "Troop", 1, "",
+                "{}", "[]", "{}", "", 0, 0, "tpl", 0)
+
+    rows = [row(101, "warzone"), row(102, "hand"), row(103, "warzone")]
+    spec = {"_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+            "m_Collection": "Warzone"}
+    template = {"template_id": "t", "is_auto_target": 1, "is_random_target": 0,
+                "optional": 0, "explicit": 0, "player_filter": "",
+                "collection_flags": "Warzone", "min_target_count": 1,
+                "max_target_count": 1,
+                "filter_json": json.dumps(spec),
+                "target_kind": "AbilityTargetTemplate"}
+    compiled = []
+    original = F.records_filter_from_metadata
+
+    def counting(spec_value):
+        compiled.append(spec_value)
+        return original(spec_value)
+
+    with mock.patch.object(T, "target_template", return_value=template), \
+            mock.patch.object(pvp_db, "db_target_candidate_rows",
+                              return_value=rows), \
+            mock.patch.object(T, "_source_card",
+                              return_value={"card_uid": 999, "user_id": 5}), \
+            mock.patch.object(F, "records_filter_from_metadata", counting):
+        targets = T.legal_targets(
+            object(), 1, 5, "t", 999, both_players=True,
+            battle_state={"_rules_port_suppress_card_properties": True})
+    assert targets == [101, 103]
+    assert len(compiled) == 1
 
 
 def test_combat_manager_accepts_wire_combat_id():
@@ -1891,6 +2031,29 @@ def test_wire_normalizer_maps_triggered_ability_batch_payload():
     assert tx.payload["activation_data"] == data
 
 
+def test_wire_continuation_marker_outranks_fresh_activation():
+    """A pending picker's answer must resume, never re-activate.
+
+    The class-39 "choose a card in your deck" picker (Scheme) is answered with
+    the triggered-ability envelope.  The host marks that payload, so the
+    normalizer must produce the continuation intent instead of validating a
+    fresh manual activation of the spell's child ability — the rejection that
+    left the open picker with an inert OK button.
+    """
+    player = game_engine.UID.make(244, 1)
+    command = SimpleNamespace(is_activate_triggered_abilities=True,
+                              is_ability_activate=False,
+                              pass_turn_phase=None,
+                              inner_bytes=b"ActivateTriggeredAbiliesTransaction")
+    data = {"target_map": {"0": [901]}}
+    tx = normalize_player_transaction(
+        command, player,
+        payload={"_triggered_continuation": True, "activation_data": data})
+    assert tx.kind == "resolve_triggered_continuation"
+    assert tx.payload["activation_data"] == data
+    assert tx.requirements == ()
+
+
 def test_wire_normalizer_maps_play_card_transactions_from_typed_payload():
     player = game_engine.UID.make(244, 1)
     command = SimpleNamespace(is_play_troop=True, is_play_resource=False,
@@ -2261,6 +2424,116 @@ def test_phase_state_priority_populations_match_client_state_subclasses():
     assert states["DeclareDefense"].priority_players is TurnPhasePlayers.DEFENDING
     assert not states["Draw"].chain_can_resolve()
     assert not states["Discard"].chain_can_resolve()
+
+
+def test_declare_defense_gives_ai_priority_while_human_is_active():
+    """A human attack leaves the AI as the native defending priority owner."""
+    from rules_port.combat import CombatId
+
+    player = game_engine.UID.make(244, 81)
+    ai = game_engine.UID.make(3, 1000)
+    session = AuthoritativeSession(181, (player, ai), seed_z=1, seed_w=2)
+    session.active_player_id = player
+    combat = session.combat_manager.create_attack(
+        CombatId(player, 1), player, 9001)
+    combat.declare_attacker(SimpleNamespace(session_card_id=9002))
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareAttackPriorityWindow
+
+    session.transition_to(game_engine.ETurnPhases.DeclareDefense)
+
+    assert session.active_player_id == player
+    assert session.action_stack.priority_player_id == ai
+
+
+def test_defense_commit_can_drive_past_native_declaration_window():
+    """After blocker commit, the completed native window advances once."""
+    from rules_port.combat import CombatId
+
+    player = game_engine.UID.make(244, 82)
+    ai = game_engine.UID.make(3, 1000)
+    attacker = SimpleNamespace(session_card_id=9002)
+    blocker = SimpleNamespace(session_card_id=9003)
+    cards = {9002: attacker, 9003: blocker}
+    session = AuthoritativeSession(182, (player, ai), seed_z=1, seed_w=2)
+    session.runtime_facts = SimpleNamespace(
+        get_card=lambda card_id: cards.get(int(card_id)),
+        validate_blocks=lambda _session, _declarations, _player: True)
+    session.active_player_id = ai
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareDefense
+    session.combat_manager.create_attack(
+        CombatId(ai, 1), ai, 9001).declare_attacker(attacker)
+    assert session.materialize_current_phase()
+    assert session.action_stack.priority_player_id == player
+
+    # Reproduce the live reconnect/projection mismatch: the transaction has
+    # already been normalized to the typed participant, while the native
+    # priority queue still contains the raw uint64 wire identity.
+    action = session.action_stack.peek()
+    action._priority_queue.clear()
+    action._priority_queue.append(int(player.uid64))
+    session.action_stack.priority_player_id = int(player.uid64)
+    transaction = RulesTransaction.commit_troops_to_defense(
+        player, game_engine.ETurnPhases.DeclareDefense,
+        ((9002, (9003,)),))
+    assert session.submit_transaction(transaction)
+    assert session.handle_transaction()
+    assert session.drive_until_input(max_steps=8)
+    assert session.current_turn_phase == game_engine.ETurnPhases.DeclareDefensePriorityWindow
+
+
+def test_checkpoint_resync_does_not_reopen_answered_defense_window():
+    """A mid-transaction checkpoint re-sync must not refill a passed window.
+
+    Live symptom: after CommitTroopsToDefense consumed the defender's
+    DeclareDefense priority, the next ordinary Game projection called
+    ``sync_checkpoint(ensure_current_priority=True)`` (every host
+    ``_fresh_game`` does).  Reapplying the stop policy to the still-stacked but
+    exhausted window refilled its queue with the defender, so the client was
+    asked to declare blockers again and the phase never reached
+    DeclareDefensePriorityWindow.
+    """
+    from rules_port.combat import CombatId
+
+    player = game_engine.UID.make(244, 83)
+    ai = game_engine.UID.make(3, 1000)
+    attacker = SimpleNamespace(session_card_id=9102)
+    blocker = SimpleNamespace(session_card_id=9103)
+    cards = {9102: attacker, 9103: blocker}
+    session = AuthoritativeSession(183, (player, ai), seed_z=1, seed_w=2)
+    session.runtime_facts = SimpleNamespace(
+        get_card=lambda card_id: cards.get(int(card_id)),
+        validate_blocks=lambda _session, _declarations, _player: True)
+    session.set_phase_priority_resolver(
+        lambda _session, _action: TurnPhasePlayers.DEFENDING)
+    session.active_player_id = ai
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareDefense
+    session.combat_manager.create_attack(
+        CombatId(ai, 1), ai, 9101).declare_attacker(attacker)
+    assert session.materialize_current_phase()
+    assert session.action_stack.priority_player_id == player
+
+    transaction = RulesTransaction.commit_troops_to_defense(
+        player, game_engine.ETurnPhases.DeclareDefense, ((9102, (9103,)),))
+    assert session.submit_transaction(transaction)
+    assert session.handle_transaction()
+    # The defender's DeclareDefense priority is consumed; the completed action
+    # is still on the stack until the scheduler's next tick pops it.
+    assert session.action_stack.priority_player_id is None
+
+    phases = (game_engine.ETurnPhases.FirstMainPhase,
+              game_engine.ETurnPhases.DeclareDefense,
+              game_engine.ETurnPhases.DeclareDefensePriorityWindow)
+    session.sync_checkpoint(
+        phases=phases, phase_idx=phases.index(
+            game_engine.ETurnPhases.DeclareDefense),
+        active_player_id=ai, client_player_id=player,
+        ensure_current_priority=True)
+    assert session.action_stack.priority_player_id is None, (
+        "the answered DeclareDefense window must not be refilled")
+
+    assert session.drive_until_input(max_steps=4)
+    assert session.current_turn_phase == (
+        game_engine.ETurnPhases.DeclareDefensePriorityWindow)
 
 
 def test_end_turn_rotation_updates_native_active_player():
@@ -3219,6 +3492,131 @@ def test_native_effect_backend_reuses_one_auto_target_mapping():
     assert activation.target_map == {0: (101,)}
 
 
+def test_matching_target_deck_copies_are_shuffled_into_the_deck():
+    """Scheme's four copies enter random deck slots, never the top of the deck.
+
+    C# ``FinishMovingCard`` inserts a card moved into the deck at
+    ``RNG.Next(deck_count + 1)`` when its location is Unknown.  Inserting the
+    copies without a slot tied them at position 0, so the next four draws were
+    always the created cards and the untouched deck order was corrupted.
+    """
+    from rules_port.context import EffectContext
+    from rules_port.token_effects import create_matching_target
+    from tests.tests_combat import (make_db, add_card, HandlerStub,
+                                    SessionStub)
+
+    db = make_db()
+    try:
+        template = "aaaaaaaa-0000-0000-0000-0000000000ab"
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, "Deck Action", "BasicAction", 2, 0, 0, 0, "[]", "[]", ""))
+        uids = [game_engine.UID.make(1, 800 + index).uid64
+                for index in range(10)]
+        for uid in uids:
+            add_card(db, uid, 5, template, loc="deck")
+        db.executemany("UPDATE game_cards SET position=? WHERE card_uid=?",
+                       [(index, uid) for index, uid in enumerate(uids)])
+        db.commit()
+
+        game = game_engine.Game(
+            1, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000))
+        context = EffectContext.from_rules_port(
+            game, SessionStub(), db, HandlerStub(db),
+            game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+            {"resolving_source_uid": uids[5]}, "matching-target-effect")
+
+        made = create_matching_target(context, uids[5], 4, "Deck", "unknown")
+        assert made == 4, made
+
+        rows = db.execute(
+            "SELECT card_uid, position FROM game_cards WHERE session_id=1 "
+            "AND location='deck' ORDER BY position, id").fetchall()
+        assert len(rows) == 14, rows
+        positions = sorted(int(position) for _uid, position in rows)
+        assert positions == list(range(14)), positions
+        originals = [int(uid) for uid, _position in rows if int(uid) in set(uids)]
+        assert originals == [int(uid) for uid in uids], originals
+    finally:
+        db.close()
+
+
+def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
+    """A picker continuation must not let the chain item rerun its BOM.
+
+    Scheme's card-resolution pass pauses inside ``ActivateAbility``; the
+    continuation resolves that child and the enclosing activation and marks the
+    chain instance complete.  The finishing pass still owns the card's zone
+    change, but re-running the BOM reopened the picker and created the copies
+    twice.
+    """
+    import hconnect_server as host
+    import db as db_module
+    from unittest import mock
+    from tests.tests_combat import (make_db, add_card, HandlerStub,
+                                    SessionStub)
+
+    db = make_db()
+    try:
+        template = "aaaaaaaa-0000-0000-0000-0000000000ef"
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, "Scheme", "BasicAction", 2, 0, 0, 0, "[]", "[]", ""))
+        uid = game_engine.UID.make(1, 700).uid64
+        add_card(db, uid, 5, template, loc="CastSpells")
+        db.commit()
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        item = {"kind": "spell", "source_uid": uid, "instance_id": 4,
+                "ability_guids": ["6201c768-0d01-8b3e-180e-94b55ec3df7d"],
+                "activations": {}, "x_cost": 0}
+        calls = []
+        handler = SimpleNamespace(
+            _card_full_data=HandlerStub(db)._card_full_data,
+            _dispatch_game_trigger=lambda *args, **kwargs:
+                calls.append(("trigger", args[5])))
+
+        def fake_played_spell(*_args, **_kwargs):
+            calls.append(("bom", None))
+
+        def run(bstate):
+            db.execute("UPDATE game_cards SET location='CastSpells' "
+                       "WHERE session_id=1 AND card_uid=?", (uid,))
+            db.commit()
+            game.events.clear()
+            previous_db = db_module._db
+            db_module._db = db
+            try:
+                with mock.patch.object(host, "_db", db), \
+                        mock.patch(
+                            "rules_port.resolution.resolve_port_played_spell",
+                            fake_played_spell):
+                    host.HCPHandler._resolve_native_card_chain_item(
+                        handler, SessionStub(), pl_t, ai_t, bstate, dict(item),
+                        game)
+            finally:
+                db_module._db = previous_db
+            return db.execute(
+                "SELECT location FROM game_cards WHERE session_id=1 "
+                "AND card_uid=?", (uid,)).fetchone()[0]
+
+        assert run({"completed_chain_instance_id": 4}) == "discard"
+        assert ("bom", None) not in calls, calls
+        assert ("trigger", "CardCastEvent") in calls, calls
+
+        # A different chain instance still resolves its own BOM.
+        calls.clear()
+        assert run({"completed_chain_instance_id": 99}) == "discard"
+        assert ("bom", None) in calls, calls
+    finally:
+        db.close()
+
+
 def test_native_effect_context_rejects_legacy_helpers():
     """A native context must never silently enter the transitional BOM ABI."""
     from abilities.framework.context import EffectContext
@@ -3715,6 +4113,93 @@ def test_can_attack_resolves_profile_owner_domain():
         int(game_engine.ECardTypes.Troop), ready, 0, 2, (), ())
     assert facts.can_attack(attacker, None, player)
     assert not facts.can_attack(attacker, None, opponent)
+
+
+def test_live_blocker_scan_resolves_practice_profile_owner():
+    """Practice blocker phase construction must scan profile-owned cards."""
+    from unittest import mock
+
+    profile_id = 6175190558117173535
+    reck_id = 1925190388022160
+    player = game_engine.UID.make(244, reck_id)
+    opponent = game_engine.UID.make(3, 1000)
+    facts = PvpRuntimeFacts(1, {}, player_uid=player, ai_uid=opponent)
+    facts.player_owner_id = profile_id
+    facts.ai_owner_id = 0
+    facts.client_player_uid = player
+    attacker = SimpleNamespace(session_card_id=16129)
+    session = SimpleNamespace(
+        has_legal_blockers=False,
+        runtime_facts=facts,
+        player_ids=(player, opponent),
+        active_player_id=opponent,
+        defending_player_ids=lambda: (player,),
+        combat_manager=SimpleNamespace(combats=[
+            SimpleNamespace(attacker=attacker),
+        ]),
+    )
+    queried_owners = []
+
+    def rows(_session_id, owner_id, conn=None):
+        queried_owners.append(owner_id)
+        return [(2560769, 0, 0, 0, 0, "[]")] if owner_id == profile_id else []
+
+    with mock.patch("pvp_db.db_warzone_troop_attributes", side_effect=rows), \
+            mock.patch("rules_port.combat_rules.can_block", return_value=True):
+        assert _live_has_legal_blockers(session)
+
+    assert profile_id in queried_owners
+
+
+def test_surfaced_troop_attack_passes_through_effective_attributes():
+    """A troop that surfaced this turn must pass the attack requirement.
+
+    Subterranean Spy surfaces through the client's Surface ability, which
+    grants Speed as a *temporary* attribute (``temporary_attributes``) while
+    the instance column stays 0.  The port read only ``card_attributes``, so
+    ``AttackerIsValid`` judged the troop summoning sick and rejected the
+    client's declaration after the attack option list had offered it.
+    """
+    import db as db_module
+    from tests.tests_combat import make_db, add_card
+
+    db = make_db()
+    previous = db_module._db
+    db_module._db = db
+    try:
+        template = "aaaaaaaa-0000-0000-0000-0000000000c1"
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, "Subterranean Spy", "Troop", 5, 3, 2, 0, "[]", "[]", ""))
+        uid = game_engine.UID.make(1, 0x0B01).uid64
+        add_card(db, uid, 5, template, loc="warzone",
+                 state=int(game_engine.ECardStates.CameOutThisTurn))
+        db.execute(
+            "UPDATE game_cards SET temporary_attributes=? "
+            "WHERE session_id=1 AND card_uid=?",
+            (int(game_engine.ECardAttributes.Speed), uid))
+        db.commit()
+
+        player = game_engine.UID.make(244, 1925190388022160)
+        facts = PvpRuntimeFacts(1, {}, player_uid=player,
+                                ai_uid=game_engine.UID.make(3, 1000))
+        facts.player_owner_id = 5
+        facts.ai_owner_id = 0
+        facts.client_player_uid = player
+
+        card = facts.get_card(uid)
+        assert card is not None and not card.is_tapped()
+        assert card.attributes & int(game_engine.ECardAttributes.Speed)
+        assert facts.can_attack(card, None, player)
+        # The opponent champion has no game_cards row; only the troop face is
+        # validated, exactly as the client's declaration carries it.
+        assert AttackerIsValidRequirement(
+            game_engine.UID.make(1, 0x0201).uid64, uid).is_valid(facts, player)
+    finally:
+        db_module._db = previous
+        db.close()
 
 
 def test_pvp_runtime_facts_price_ability_from_metadata_owner():

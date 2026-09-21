@@ -7,6 +7,12 @@ import sqlite3
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 from az1_pack import (
     AZ1_EQUIPMENT_SLOT_WEIGHTS,
     AZ1_PVE_RARITY_WEIGHTS,
@@ -28,13 +34,10 @@ from gamedata import DEFAULT_RECORD_STORE
 
 
 def card_data_from_db():
-    # ``tests/run_all.py`` gives each test process an isolated in-memory
-    # runtime DB, while this test reads the seeded card catalogue directly.
-    # Prefer the suite's immutable snapshot so this read does not point at a
-    # separate empty ``:memory:`` database.
-    db_path = os.environ.get("HEX_TEST_SOURCE_DB") or os.environ.get(
-        "HEX_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "hconnect.db"))
-    con = sqlite3.connect(db_path)
+    # The seeded card catalogue comes from this process's own test database:
+    # ``tests/run_all.py`` shares one snapshot across the run, direct runs
+    # build a fresh one.  Never the developer's live ``hconnect.db``.
+    con = sqlite3.connect(fresh_database())
     try:
         data = {}
         for row in con.execute(

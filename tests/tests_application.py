@@ -8,6 +8,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from application import ApplicationCommandDispatcher
 from application.commands import (ClaimMailCommand, DeleteMailCommand,
                                   JoinSessionCommand, RemoveSessionCommand,
@@ -216,6 +220,9 @@ def test_typed_payload_extracts_combat_declarations():
         "m_DefenseDeclarations": [{"AttackerId": {"m_UID64": 31},
                                     "DefendingCardIds": [{"m_UID64": 41}]}],
     })["declarations"] == ((31, (41,)),)
+    assert typed_payload_from_decoded(defense, {
+        "m_DefenseDeclarations": [],
+    }) == {"declarations": ()}
 
 
 def test_typed_payload_extracts_turn_stops_and_auto_pass():

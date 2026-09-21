@@ -182,6 +182,22 @@ def db_game_card_effective_cost(session_id, card_uid, battle_state=None,
                    (int(row[1] or 0) if len(row) > 1 else 0))
 
 
+def db_game_card_effective_attributes(session_id, card_uid, battle_state=None,
+                                      conn=None):
+    """Return the attribute bits that gate a card's combat legality.
+
+    ``game_cards.card_attributes`` holds only the attributes written directly
+    on the instance.  Template attributes, temporary grants (a troop that
+    surfaced this turn carries Speed here) and static modifiers project on top
+    of it, so a legality predicate that reads the instance column alone
+    rejects an attack the option list already offered the client.
+    """
+    connection = conn or _db_layer._db
+    from rules_port.static_rules import effective_attributes
+    return int(effective_attributes(
+        connection, session_id, battle_state or {}, int(card_uid)) or 0)
+
+
 def db_game_champion(session_id, user_id, conn=None):
     """Return ``(card_uid, template_guid)`` for a session champion."""
     return (conn or _db_layer._db).execute(
@@ -2871,13 +2887,50 @@ def db_card_state_value(session_id, card_uid, conn=None):
     return row[0] if row else None
 
 
-def db_add_temporary_attributes(session_id, card_uid, attributes, conn=None):
-    """OR temporary card attributes without forcing a commit."""
-    return (conn or _db_layer._db).execute(
+def db_add_temporary_attributes(session_id, card_uid, attributes, conn=None,
+                                owner_id=None, boundary=None):
+    """OR temporary card attributes and optionally record their expiry.
+
+    A grant written without an expiry rule is cleared at the affected card's
+    next owner boundary, which is wrong for a grant with an authored duration
+    that is issued inside the same turn-start sequence it belongs to (a
+    Tunneling Surface resolves at StartTurn and the Prep that follows would
+    clear it before the turn it was granted for has ended).  Callers that know
+    the duration pass ``owner_id``/``boundary`` so the shared
+    ``clear_expired_temporary_attributes`` readers expire it at the right
+    boundary; the metadata key and rule shape are theirs.
+    """
+    connection = conn or _db_layer._db
+    connection.execute(
         "UPDATE game_cards SET temporary_attributes = "
         "COALESCE(temporary_attributes, 0) | ? "
         "WHERE session_id=? AND card_uid=?",
         (int(attributes), session_id, int(card_uid)))
+    if not attributes or owner_id is None or not boundary:
+        return
+    row = connection.execute(
+        "SELECT COALESCE(temporary_attributes, 0), temporary_buffs "
+        "FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+    if not row:
+        return
+    bits = int(row[0] or 0) & int(attributes)
+    try:
+        buffs = json.loads(row[1] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        buffs = {}
+    if not isinstance(buffs, dict):
+        buffs = {}
+    metadata = buffs.setdefault("__attribute_expirations", {})
+    for bit in (1 << index for index in range(bits.bit_length())
+                if bits & (1 << index)):
+        metadata[str(bit)] = {"owner": int(owner_id),
+                              "boundary": str(boundary)}
+    connection.execute(
+        "UPDATE game_cards SET temporary_buffs=? "
+        "WHERE session_id=? AND card_uid=?",
+        (json.dumps(buffs, separators=(",", ":"), sort_keys=True), session_id,
+         int(card_uid)))
 
 
 def db_warzone_cards_with_state(session_id, conn=None):

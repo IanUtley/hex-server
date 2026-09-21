@@ -16,6 +16,10 @@ from binascii import hexlify, unhexlify
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 # We import the module to get at its encoding functions, but we avoid
 # triggering the server startup (module-level code) by faking _db/_CARD_CACHE.
 import importlib.util as iutil

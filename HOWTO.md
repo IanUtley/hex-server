@@ -99,6 +99,19 @@ client unless `HEX_DEBUGPY_WAIT=1` is set. Snapshots are written to
 `/tmp/hconnect_log.txt` at RulesPort attachment, scheduler drives, projection,
 and AI-turn boundaries; ordinary restarts do not enable either feature.
 
+`hex_mcp.py` answers champion, encounter, card, and ability questions over the
+MCP stdio transport. It is read-only and reads the same Records-derived
+snapshot the server seeds from (`AssetExtraction/gamedata_seed.py` for the
+authored joins, `gamedata.ability_graph` for what an ability does), so it never
+opens `hconnect.db` and cannot disagree with the engine about static
+definitions. Run it directly, or register it with a Codex client:
+
+```toml
+[mcp_servers.hex]
+command = "/usr/bin/python3"
+args = ["/home/ianutley/Hex/hex_mcp.py"]
+```
+
 ## 4. Module ownership
 
 | Module | Owns |
@@ -176,6 +189,41 @@ the `@effect` decorator. `AbilityBuilder` must wrap the authoritative
 fields, ordering, conditions, and continuation behavior; it must not introduce
 a parallel card-rules source.
 
+Counter keywords the client ships as `BuiltInResources` rather than Records
+rows are server rules: `rules_port/tunneling.py` owns the underground
+Tunneling lifecycle and `rules_port/stealth.py` owns the Stealth counter
+lifecycle (opposing troops can't attack a stealthed champion, that champion
+has Spellshield, and one counter is removed at the start of the controller's
+turn). Both run from the shared turn-boundary service and apply to PvE and PvP
+alike. Champions are synthetic SessionCardIds with no `game_cards` row, so
+their counters live in `battle_state["champion_counters"]` and their ONE-SHOT
+usage in `battle_state["champion_ability_uses"]`; resolve controller identity
+with `rules_port.runtime_helpers.champion_owner_id` / `champion_uid_for_owner`
+instead of converting a participant UID (`game_engine.UID` has no `__int__`).
+Manual champion powers are accepted, paid, and queued by the port
+(`MetadataCardTransactionExecutor`), which also gates and spends their
+authored `m_UsesPerGame`; the legacy HConnect champion-ability handler is not
+the live path, so a rule added only there never runs. A phase-entry resolver
+(`set_turn_phase_entry_resolver`) must publish the wire events its projection
+queued: readiness is applied at Prep, and leaving those events queued until
+the drive stops made Unity untap troops when Main began instead.
+Champion counters must be published as a `CardUpdated` for the champion
+carrying `counters`, with the collection the champion already sits in
+(`None_`): Unity derives the champion HUD effect icons (Stealth, Burning,
+Dazed, Vulnerable) from the cached `CardRepresentation` counters, and only a
+`CardUpdated` stores them. `ECardCollections.Champions` is both suppressed by
+`push_card_updated` and read as a card move, so `CardCountersChanged` alone
+never reaches the portrait.
+
+When an `ActivateAbility` child waits on a picker, the authored `InZone` card
+filter selects which one: `Choosing` opens the built-in ChooseAndPlay picker,
+`Deck` opens the class-39 deck search, and a hand-restricted child (Bloatcap's
+Deathcry, Giant Corpse Fly's Deploy) is the class-23 discard prompt. The
+`m_CollectionFlags` visibility mask is only the union of every collection a
+card could occupy and must never choose a prompt. A paused discard resumes at
+the same effect order with the chosen card bound as the resolved target: the
+first pass stopped before its mutation, so resuming after it discards nothing.
+
 Resource and cost transitions are likewise RulesPort-owned. Use the typed
 resource transitions for current/total pools, thresholds, charges, spell
 points, resource-play resets, and payments; mode services and AI may only
@@ -188,6 +236,16 @@ Attached-session card display costs must use `rules_port.static_rules.effective_
 as well, so the client-visible cost and the payment validator cannot be fed by
 different evaluators. The historical `abilities.framework.cost_mod` path is
 reserved for explicitly disabled rollback sessions.
+
+Static projection is per card, so callers that need several projections of the
+same card must take them from one evaluation. `effective_option_projection`
+returns the effective attributes and cost of a hand card from a single native
+scan; option refreshes use it instead of calling `effective_attributes` and
+`effective_cost` separately. In the same vein, a target scan compiles its
+authored Records filter once per candidate pool (`records_filter_evaluator`)
+rather than rebuilding the filter tree for every candidate — target and static
+evaluation run that scan for every candidate in the template's zones, so
+per-candidate compilation dominated those paths.
 
 ## 5. Database contract
 
@@ -314,3 +372,17 @@ edit generated talent seed blocks.
 When a typed field is missing or demonstrably wrong, add a small compatibility
 adapter and document why. Do not create a handler branch for a card name when
 the same behavior can be represented by metadata.
+
+The authored target template, not the effect, owns the picker contract. A
+template with `m_IsAutoTarget` is never a player picker: every activation —
+human, AI, or server-driven — resolves it to its whole legal pool, bounded
+only by `m_MaximumTargetCount` (unset means all). Only an input-bearing
+(explicit) target is picked singly when the server drives an AI activation.
+
+A resolved trigger is owned by the trigger engine. The death path emits the
+warzone→discard `CardEnteredZoneEvent` and lets trigger discovery resolve the
+authored Deathcries through the chain — it must not also resolve them inline,
+or the queued copy strands and blocks the enters-play triggers of the same
+transition. `uses_per_game == 1` is the extracted representation of ONE-SHOT:
+once such an ability resolves (inline or from the chain) the resolving path
+consumes it on the card instance so the client drops the used power.

@@ -580,11 +580,11 @@ def typed_payload_from_decoded(command, decoded):
                 if target is not None)
     elif getattr(command, "is_commit_defense", False):
         declarations = find("DefenseDeclarations", "m_DefenseDeclarations",
-                            "declarations") or ()
-        if declarations:
+                            "declarations")
+        if declarations is not None:
             payload["declarations"] = tuple(
                 (attacker, blockers)
-                for item in declarations if isinstance(item, Mapping)
+                for item in (declarations or ()) if isinstance(item, Mapping)
                 for attacker in (numeric_id(item.get("AttackerId",
                                                    item.get("attacker_id"))),)
                 for blockers in (id_list(item.get("DefendingCardIds",

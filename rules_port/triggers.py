@@ -38,6 +38,47 @@ def trigger_collection_allows(trigger_flags, card_location):
     return not location or location in allowed
 
 
+def consume_one_shot_trigger(handler, session, game, db, player_uid, ai_uid,
+                             battle_state, ability_guid, source_uid) -> bool:
+    """Consume a resolved ONE-SHOT (``uses_per_game == 1``) trigger.
+
+    ONE-SHOT is an instance property: the ability triggers once and the card
+    then loses it (C# ``Card.PayPerGameCosts`` / ``HasAbility``).  Every
+    trigger path therefore reports the resolved trigger here — the mode host
+    owns the per-instance write and the CardUpdated projection that drops the
+    power from the client's card, so the two authorities cannot drift.
+    """
+    if source_uid is None:
+        return False
+    ability = str(ability_guid or "").lower()
+    if not ability:
+        return False
+    consume = getattr(handler, "_remove_one_shot_ability", None)
+    if callable(consume):
+        try:
+            return bool(consume(session, int(source_uid), ability, game,
+                                player_uid, ai_uid, battle_state))
+        except Exception:
+            return False
+    # Headless interpreters have no host seam (focused tests, tooling).  Drop
+    # the ability from the instance list directly so the invariant still
+    # holds outside a live service.
+    from pvp_db import (db_ability_activation_metadata, db_card_ability_list,
+                        db_set_card_abilities)
+    meta = db_ability_activation_metadata(ability, conn=db)
+    if not meta or int(meta[1] or 0) != 1:
+        return False
+    current = [str(value).lower() for value in db_card_ability_list(
+        session.session_id, int(source_uid), conn=db)]
+    if ability not in current:
+        return False
+    current.remove(ability)
+    db_set_card_abilities(
+        session.session_id, int(source_uid), json.dumps(current), conn=db)
+    db.commit()
+    return True
+
+
 class RecordsTriggerBackend:
     """Execute Records trigger metadata behind the RulesPort boundary."""
 
@@ -160,9 +201,26 @@ class NativeTriggerBackend:
             for pid, champion in (battle_state.get("champ_map") or {}).items():
                 if int(champion) == int(uid):
                     return int(pid)
-            pchamp = getattr(handler, "_player_champ_scid", None)
-            if pchamp is not None and int(pchamp.uid.uid64) == int(uid):
-                return int((getattr(handler, "user_profile", None) or {}).get("id", 0))
+            # Champions have no ``game_cards`` row, so resolve them from the
+            # handler's per-battle champion identities.  Falling back to the
+            # event's player made an OPPOSING champion's ability look like it
+            # was owned by that player: the AI's Mentor of the Grave then
+            # reacted to cards entering the human's hand from the human's
+            # crypt ("when a troop enters YOUR hand from YOUR crypt").
+            profile = getattr(handler, "user_profile", None) or {}
+            for attr, owner_id in (
+                    ("_player_champ_scid",
+                     int(profile.get("id", 0) or 0)),
+                    ("_ai_champ_scid", 0)):
+                champion = getattr(handler, attr, None)
+                if champion is None:
+                    continue
+                try:
+                    if int(getattr(getattr(champion, "uid", champion),
+                                   "uid64", champion)) == int(uid):
+                        return int(owner_id)
+                except (TypeError, ValueError):
+                    continue
             return fallback
 
         def chain_targets(uid):
@@ -215,6 +273,26 @@ class NativeTriggerBackend:
                 if key in seen:
                     continue
                 seen.add(key)
+                # Inspect the lightweight AbilityTemplate before constructing
+                # its full target/effect graph. A cold CardEntered/CardCast
+                # event otherwise deserializes every manual/static ability in
+                # the session before finding the few matching triggers.
+                ability_record = DEFAULT_RECORD_STORE.get(
+                    "AbilityTemplate", key[1])
+                if ability_record is None:
+                    continue
+                trigger_type = str(
+                    getattr(ability_record, "trigger_event_type", "") or "")
+                dynamic_source = (
+                    event_name == "CardEnteredZoneEvent" and
+                    source_uid in {int(uid) for uid in
+                                   (getattr(handler,
+                                            "_champion_granted_ability_guids",
+                                            {}) or {})})
+                if (event_name != "GameStartedEvent" and
+                        str(trigger_type).rsplit(".", 1)[-1] != event_name and
+                        not dynamic_source):
+                    continue
                 graph = ability_graph(DEFAULT_RECORD_STORE, key[1])
                 if graph is None:
                     continue
@@ -291,7 +369,9 @@ class NativeTriggerBackend:
                     event_previous_state=event.data.get("event_previous_state"),
                     uses_previous_state=graph.uses_previous_state,
                     event_int_attribute=event.data.get("event_int_attribute"),
-                    event_tac=event.data.get("event_tac"))
+                    event_tac=event.data.get("event_tac"),
+                    event_previous_owner_id=event.data.get(
+                        "event_previous_owner_id"))
                 if not trigger_condition_met(graph.source.to_dict(), context):
                     continue
                 chance = chance_to_happen(graph)
@@ -366,6 +446,10 @@ class NativeTriggerBackend:
                         else:
                             battle_state["resolving_trigger_target_uid"] = old_trigger_target
                     logs.append(f"{event_name} {key[1][:8]} -> {result}")
+                    if not battle_state.get("resolution_paused"):
+                        consume_one_shot_trigger(
+                            handler, session, game, db, player_uid, ai_uid,
+                            battle_state, key[1], source_uid)
                 else:
                     import game_engine
                     from . import chain
@@ -485,9 +569,15 @@ def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
             db=db, handler=handler, game=game, session=session,
             player_uid=player_uid, ai_uid=ai_uid, battle_state=battle_state,
             force_ignores_chain=force_ignores_chain,
+            # ``data`` must be passed by keyword: the positional slot after
+            # ``target_card_id`` is ``target_player_id``.  Passing it
+            # positionally dropped every authored collection/state fact
+            # (event_source_collection, event_destination_collection,
+            # event_previous_state, event_tac, ...) from host-emitted events,
+            # which silently made the zone-entry conditions lenient.
             event=TriggerEvent(event_name, source_card_id,
                                source_player_id, target_card_id,
-                               dict(data or {})))
+                               data=dict(data or {})))
     finally:
         if previous_event_type is None:
             battle_state.pop("event_type", None)

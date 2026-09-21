@@ -11,7 +11,6 @@ combat and attacks the player with ALL of its eligible troops.
 """
 import json
 import random
-import time
 
 import game_engine
 from db import _db, log_req
@@ -46,12 +45,6 @@ from pvp_db import (db_set_card_state_or,
                     db_hand_resources_with_template,
                     db_ai_hand_playables, db_ai_hand_cards,
                     db_ai_deck_top_card, db_ai_hand_tunneling_cards)
-
-
-# Keep a short pause between automatic AI phase pushes so Unity can consume the
-# phase packet and render its transition without adding a full second to every
-# combat/main phase.
-AI_PHASE_DELAY = 0.25
 
 
 def _checkpoint_engine(session, state):
@@ -384,6 +377,25 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         game.push_combat_listing(pl_t, combats)
     log_req(f"    AI declares {len(assignment)} block(s): "
             f"{[(hex(k), [hex(b) for b in v]) for k, v in assignment.items()]}")
+    # ``Session.EmitBlockerEvents``: the blocker's "when this blocks" and the
+    # blocked attacker's "when this becomes blocked" abilities fire with the
+    # declaration, i.e. before combat damage.  The declaration owns them for
+    # the AI's blocks here; the human's blocks dispatch the same events from
+    # the host's CommitDefense projection.
+    for attacker_uid, blocker_uids in assignment.items():
+        for blocker_uid in blocker_uids:
+            _dispatch_triggers(
+                _db, handler, game, session, pl_t, ai_t, bstate,
+                "CardBlockedEvent", int(blocker_uid), 0,
+                extra_target=int(attacker_uid))
+            _dispatch_triggers(
+                _db, handler, game, session, pl_t, ai_t, bstate,
+                "CardAttackedOrBlockedEvent", int(blocker_uid), 0,
+                extra_target=int(attacker_uid))
+        _dispatch_triggers(
+            _db, handler, game, session, pl_t, ai_t, bstate,
+            "CardWasBlockedEvent", int(attacker_uid),
+            int((getattr(handler, "user_profile", None) or {}).get("id", 0) or 0))
     return bstate
 
 def player_can_attack_troops(handler, session, user_id=None):
@@ -580,6 +592,14 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
     player_champ_uid64 = player_champ_uid.uid.to_uint64() if player_champ_uid else 0
     if not player_champ_uid64:
         log_req("    AI attack aborted: no opposing champion SessionCardId")
+        return battle_state
+    # CardCounterTemplate "Stealth": while the defending champion holds a
+    # stealth counter, opposing troops can't attack it, so the AI has no
+    # legal attack target this turn (client built-in
+    # StealthCantAttackAbilityTemplateId).
+    from rules_port.stealth import is_stealthed
+    if is_stealthed(battle_state, player_champ_uid64):
+        log_req("    AI attack aborted: opposing champion is Stealth")
         return battle_state
     rows = db_warzone_attack_candidates(session.session_id, 0, conn=_db)
     log_req(f"    AI DeclareAttackers: candidate rows={len(rows)} "
@@ -1170,13 +1190,11 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 _db, handler, game, session, pl_t, ai_t, bstate,
                 "CardDealtDamageEvent", int(u),
                 _owner_of(attacker_uid), extra_target=dmg_target)
-        for b in blockers_map.get(int(u), []):
-            _dispatch_triggers(_db, handler, game, session, pl_t, ai_t,
-                                   bstate, "CardBlockedEvent", int(b),
-                                   _owner_of(defender_uid))
-            _dispatch_triggers(_db, handler, game, session, pl_t, ai_t,
-                                   bstate, "CardAttackedOrBlockedEvent", int(b),
-                                   _owner_of(defender_uid))
+        # CardBlockedEvent / CardAttackedOrBlockedEvent / CardWasBlockedEvent
+        # are emitted where the client emits them: when blockers are DECLARED
+        # (Session.EmitBlockerEvents), so the abilities resolve before combat
+        # damage instead of after it.  Dispatching them here as well fired each
+        # trigger twice.
     _db.commit()
     # Lifelink heals for each controller's damage dealt.  Route through
     # _apply_health_gain so "when you gain health" triggers (e.g. Incantation
@@ -1307,6 +1325,12 @@ def resolve_ai_combat_damage(handler, session, pl_t, ai_t, bstate,
             attacker_key="ai_attackers", blocker_key="ai_blockers")
         if game.events:
             handler._send_battle_events(session, game, pl_t)
+        # Simultaneous combat damage is fully applied before the champion's
+        # defeat is decided (the client's state-based check runs after the
+        # step), so publish a champion loss here rather than on a later phase.
+        check_health = getattr(handler, "_check_champion_health", None)
+        if callable(check_health):
+            check_health(session, pl_t, ai_t, bstate)
         return result
     attackers = {int(k): int(v) for k, v in (bstate.get("ai_attackers") or {}).items()}
     blockers = {int(k): [int(b) for b in (v or [])]
@@ -1340,15 +1364,33 @@ def combat_has_swiftstrike(db, session, bstate):
            game_engine.ECardAttributes.DualStrike)
         for uid in uids)
 
+def _ai_turn_prompt_pending(battle_state):
+    """Whether a client-owned prompt is open during the AI's turn.
+
+    ``resolve_combat`` pushes its own prompt packet, so the AI phase loop must
+    not follow it with a phase packet: the TurnPhaseUpdated/PlayerOptionList
+    would tear the picker down ("priority passed while a non-root state is
+    active") right after it opens.  That is the deck-search coverflow
+    (Darkspire Priestess) and the class-23 discard picker a Deathcry opens for
+    the opposing champion (Bloatcap's "each opposing champion chooses and
+    discards a card").  The answer (SetAbilityActivationData) resumes the AI
+    turn from the stored phase cursor.
+    """
+    if not isinstance(battle_state, dict):
+        return False
+    return bool(battle_state.get("pending_deck_search")
+                or battle_state.get("pending_discard_ability"))
+
+
 def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
     """Drive the AI's turn, one phase at a time.
 
     The AI has no client, so its actions are server-side. Each phase is
-    pushed in its own packet, paused AI_PHASE_DELAY so the client renders
-    it. If the current phase is a stop for the human (their opponent-turn
-    stop settings), the server grants the human priority and returns; the
-    human's pass resumes the AI turn from the next phase. At EndTurn the
-    turn returns to the human.
+    pushed in its own packet, in order, with no artificial pacing delay.
+    If the current phase is a stop for the human (their opponent-turn stop
+    settings), the server grants the human priority and returns; the human's
+    pass resumes the AI turn from the next phase. At EndTurn the turn returns
+    to the human.
 
     The AI logs holding priority and passing it as its default action for
     every phase it has nothing to do in.
@@ -1445,7 +1487,6 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         battle_state["ai_passed"] = False
     if start_idx == 0:
         log_req("    AI begins its turn — turn=ai priority=ai")
-        time.sleep(0.5)
         # ConsiderAttitutudeChange: the AI shifts Aggressive/Comfortable/
         # Defensive with its health relative to the opponent.
         try:
@@ -1914,16 +1955,15 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         game.ai_threshold = dict(battle_state.get("ai_threshold", {}))
         game.ai_health = battle_state.get("ai_health", 10)
         game.player_health = battle_state.get("player_health", 20)
-        # A combat-death deck-search prompt (Darkspire Priestess) was pushed in
-        # the combat packet (resolve_combat sends its own).  PAUSE the AI turn
-        # WITHOUT sending this phase packet — its TurnPhaseUpdated would tear
-        # the client's target picker down ("priority passed while a non-root
-        # state is active") right after the coverflow opens.  The answer
-        # (SetAbilityActivationData) resumes the AI turn.
-        if battle_state.get("pending_deck_search"):
+        # A combat-death prompt was pushed in the combat packet
+        # (``resolve_combat`` sends its own).  PAUSE the AI turn WITHOUT
+        # sending this phase packet — its TurnPhaseUpdated/PlayerOptionList
+        # would tear the client's picker down right after it opens, so the
+        # player never got to answer it.
+        if _ai_turn_prompt_pending(battle_state):
             battle_state["ai_turn_phase_idx"] = idx + 1
             be.save_state(session, battle_state)
-            log_req("    AI turn paused for deck-search answer")
+            log_req("    AI turn paused for a pending client prompt")
             return battle_state
         game.push_player_updated(ai_t, champ_id=getattr(handler, "_ai_champ_scid", None))
         handler._send_battle_events(session, game, pl_t)
@@ -1943,6 +1983,22 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         else:
             on_chain = not be.stack_empty(battle_state)
         if on_chain:
+            # The active player responds first to a chain item (C#
+            # WaitForTriggeredAbilitiesAction.OnEnter refreshes the priority
+            # player from GetActivePlayer()).  When that window belongs to the
+            # AI there is no client to submit its pass, so supply it here:
+            # otherwise the human is handed a ResolveTopOfChain they are not
+            # allowed to answer (the port rejects the pass) and the item
+            # strands — a trigger queued while another item resolved (Moon'
+            # ariu Sensei's one-shot Deathcry returning to play queues its
+            # Deploy draw the same way).
+            if native_mode:
+                _chain_port = getattr(session, "_rules_port_session", None)
+                _chain_action = (_chain_port.action_stack.peek()
+                                 if _chain_port is not None else None)
+                if (isinstance(_chain_action, PriorityWindowAction)
+                        and _chain_action.priority_player_id == native_ai_id):
+                    _chain_port.pass_player_priority(native_ai_id)
             battle_state["ai_turn_phase_idx"] = idx + 1
             be.save_state(session, battle_state)
             handler._push_phase_options_empty(session, pl_t, ai_t)
@@ -1972,7 +2028,6 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             # (no blocker UI, no priority handoff).
             if phase == game_engine.ETurnPhases.DeclareDefense and not handler._player_can_block(session):
                 log_req("    No player blockers — DeclareDefense auto-passed (attackers unblocked)")
-                time.sleep(AI_PHASE_DELAY)
                 idx += 1
                 continue
             battle_state["ai_turn_phase_idx"] = idx + 1
@@ -2013,7 +2068,6 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             be.save_state(session, battle_state)
             log_req(f"    AI phase {phase}: opponent stop — priority to player (waiting for pass)")
             return
-        time.sleep(AI_PHASE_DELAY)
         if native_lifecycle:
             port = getattr(session, "_rules_port_session", None)
             if port is not None:
@@ -2612,11 +2666,21 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
     charges = int(battle_state.get("ai_charges", 0))
     from pvp_db import db_champion_ability_costs, db_champion_ability_thresholds
     from pve_db import db_talent_ability_costs
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
     ai_champ_scid = getattr(handler, "_ai_champ_scid", None)
     if ai_champ_scid is None:
         return False
     for ag in ags:
         ag = str(ag)
+        # ONE-SHOT powers (m_UsesPerGame) are spent once per game.  The AI's
+        # champion is a synthetic SessionCardId, so the count lives in the
+        # shared battle state next to the champion counters.
+        graph = ability_graph(DEFAULT_RECORD_STORE, ag.lower())
+        uses_limit = int(getattr(getattr(graph, "costs", None),
+                                 "uses_per_game", 0) or 0)
+        uses = battle_state.get("champion_ability_uses") or {}
+        if uses_limit and int(uses.get(ag.lower(), 0) or 0) >= uses_limit:
+            continue
         cost_row = db_champion_ability_costs(ag)
         if not cost_row:
             continue
@@ -3027,6 +3091,9 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
         game.push_ability_on_chain(
             ai_champ_scid, game_engine.ResourceId.from_str(ag),
             ability_instance_id=inst_id)
+        if uses_limit:
+            uses = battle_state.setdefault("champion_ability_uses", {})
+            uses[ag.lower()] = int(uses.get(ag.lower(), 0) or 0) + 1
         _be.save_state(session, battle_state)
         log_req(f"    AI champion ability {ag[:8]} on chain "
                 f"(charges {charges}->{battle_state['ai_charges']}, "

@@ -2,8 +2,8 @@
 ability resolves data-driven against the real seeded ability metadata.
 
 The tests copy the relevant card_abilities_meta / ability_effects / template
-rows from hconnect.db into a temp DB, stub the handler, and drive the same
-resolver entry points the server uses.
+rows from this process's own test database (``tests/test_db.py``) into a temp
+DB, stub the handler, and drive the same resolver entry points the server uses.
 
 Run:  python3 tests_deck_abilities.py
 """
@@ -15,6 +15,12 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 import db as dbmod
 
@@ -22,10 +28,6 @@ from abilities.framework import triggers
 from abilities.framework.bom import _LEAFS
 from abilities import resolve_played_spell
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 TPL = {
     "scrivener": "2ce8233b-c5bd-4be0-86c6-a17021b071ee",

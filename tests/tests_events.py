@@ -5,8 +5,13 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 import game_engine
 from domain.events import (
+    make_game_ended_packet,
     EncounterModDialogSessionEventArgs,
     ChessTimerUpdatedSessionEventArgs,
     CardDestroyedSessionEventArgs,
@@ -24,6 +29,18 @@ from domain.events import (
     EquipmentSetSessionEventArgs,
     CardCollectionsMergedSessionEventArgs,
 )
+
+
+def test_uid_lists_normalize_raw_uid64_values():
+    """UID-list events accept the raw IDs used by RulesPort projections."""
+    loser_uid = game_engine.UID.make(3, 1000)
+    packet = make_game_ended_packet(
+        123, game_engine.UID.make(244, 7),
+        [game_engine.UID.make(244, 7)], [loser_uid.uid64])
+    raw = packet.event_data[0]
+
+    assert raw
+    assert int.from_bytes(raw[-8:], "little") == loser_uid.uid64
 
 
 def test_missing_events_have_client_class_ids_and_serialize():
