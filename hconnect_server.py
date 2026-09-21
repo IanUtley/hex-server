@@ -16,6 +16,7 @@ import random
 import re
 import sqlite3
 import os
+from collections import namedtuple
 from collections.abc import Mapping
 import uuid
 import hashlib
@@ -190,6 +191,8 @@ from profile_db import (db_find_deck_owner, db_deck_champion_name,
                         db_delete_all_mail, db_primal_pack_for,
                         db_get_chest_by_id, db_next_card_instance_id,
                         db_create_card_instance, db_open_chest,
+                        db_chest_template, db_inventory_item_by_client_uid,
+                        db_consume_inventory_row,
                         db_set_champion_last_deck,
                         db_champion_last_deck, db_card_instance_template,
                         db_inventory_item, db_consume_inventory,
@@ -508,6 +511,153 @@ def _dispatch_service(handler, data_type, target, instance, reqid, comp,
         inner_obj, inner_bytes,
         service_uids={"mail": SERVICE_MAIL_UID, "profile": SERVICE_PROFILE_UID},
         log_req=log_req)
+
+
+# The fixed client addresses every treasure chest by the InventoryItem UID the
+# server handed it, which comes from two spaces: ``9000 + treasure_chests.id``
+# for chests delivered as chest_bits / Applied chest rewards, and the
+# ``player_inventory.client_item_uid`` of an InventoryTreasureChest template
+# granted as an item (a store purchase such as the AZ1/Howling Plains campaign
+# booster).  Chest opening must resolve both or the client sees
+# "Invalid Chest ID" for the items it legitimately owns.
+CLIENT_CHEST_UID_BASE = 9000
+_CHEST_KEEP_COUNTS = {"Common": 3, "Uncommon": 2, "Rare": 1,
+                      "Legendary": 0, "Primal": 0}
+
+ClientChest = namedtuple(
+    "ClientChest",
+    "client_uid template_guid set_guid chest_type db_id inventory_row_id")
+
+
+def _resolve_client_chest(user_id, chest_uid):
+    """Resolve a client chest-instance UID to the chest it addresses.
+
+    Returns ``ClientChest`` or ``None`` when the UID is not an unopened chest
+    owned by the player.
+    """
+    try:
+        chest_uid = int(chest_uid)
+    except (TypeError, ValueError):
+        return None
+    if not user_id or chest_uid <= 0:
+        return None
+    if chest_uid >= CLIENT_CHEST_UID_BASE:
+        row = db_get_chest_by_id(
+            chest_uid - CLIENT_CHEST_UID_BASE, user_id, conn=_db)
+        if not row:
+            return None
+        return ClientChest(chest_uid, row[4] or "", row[1] or "",
+                           row[2] or "Common", row[0], None)
+    row = db_inventory_item_by_client_uid(user_id, chest_uid, conn=_db)
+    if not row:
+        return None
+    template_guid = row[1] or ""
+    template = db_chest_template(template_guid, conn=_db)
+    if not template:
+        return None
+    return ClientChest(chest_uid, template_guid, template[2] or "",
+                       template[3] or "Promo", None, row[0])
+
+
+def _generate_chest_rewards(chest, card_templates, rng=None):
+    """Return ``(cards, inventory_rewards)`` for one resolved client chest.
+
+    ``cards`` are ``(guid, name, cost, attack, defense)`` rows and
+    ``inventory_rewards`` are ``(template_guid, kind)`` pairs.  Campaign packs
+    and Crayburn promo chests are authored by template; every other chest falls
+    back to its set booster trimmed to the chest rarity.
+    """
+    rng = rng or random
+    pack_config = CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
+    if pack_config:
+        from gamedata import DEFAULT_RECORD_STORE
+        reward = generate_campaign_pack(
+            card_templates, DEFAULT_RECORD_STORE, rng,
+            pack_config=pack_config)
+        inventory_rewards = [(guid, "equipment")
+                             for guid in reward.equipment_guids]
+        inventory_rewards.extend(
+            (STARDUST_TEMPLATES[rarity.lower()], "stardust")
+            for rarity in reward.stardust_rarities)
+        return list(reward.cards), inventory_rewards
+    cards = _generate_crayburn_chest(card_templates, chest.template_guid)
+    if cards is None:
+        cards = _generate_booster(card_templates, chest.set_guid)
+        keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
+        if len(cards) > keep_count:
+            cards = rng.sample(cards, keep_count)
+    return list(cards), []
+
+
+def _grant_pack_inventory_rewards(handler, inventory_rewards):
+    """Persist and coalesce equipment/Stardust pack rewards.
+
+    Returns ``(template_guid, client_uid, quantity)`` rows to push to the
+    client.  Stardust is additionally recorded in its own ledger.
+    """
+    user_id = handler.user_profile["id"]
+    next_uid = db_next_inventory_client_uid(user_id, conn=_db)
+    updates = {}
+    for template_guid, _kind in inventory_rewards:
+        row = db_inventory_item(user_id, template_guid, conn=_db)
+        candidate_uid = next_uid if not row or not row[2] else 0
+        client_uid = db_upsert_inventory_item(
+            user_id, template_guid, 1, client_item_uid=candidate_uid, conn=_db)
+        if candidate_uid:
+            next_uid += 1
+        if template_guid in STARDUST_TEMPLATES.values():
+            rarity = next(key for key, value in STARDUST_TEMPLATES.items()
+                          if value == template_guid)
+            db_add_stardust(user_id, rarity, 1, conn=_db)
+        updates[template_guid] = (client_uid, int(row[1] or 0) + 1 if row else 1)
+    return [(guid, client_uid, quantity)
+            for guid, (client_uid, quantity) in updates.items()]
+
+
+def _open_client_chests(handler, chest_uids):
+    """Award and consume client-addressed chests without sending packets.
+
+    Returns ``None`` when there is no profile to award.  Otherwise a summary
+    carrying ``cards`` (``card_instance_bits`` tuples), ``card_template_ids``,
+    ``inventory_template_ids``, ``inventory_updates`` as
+    ``(template_guid, client_uid, quantity)``, ``opened`` as
+    ``(template_guid, client_uid, remaining_quantity)`` and ``invalid`` (the
+    UIDs that are unknown, already opened, or not owned by the player).
+    """
+    if not handler.user_profile:
+        return None
+    user_id = handler.user_profile["id"]
+    card_templates = _load_card_templates()
+    summary = {"cards": [], "card_template_ids": [], "inventory_template_ids": [],
+               "inventory_updates": [], "opened": [], "invalid": []}
+    for chest_uid in chest_uids:
+        chest = _resolve_client_chest(user_id, chest_uid)
+        if chest is None:
+            summary["invalid"].append(chest_uid)
+            continue
+        cards, inventory_rewards = _generate_chest_rewards(chest, card_templates)
+        next_id = db_next_card_instance_id(user_id, conn=_db)
+        for offset, (guid, name, cost, atk, def_) in enumerate(cards):
+            instance_id = next_id + offset
+            db_add_card(user_id, guid, conn=_db)
+            db_create_card_instance(user_id, instance_id, guid, conn=_db)
+            summary["card_template_ids"].append(guid)
+            summary["cards"].append((guid, name, cost, atk, def_, instance_id, 0))
+        for guid, item_uid, quantity in _grant_pack_inventory_rewards(
+                handler, inventory_rewards):
+            summary["inventory_template_ids"].append(guid)
+            summary["inventory_updates"].append((guid, item_uid, quantity))
+        if chest.db_id is not None:
+            db_open_chest(chest.db_id, conn=_db)
+            remaining = 0
+        else:
+            remaining = db_consume_inventory_row(
+                chest.inventory_row_id, 1, conn=_db)
+        summary["opened"].append((chest.template_guid, chest_uid, remaining))
+        log_req(f"    Opened chest {chest_uid} "
+                f"({chest.template_guid or chest.set_guid}): {len(cards)} cards, "
+                f"{len(inventory_rewards)} items, remaining={remaining}")
+    return summary
 
 
 class HCPHandler(ProfileStreamMixin):
@@ -17388,33 +17538,9 @@ class HCPHandler(ProfileStreamMixin):
                 # client.  Keeping the rewards in player_inventory also makes
                 # them survive a reconnect.
                 if pack_inventory_rewards:
-                    inventory_updates = {}
-                    inventory_kinds = {}
-                    next_uid = db_next_inventory_client_uid(
-                        self.user_profile["id"], conn=_db)
-                    for template_guid, _kind in pack_inventory_rewards:
-                        row = db_inventory_item(
-                            self.user_profile["id"], template_guid, conn=_db)
-                        candidate_uid = next_uid if not row or not row[2] else 0
-                        client_uid = db_upsert_inventory_item(
-                            self.user_profile["id"], template_guid, 1,
-                            client_uid=candidate_uid, conn=_db)
-                        quantity = int(row[1] or 0) + 1 if row else 1
-                        if candidate_uid:
-                            next_uid += 1
-                        inventory_updates[template_guid] = (client_uid, quantity)
-                        inventory_kinds[template_guid] = _kind
-                        if template_guid in STARDUST_TEMPLATES.values():
-                            rarity = next(
-                                key for key, value in STARDUST_TEMPLATES.items()
-                                if value == template_guid)
-                            db_add_stardust(
-                                self.user_profile["id"], rarity, 1, conn=_db)
+                    pack_inventory_updates = _grant_pack_inventory_rewards(
+                        self, pack_inventory_rewards)
                     _db.commit()
-                    pack_inventory_updates = [
-                        (guid, inventory_kinds[guid], inventory_updates[guid][0],
-                         inventory_updates[guid][1])
-                        for guid in inventory_updates]
 
                 # Generate treasure chest for normal boosters.  Campaign
                 # packs already contain their two equipment/Stardust slots;
@@ -17481,7 +17607,7 @@ class HCPHandler(ProfileStreamMixin):
                 "issuer": issuer_str, "target": target, "instance": instance,
                 "reqid": resp_reqid, "c": comp, "conh": conh, "sid": self.sid,
             }, dw_bytes)
-            for template_guid, _kind, item_uid, quantity in pack_inventory_updates:
+            for template_guid, item_uid, quantity in pack_inventory_updates:
                 self.push_inventory_to_client(
                     qty=quantity, template_guid=template_guid,
                     item_id=item_uid)
@@ -18489,211 +18615,195 @@ class HCPHandler(ProfileStreamMixin):
                 chest_uid = int(chest_id_raw)
             except (TypeError, ValueError):
                 chest_uid = 0
-            chest_db_id = chest_uid - 9000 if chest_uid >= 9000 else 0
-            log_req(f">>> SpinWheelOfFate: ChestID={chest_uid} db_id={chest_db_id}")
+            log_req(f">>> SpinWheelOfFate: ChestID={chest_uid}")
 
-            if not self.user_profile or chest_db_id <= 0:
+            chest = (_resolve_client_chest(self.user_profile["id"], chest_uid)
+                     if self.user_profile else None)
+            if chest is None:
                 log_req(f"    Invalid chest or no profile")
                 resp_inner = b""
             else:
-                from profile_db import db_get_chest_by_id
-                chest = db_get_chest_by_id(chest_db_id, self.user_profile["id"])
-                if not chest:
-                    log_req(f"    Chest {chest_db_id} not found or already opened")
-                    resp_inner = b""
-                else:
-                    import random as _rand2
-                    # Crayburn Promo chests have no set GUID; use their
-                    # authored template-keyed pool. Other chests retain the
-                    # normal set/rarity-based booster behavior.
-                    card_templates = _load_card_templates()
-                    chest_cards = _generate_crayburn_chest(card_templates, chest[4])
-                    if chest_cards is None:
-                        chest_cards = _generate_booster(card_templates, chest[1])
-                        # Reduce to a smaller set based on chest rarity
-                        rarity_counts = {"Common": 3, "Uncommon": 2, "Rare": 1, "Legendary": 0, "Primal": 0}
-                        keep_count = rarity_counts.get(chest[2], 3)
-                        if len(chest_cards) > keep_count:
-                            chest_cards = _rand2.sample(chest_cards, keep_count)
-                    is_crayburn = chest[4] in CRAYBURN_PACK_CARD_SEEDS
-                    
-                    # Persist cards and create instances
-                    from profile_db import db_next_card_instance_id, db_create_card_instance, db_open_chest
-                    max_cid = db_next_card_instance_id(
-                        self.user_profile["id"], conn=_db)
-                    reward_card_bits = []
-                    for i, (guid, name, cost, atk, def_) in enumerate(chest_cards):
-                        cid = max_cid + i
-                        db_add_card(self.user_profile["id"], guid)
-                        db_create_card_instance(self.user_profile["id"], cid, guid)
-                        reward_card_bits.append((guid, name, cost, atk, def_, cid, 0))
-                    db_open_chest(chest_db_id)
-                    log_req(f"    Spun {'Crayburn ' if is_crayburn else ''}chest {chest[2]} id={chest_db_id}, awarded {len(reward_card_bits)} cards")
+                summary = _open_client_chests(self, [chest_uid])
+                reward_card_bits = summary["cards"]
+                log_req(f"    Spun chest {chest.chest_type} uid={chest_uid}, "
+                        f"awarded {len(reward_card_bits)} cards")
 
-                    # Push reward cards to client
-                    self._send_cards_chunk(reward_card_bits)
+                # Push reward cards and inventory changes to client
+                self._send_cards_chunk(reward_card_bits)
+                for template_guid, item_uid, quantity in summary["inventory_updates"]:
+                    self.push_inventory_to_client(
+                        qty=quantity, template_guid=template_guid,
+                        item_id=item_uid)
+                for template_guid, opened_uid, remaining in summary["opened"]:
+                    if remaining:
+                        self.push_inventory_to_client(
+                            qty=remaining, template_guid=template_guid,
+                            item_id=opened_uid)
+                    else:
+                        self._send_inventory_updated(
+                            template_guid, opened_uid, quantity=0)
 
-                    # Encode SpinWheelOfFateResponse
-                    # Chest (chest_bits, marked opened), RewardCards (List<card_instance_bits>), RewardItems (empty)
-                    rtn = ["Game.Client.Network.Profile.SpinWheelOfFateResponse",
-                           "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-                           "Game.Shared.Domain.card_instance_bits",
-                           "Game.Shared.ResourceId", "System.Guid", "System.UInt64",
-                           "System.Boolean", "System.String", "System.Int32",
-                           "System.UInt32",
-                           "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-                           "Game.Shared.Domain.chest_bits"]
-                    def rft(tn):
-                        if tn not in rtn: rtn.append(tn)
-                        return rtn.index(tn)
-                    rsizes = []; rbuf = io.BytesIO()
-                    rw = lambda s: rbuf.write(s.encode("utf-8"))
-                    rsep = lambda: rbuf.write(b";")
-                    rsizes.append(0)
-                    rw(""); rsep(); rw("0"); rsep(); rw(str(rft(rtn[0]))); rsep(); rw("6"); rsep()
+                # Encode SpinWheelOfFateResponse
+                # Chest (chest_bits, marked opened), RewardCards (List<card_instance_bits>), RewardItems (empty)
+                rtn = ["Game.Client.Network.Profile.SpinWheelOfFateResponse",
+                       "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
+                       "Game.Shared.Domain.card_instance_bits",
+                       "Game.Shared.ResourceId", "System.Guid", "System.UInt64",
+                       "System.Boolean", "System.String", "System.Int32",
+                       "System.UInt32",
+                       "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+                       "Game.Shared.Domain.chest_bits"]
+                def rft(tn):
+                    if tn not in rtn: rtn.append(tn)
+                    return rtn.index(tn)
+                rsizes = []; rbuf = io.BytesIO()
+                rw = lambda s: rbuf.write(s.encode("utf-8"))
+                rsep = lambda: rbuf.write(b";")
+                rsizes.append(0)
+                rw(""); rsep(); rw("0"); rsep(); rw(str(rft(rtn[0]))); rsep(); rw("6"); rsep()
 
-                    # Chest field (chest_bits, 8 props, WasOpened=true)
-                    rc = rbuf.tell(); rsizes.append(0)
-                    rw("Chest"); rsep(); rw("1"); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("0"); rsep()
-                    rw("1"); rsep()
-                    rfe = rbuf.tell(); rsizes.append(0); reidx = len(rsizes)-1
-                    rw("0"); rsep(); rw(str(reidx)); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("8"); rsep()
-                    # ChestRarity
-                    rf1 = rbuf.tell(); rsizes.append(0)
-                    rw("ChestRarity"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    cmap = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4, "Promo":5}
-                    rw(hexlify(struct.pack("<i", cmap.get(chest[2], 0))).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - rf1
-                    # WOFSpinStatus = 0
-                    rf2 = rbuf.tell(); rsizes.append(0)
-                    rw("WOFSpinStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - rf2
-                    # BoosterPackType
-                    rf3 = rbuf.tell(); rsizes.append(0); rti = len(rsizes)-1
-                    rw("BoosterPackType"); rsep(); rw(str(rti)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                    rgs = rbuf.tell(); rsizes.append(0); rgi = len(rsizes)-1
-                    rw("guid"); rsep(); rw(str(rgi)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                    booster_type_guid = chest[4] or chest[1]
-                    rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
-                    rsizes[rgi] = rbuf.tell() - rgs; rsizes[rti] = rbuf.tell() - rf3
-                    # WasOpened = true
-                    rf4 = rbuf.tell(); rsizes.append(0)
-                    rw("WasOpened"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
-                    rw("1"); rsizes[-1] = rbuf.tell() - rf4
-                    # InventoryId
-                    rf5 = rbuf.tell(); rsizes.append(0)
-                    rw("InventoryId"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<Q", chest_uid)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - rf5
-                    # PromoID
-                    rf6 = rbuf.tell(); rsizes.append(0)
-                    rw("PromoID"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<I", 0)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - rf6
-                    # TempateID
-                    rf7 = rbuf.tell(); rsizes.append(0); rti2 = len(rsizes)-1
-                    rw("TempateID"); rsep(); rw(str(rti2)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                    rgs2 = rbuf.tell(); rsizes.append(0); rgi2 = len(rsizes)-1
-                    rw("guid"); rsep(); rw(str(rgi2)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                    rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
-                    rsizes[rgi2] = rbuf.tell() - rgs2; rsizes[rti2] = rbuf.tell() - rf7
-                    # Vendor
-                    rf8 = rbuf.tell(); rsizes.append(0)
-                    rw("Vendor"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - rf8
-                    rsizes[reidx] = rbuf.tell() - rfe
-                    rsizes[1] = rbuf.tell() - rc
+                # Chest field (chest_bits, 8 props, WasOpened=true)
+                rc = rbuf.tell(); rsizes.append(0)
+                rw("Chest"); rsep(); rw("1"); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("0"); rsep()
+                rw("1"); rsep()
+                rfe = rbuf.tell(); rsizes.append(0); reidx = len(rsizes)-1
+                rw("0"); rsep(); rw(str(reidx)); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("8"); rsep()
+                # ChestRarity
+                rf1 = rbuf.tell(); rsizes.append(0)
+                rw("ChestRarity"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                cmap = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4, "Promo":5}
+                rw(hexlify(struct.pack("<i", cmap.get(chest.chest_type, 0))).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - rf1
+                # WOFSpinStatus = 0
+                rf2 = rbuf.tell(); rsizes.append(0)
+                rw("WOFSpinStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - rf2
+                # BoosterPackType
+                rf3 = rbuf.tell(); rsizes.append(0); rti = len(rsizes)-1
+                rw("BoosterPackType"); rsep(); rw(str(rti)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
+                rgs = rbuf.tell(); rsizes.append(0); rgi = len(rsizes)-1
+                rw("guid"); rsep(); rw(str(rgi)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
+                booster_type_guid = chest.template_guid or chest.set_guid
+                rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
+                rsizes[rgi] = rbuf.tell() - rgs; rsizes[rti] = rbuf.tell() - rf3
+                # WasOpened = true
+                rf4 = rbuf.tell(); rsizes.append(0)
+                rw("WasOpened"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
+                rw("1"); rsizes[-1] = rbuf.tell() - rf4
+                # InventoryId
+                rf5 = rbuf.tell(); rsizes.append(0)
+                rw("InventoryId"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<Q", chest_uid)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - rf5
+                # PromoID
+                rf6 = rbuf.tell(); rsizes.append(0)
+                rw("PromoID"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt32"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<I", 0)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - rf6
+                # TempateID
+                rf7 = rbuf.tell(); rsizes.append(0); rti2 = len(rsizes)-1
+                rw("TempateID"); rsep(); rw(str(rti2)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
+                rgs2 = rbuf.tell(); rsizes.append(0); rgi2 = len(rsizes)-1
+                rw("guid"); rsep(); rw(str(rgi2)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
+                rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
+                rsizes[rgi2] = rbuf.tell() - rgs2; rsizes[rti2] = rbuf.tell() - rf7
+                # Vendor
+                rf8 = rbuf.tell(); rsizes.append(0)
+                rw("Vendor"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - rf8
+                rsizes[reidx] = rbuf.tell() - rfe
+                rsizes[1] = rbuf.tell() - rc
 
-                    # RewardCards (List<card_instance_bits>, encoded with reward cards)
-                    rfc = rbuf.tell(); rsizes.append(0)
-                    rw("RewardCards"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[1]))); rsep(); rw("0"); rsep()
-                    rw(str(len(reward_card_bits))); rsep()
-                    for ri, (guid, name, cost, atk, def_, cid, iext) in enumerate(reward_card_bits):
-                        rfe2 = rbuf.tell(); rsizes.append(0); rei = len(rsizes)-1
-                        rw(str(ri)); rsep(); rw(str(rei)); rsep(); rw(str(rft(rtn[2]))); rsep(); rw("6"); rsep()
-                        # Id
-                        f1c = rbuf.tell(); rsizes.append(0)
-                        rw("Id"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
-                        rw(hexlify(struct.pack("<Q", cid)).decode("ascii")); rsep()
-                        rsizes[-1] = rbuf.tell() - f1c
-                        # TemplateID
-                        f2c = rbuf.tell(); rsizes.append(0); rti3 = len(rsizes)-1
-                        rw("TemplateID"); rsep(); rw(str(rti3)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                        rgs3 = rbuf.tell(); rsizes.append(0); rgi3 = len(rsizes)-1
-                        rw("guid"); rsep(); rw(str(rgi3)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                        rw("36"); rsep(); rbuf.write(guid.encode())
-                        rsizes[rgi3] = rbuf.tell() - rgs3; rsizes[rti3] = rbuf.tell() - f2c
-                        for bname in ("IsFoil", "IsExtended", "IsNotTradeable"):
-                            tb = rbuf.tell(); rsizes.append(0)
-                            rw(bname); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
-                            rw("0"); rsizes[-1] = rbuf.tell() - tb
-                        # EscrowStatus
-                        te = rbuf.tell(); rsizes.append(0)
-                        rw("EscrowStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
-                        enc = b"Clean"; rw(str(len(enc))); rsep(); rbuf.write(enc)
-                        rsizes[-1] = rbuf.tell() - te
-                        rsizes[rei] = rbuf.tell() - rfe2
-                    rsizes[-1] = rbuf.tell() - rfc
+                # RewardCards (List<card_instance_bits>, encoded with reward cards)
+                rfc = rbuf.tell(); rsizes.append(0)
+                rw("RewardCards"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[1]))); rsep(); rw("0"); rsep()
+                rw(str(len(reward_card_bits))); rsep()
+                for ri, (guid, name, cost, atk, def_, cid, iext) in enumerate(reward_card_bits):
+                    rfe2 = rbuf.tell(); rsizes.append(0); rei = len(rsizes)-1
+                    rw(str(ri)); rsep(); rw(str(rei)); rsep(); rw(str(rft(rtn[2]))); rsep(); rw("6"); rsep()
+                    # Id
+                    f1c = rbuf.tell(); rsizes.append(0)
+                    rw("Id"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
+                    rw(hexlify(struct.pack("<Q", cid)).decode("ascii")); rsep()
+                    rsizes[-1] = rbuf.tell() - f1c
+                    # TemplateID
+                    f2c = rbuf.tell(); rsizes.append(0); rti3 = len(rsizes)-1
+                    rw("TemplateID"); rsep(); rw(str(rti3)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
+                    rgs3 = rbuf.tell(); rsizes.append(0); rgi3 = len(rsizes)-1
+                    rw("guid"); rsep(); rw(str(rgi3)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
+                    rw("36"); rsep(); rbuf.write(guid.encode())
+                    rsizes[rgi3] = rbuf.tell() - rgs3; rsizes[rti3] = rbuf.tell() - f2c
+                    for bname in ("IsFoil", "IsExtended", "IsNotTradeable"):
+                        tb = rbuf.tell(); rsizes.append(0)
+                        rw(bname); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
+                        rw("0"); rsizes[-1] = rbuf.tell() - tb
+                    # EscrowStatus
+                    te = rbuf.tell(); rsizes.append(0)
+                    rw("EscrowStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
+                    enc = b"Clean"; rw(str(len(enc))); rsep(); rbuf.write(enc)
+                    rsizes[-1] = rbuf.tell() - te
+                    rsizes[rei] = rbuf.tell() - rfe2
+                rsizes[-1] = rbuf.tell() - rfc
 
-                    # RewardItems (empty list)
-                    fri = rbuf.tell(); rsizes.append(0)
-                    rw("RewardItems"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[10]))); rsep(); rw("0"); rsep()
-                    rw("0"); rsep()
-                    rsizes[-1] = rbuf.tell() - fri
+                # RewardItems (empty list)
+                fri = rbuf.tell(); rsizes.append(0)
+                rw("RewardItems"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[10]))); rsep(); rw("0"); rsep()
+                rw("0"); rsep()
+                rsizes[-1] = rbuf.tell() - fri
 
-                    # GoldAward (int 0)
-                    fga = rbuf.tell(); rsizes.append(0)
-                    rw("GoldAward"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - fga
+                # GoldAward (int 0)
+                fga = rbuf.tell(); rsizes.append(0)
+                rw("GoldAward"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - fga
 
-                    # SpinEntryColors (List<int>, 3 entries — random symbols for slot reels)
-                    import random as _rand3
-                    fsc = rbuf.tell(); rsizes.append(0)
-                    rw("SpinEntryColors"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
-                    colors = [_rand3.randint(0, 2) for _ in range(3)]
-                    rw(str(len(colors))); rsep()
-                    for ci, cv in enumerate(colors):
-                        fec = rbuf.tell(); rsizes.append(0); eci = len(rsizes)-1
-                        rw(str(ci)); rsep(); rw(str(eci)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                        rw(hexlify(struct.pack("<i", cv)).decode("ascii")); rsep()
-                        rsizes[eci] = rbuf.tell() - fec
-                    rsizes[-1] = rbuf.tell() - fsc
+                # SpinEntryColors (List<int>, 3 entries — random symbols for slot reels)
+                import random as _rand3
+                fsc = rbuf.tell(); rsizes.append(0)
+                rw("SpinEntryColors"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
+                colors = [_rand3.randint(0, 2) for _ in range(3)]
+                rw(str(len(colors))); rsep()
+                for ci, cv in enumerate(colors):
+                    fec = rbuf.tell(); rsizes.append(0); eci = len(rsizes)-1
+                    rw(str(ci)); rsep(); rw(str(eci)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                    rw(hexlify(struct.pack("<i", cv)).decode("ascii")); rsep()
+                    rsizes[eci] = rbuf.tell() - fec
+                rsizes[-1] = rbuf.tell() - fsc
 
-                    # SpinEntrySymbols (List<int>, 3 entries)
-                    fss = rbuf.tell(); rsizes.append(0)
-                    rw("SpinEntrySymbols"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
-                    symbols = [_rand3.randint(0, 7) for _ in range(3)]
-                    rw(str(len(symbols))); rsep()
-                    for si, sv in enumerate(symbols):
-                        fes = rbuf.tell(); rsizes.append(0); esi = len(rsizes)-1
-                        rw(str(si)); rsep(); rw(str(esi)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                        rw(hexlify(struct.pack("<i", sv)).decode("ascii")); rsep()
-                        rsizes[esi] = rbuf.tell() - fes
-                    rsizes[-1] = rbuf.tell() - fss
+                # SpinEntrySymbols (List<int>, 3 entries)
+                fss = rbuf.tell(); rsizes.append(0)
+                rw("SpinEntrySymbols"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
+                symbols = [_rand3.randint(0, 7) for _ in range(3)]
+                rw(str(len(symbols))); rsep()
+                for si, sv in enumerate(symbols):
+                    fes = rbuf.tell(); rsizes.append(0); esi = len(rsizes)-1
+                    rw(str(si)); rsep(); rw(str(esi)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                    rw(hexlify(struct.pack("<i", sv)).decode("ascii")); rsep()
+                    rsizes[esi] = rbuf.tell() - fes
+                rsizes[-1] = rbuf.tell() - fss
 
-                    # Error (Ok=0) — enum struct format
-                    ferr = rbuf.tell(); rsizes.append(0)
-                    rw("Error"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("Game.Shared.Network.Profile.ESpinWheelOfFateError"))); rsep(); rw("1"); rsep()
-                    ferrv = rbuf.tell(); rsizes.append(0)
-                    rw("value__"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - ferrv; rsizes[-2] = rbuf.tell() - ferr
+                # Error (Ok=0) — enum struct format
+                ferr = rbuf.tell(); rsizes.append(0)
+                rw("Error"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("Game.Shared.Network.Profile.ESpinWheelOfFateError"))); rsep(); rw("1"); rsep()
+                ferrv = rbuf.tell(); rsizes.append(0)
+                rw("value__"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
+                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
+                rsizes[-1] = rbuf.tell() - ferrv; rsizes[-2] = rbuf.tell() - ferr
 
-                    # ErrorMessage (empty string)
-                    fem = rbuf.tell(); rsizes.append(0)
-                    rw("ErrorMessage"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
-                    rw("0"); rsep()
-                    rsizes[-1] = rbuf.tell() - fem
+                # ErrorMessage (empty string)
+                fem = rbuf.tell(); rsizes.append(0)
+                rw("ErrorMessage"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
+                rw("0"); rsep()
+                rsizes[-1] = rbuf.tell() - fem
 
-                    rsizes[0] = rbuf.tell()
-                    rw(";".join(rtn))
-                    for i, s in enumerate(rsizes):
-                        if i > 0: rw(";")
-                        rw(str(s))
-                    resp_inner = rbuf.getvalue()
+                rsizes[0] = rbuf.tell()
+                rw(";".join(rtn))
+                for i, s in enumerate(rsizes):
+                    if i > 0: rw(";")
+                    rw(str(s))
+                resp_inner = rbuf.getvalue()
 
             if not resp_inner:
                 resp_inner = encode_objfmt_response(
@@ -18711,11 +18821,11 @@ class HCPHandler(ProfileStreamMixin):
             }, dw_bytes)
             log_req(f"    Sent SpinWheelOfFate response ({len(dw_bytes)}b)")
 
-        # OpenChest (2129) — direct opening for NoSpin Promo chests.
-        # The pack-opening UI uses this transaction for Crayburn Castle packs;
-        # SpinWheelOfFate (2049) is reserved for chests with a spin sequence.
+        # OpenChest (2129) — direct opening for NoSpin promo chests and for
+        # InventoryTreasureChest items granted as inventory (Crayburn Castle
+        # packs, the AZ1/AZ2 campaign boosters).  SpinWheelOfFate (2049) is
+        # reserved for chests with a spin sequence.
         elif data_type == 2129:
-            import random as _rand2
             raw_chest_ids = inner_obj.get("ChestIds", [])
             if isinstance(raw_chest_ids, str):
                 try:
@@ -18734,64 +18844,28 @@ class HCPHandler(ProfileStreamMixin):
                     requested_ids.append(chest_uid)
             log_req(f">>> OpenChest: ids={requested_ids}")
 
-            valid_chest_ids = []
-            card_template_ids = []
-            reward_card_bits = []
-            opened_inventory_items = []
             error_val = 0
             error_message = ""
+            summary = None
             if not self.user_profile:
                 error_val = 1  # InvalidChestID
                 error_message = "Invalid chest ID"
             else:
-                from profile_db import (db_get_chest_by_id, db_next_card_instance_id,
-                                db_create_card_instance, db_open_chest)
-                card_templates = _load_card_templates()
-                for chest_uid in requested_ids:
-                    chest_db_id = chest_uid - 9000 if chest_uid >= 9000 else 0
-                    chest = db_get_chest_by_id(
-                        chest_db_id, self.user_profile["id"])
-                    if not chest:
-                        error_val = 1  # InvalidChestID
-                        error_message = "Invalid chest ID"
-                        continue
-
-                    chest_cards = _generate_crayburn_chest(
-                        card_templates, chest[4])
-                    if chest_cards is None:
-                        chest_cards = _generate_booster(
-                            card_templates, chest[1])
-                        rarity_counts = {
-                            "Common": 3, "Uncommon": 2, "Rare": 1,
-                            "Legendary": 0, "Primal": 0,
-                        }
-                        keep_count = rarity_counts.get(chest[2], 3)
-                        if len(chest_cards) > keep_count:
-                            chest_cards = _rand2.sample(chest_cards, keep_count)
-
-                    max_cid = db_next_card_instance_id(
-                        self.user_profile["id"], conn=_db)
-                    for offset, (guid, name, cost, atk, def_) in enumerate(
-                            chest_cards):
-                        cid = max_cid + offset
-                        db_add_card(self.user_profile["id"], guid)
-                        db_create_card_instance(
-                            self.user_profile["id"], cid, guid)
-                        card_template_ids.append(guid)
-                        reward_card_bits.append(
-                            (guid, name, cost, atk, def_, cid, 0))
-                    db_open_chest(chest_db_id)
-                    valid_chest_ids.append(chest_uid)
-                    opened_inventory_items.append((chest_uid, chest[4]))
-
-                if requested_ids and not valid_chest_ids and not error_val:
+                summary = _open_client_chests(self, requested_ids)
+                if requested_ids and not summary["opened"]:
                     error_val = 1
                     error_message = "Invalid chest ID"
 
+            valid_chest_ids = [uid for _t, uid, _r in summary["opened"]] \
+                if summary else []
+            inventory_template_ids = summary["inventory_template_ids"] \
+                if summary else []
+            card_template_ids = summary["card_template_ids"] if summary else []
             from objfmt_builder import ObjFmtBuilder
             b = ObjFmtBuilder("Game.Client.Network.Profile.OpenChestResponse")
             b.field_ulong_list("validChestIds", valid_chest_ids)
-            b.field_resource_id_list("inventoryTemplateIDs", [])
+            b.field_resource_id_list("inventoryTemplateIDs",
+                                     inventory_template_ids)
             b.field_resource_id_list("cardTemplateIDs", card_template_ids)
             b.field_int("goldAcquired", 0)
             b.field_int("platinumAcquired", 0)
@@ -18816,14 +18890,26 @@ class HCPHandler(ProfileStreamMixin):
                 f"    Sent OpenChest response ({len(card_template_ids)} cards, "
                 f"{len(dw_bytes)}b)")
             # OpenChestResponse only drives the reward display.  Collection
-            # cards and the consumed inventory item arrive through the normal
-            # profile events, just as they do for the other pack-opening
-            # paths.
-            if reward_card_bits:
-                self._send_cards_chunk(reward_card_bits)
-            for inventory_id, template_guid in opened_inventory_items:
-                self._send_inventory_updated(
-                    template_guid, inventory_id, quantity=0)
+            # cards, equipment/Stardust rewards and the consumed chest entry
+            # arrive through the normal profile events, just as they do for the
+            # other pack-opening paths.
+            if summary:
+                if summary["cards"]:
+                    self._send_cards_chunk(summary["cards"])
+                for template_guid, item_uid, quantity in summary["inventory_updates"]:
+                    self.push_inventory_to_client(
+                        qty=quantity, template_guid=template_guid,
+                        item_id=item_uid)
+                for template_guid, chest_uid, remaining in summary["opened"]:
+                    if remaining:
+                        # An inventory chest can be a stack; keep the entry
+                        # with its authoritative remaining count.
+                        self.push_inventory_to_client(
+                            qty=remaining, template_guid=template_guid,
+                            item_id=chest_uid)
+                    else:
+                        self._send_inventory_updated(
+                            template_guid, chest_uid, quantity=0)
 
         # --- Friend / Social ---
         elif data_type == 2149:

@@ -475,6 +475,18 @@ def db_open_chest(chest_db_id, conn=None):
         connection.commit()
 
 
+def db_chest_template(template_guid, conn=None):
+    """Return the authored metadata for one chest template.
+
+    ``chest_templates`` is the Records-derived table of every
+    ``InventoryTreasureChest`` definition, so it is the authority for deciding
+    whether an inventory item is a chest the fixed client can open.
+    """
+    return _profile_connection(conn).execute(
+        "SELECT guid, name, set_guid, chest_type, spin_type, promotional_id "
+        "FROM chest_templates WHERE guid=?", (template_guid,)).fetchone()
+
+
 def db_get_unopened_chests(user_id, conn=None):
     return _profile_connection(conn).execute(
         "SELECT id, template_guid FROM treasure_chests "
@@ -549,6 +561,41 @@ def db_consume_inventory(user_id, template_guid, quantity, conn=None):
     if conn is None:
         connection.commit()
     return _row_value(row, "client_item_uid", 2) or 0, remaining
+
+
+def db_inventory_item_by_client_uid(user_id, client_item_uid, conn=None):
+    """Return the inventory row a client addresses by its item UID."""
+    return _profile_connection(conn).execute(
+        "SELECT id, template_guid, quantity, client_item_uid "
+        "FROM player_inventory WHERE user_id=? AND client_item_uid=? "
+        "ORDER BY id LIMIT 1",
+        (user_id, int(client_item_uid))).fetchone()
+
+
+def db_consume_inventory_row(row_id, quantity=1, conn=None):
+    """Consume quantity from one inventory row; returns the remaining count.
+
+    Chest opening addresses a single inventory entry (its client UID), so it
+    must consume by row: several entries of the same template can coexist with
+    different client UIDs.
+    """
+    connection = _profile_connection(conn)
+    row_id = int(row_id)
+    row = connection.execute(
+        "SELECT quantity FROM player_inventory WHERE id=?", (row_id,)).fetchone()
+    if not row:
+        return 0
+    remaining = int(_row_value(row, "quantity", 0) or 0) - int(quantity)
+    if remaining > 0:
+        connection.execute(
+            "UPDATE player_inventory SET quantity=? WHERE id=?",
+            (remaining, row_id))
+    else:
+        connection.execute("DELETE FROM player_inventory WHERE id=?", (row_id,))
+        remaining = 0
+    if conn is None:
+        connection.commit()
+    return remaining
 
 
 def db_next_inventory_client_uid(user_id, conn=None):
