@@ -50,8 +50,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Read base version
+        id: base_version
+        run: echo "version=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Mark image version as official
-        run: printf '%s-official\n' "$(tr -d '\r\n' < VERSION)" > VERSION
+        run: printf '%s-official\n' "${{ steps.base_version.outputs.version }}" > VERSION
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,6 +84,7 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ steps.version.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.base_version.outputs.version }},enable={{is_default_branch}}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
