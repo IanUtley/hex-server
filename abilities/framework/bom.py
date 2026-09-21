@@ -2411,11 +2411,12 @@ def _queue_free_played_card(game, session, db, handler, pl_t, ai_t, bstate,
     if surfaced_from_underground:
         # A troop that untunnels has Speed for the turn it surfaces.  Persist
         # this as a temporary instance attribute so targeting, attack-option
-        # generation, combat validation, and CardUpdated all agree; the
-        # normal end-turn expiry clears it.
+        # generation, combat validation, and CardUpdated all agree.  Surface
+        # resolves at StartTurn, so record the EndTurn boundary rather than
+        # letting the Prep that follows in the same turn expire the grant.
         db_add_temporary_attributes(
             session.session_id, card_uid, game_engine.ECardAttributes.Speed,
-            conn=db)
+            conn=db, owner_id=owner_id, boundary="end_turn")
         db.commit()
         # Reese's typed replacement is granted by the authored Underground ->
         # CastSpells transition. It must not be active while he is buried.

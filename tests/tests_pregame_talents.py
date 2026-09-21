@@ -9,10 +9,12 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 GREAT_SPORE_ABILITY = "9f000616-e866-ef3c-efa6-8b85b6079e80"
 ZODIAC_ABILITY = "11483a8a-a568-ce6b-0d03-8d14ae49a373"
 ZODIAC_BY_MONTH = {

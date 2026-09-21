@@ -10,6 +10,12 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 
 from abilities.framework.condition_engine import (
@@ -19,10 +25,6 @@ from abilities.framework.condition_engine import (
 )
 from abilities.framework.targeting import evaluate_card_filter
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 SCRIVENER = "e6e77180-238a-a5db-08da-16f07cb67836"
 ANGEL = "0d22faf5-a934-0983-ca9d-9d0a11636891"

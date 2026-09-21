@@ -13,14 +13,16 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import campaign
 from campaign_fixtures import seed_campaign_fixtures
 
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(__file__), "..", "hconnect.db"),
-)
 SAVAGE_LORD = "ab77df1e-5f13-471b-80e7-b7b4824ca280"
 CORRUPT_DRYAD = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
 GNASH_BRIDGES = "3cf073b0-47fd-4911-953a-d86902890459"
@@ -365,16 +367,36 @@ def test_az1_unfinished_encounter_does_not_reveal_outgoing_paths():
         assert "Path_Node003_Node004" not in pdata["locked_paths"]
         assert "Path_Node003_Node007" not in pdata["locked_paths"]
 
-        # A failed/conditional result is retryable and also opens the paths.
+        # A concede must leave an encounter incomplete.  Conditional scenes
+        # may be retryable after an unsuccessful *win*, but a loss cannot
+        # promote this node to that state or expose paths beyond it.
+        state["ActiveEncounterGuid"] = locations["Node003"]["encounter"]
+        state["ALoc"] = "Dunnwood"
         locations["Node003"].update({
-            "completed": False, "repeatable": True, "autostart": False,
+            "type": "Encounter", "completed": False,
+            "repeatable": False, "autostart": True,
         })
-        pdata["failed_nodes"] = ["Node003"]
-        campaign._az1_reveal_neighbors(db, state, "Node003")
-        assert locations["Node004"]["visible"] is True
-        assert locations["Node007"]["visible"] is True
-        assert "Path_Node003_Node004" not in pdata["locked_paths"]
-        assert "Path_Node003_Node007" not in pdata["locked_paths"]
+        locations["Node004"].update({"visible": False, "enabled": False})
+        locations["Node007"].update({"visible": False, "enabled": False})
+        pdata["failed_nodes"] = []
+        pdata["unlocked_nodes"] = []
+        pdata["quest_reveal_nodes"] = []
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+
+        _camp_id, after_loss = campaign._apply_gameend(db, area_id, False)
+        after_locations = {
+            item["Data"].get("node"): item["Data"]
+            for item in after_loss["VisLocs"]
+        }
+        after_data = after_loss["PublicState"]["Data"]
+        assert after_locations["Node003"]["completed"] is False
+        assert after_locations["Node003"]["repeatable"] is False
+        assert after_locations["Node004"]["visible"] is False
+        assert after_locations["Node007"]["visible"] is False
+        assert "Path_Node003_Node004" in after_data["locked_paths"]
+        assert "Path_Node003_Node007" in after_data["locked_paths"]
     finally:
         db.close()
         os.unlink(path)

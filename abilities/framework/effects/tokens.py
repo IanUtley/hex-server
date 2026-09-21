@@ -116,6 +116,7 @@ def _replacement_token_guid(db, session_id, owner_id, token_guid, bstate,
         return token_guid
     from pvp_db import (db_cards_in_zones_with_abilities,
                         db_card_mutation_field)
+    from rules_port.creation_effects import replacement_filter
     rows = db_cards_in_zones_with_abilities(
         session_id, int(owner_id or 0), ("warzone", "underground"), conn=db)
     for card_uid, abilities_json in rows:
@@ -134,12 +135,11 @@ def _replacement_token_guid(db, session_id, owner_id, token_guid, bstate,
             if not int(attrs.get(attribute, 0) or 0) or \
                     str(token_guid).lower() not in linked_templates:
                 continue
-            robot_filter = {
-                "_t": "Game.Shared.Mechanics.Cards.Filters.IsSubType",
-                "m_SubType": "Robot",
-            }
+            substitute_filter = replacement_filter(attribute)
+            if substitute_filter is None:
+                continue
             candidates = _random_template_guids(
-                db, robot_filter, source_uid, owner_id, bstate)
+                db, substitute_filter, source_uid, owner_id, bstate)
             if candidates:
                 return random.choice(candidates)
     return token_guid

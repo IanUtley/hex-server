@@ -4,6 +4,10 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from rules_port.sql_capture import capture_session, event_capture, transaction_capture
 
 

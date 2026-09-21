@@ -198,12 +198,34 @@ class PvpRuntimeFacts:
         cost = self._pvp.db_card_template_field(template_guid, "cost") or 0
         return max(0, int(cost or 0))
 
+    def _effective_attributes(self, card_uid, stored) -> int:
+        """Resolve the attribute bits every combat keyword predicate reads.
+
+        ``RuntimeCard.attributes`` is only ever tested for combat keywords
+        (Speed, CantAttack, Defensive, FirstStrike, CantBlock), so it must be
+        the same effective projection that builds the attack/block option
+        lists and applies temporary grants.  Reading the instance column alone
+        rejected a troop that surfaced this turn — it carries Speed as a
+        temporary attribute — after the client had been offered the attack.
+        """
+        resolver = getattr(self._pvp, "db_game_card_effective_attributes", None)
+        if callable(resolver):
+            return int(resolver(self.session_id, int(card_uid),
+                                self.battle_state) or 0)
+        if self.battle_state.get("_rules_port_attached"):
+            raise RuntimeError(
+                "RulesPort runtime facts require the effective-attribute facade")
+        # Focused test doubles and older non-battle callers project the
+        # instance column until they expose the facade.
+        return int(stored or 0)
+
     def get_card(self, card_id) -> RuntimeCard | None:
         location, row = self._location_row(card_id)
         if row is None:
             return None
         card_uid, template_guid, owner, type_name, state, abilities, attributes = row
         cost = self._effective_cost(card_uid, template_guid)
+        attributes = self._effective_attributes(card_uid, attributes)
         try:
             ability_ids = tuple(json.loads(abilities or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -351,11 +373,59 @@ class PvpRuntimeFacts:
             if attached is not None and guid not in {
                     str(value).lower() for value in attached}:
                 return False
+            if self.champion_ability_uses_exhausted(
+                    source_id, ability_graph(DEFAULT_RECORD_STORE, guid)):
+                return False
             from pvp_db import db_champion_ability_costs, db_charge_ability_cost
             return (db_champion_ability_costs(guid) is not None or
                     db_charge_ability_cost(guid) is not None)
         except Exception:
             return False
+
+    # ── champion power usage (m_UsesPerGame / ONE-SHOT) ────────────────────
+    #
+    # A champion power belongs to a synthetic SessionCardId with no
+    # ``game_cards`` row, so ``card_uses`` cannot hold its per-game count the
+    # way an ordinary card ability does.  Keep it in the shared battle state
+    # next to the champion counters, so Practice/PvE and tournament PvP gate
+    # and spend a ONE-SHOT by the same rule.
+
+    def _champion_power_key(self, source_card_id, graph):
+        """Return the usage key for a champion power, else None."""
+        guid = str(getattr(graph, "guid", "") or "").lower()
+        if not guid:
+            return None
+        try:
+            source = int(getattr(source_card_id, "uid64", source_card_id))
+        except (TypeError, ValueError):
+            return None
+        from .runtime_helpers import champion_uids_by_owner
+        champions = champion_uids_by_owner(self, self.battle_state)
+        if source not in set(champions.values()):
+            return None  # an ordinary card keeps its own card_uses record
+        return guid
+
+    def champion_ability_uses_exhausted(self, source_card_id, graph) -> bool:
+        """Whether an authored ``m_UsesPerGame`` champion power is spent."""
+        key = self._champion_power_key(source_card_id, graph)
+        if key is None:
+            return False
+        limit = int(getattr(getattr(graph, "costs", None),
+                            "uses_per_game", 0) or 0)
+        if limit <= 0:
+            return False
+        used = int((self.battle_state.get("champion_ability_uses") or {}).get(
+            key, 0) or 0)
+        return used >= limit
+
+    def consume_champion_ability_use(self, source_card_id, graph) -> int:
+        """Record one activation of an authored (possibly limited) power."""
+        key = self._champion_power_key(source_card_id, graph)
+        if key is None:
+            return 0
+        uses = self.battle_state.setdefault("champion_ability_uses", {})
+        uses[key] = int(uses.get(key, 0) or 0) + 1
+        return uses[key]
 
     def can_pay_ability_cost(self, ability) -> bool:
         """Check authored activation costs before an ability enters the chain.
@@ -441,6 +511,12 @@ class PvpRuntimeFacts:
                 # Champion SessionCardIds are synthetic (not game_cards
                 # rows), so ``defender`` is None for the normal face.
                 (defender is None or defender.owner_id != attacker.owner_id)):
+            return False
+        # CardCounterTemplate "Stealth": while the defending champion holds a
+        # stealth counter, opposing troops can't attack (client built-in
+        # StealthCantAttackAbilityTemplateId).
+        from .stealth import defending_champion_is_stealthed
+        if defending_champion_is_stealthed(self, attacker, defender):
             return False
         # C# Card.CanAttack: a Defensive troop cannot attack unless it carries
         # the IgnoresDefensive int-attribute.

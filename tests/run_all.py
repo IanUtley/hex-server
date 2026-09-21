@@ -61,30 +61,11 @@ def _create_baseline(target_path):
         _snapshot(source_path, target_path)
         return f"snapshot={source_path}"
 
-    previous_db_path = os.environ.get("HEX_DB_PATH")
-    os.environ["HEX_DB_PATH"] = str(target_path)
-    import static
+    # One owner for what a test baseline contains: the same builder serves
+    # direct test runs (tests/test_db.py) and this suite.
+    from tests.test_db import build_baseline
 
-    db = sqlite3.connect(str(target_path), timeout=30.0)
-    try:
-        static.ensure_schema(db)
-        # A small number of protocol tests inspect an authored deck row by
-        # ID. Keep that identity synthetic and metadata-only; never copy the
-        # developer's decks or collection into the test baseline.
-        db.execute(
-            "INSERT OR IGNORE INTO decks "
-            "(id,user_id,deck_name,cards,pvp_champion_guid) "
-            "VALUES (4,0,?,?,?)",
-            ("test-lifesteal", "[]",
-             "0c0ba840-cba0-4e33-a379-4d16aeaf9a73"),
-        )
-        db.commit()
-    finally:
-        db.close()
-        if previous_db_path is None:
-            os.environ.pop("HEX_DB_PATH", None)
-        else:
-            os.environ["HEX_DB_PATH"] = previous_db_path
+    build_baseline(target_path)
     return "fresh static database"
 
 

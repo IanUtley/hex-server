@@ -6,7 +6,40 @@ import json
 import re
 
 
-def _replacement_abilities(db, ability_guids):
+# The client names the substitute in the IntAttr itself, so the replacement
+# filter is keyed on that authored attribute rather than on a card name or
+# game text.  Reese the Crustcrawler's Surface grant makes one of your effects
+# create a random Robot instead of a Worker Bot.
+_REPLACEMENT_FILTERS = {
+    "CreateRandomRobotInsteadOfWorkerBotIfThisIsInPlay": {
+        "_t": "Game.Shared.Mechanics.Cards.Filters.IsSubType",
+        "m_SubType": "Robot",
+    },
+}
+
+
+def replacement_filter(attribute):
+    """Return the Records card filter an authored replacement IntAttr creates."""
+    return _REPLACEMENT_FILTERS.get(str(attribute))
+
+
+# The replaced template is named by the client's ``<a data=GUID>`` card link
+# inside the ability's game text, so the reference is read from the graph's
+# strings rather than from a parsed dict field.
+_CARD_LINK = re.compile(
+    r"data=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+
+
+def replacement_abilities(db, ability_guids):
+    """Return each authored creation replacement on *ability_guids*.
+
+    Each entry is ``(int_attribute, linked_template_guids)``: a permanent
+    CardModifier that sets an IntAttr, plus the templates that IntAttr replaces
+    (named in the ability's Records graph).  Both halves are authored data, so
+    the summon boundary and the Surface activation read them from here rather
+    than keying off a card name or game text.
+    """
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from pvp_db import db_template_exists
     result = []
@@ -31,6 +64,10 @@ def _replacement_abilities(db, ability_guids):
                 elif isinstance(value, list):
                     for child in value:
                         walk(child)
+                elif isinstance(value, str):
+                    for match in _CARD_LINK.findall(value):
+                        if db_template_exists(match.lower(), conn=db):
+                            linked.append(match.lower())
             walk(graph.source.to_dict())
             result.append((attr, tuple(dict.fromkeys(linked))))
     return result
@@ -53,7 +90,7 @@ def activate_creation_replacements(db, session_id, card_uid):
     except (TypeError, ValueError, json.JSONDecodeError):
         template = []
     combined = list(dict.fromkeys(current + [str(value).lower() for value in template]))
-    replacements = _replacement_abilities(db, combined)
+    replacements = replacement_abilities(db, combined)
     if not replacements:
         return False
     try:

@@ -189,7 +189,7 @@ def _push_card_in_zone(game, session, db, handler, pl_t, ai_t, bstate,
 
 
 def _create_matching_target(game, session, db, handler, pl_t, ai_t, bstate,
-                            target, count, collection):
+                            target, count, collection, deck_location=""):
     """Create copies of a target template using the normal token projection."""
     from pvp_db import (db_card_source_info, db_copy_template_payload,
                         db_next_game_card_row_id, db_insert_generated_card)
@@ -213,6 +213,13 @@ def _create_matching_target(game, session, db, handler, pl_t, ai_t, bstate,
             tpl[2], next_id, conn=db, owner_user_id=owner_id,
             original_template_guid=tpl_guid, gems=0)
         created.append(int(uid))
+    # Deck copies follow the client's Unknown-location rule: a random slot,
+    # with the untouched cards keeping their existing relative order.
+    if (loc == "deck" and created and
+            str(deck_location or "").lower() in ("", "unknown", "random")):
+        from pvp_db import db_randomly_insert_deck_cards
+        db_randomly_insert_deck_cards(
+            session.session_id, owner_id, created, connection=db)
     db.commit()
     for uid in created:
         _push_card_in_zone(game, session, db, handler, pl_t, ai_t, bstate,

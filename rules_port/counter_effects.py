@@ -21,20 +21,17 @@ def _counter_guid(db, name):
 
 
 def _champion_owner(context, uid):
-    if context.bstate.get("pvp"):
-        for owner, champion in (context.bstate.get("champ_map") or {}).items():
-            if int(champion) == int(uid):
-                return int(owner)
-        return None
-    for attr, owner in (("_player_champ_scid", context.player_uid),
-                        ("_ai_champ_scid", context.ai_uid)):
-        champion = getattr(context.handler, attr, None)
-        try:
-            if champion is not None and int(champion.uid.uid64) == int(uid):
-                return int(owner)
-        except (AttributeError, TypeError, ValueError):
-            continue
-    return None
+    """Return the controller id owning a champion SessionCardId, else None.
+
+    Champion counters live in the persisted battle state keyed by champion
+    identity, and every later projection (owner UID, template, health) is
+    derived from this owner id.  The controller must therefore come from the
+    PvP champion map or the PvE handler fields; converting a participant UID
+    with ``int()`` is undefined for ``game_engine.UID`` and previously raised
+    TypeError, dropping every champion counter into the card path.
+    """
+    from .runtime_helpers import champion_owner_id
+    return champion_owner_id(context.handler, context.bstate, uid)
 
 
 def _secret(guid):
@@ -55,7 +52,14 @@ def _project(context, uid, owner, guid, old, new, champion=False):
         template = (getattr(context.handler, "_player_champ_guid", None)
                     if owner == context.bstate.get("pids", [owner])[0]
                     else getattr(context.handler, "_ai_champ_guid", None))
-        collection = game_engine.ECardCollections.Champions
+        # The champion HUD reads its effect icons (Stealth, Burning, Dazed,
+        # Vulnerable) from the cached CardRepresentation counters, and the
+        # client only stores those from a CardUpdated.  Champions sit in the
+        # cache as collection None (the battle-start seed), and a Champions
+        # collection here would be both suppressed by ``push_card_updated``
+        # and read as a CardMoved, so keep the collection the client already
+        # has while carrying the new counters.
+        collection = game_engine.ECardCollections.None_
         card_type = game_engine.ECardTypes.Champion
         health = int(context.bstate.get(
             ((context.bstate.get("pvp_health_map") or {}).get(owner) or

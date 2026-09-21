@@ -137,14 +137,27 @@ def _live_has_legal_blockers(session):
     from .runtime_adapter import _raw_player_id
     from pvp_db import db_warzone_troop_attributes
     state = getattr(facts, "battle_state", {}) or {}
+    owner_resolver = getattr(facts, "_resolved_owner_id", None)
+    defenders = getattr(session, "defending_player_ids", None)
+    participants = (defenders() if callable(defenders)
+                    else getattr(session, "player_ids", ()))
     for combat in session.combat_manager.combats:
         attacker = combat.attacker
         attacker_uid = int(getattr(attacker, "session_card_id",
                                    getattr(attacker, "uid", 0)) or 0)
         if not attacker_uid:
             continue
-        for participant in session.player_ids:
-            raw = _raw_player_id(participant)
+        for participant in participants:
+            # Practice/PvE cards are owned by the profile ID (human) or 0
+            # (AI), while native participants are typed service UIDs. Reuse
+            # the runtime adapter's ownership mapping so phase construction
+            # sees the same cards as block validation and option projection.
+            try:
+                raw = (owner_resolver(participant)
+                       if callable(owner_resolver)
+                       else _raw_player_id(participant))
+            except (TypeError, ValueError):
+                continue
             try:
                 rows = db_warzone_troop_attributes(session_id, raw, conn=None)
             except Exception:

@@ -225,6 +225,18 @@ class NativeEffectBackend:
             "resolving_owner_id", "resolving_target_uid",
             "resolving_responsible_player_id", "resolving_effect_order",
             "ability_target_map", "_rules_port_native_effect")}
+        # An ability's list attrs (``VoidedCards`` and friends) belong to one
+        # resolution: a nested child must see its parent's list, and a
+        # finished resolution must not leave its list behind for the next
+        # activation to sum a second time.  Mirrors the legacy resolver's
+        # save/restore of ``ability_lists``.
+        previous_lists = battle_state.get("ability_lists")
+        if isinstance(previous_lists, dict):
+            # Copy the flat list values too: restoring the dict alone would
+            # keep the lists this resolution appended to.
+            previous_lists = {
+                key: (list(value) if isinstance(value, list) else value)
+                for key, value in previous_lists.items()}
         battle_state["resolving_ability"] = ability.ability_template_id
         battle_state["resolving_source_uid"] = ability.source_uid
         battle_state["resolving_owner_id"] = int(
@@ -248,6 +260,23 @@ class NativeEffectBackend:
                 }
                 return item.get(name, item.get(aliases.get(name, ""), default))
             return default
+
+        def condition_passes(effect_value, target_value):
+            """Evaluate one effect-instance condition the way C# does."""
+            condition_id = str(field(effect_value, "condition_guid", ""))
+            if not condition_id or condition_id == "0" * 36:
+                return True
+            condition_context = ConditionContext(
+                db, session, battle_state,
+                event_type="AbilityEffectEvent",
+                ability_source_uid=ability.source_uid,
+                ability_source_owner_id=ability.responsible_player_id,
+                trigger_uid=target_value,
+                pl_t=player_uid, ai_t=ai_uid,
+                event_int_attribute=None)
+            return bool(evaluate_effect_condition(
+                db, condition_id, condition_context))
+
         try:
             effects = ability.ordered_effects
             start = int(resume_from_order or 0)
@@ -281,17 +310,30 @@ class NativeEffectBackend:
                         if kind == "AbilitySourceCardTargetTemplate":
                             target_values = (ability.source_uid,)
                         elif kind.endswith("PlayerTargetTemplate"):
-                            # Player targets are typed identities, not card
-                            # filters.  Do not send a null card-filter spec
-                            # through the card-target evaluator (common for
-                            # "You" targets such as token summons).
-                            target_values = (ability.responsible_player_id,)
+                            # A PlayerTargetTemplate identifies a champion in
+                            # the client session, not the controller's raw
+                            # player id.  In PvE the AI controller is ``0``;
+                            # preserving that value made a "You get ..."
+                            # GrantAbility look for card UID 0 instead of the
+                            # AI champion's synthetic SessionCardId.
+                            from .targeting import implicit_champion_target
+                            champion = implicit_champion_target(
+                                db, session, handler, battle_state,
+                                opposing=False)
+                            target_values = ((champion,) if champion is not None
+                                             else ())
                         elif (int(ability.responsible_player_id or 0) == 0 and
-                              kind.endswith("AbilityTargetTemplate")):
-                            # Server-driven AI activations still need the
-                            # same authored target pool as a client picker.
-                            # Choose deterministically from native legal
-                            # targets; do not fall back to the parent source.
+                              kind.endswith("AbilityTargetTemplate")
+                              and not target_spec.is_auto):
+                            # Server-driven AI activations of a player-input
+                            # target need the same authored target pool as a
+                            # client picker.  Choose deterministically from
+                            # native legal targets; do not fall back to the
+                            # parent source.  Authored auto targets are not a
+                            # picker: they resolve to their whole legal pool
+                            # below (truncating "each champion" to one card
+                            # made an AI-owned variable such as Ghastly
+                            # Exchange bury only the human's deck).
                             both_players = str(
                                 target_spec.player_filter or "").lower() not in {
                                     "self", "you", "controller"}
@@ -327,6 +369,21 @@ class NativeEffectBackend:
                             target_values = _list_target_values(
                                 battle_state, ability, kind,
                                 ability.source_uid)
+                            if not target_values:
+                                # C# disables an effect whose authored list
+                                # target enumerates nothing; it never falls
+                                # back to the source card.  The instance still
+                                # counts as applied when its condition holds,
+                                # matching the client's m_WasApplied
+                                # bookkeeping for contingent effects.
+                                applied[instance_id] = condition_passes(
+                                    effect, None)
+                                for key in ("resolving_target_uid",
+                                            "player_mod_target",
+                                            "player_spell_target",
+                                            "grant_target"):
+                                    battle_state.pop(key, None)
+                                continue
                         elif kind == "SecondaryTargetTemplate":
                             # C# SecondaryTargetTemplate: the input cards are
                             # the resolved outputs of the contingent effect's
@@ -484,20 +541,9 @@ class NativeEffectBackend:
                         game, session, db, handler, player_uid, ai_uid,
                         battle_state, effect_guid, effect_param,
                         ability=ability)
-                    condition_id = str(field(effect, "condition_guid", ""))
-                    if condition_id and condition_id != "0" * 36:
-                        condition_context = ConditionContext(
-                            db, session, battle_state,
-                            event_type="AbilityEffectEvent",
-                            ability_source_uid=ability.source_uid,
-                            ability_source_owner_id=ability.responsible_player_id,
-                            trigger_uid=target,
-                            pl_t=player_uid, ai_t=ai_uid,
-                            event_int_attribute=None)
-                        if not evaluate_effect_condition(
-                                db, condition_id, condition_context):
-                            applied[instance_id] = False
-                            continue
+                    if not condition_passes(effect, target):
+                        applied[instance_id] = False
+                        continue
                     result = native_effect(effect_type, effect_context, effect)
                     if result is None:
                         raise RuntimeError(
@@ -515,6 +561,10 @@ class NativeEffectBackend:
                     battle_state.pop(key, None)
                 else:
                     battle_state[key] = value
+            if previous_lists is None:
+                battle_state.pop("ability_lists", None)
+            else:
+                battle_state["ability_lists"] = previous_lists
 
 
 class PortAbilityResolver:
@@ -759,14 +809,36 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
                 break
     old_source = battle_state.get("resolving_source_uid")
     old_owner = battle_state.get("resolving_owner_id")
+    old_trigger_target = battle_state.get("resolving_trigger_target_uid")
     battle_state["resolving_source_uid"] = source_uid
     battle_state["resolving_owner_id"] = owner_id
+    # C# keeps the triggering event on the ability instance, so a target
+    # template of kind AbilityTriggerCardTargetTemplate ("TriggerSource")
+    # still resolves the event's card when the trigger waits on the chain for
+    # priority instead of resolving inline.
+    if target is None:
+        battle_state.pop("resolving_trigger_target_uid", None)
+    else:
+        battle_state["resolving_trigger_target_uid"] = int(target)
     try:
         state = resolve_port_ability(
             handler, game, session, db, player_uid, ai_uid, battle_state,
             guid, source_uid, owner_id, target_map=target_map,
             instance_id=int(item.get("instance_id", 1)))
+        if not battle_state.get("resolution_paused"):
+            # A queued trigger resolves here (mulligan/setup drains, the port's
+            # chain resolver, and the PvP projections).  Consume an authored
+            # ONE-SHOT once its effect has applied, exactly like the inline
+            # trigger path, so the card loses the used ability on both sides.
+            from .triggers import consume_one_shot_trigger
+            consume_one_shot_trigger(
+                handler, session, game, db, player_uid, ai_uid, battle_state,
+                guid, source_uid)
         return state.name if hasattr(state, "name") else str(state)
     finally:
         battle_state["resolving_source_uid"] = old_source
         battle_state["resolving_owner_id"] = old_owner
+        if old_trigger_target is None:
+            battle_state.pop("resolving_trigger_target_uid", None)
+        else:
+            battle_state["resolving_trigger_target_uid"] = old_trigger_target

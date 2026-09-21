@@ -203,6 +203,13 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         graph = self.graph_loader(str(payload["ability_template_id"]))
         if graph is None:
             return False
+        facts = getattr(self.port, "runtime_facts", None)
+        exhausted = getattr(facts, "champion_ability_uses_exhausted", None)
+        if callable(exhausted) and exhausted(int(payload["source_card_id"]),
+                                             graph):
+            # ONE-SHOT (m_UsesPerGame) champion powers are spent once; a
+            # replayed transaction must not resolve a second counter.
+            return False
         if (getattr(graph, "additional_cost_targets", ()) and
                 self.activation_compatibility is not None):
             return bool(self.activation_compatibility(transaction))
@@ -240,6 +247,9 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         # resolve and silently drops the chain item.
         if not self.port.pay_ability_cost(ability):
             return False
+        consume = getattr(facts, "consume_champion_ability_use", None)
+        if callable(consume):
+            consume(int(payload["source_card_id"]), graph)
         activation = ability.activation.as_dict()
         descriptor = {
             "kind": "ability",

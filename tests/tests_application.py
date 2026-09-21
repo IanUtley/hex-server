@@ -8,6 +8,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from application import ApplicationCommandDispatcher
 from application.commands import (ClaimMailCommand, DeleteMailCommand,
                                   JoinSessionCommand, RemoveSessionCommand,
@@ -54,6 +58,15 @@ def test_typed_payload_recovers_objfmt_nested_champion_activation():
     assert payload["ability_template_id"] == \
         "2f6e6655-df57-5028-ba42-01067242f4be"
     assert payload["activation_data"] == {}
+
+
+def test_player_transaction_classifier_recognizes_untyped_manual_activation():
+    """Mono can omit the concrete class after a complete activation envelope."""
+    command = classify_player_transaction(
+        b"m_AbilityActivationData;SourceCardId;m_UID64;0101000000000000;"
+        b"AbilityTemplateId;m_Guid;7cc301b8-568a-05f2-d7c2-5414f9e9d6ad;")
+    assert command.is_ability_activate is True
+    assert command.is_activate_triggered_abilities is False
 
 
 def test_typed_payload_extractor_reads_only_named_decoded_fields():
@@ -207,6 +220,9 @@ def test_typed_payload_extracts_combat_declarations():
         "m_DefenseDeclarations": [{"AttackerId": {"m_UID64": 31},
                                     "DefendingCardIds": [{"m_UID64": 41}]}],
     })["declarations"] == ((31, (41,)),)
+    assert typed_payload_from_decoded(defense, {
+        "m_DefenseDeclarations": [],
+    }) == {"declarations": ()}
 
 
 def test_typed_payload_extracts_turn_stops_and_auto_pass():

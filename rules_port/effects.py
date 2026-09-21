@@ -156,7 +156,7 @@ def _copy_ability(context):
 
 
 def grant_ability(context):
-    """Apply a typed ability grant to a normal session card."""
+    """Apply a typed ability grant to a session card or champion."""
     import game_engine
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from pvp_db import (db_ability_metadata_exists, db_card_grant_info,
@@ -181,6 +181,67 @@ def grant_ability(context):
         target = context.resolved_target()
     if target is None:
         return "grant: no target"
+    template = context.template_value("m_AbilityIsUnique", True)
+    unique = bool(template)
+
+    # Champions are represented in the client session by SessionCardId, but
+    # deliberately have no ``game_cards`` row.  Encounter setup cards can
+    # grant an ability to a champion (for example Cockatwice grants its
+    # opposing champion the GameStarted Taming Sphere summon), so retain
+    # those abilities on the handler's per-battle champion list.
+    profile = getattr(context.handler, "user_profile", None) or {}
+    player_owner = int(profile.get("id", 0) or 0)
+    for attr, owner in (("_player_champ_scid", player_owner),
+                        ("_ai_champ_scid", 0)):
+        champion = getattr(context.handler, attr, None)
+        try:
+            champion_uid = int(champion.uid.uid64)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if champion_uid != int(target):
+            continue
+        dynamic = getattr(context.handler,
+                          "_champion_granted_ability_guids", None)
+        if dynamic is None:
+            dynamic = context.handler._champion_granted_ability_guids = {}
+        abilities = dynamic.setdefault(champion_uid, [])
+        added = []
+        for guid in granted_values:
+            if (not db_ability_metadata_exists(guid, conn=context.db) and
+                    ability_graph(DEFAULT_RECORD_STORE, guid) is None):
+                continue
+            if unique and guid in abilities:
+                continue
+            abilities.append(guid)
+            added.append(guid)
+        # A hidden encounter setup card can grant a GameStarted ability while
+        # the event is already traversing the opposing side.  That champion's
+        # normal discovery pass has then finished, so run the newly granted
+        # authored trigger now instead of losing its one setup opportunity.
+        # A permanent CardModifier with a card-filter target is a continuous
+        # champion aura.  Resolve its current board effect at the same point;
+        # later CardEnteredZoneEvent dispatches keep that aura current.
+        if (added and context.bstate.get("event_type") ==
+                "GameStartedEvent"):
+            from rules_port.resolution import resolve_port_ability
+            for guid in added:
+                graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+                continuous_card_modifier = bool(graph and not graph.trigger_event_type and
+                    any(effect.concrete_type == "CardModifierAbilityEffectTemplate" and
+                        str(effect.duration).lower() == "permanent"
+                        for effect in graph.effects) and
+                    any(target.card_filter for target in graph.targets))
+                if (graph is not None and
+                    (str(graph.trigger_event_type or "").rsplit(
+                        ".", 1)[-1] == "GameStartedEvent" or
+                     continuous_card_modifier)):
+                    resolve_port_ability(
+                        context.handler, context.game, context.session,
+                        context.db, context.player_uid, context.ai_uid,
+                        context.bstate, guid, champion_uid, owner,
+                        target_map={})
+        return f"granted {len(added)} champion ability(s) to {hex(champion_uid)}"
+
     row = db_card_grant_info(
         context.session.session_id, int(target), conn=context.db)
     if not row:
@@ -189,8 +250,6 @@ def grant_ability(context):
         abilities = json.loads(row[0] or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         abilities = []
-    template = context.template_value("m_AbilityIsUnique", True)
-    unique = bool(template)
     added = []
     for guid in granted_values:
         if (not db_ability_metadata_exists(guid, conn=context.db) and

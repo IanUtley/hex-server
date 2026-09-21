@@ -158,15 +158,29 @@ def queue_surfaces(context, owner_id):
                        TUNNELING_COUNTER_GUID, 0, "set")
         instance_id = int(context.bstate.get("_next_instance_id", 1))
         context.bstate["_next_instance_id"] = instance_id + 1
-        chain.push(context.bstate, {
+        descriptor = {
             "kind": "ability", "ability_guid": SURFACE_ABILITY_GUID,
             "source_uid": int(card_uid), "target_uid": int(card_uid),
             "source_owner_uid": owner_id, "instance_id": instance_id,
-        })
+        }
+        chain.push(context.bstate, descriptor)
         scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
         context.game.push_ability_on_chain(
             scid, game_engine.ResourceId.from_str(SURFACE_ABILITY_GUID),
             ability_instance_id=instance_id, target_card_ids=[scid],
             ignores_chain=False)
+        # The native scheduler owns chain ordering and the response window;
+        # the compatibility descriptor above is only its durable projection.
+        # Registering nowhere else left the Surface on the client's chain with
+        # no native item to resolve, so the buried card never surfaced even
+        # though the counter had already been spent.
+        port = getattr(context.session, "_rules_port_session", None)
+        register = getattr(port, "queue_projected_chain", None)
+        if callable(register):
+            # C# responds to an authored chain item with the active player
+            # first; the Surface belongs to the player whose turn it is.
+            register(descriptor, owner_id,
+                     first_player_id=(getattr(port, "active_player_id", None)
+                                      or owner_id))
         queued.append(int(card_uid))
     return queued

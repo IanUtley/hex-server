@@ -11,6 +11,8 @@ from __future__ import annotations
 import ast
 import json
 import math
+import threading
+from contextlib import contextmanager
 
 import game_engine
 
@@ -21,13 +23,70 @@ def _empty_deltas():
             "card_properties": {}}
 
 
-def _static_abilities(db, session_id, card_uid):
+_EMPTY_TARGET_SET = frozenset()
+_MISSING = object()
+# Continuous leaf properties that change a card's projected view (thresholds
+# and subtype) rather than its combat numbers.
+_CARD_PROPERTY_LEAVES = frozenset({"cardthreshold", "subtype"})
+
+
+class _ProjectionCache:
+    """Memo of the target-independent inputs of one static projection.
+
+    A single ``effective_stats``/``effective_cost``/``effective_attributes``
+    call re-derives the same continuous modifiers many times: every projected
+    target card asks every source card for its authored leaves, every aura
+    leaf asks its ability for the authored target template, and every
+    candidate card in that template's pool projects its own threshold/subtype
+    view.  Those inputs cannot change while one synchronous projection runs,
+    so they are memoized here for the lifetime of the outermost scan.
+    """
+
+    __slots__ = ("source_cards", "source_abilities", "ability_leaves",
+                 "ability_targets", "target_sets", "card_property_sources",
+                 "card_rows")
+
+    def __init__(self):
+        self.source_cards = {}
+        self.source_abilities = {}
+        self.ability_leaves = {}
+        self.ability_targets = {}
+        self.target_sets = {}
+        self.card_property_sources = {}
+        self.card_rows = {}
+
+
+_projection_local = threading.local()
+
+
+@contextmanager
+def _projection_cache():
+    """Share one :class:`_ProjectionCache` with every nested scan."""
+    cache = getattr(_projection_local, "cache", None)
+    if cache is not None:
+        yield cache
+        return
+    cache = _ProjectionCache()
+    _projection_local.cache = cache
+    try:
+        yield cache
+    finally:
+        _projection_local.cache = None
+
+
+def _static_abilities(db, session_id, card_uid, cache=None):
+    """Return the continuous abilities authored on one materialized card."""
     from pvp_db import db_card_ability_payload, db_ability_static_metadata
+    key = (int(session_id or 0), int(card_uid))
+    if cache is not None:
+        cached = cache.source_abilities.get(key)
+        if cached is not None:
+            return cached
     payload = db_card_ability_payload(session_id, int(card_uid), conn=db)
     try:
         values = json.loads(payload or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
-        return []
+        values = []
     result = []
     for value in values:
         guid = str(value).lower()
@@ -41,12 +100,21 @@ def _static_abilities(db, session_id, card_uid):
         if ("CardCreatedEvent" in str(metadata[0] or "") and
                 all(zone in raw for zone in ("Deck", "Hand", "Warzone", "Discard"))):
             result.append(guid)
+    result = tuple(result)
+    if cache is not None:
+        cache.source_abilities[key] = result
     return result
 
 
-def _static_leaves(db, ability_guid):
+def _static_leaves(db, ability_guid, cache=None):
+    """Return the continuous CardModifier leaves authored on one ability."""
     from .metadata import modifier_metadata
     from pvp_db import db_ability_effect_rows
+    cache_key = str(ability_guid or "").lower()
+    if cache is not None:
+        cached = cache.ability_leaves.get(cache_key)
+        if cached is not None:
+            return cached
     leaves = []
     for effect_guid, effect_type, raw_param in db_ability_effect_rows(
             ability_guid, conn=db):
@@ -70,6 +138,9 @@ def _static_leaves(db, ability_guid):
                         param.setdefault(key, value)
         from pvp_db import db_ability_raw_json
         leaves.append((param, db_ability_raw_json(ability_guid, conn=db) or ""))
+    leaves = tuple(leaves)
+    if cache is not None:
+        cache.ability_leaves[cache_key] = leaves
     return leaves
 
 
@@ -506,16 +577,47 @@ def _native_leaf_value(db, session_id, battle_state, source_uid, owner, param,
 
 
 def _target_matches(db, session_id, source_uid, source_owner, target_uid,
-                    ability_guid, battle_state):
+                    ability_guid, battle_state, cache=None):
+    """Whether one continuous leaf's authored target set contains ``target``."""
+    if cache is None:
+        cache = _ProjectionCache()
+    entries = _ability_target_entries(db, ability_guid, cache)
+    if entries is None:
+        # An ability with no authored target template modifies its own source.
+        return int(source_uid) == int(target_uid)
+    for template_id, self_only, both in entries:
+        if self_only:
+            if int(source_uid) == int(target_uid):
+                return True
+            continue
+        if int(target_uid) in _template_target_set(
+                db, session_id, source_owner, template_id, source_uid,
+                both, battle_state, cache):
+            return True
+    return False
+
+
+def _ability_target_entries(db, ability_guid, cache):
+    """Return ``(template_id, self_only, both_players)`` per authored target.
+
+    The template list and its game-text classification are authored data, so
+    they are resolved once per projection instead of once per projected card.
+    ``None`` means the ability authors no target template at all.
+    """
+    key = str(ability_guid or "").lower()
+    cached = cache.ability_targets.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
     from pvp_db import db_ability_target_template_ids, db_static_target_template
     payload = db_ability_target_template_ids(ability_guid, conn=db)
     if not payload:
-        return int(source_uid) == int(target_uid)
+        cache.ability_targets[key] = None
+        return None
     try:
         template_ids = json.loads(payload or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    from .targeting import legal_targets
+        template_ids = []
+    entries = []
     for template_id in template_ids:
         row = db_static_target_template(template_id, conn=db)
         if not row:
@@ -525,21 +627,43 @@ def _target_matches(db, session_id, source_uid, source_owner, target_uid,
         # abilities (including Emberleaf Duelist's attack-time Swiftstrike)
         # fail their target match and silently disappear from combat stats.
         text = str(row[1] or "").lower()
-        if "this" in text or "#self#" in text or text.strip() == "you":
-            if int(source_uid) == int(target_uid):
-                return True
-            continue
-        try:
-            both = str(row[1] or "").lower() in {"multipleplayers", "allplayers"}
-            candidates = legal_targets(
-                db, session_id, int(source_owner), template_id,
-                int(source_uid), both_players=both,
-                battle_state=battle_state)
-        except Exception:
-            continue
-        if int(target_uid) in {int(value) for value in candidates}:
-            return True
-    return False
+        entries.append((template_id,
+                        "this" in text or "#self#" in text or
+                        text.strip() == "you",
+                        text in {"multipleplayers", "allplayers"}))
+    entries = tuple(entries)
+    cache.ability_targets[key] = entries
+    return entries
+
+
+def _template_target_set(db, session_id, controller_uid, template_id,
+                         source_uid, both_players, battle_state, cache):
+    """Return the candidate uids matching one authored target template.
+
+    An aura only needs to know whether a single projected card is a legal
+    target.  Materializing the candidate pool once per projection keeps that
+    question linear in the board size instead of re-scanning (and re-projecting
+    every candidate's threshold/subtype view) for every leaf and card.
+    """
+    state = battle_state if isinstance(battle_state, dict) else {}
+    key = (int(session_id or 0), str(template_id).lower(),
+           int(controller_uid or 0), int(source_uid or 0), bool(both_players),
+           bool(state.get("_rules_port_suppress_card_properties")))
+    cached = cache.target_sets.get(key)
+    if cached is not None:
+        return cached
+    from .targeting import legal_targets
+    try:
+        candidates = legal_targets(
+            db, session_id, int(controller_uid), template_id, int(source_uid),
+            both_players=bool(both_players), battle_state=battle_state)
+    except Exception:
+        # A failing template resolves no targets, exactly as the per-leaf
+        # probe did; do not memoize it so a transient failure can retry.
+        return _EMPTY_TARGET_SET
+    result = frozenset(int(value) for value in candidates)
+    cache.target_sets[key] = result
+    return result
 
 
 class _StaticSession:
@@ -565,19 +689,67 @@ def _static_condition_matches(db, session_id, battle_state, param, source_uid,
 
 def _native_static_deltas(db, session_id, battle_state, card_uid):
     """Evaluate the supported literal continuous Records leaves natively."""
-    from pvp_db import (db_card_owner_location_position,
-                        db_cards_in_zones_with_abilities)
-    row = db_card_owner_location_position(session_id, int(card_uid), conn=db)
+    with _projection_cache() as cache:
+        return _scan_static_deltas(
+            db, session_id, battle_state, card_uid, cache)
+
+
+def _owner_static_sources(db, session_id, owner, cache):
+    """Return the uids whose continuous abilities can project onto ``owner``."""
+    from pvp_db import db_cards_in_zones_with_abilities
+    key = (int(session_id or 0), int(owner or 0))
+    cached = cache.source_cards.get(key)
+    if cached is None:
+        cached = tuple(int(uid) for uid, _abilities in
+                       db_cards_in_zones_with_abilities(
+                           session_id, int(owner),
+                           ("warzone", "underground"), conn=db))
+        cache.source_cards[key] = cached
+    return cached
+
+
+def _card_location_row(db, session_id, card_uid, cache):
+    """Return ``(owner, location, position)`` for one card, memoized per scan."""
+    from pvp_db import db_card_owner_location_position
+    key = (int(session_id or 0), int(card_uid))
+    cached = cache.card_rows.get(key, _MISSING)
+    if cached is _MISSING:
+        cached = db_card_owner_location_position(
+            session_id, int(card_uid), conn=db)
+        cache.card_rows[key] = cached
+    return cached
+
+
+def _owner_projects_card_properties(db, session_id, owner, cache):
+    """Whether any source of ``owner`` can change a card's projected view.
+
+    Only ``CardThreshold``/``SubType`` leaves feed the threshold/subtype
+    projection.  When the owner has none — the common case — projecting a
+    candidate's view is a no-op, so the pool scan skips an aura evaluation per
+    candidate card.
+    """
+    key = (int(session_id or 0), int(owner or 0))
+    cached = cache.card_property_sources.get(key)
+    if cached is not None:
+        return cached
+    cached = any(
+        str(param.get("property") or "").lower() in _CARD_PROPERTY_LEAVES
+        for source_uid in _owner_static_sources(db, session_id, owner, cache)
+        for ability_guid in _static_abilities(db, session_id, source_uid, cache)
+        for param, _raw in _static_leaves(db, ability_guid, cache))
+    cache.card_property_sources[key] = cached
+    return cached
+
+
+def _scan_static_deltas(db, session_id, battle_state, card_uid, cache):
+    row = _card_location_row(db, session_id, card_uid, cache)
     if not row:
         return _empty_deltas(), False
     owner, location, _position = row
     total = _empty_deltas()
-    sources = db_cards_in_zones_with_abilities(
-        session_id, int(owner), ("warzone", "underground"), conn=db)
-    for source_uid, _abilities_json in sources:
-        source_uid = int(source_uid)
-        for ability_guid in _static_abilities(db, session_id, source_uid):
-            for param, raw in _static_leaves(db, ability_guid):
+    for source_uid in _owner_static_sources(db, session_id, owner, cache):
+        for ability_guid in _static_abilities(db, session_id, source_uid, cache):
+            for param, raw in _static_leaves(db, ability_guid, cache):
                 literal = _native_leaf_value(
                     db, session_id, battle_state, source_uid, owner, param, raw)
                 property_name = str(param.get("property") or "").lower()
@@ -588,7 +760,7 @@ def _native_static_deltas(db, session_id, battle_state, card_uid):
                 if property_name in {"cardthreshold", "subtype"}:
                     if not _target_matches(
                             db, session_id, source_uid, int(owner),
-                            int(card_uid), ability_guid, battle_state):
+                            int(card_uid), ability_guid, battle_state, cache):
                         continue
                     if not _static_condition_matches(
                             db, session_id, battle_state, param, source_uid,
@@ -636,7 +808,7 @@ def _native_static_deltas(db, session_id, battle_state, card_uid):
                     return total, True
                 if not _target_matches(
                         db, session_id, source_uid, int(owner), int(card_uid),
-                        ability_guid, battle_state):
+                        ability_guid, battle_state, cache):
                     continue
                 try:
                     if not _static_condition_matches(
@@ -720,8 +892,15 @@ def effective_card_properties(db, session_id, battle_state, card_uid):
     previous = state.get(marker)
     state[marker] = True
     try:
-        native, _unsupported = _native_static_deltas(
-            db, session_id, state, int(card_uid))
+        props = {}
+        with _projection_cache() as cache:
+            row = _card_location_row(db, session_id, int(card_uid), cache)
+            if row and _owner_projects_card_properties(
+                    db, session_id, row[0], cache):
+                native, _unsupported = _scan_static_deltas(
+                    db, session_id, state, int(card_uid), cache)
+                props = native.get("card_properties", {}).get(
+                    int(card_uid), {}) or {}
     finally:
         if previous is None:
             state.pop(marker, None)
@@ -747,7 +926,6 @@ def effective_card_properties(db, session_id, battle_state, card_uid):
             thresholds = [int(value) for value in buffs["thresholds"]]
         if isinstance(buffs.get("subtype"), str):
             subtype = buffs["subtype"]
-    props = native.get("card_properties", {}).get(int(card_uid), {})
     if props.get("thresholds") is not None:
         thresholds = list(props["thresholds"])
     if props.get("subtype") is not None:
@@ -817,6 +995,11 @@ def effective_stats(db, session_id, battle_state, card_uid):
     if unsupported:
         raise RuntimeError(
             f"RulesPort static stats have no native handler for card {card_uid}")
+    return _stats_from_deltas(db, session_id, card_uid, static)
+
+
+def _stats_from_deltas(db, session_id, card_uid, static):
+    """Project combat stats from an already-computed native delta view."""
     from pvp_db import db_card_static_row, db_card_combat_state
     try:
         row = db_card_static_row(session_id, int(card_uid), conn=db)
@@ -824,7 +1007,8 @@ def effective_stats(db, session_id, battle_state, card_uid):
         # Focused/older schemas predate the optional printed Rage/Lethal
         # columns.  The combat projection contains all baseline fields.
         row = db_card_combat_state(session_id, int(card_uid), conn=db)
-        row = tuple(row) + (0, 0)
+        if row is not None:
+            row = tuple(row) + (0, 0)
     if not row:
         return 0, 0, 0, set(), 0
     atk, defense, attrs, flags, rage = _instance_buffs(row)
@@ -861,6 +1045,11 @@ def effective_cost(db, session_id, battle_state, card_uid):
     if unsupported:
         raise RuntimeError(
             f"RulesPort static cost has no native handler for card {card_uid}")
+    return _cost_from_deltas(db, session_id, card_uid, native)
+
+
+def _cost_from_deltas(db, session_id, card_uid, native):
+    """Project an effective cost from an already-computed native delta view."""
     from pvp_db import db_card_cost_location_state
     row = db_card_cost_location_state(session_id, int(card_uid), conn=db)
     if not row:
@@ -873,6 +1062,28 @@ def effective_cost(db, session_id, battle_state, card_uid):
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
     return max(0, cost + int(native["cost_mod"]))
+
+
+def effective_option_projection(db, session_id, battle_state, card_uid):
+    """Return ``(attributes, cost)`` for one hand card from a single scan.
+
+    The returned values are the same projections as :func:`effective_attributes`
+    and :func:`effective_cost`; they share this evaluator rather than a parallel
+    cost/attribute source.
+
+    Play-option refreshes need both values for every card in hand.  Calling
+    :func:`effective_attributes` and :func:`effective_cost` separately repeated
+    the native static scan — including its target-filter evaluation — twice per
+    card, which dominated the opponent-turn priority window.
+    """
+    native, unsupported = _native_static_deltas(
+        db, session_id, battle_state or {}, int(card_uid))
+    if unsupported:
+        raise RuntimeError(
+            "RulesPort static projection has no native handler for card "
+            f"{card_uid}")
+    attributes = _stats_from_deltas(db, session_id, card_uid, native)[2]
+    return attributes, _cost_from_deltas(db, session_id, card_uid, native)
 
 
 def controller_flags(db, session_id, battle_state, owner):

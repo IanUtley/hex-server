@@ -6,6 +6,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
 from profile_db import (db_card_instance_template, db_champion_last_deck,
                         db_consume_inventory, db_find_deck_owner,
                         db_insert_card_instance, db_set_champion_last_deck,

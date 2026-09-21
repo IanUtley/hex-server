@@ -178,7 +178,32 @@ def _effect_spec(mapping: AbilityEffectMapping,
 
 
 def ability_graph(store: RecordStore, ability_guid: str) -> AbilityGraph | None:
-    """Resolve one AbilityTemplate and all referenced target/effect records."""
+    """Resolve and cache one immutable Records-backed ability graph.
+
+    Trigger discovery asks about the same authored abilities on every card
+    event. Rebuilding each graph repeatedly made the first troop resolution
+    synchronously deserialize hundreds of target/effect records. The
+    ``RecordStore`` snapshot is immutable for a server lifetime, so its
+    existing re-entrant lock is the natural ownership boundary for this
+    derived cache as well.
+    """
+    key = str(ability_guid or "").lower()
+    if not key:
+        return None
+    with store._lock:
+        cache = getattr(store, "_ability_graph_cache", None)
+        if cache is None:
+            cache = store._ability_graph_cache = {}
+        if key in cache:
+            return cache[key]
+        graph = _build_ability_graph(store, key)
+        cache[key] = graph
+        return graph
+
+
+def _build_ability_graph(store: RecordStore,
+                         ability_guid: str) -> AbilityGraph | None:
+    """Construct one graph; callers should use :func:`ability_graph`."""
     ability = store.get("AbilityTemplate", ability_guid)
     if not isinstance(ability, AbilityTemplate):
         return None
@@ -288,11 +313,18 @@ def _effect_param(effect: EffectSpec) -> str:
             "BlockRestrictionModifier": "blockrestriction",
             "TargetingImmunityModifier": "targetingimmunity",
         }.get(modifier_type, "")
+        # The typed child modifier owns the operation; the effect template has
+        # no ``m_Operation`` of its own.  Defaulting it to "Set" here also
+        # defeated the leaf's metadata merge (which only fills empty values),
+        # so an authored "add a counter" resolved as a clear-to-zero.
+        operation = _field(modifier, "m_Operation", None)
+        if not operation:
+            operation = _field(template, "m_Operation", "Set")
         payload = {
             "amount": 0,
             "duration": effect.duration,
             "variable": _field(template, "m_VariableName", ""),
-            "operation": _field(template, "m_Operation", "Set"),
+            "operation": operation,
             "text": _field(template, "m_GameText", ""),
         }
         # Leave this absent when the modifier has a typed class not yet

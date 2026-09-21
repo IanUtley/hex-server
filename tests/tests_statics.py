@@ -11,6 +11,12 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 
 from abilities.framework.statics import (
@@ -20,10 +26,6 @@ from abilities.framework.statics import (
     global_flags,
 )
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 LIGHT = "fb84ad94-e6ed-f04b-353d-eda325e0ae43"   # +2/+2 per card in your hand
 SOUL = "d60496f7-9c0c-f6f2-9e1b-ae889a675112"     # troops you control +2/+2
@@ -517,6 +519,9 @@ def test_resource_properties(db):
     class S:
         session_id = 1
 
+        def _persist(self, conn=None):
+            """Native resource transitions persist their checkpoint here."""
+
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
     game = game_engine.Game(1, pl_t, ai_t)
@@ -660,6 +665,38 @@ def test_beginning_of_owners_turn_uses_source_controller(db):
     ).fetchone()[0] & defensive)
 
 
+def test_surfaced_speed_expires_at_end_of_turn_not_prep(db):
+    """A "for the turn" grant issued at StartTurn must survive that turn's Prep.
+
+    A Tunneling Surface resolves at StartTurn and grants Speed for the turn,
+    but the Prep that follows in the same turn used to clear the grant because
+    a temporary attribute without an authored expiry expires at the affected
+    card's next owner boundary.  The grant now records its EndTurn boundary.
+    """
+    from pvp_db import db_add_temporary_attributes
+    from rules_port.lifecycle import clear_expired_temporary_attributes
+
+    speed = int(game_engine.ECardAttributes.Speed)
+    card(db, 101, 5, TPL_PLAIN, "warzone")
+    db_add_temporary_attributes(1, 101, speed, conn=db, owner_id=5,
+                                boundary="end_turn")
+    db.commit()
+
+    def temporary_attributes():
+        return int(db.execute(
+            "SELECT temporary_attributes FROM game_cards WHERE card_uid=101"
+        ).fetchone()[0] or 0)
+
+    assert temporary_attributes() & speed
+    clear_expired_temporary_attributes(db, 1, 5, "start_turn",
+                                       clear_stat_buffs=True)
+    clear_expired_temporary_attributes(db, 1, 5, "prep", clear_stat_buffs=True)
+    assert temporary_attributes() & speed
+    clear_expired_temporary_attributes(db, 1, 5, "end_turn",
+                                       clear_stat_buffs=True)
+    assert not (temporary_attributes() & speed)
+
+
 def test_combat_has_swiftstrike(db):
     """The first-strike damage steps only occur when an attacking or blocking
     troop has Swiftstrike (FirstStrike) or DualStrike — mirrors the client's
@@ -751,5 +788,7 @@ if __name__ == "__main__":
     run("End-of-turn cleanup clears damage before buffs",
         test_end_of_turn_cleanup_clears_damage_before_buffs)
     run("Source-owned durations expire on source turn", test_beginning_of_owners_turn_uses_source_controller)
+    run("Surfaced Speed expires at end of turn, not at Prep",
+        test_surfaced_speed_expires_at_end_of_turn_not_prep)
     run("Swiftstrike phases need FirstStrike/DualStrike", test_combat_has_swiftstrike)
     run("CantBlock troops cannot block", test_can_block_rejects_cantblock)

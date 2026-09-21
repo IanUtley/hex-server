@@ -127,9 +127,14 @@ def queue_free_played_card(host, game, session, db, player_uid, ai_uid,
     db_set_card_played_to_zone(session.session_id, card_uid, "CastSpells",
                                conn=db)
     if surfaced:
+        # A troop that untunnels has Speed for the turn it surfaces.  Persist
+        # that as a temporary instance attribute so targeting, attack-option
+        # generation, combat validation, and CardUpdated all agree, and record
+        # the EndTurn boundary: Surface resolves at StartTurn, so the Prep that
+        # follows in the same turn must not expire the grant.
         db_add_temporary_attributes(
             session.session_id, card_uid, game_engine.ECardAttributes.Speed,
-            conn=db)
+            conn=db, owner_id=owner_id, boundary="end_turn")
         db.commit()
         from .creation_effects import activate_creation_replacements
         activate_creation_replacements(db, session.session_id, card_uid)

@@ -15,7 +15,7 @@ class ConditionContext:
                  trigger_owner_id=None, event_source_collection=None,
                  event_destination_collection=None, event_previous_state=None,
                  uses_previous_state=False, event_int_attribute=None,
-                 event_tac=None):
+                 event_tac=None, event_previous_owner_id=None):
         self.db, self.session = db, session
         self.bstate = bstate or {}
         self.event_type = event_type
@@ -27,12 +27,23 @@ class ConditionContext:
         self.event_source_collection = event_source_collection
         self.event_destination_collection = event_destination_collection
         self.event_previous_state = event_previous_state
+        # The controller the entering card had before the zone move.  The
+        # client's ``TriggerCardEnteredZone`` requires both the current and the
+        # previous controller for a "friendly zone" condition, so a card moved
+        # out of an opponent's zone cannot satisfy ``m_Your``.
+        self.event_previous_owner_id = event_previous_owner_id
         self.event_int_attribute = event_int_attribute
         self.event_tac = event_tac or {}
         self.uses_previous_state = bool(uses_previous_state)
         self.champions = champions or []
-        self.ability_variables = {}
-        self.applied_effects = {}
+        # C# evaluates an effect condition against the ability instance, so
+        # the context reads that instance's variables (RandomizeVariable and
+        # friends) and its applied-effect bookkeeping.  The port keeps both in
+        # the shared battle state; callers may still override them directly.
+        self.ability_variables = dict(
+            (self.bstate or {}).get("ability_variables") or {})
+        self.applied_effects = dict(
+            (self.bstate or {}).get("applied_effects") or {})
         self._cards = {}
         self._champions = {int(uid): (owner, name, health)
                            for uid, owner, name, health in self.champions}

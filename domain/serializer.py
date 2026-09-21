@@ -84,7 +84,10 @@ class Serializer:
 
     def add_list_uid(self, lst: List[UID]):
         self.w.write_int32(len(lst))
-        for v in lst: v.write(self.w)
+        # Keep list elements on the same wire-boundary path as scalar UIDs.
+        # RulesPort and persistence-backed callers may still hold raw uid64
+        # integers at this point.
+        for v in lst: self.add_uid(v)
 
     def add_list_resource_id(self, lst: List[ResourceId]):
         self.w.write_int32(len(lst))

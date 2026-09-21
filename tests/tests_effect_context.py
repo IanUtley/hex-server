@@ -7,6 +7,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tests.test_db import fresh_database
+
+fresh_database()   # bind this process's database before ``db`` is imported
+
+import game_engine
 from abilities.framework.builder import AbilityBuilder
 from abilities.framework.context import EffectContext
 from abilities.framework.effects.registry import _LEAFS, effect
@@ -56,8 +61,88 @@ class _ConversationHandler:
         return "queued"
 
 
+def test_native_grant_ability_can_target_a_champion():
+    """Encounter setup grants persist on champions outside ``game_cards``."""
+    player = game_engine.SessionCardId(game_engine.UID.make(244, 5))
+    ai = game_engine.SessionCardId(game_engine.UID.make(3, 1000))
+    handler = SimpleNamespace(
+        user_profile={"id": 5}, _player_champ_scid=player,
+        _ai_champ_scid=ai, _champion_granted_ability_guids={})
+    granted = "ca145de3-61d9-d07e-51dd-fe51021e398d"
+    context = EffectContext.from_rules_port(
+        SimpleNamespace(events=[]), _Session(), object(), handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"grant_target": player.uid.uid64}, "effect", granted)
+    opponent_context = EffectContext.from_rules_port(
+        SimpleNamespace(events=[]), _Session(), object(), handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"grant_target": ai.uid.uid64}, "effect", granted)
+
+    with mock.patch("pvp_db.db_card_grant_info", return_value=None), \
+            mock.patch("pvp_db.db_ability_metadata_exists", return_value=True):
+        result = context.grant_ability()
+        opponent_result = opponent_context.grant_ability()
+
+    assert result == f"granted 1 champion ability(s) to {hex(player.uid.uid64)}"
+    assert opponent_result == f"granted 1 champion ability(s) to {hex(ai.uid.uid64)}"
+    assert handler._champion_granted_ability_guids == {
+        player.uid.uid64: [granted], ai.uid.uid64: [granted]}
+
+    handler._champion_granted_ability_guids = {}
+    game_started_context = EffectContext.from_rules_port(
+        SimpleNamespace(events=[]), _Session(), object(), handler,
+        game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        {"grant_target": player.uid.uid64, "event_type": "GameStartedEvent"},
+        "effect", granted)
+    with mock.patch("pvp_db.db_card_grant_info", return_value=None), \
+            mock.patch("pvp_db.db_ability_metadata_exists", return_value=True), \
+            mock.patch("rules_port.resolution.resolve_port_ability") as resolve:
+        game_started_context.grant_ability()
+    resolve.assert_called_once_with(
+        handler, game_started_context.game, game_started_context.session,
+        game_started_context.db, game_started_context.player_uid,
+        game_started_context.ai_uid, game_started_context.bstate, granted,
+        player.uid.uid64, 5, target_map={})
+
+
+def test_player_target_template_uses_champion_identity_for_grants():
+    """A PvE AI player's raw id 0 must resolve to its champion SessionCardId."""
+    from rules_port.resolution import NativeEffectBackend
+
+    ai = game_engine.SessionCardId(game_engine.UID.make(3, 1000))
+    effect = SimpleNamespace(
+        guid="grant-effect", concrete_type="GrantAbilityEffectTemplate",
+        effect_group_id=1, target_index=0, effect_instance_id=0,
+        contingent_effect_instance_id=-1, param="", condition_guid="")
+    ability = SimpleNamespace(
+        ability_template_id="grant-ability", source_uid=55,
+        responsible_player_id=0, activation=SimpleNamespace(target_map={}),
+        metadata=SimpleNamespace(targets=[SimpleNamespace(
+            target_kind="PlayerTargetTemplate")]), ordered_effects=[effect])
+    state = {}
+    targets = []
+
+    def native_effect(_kind, context, _effect):
+        targets.append(context.bstate["grant_target"])
+        return "granted"
+
+    with mock.patch("rules_port.targeting.implicit_champion_target",
+                    return_value=ai.uid.uid64):
+        NativeEffectBackend()(
+            handler=object(), game=SimpleNamespace(), session=_Session(),
+            db=object(), player_uid=1, ai_uid=2, battle_state=state,
+            ability=ability, native_effect=native_effect)
+
+    assert targets == [ai.uid.uid64]
+
+
 def test_native_discard_creates_parent_continuation_for_hand_picker():
-    """A native discard target must pause the same typed ability instance."""
+    """A native discard target must pause the same typed ability instance.
+
+    The continuation re-enters the paused effect, not the one after it: the
+    first pass stopped before its mutation, so resuming past it discarded
+    nothing at all.
+    """
     state = {"resolving_effect_order": 3, "resolving_ability": "parent"}
 
     class Handler:
@@ -79,7 +164,7 @@ def test_native_discard_creates_parent_continuation_for_hand_picker():
         state, "effect", ability=Ability())
     assert context.discard() == "prompted"
     assert state["pending_discard_continuation"]["instance_id"] == 7
-    assert state["pending_discard_continuation"]["resume_effect_order"] == 4
+    assert state["pending_discard_continuation"]["resume_effect_order"] == 3
     assert state["resolution_paused"] is True
 
 
@@ -353,6 +438,74 @@ def test_tunneling_surface_queue_is_empty_without_underground_cards():
         EmptyDB(), Session(), Handler(), Game(), "player", "ai", bstate,
         1001) == []
     assert bstate["stack"] == []
+
+
+def test_queue_surfaces_registers_the_native_chain_item():
+    """A thresholded underground card must reach the native scheduler.
+
+    ``rules_port.tunneling.queue_surfaces`` spent the counter and pushed only
+    the wire-compatible descriptor, so the Surface stayed on the client's
+    chain with no native item to resolve: the buried card never surfaced and
+    could not be re-queued because the orphan kept the stack non-empty.
+    """
+    import json as _json
+    from rules_port.actions import ResolveTopOfChainAction
+    from rules_port.kernel import PriorityWindowAction
+    from rules_port import tunneling
+    from rules_port.context import EffectContext
+    from rules_port.session import AuthoritativeSession
+    from tests.tests_combat import (make_db, add_card, HandlerStub,
+                                    SessionStub)
+
+    db = make_db()
+    try:
+        template = "aaaaaaaa-0000-0000-0000-0000000000aa"
+        db.execute(
+            "INSERT INTO card_templates "
+            "(guid,name,card_type,cost,attack,defense,attributes,"
+            "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, "Wakizashi Ambusher", "Troop", 4, 2, 1, 0, "[]", "[]", ""))
+        uid = game_engine.UID.make(1, 8).uid64
+        add_card(db, uid, 5, template, loc="underground")
+        db.execute(
+            "UPDATE game_cards SET permanent_buffs=? WHERE card_uid=?",
+            (_json.dumps({"counters": {"tunneling": 3}}), uid))
+        db.commit()
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        port = AuthoritativeSession(1, (pl_t, ai_t), seed_z=1, seed_w=2)
+        session = SessionStub()
+        session._rules_port_session = port
+        bstate = {"stack": []}
+        context = EffectContext.from_rules_port(
+            game, session, db, HandlerStub(db), pl_t, ai_t, bstate, "",
+            ability=None)
+        with mock.patch.object(tunneling, "tunneling_value", return_value=3):
+            queued = tunneling.queue_surfaces(context, 5)
+
+        assert queued == [int(uid)], queued
+        wire = bstate["stack"][-1]
+        assert wire["ability_guid"] == tunneling.SURFACE_ABILITY_GUID, wire
+        assert wire["source_uid"] == int(uid), wire
+        instance_id = int(wire["instance_id"])
+        assert port.chain._instance_ids == [instance_id], port.chain._instance_ids
+        assert port._projected_chain_descriptors[instance_id]["instance_id"] == \
+            instance_id, port._projected_chain_descriptors
+        top = port.action_stack.peek()
+        assert isinstance(top, PriorityWindowAction), top
+        assert int(getattr(top.ability_responding_to, "instance_id", -1)) == \
+            instance_id, top.ability_responding_to
+        assert port.action_stack.priority_player_id == pl_t, \
+            port.action_stack.priority_player_id
+        assert any(isinstance(action, ResolveTopOfChainAction)
+                   for action in port.action_stack._stack), port.action_stack._stack
+        assert _json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0]).get("counters") == {}, "counter not spent"
+    finally:
+        db.close()
 
 
 def test_resource_choice_ability_is_detected_from_metadata():
@@ -987,6 +1140,31 @@ def test_context_typed_card_threshold_and_subtype_preserve_metadata_values():
         push.assert_called_once_with(123, sub_type="Orc Robot")
 
 
+def test_context_modifier_keeps_deck_cards_nulled():
+    """Prophecy's persisted IntAttr update must not reveal its deck target."""
+    class Game:
+        def __init__(self):
+            self.updated = []
+
+        def push_card_updated(self, *args, **kwargs):
+            self.updated.append((args, kwargs))
+
+    class Handler:
+        @staticmethod
+        def _card_full_data(_game, _scid, template):
+            return (template, "Troop", "Hidden troop", 2, 2, 2, 0)
+
+    game = Game()
+    context = EffectContext.from_rules_port(
+        game, _Session(), _DB(), Handler(), "player", "ai", {}, "effect")
+    with mock.patch("pvp_db.db_card_zone_details",
+                    return_value=("template-guid", 0, 0, "deck")):
+        context._push_modifier_card(123, int_attrs={"Prophesied": -2})
+
+    assert game.updated[0][1]["nulling"] is True
+    assert game.updated[0][1]["int_attrs"] == {"Prophesied": -2}
+
+
 def test_context_typed_damage_shield_uses_client_flags():
     context = EffectContext.from_legacy(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
@@ -1163,10 +1341,13 @@ def test_builder_target_and_cost_candidates_delegate_to_shared_legality():
 
 
 if __name__ == "__main__":
+    test_native_grant_ability_can_target_a_champion()
+    test_player_target_template_uses_champion_identity_for_grants()
     test_context_decorator_adapts_legacy_leaf_arguments()
     test_tunnel_moves_source_to_underground_and_emits_zone_triggers()
     test_tunneling_metadata_and_underground_visibility_are_data_driven()
     test_tunneling_surface_queue_is_empty_without_underground_cards()
+    test_queue_surfaces_registers_the_native_chain_item()
     test_resource_choice_ability_is_detected_from_metadata()
     test_subterranean_spy_visibility_reveals_only_the_controller_view()
     test_match_secondary_reveal_uses_stored_target_owner()
@@ -1189,6 +1370,7 @@ if __name__ == "__main__":
     test_context_lose_thresholds_preserves_state_and_event_operation()
     test_context_typed_hero_health_and_spell_points_share_owner_projection()
     test_context_typed_card_threshold_and_subtype_preserve_metadata_values()
+    test_context_modifier_keeps_deck_cards_nulled()
     test_context_typed_damage_shield_uses_client_flags()
     test_builder_reuses_metadata_cost_target_filter_and_ordering()
     test_builder_exposes_typed_values_conditions_and_continuations()

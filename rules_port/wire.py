@@ -243,6 +243,14 @@ def submit_classified_transaction(session, command, player_id, *,
     coerce_player = getattr(session, "coerce_transaction_player_id", None)
     if callable(coerce_player):
         player_id = coerce_player(player_id)
+    # Adopt the durable checkpoint phase before normalization so the intent's
+    # phase matches the phase ``submit_transaction`` will validate against.
+    # The AI driver can advance the native port without updating the
+    # compatibility cursor; normalizing against the pre-refresh phase then
+    # rejected a valid pass as a phase mismatch.
+    refresh = getattr(session, "refresh_checkpoint_state", None)
+    if callable(refresh):
+        refresh()
     transaction = normalize_player_transaction(
         command, player_id, current_phase=session.current_turn_phase,
         payload=payload)

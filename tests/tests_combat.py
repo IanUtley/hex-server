@@ -17,13 +17,15 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 import ai
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 
 TPL_GLADIATOR = "b7172b6a-ef85-4fef-91e1-81975b4ce7cd"
 TPL_PRIESTESS = "14909185-1070-48df-9508-61d5a9650bd2"
@@ -1355,6 +1357,54 @@ def test_spiritdrain_heals_actual_blocker_damage(db):
     assert bstate["ai_health"] == 12, bstate
 
 
+def test_simultaneous_combat_damage_cannot_be_undone_by_lifelink(db):
+    """A champion killed by unblocked attackers dies even if a blocker has
+    Lifedrain.
+
+    C# sets the champion's health to ``CurrentDefenseValue - amount`` with no
+    clamp and only then runs the state-based ``<= 0`` check, so the lifelink
+    of a blocker that dealt its damage in the same step cannot resurrect a
+    champion the same strike had already killed.  Clamping at 0 in the port
+    turned 2 health - 11 damage + 4 lifelink into "0, then 4".
+    """
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+
+    blocker_tpl = "ffffffff-0000-0000-0000-00000000b001"
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (blocker_tpl, "Lifedrain Blocker", "Troop", 4, 4, 4,
+         int(game_engine.ECardAttributes.SpiritDrain), "[]", "[]", ""))
+    for index, (attack, defense) in enumerate(((4, 4), (4, 4), (3, 3), (3, 3))):
+        template = "ffffffff-0000-0000-0000-00000000b1%02d" % index
+        db.execute(
+            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "defense, attributes, abilities_json, threshold_json, subtype) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (template, f"Attacker {index}", "Troop", 2, attack, defense, 0,
+             "[]", "[]", ""))
+        add_card(db, 101 + index, 5, template)
+    add_card(db, 201, 0, blocker_tpl)
+    db.commit()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {"player_health": 20, "ai_health": 2, "turn_number": 3,
+              "player_attackers": {"101": "0", "102": "0", "103": "0",
+                                   "104": "0"},
+              "ai_blockers": {"103": ["201"]},
+              "player_damage_order": {"103": ["201"]}}
+    handler = HandlerStub(db)
+    game = game_engine.Game(1, pl_t, ai_t)
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "", ability=None)
+    resolve_native(context, attacker_key="player_attackers",
+                   blocker_key="ai_blockers")
+    # 2 - (4+4+3 unblocked) + 4 lifelink = -5, i.e. defeated.
+    assert bstate["ai_health"] == -5, bstate
+
+
 def test_lethal_kills_high_defense_blocker(db):
     """A Lethal attacker kills a troop it damages even when one damage is
     less than that blocker's remaining defense."""
@@ -1391,6 +1441,106 @@ def test_lethal_kills_high_defense_blocker(db):
     assert blocker[0] == "discard", blocker
     assert blocker[1] & game_engine.ECardStates.Dead, blocker
     assert attacker == ("warzone", 2), attacker
+
+
+def test_lethal_attacker_native_kills_high_defense_blocker(db):
+    """A Lethal attacker kills a blocked troop whose defense exceeds its attack.
+
+    The attached RulesPort resolver is the live PvE/PvP path and previously
+    applied only the raw attack damage, so a 1-attack Lethal attacker left a
+    6-defense blocker alive.  Lethal damage destroys the troop it damages
+    regardless of the amount (client ``LethalDamageTaken`` sweep).
+    """
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+
+    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
+    lethal_tpl = "ffffffff-0000-0000-0000-00000000c001"
+    wall_tpl = "ffffffff-0000-0000-0000-00000000c002"
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (lethal_tpl, "Lethal Attacker", "Troop", 1, 1, 3, 0, "[]", "[]", "", 1))
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (wall_tpl, "Stonewall", "Troop", 4, 2, 6, 0, "[]", "[]", "", 0))
+    add_card(db, 101, 5, lethal_tpl)
+    add_card(db, 102, 0, wall_tpl)
+    db.commit()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "player_attackers": {"101": "0"},
+              "ai_blockers": {"101": ["102"]},
+              "player_damage_order": {"101": ["102"]}}
+    handler = HandlerStub(db)
+    game = game_engine.Game(1, pl_t, ai_t)
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "", ability=None)
+    resolve_native(context, attacker_key="player_attackers",
+                   blocker_key="ai_blockers")
+    blocker = db.execute(
+        "SELECT location, card_state FROM game_cards WHERE card_uid=102"
+    ).fetchone()
+    attacker = db.execute(
+        "SELECT location, card_damage FROM game_cards WHERE card_uid=101"
+    ).fetchone()
+    assert blocker[0] == "discard", blocker
+    assert blocker[1] & game_engine.ECardStates.Dead, blocker
+    assert attacker == ("warzone", 2), attacker
+
+
+def test_lethal_blocker_native_kills_high_defense_attacker(db):
+    """A Lethal blocker kills a higher-defense attacker it damages.
+
+    The reported defect: a 1-attack Lethal blocker dealt one damage to a
+    6-defense attacker, which then survived because only the raw amount was
+    compared to defense.
+    """
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+
+    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
+    attacker_tpl = "ffffffff-0000-0000-0000-00000000c003"
+    lethal_tpl = "ffffffff-0000-0000-0000-00000000c004"
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (attacker_tpl, "Big Attacker", "Troop", 5, 1, 6, 0, "[]", "[]", "", 0))
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (lethal_tpl, "Lethal Blocker", "Troop", 1, 1, 2, 0, "[]", "[]", "", 1))
+    add_card(db, 101, 5, attacker_tpl)
+    add_card(db, 102, 0, lethal_tpl)
+    db.commit()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "player_attackers": {"101": "0"},
+              "ai_blockers": {"101": ["102"]},
+              "player_damage_order": {"101": ["102"]}}
+    handler = HandlerStub(db)
+    game = game_engine.Game(1, pl_t, ai_t)
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "", ability=None)
+    resolve_native(context, attacker_key="player_attackers",
+                   blocker_key="ai_blockers")
+    attacker = db.execute(
+        "SELECT location, card_state FROM game_cards WHERE card_uid=101"
+    ).fetchone()
+    blocker = db.execute(
+        "SELECT location, card_damage FROM game_cards WHERE card_uid=102"
+    ).fetchone()
+    assert attacker[0] == "discard", attacker
+    assert attacker[1] & game_engine.ECardStates.Dead, attacker
+    # The 2-defense blocker survives the attacker's single damage.
+    assert blocker == ("warzone", 1), blocker
 
 
 def test_ai_attacks_zero_attack_rage_troop_when_unblocked(db):
@@ -1467,6 +1617,41 @@ def test_player_can_block_excludes_cantblock(db):
     finally:
         dbmod._db = old_db
         hcs._db = old_hcs_db
+
+
+def test_block_rule_filter_uses_card_owner_and_zone(db):
+    """Block-rule filters must see the card's real owner and zone.
+
+    ``_combat_card`` previously read ``db_card_mutation_info`` as
+    (owner, location, type); the row is actually (template_guid, owner,
+    card_type).  A template GUID therefore reached the filter player operand
+    and ``ValueError: invalid literal for int()`` killed the connection thread
+    during the AI's DeclareAttackPriorityWindow -> DeclareDefense step.
+    """
+    import rules_port.combat_rules as combat_rules
+
+    add_card(db, 401, 0, TPL_GLADIATOR)
+    add_card(db, 402, 5, TPL_PRIESTESS)
+    db.execute(
+        "UPDATE game_cards SET permanent_buffs=? WHERE card_uid=?",
+        (json.dumps({"rule_modifiers": [{
+            "property": "blockimmunity",
+            "filter": {"_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"},
+        }]}), 401))
+    db.commit()
+
+    attacker, _attrs, _damage = combat_rules._combat_card(db, 1, {}, 401)
+    assert attacker["user_id"] == 0, attacker
+    assert attacker["controller_id"] == 0, attacker
+    assert attacker["location"] == "warzone", attacker
+
+    # A card identity in the checkpoint must not break the blocker scan.
+    battle_state = {
+        "resolving_owner_id": TPL_GLADIATOR,
+        "player_threshold": {4: 1},
+        "ai_threshold": {4: 1},
+    }
+    assert combat_rules.can_block(db, 1, battle_state, 401, 402) is False
 
 
 def test_transform_bom_returns_string(db):
@@ -1552,6 +1737,7 @@ def main():
         ("CardUpdated carries Rage", test_card_updated_carries_rage),
         ("Priestess Deathcry human picker", test_priestess_deathcry_human_picker),
         ("Blocker options exclude CantBlock", test_player_can_block_excludes_cantblock),
+        ("Block rules read owner/zone", test_block_rule_filter_uses_card_owner_and_zone),
         ("Transform BOM returns string", test_transform_bom_returns_string),
         ("Poca summons Blaze Elemental", test_poca_summons_blaze_elemental),
         ("Speed troop attacks same turn", test_speed_troop_can_attack_same_turn),
@@ -1566,10 +1752,16 @@ def main():
         ("AI X kills target", test_ai_x_kills_target),
         ("Swiftstrike kills before normal damage", test_swiftstrike_kills_before_normal_damage),
         ("AI attacks unblocked zero-attack Rage troop", test_ai_attacks_zero_attack_rage_troop_when_unblocked),
+        ("simultaneous combat damage cannot be undone by lifelink",
+         test_simultaneous_combat_damage_cannot_be_undone_by_lifelink),
         ("SpiritDrain heals actual blocker damage",
          test_spiritdrain_heals_actual_blocker_damage),
         ("Lethal kills high-defense blocker",
          test_lethal_kills_high_defense_blocker),
+        ("Lethal attacker kills high-defense blocker (native)",
+         test_lethal_attacker_native_kills_high_defense_blocker),
+        ("Lethal blocker kills high-defense attacker (native)",
+         test_lethal_blocker_native_kills_high_defense_attacker),
     ]
     failed = 0
     for name, fn in tests:

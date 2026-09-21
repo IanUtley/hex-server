@@ -120,6 +120,22 @@ def _damage_prevented(context, target, combat):
             "prevent_noncombat_damage" in flags)
 
 
+def _source_is_lethal(context, dealer):
+    """Return whether a damage source projects the printed Lethal keyword.
+
+    Lethal is a continuous rule flag (``static_rules.effective_stats``), not an
+    attribute bit.  The C# client marks ``LethalDamageTaken`` on any troop a
+    Lethal source damages and lets the state-based sweep destroy it, so the
+    marker is projected here instead of being folded into the damage amount.
+    """
+    if dealer is None:
+        return False
+    from .static_rules import effective_stats
+    flags = effective_stats(
+        context.db, context.session.session_id, context.bstate, int(dealer))[3]
+    return "lethal" in (flags or ())
+
+
 def deal_damage(context, target, amount):
     from pvp_db import (db_add_card_damage,
                         db_card_owner_id, db_card_source_info)
@@ -182,7 +198,12 @@ def deal_damage(context, target, amount):
         key = key or (f"hp_{int(owner)}" if context.bstate.get("pvp") else
                       ("player_health" if int(owner) else "ai_health"))
         current = int(context.bstate.get(key, 20) or 0)
-        new = max(0, current - amount)
+        # C# ``DamageChampion`` sets ``CurrentDefenseValue - amount`` with no
+        # clamp and lets the state-based action test ``<= 0`` afterwards.  The
+        # clamp let a simultaneous lifelinker "rescue" a champion the same
+        # strike had already killed: 2 health took 10 damage (clamped to 0),
+        # then the blocker's lifedrain healed it back to 4.
+        new = current - amount
         context.bstate[key] = new
         setattr(context.game, key, new)
         event = game_engine.ChampionHealthChangedSessionEventArgs()
@@ -196,10 +217,11 @@ def deal_damage(context, target, amount):
         return f"champion {current}->{new}"
 
     from .static_rules import effective_stats
-    stats = effective_stats(
-        context.db, context.session.session_id, context.bstate, target)
-    if not db_card_source_info(context.session.session_id, target, conn=context.db):
+    target_info = db_card_source_info(
+        context.session.session_id, target, conn=context.db)
+    if not target_info:
         return "damage: no card"
+    is_troop = "Troop" in str(target_info[1] or "")
     db_add_card_damage(context.session.session_id, target, amount,
                        conn=context.db)
     context.db.commit()
@@ -209,13 +231,20 @@ def deal_damage(context, target, amount):
     emit_dealt_damage()
     remaining = int(effective_stats(
         context.db, context.session.session_id, context.bstate, target)[1] or 0)
-    if remaining <= 0:
-        # Combat damage is simultaneous.  The RulesPort combat resolver runs
-        # the state-based lethal/deathcry pass after every combatant has
-        # assigned damage, so a lethal hit cannot remove a blocker midway
-        # through the same combat.  Ordinary effect damage retains its
-        # immediate lethal transition.
+    # Lethal: any damage a Lethal source deals to a troop is lethal to that
+    # troop even when it is below the troop's remaining defense.  The C#
+    # client records ``LethalDamageTaken`` and destroys the troop in the
+    # state-based sweep; mirror that by deferring a combat Lethal hit to the
+    # shared state-based pass while ordinary effect damage still transitions
+    # immediately.
+    lethal_hit = (amount > 0 and is_troop
+                  and _source_is_lethal(context, dealer))
+    if remaining <= 0 or lethal_hit:
         if context.bstate.get("combat_damage"):
+            if lethal_hit and remaining > 0:
+                marked = context.bstate.setdefault("_lethal_damage_uids", [])
+                if target not in marked:
+                    marked.append(target)
             return "survives"
         context.destroy(target)
         return "killed"

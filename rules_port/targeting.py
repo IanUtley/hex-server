@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 
-from rules_port.filters import records_filter_matches
+from rules_port.filters import (records_filter_evaluator,
+                                records_filter_matches)
 
 
 # ECardAttributes.SpellShield (Mechanics/ECardAttributes.cs).
@@ -53,6 +54,29 @@ def _targeting_immune(db, session_id, battle_state, card, source):
     return False
 
 
+def _protected_target(db, session_id, battle_state, card, source, source_owner,
+                      is_auto):
+    """C# ``AbilityTargetTemplate.IsCardValidTarget`` protections.
+
+    A non-auto target on an opposing permanent (troop, artifact or champion)
+    must not be Spell-Shielded, Stealth-Spellshielded, or covered by an
+    authored TargetingImmunity rule.  Champions are not ``game_cards`` rows,
+    so the Stealth keyword reads them from the persisted battle state.
+    """
+    if is_auto:
+        return False
+    if str(card.get("location") or "").lower() not in ("warzone", "champions"):
+        return False
+    if int(card.get("user_id", 0) or 0) == int(source_owner or 0):
+        return False
+    if int(card.get("attributes", 0) or 0) & _SPELL_SHIELD_ATTR:
+        return True
+    from .stealth import champion_target_is_spellshielded
+    if champion_target_is_spellshielded(battle_state, card):
+        return True
+    return _targeting_immune(db, session_id, battle_state, card, source)
+
+
 def _last(value):
     return str(value or "").rsplit(".", 1)[-1]
 
@@ -75,6 +99,27 @@ def _find_filter(node, kind):
 
 def _side(uid):
     return "ai" if not uid else "player"
+
+
+def filter_restricts_to_zone(node, zone):
+    """Return whether a Records card filter restricts cards to ``zone``.
+
+    ``collection_flags`` is a visibility mask and is commonly the union of
+    every collection a card could sit in, so only a nested ``InZone`` filter
+    is the authoritative zone restriction.  Scheme ("choose an action in your
+    deck") advertises ``Choosing`` in its visibility mask while its filter is
+    ``InZone: Deck``; Corinth's choice-zone picker is the opposite.
+    """
+    if isinstance(node, dict):
+        if (_last(node.get("_t")) == "InZone" and
+                str(node.get("m_Collection") or "").lower() ==
+                str(zone).lower()):
+            return True
+        return any(filter_restricts_to_zone(value, zone)
+                   for value in node.values())
+    if isinstance(node, list):
+        return any(filter_restricts_to_zone(value, zone) for value in node)
+    return False
 
 
 def _shards(value):
@@ -281,6 +326,23 @@ def evaluate_card_filter(card, spec, source_uid=None, *, ability_state=None,
 
 def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                   both_players=False, champions=None, battle_state=None):
+    """Return the SessionCardId-backed uids of one authored target template.
+
+    Projecting the candidate pool asks every candidate for its current
+    threshold/subtype view, and that view is itself an aura scan.  Share one
+    projection memo across the whole pool so each authored target set is
+    resolved once per scan instead of once per candidate card.
+    """
+    from .static_rules import _projection_cache
+    with _projection_cache():
+        return _legal_targets(
+            db, session_id, controller_uid, template_id, source_uid,
+            both_players=both_players, champions=champions,
+            battle_state=battle_state)
+
+
+def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
+                   both_players=False, champions=None, battle_state=None):
     template = target_template(db, template_id)
     if not template:
         return []
@@ -320,35 +382,42 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
             continue
         if opposing and card["user_id"] == int(controller_uid or 0):
             continue
-        # C# AbilityTargetTemplate.IsCardValidTarget: a non-auto target on an
-        # opposing permanent must not be Spell-Shielded, Spectral, or covered
-        # by a TargetingImmunity rule.  Without these the picker/AI offered
-        # untargetable cards as legal.
-        permanent = str(card.get("location") or "").lower() in (
-            "warzone", "champions")
-        if (not is_auto and permanent and card["user_id"] != source_owner):
-            if int(card.get("attributes", 0) or 0) & _SPELL_SHIELD_ATTR:
-                continue
-            if _targeting_immune(db, session_id, battle_state, card, source):
-                continue
+        # Spell-Shielded, Stealth-Spellshielded and Targeting-Immune opposing
+        # permanents are not legal non-auto targets.  Without this the
+        # picker/AI offered untargetable cards as legal.
+        if _protected_target(db, session_id, battle_state, card, source,
+                             source_owner, is_auto):
+            continue
         if (int((card.get("int_attrs") or {}).get("Spectral", 0) or 0) >= 1
                 and int(card["card_uid"]) != int(source_uid or 0)):
             continue
         cards.append(card)
         by_owner.setdefault(card["user_id"], []).append(card)
+    # One template filter is evaluated against every candidate in the scanned
+    # zones, so compile it once per (spec, candidate-pool) pair: rebuilding the
+    # Records filter tree per candidate dominated target/static evaluation.
+    # Both key objects are call-local, and the predicate keeps its evaluation
+    # context (including the pool) alive, so ids cannot be recycled here.
+    evaluators = {}
+
     def matches(card, spec, pool):
-        context = _FilterContext(battle_state or {})
-        context["cards"] = pool
-        context["all_cards"] = pool
-        context["active_player_id"] = (battle_state or {}).get(
-            "active_player_id", controller_uid)
-        # The activating player is the authoritative ``player`` operand for
-        # cost/target filters.  Relying only on the source-card projection
-        # makes an optional or partially materialized source look
-        # uncontrolled, which suppresses valid payment candidates.
-        return records_filter_matches(
-            card, spec, source=source, context=context,
-            player=int(controller_uid or 0))
+        key = (id(spec), id(pool))
+        predicate = evaluators.get(key)
+        if predicate is None:
+            context = _FilterContext(battle_state or {})
+            context["cards"] = pool
+            context["all_cards"] = pool
+            context["active_player_id"] = (battle_state or {}).get(
+                "active_player_id", controller_uid)
+            # The activating player is the authoritative ``player`` operand for
+            # cost/target filters.  Relying only on the source-card projection
+            # makes an optional or partially materialized source look
+            # uncontrolled, which suppresses valid payment candidates.
+            predicate = records_filter_evaluator(
+                spec, source=source, context=context,
+                player=int(controller_uid or 0))
+            evaluators[key] = predicate
+        return predicate(card)
     if top_n is not None:
         nested = top_n.get("m_Filter") or {}
         amount = int(top_n.get("m_Amount", 1) or 1)
@@ -380,6 +449,11 @@ def legal_targets(db, session_id, controller_uid, template_id, source_uid,
                     "location": "warzone", "user_id": owner,
                     "controller_id": owner, "name": name or "Champion",
                     "defense": int(health or 0), "attack": 0}
+            # Champions join the pool as synthetic cards, so the same
+            # opposing-target protections apply to them.
+            if _protected_target(db, session_id, battle_state, card, source,
+                                 source_owner, is_auto):
+                continue
             if matches(card, filter_json, cards):
                 out.append(int(uid))
     return out

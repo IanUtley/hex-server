@@ -25,6 +25,12 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from tests.test_db import fresh_database
+
+# Bind this process's test database before any runtime import
+# opens ``db``; the live ``hconnect.db`` is never opened.
+SRC = fresh_database()
+
 import game_engine
 
 from tests.tests_combat import HandlerStub, SessionStub
@@ -34,10 +40,6 @@ from abilities.framework.triggers import (
     resolve_stack_trigger,
 )
 
-SRC = os.environ.get(
-    "HEX_TEST_SOURCE_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hconnect.db"),
-)
 SET1 = "0382f729-7710-432b-b761-13677982dcd2"
 OUT = "/tmp/set1_sweep_failures.txt"
 

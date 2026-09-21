@@ -55,6 +55,18 @@ def _uid_value(value) -> int:
     return int(getattr(value, "uid64", value))
 
 
+def _same_player_uid(left, right) -> bool:
+    """Compare participant identities across raw/typed UID and plain forms.
+
+    Test and focused fixtures use plain string participants; ``_uid_value``
+    cannot coerce those, so fall back to ordinary equality instead of raising.
+    """
+    try:
+        return _uid_value(left) == _uid_value(right)
+    except (TypeError, ValueError):
+        return left == right
+
+
 def _serial_id(value):
     try:
         return _uid_value(value)
@@ -998,10 +1010,18 @@ class AuthoritativeSession:
             self.action_stack.clear()
             top = None
         if (isinstance(top, PriorityWindowAction) and
-                getattr(top, "ability_responding_to", None) is None):
+                getattr(top, "ability_responding_to", None) is None and
+                top.priority_player_id is not None):
             # Reattached actions are materialized from the durable snapshot,
             # so they need the same stop-policy translation as actions created
-            # by TurnPhaseState.on_entry.
+            # by TurnPhaseState.on_entry.  An exhausted queue (``None``) is
+            # deliberately excluded: every participant the window asked has
+            # already passed, so the window is complete and the next tick pops
+            # it and advances the phase.  Re-applying the stop policy there
+            # would rebuild the queue and re-ask an already-answered decision
+            # (live symptom: the DeclareDefense blocker prompt reopened after
+            # CommitTroopsToDefense because an ordinary Game projection
+            # re-synced the checkpoint mid-transaction).
             self.configure_phase_priority(top)
         initial_start_turn = (
             phase_name(self.current_turn_phase) == "StartTurn" and
@@ -1238,26 +1258,44 @@ class AuthoritativeSession:
         checker = getattr(self.runtime_facts, "validate_ability_targets", None)
         return bool(checker(ability, activation_data, player_id)) if callable(checker) else False
 
-    def submit_transaction(self, transaction: RulesTransaction) -> bool:
-        # The session wrapper can be rehydrated with a new checkpoint while
-        # this native scheduler object is cached. Refresh the facts bridge at
-        # the transaction boundary so validation never reads an attach-time
-        # resource, card-state, or ownership snapshot.
+    def refresh_checkpoint_state(self) -> None:
+        """Adopt the durable checkpoint's phase before validating a transaction.
+
+        The session wrapper can be rehydrated with a new checkpoint while this
+        native scheduler object is cached.  Refresh the facts bridge at the
+        transaction boundary so validation never reads an attach-time resource,
+        card-state, or ownership snapshot.
+
+        The phase must be refreshed before normalization, not only inside
+        ``submit_transaction``.  Practice/PvE keeps two phase representations
+        (the native port's ``current_turn_phase`` and the compatibility
+        checkpoint's ``phase_idx`` cursor); the AI driver can advance one
+        without updating the other.  Normalizing against one value and then
+        validating against the other rejected a legitimate client pass with
+        ``requirements=phase/player/handler`` even though both requirements
+        passed on re-inspection.  Callers normalize after this refresh so both
+        steps observe the same phase.
+        """
         facts = self.runtime_facts
         game_session = getattr(self.snapshot_store, "game_session", None)
-        if facts is not None and game_session is not None:
-            from .persistence import load_state
-            live_state = load_state(game_session)
-            if isinstance(live_state, dict) and live_state:
-                facts.battle_state = live_state
-                # Practice/PvE stores the native phase at the checkpoint
-                # cursor. PvP supplies its own raw-phase synchronization in
-                # PvpAuthoritativeSession.submit_transaction.
-                if not live_state.get("pvp"):
-                    from .persistence import current_phase
-                    live_phase = current_phase(live_state)
-                    if live_phase is not None:
-                        self.current_turn_phase = live_phase
+        if facts is None or game_session is None:
+            return
+        from .persistence import load_state
+        live_state = load_state(game_session)
+        if not (isinstance(live_state, dict) and live_state):
+            return
+        facts.battle_state = live_state
+        # Practice/PvE stores the native phase at the checkpoint cursor. PvP
+        # supplies its own raw-phase synchronization in
+        # PvpAuthoritativeSession.submit_transaction.
+        if not live_state.get("pvp"):
+            from .persistence import current_phase
+            live_phase = current_phase(live_state)
+            if live_phase is not None:
+                self.current_turn_phase = live_phase
+
+    def submit_transaction(self, transaction: RulesTransaction) -> bool:
+        self.refresh_checkpoint_state()
         # A server-driven card can be queued between two compatibility
         # projections.  The durable RulesPort snapshot is the transaction
         # boundary in that case; repair a live response queue that still has
@@ -1505,7 +1543,12 @@ class AuthoritativeSession:
         # no-resolver branch left the window waiting in the live host, so the
         # phase never advanced to ``DeclareAttackPriorityWindow`` and the client
         # stayed stuck in Select Attackers.
-        if self.action_stack.priority_player_id == transaction.player_id:
+        if (self.action_stack.priority_player_id is not None and
+                _same_player_uid(
+                    self.coerce_transaction_player_id(
+                        self.action_stack.priority_player_id),
+                    self.coerce_transaction_player_id(
+                        transaction.player_id))):
             self.pass_player_priority(transaction.player_id)
         resolver = self.projection("attack_transaction")
         if resolver is not None:
@@ -1535,7 +1578,12 @@ class AuthoritativeSession:
         # and then calls ``session.DoPassPriorityTransaction()``; the defender's
         # ``DeclareDefense`` window must be consumed before the host projection
         # drives the next boundary (see ``_resolve_commit_troops_to_attack``).
-        if self.action_stack.priority_player_id == transaction.player_id:
+        if (self.action_stack.priority_player_id is not None and
+                _same_player_uid(
+                    self.coerce_transaction_player_id(
+                        self.action_stack.priority_player_id),
+                    self.coerce_transaction_player_id(
+                        transaction.player_id))):
             self.pass_player_priority(transaction.player_id)
         resolver = self.projection("defense_transaction")
         if resolver is not None:
@@ -2229,23 +2277,91 @@ class AuthoritativeSession:
         except (AttributeError, TypeError, ValueError):
             return
 
+    def _checkpoint_chain_descriptors(self):
+        """Read the durable compatibility chain from the battle checkpoint."""
+        state = None
+        facts = getattr(self, "runtime_facts", None)
+        candidate = getattr(facts, "battle_state", None) if facts else None
+        if isinstance(candidate, Mapping):
+            state = candidate
+        if state is None:
+            session = getattr(getattr(self, "snapshot_store", None),
+                              "game_session", None)
+            candidate = getattr(session, "_rules_port_battle_state", None)
+            if not isinstance(candidate, Mapping):
+                candidate = getattr(session, "turn_order", None)
+            if isinstance(candidate, Mapping):
+                state = candidate
+        items = state.get("stack") if isinstance(state, Mapping) else None
+        return list(items) if isinstance(items, (list, tuple)) else []
+
+    def _durable_chain_descriptors(self) -> list:
+        """Return the pending chain descriptors in durable resolution order.
+
+        ``projected_chain`` is the port-owned projection of the native chain
+        at the last save.  The battle checkpoint's ``stack`` list is the same
+        projection for the compatibility wire format, so including it keeps an
+        item queued in an earlier transaction even when a later checkpoint
+        already lost its native counterpart.
+        """
+        ordered: list = []
+        seen: set = set()
+
+        def add(descriptor):
+            if not isinstance(descriptor, Mapping):
+                return
+            try:
+                instance_id = int(descriptor.get("instance_id", 0) or 0)
+            except (TypeError, ValueError):
+                return
+            if instance_id <= 0 or instance_id in seen:
+                return
+            seen.add(instance_id)
+            ordered.append(dict(descriptor))
+
+        for descriptor in self._checkpoint_chain_descriptors():
+            add(descriptor)
+        projected = getattr(self, "_projected_chain_descriptors", {}) or {}
+        for instance_id in getattr(self, "restored_chain_instance_ids", ()):
+            add(projected.get(instance_id))
+        for descriptor in projected.values():
+            add(descriptor)
+        return ordered
+
     def rehydrate_projected_chain(self) -> bool:
-        """Rebuild the active projected chain after reconnect."""
-        descriptors = getattr(self, "_projected_chain_descriptors", {})
-        if not descriptors or self.chain._instance_ids:
+        """Rebuild every pending projected chain item after a reconnect.
+
+        Practice rebuilds this host from the persisted checkpoint for each
+        client transaction, so a chain item queued in an earlier transaction
+        only survives when its durable descriptor is re-created here.  Rebuild
+        only the most recent descriptor (or none at all) left the durable
+        ``stack`` projecting items no native action owned: their effects never
+        resolved, and ``stack_empty`` stayed false for the rest of the game,
+        which suppressed BasicAction activations such as Tunnel.
+        """
+        if self.chain._instance_ids:
             return False
-        descriptor = next(reversed(descriptors.values()))
-        try:
-            instance_id = int(descriptor.get("instance_id", 0) or 0)
-        except (TypeError, ValueError):
-            return False
-        owner_id = descriptor.get("owner_id")
-        if owner_id is None:
-            return False
-        self.queue_projected_chain(
-            descriptor, owner_id,
-            first_player_id=self.action_stack.priority_player_id)
-        return instance_id in self.chain._instance_ids
+        restored = False
+        for descriptor in self._durable_chain_descriptors():
+            try:
+                instance_id = int(descriptor.get("instance_id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if instance_id <= 0 or instance_id in self.chain._instance_ids:
+                continue
+            owner_id = descriptor.get("owner_id")
+            if owner_id is None:
+                owner_id = descriptor.get("source_owner_uid")
+            if owner_id is None:
+                owner_id = self.active_player_id
+            try:
+                self.queue_projected_chain(
+                    descriptor, owner_id,
+                    first_player_id=self.action_stack.priority_player_id)
+            except (TypeError, ValueError):
+                continue
+            restored = instance_id in self.chain._instance_ids or restored
+        return restored
 
     def chain_can_resolve(self) -> bool:
         """Port of ``TurnPhaseState.ChainCanResolve`` for the live phase."""
