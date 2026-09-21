@@ -18571,14 +18571,19 @@ class HCPHandler(ProfileStreamMixin):
                         "is_pass_priority", "is_choose_pick",
                         "is_cancel_auto_pass", "is_priority_sync",
                         "is_tip_window_closed"))
-                if self._rules_port_auto_attach and native_boundary_intent:
-                    # RulesPort mode is authoritative for every typed
-                    # transaction in its coverage. Never reinterpret a
-                    # rejected request in the legacy compatibility dispatcher,
-                    # including the attach-failure case: executing legacy code
-                    # after a port setup error would make behavior depend on
-                    # which host happened to initialize first.
-                    log_req("    RulesPort boundary: refusing legacy fallback")
+                if self._rules_port_auto_attach:
+                    # With the port attached the native scheduler is the only
+                    # ingress for a live PlayerTransaction.  A classified
+                    # request never falls through to the legacy dispatcher,
+                    # and neither does an unrecognized one: the port cannot
+                    # validate an intent it cannot decode, so the request is
+                    # acknowledged and dropped rather than reinterpreted
+                    # under a different phase/priority contract.  A
+                    # transaction class the client actually sends belongs in
+                    # classify_player_transaction, not in the legacy engine.
+                    log_req("    RulesPort boundary: refusing legacy fallback"
+                            + ("" if native_boundary_intent else
+                               " (unclassified transaction)"))
                     self._push_transaction_ack(session)
                     handled = True
                 else:

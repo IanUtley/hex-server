@@ -1230,6 +1230,44 @@ def test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty():
     print("PASS PvP choice reads native payload when raw envelope is empty")
 
 
+def test_pvp_play_transactions_use_the_client_envelope():
+    """A PvP play must be submitted as the client's typed Play transaction.
+
+    The smoke harness used to submit a generic ``PlayCardTransaction``
+    envelope, which is not a client transaction class: every play fell outside
+    the typed RulesPort ingress and was executed by the legacy PvP dispatcher
+    instead.  Guard both halves of that contract — the envelope the harness
+    builds must normalize to a port play intent, and the generic envelope must
+    stay unclassified so the boundary refuses it.
+    """
+    from application.player_transactions import (
+        classify_player_transaction, typed_payload_from_decoded)
+    from rules_port.wire import normalize_player_transaction
+    import pvp_autoplay
+
+    for card_type, kind in (("Resource", "play_resource"),
+                            ("Troop", "play_troop"),
+                            ("BasicAction", "play_spell")):
+        raw = pvp_autoplay._card_play_bytes(257, card_type)
+        command = classify_player_transaction(raw)
+        assert getattr(command, f"is_{kind}"), (card_type, raw)
+        payload = typed_payload_from_decoded(command, {"__raw__": raw})
+        assert payload and payload["card_id"] == 257, (card_type, payload)
+        transaction = normalize_player_transaction(
+            command, 1001,
+            current_phase=game_engine.ETurnPhases.FirstMainPhase,
+            payload=payload)
+        assert transaction is not None and transaction.kind == kind, card_type
+        assert transaction.payload["card_id"] == 257, card_type
+
+    legacy_shape = b"PlayCardTransaction;m_SessionCardId;" + \
+        pvp_autoplay._mk_uid_bytes(257)
+    unclassified = classify_player_transaction(legacy_shape)
+    assert not any(getattr(unclassified, name) for name in dir(unclassified)
+                   if name.startswith("is_")), legacy_shape
+    print("PASS PvP play transactions use the typed client envelope")
+
+
 if __name__ == "__main__":
     test_parity()
     test_pvp_combat_trigger_stays_on_authoritative_stack()
@@ -1248,3 +1286,4 @@ if __name__ == "__main__":
     test_pvp_steadfast_attacker_stays_untapped()
     test_pvp_choice_zone_target_resolves_child_then_parent()
     test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty()
+    test_pvp_play_transactions_use_the_client_envelope()

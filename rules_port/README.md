@@ -108,8 +108,14 @@ RulesPort scheduler. Domain callbacks are projection adapters for SQLite and
 Unity events; they do not select or implement gameplay rules. Typed requests
 never fall through to the legacy dispatcher after a RulesPort rejection.
 `DebugCheatTransaction` and `NonsenseTransaction` remain intentionally
-outside the gameplay rules boundary. Live attached sessions use
-`NativeEffectBackend`, `NativeTriggerBackend`, and the native target evaluator;
+outside the gameplay rules boundary. With the port attached, a request the
+decoder cannot classify is acknowledged and dropped instead of being handed to
+the legacy engine; the class belongs in `classify_player_transaction` before it
+can be played. `HEX_RULES_PORT_AUTO_ATTACH=0` is the only mode that still
+dispatches a PlayerTransaction through the legacy handlers.
+
+Live attached sessions use `NativeEffectBackend`, `NativeTriggerBackend`, and
+the native target evaluator;
 the deprecated compatibility adapters live outside the RulesPort dispatcher and
 are not selectable by a live session.
 

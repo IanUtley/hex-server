@@ -131,7 +131,12 @@ def _seed_champion(session_id, pid, champ_guid, uid_offset=0):
 
 
 def _transaction(handler, session, inner_bytes):
-    """Push a 3029 PlayerTransaction through the production handler."""
+    """Push a 3029 PlayerTransaction through the production handler.
+
+    ``inner_obj`` carries the labelled raw envelope so the handler recovers
+    the same typed payload it recovers when ObjFmt decoding of a live request
+    fails; without it the harness would only exercise the untyped ingress.
+    """
     import game_engine as _ge
     # The 3029 handler reloads the session via find_session_by_player; use the
     # same lookup so our view of the state stays in sync with the DB.
@@ -147,7 +152,7 @@ def _transaction(handler, session, inner_bytes):
     handler.handle_service_request(
         "ServiceGameSession", str(session.server_id),
         PLAYER_TRANSACTION_DATA_TYPE, 1, 1,
-        session.session_id, 0, {}, inner_bytes)
+        session.session_id, 0, {"__raw__": inner_bytes}, inner_bytes)
     cur = gs.find_session_by_player(
         _ge.UID.make(PLAYER_UID_TYPE, int(handler.client_reck_id)).to_uint64()) or session
     if os.environ.get("PVP_TRACE"):
@@ -168,10 +173,28 @@ def _mk_uid_bytes(uid):
             + b";0;" + hexlify(struct.pack("<Q", int(uid))) + b";")
 
 
-def _card_play_bytes(card_uid):
-    # Minimal transaction: the parser only looks for m_SessionCardId ->
-    # m_UID64 (the hex UID is in parts[4] of the split).
-    return b"PlayCardTransaction;m_SessionCardId;" + _mk_uid_bytes(card_uid)
+# The stock client submits one Play<CardType>Transaction per card (there is no
+# generic play envelope), so the harness must name the same class the client
+# would or its plays fall outside the typed RulesPort ingress.  Keyed by
+# ``card_templates.card_type``; a combined type uses its first listed token.
+_PLAY_TRANSACTION_BY_DB_TYPE = {
+    "Champion": b"PlayChampionTransaction",
+    "BasicAction": b"PlaySpellTransaction",
+    "QuickAction": b"PlaySpellTransaction",
+    "Troop": b"PlayTroopTransaction",
+    "Artifact": b"PlayArtifactTransaction",
+    "Constant": b"PlayArtifactTransaction",
+    "Resource": b"PlayResourceTransaction",
+}
+
+
+def _card_play_bytes(card_uid, card_type):
+    """Client-shaped play transaction for one hand card of ``card_type``."""
+    for token in str(card_type or "").split("|"):
+        transaction = _PLAY_TRANSACTION_BY_DB_TYPE.get(token.strip())
+        if transaction is not None:
+            return transaction + b";m_SessionCardId;" + _mk_uid_bytes(card_uid)
+    raise ValueError(f"autoplay cannot play card type {card_type!r}")
 
 
 def _attack_bytes(attacker_uids, champ_uid):
@@ -316,14 +339,16 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
                 res_rows = db_hand_resources_with_template(session_id, turn_pid)
                 if res_rows and not db_zone_card_count(
                         session_id, turn_pid, "PlayedResources"):
-                    _transaction(h, session, _card_play_bytes(res_rows[0][1]))
+                    _transaction(h, session,
+                                 _card_play_bytes(res_rows[0][1], "Resource"))
                     _transaction(player_handlers[opp_pid], session,
                                  b"PassPriorityTransaction;")
                 troop = next((row for row in db_ai_hand_playables(
                     session_id, turn_pid, "permanent")
                     if "Troop" in str(row[4])), None)
                 if troop:
-                    _transaction(h, session, _card_play_bytes(troop[1]))
+                    _transaction(h, session,
+                                 _card_play_bytes(troop[1], troop[4]))
                     _transaction(player_handlers[opp_pid], session,
                                  b"PassPriorityTransaction;")
                 _transaction(h, session, b"PassPriorityTransaction;")
