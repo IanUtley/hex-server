@@ -22,7 +22,7 @@ Use the sources in this order:
    invariants.
 4. Focused documents provide evidence and subsystem detail:
    `docs/CLIENT_SERVER_PROTOCOL.md`, `docs/GAMEDATA_MODEL.md`,
-   `docs/CAMPAIGN.md`, `docs/FROST_RING_ARENA.md`,
+   `docs/CAMPAIGN.md`, `docs/FROST_RING_ARENA.md`, `docs/MERCENARIES.md`,
    `abilities/ABILITIES.md`, and `docs/PRIVATE_SERVER_FEATURES.md`.
 5. Tests and the running code are the current executable check. If they
    disagree with a document, fix the implementation and the document together;

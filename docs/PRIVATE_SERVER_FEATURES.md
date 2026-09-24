@@ -9,7 +9,8 @@ than a promise that the feature is entirely absent.
 The gameplay rules are defined in [RULES.md](../RULES.md). The wire-level
 overview is in [CLIENT_SERVER_PROTOCOL.md](CLIENT_SERVER_PROTOCOL.md).
 Frost Ring Arena implementation details are in
-[FROST_RING_ARENA.md](FROST_RING_ARENA.md).
+[FROST_RING_ARENA.md](FROST_RING_ARENA.md), and mercenary parties in
+[MERCENARIES.md](MERCENARIES.md).
 
 ## Server foundation and persistence
 
@@ -65,7 +66,8 @@ Frost Ring Arena implementation details are in
 - [x] Campaign encounters started with a party mercenary use its champion
   template, health, abilities, and saved deck.
 - [ ] Raise `CAMP_PARTYCAP` when the AZ2 mercenary recruitment encounters are
-  won (Katsuhiro, Augustine); `!partycap` stands in for testing.
+  won (Katsuhiro, Augustine); `!partycap` stands in for testing. See
+  `docs/MERCENARIES.md`.
 - [ ] Mercenary party passives, upgrades (`mercupd`, `MercLeveling`), and
   dungeon mercenary nodes (`/merc_node_ch`, `/passivemercs`).
 - [ ] Known mercenary ability issues: B.E.B.O.'s passive only exhausts its
