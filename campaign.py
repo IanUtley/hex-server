@@ -4259,7 +4259,8 @@ def handle_campaign_request(handler, _db, inner_obj, comp, session_id, reqid,
         return _handle_cheat(handler, _db, env_json, comp, session_id,
                               reqid, target, instance, conh, uid)
     else:
-        log(f"    Unhandled campaign request: {req_type}")
+        log(f"    Unhandled campaign request: {req_type} "
+            f"{json.dumps(env_json, default=str)[:4000]}")
         return
 
 

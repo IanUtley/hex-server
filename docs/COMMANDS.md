@@ -19,6 +19,7 @@ authoritative in-game list.
 | `!encounter` | `!encounter <name>` | Implemented | Start a named campaign encounter; available outside an active game. |
 | `!challenge` | `!challenge [opponent]` | Implemented | Create a duel challenge. |
 | `!reload` | `!reload` | Implemented | Reload runtime modules. |
+| `!additem` | `!additem <item name> [xN]` | Implemented | Add any inventory item (mercenary, equipment, chest, sleeve...) by exact or unique partial name; available outside an active game. |
 
 ## Card Info & Manipulation
 

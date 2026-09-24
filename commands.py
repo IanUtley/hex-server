@@ -174,6 +174,7 @@ def _full_help_lines():
         "=== Commands ===",
         "!version — show the server version",
         "!arena-cleanup — clear your Frost Ring Arena run",
+        "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!hand — list cards in hand (name [id])",
         "!playable [id|name ...] — set golden outlines (no args = all)",
@@ -252,6 +253,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "encounter":
         try:
             return _cmd_encounter(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "additem":
+        try:
+            return _cmd_additem(handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "challenge":
@@ -350,6 +356,43 @@ def _refresh_pvp_debug_options(tournament_game, session, state):
     elif phase not in (3, 4, 5, 6, 7, 8, 9):
         tournament_game.pvp_push_phase_options(
             session, state, pid=state.get("priority_pid"))
+
+
+def _cmd_additem(handler, args):
+    """Grant an inventory item by name: !additem <item name> [xN].
+
+    Works for any InventoryItemData (mercenaries, equipment, chests,
+    sleeves, ...).  An exact name wins; otherwise a unique partial match.
+    """
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(99, int(args[-1][1:])))
+        args = args[:-1]
+    wanted = " ".join(args).strip().lower()
+    if not wanted:
+        return "Usage: !additem <item name> [xN]"
+    from gamedata import DEFAULT_RECORD_STORE
+    items = [record for record in DEFAULT_RECORD_STORE.load("InventoryItemData")
+             if record.field("m_Name")]
+    matches = [r for r in items if r.field("m_Name").lower() == wanted]
+    if not matches:
+        matches = [r for r in items if wanted in r.field("m_Name").lower()]
+    names = sorted({r.field("m_Name") for r in matches})
+    if not matches:
+        return f"No item named '{wanted}'"
+    if len(names) > 1:
+        return (f"{len(names)} items match: " + ", ".join(names[:8])
+                + (" ..." if len(names) > 8 else ""))
+    item = matches[0]
+    kind = str(item.field("m_Type") or "item").lower()
+    updates = hconnect_server._grant_pack_inventory_rewards(
+        handler, [(item.guid, kind)] * quantity)
+    hconnect_server._db.commit()
+    for template_guid, item_uid, total in updates:
+        handler.push_inventory_to_client(
+            qty=total, template_guid=template_guid, item_id=item_uid)
+    total = updates[-1][2] if updates else quantity
+    return f"Added {quantity}x {names[0]} ({item.field('m_Type')}); you now have {total}"
 
 
 def _cmd_encounter(handler, args):
