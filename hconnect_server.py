@@ -10444,6 +10444,10 @@ class HCPHandler(ProfileStreamMixin):
             from services.chat import handle_chat_message
             handle_chat_message(self, body)
 
+        elif target == "Session" and instance == "whsp":
+            from services.chat import handle_whisper_message
+            handle_whisper_message(self, body)
+
         # === ROUTED SERVICE MESSAGES ===
         elif instance and instance != "ping":
             log_req(f">>> Routed msg target={target} instance={instance}")

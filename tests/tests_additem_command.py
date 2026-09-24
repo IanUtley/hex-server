@@ -71,9 +71,37 @@ def test_unknown_item():
     assert "No item named" in _command(_handler(9303), "!additem Not A Real Thing")
 
 
+def test_forgiving_names_from_real_attempts():
+    handler = _handler(9304)
+    result = _command(handler, "!additem Bebo")
+    assert result.startswith("Added 1x B.E.B.O."), result
+    assert "Did you mean: Mooof" in _command(handler, "!additem Moof")
+    assert "Glorfenblort" in _command(handler, "!additem Glorfenbort")
+    assert "is a card, not an inventory item" in _command(handler, "!additem extinction")
+
+
+def test_whispered_command_runs():
+    import json
+    from services import chat
+    handler = _handler(9305)
+    sent = []
+    handler.scnt = 0
+    handler.sid = "test"
+    handler.send = lambda headers, body=b"": sent.append(json.loads(body))
+    handler._handle_chat_command = lambda text, room, user: _command(handler, "!" + text)
+    chat.handle_whisper_message(handler, json.dumps(
+        {"target": None, "flags": "", "msg": "!additem Scabtongue"}).encode())
+    assert sent and sent[-1]["room"] == "general", sent
+    assert sent[-1]["msg"].startswith("Added 1x Scabtongue"), sent[-1]
+    chat.handle_whisper_message(handler, b'{"target": "Bob", "msg": "hello"}')
+    assert len(sent) == 1
+
+
 if __name__ == "__main__":
     run("adds a mercenary by exact name", test_adds_mercenary_by_exact_name)
     run("quantity and partial name", test_quantity_and_partial_name)
     run("unknown item", test_unknown_item)
+    run("forgiving names from real attempts", test_forgiving_names_from_real_attempts)
+    run("whispered command runs", test_whispered_command_runs)
     if FAILURES:
         sys.exit(1)

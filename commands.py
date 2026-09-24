@@ -358,28 +358,45 @@ def _refresh_pvp_debug_options(tournament_game, session, state):
             session, state, pid=state.get("priority_pid"))
 
 
+def _item_name_key(name):
+    """Lowercase alphanumerics only, so "bebo" matches "B.E.B.O."."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
 def _cmd_additem(handler, args):
     """Grant an inventory item by name: !additem <item name> [xN].
 
     Works for any InventoryItemData (mercenaries, equipment, chests,
-    sleeves, ...).  An exact name wins; otherwise a unique partial match.
+    sleeves, ...).  Names ignore case and punctuation; an exact name wins,
+    then a unique partial match, then spelling suggestions.
     """
     quantity = 1
     if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
         quantity = max(1, min(99, int(args[-1][1:])))
         args = args[:-1]
-    wanted = " ".join(args).strip().lower()
+    wanted_text = " ".join(args).strip()
+    wanted = _item_name_key(wanted_text)
     if not wanted:
         return "Usage: !additem <item name> [xN]"
     from gamedata import DEFAULT_RECORD_STORE
     items = [record for record in DEFAULT_RECORD_STORE.load("InventoryItemData")
              if record.field("m_Name")]
-    matches = [r for r in items if r.field("m_Name").lower() == wanted]
+    matches = [r for r in items if _item_name_key(r.field("m_Name")) == wanted]
     if not matches:
-        matches = [r for r in items if wanted in r.field("m_Name").lower()]
+        matches = [r for r in items if wanted in _item_name_key(r.field("m_Name"))]
     names = sorted({r.field("m_Name") for r in matches})
     if not matches:
-        return f"No item named '{wanted}'"
+        import difflib
+        by_key = {_item_name_key(r.field("m_Name")): r.field("m_Name") for r in items}
+        close = difflib.get_close_matches(wanted, list(by_key), n=5, cutoff=0.7)
+        if close:
+            return (f"No item named '{wanted_text}'. Did you mean: "
+                    + ", ".join(by_key[key] for key in close) + "?")
+        if hconnect_server._db.execute(
+                "SELECT 1 FROM card_templates WHERE lower(name)=lower(?) LIMIT 1",
+                (wanted_text,)).fetchone():
+            return f"'{wanted_text}' is a card, not an inventory item"
+        return f"No item named '{wanted_text}'"
     if len(names) > 1:
         return (f"{len(names)} items match: " + ", ".join(names[:8])
                 + (" ..." if len(names) > 8 else ""))
