@@ -58,6 +58,19 @@ Frost Ring Arena implementation details are in
   and PvE battles swap each card for the equipment-modified template
   extracted into `equipment_card_variants`; see `services/equipment.py`.
 - [ ] `RemoveEquipmentFromAllDecks` and the `EquipmentSet` battle event.
+- [x] Mercenary parties: the `CAMP_PARTYCAP` profile flag, `partysave`/
+  `partyload`, mercenary deck templates (`pdecktsave`/`pdeckdel`), and the
+  login `FlagData`/`ChampionParty`/`SavedProfileDeckTemplate` lists; see
+  `services/mercenaries.py` and `services/deck_templates.py`.
+- [x] Campaign encounters started with a party mercenary use its champion
+  template, health, abilities, and saved deck.
+- [ ] Raise `CAMP_PARTYCAP` when the AZ2 mercenary recruitment encounters are
+  won (Katsuhiro, Augustine); `!partycap` stands in for testing.
+- [ ] Mercenary party passives, upgrades (`mercupd`, `MercLeveling`), and
+  dungeon mercenary nodes (`/merc_node_ch`, `/passivemercs`).
+- [ ] Known mercenary ability issues: B.E.B.O.'s passive only exhausts its
+  controller's non-Robot troops; its charge power offers one "Over-" card
+  instead of two and then loops.
 - [ ] Auction House protocol and persistence.
 
 ## Mail and notifications
