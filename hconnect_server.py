@@ -14861,7 +14861,9 @@ class HCPHandler(ProfileStreamMixin):
                     "fortune_ability_guid")
                 self._campaign_fortune_starting_hand_bonus = int(
                     cfg.get("fortune_starting_hand_bonus", 0) or 0)
-                log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}")
+                mercenary_deck_cards = cfg.get("mercenary_deck_cards")
+                log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}"
+                        + (f" mercenary_deck={len(mercenary_deck_cards)} cards" if mercenary_deck_cards else ""))
             else:
                 # Get player champion from the selected deck. Practice uses
                 # this same deck as the AI's mirror; FRA uses it only as the
@@ -15089,7 +15091,10 @@ class HCPHandler(ProfileStreamMixin):
             import json as _json
             db_clear_session_cards(session.session_id)
             deck_rows = None
-            if deck_db_id and self.user_profile:
+            if is_campaign and mercenary_deck_cards:
+                # Mercenary decks are template GUID lists, like starter decks.
+                deck_rows = (_json.dumps(mercenary_deck_cards),)
+            elif deck_db_id and self.user_profile:
                 deck_cards_json = db_deck_cards_json(
                     deck_db_id, self.user_profile["id"], conn=_db)
                 deck_rows = (deck_cards_json,) if deck_cards_json is not None else None
@@ -15124,7 +15129,8 @@ class HCPHandler(ProfileStreamMixin):
             from profile_db import db_deck_equipment
             from services.equipment import equipped_variant
             deck_equipment = (db_deck_equipment(deck_db_id, conn=_db)
-                              if deck_db_id else [])
+                              if deck_db_id and not (is_campaign and mercenary_deck_cards)
+                              else [])
             if deck_equipment:
                 log_req(f"    Deck equipment: {deck_equipment}")
             if deck_rows and deck_rows[0]:

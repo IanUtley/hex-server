@@ -70,6 +70,7 @@ RECORD_SECTIONS = (
     "DeckTemplate",
     "EncounterDeck",
     "InventoryItemData",
+    "MercenaryTemplate",
     "QuestTemplate",
     "SceneData",
     "ConversationTemplate",
@@ -583,7 +584,8 @@ def _extract_gems(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...
     return sorted(gem_rows), sorted(meta_rows), gem_bom
 
 
-def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
+def _extract_champions(data: str, sections=("ChampionTemplate", "MercenaryTemplate")
+                       ) -> dict[str, list[tuple[Any, ...]]]:
     helpers = _card_helpers()
     ability_records = {}
     for _, record in records(data, "AbilityTemplate")[0]:
@@ -593,7 +595,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
     extended_rows = []
     ability_rows = []
     ability_guids: set[str] = set()
-    for _, record in records(data, "ChampionTemplate")[0]:
+    champion_records = [record for section in sections
+                        for _, record in records(data, section)[0]]
+    for record in champion_records:
         champion_guid = nested_guid(record, "m_Id")
         if not champion_guid:
             continue
@@ -609,7 +613,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
                     1,
                 )
             )
-        if champion_type != "PvPChampion":
+        # Mercenaries are fixed-stat champions like PvP champions: a starting
+        # health, champion abilities, and no talents.
+        if champion_type not in ("PvPChampion", "Mercenary"):
             continue
         extended_rows.append(
             (
@@ -626,6 +632,10 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
         for entry in record.get("m_ChampionAbilities") or []:
             ability_guid = guid(entry.get("m_CardAbilityId")) if isinstance(entry, dict) else ""
             if not ability_guid:
+                continue
+            # Some unreleased mercenaries (e.g. Andres the Supremo) reference
+            # abilities that are absent from the client's AbilityTemplates.
+            if champion_type == "Mercenary" and ability_guid not in ability_records:
                 continue
             ability_guids.add(ability_guid)
             ability = ability_records.get(ability_guid) or {}
@@ -1259,6 +1269,15 @@ def extract_equipment_variants(path: str | None = None) -> list[tuple[Any, ...]]
     return _extract_equipment_variants(load_records_text(configured_records_path()))
 
 
+def extract_mercenary_champions(path: str | None = None) -> dict[str, list[tuple[Any, ...]]]:
+    """Extract champion tables for MercenaryTemplate records only."""
+    if path or configured_path():
+        data = load_text(path)
+    else:
+        data = load_records_text(configured_records_path())
+    return _extract_champions(data, sections=("MercenaryTemplate",))
+
+
 def extract_equipment(path: str | None = None) -> list[tuple[Any, ...]]:
     """Extract equipment items from gamedata or the checked-in Records."""
     if path or configured_path():
@@ -1299,6 +1318,8 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
+# Bump when extract() output changes so on-disk caches are rebuilt.
+_EXTRACT_VERSION = 2
 
 
 def _extract_cache_file(cache_key: str) -> str:
@@ -1326,9 +1347,10 @@ def extract(path: str | None = None) -> dict[str, Any]:
         source_stat = os.stat(cache_key)
         with open(cache_file, "rb") as stream:
             disk = pickle.load(stream)
-        if (isinstance(disk, tuple) and len(disk) == 3 and
+        if (isinstance(disk, tuple) and len(disk) == 4 and
                 disk[0] == int(source_stat.st_mtime_ns) and
                 disk[1] == int(source_stat.st_size) and
+                disk[3] == _EXTRACT_VERSION and
                 isinstance(disk[2], dict)):
             _EXTRACT_CACHE[cache_key] = disk[2]
             return disk[2]
@@ -1411,7 +1433,8 @@ def extract(path: str | None = None) -> dict[str, Any]:
         source_stat = os.stat(cache_key)
         with open(cache_file, "wb") as stream:
             pickle.dump((int(source_stat.st_mtime_ns), int(source_stat.st_size),
-                         result), stream, protocol=pickle.HIGHEST_PROTOCOL)
+                         result, _EXTRACT_VERSION), stream,
+                        protocol=pickle.HIGHEST_PROTOCOL)
     except (OSError, pickle.PickleError):
         pass
     return result

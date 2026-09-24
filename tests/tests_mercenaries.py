@@ -202,6 +202,71 @@ def test_pdecktsave_returns_objfmt_template_and_login_lists_it():
     assert deck_templates.list_templates(db._db, user_id) == []
 
 
+BEBO_ITEM = "321fd775-ee06-4186-a5d6-368d552f8d09"
+BEBO_TEMPLATE = "8a336fec-d970-4613-9308-c0afd41b62eb"
+CHARGE_BOT = "7325706e-6bf1-4ca4-8d6b-5da13ac069f4"
+
+
+def _party_with_bebo(user_id, champion_id):
+    from services import deck_templates
+    data = _deck_template_bytes("BEBO Bots", [(CHARGE_BOT, 4)])
+    template_id, _ = deck_templates.save_template(db._db, user_id, 0, data)
+    mercenaries.save_party(db._db, user_id, {
+        "ChampionID": champion_id,
+        "Members": [{"Mercenary": {"m_Guid": BEBO_ITEM},
+                     "DeckTemplate": template_id, "Upgrade": 0}]})
+    db._db.commit()
+
+
+def test_mercenary_champions_are_seeded():
+    row = db._db.execute(
+        "SELECT name, starting_health FROM champion_templates_extended WHERE guid=?",
+        (BEBO_TEMPLATE,)).fetchone()
+    assert tuple(row) == ("B.E.B.O.", 22), row
+    abilities = db._db.execute(
+        "SELECT COUNT(*) FROM champion_abilities WHERE champion_guid=?",
+        (BEBO_TEMPLATE,)).fetchone()[0]
+    assert abilities == 2, abilities
+
+
+def test_existing_database_backfills_mercenary_champions():
+    import static
+    db._db.execute("DELETE FROM champion_abilities WHERE champion_guid=?", (BEBO_TEMPLATE,))
+    db._db.execute("DELETE FROM champion_templates_extended WHERE guid=?", (BEBO_TEMPLATE,))
+    db._db.commit()
+    static.ensure_schema(db._db)
+    test_mercenary_champions_are_seeded()
+
+
+def test_battle_mercenary_resolves_party_member():
+    user_id = _new_user(9406)
+    _party_with_bebo(user_id, 4)
+    merc = mercenaries.battle_mercenary(db._db, user_id, 4, BEBO_ITEM)
+    assert merc == {"champion_guid": BEBO_TEMPLATE, "name": "B.E.B.O.",
+                    "starting_health": 22, "deck_cards": [CHARGE_BOT] * 4}, merc
+    assert mercenaries.battle_mercenary(db._db, user_id, 5, BEBO_ITEM) is None
+    assert mercenaries.battle_mercenary(db._db, user_id, 4, mercenaries.ZERO_GUID) is None
+
+
+def test_battle_config_uses_active_mercenary():
+    user_id = _new_user(9407)
+    _party_with_bebo(user_id, 4)
+    handler = hconnect_server.HCPHandler.__new__(hconnect_server.HCPHandler)
+    handler.user_profile = {"id": user_id}
+    base = campaign.resolve_battle_config(handler, db._db, 0, "camp_0")
+    assert base["mercenary_deck_cards"] is None
+    campaign._active_mercenary[0] = (4, BEBO_ITEM)
+    try:
+        cfg = campaign.resolve_battle_config(handler, db._db, 0, "camp_0")
+    finally:
+        campaign._active_mercenary.pop(0, None)
+    assert cfg["player_champ_guid"] == BEBO_TEMPLATE
+    assert cfg["player_champ_name"] == "B.E.B.O."
+    assert cfg["player_starting_health"] == 22
+    assert cfg["player_talents_json"] == "[]"
+    assert cfg["mercenary_deck_cards"] == [CHARGE_BOT] * 4
+
+
 if __name__ == "__main__":
     run("list writer matches chest encoder", test_list_writer_matches_chest_encoder)
     run("flag and party encoding", test_flag_and_party_encoding)
@@ -210,5 +275,9 @@ if __name__ == "__main__":
     run("login push sends flags and parties", test_login_push_sends_flags_and_parties)
     run("template name and storage", test_template_name_and_storage)
     run("pdecktsave returns ObjFmt template", test_pdecktsave_returns_objfmt_template_and_login_lists_it)
+    run("mercenary champions are seeded", test_mercenary_champions_are_seeded)
+    run("existing database backfills mercenary champions", test_existing_database_backfills_mercenary_champions)
+    run("battle mercenary resolves party member", test_battle_mercenary_resolves_party_member)
+    run("battle config uses active mercenary", test_battle_config_uses_active_mercenary)
     if FAILURES:
         sys.exit(1)

@@ -9,6 +9,7 @@ are also sent at login as ``List<SavedProfileDeckTemplate>``.
 """
 
 import base64
+import struct
 
 from encoder import encode_objfmt_response
 
@@ -25,6 +26,43 @@ def _read_varint(data, pos):
             break
         shift += 7
     return value, pos
+
+
+def _read_guid(data, pos):
+    """Read a .NET Guid.ToByteArray() (mixed-endian) GUID."""
+    raw = data[pos:pos + 16]
+    a, b, c = struct.unpack("<IHH", raw[:8])
+    tail = raw[8:].hex()
+    return f"{a:08x}-{b:04x}-{c:04x}-{tail[:4]}-{tail[4:]}", pos + 16
+
+
+def template_cards(data):
+    """Return the card template GUIDs of ProfileDeckTemplate bytes.
+
+    Layout (ProfileDeckTemplate.ToBytes): name, champion GUID, sleeve GUID,
+    Equip {varint slot, GUID}*, Cards {GUID, varint count, reserve, extended,
+    foil bytes, varint gem count, varint gems}*.  Reserve (sideboard) cards
+    are skipped; each card is repeated ``count`` times.
+    """
+    length, pos = _read_varint(data, 0)
+    pos += length + 32                       # name, champion, sleeve
+    equipped, pos = _read_varint(data, pos)
+    for _ in range(equipped):
+        _slot, pos = _read_varint(data, pos)
+        pos += 16
+    count, pos = _read_varint(data, pos)
+    cards = []
+    for _ in range(count):
+        guid, pos = _read_guid(data, pos)
+        copies, pos = _read_varint(data, pos)
+        reserve = data[pos]
+        pos += 3
+        gems, pos = _read_varint(data, pos)
+        for _ in range(gems):
+            _gem, pos = _read_varint(data, pos)
+        if not reserve:
+            cards.extend([guid] * copies)
+    return cards
 
 
 def template_name(data):

@@ -3956,6 +3956,9 @@ def _az1_panorama_assets(panorama_node, champion_race=None):
 # correct AI deck/name (resolve_encounter uses this to override
 # the race's training encounter with the actual launched scene).
 _last_encounter_scene = {}
+# camp_id -> (champion_id, InventoryMercenaryData GUID) chosen in the latest
+# 'start' event ("merc=<guid>" in OParms); consumed by resolve_battle_config.
+_active_mercenary = {}
 
 # Race-specific Castle Crayburn EncounterScene IDs from the client data.
 # The shared dungeon template supplies the map, but these scenes supply the
@@ -6835,6 +6838,19 @@ def resolve_battle_config(handler, db, camp_id, session_name):
             db, talent_guids)
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
+
+    # A mercenary chosen for this encounter replaces the champion: its own
+    # template, health and saved party deck, and no champion talents.
+    mercenary = None
+    if camp_id in _active_mercenary and profile:
+        from services.mercenaries import battle_mercenary
+        merc_champ_id, merc_guid = _active_mercenary[camp_id]
+        mercenary = battle_mercenary(db, profile.get("id"), merc_champ_id, merc_guid)
+    if mercenary:
+        player_champ_guid = mercenary["champion_guid"]
+        player_champ_name = mercenary["name"]
+        player_starting_health = mercenary["starting_health"]
+        player_talents_json = "[]"
     return {
         "scene_guid": scene_guid,
         "ai_deck_guid": ai_deck_guid,
@@ -6859,6 +6875,7 @@ def resolve_battle_config(handler, db, camp_id, session_name):
         "fortune_guid": fortune_guid,
         "fortune_ability_guid": fortune_ability_guid,
         "fortune_starting_hand_bonus": fortune_starting_hand_bonus,
+        "mercenary_deck_cards": mercenary["deck_cards"] if mercenary else None,
     }
 
 
@@ -6981,6 +6998,16 @@ def _handle_campaign_start(handler, db, env_json, champ_id, cfg,
     """
     log = getattr(handler, "_log_req", print)
     camp_id = env_json.get("CampID", 0)
+
+    # The party selector sends the chosen mercenary as "merc=<item guid>";
+    # the zero GUID means the champion fights with their own deck.
+    merc_guid = next((str(p)[5:] for p in env_json.get("OParms") or []
+                      if str(p).startswith("merc=")), "")
+    if merc_guid and merc_guid.strip("0-"):
+        _active_mercenary[int(camp_id or 0)] = (champ_id, merc_guid.lower())
+        log(f"    Campaign start with mercenary {merc_guid} (camp={camp_id})")
+    else:
+        _active_mercenary.pop(int(camp_id or 0), None)
 
     # Player's deck for this champion (the auto-created race starter deck).
     deck_db_id = pve_db.db_champion_last_deck_id(champ_id, conn=db)

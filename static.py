@@ -1566,6 +1566,29 @@ def ensure_schema(db):
     except Exception as exc:
         print(f"Equipment template seed skipped: {exc}")
 
+    # Mercenary champions (health, champion abilities, ability effects) were
+    # added to the champion catalog after databases already existed.  Fresh
+    # databases receive them from the full client seed below, so only backfill
+    # an already-seeded catalog.  B.E.B.O. is a MercenaryTemplate in every
+    # client build, so use it as the marker.
+    try:
+        if db.execute("SELECT 1 FROM champion_templates_extended LIMIT 1").fetchone()                 and not db.execute(
+                "SELECT 1 FROM champion_templates_extended WHERE guid=?",
+                ("8a336fec-d970-4613-9308-c0afd41b62eb",)).fetchone():
+            from AssetExtraction.gamedata_seed import (
+                extract_mercenary_champions, seed_database)
+            mercs = extract_mercenary_champions()
+            inserted = seed_database(db, {"tables": {
+                "champion_templates_extended": mercs["champion_templates_extended"],
+                "champion_template_data": mercs["champion_template_data"],
+                "champion_abilities": mercs["champion_abilities"],
+                "ability_effects": mercs["champion_ability_effects"],
+                "card_abilities_meta": mercs["champion_ability_meta"],
+            }})
+            print(f"Seeded mercenary champions: {inserted}")
+    except Exception as exc:
+        print(f"Mercenary champion seed skipped: {exc}")
+
     # QuestTemplate records provide the objective definitions while authored
     # conversation names identify the NPC/node and quest stage.  Keep both in
     # server-owned tables so campaign.py can grant quests and show !/? markers

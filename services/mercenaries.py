@@ -175,6 +175,50 @@ def normalize_party(party):
             "Members": members}
 
 
+# ── Battle ────────────────────────────────────────────────────────────
+
+def mercenary_template_guid(item_guid):
+    """Map an InventoryMercenaryData GUID to its MercenaryTemplate GUID."""
+    from gamedata import DEFAULT_RECORD_STORE
+    item = DEFAULT_RECORD_STORE.get("InventoryItemData", str(item_guid).lower())
+    if item is None:
+        return None
+    return _guid(item.field("m_MercenaryTemplateId")) or None
+
+
+def battle_mercenary(db, user_id, champion_id, item_guid):
+    """Resolve the mercenary a champion chose for an encounter.
+
+    ``item_guid`` is the InventoryMercenaryData GUID the client sends as
+    ``merc=<guid>`` in the campaign 'start' event.  Returns the champion
+    template, name, starting health, and the party member's deck cards, or
+    None when the mercenary has no saved deck.
+    """
+    from services import deck_templates
+    item_guid = str(item_guid or "").lower()
+    if not item_guid or item_guid == ZERO_GUID:
+        return None
+    member = None
+    for party in get_parties(db, user_id):
+        if party["ChampionID"] == int(champion_id or 0):
+            member = next((m for m in party["Members"]
+                           if m["Mercenary"] == item_guid), None)
+    if not member or not member["DeckTemplate"]:
+        return None
+    template = deck_templates.get_template(db, user_id, member["DeckTemplate"])
+    champion_guid = mercenary_template_guid(item_guid)
+    if not template or not champion_guid:
+        return None
+    row = db.execute(
+        "SELECT name, starting_health FROM champion_templates_extended WHERE guid=?",
+        (champion_guid,)).fetchone()
+    if not row:
+        return None
+    return {"champion_guid": champion_guid, "name": row[0],
+            "starting_health": int(row[1] or 20),
+            "deck_cards": deck_templates.template_cards(template[2])}
+
+
 # ── Persistence ───────────────────────────────────────────────────────
 
 def get_flags(db, user_id):
