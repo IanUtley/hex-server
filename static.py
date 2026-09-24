@@ -224,6 +224,14 @@ DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS equipment_card_variants (
+        base_guid TEXT NOT NULL,
+        equipment_key TEXT NOT NULL,
+        variant_guid TEXT NOT NULL,
+        PRIMARY KEY (base_guid, equipment_key)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS redeem_codes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT NOT NULL UNIQUE,
@@ -690,7 +698,8 @@ DDL = [
         deck_sleeve_guid TEXT DEFAULT NULL,
         gameboard_guid TEXT DEFAULT NULL,
         coin_guid TEXT DEFAULT NULL,
-        last_saved TEXT DEFAULT ''
+        last_saved TEXT DEFAULT '',
+        equipment TEXT DEFAULT '[]'
     )
     """,
     """
@@ -1519,6 +1528,15 @@ def ensure_schema(db):
                 "VALUES (?,?,?,?,?,?,?,?,?,?)", equipment_rows)
             db.commit()
             print(f"Seeded equipment templates: {len(equipment_rows)} rows")
+        if not db.execute("SELECT 1 FROM equipment_card_variants LIMIT 1").fetchone():
+            from AssetExtraction.gamedata_seed import extract_equipment_variants
+            variant_rows = extract_equipment_variants()
+            db.executemany(
+                "INSERT OR IGNORE INTO equipment_card_variants "
+                "(base_guid,equipment_key,variant_guid) VALUES (?,?,?)",
+                variant_rows)
+            db.commit()
+            print(f"Seeded equipment card variants: {len(variant_rows)} rows")
     except Exception as exc:
         print(f"Equipment template seed skipped: {exc}")
 
@@ -1752,6 +1770,8 @@ def ensure_schema(db):
             db.execute("ALTER TABLE card_templates ADD COLUMN equipment_modified INTEGER DEFAULT 0")
         if "gem_abilities" not in dcols:
             db.execute("ALTER TABLE decks ADD COLUMN gem_abilities TEXT DEFAULT '{}'")
+        if "equipment" not in dcols:
+            db.execute("ALTER TABLE decks ADD COLUMN equipment TEXT DEFAULT '[]'")
         if "effect_group_id" not in ecols:
             db.execute("ALTER TABLE ability_effects ADD COLUMN effect_group_id INTEGER DEFAULT 0")
         if "condition_id" not in ecols:

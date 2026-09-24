@@ -134,7 +134,13 @@ class ProfileStreamMixin:
                 except:
                     card_ids = []
                 card_guids = []  # CardsInDeck kept empty in profile push
-                deck_data.append((deck_uid64, dname, deck_uid, champ_id, dk.get("cards", "[]"), card_guids))
+                try:
+                    deck_equipment = _json.loads(dk.get("equipment") or "[]")
+                except (TypeError, ValueError):
+                    deck_equipment = []
+                from services.equipment import equipment_slots
+                deck_data.append((deck_uid64, dname, deck_uid, champ_id, dk.get("cards", "[]"), card_guids,
+                                  equipment_slots(_db, deck_equipment)))
         deck_count = len(deck_data)
         log(f">>> Profile push: {deck_count} decks from DB")
         

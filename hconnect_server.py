@@ -15106,6 +15106,14 @@ class HCPHandler(ProfileStreamMixin):
             player_ref_cache = {}
             player_card_data = []
             player_insert_rows = []
+            # Equipped items replace their cards with the equipment-modified
+            # templates the client data provides for each combination.
+            from profile_db import db_deck_equipment
+            from services.equipment import equipped_variant
+            deck_equipment = (db_deck_equipment(deck_db_id, conn=_db)
+                              if deck_db_id else [])
+            if deck_equipment:
+                log_req(f"    Deck equipment: {deck_equipment}")
             if deck_rows and deck_rows[0]:
                 card_ids = _json.loads(deck_rows[0])
                 random.shuffle(card_ids)
@@ -15123,8 +15131,18 @@ class HCPHandler(ProfileStreamMixin):
                                if isinstance(card_tpl_id, str)
                                else ("instance", card_tpl_id))
                     if ref_key not in player_ref_cache:
-                        player_ref_cache[ref_key] = self._resolve_card_ref(
+                        resolved = self._resolve_card_ref(
                             card_tpl_id, self.user_profile["id"])
+                        variant = equipped_variant(
+                            _db, resolved[0], deck_equipment)
+                        if variant:
+                            upgraded = self._resolve_card_ref(
+                                variant, self.user_profile["id"])
+                            if upgraded[0]:
+                                log_req(f"    Equipped {resolved[2]}: "
+                                        f"{resolved[0]} -> {variant}")
+                                resolved = upgraded
+                        player_ref_cache[ref_key] = resolved
                     _tpl, ctype, _n, _c, _a, _d = player_ref_cache[ref_key]
                     player_resolved_tpl_ids.append(_tpl)
                     setup_data = self._battle_setup_template_data(
@@ -17156,6 +17174,9 @@ class HCPHandler(ProfileStreamMixin):
                                     elif fname == b'CoinId': coin_guid = val
                                 except: pass
             log_req(f"    Parsed: id={deck_id}, name={deck_name}, cards={len(card_ids) if card_ids else 0}, gems={len(active_gems)}, sleeve={deck_sleeve_guid}")
+            from services.equipment import (parse_request_equipment_ids,
+                                            sanitize_deck_equipment)
+            equipment_ids = parse_request_equipment_ids(inner_bytes)
 
             success = False
             owner_id = None
@@ -17178,11 +17199,19 @@ class HCPHandler(ProfileStreamMixin):
                 ag_json = json.dumps(active_gems)
                 gem_abilities = self._resolve_gem_abilities(active_gems)
                 ga_json = json.dumps(gem_abilities)
+                equipment_json = None
+                if equipment_ids is not None:
+                    kept_equipment = sanitize_deck_equipment(
+                        _db, owner_id, equipment_ids)
+                    equipment_json = json.dumps(kept_equipment)
+                    log_req(f"    Equipment: requested={len(equipment_ids)} "
+                            f"kept={kept_equipment}")
                 success = db_update_deck(deck_id, owner_id,
                     deck_name=deck_name, cards_json=cards_json,
                     pve_champion_id=pve_champion_id, pvp_champion_guid=pvp_champion_guid,
                     active_gems_json=ag_json, gem_abilities_json=ga_json,
-                    deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+                    deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid,
+                    equipment_json=equipment_json)
                 log_req(f"    DB update: {'OK' if success else 'FAILED'} "
                         f"(owner={owner_id})")
                 # Link this deck as the champion's last used deck (pve_champion_id
@@ -17302,7 +17331,11 @@ class HCPHandler(ProfileStreamMixin):
                 for ci, cid in enumerate(card_ids):
                     b.add_list_item_uint64(ci, cid)
                 b.begin_list("SideboardCardIDs", "System.Collections.Generic.List`1#System.UInt64", 0)
-                b.begin_list("EquipmentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
+                try:
+                    deck_equipment = json.loads(db_deck.get("equipment") or "[]")
+                except (TypeError, ValueError):
+                    deck_equipment = []
+                b.field_resource_id_list("EquipmentIDs", deck_equipment)
                 b.begin_list("TalentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
                 b.field_resource_id("DeckSleeveId", db_deck.get("deck_sleeve_guid") or "00000000-0000-0000-0000-000000000000")
                 b.field_resource_id("GameboardId", db_deck.get("gameboard_guid") or "00000000-0000-0000-0000-000000000000")

@@ -16,6 +16,7 @@ that name.
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import json
 import os
@@ -1220,6 +1221,44 @@ def _extract_equipment(data: str) -> list[tuple[Any, ...]]:
     return sorted(set(row for row in rows if row[0]))
 
 
+_TAC_GUID = re.compile(
+    rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _extract_equipment_variants(data: str) -> list[tuple[Any, ...]]:
+    """Map (base card, equipped items) to the equipment-modified card.
+
+    Equipment-modified CardTemplates (``m_EquipmentModifiedCard``) carry a
+    serialized TAC whose first GUID is the base card and whose remaining GUIDs
+    are the equipment that produces this variant.  ``equipment_key`` is the
+    sorted, comma-joined equipment GUID list.
+    """
+    rows = []
+    for _, record in records(data, "CardTemplate")[0]:
+        if not int_value(record.get("m_EquipmentModifiedCard")):
+            continue
+        tac = record.get("m_SerializedTAC") or {}
+        payload = tac.get("data") if isinstance(tac, dict) else None
+        if not payload:
+            continue
+        try:
+            guids = [g.decode() for g in _TAC_GUID.findall(base64.b64decode(payload))]
+        except (ValueError, TypeError):
+            continue
+        if len(guids) < 2:
+            continue
+        rows.append((guids[0], ",".join(sorted(set(guids[1:]))),
+                     nested_guid(record, "m_Id")))
+    return sorted(set(row for row in rows if row[2]))
+
+
+def extract_equipment_variants(path: str | None = None) -> list[tuple[Any, ...]]:
+    """Extract equipment-modified card variants from gamedata or Records."""
+    if path or configured_path():
+        return _extract_equipment_variants(load_text(path))
+    return _extract_equipment_variants(load_records_text(configured_records_path()))
+
+
 def extract_equipment(path: str | None = None) -> list[tuple[Any, ...]]:
     """Extract equipment items from gamedata or the checked-in Records."""
     if path or configured_path():
@@ -1363,6 +1402,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
             "quest_conversations": quest_conversations,
             "chest_templates": _extract_chests(data),
             "equipment_templates": _extract_equipment(data),
+            "equipment_card_variants": _extract_equipment_variants(data),
             "pack_set_map": _extract_pack_map(data),
         },
     }
@@ -1405,6 +1445,7 @@ TABLE_COLUMNS = {
     "quest_conversations": ("quest_script", "conversation_guid", "campaign_template", "node_id", "npc", "role", "faction", "conversation_name", "start_hook", "conditions_json", "priority", "enabled"),
     "chest_templates": ("guid", "name", "set_guid", "chest_type", "spin_type", "promotional_id"),
     "equipment_templates": ("guid", "name", "set_guid", "rarity", "equipment_type", "modifiers", "description", "design_notes", "is_chest_loot", "is_live"),
+    "equipment_card_variants": ("base_guid", "equipment_key", "variant_guid"),
     "pack_set_map": ("pack_guid", "set_guid", "is_full_set", "is_primal"),
 }
 

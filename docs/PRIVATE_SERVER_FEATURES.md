@@ -53,8 +53,11 @@ Frost Ring Arena implementation details are in
   `SpinWheelOfFate` and `OpenChest`; see `services/chest_loot.py`.
 - [ ] Retail chest equipment-rarity odds (current weights are estimates),
   Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
-- [ ] Equipping equipment to decks and applying equipment-modified cards in
-  battle.
+- [x] Deck equipment: `UpdateDeck` saves owned `EquipmentIDs` (one per
+  equipment type), `GetDeckInfo`, `deck_bits`, and `EncodedDecks` return them,
+  and PvE battles swap each card for the equipment-modified template
+  extracted into `equipment_card_variants`; see `services/equipment.py`.
+- [ ] `RemoveEquipmentFromAllDecks` and the `EquipmentSet` battle event.
 - [ ] Auction House protocol and persistence.
 
 ## Mail and notifications
