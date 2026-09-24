@@ -13999,12 +13999,21 @@ class HCPHandler(ProfileStreamMixin):
                 env_json = json.loads(envelope.decode("utf-8"))
             except (TypeError, ValueError, UnicodeDecodeError):
                 env_json = {}
+            template_envelope = None
+            if isinstance(env_json, dict) and self.user_profile and                     env_json.get("action") in ("pdecktsave", "pdeckdel"):
+                from services.deck_templates import handle_profile_action
+                template_envelope = handle_profile_action(
+                    _db, self.user_profile["id"], env_json)
             if isinstance(env_json, dict) and env_json.get("action") == "qreplaylst":
                 from replay import replay_list
                 resp_envelope = json.dumps(
                     replay_list(env_json), separators=(",", ":")
                 ).encode("utf-8")
                 log_req("    Replay list returned from game_replays")
+            elif template_envelope is not None:
+                resp_envelope = template_envelope
+                log_req(f"    Deck template {env_json.get('action')} handled "
+                        f"({len(resp_envelope)}b)")
             else:
                 resp_envelope = b"{}"
             resp_inner = encode_profile_response(resp_envelope)

@@ -44,7 +44,7 @@ class ObjFmtListWriter:
 
     PRIMITIVES = {"int": "System.Int32", "uint": "System.UInt32",
                   "ulong": "System.UInt64", "bool": "System.Boolean",
-                  "string": "System.String"}
+                  "string": "System.String", "bytes": "System.Byte[]"}
 
     def __init__(self, element_type, type_names=None):
         self.types = [list_type(element_type)] + list(type_names or [])
@@ -90,6 +90,9 @@ class ObjFmtListWriter:
             elif kind == "string":
                 data = str(value or "").encode("utf-8")
                 self._w(str(len(data))); self._sep(); self.buf.write(data)
+            elif kind == "bytes":
+                data = bytes(value or b"")
+                self.buf.write(struct.pack("!I", len(data))); self.buf.write(data)
             else:
                 fmt = {"int": "<i", "uint": "<I", "ulong": "<Q"}[kind]
                 self._w(hexlify(struct.pack(fmt, int(value or 0))).decode("ascii")); self._sep()

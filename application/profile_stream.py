@@ -407,6 +407,12 @@ class ProfileStreamMixin:
             self._push_profile_stream_object(
                 mercenaries.encode_flag_list(flags),
                 f"FlagData list {[f[0] + '=' + str(f[1]) for f in flags]}")
+        from services import deck_templates
+        templates = deck_templates.list_templates(_db, profile["id"])
+        if templates:
+            self._push_profile_stream_object(
+                deck_templates.encode_saved_template_list(templates),
+                f"SavedProfileDeckTemplate list ({len(templates)} templates)")
         parties = mercenaries.get_parties(_db, profile["id"])
         if parties:
             self._push_profile_stream_object(

@@ -148,11 +148,67 @@ def test_login_push_sends_flags_and_parties():
     assert b"ChampionParty" in pushed[1]
 
 
+def _deck_template_bytes(name, cards=()):
+    import io
+    import encoded_decks
+    buf = io.BytesIO()
+    encoded_decks.encode_profile_deck_template(
+        buf, name, SCABTONGUE, mercenaries.ZERO_GUID,
+        [(guid, count, False, False, False) for guid, count in cards])
+    return buf.getvalue()
+
+
+def test_template_name_and_storage():
+    from services import deck_templates
+    user_id = _new_user(9403)
+    data = _deck_template_bytes("Shin'hare Assault")
+    assert deck_templates.template_name(data) == "Shin'hare Assault"
+    tid, name = deck_templates.save_template(db._db, user_id, 0, data)
+    assert name == "Shin'hare Assault" and tid > 0
+    renamed = _deck_template_bytes("Renamed")
+    assert deck_templates.save_template(db._db, user_id, tid, renamed) == (tid, "Renamed")
+    assert deck_templates.list_templates(db._db, user_id) == [(tid, "Renamed", renamed)]
+    # Another player's id is never updated in place.
+    other = _new_user(9404)
+    new_id, _ = deck_templates.save_template(db._db, other, tid, data)
+    assert new_id != tid
+
+
+def test_pdecktsave_returns_objfmt_template_and_login_lists_it():
+    import base64
+    from services import deck_templates
+    user_id = _new_user(9405)
+    data = _deck_template_bytes("Merc Deck", [(SCABTONGUE, 2)])
+    handler = _CampaignHandler(user_id)
+    handler.authenticated = True
+    request = json.dumps({"action": "pdecktsave", "DeckTemplateID": 0,
+                          "Template": base64.b64encode(data).decode()}).encode()
+    hconnect_server.HCPHandler._handle_service_request_legacy(
+        handler, "ServiceProfile", "Shared", 80000, 2, 1,
+        "00000000-0000-0000-0000-000000000000", 0, {"Envelope": request}, b"")
+    body = _unwrap(handler.sent[-1])
+    assert b"Game.Shared.Profile.SavedProfileDeckTemplate" in body, body[:200]
+    assert b"Merc Deck" in body and data in body
+    (tid, name, stored), = deck_templates.list_templates(db._db, user_id)
+    assert (name, stored) == ("Merc Deck", data)
+    encoded = deck_templates.encode_saved_template_list([(tid, name, stored)])
+    assert b"List`1#Game.Shared.Profile.SavedProfileDeckTemplate" in encoded
+    assert data in encoded
+
+    delete = json.dumps({"action": "pdeckdel", "DeckTemplateID": tid}).encode()
+    hconnect_server.HCPHandler._handle_service_request_legacy(
+        handler, "ServiceProfile", "Shared", 80000, 4, 1,
+        "00000000-0000-0000-0000-000000000000", 0, {"Envelope": delete}, b"")
+    assert deck_templates.list_templates(db._db, user_id) == []
+
+
 if __name__ == "__main__":
     run("list writer matches chest encoder", test_list_writer_matches_chest_encoder)
     run("flag and party encoding", test_flag_and_party_encoding)
     run("party JSON accepts ResourceId shapes", test_party_json_accepts_resource_id_shapes)
     run("partysave/partyload round trip", test_partysave_and_partyload_round_trip)
     run("login push sends flags and parties", test_login_push_sends_flags_and_parties)
+    run("template name and storage", test_template_name_and_storage)
+    run("pdecktsave returns ObjFmt template", test_pdecktsave_returns_objfmt_template_and_login_lists_it)
     if FAILURES:
         sys.exit(1)

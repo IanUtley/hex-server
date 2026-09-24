@@ -234,6 +234,15 @@ DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS profile_deck_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL DEFAULT '',
+        data BLOB NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS champion_parties (
         champion_id INTEGER PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id),
