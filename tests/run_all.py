@@ -101,7 +101,9 @@ def _test_files(quick=False, only=None):
 
 
 def main(quick=False, only=None):
-    with tempfile.TemporaryDirectory(prefix="hex-test-suite-") as work_dir:
+    # Windows cannot delete the baseline while a SQLite handle is still open.
+    with tempfile.TemporaryDirectory(prefix="hex-test-suite-",
+                                     ignore_cleanup_errors=True) as work_dir:
         template_path = Path(work_dir) / "baseline.db"
         try:
             baseline_description = _create_baseline(template_path)

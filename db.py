@@ -14,6 +14,7 @@ threads can share it (SQLite serializes writes internally).
 
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 import struct
@@ -30,7 +31,10 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "hconnect.db"),
 )
 
-REQUEST_LOG = "/tmp/hconnect_requests.log"
+REQUEST_LOG = os.environ.get(
+    "HEX_REQUEST_LOG",
+    os.path.join(tempfile.gettempdir(), "hconnect_requests.log"),
+)
 _log_req_file = open(REQUEST_LOG, "a", buffering=1)
 
 # SQLITE_BUSY honors the connection busy timeout; SQLITE_LOCKED variants do
