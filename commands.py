@@ -175,6 +175,7 @@ def _full_help_lines():
         "!version — show the server version",
         "!arena-cleanup — clear your Frost Ring Arena run",
         "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
+        "!partycap <0-4> — set mercenary party slots (applies after relog)",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!hand — list cards in hand (name [id])",
         "!playable [id|name ...] — set golden outlines (no args = all)",
@@ -253,6 +254,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "encounter":
         try:
             return _cmd_encounter(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "partycap":
+        try:
+            return _cmd_partycap(handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "additem":
@@ -410,6 +416,22 @@ def _cmd_additem(handler, args):
             qty=total, template_guid=template_guid, item_id=item_uid)
     total = updates[-1][2] if updates else quantity
     return f"Added {quantity}x {names[0]} ({item.field('m_Type')}); you now have {total}"
+
+
+def _cmd_partycap(handler, args):
+    """Set the mercenary party-slot flag: !partycap <0-4>.
+
+    The client reads CAMP_PARTYCAP from the login profile stream, so the new
+    value applies after the next login.
+    """
+    from services import mercenaries
+    if not args or not args[0].isdigit():
+        return "Usage: !partycap <0-4>  (then log out and back in)"
+    slots = max(0, min(4, int(args[0])))
+    mercenaries.set_flag(hconnect_server._db, handler.user_profile["id"],
+                         mercenaries.PARTY_CAP_FLAG, slots, 4)
+    hconnect_server._db.commit()
+    return f"Mercenary party slots set to {slots}; log out and back in to apply"
 
 
 def _cmd_encounter(handler, args):

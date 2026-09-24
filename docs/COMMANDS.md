@@ -20,6 +20,7 @@ authoritative in-game list.
 | `!challenge` | `!challenge [opponent]` | Implemented | Create a duel challenge. |
 | `!reload` | `!reload` | Implemented | Reload runtime modules. |
 | `!additem` | `!additem <item name> [xN]` | Implemented | Add any inventory item (mercenary, equipment, chest, sleeve...) by exact or unique partial name; available outside an active game. |
+| `!partycap` | `!partycap <0-4>` | Implemented | Set the `CAMP_PARTYCAP` profile flag (unlocked mercenary party slots); applies after the next login. |
 
 ## Card Info & Manipulation
 

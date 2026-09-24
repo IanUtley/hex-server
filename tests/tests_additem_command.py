@@ -1,4 +1,4 @@
-"""The !additem developer command grants inventory items by name."""
+"""Developer test commands: !additem and !partycap."""
 
 import os
 import sys
@@ -97,11 +97,21 @@ def test_whispered_command_runs():
     assert len(sent) == 1
 
 
+def test_partycap_sets_flag():
+    from services import mercenaries
+    handler = _handler(9306)
+    result = _command(handler, "!partycap 3")
+    assert "set to 3" in result, result
+    assert mercenaries.get_flags(db._db, 9306) == [("CAMP_PARTYCAP", 3, 4, 0)]
+    assert "Usage" in _command(handler, "!partycap")
+
+
 if __name__ == "__main__":
     run("adds a mercenary by exact name", test_adds_mercenary_by_exact_name)
     run("quantity and partial name", test_quantity_and_partial_name)
     run("unknown item", test_unknown_item)
     run("forgiving names from real attempts", test_forgiving_names_from_real_attempts)
     run("whispered command runs", test_whispered_command_runs)
+    run("!partycap sets flag", test_partycap_sets_flag)
     if FAILURES:
         sys.exit(1)
