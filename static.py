@@ -224,6 +224,23 @@ DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS profile_flags (
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        maximum INTEGER NOT NULL DEFAULT 0,
+        completed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, name)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS champion_parties (
+        champion_id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        party_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS equipment_card_variants (
         base_guid TEXT NOT NULL,
         equipment_key TEXT NOT NULL,

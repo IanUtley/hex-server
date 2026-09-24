@@ -4258,10 +4258,47 @@ def handle_campaign_request(handler, _db, inner_obj, comp, session_id, reqid,
     elif req_type == "cheat":
         return _handle_cheat(handler, _db, env_json, comp, session_id,
                               reqid, target, instance, conh, uid)
+    elif req_type == "partysave":
+        return _handle_partysave(handler, _db, env_json, comp, session_id,
+                                 reqid, target, instance, conh, uid)
+    elif req_type == "partyload":
+        return _handle_partyload(handler, _db, env_json, comp, session_id,
+                                 reqid, target, instance, conh, uid)
     else:
         log(f"    Unhandled campaign request: {req_type} "
             f"{json.dumps(env_json, default=str)[:4000]}")
         return
+
+
+def _handle_partysave(handler, db, env_json, comp, session_id,
+                      reqid, target, instance, conh, uid):
+    """Party.SaveRequest: persist the champion's mercenary party.
+
+    The client deserializes the response envelope as the saved
+    CampSysGeneral+Party+ChampionParty and hands it to its callback.
+    """
+    from services import mercenaries
+    log = getattr(handler, "_log_req", print)
+    log(f"    partysave {json.dumps(env_json, default=str)[:2000]}")
+    user_id = handler.user_profile["id"] if handler.user_profile else 0
+    party = mercenaries.save_party(db, user_id, env_json.get("Party") or {})
+    db.commit()
+    return _send_response(handler, json.dumps(party), comp, session_id,
+                          reqid, target, instance, conh, uid)
+
+
+def _handle_partyload(handler, db, env_json, comp, session_id,
+                      reqid, target, instance, conh, uid):
+    """Party.LoadRequest: return the requested champions' parties."""
+    from services import mercenaries
+    log = getattr(handler, "_log_req", print)
+    log(f"    partyload {json.dumps(env_json, default=str)[:2000]}")
+    user_id = handler.user_profile["id"] if handler.user_profile else 0
+    wanted = {int(c) for c in env_json.get("Champs") or []}
+    parties = [party for party in mercenaries.get_parties(db, user_id)
+               if not wanted or party["ChampionID"] in wanted]
+    return _send_response(handler, json.dumps(parties), comp, session_id,
+                          reqid, target, instance, conh, uid)
 
 
 def _handle_qcur4champ(handler, db, env_json, comp, session_id,

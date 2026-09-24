@@ -72,6 +72,8 @@ class ProfileStreamMixin:
         # The client collects List<chest_bits> from the profile stream and
         # feeds them to CreateLocalTreasureCache (PlayerProfile.cs).
         self._push_chests_stream(p)
+        # Profile flags (e.g. CAMP_PARTYCAP) and mercenary parties.
+        self._push_mercenary_stream(p)
 
         now_str = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
         
@@ -376,6 +378,40 @@ class ProfileStreamMixin:
         }, packet)
         log_req(f">>> PUSH Iconoclast BannedCardList (dt=2214) "
                  f"{len(banned)} cards, dw_sz={len(packet)}")
+
+    def _push_profile_stream_object(self, inner, label):
+        """Send one standalone object in the login profile stream (dt=2210)."""
+        profile_args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileStreamEventArgs",
+             "System.Byte[]", "System.Boolean"],
+            [("Data", "bytes", inner),
+             ("done", "bool", False)]
+        )
+        dw = encode_datawrapper(0, 2210, compress_gzip(profile_args), 1,
+                                "00000000-0000-0000-0000-000000000000")
+        issuer = f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer.{self.client_uid}.{self.scnt}"
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH {label} (dt=2210) dw_sz={len(dw)}")
+
+    def _push_mercenary_stream(self, profile):
+        """Push List<FlagData> and List<ChampionParty> for mercenary parties."""
+        from services import mercenaries
+        if not profile:
+            return
+        flags = mercenaries.get_flags(_db, profile["id"])
+        if flags:
+            self._push_profile_stream_object(
+                mercenaries.encode_flag_list(flags),
+                f"FlagData list {[f[0] + '=' + str(f[1]) for f in flags]}")
+        parties = mercenaries.get_parties(_db, profile["id"])
+        if parties:
+            self._push_profile_stream_object(
+                mercenaries.encode_party_list(parties),
+                f"ChampionParty list ({len(parties)} parties)")
 
     def _push_chests_stream(self, profile):
         """Push unopened treasure chests in the login profile stream.
