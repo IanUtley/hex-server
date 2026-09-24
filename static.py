@@ -210,6 +210,20 @@ DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS equipment_templates (
+        guid TEXT PRIMARY KEY,
+        name TEXT,
+        set_guid TEXT,
+        rarity TEXT,
+        equipment_type TEXT,
+        modifiers TEXT,
+        description TEXT,
+        design_notes TEXT,
+        is_chest_loot INTEGER NOT NULL DEFAULT 0,
+        is_live INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS redeem_codes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT NOT NULL UNIQUE,
@@ -1491,6 +1505,22 @@ def ensure_schema(db):
             )
     except Exception as exc:
         print(f"Campaign node conversation seed skipped: {exc}")
+
+    # Equipment catalog used for chest loot and deck equipment.  Seed it
+    # incrementally so databases created before the table existed gain it.
+    try:
+        if not db.execute("SELECT 1 FROM equipment_templates LIMIT 1").fetchone():
+            from AssetExtraction.gamedata_seed import extract_equipment
+            equipment_rows = extract_equipment()
+            db.executemany(
+                "INSERT OR IGNORE INTO equipment_templates "
+                "(guid,name,set_guid,rarity,equipment_type,modifiers,"
+                "description,design_notes,is_chest_loot,is_live) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)", equipment_rows)
+            db.commit()
+            print(f"Seeded equipment templates: {len(equipment_rows)} rows")
+    except Exception as exc:
+        print(f"Equipment template seed skipped: {exc}")
 
     # QuestTemplate records provide the objective definitions while authored
     # conversation names identify the NPC/node and quest stage.  Keep both in

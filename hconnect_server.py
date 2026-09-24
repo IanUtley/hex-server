@@ -564,8 +564,9 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
 
     ``cards`` are ``(guid, name, cost, attack, defense)`` rows and
     ``inventory_rewards`` are ``(template_guid, kind)`` pairs.  Campaign packs
-    and Crayburn promo chests are authored by template; every other chest falls
-    back to its set booster trimmed to the chest rarity.
+    and Crayburn promo chests are authored by template; booster treasure chests
+    award their set's chest-loot equipment, and chests from sets without
+    chest loot fall back to the set booster trimmed to the chest rarity.
     """
     rng = rng or random
     pack_config = CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
@@ -582,6 +583,11 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
         return list(reward.cards), inventory_rewards
     cards = _generate_crayburn_chest(card_templates, chest.template_guid)
     if cards is None:
+        from services.chest_loot import roll_chest_equipment
+        equipment = roll_chest_equipment(
+            _db, chest.set_guid, chest.chest_type, rng)
+        if equipment:
+            return [], [(guid, "equipment") for guid in equipment]
         cards = _generate_booster(card_templates, chest.set_guid)
         keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
         if len(cards) > keep_count:
@@ -18626,10 +18632,12 @@ class HCPHandler(ProfileStreamMixin):
                 summary = _open_client_chests(self, [chest_uid])
                 reward_card_bits = summary["cards"]
                 log_req(f"    Spun chest {chest.chest_type} uid={chest_uid}, "
-                        f"awarded {len(reward_card_bits)} cards")
+                        f"awarded {len(reward_card_bits)} cards, "
+                        f"{len(summary['inventory_updates'])} items")
 
                 # Push reward cards and inventory changes to client
-                self._send_cards_chunk(reward_card_bits)
+                if reward_card_bits:
+                    self._send_cards_chunk(reward_card_bits)
                 for template_guid, item_uid, quantity in summary["inventory_updates"]:
                     self.push_inventory_to_client(
                         qty=quantity, template_guid=template_guid,
@@ -18717,8 +18725,8 @@ class HCPHandler(ProfileStreamMixin):
                 rsizes[1] = rbuf.tell() - rc
 
                 # RewardCards (List<card_instance_bits>, encoded with reward cards)
-                rfc = rbuf.tell(); rsizes.append(0)
-                rw("RewardCards"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[1]))); rsep(); rw("0"); rsep()
+                rfc = rbuf.tell(); rsizes.append(0); rci = len(rsizes)-1
+                rw("RewardCards"); rsep(); rw(str(rci)); rsep(); rw(str(rft(rtn[1]))); rsep(); rw("0"); rsep()
                 rw(str(len(reward_card_bits))); rsep()
                 for ri, (guid, name, cost, atk, def_, cid, iext) in enumerate(reward_card_bits):
                     rfe2 = rbuf.tell(); rsizes.append(0); rei = len(rsizes)-1
@@ -18745,13 +18753,16 @@ class HCPHandler(ProfileStreamMixin):
                     enc = b"Clean"; rw(str(len(enc))); rsep(); rbuf.write(enc)
                     rsizes[-1] = rbuf.tell() - te
                     rsizes[rei] = rbuf.tell() - rfe2
-                rsizes[-1] = rbuf.tell() - rfc
+                rsizes[rci] = rbuf.tell() - rfc
 
-                # RewardItems (empty list)
-                fri = rbuf.tell(); rsizes.append(0)
-                rw("RewardItems"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[10]))); rsep(); rw("0"); rsep()
-                rw("0"); rsep()
-                rsizes[-1] = rbuf.tell() - fri
+                # RewardItems (List<inventory_bits>): the chest's equipment drops
+                reward_items = summary["inventory_updates"]
+                fri = rbuf.tell(); rsizes.append(0); rii = len(rsizes)-1
+                rw("RewardItems"); rsep(); rw(str(rii)); rsep(); rw(str(rft(rtn[10]))); rsep(); rw("0"); rsep()
+                rw(str(len(reward_items))); rsep()
+                for ii, (item_guid, item_uid, _total) in enumerate(reward_items):
+                    encode_inventory_item(rbuf, rsizes, rft, item_guid, item_uid, ii, quantity=1)
+                rsizes[rii] = rbuf.tell() - fri
 
                 # GoldAward (int 0)
                 fga = rbuf.tell(); rsizes.append(0)

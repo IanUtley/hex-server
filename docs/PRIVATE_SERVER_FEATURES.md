@@ -48,6 +48,13 @@ Frost Ring Arena implementation details are in
 - [x] Immediate client inventory removal for direct chest/pack opening using
   the client-compatible `InventoryUpdated` event; other inventory paths still
   need broader auditing.
+- [x] Booster treasure chests award equipment from their set's chest-loot
+  pool (1 item for Common-Rare, 2 for Legendary, 3 for Primal) through both
+  `SpinWheelOfFate` and `OpenChest`; see `services/chest_loot.py`.
+- [ ] Retail chest equipment-rarity odds (current weights are estimates),
+  Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
+- [ ] Equipping equipment to decks and applying equipment-modified cards in
+  battle.
 - [ ] Auction House protocol and persistence.
 
 ## Mail and notifications

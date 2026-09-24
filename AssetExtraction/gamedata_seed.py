@@ -1191,6 +1191,42 @@ def extract_quest_conversations(path: str | None = None) -> list[tuple[Any, ...]
     return _extract_quest_conversations(load_records_text(configured_records_path()))
 
 
+def _extract_equipment(data: str) -> list[tuple[Any, ...]]:
+    """Extract InventoryEquipmentData items.
+
+    ``is_chest_loot`` marks the per-set treasure-chest pools; the client data
+    only identifies them through design notes such as "Set 1 Chest Loot",
+    "Scars Chest", or "Frostheart Chest Loot".
+    """
+    rows = []
+    for _, record in records(data, "InventoryItemData")[0]:
+        if not str(record.get("_t") or "").endswith("InventoryEquipmentData"):
+            continue
+        notes = str(record.get("m_DesignNotes") or "").strip()
+        rows.append(
+            (
+                nested_guid(record, "m_Id"),
+                record.get("m_Name") or "",
+                nested_guid(record, "m_SetId"),
+                record.get("m_Rarity") or "",
+                record.get("m_EquipmentType") or "",
+                record.get("m_Modifiers") or "",
+                record.get("m_Description") or "",
+                notes,
+                1 if "chest" in notes.lower() else 0,
+                int_value(record.get("m_IsLive")),
+            )
+        )
+    return sorted(set(row for row in rows if row[0]))
+
+
+def extract_equipment(path: str | None = None) -> list[tuple[Any, ...]]:
+    """Extract equipment items from gamedata or the checked-in Records."""
+    if path or configured_path():
+        return _extract_equipment(load_text(path))
+    return _extract_equipment(load_records_text(configured_records_path()))
+
+
 def _extract_chests(data: str) -> list[tuple[Any, ...]]:
     rows = []
     for _, record in records(data, "InventoryItemData")[0]:
@@ -1326,6 +1362,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
             "quest_templates": quest_templates,
             "quest_conversations": quest_conversations,
             "chest_templates": _extract_chests(data),
+            "equipment_templates": _extract_equipment(data),
             "pack_set_map": _extract_pack_map(data),
         },
     }
@@ -1367,6 +1404,7 @@ TABLE_COLUMNS = {
     "quest_templates": ("script_name", "name", "title", "objectives_json", "campaign_group", "start_hook", "enabled"),
     "quest_conversations": ("quest_script", "conversation_guid", "campaign_template", "node_id", "npc", "role", "faction", "conversation_name", "start_hook", "conditions_json", "priority", "enabled"),
     "chest_templates": ("guid", "name", "set_guid", "chest_type", "spin_type", "promotional_id"),
+    "equipment_templates": ("guid", "name", "set_guid", "rarity", "equipment_type", "modifiers", "description", "design_notes", "is_chest_loot", "is_live"),
     "pack_set_map": ("pack_guid", "set_guid", "is_full_set", "is_primal"),
 }
 
