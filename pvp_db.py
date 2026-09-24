@@ -2569,6 +2569,13 @@ def db_transform_candidate_templates(conn=None):
     Equipment-modified printings are not valid generated-card choices.  They
     are encounter/deck equipment variants, even when their base card type and
     PvP flags look collectible.
+
+    Non-ownable cards are excluded as well.  ``CardTemplate.IsOwnable`` is
+    ``CardRarity > ERarity.Land || IsBasicResource()``, so a Land-rarity card
+    that is not a basic shard is a token/encounter card that only ever exists
+    because another card creates it (Valor, Vine Goliath).  Offering those as
+    random generated cards handed the client cards the collection never
+    contains.
     """
     connection = conn or _db_layer._db
     columns = {row[1] for row in connection.execute(
@@ -2587,6 +2594,9 @@ def db_transform_candidate_templates(conn=None):
         + " FROM card_templates WHERE COALESCE(" + is_pve_expr + ", 0)=0 "
         + "AND COALESCE(" + no_pvp_expr + ", 0)=0 "
         + "AND COALESCE(" + equipment_expr + ", 0)=0 "
+        + "AND (COALESCE(" + rarity_expr + ", '')<>'Land' "
+        + "OR (card_type LIKE '%Resource%' "
+        + "AND COALESCE(subtype, '') LIKE '%Standard%')) "
         "AND card_type NOT LIKE '%Choice%'"
     ).fetchall()
 

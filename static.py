@@ -2,10 +2,140 @@
 
 Client-derived rows are loaded into fresh databases by
 ``AssetExtraction.gamedata_seed`` from ``HEX_GAMEDATA`` or the checked-in
-``Records/`` snapshot.  They deliberately do not live in this module.
+``Records/`` snapshot.  They deliberately do not live in this module; an
+existing database keeps whichever snapshot first seeded it, so
+``refresh_client_seed`` upserts the seed-owned columns when that snapshot
+moves on.
 """
 
 import json
+import hashlib
+import os
+import shutil
+import sqlite3
+
+
+CLIENT_SEED_META_TABLE = "client_seed_meta"
+
+
+def _seed_conflict_columns(db, table, columns):
+    """Primary-key columns shared by the database table and the seed row.
+
+    Returns ``None`` when the table has no usable key, in which case the
+    caller falls back to insert-if-missing for that table.
+    """
+    try:
+        info = list(db.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return None
+    keys = [row[1] for row in sorted(info, key=lambda row: row[5])
+            if row[5]]
+    if not keys or any(key not in columns for key in keys):
+        return None
+    return keys
+
+
+def _client_seed_fingerprint(seed) -> str:
+    """Stable digest of the client-derived rows in one extracted seed."""
+    payload = json.dumps(
+        {table: rows for table, rows in sorted(seed["tables"].items())
+         if table != "pack_set_map"},
+        sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _store_client_seed_fingerprint(db, fingerprint: str) -> None:
+    """Record which snapshot the client-derived projection was built from."""
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute(
+        f"INSERT INTO {CLIENT_SEED_META_TABLE} (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("records_fingerprint", fingerprint))
+    db.commit()
+
+
+def refresh_client_seed(db) -> int:
+    """Keep an existing database's client-derived projection in step.
+
+    ``seed_database`` is insert-if-missing and only runs for a fresh database,
+    so an existing database keeps whichever Records snapshot first seeded it.
+    When the checked-in snapshot later gains typed modifier fields, champion
+    abilities or effect chains, that staleness silently changes gameplay: the
+    ``Minor Ruby of Zeal`` gem kept a lossy ``ability_effects.param`` row, so
+    the Swiftstrike it grants when the controller has a Ruby threshold never
+    applied, and champion abilities added to the snapshot never reached the
+    engine at all.
+
+    Refresh only the columns the seed owns, keyed by the snapshot fingerprint
+    so an unchanged snapshot is a no-op. Rows are upserted, never deleted, and
+    columns written by other extractors or runtime code (for example
+    ``champion_templates.charge_power``, ``quest_conversations.enabled``,
+    ``encounter_scenes.ai_deck_personality``) are left intact.
+    """
+    from AssetExtraction.gamedata_seed import TABLE_COLUMNS, extract
+
+    seed = extract()
+    fingerprint = _client_seed_fingerprint(seed)
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    stored = db.execute(
+        f"SELECT value FROM {CLIENT_SEED_META_TABLE} WHERE key=?",
+        ("records_fingerprint",)).fetchone()
+    if stored and stored[0] == fingerprint:
+        return 0
+
+    # The projection is derived, but it is also the only copy of rows the
+    # running server reads; keep the pre-refresh file for a rollback.
+    try:
+        row = db.execute("PRAGMA database_list").fetchall()
+        path = next((value for _seq, name, value in row
+                     if name == "main" and value), None)
+        if path and os.path.isfile(path):
+            backup = path + ".preseed.bak"
+            if not os.path.exists(backup):
+                shutil.copy2(path, backup)
+    except Exception:
+        pass
+
+    refreshed: dict[str, int] = {}
+    for table, rows in sorted(seed["tables"].items()):
+        if table == "pack_set_map" or not rows:
+            continue
+        columns = list(TABLE_COLUMNS.get(table, ()))
+        if not columns or not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone():
+            continue
+        present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        columns = [column for column in columns if column in present]
+        keys = _seed_conflict_columns(db, table, set(columns))
+        before = db.total_changes
+        if keys:
+            assignments = ", ".join(
+                f"{column}=excluded.{column}" for column in columns
+                if column not in keys)
+            sql = (
+                f"INSERT INTO {table} ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in columns)}) "
+                f"ON CONFLICT({','.join(keys)}) DO UPDATE SET {assignments}")
+        else:
+            sql = (f"INSERT OR IGNORE INTO {table} ({','.join(columns)}) "
+                   f"VALUES ({','.join('?' for _ in columns)})")
+        db.executemany(sql, rows)
+        changed = db.total_changes - before
+        if changed:
+            refreshed[table] = changed
+    _store_client_seed_fingerprint(db, fingerprint)
+    print(
+        "Refreshed client-derived rows for {}: {}".format(
+            seed["source"],
+            ", ".join(f"{table}={count}"
+                      for table, count in sorted(refreshed.items()))
+            or "already current"))
+    return sum(refreshed.values())
 
 # ---------------------------------------------------------------------------
 # DDL — all tables the server expects to exist.
@@ -34,6 +164,16 @@ DDL = [
         password_hash TEXT DEFAULT NULL,
         email TEXT DEFAULT NULL,
         created_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reckoning_flags (
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        maximum INTEGER NOT NULL DEFAULT 0,
+        completed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, name)
     )
     """,
     """
@@ -1789,12 +1929,26 @@ def ensure_schema(db):
 
         client_seed = extract()
         inserted = seed_database(db, client_seed)
+        # Record the snapshot the fresh projection was built from so the
+        # refresh below is a no-op on the next start.
+        _store_client_seed_fingerprint(
+            db, _client_seed_fingerprint(client_seed))
         print(
             "Seeded client data from {}: {}".format(
                 client_seed["source"],
                 ", ".join(f"{table}={count}" for table, count in sorted(inserted.items())),
             )
         )
+    else:
+        # The schema (and the client-derived projection it reads) is owned
+        # here, so the refresh of an existing database also belongs here
+        # rather than in each metadata consumer.
+        try:
+            refresh_client_seed(db)
+        except Exception as exc:
+            print(
+                f"Client-derived row refresh skipped ({exc}); keeping the "
+                "existing client data")
 
     # Existing databases predate the race-specific Crayburn encounter seed.
     # Add only the missing client-derived encounter rows; do not reseed or

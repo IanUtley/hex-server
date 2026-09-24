@@ -491,6 +491,9 @@ def encode_objfmt_response(type_names, fields):
             tname = val[0]
             ecount = val[1]
             elems = val[2] if len(val) > 2 else []
+        elif tcode == "thresholdlist":
+            tname = "System.Collections.Generic.List`1#Reckoning.Game.CardThreshold"
+            threshold_data = val or []
         elif tcode == "arenafightlist":
             tname = val[0]
             ecount = val[1]
@@ -628,6 +631,19 @@ def encode_objfmt_response(type_names, fields):
                 w(str(find_type("System.Int32"))); sep(); w("0"); sep()
                 w(hexlify(struct.pack("<i", e)).decode("ascii")); sep()
                 sizes[-1] = buf.tell() - se
+        elif tcode == "thresholdlist":
+            w(str(len(threshold_data)))
+            sep()
+            for i, threshold in enumerate(threshold_data):
+                se = buf.tell(); sizes.append(0)
+                w(str(i)); sep(); w(str(len(sizes) - 1)); sep()
+                w(str(find_type("Reckoning.Game.CardThreshold"))); sep(); w("2"); sep()
+                encode_field("m_ColorFlags", "enum1", (
+                    "Game.Shared.Mechanics.ECardShards",
+                    int(threshold.get("color_flags", 0) or 0)))
+                encode_field("m_ThresholdColorRequirement", "int",
+                             int(threshold.get("threshold", 0) or 0))
+                sizes[-1] = buf.tell() - se
         elif tcode == "arenafightlist":
             w(str(ecount))
             sep()
@@ -659,10 +675,7 @@ def encode_objfmt_response(type_names, fields):
                 w(str(i)); sep(); w(str(len(sizes) - 1)); sep()
                 mod_type = modification.get(
                     "wire_type", "Reckoning.Game.EncounterModAddChampionHealth")
-                w(str(find_type(mod_type))); sep(); w("6"); sep()
-                for name, stcode, sval in (
-                    ("Amount", "int", int(modification.get("amount", 0))),
-                    ("Absolute", "bool", bool(modification.get("absolute", False))),
+                base_fields = [
                     ("IsApplied", "bool", bool(modification.get("is_applied", False))),
                     ("RoundToApply", "int", int(modification.get("round_to_apply", 0))),
                     ("ConversationId", "struct", ("Game.Shared.ResourceId", [
@@ -672,7 +685,59 @@ def encode_objfmt_response(type_names, fields):
                     ("TargetPlayer", "enum1", (
                         "Game.Shared.Mechanics.EModTarget",
                         int(modification.get("target_player", 0)))),
-                ):
+                ]
+                if mod_type == "Reckoning.Game.EncounterModAddChampionHealth":
+                    specific_fields = [
+                        ("Amount", "int", int(modification.get("amount", 0))),
+                        ("Absolute", "bool", bool(
+                            modification.get("absolute", False))),
+                    ]
+                elif mod_type == "Reckoning.Game.EncounterModAddCard":
+                    collection_values = {
+                        "None": 0, "Deck": 1, "Hand": 2, "Champions": 4,
+                        "Warzone": 8, "Discard": 16, "Void": 32,
+                        "PlayedResources": 64, "CastSpells": 128,
+                        "Underground": 256, "Choosing": 512, "Mod": 1024,
+                        "Simulacrum": 2048, "UI_Warzone": 4096,
+                        "UI_Constant": 8192,
+                    }
+                    location_values = {"Unknown": 0, "Top": 1, "Bottom": 2}
+                    collection = modification.get("collection", "Deck")
+                    location = modification.get("location", "Unknown")
+                    specific_fields = [
+                        ("CardId", "struct", ("Game.Shared.ResourceId", [
+                            ("m_Guid", "guid", _wire_guid(
+                                modification.get("card_guid")))
+                        ])),
+                        ("Amount", "int", int(modification.get("amount", 1))),
+                        ("Collection", "enum1", (
+                            "Game.Shared.Mechanics.ECardCollections",
+                            collection_values.get(str(collection), int(collection)
+                                                  if str(collection).isdigit() else 0))),
+                        ("Location", "enum1", (
+                            "Game.Shared.Mechanics.ECardLocations",
+                            location_values.get(str(location), int(location)
+                                                if str(location).isdigit() else 0))),
+                        ("Shuffle", "bool", bool(modification.get("shuffle", False))),
+                    ]
+                elif mod_type == "Reckoning.Game.EncounterModAddResource":
+                    specific_fields = [
+                        ("MaxResourceValue", "int", int(
+                            modification.get("max_resource_value", 0))),
+                        ("ThresholdValues", "thresholdlist",
+                         modification.get("threshold_values", [])),
+                        ("ChargeValue", "int", int(
+                            modification.get("charge_value", 0))),
+                        ("Absolute", "bool", bool(
+                            modification.get("absolute", False))),
+                    ]
+                else:
+                    # DrawCards has no subtype fields; unsupported subclasses
+                    # are rejected by the arena descriptor translator.
+                    specific_fields = []
+                fields = base_fields + specific_fields
+                w(str(find_type(mod_type))); sep(); w(str(len(fields))); sep()
+                for name, stcode, sval in fields:
                     encode_field(name, stcode, sval)
                 sizes[-1] = buf.tell() - se
         elif tcode == "struct":
@@ -857,6 +922,77 @@ def encode_chest_list(chests):
         if i > 0:
             w(";")
         w(str(s))
+    return buf.getvalue()
+
+
+def encode_profile_flag_list(flags):
+    """Encode a standalone List<FlagData> for PlayerProfile's login stream."""
+    type_names = [
+        "System.Collections.Generic.List`1#Reckoning.Profile.Messages.FlagData",
+        "Reckoning.Profile.Messages.FlagData",
+        "System.String", "System.Int32", "System.Boolean",
+    ]
+    sizes = []
+    buf = io.BytesIO()
+
+    def w(value):
+        buf.write(value.encode("utf-8"))
+
+    def sep():
+        buf.write(b";")
+
+    def lf():
+        buf.write(b"\n")
+
+    def ft(type_name):
+        if type_name not in type_names:
+            type_names.append(type_name)
+        return type_names.index(type_name)
+
+    # Root header: the List<FlagData> object itself.
+    sizes.append(0)
+    w(""); sep(); w("0"); sep(); w(str(ft(type_names[0]))); sep(); w("0"); sep()
+    collection_start = buf.tell()
+    sizes.append(0)
+    w(str(len(flags))); sep()
+
+    for element_index, flag in enumerate(flags):
+        element_start = buf.tell()
+        sizes.append(0)
+        element_size_index = len(sizes) - 1
+        w(str(element_index)); sep(); w(str(element_size_index)); sep()
+        w(str(ft(type_names[1]))); sep(); w("4"); sep()
+
+        values = (
+            ("Name", "System.String", str(flag.get("name", ""))),
+            ("Progress", "System.Int32", int(flag.get("progress", 0) or 0)),
+            ("Maximum", "System.Int32", int(flag.get("maximum", 0) or 0)),
+            ("Completed", "System.Boolean", bool(flag.get("completed", False))),
+        )
+        for field_name, type_name, value in values:
+            field_start = buf.tell()
+            sizes.append(0)
+            field_size_index = len(sizes) - 1
+            w(field_name); sep(); w(str(field_size_index)); sep()
+            w(str(ft(type_name))); sep(); w("0"); sep()
+            if type_name == "System.String":
+                encoded = value.encode("utf-8")
+                w(str(len(encoded))); sep(); buf.write(encoded)
+            elif type_name == "System.Int32":
+                w(hexlify(struct.pack("<i", value)).decode("ascii")); sep()
+            else:
+                w("1" if value else "0")
+            sizes[field_size_index] = buf.tell() - field_start
+
+        sizes[element_size_index] = buf.tell() - element_start
+
+    sizes[1] = buf.tell() - collection_start
+    sizes[0] = buf.tell()
+    w(";".join(type_names)); lf()
+    for index, size in enumerate(sizes):
+        if index:
+            w(";")
+        w(str(size))
     return buf.getvalue()
 
 

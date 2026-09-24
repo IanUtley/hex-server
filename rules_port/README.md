@@ -45,6 +45,12 @@ mutable session projection. A request classified as a port intent is
 acknowledged even when rejected and is never re-run through the legacy
 dispatcher.
 
+Client events are projections too: a `Game` is one packet's buffer, and the
+host replaces it per packet. The port publishes through `GameEngineEventSink`,
+which queues a projection the host moves off before anything serialized it; the
+session-level serializer drains that queue into the packet it is about to build
+(`GameEngineEventSink.drain_into`) and consumes the buffer when it sends.
+
 ### UI checkpoints and continuations
 
 The client is request-serialized: it will not send the next transaction until

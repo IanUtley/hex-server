@@ -50,6 +50,12 @@ def kill_troop(context, target, *, cause="effect"):
             game_engine.ECardStates.HasBlocked |
             game_engine.ECardStates.Damaged),
         int(game_engine.ECardStates.Dead), conn=context.db)
+    # The C# clears the card's combat membership as part of the leave-play
+    # transition (``Session.DeactivateCard`` -> ``RemoveTroopFromCombat``), so a
+    # Deathcry that returns this same card to play later in the step cannot
+    # rejoin the combat it died in.
+    from .combat import remove_troop_from_combat
+    remove_troop_from_combat(context.bstate, target)
     context.db.commit()
     scid = game_engine.SessionCardId(game_engine.UID(target))
     tpl, card_type, _name, cost, attack, defense, gems = \

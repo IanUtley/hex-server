@@ -1340,6 +1340,76 @@ def test_builder_target_and_cost_candidates_delegate_to_shared_legality():
     legal.assert_called_once()
 
 
+def test_battle2cards_uses_authored_secondary_effect_target():
+    """The referenced effect target wins over older stored targets."""
+    from rules_port.effects import dispatch
+
+    ability_guid = "shared-battle-ability"
+    first_source, first_target = 0x801, 0x4701
+    second_source, second_target = 0x301, 0x4401
+    attack = {
+        first_source: 3, first_target: 2,
+        second_source: 6, second_target: 1,
+    }
+    damage = []
+    battle_effect = SimpleNamespace(
+        effect_instance_id=1, target_index=1, secondary_target_index=0)
+    effects = (
+        # The secondary value indexes an effect instance; that effect's
+        # target_index may differ from both the secondary value and the
+        # Battle2Cards effect's own target index.
+        SimpleNamespace(effect_instance_id=0, target_index=2),
+        battle_effect,
+    )
+
+    def resolve(source, target, old_stored):
+        target_map = {1: (target,), 2: (source,)}
+        bstate = {
+            "resolving_ability": ability_guid,
+            "resolving_source_uid": source,
+            "resolving_target_uid": target,
+            "ability_target_map": target_map,
+            "stored_targets": {ability_guid: list(old_stored)},
+        }
+        ability = SimpleNamespace(
+            ordered_effects=effects,
+            activation=SimpleNamespace(target_map=target_map))
+        context = EffectContext.from_rules_port(
+            _Game(), _Session(), _DB(), object(), "player", "ai", bstate,
+            "battle-effect", ability=ability)
+        context.template_value = lambda _name, default=None: True
+        context.damage = lambda uid, amount: (
+            damage.append((int(bstate["resolving_source_uid"]),
+                           int(uid), int(amount))) or "applied")
+        context._emit_authored_event = lambda event_type, target: (
+            damage_events.append((event_type,
+                                  int(bstate["resolving_source_uid"]),
+                                  int(target))) or "queued")
+        return dispatch("Battle2CardsAbilityEffectTemplate",
+                        context, battle_effect)
+
+    damage_events = []
+    with mock.patch("rules_port.static_rules.effective_stats",
+                    side_effect=lambda _db, _session, _state, uid:
+                    (attack[int(uid)], 0)):
+        resolve(first_source, first_target, [first_source])
+        resolve(second_source, second_target,
+                [first_source, second_source])
+
+    assert damage == [
+        (first_source, first_target, attack[first_source]),
+        (first_target, first_source, attack[first_target]),
+        (second_source, second_target, attack[second_source]),
+        (second_target, second_source, attack[second_target]),
+    ], damage
+    assert damage_events == [
+        ("CardBattledEvent", first_source, first_target),
+        ("CardBattledEvent", first_target, first_source),
+        ("CardBattledEvent", second_source, second_target),
+        ("CardBattledEvent", second_target, second_source),
+    ], damage_events
+
+
 if __name__ == "__main__":
     test_native_grant_ability_can_target_a_champion()
     test_player_target_template_uses_champion_identity_for_grants()
@@ -1375,4 +1445,5 @@ if __name__ == "__main__":
     test_builder_reuses_metadata_cost_target_filter_and_ordering()
     test_builder_exposes_typed_values_conditions_and_continuations()
     test_builder_target_and_cost_candidates_delegate_to_shared_legality()
+    test_battle2cards_uses_authored_secondary_effect_target()
     print("PASS effect context/builder tests")

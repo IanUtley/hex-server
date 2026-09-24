@@ -29,6 +29,73 @@ if os.path.exists(_path2):
         _STARTER_DECKS = json.load(f)
 
 
+def send_purchase_response(handler, target, instance, reqid, comp,
+                           session_id, conh, service_uid, *, remaining,
+                           currency_type, granted_list=(), error_code=0,
+                           error_message=""):
+    """Send the stock-client PurchaseItem response, including its result."""
+    inventory_type = "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits"
+    deck_type = "System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits"
+    card_type = "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits"
+    resp_inner = encode_objfmt_response(
+        ["Game.Client.Network.Escrow.PurchaseItemResponse",
+         "System.Int32", "System.String", inventory_type,
+         "Game.Shared.Domain.inventory_bits", "Game.Shared.ResourceId",
+         "System.Guid", "System.DateTime", deck_type, card_type,
+         inventory_type, deck_type, card_type, inventory_type, card_type,
+         inventory_type, "Game.Shared.Network.Escrow.EPurchaseItemError",
+         "System.String"],
+        [("RemainingCurrency", "int", int(remaining or 0)),
+         ("TransactionCurrencyType", "string", currency_type),
+         ("PurchasedInventory", "coll", (inventory_type, 0)),
+         ("PurchasedDeckBits", "coll", (deck_type, 0)),
+         ("PurchasedCards", "coll", (card_type, 0)),
+         ("GrantedInventory", "coll",
+          (inventory_type, len(granted_list), list(granted_list))),
+         ("GrantedDeckBits", "coll", (deck_type, 0)),
+         ("GrantedCards", "coll", (card_type, 0)),
+         ("ConsumedInventory", "coll", (inventory_type, 0)),
+         ("ConsumedCards", "coll", (card_type, 0)),
+         ("CurrencyInventory", "coll", (inventory_type, 0)),
+         ("Error", "enum1",
+          ("Game.Shared.Network.Escrow.EPurchaseItemError", int(error_code))),
+         ("ErrorMessage", "string", str(error_message or ""))]
+    )
+    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_reqid = reqid | 1
+    dw_bytes = encode_datawrapper(resp_reqid, 6011, resp_body, comp, session_id)
+    issuer_str = (f"0.0.0.0.ServiceEscrow.{service_uid}.ServicePlayer."
+                  f"{handler.client_uid}.{resp_reqid}")
+    handler.scnt += 1
+    handler.send_and_cache({
+        "issuer": issuer_str, "target": target, "instance": instance,
+        "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
+    }, dw_bytes, 6011, reqid, target, instance)
+
+
+def send_purchase_failure(handler, target, instance, reqid, comp,
+                          session_id, conh, service_uid, item_id,
+                          error_message="Purchase failed."):
+    """Reply to a failed service dispatch without retrying a legacy mutation."""
+    p = handler.user_profile if isinstance(handler.user_profile, dict) else {}
+    user_id = p.get("id")
+    try:
+        row = db_get_store_item(int(item_id))
+        currency_type = row[2] if row else "Gold"
+    except (TypeError, ValueError, IndexError):
+        currency_type = "Gold"
+    currency_column = "platinum" if currency_type == "Platinum" else "gold"
+    try:
+        remaining = db_get_user_currency(user_id, currency_column) \
+            if user_id is not None else p.get(currency_column, 0)
+    except Exception:
+        remaining = p.get(currency_column, 0)
+    send_purchase_response(
+        handler, target, instance, reqid, comp, session_id, conh, service_uid,
+        remaining=remaining, currency_type=currency_type, error_code=6,
+        error_message=error_message)
+
+
 def _grant_deck_to_player(user_id, cards, deck_name, handler=None, conn=None):
     """Grant cards to collection + card_instances, create deck, push to client.
     
@@ -70,16 +137,46 @@ def grant_vendor_code_cards(user_id, redeem_code, conn=None):
 
 
 def apply_purchase(conn, user_id, item_id, quantity):
-    """Apply a store purchase using the caller-owned transaction."""
+    """Apply an affordable store purchase in the caller-owned transaction."""
     row = db_get_store_item(item_id, conn=conn)
     if not row:
-        item_name, cost, currency_type, template_guid, store_tab = (
-            "Unknown", 100, "Gold", "", "")
-    else:
-        item_name, cost, currency_type, template_guid, store_tab = row
+        balance = db_get_user_currency(user_id, "gold", conn=conn)
+        return {
+            "success": False, "error_code": 6,
+            "error_message": "Unknown store item.",
+            "remaining": int(balance or 0), "currency": "Gold",
+            "item_name": "Unknown", "template_guid": "",
+            "quantity": 0, "item_id": int(item_id),
+            "deck_granted": False, "granted_list": [], "total_cost": 0,
+        }
+    item_name, cost, currency_type, template_guid, store_tab = row
+    quantity = int(quantity)
     balance_column = "platinum" if currency_type == "Platinum" else "gold"
-    balance = db_get_user_currency(user_id, balance_column, conn=conn)
-    remaining = balance - (int(cost) * int(quantity))
+    balance = int(db_get_user_currency(
+        user_id, balance_column, conn=conn) or 0)
+    cost = int(cost or 0)
+
+    def rejected(error_code, message):
+        return {
+            "success": False, "error_code": error_code,
+            "error_message": message, "remaining": balance,
+            "currency": currency_type, "item_name": item_name,
+            "template_guid": template_guid, "quantity": quantity,
+            "item_id": int(item_id), "deck_granted": False,
+            "granted_list": [], "total_cost": 0,
+        }
+
+    if quantity <= 0 or cost < 0:
+        return rejected(6, "Invalid purchase quantity or price.")
+    total_cost = cost * quantity
+    if total_cost > balance:
+        error_code = (1 if currency_type == "Platinum" else
+                      2 if currency_type == "Gold" else 3)
+        result = rejected(error_code, "Insufficient funds.")
+        result["total_cost"] = total_cost
+        return result
+
+    remaining = balance - total_cost
     db_set_user_currency(user_id, balance_column, remaining, conn=conn)
 
     granted_list = []
@@ -109,6 +206,9 @@ def apply_purchase(conn, user_id, item_id, quantity):
         db_set_inventory_client_uid(
             user_id, template_guid, 1000 + int(item_id), conn=conn)
     return {
+        "success": True,
+        "error_code": 0,
+        "error_message": "",
         "remaining": remaining,
         "currency": currency_type,
         "item_name": item_name,
@@ -117,6 +217,7 @@ def apply_purchase(conn, user_id, item_id, quantity):
         "item_id": int(item_id),
         "deck_granted": deck_granted,
         "granted_list": granted_list,
+        "total_cost": total_cost,
     }
 
 
@@ -187,64 +288,32 @@ def handle_purchase(handler, target, instance, reqid, comp, session_id, conh,
     template_guid = result["template_guid"]
     remaining = result["remaining"]
     granted_list = result["granted_list"]
+    success = bool(result.get("success", True))
     p = handler.user_profile
     if currency_type == "Platinum":
         p["platinum"] = remaining
     else:
         p["gold"] = remaining
 
-    resp_inner = encode_objfmt_response(
-        ["Game.Client.Network.Escrow.PurchaseItemResponse",
-         "System.Int32", "System.String",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-         "Game.Shared.Domain.inventory_bits",
-         "Game.Shared.ResourceId", "System.Guid", "System.DateTime",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-         "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits"],
-        [("RemainingCurrency", "int", remaining),
-         ("TransactionCurrencyType", "string", currency_type),
-         ("PurchasedInventory", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits", 0)),
-         ("PurchasedDeckBits", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits", 0)),
-         ("PurchasedCards", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
-         ("GrantedInventory", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-           len(granted_list), granted_list)),
-         ("GrantedDeckBits", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.deck_bits", 0)),
-         ("GrantedCards", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
-         ("ConsumedInventory", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits", 0)),
-         ("ConsumedCards", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits", 0)),
-         ("CurrencyInventory", "coll",
-          ("System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits", 0))]
-    )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
-    resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, 6011, resp_body, comp, session_id)
-    issuer_str = f"0.0.0.0.ServiceEscrow.{SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
-    handler.scnt += 1
-    handler.send_and_cache({
-        "issuer": issuer_str, "target": target, "instance": instance,
-        "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
-    }, dw_bytes, 6011, reqid, target, instance)
-    if result["deck_granted"]:
+    send_purchase_response(
+        handler, target, instance, reqid, comp, session_id, conh,
+        SERVICE_MAIL_UID, remaining=remaining,
+        currency_type=currency_type, granted_list=granted_list,
+        error_code=result.get("error_code", 0),
+        error_message=result.get("error_message", ""))
+    if success and result["deck_granted"]:
         handler.push_cards_to_client()
-    if template_guid:
+    if success and template_guid:
         handler.push_inventory_to_client(
             qty=result["quantity"], template_guid=template_guid,
             item_id=1000 + result["item_id"])
-    log_req(f"    Sent PurchaseItem response: remaining={remaining} {currency_type}")
+    if success:
+        log_req(f"    Sent PurchaseItem response: remaining={remaining} {currency_type}")
+    else:
+        log_req(
+            f"    Rejected PurchaseItem: {result['error_message']} "
+            f"balance={remaining} {currency_type} total="
+            f"{result.get('total_cost', 0)}")
 
 
 def handle_redeem(handler, target, instance, reqid, comp, session_id, conh,

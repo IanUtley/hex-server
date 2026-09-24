@@ -635,6 +635,30 @@ class QuickActionCardRequirement:
             return False
 
 
+@dataclass(frozen=True)
+class CardPlayTimingRequirement:
+    """Match the client's speed, active-player, phase, and chain checks.
+
+    Quick-speed cards may be cast whenever their controller has priority.
+    Other cards require the active player in a main-phase priority window
+    with an empty chain.
+    """
+    card_id: object
+
+    def is_valid(self, session, player_id) -> bool:
+        if QuickActionCardRequirement(self.card_id).is_valid(
+                session, player_id):
+            return True
+        chain = getattr(session, "chain", None)
+        return (
+            MainPhaseRequirement().is_valid(session, player_id)
+            and PlayerIsActiveRequirement(player_id).is_valid(
+                session, player_id)
+            and chain is not None
+            and bool(getattr(chain, "is_empty", False))
+        )
+
+
 class PriorityWindowRequirement:
     def is_valid(self, session, player_id) -> bool:
         return phase_name(session.current_turn_phase).endswith("PriorityWindow")

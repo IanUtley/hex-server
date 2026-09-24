@@ -7,6 +7,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -48,7 +49,8 @@ class HandlerStub:
 
     def _prompt_trigger_targets(self, game, pl_t, ai_t, session, bstate,
                                 source_uid, ability_guid, target_template_ids,
-                                candidates):
+                                candidates, owner_id=None,
+                                trigger_target_uid=None):
         inst_id = int(bstate.get("_next_instance_id", 1))
         bstate["_next_instance_id"] = inst_id + 1
         bstate["pending_trigger"] = {
@@ -56,6 +58,7 @@ class HandlerStub:
             "source_uid": int(source_uid),
             "instance_id": inst_id,
             "target_template_id": (target_template_ids or [None])[0],
+            "trigger_target_uid": trigger_target_uid,
         }
         self.prompted = (int(source_uid), ability_guid,
                          list(target_template_ids), list(candidates))
@@ -354,6 +357,103 @@ def test_class39_wire(db):
     assert ev.CLASS_ID == 39
 
 
+def test_trigger_target_prompt_uses_explicit_controller(db):
+    """A trigger prompt must keep its controller when phase state has None."""
+    import hconnect_server as hcs
+
+    class Checkpoint:
+        def save_state(self, _session, _state):
+            pass
+
+    handler = object.__new__(hcs.HCPHandler)
+    checkpoint = Checkpoint()
+    handler._checkpoint_engine = lambda _session: checkpoint
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"resolving_owner_id": None}
+    all_targets = ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", EXILE_TARGET]
+    with mock.patch.object(
+            hcs, "db_ability_target_template_ids",
+            return_value=json.dumps(all_targets)):
+        hcs.HCPHandler._prompt_trigger_targets(
+            handler, game, pl_t, ai_t, SessionStub(), bstate, 0x101,
+            EXILE_DEPLOY, [EXILE_TARGET], [0x201], owner_id=5,
+            trigger_target_uid=0x101)
+
+    assert bstate["pending_trigger"]["owner_id"] == 5
+    assert bstate["pending_trigger"]["trigger_target_uid"] == 0x101
+    target = game.events[0].options[0].instances[0].target_instances[0]
+    assert target.target_index == 1
+
+
+def test_pending_trigger_target_queues_reconnectable_chain(db):
+    """A class-39 answer must survive the next RulesPort reattach."""
+    import hconnect_server as hcs
+    from rules_port.session import AuthoritativeSession
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    port = AuthoritativeSession(1, (pl_t, ai_t), seed_z=1, seed_w=2)
+    port.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    port.active_player_id = pl_t
+    state = {
+        "pending_trigger": {
+            "ability_guid": EXILE_DEPLOY,
+            "source_uid": 0x1801,
+            "owner_id": 5,
+            "instance_id": 41,
+            "target_index": 1,
+            "selected_uid": 0x6801,
+            "trigger_target_uid": 0x1801,
+        },
+    }
+
+    class Checkpoint:
+        def load_state(self, _session):
+            return state
+
+        def save_state(self, _session, value):
+            state.update(value)
+
+    class Session:
+        session_id = 1
+        _rules_port_session = port
+        _rules_port_battle_state = state
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler._checkpoint_engine = lambda _session: Checkpoint()
+    projected = []
+    handler._fresh_game = lambda *_args: (
+        projected.append(game_engine.Game(1, pl_t, ai_t)) or projected[-1])
+    handler._send_battle_events = lambda *_args: None
+    handler._push_transaction_ack = lambda *_args: None
+
+    assert handler._resolve_pending_trigger_target(
+        Session(), pl_t, ai_t, b"", ability_guid=EXILE_DEPLOY)
+    chain_events = [event for event in projected[0].events
+                    if isinstance(
+                        event, game_engine.AbilityPushedOnChainSessionEventArgs)]
+    assert len(chain_events) == 1, chain_events
+    assert [int(card.uid.uid64) for card in chain_events[0].target_card_ids] == [
+        0x6801]
+    saved = port.snapshot()
+    descriptor = next(item for item in saved["projected_chain"]
+                      if item["instance_id"] == 41)
+    assert descriptor["kind"] == "trigger"
+    assert descriptor["target_uid"] == 0x6801
+    assert descriptor["trigger_target_uid"] == 0x1801
+    assert descriptor["activation_data"]["target_map"] == {"1": [0x6801]}
+
+    restored = AuthoritativeSession(1, (pl_t, ai_t), seed_z=9, seed_w=9)
+    assert restored.restore_snapshot(saved)
+    assert restored.rehydrate_projected_chain()
+    resumed = restored.chain.peek_ability()
+    assert resumed.instance_id == 41
+    assert resumed.descriptor["target_uid"] == 0x6801
+    assert resumed.descriptor["trigger_target_uid"] == 0x1801
+
+
 def test_pending_trigger_prompt_survives_priority_projection(db):
     """The practice priority projection must not replace a pending picker.
 
@@ -427,6 +527,10 @@ if __name__ == "__main__":
     run("BlockingFilter follows the active combat", test_blocking_filter_uses_active_combat_assignment)
     run("champion targets join the pool", test_champion_targets)
     run("human deploy triggers class-39 prompt", test_deploy_prompt_human)
+    run("trigger target prompt preserves controller",
+        test_trigger_target_prompt_uses_explicit_controller)
+    run("trigger target continuation survives reconnect",
+        test_pending_trigger_target_queues_reconnectable_chain)
     run("AI deploy auto-picks + chains", test_deploy_auto_ai)
     run("class-39 event serializes", test_class39_wire)
     run("pending trigger prompt survives the priority projection",

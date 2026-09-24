@@ -23,24 +23,10 @@ def _apply_lifelink(context, source_uid, amount):
         context.session.session_id, int(source_uid), conn=context.db)
     if owner is None:
         return
-    if context.bstate.get("pvp"):
-        key = f"hp_{int(owner)}"
-    else:
-        key = "player_health" if int(owner) else "ai_health"
-    current = int(context.bstate.get(key, 20) or 0)
-    new_value = min(20, current + int(amount))
-    if new_value == current:
-        return
-    context.bstate[key] = new_value
-    setattr(context.game, key, new_value)
-    from .runtime_helpers import owner_uid
-    event = game_engine.ChampionHealthChangedSessionEventArgs()
-    event.player_id = owner_uid(owner, context.player_uid,
-                                context.ai_uid, context.bstate)
-    event.old_damage_value = current
-    event.new_damage_value = new_value
-    context.game._push(event)
-    context.emit_champion_healed(owner, current, new_value)
+    # C# ``DamageCard`` heals a SpiritDrain source's champion through
+    # ``Session.HealChampion``, so lifelink obeys the same authored
+    # constraints (and emits the same healed trigger) as any other gain.
+    context.gain_health(int(owner), int(amount))
 
 
 @dataclass
@@ -126,6 +112,12 @@ def resolve(context, *, first_strike=False, attacker_key="player_attackers",
                 for uid, values in (context.bstate.get(blocker_key) or {}).items()}
     order = {int(uid): [int(value) for value in values]
              for uid, values in (context.bstate.get("player_damage_order") or {}).items()}
+    # Attacks whose declared blockers have all left play (see
+    # ``combat.remove_troop_from_combat``) keep the client's sticky
+    # ``AttackBlocked`` fact across the damage steps.
+    blocked_attackers = {str(uid) for uid, flag in
+                         (context.bstate.get("blocked_attackers")
+                          or {}).items() if flag}
     if not attackers:
         if previous_native is None:
             context.bstate.pop("_rules_port_native_effect", None)
@@ -150,7 +142,13 @@ def resolve(context, *, first_strike=False, attacker_key="player_attackers",
             if fact is not None:
                 blocker_facts.append(fact)
         combat.blockers = blocker_facts
-        combat.flags |= 8 if blocker_facts else 0
+        # C# ``Combat.DeclareBlockers`` sets ``ECombatFlags.AttackBlocked`` from
+        # the declaration and never clears it.  A blocker that has since left
+        # play (killed in the Swiftstrike step and returned by a Deathcry, or
+        # bounced) is gone from the live list but the attack stays blocked, so
+        # it deals no champion damage without Crush.
+        blocked = bool(blocker_facts) or str(attacker_uid) in blocked_attackers
+        combat.flags |= 8 if blocked else 0
         old_source = context.bstate.get("resolving_source_uid")
         old_combat = context.bstate.get("combat_damage")
 

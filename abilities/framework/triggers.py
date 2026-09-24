@@ -745,7 +745,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     """Fire every card ability whose trigger_event_type == event_type.
 
     ``source_uid`` is the card that entered / attacked / blocked / died.
-    ``source_owner_uid`` is the DB user_id owning that card (0 = AI).
+    For ``CardCastEvent``, it is the casting champion and ``extra_target`` is
+    the card being cast. ``source_owner_uid`` is the event player's DB id
+    (0 = AI).
     Returns a log string.
     """
     from db import log_req
@@ -889,7 +891,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             cand.setdefault(int(source_uid), []).append(ag)
     # The event TARGET card's own triggers also fire (CardDrawnEvent's drawn
     # card — e.g. Angel of Dawn's "when you draw this, play it for free").
-    if extra_target is not None and int(extra_target) != int(source_uid or 0):
+    if (extra_target is not None and
+            int(extra_target) != int(source_uid or 0) and
+            not (str(event_type).rsplit(".", 1)[-1] == "CardCastEvent")):
         for ag in _card_ability_guids(db, session.session_id, extra_target):
             cand.setdefault(int(extra_target), []).append(ag)
     owner_id = source_owner_uid
@@ -1151,11 +1155,10 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     _log(f"    {event_type} {ag[:8]} -> chance failed "
                          f"({chance}%)")
                     continue
-                # For CardCastEvent the event's trigger target is the card
-                # being cast (the caller passes it as source_uid).  Preserve
-                # that target for TriggerTargetPropertyVariable and
-                # AbilityTriggerCardTargetTemplate even when no explicit
-                # target was supplied by the event caller.
+                # CardCastEvent's target is the card being cast. Preserve it
+                # for TriggerTargetPropertyVariable and
+                # AbilityTriggerCardTargetTemplate; the event source is the
+                # casting champion, as in the client event envelope.
                 event_target = extra_target
                 # Most card lifecycle events identify their triggering card
                 # as the source. Preserve that as the activation target for
@@ -1168,6 +1171,11 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     event_target = source_uid
                 resolution_target = (extra_target if extra_target is not None
                                      else event_target)
+                trigger_target_uid = (
+                    extra_target
+                    if (str(event_type).rsplit(".", 1)[-1] ==
+                        "CardCastEvent" and extra_target is not None)
+                    else source_uid)
                 # A triggered ability with EXPLICIT target templates (e.g.
                 # Solitary Exile's Deploy "Void another target card") must ask
                 # the controller to choose before it can resolve.
@@ -1193,7 +1201,9 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     else:
                         handler._prompt_trigger_targets(
                             game, pl_t, ai_t, session, bstate, cu, ag,
-                            explicit_tpls, candidates)
+                            explicit_tpls, candidates,
+                            owner_id=ability_owner_id,
+                            trigger_target_uid=extra_target)
                         logs.append(f"{event_type} {ag[:8]} -> awaiting target")
                         continue
                 elif ability_owner_id == 0:
@@ -1246,7 +1256,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                         db, handler, game, session, pl_t, ai_t, bstate,
                         ag, cu, gtext, target_uid=resolution_target,
                         source_owner_uid=ability_owner_id,
-                        trigger_target_uid=source_uid,
+                        trigger_target_uid=trigger_target_uid,
                         effect_groups=private_groups)
                     logs.append(f"{event_type} {ag[:8]} -> secret {res}")
                     if not _public_effect_groups_ready(
@@ -1259,7 +1269,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     _be.stack_push(bstate, {
                         "kind": "trigger", "ability_guid": ag,
                         "source_uid": cu, "target_uid": resolution_target,
-                        "trigger_target_uid": source_uid,
+                        "trigger_target_uid": trigger_target_uid,
                         "effect_groups": sorted(public_groups),
                         "source_owner_uid": ability_owner_id,
                         "instance_id": inst_id,
@@ -1296,7 +1306,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                                                bstate, ag, cu, gtext,
                                                target_uid=resolution_target,
                                                source_owner_uid=ability_owner_id,
-                                               trigger_target_uid=source_uid)
+                                               trigger_target_uid=trigger_target_uid)
                     bstate["resolving_source_uid"] = old_trigger_src
                     bstate["resolving_owner_id"] = old_trigger_owner
                     logs.append(f"{event_type} {ag[:8]} -> {res}")
@@ -1308,7 +1318,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     _be.stack_push(bstate, {
                         "kind": "trigger", "ability_guid": ag,
                         "source_uid": cu, "target_uid": resolution_target,
-                        "trigger_target_uid": source_uid,
+                        "trigger_target_uid": trigger_target_uid,
                         "source_owner_uid": ability_owner_id,
                         "instance_id": inst_id,
                         "activated_ability_guid": (

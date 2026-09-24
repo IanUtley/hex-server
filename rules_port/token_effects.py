@@ -121,6 +121,46 @@ def create_matching_target(context, target, count, collection,
     return len(created)
 
 
+# ECardShards list index (Records ``m_Threshold`` order) -> shard flag.
+_SHARD_FLAGS = {0: 0, 1: 4, 2: 8, 3: 16, 4: 32, 5: 64}
+
+
+def _candidate_thresholds(threshold_data):
+    """Shard requirements for one template, one entry per colour.
+
+    Records stores the authored requirement twice: ``values`` is the per-shard
+    count array and ``list`` is the same requirement flattened with one entry
+    per shard ("Wild Wild Wild" -> [4, 4, 4]).  The flattened form must be
+    aggregated back into counts before the TAC filter compares it with the
+    player's thresholds; comparing entry-by-entry let a card needing three
+    Wild through a player holding one.
+    """
+    if not isinstance(threshold_data, dict):
+        return []
+    values = threshold_data.get("values")
+    if isinstance(values, (list, tuple)) and values:
+        requirements = []
+        for index, count in enumerate(values):
+            try:
+                count = int(count or 0)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                requirements.append({
+                    "color_flags": _SHARD_FLAGS.get(index, index),
+                    "quantity": count})
+        return requirements
+    counts = {}
+    for color in threshold_data.get("list", []) or []:
+        try:
+            flag = _SHARD_FLAGS.get(int(color), int(color))
+        except (TypeError, ValueError):
+            continue
+        counts[flag] = counts.get(flag, 0) + 1
+    return [{"color_flags": flag, "quantity": quantity}
+            for flag, quantity in counts.items()]
+
+
 def _authored_banned_guids(context):
     """Return the authored banned-card set for a random creation.
 
@@ -173,17 +213,7 @@ def _matching_template_candidates(context, card_filter, banned_guids=()):
         # as runtime CardRepresentations.  The SQL candidate projection is
         # intentionally lightweight, so add that derived view here rather than
         # making the filter depend on SQLite rows.
-        threshold_list = (threshold_data.get("list", [])
-                          if isinstance(threshold_data, dict) else [])
-        candidate_thresholds = []
-        for color in threshold_list:
-            try:
-                candidate_thresholds.append({
-                    "color_flags": {0: 0, 1: 4, 2: 8, 3: 16,
-                                    4: 32, 5: 64}.get(int(color), int(color)),
-                    "quantity": 1})
-            except (TypeError, ValueError):
-                continue
+        candidate_thresholds = _candidate_thresholds(threshold_data)
         candidate = {"card_uid": 0, "template_guid": row[0],
                      "name": row[1] or "", "card_type": row[2] or "",
                      "cost": int(row[3] or 0), "rarity": row[4] or "",

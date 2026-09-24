@@ -156,15 +156,13 @@ def _match_secondary_values(db, session_id, ability, effect, target_spec,
     if not (same_cost or same_owner or shares_race or doesnt_share_race or
             same_name or cant_be_prev):
         return ()
-    sec = int(effect.get("secondary_target_index", -1) or -1) \
-        if isinstance(effect, dict) else int(
-            getattr(effect, "secondary_target_index", -1) or -1)
+    sec_value = (effect.get("secondary_target_index", -1)
+                 if isinstance(effect, dict)
+                 else getattr(effect, "secondary_target_index", -1))
+    sec = -1 if sec_value is None else int(sec_value)
     if sec < 0:
         return ()
-    raw = ability.activation.target_map.get(
-        sec, ability.activation.target_map.get(str(sec), ()))
-    if not isinstance(raw, (tuple, list, set)):
-        raw = (raw,)
+    raw = _resolved_target_values(ability, sec, battle_state)
     from .targeting import legal_targets, _source_card
     secondary = []
     for value in raw:
@@ -208,6 +206,37 @@ def _match_secondary_values(db, session_id, ability, effect, target_spec,
     return tuple(out)
 
 
+def _resolved_target_values(ability, index, battle_state=None):
+    """Return the cards already resolved for one activation mapping index.
+
+    ``ActivateAbility``/``MoveCardToZone`` effects can reference a previous
+    effect's target ("the remaining cards", ``m_SecondaryTargetIndex``).  The
+    client resolves those from the *target instance* of that mapping, so the
+    resolver must read the activation map instead of re-enumerating that
+    template's whole legal pool.
+    """
+    if index is None:
+        return ()
+    try:
+        key = int(index)
+    except (TypeError, ValueError):
+        return ()
+    if key < 0:
+        return ()
+    maps = (
+        getattr(getattr(ability, "activation", None), "target_map", {}) or {},
+        (battle_state or {}).get("ability_target_map") or {},
+    )
+    for mapping in maps:
+        value = mapping.get(key, mapping.get(str(key)))
+        if value is None:
+            continue
+        if isinstance(value, (tuple, list, set)):
+            return tuple(int(item) for item in value if item is not None)
+        return (int(value),)
+    return ()
+
+
 class NativeEffectBackend:
     """Walk one typed ability without entering the legacy BOM resolver."""
 
@@ -217,6 +246,7 @@ class NativeEffectBackend:
         if native_effect is None:
             from .effects import dispatch
             native_effect = dispatch
+        from .effects import SELF_TARGETED_EFFECTS
         from rules_port.context import EffectContext
         from rules_port.conditions import ConditionContext, evaluate_effect_condition
 
@@ -408,11 +438,19 @@ class NativeEffectBackend:
                                                     _target_ignore_acted_on)
                             acted_on = ()
                             if _target_ignore_acted_on(target_spec.guid):
-                                sec_index = int(field(
-                                    effect, "secondary_target_index", -1) or -1)
+                                sec_value = field(
+                                    effect, "secondary_target_index", -1)
+                                sec_index = (-1 if sec_value is None
+                                             else int(sec_value))
+                                # "the remaining cards" ignores what the
+                                # referenced mapping already acted on: the
+                                # card the player just chose, not that
+                                # template's whole legal candidate pool.
+                                acted_on = _resolved_target_values(
+                                    ability, sec_index, battle_state)
                                 if 0 <= sec_index < len(ability.metadata.targets):
                                     sec_spec = ability.metadata.targets[sec_index]
-                                    acted_on = tuple(revealed_target_uids(
+                                    acted_on = acted_on or tuple(revealed_target_uids(
                                         db, session.session_id,
                                         ability.responsible_player_id,
                                         ability.source_uid, sec_spec.guid,
@@ -424,7 +462,16 @@ class NativeEffectBackend:
                                 target_spec.guid,
                                 battle_state.get("revealed_cards") or [],
                                 battle_state=battle_state, acted_on_uids=acted_on)
-                            if candidates and int(ability.responsible_player_id or 0) != 0:
+                            # A SourceRevealed target is input-bearing only when
+                            # the authored template asks the player to choose.
+                            # Oakhenge's child ability targets "a revealed troop"
+                            # (a real picker) and then "the remaining cards"
+                            # (m_IsAutoTarget): prompting for the second one asked
+                            # the player to pick twice and re-moved the chosen
+                            # card, and the extra pause left the spell on the
+                            # chain without priority.
+                            if (candidates and target_spec.requires_input
+                                    and int(ability.responsible_player_id or 0) != 0):
                                 prompt = getattr(handler, "_prompt_revealed_choice", None)
                                 if callable(prompt):
                                     continuation = {
@@ -525,6 +572,16 @@ class NativeEffectBackend:
                 if not isinstance(target_values, (tuple, list)):
                     target_values = (target_values,)
                 effect_param = field(effect, "param", "")
+                # C# runs a non-card AbilityEffectTemplate once per effect
+                # instance with that instance's whole target list, while the
+                # card-scoped leaves below expect one call per target.  A
+                # self-targeted effect resolves its own set from Records, so
+                # looping its resolved targets re-runs the whole operation:
+                # Oakhenge's reveal fired once per revealed card.
+                if effect_type in SELF_TARGETED_EFFECTS:
+                    target_values = (next(
+                        (value for value in target_values
+                         if value is not None), None),)
                 for target in target_values:
                     if target is None:
                         battle_state.pop("resolving_target_uid", None)
@@ -632,6 +689,38 @@ class PortAbilityResolver:
                 self.battle_state["_rules_port_strict_effects"] = previous_strict
         port_session = getattr(self.game_session, "_rules_port_session", None)
         if self.battle_state.get("pending_discard_ability") and port_session is not None:
+            pending = self.battle_state.get("pending_discard_continuation")
+            child_guid = str((pending or {}).get("ability_guid") or "").lower()
+            current_guid = str(ability.ability_template_id or "").lower()
+            if (self.battle_state.get("resolution_paused") and
+                    isinstance(pending, dict) and child_guid and
+                    child_guid != current_guid):
+                paused_order = self.battle_state.get(
+                    "rules_port_resume_effect_order")
+                if paused_order is None:
+                    paused_order = self.battle_state.get(
+                        "resolving_effect_order", 0)
+                continuation = ability.continuation(
+                    resume_effect_order=int(paused_order or 0) + 1)
+                activation = continuation.pop("activation", {})
+                continuation["target_map"] = dict(
+                    activation.get("target_map") or {})
+                continuation["variables"] = dict(
+                    activation.get("variables") or
+                    continuation.get("variables") or {})
+                # ActivateAbility effects may nest. Keep each suspended
+                # parent in order so the picker answer resumes the child,
+                # then its parent, then any enclosing ability.
+                cursor = pending
+                ancestors = {(child_guid, int(pending.get(
+                    "ability_instance_id", pending.get("instance_id", 1)) or 1))}
+                while isinstance(cursor.get("parent"), dict):
+                    cursor = cursor["parent"]
+                    ancestors.add((str(cursor.get("ability_guid") or "").lower(),
+                                   int(cursor.get("ability_instance_id", 1) or 1)))
+                identity = (current_guid, int(ability.instance_id))
+                if identity not in ancestors:
+                    cursor["parent"] = continuation
             port_session.pending_activation = {
                 "ability_instance_id": int(ability.instance_id),
                 "responsible_player_id": int(ability.responsible_player_id),
@@ -700,6 +789,109 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
         handler, game, session, db, player_uid, ai_uid, battle_state,
         native_effect=native_effect,
         effect_groups=effect_groups)(ability)
+
+
+def resume_ability_continuation_parents(
+        handler, game, session, db, player_uid, ai_uid, battle_state,
+        continuation):
+    """Resume nested parents after an invoked child ability finishes."""
+    state = battle_state or {}
+    continuation = dict(continuation or {})
+    parent = ((continuation or {}).get("parent")
+              if isinstance(continuation, dict) else None)
+    if not isinstance(parent, dict):
+        # A class-23 picker can outlive the process that created it. Older
+        # checkpoints stored the child continuation but not the suspended
+        # ActivateAbility parent, leaving the parent chain item to replay on
+        # every pass. Rebuild that one edge from the persisted chain
+        # descriptor and authored ActivateAbility metadata.
+        try:
+            from gamedata import DEFAULT_RECORD_STORE, ability_graph
+            child_guid = str(continuation.get("ability_guid") or "").lower()
+            chain_id = int(state.get("paused_chain_instance_id", 0) or 0)
+            item = next((entry for entry in reversed(state.get("stack") or [])
+                         if int(entry.get("instance_id", -1)) == chain_id), None)
+            parent_guid = str((item or {}).get("ability_guid") or "").lower()
+            parent_graph = (ability_graph(DEFAULT_RECORD_STORE, parent_guid)
+                            if parent_guid else None)
+            if (chain_id > 0 and child_guid and parent_graph is not None and
+                    parent_guid != child_guid):
+                for order, effect in enumerate(parent_graph.effects):
+                    if effect.concrete_type not in (
+                            "ActivateAbilityEffectTemplate",
+                            "ActivatePowerAbilityEffectTemplate"):
+                        continue
+                    invoked = getattr(effect.template, "m_AbilityToInvoke", None)
+                    invoked_guid = (invoked.get("m_Guid")
+                                    if isinstance(invoked, dict) else
+                                    getattr(invoked, "m_Guid", None))
+                    if str(invoked_guid or "").lower() != child_guid:
+                        continue
+                    activation = (item.get("activation_data") or {})
+                    parent = {
+                        "ability_instance_id": chain_id,
+                        "ability_guid": parent_guid,
+                        "source_uid": int(continuation.get(
+                            "source_uid", item.get("source_uid", 0)) or 0),
+                        "owner_id": int(continuation.get(
+                            "owner_id", item.get("owner_id", 0)) or 0),
+                        "target_map": dict(
+                            activation.get("target_map") or {}),
+                        "variables": dict(
+                            activation.get("variables") or {}),
+                        "resume_effect_order": int(order) + 1,
+                    }
+                    continuation["parent"] = parent
+                    break
+        except (TypeError, ValueError, AttributeError):
+            parent = None
+    result = AbilityResolutionState.COMPLETED
+    while isinstance(parent, dict) and parent.get("ability_guid"):
+        parent_guid = str(parent.get("ability_guid") or "").lower()
+        activation = parent.get("activation") or {}
+        target_map = parent.get("target_map")
+        variables = parent.get("variables")
+        if isinstance(activation, dict):
+            if target_map is None:
+                target_map = activation.get("target_map")
+            if variables is None:
+                variables = activation.get("variables")
+        result = resolve_port_ability(
+            handler, game, session, db, player_uid, ai_uid, state,
+            parent_guid, parent.get("source_uid"),
+            int(parent.get("owner_id", 0) or 0),
+            target_map=target_map or {}, variables=variables or {},
+            resume_from_order=int(parent.get("resume_effect_order", 0) or 0),
+            instance_id=int(parent.get(
+                "ability_instance_id", parent.get("instance_id", 1)) or 1))
+        if state.get("resolution_paused"):
+            return result
+        parent = parent.get("parent")
+
+    if not state.get("resolution_paused"):
+        completed = int(state.pop("paused_chain_instance_id", 0) or 0)
+        if completed:
+            state["completed_chain_instance_id"] = completed
+        # The class-23 prompt was projected as a host event rather than as a
+        # normal RulesPort activation response. Release the activation slot
+        # once the child and every suspended parent have resumed; otherwise
+        # the next player transaction can still look like a reply to the old
+        # prompt after its chain item has been completed.
+        port_session = getattr(session, "_rules_port_session", None)
+        pending_activation = getattr(port_session, "pending_activation", None)
+        if isinstance(pending_activation, dict):
+            try:
+                pending_id = int(pending_activation.get(
+                    "ability_instance_id", -1))
+                continuation_id = int((continuation or {}).get(
+                    "ability_instance_id",
+                    (continuation or {}).get("instance_id", -2)))
+            except (TypeError, ValueError):
+                pending_id = continuation_id = -1
+            if pending_id == continuation_id:
+                port_session.pending_activation = None
+                port_session.persist()
+    return result
 
 
 def resolve_port_played_spell(game, session, db, handler, player_uid, ai_uid,
@@ -800,12 +992,24 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
             "source_uid": item.get("activated_source_uid"),
             "target_uid": item.get("activated_target_uid"),
         }
-    target = item.get("trigger_target_uid", item.get("target_uid"))
-    target_map = {}
-    if target is not None:
+    # ``target_uid`` is the card chosen for the authored input-bearing target
+    # (a player picker, or the AI's legal pool), while ``trigger_target_uid``
+    # is the card that raised the event.  They differ whenever a triggered
+    # ability chooses "another" card: preferring the event card resolved the
+    # effect against the trigger's own source (Armitron's Deploy buffed
+    # Armitron instead of the selected Robot).  Keep the event card only for
+    # the templates that name it, such as AbilityTriggerCardTargetTemplate.
+    selected_target = item.get("target_uid")
+    trigger_target = item.get("trigger_target_uid")
+    if trigger_target is None:
+        trigger_target = selected_target
+    activation_data = item.get("activation_data") or {}
+    target_map = (dict(activation_data.get("target_map") or {})
+                  if isinstance(activation_data, dict) else {})
+    if not target_map and selected_target is not None:
         for index, spec in enumerate(graph.targets):
             if spec.requires_input:
-                target_map[index] = int(target)
+                target_map[index] = int(selected_target)
                 break
     old_source = battle_state.get("resolving_source_uid")
     old_owner = battle_state.get("resolving_owner_id")
@@ -816,10 +1020,10 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
     # template of kind AbilityTriggerCardTargetTemplate ("TriggerSource")
     # still resolves the event's card when the trigger waits on the chain for
     # priority instead of resolving inline.
-    if target is None:
+    if trigger_target is None:
         battle_state.pop("resolving_trigger_target_uid", None)
     else:
-        battle_state["resolving_trigger_target_uid"] = int(target)
+        battle_state["resolving_trigger_target_uid"] = int(trigger_target)
     try:
         state = resolve_port_ability(
             handler, game, session, db, player_uid, ai_uid, battle_state,

@@ -382,13 +382,13 @@ class PvpRuntimeFacts:
         except Exception:
             return False
 
-    # ── champion power usage (m_UsesPerGame / ONE-SHOT) ────────────────────
+    # ── champion power usage (per-game and per-turn) ───────────────────────
     #
     # A champion power belongs to a synthetic SessionCardId with no
     # ``game_cards`` row, so ``card_uses`` cannot hold its per-game count the
     # way an ordinary card ability does.  Keep it in the shared battle state
     # next to the champion counters, so Practice/PvE and tournament PvP gate
-    # and spend a ONE-SHOT by the same rule.
+    # and spend authored use limits by the same rule.
 
     def _champion_power_key(self, source_card_id, graph):
         """Return the usage key for a champion power, else None."""
@@ -406,17 +406,27 @@ class PvpRuntimeFacts:
         return guid
 
     def champion_ability_uses_exhausted(self, source_card_id, graph) -> bool:
-        """Whether an authored ``m_UsesPerGame`` champion power is spent."""
+        """Whether an authored per-game or per-turn champion limit is spent."""
         key = self._champion_power_key(source_card_id, graph)
         if key is None:
             return False
-        limit = int(getattr(getattr(graph, "costs", None),
-                            "uses_per_game", 0) or 0)
-        if limit <= 0:
-            return False
-        used = int((self.battle_state.get("champion_ability_uses") or {}).get(
-            key, 0) or 0)
-        return used >= limit
+        costs = getattr(graph, "costs", None)
+        per_game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
+        if per_game_limit > 0:
+            used = int((self.battle_state.get("champion_ability_uses") or {}).get(
+                key, 0) or 0)
+            if used >= per_game_limit:
+                return True
+        per_turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
+        if per_turn_limit > 0:
+            from .runtime_helpers import (
+                champion_ability_use_key, champion_ability_uses_this_turn,
+            )
+            turn_key = champion_ability_use_key(source_card_id, key)
+            used = champion_ability_uses_this_turn(self.battle_state, turn_key)
+            if used >= per_turn_limit:
+                return True
+        return False
 
     def consume_champion_ability_use(self, source_card_id, graph) -> int:
         """Record one activation of an authored (possibly limited) power."""
@@ -425,6 +435,15 @@ class PvpRuntimeFacts:
             return 0
         uses = self.battle_state.setdefault("champion_ability_uses", {})
         uses[key] = int(uses.get(key, 0) or 0) + 1
+        per_turn_limit = int(getattr(getattr(graph, "costs", None),
+                                     "uses_per_turn", 0) or 0)
+        if per_turn_limit > 0:
+            from .runtime_helpers import (
+                champion_ability_use_key,
+                record_champion_ability_use_this_turn,
+            )
+            turn_key = champion_ability_use_key(source_card_id, key)
+            record_champion_ability_use_this_turn(self.battle_state, turn_key)
         return uses[key]
 
     def can_pay_ability_cost(self, ability) -> bool:

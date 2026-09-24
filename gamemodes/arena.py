@@ -8,10 +8,11 @@ selected roster; this module only applies the run's rank and boss rules.
 import random
 
 
-# One-based positions in the four five-fight Arena tiers.  The client marks
-# every fifth position as a boss fight; the extracted roster currently has
-# explicit boss classifications for the later three positions.
-FIXED_BOSS_RANKS = frozenset((10, 15, 20))
+# One-based positions in the four five-fight Arena tiers.  The Eternal
+# Guardian is the first tier's boss; the later boss decks are the final fight
+# of tiers two through four.
+TIER_ONE_BOSS_RANK = 5
+FIXED_BOSS_RANKS = frozenset((TIER_ONE_BOSS_RANK, 10, 15, 20))
 FIXED_ELITE_RANKS = frozenset((9, 12, 14, 17, 19))
 # DeckTemplate has no generic boss field.  These are the boss families
 # recovered from the Arena data; their elite variants are the boss versions.
@@ -21,12 +22,15 @@ KNOWN_BOSS_BASES = frozenset((
     "Arena_Princess_Cory",
     "Arena_Hogarth",
 ))
+TIER_ONE_BOSS_BASES = frozenset(("Arena_Eternal_Guardian",))
 RUN_LENGTH = 20
 
 
 def is_boss_encounter(encounter):
     """Return whether an encounter is a boss, not merely an elite upgrade."""
     return bool(encounter.get("is_boss")) or (
+        encounter_family(encounter) in TIER_ONE_BOSS_BASES
+    ) or (
         bool(encounter.get("is_elite"))
         and encounter.get("base") in KNOWN_BOSS_BASES
     )
@@ -49,11 +53,11 @@ def select_fra_roster(encounters, rng=None, run_length=RUN_LENGTH):
 
     ``encounters`` is an iterable of dictionaries containing ``min_rank``,
     ``max_rank``, ``is_boss``, ``is_elite`` and ``base``.  The returned list
-    contains ``(rank, encounter)`` pairs.  Ranks 10, 15 and 20 use the known
-    boss encounters.  Ranks 9, 12, 14, 17 and 19 always use an eligible elite
-    version of a normal deck family; all other positions use normal decks.
-    A family may only be selected once, and boss families are reserved for
-    the fixed boss positions.
+    contains ``(rank, encounter)`` pairs.  Ranks 5, 10, 15 and 20 use the
+    known boss encounters.  Ranks 9, 12, 14, 17 and 19 always use an eligible
+    elite version of a normal deck family; all other positions use normal
+    decks. A family may only be selected once, and boss families are reserved
+    for the fixed boss positions.
     """
     rng = rng or random.SystemRandom()
     encounters = list(encounters)

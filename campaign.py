@@ -4195,6 +4195,29 @@ def _push_campaign_notify(handler, env_json, comp, session_id, target, instance,
     return f"    Sent Campaign notify {env_json.get('RequestType','?')} ({len(dw_bytes)}b)"
 
 
+def _push_fra_buff_conversation(handler, conversation_guid, service_mail_uid):
+    """Queue an authored FRA reward conversation in the Arena client."""
+    body = encode_objfmt_response(
+        ["Game.Shared.Network.Campaign.BuffConversationEventArgs",
+         "Game.Shared.ResourceId", "System.Guid"],
+        [("ConversationID", "struct", ("Game.Shared.ResourceId", [
+            ("m_Guid", "guid", str(conversation_guid)),
+        ]))],
+    )
+    body = compress_gzip(body)
+    data = encode_datawrapper(
+        0, 10047, body, 1, "00000000-0000-0000-0000-000000000000")
+    reqid = int(getattr(handler, "scnt", 0) or 0)
+    issuer = (f"0.0.0.0.ServiceCampaign.{service_mail_uid}."
+              f"ServicePlayer.{handler.client_uid}.{reqid}")
+    handler.scnt = reqid + 1
+    handler.send({
+        "issuer": issuer, "target": "ServiceCampaign", "instance": "Shared",
+        "reqid": 0, "c": 1, "conh": 0, "sid": handler.sid,
+    }, data)
+    return f"    Sent FRA reward conversation {conversation_guid}"
+
+
 # ---------------------------------------------------------------------------
 # Request handlers
 # ---------------------------------------------------------------------------
@@ -6538,8 +6561,25 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
         if not session_name.startswith("camp_"):
             profile = getattr(handler, "user_profile", None)
             if not session_name.startswith("tourney-") and profile:
-                db_record_arena_fight(profile["id"], won)
+                result = db_record_arena_fight(
+                    profile["id"], won, return_details=True,
+                    session_id=session.session_id)
                 db_delete_game_session(session.session_id)
+                reward_guid = result.get("reward_conversation_guid", "")
+                if result.get("tier_one_perfect_flag_awarded"):
+                    try:
+                        handler.push_reckoning_flags_updated()
+                    except Exception as exc:
+                        getattr(handler, "_log_req", print)(
+                            "    Could not publish ARENA_TIER1_PERFECT: "
+                            f"{exc}")
+                if result.get("recorded") and reward_guid:
+                    try:
+                        _push_fra_buff_conversation(
+                            handler, reward_guid, service_mail_uid)
+                    except Exception as exc:
+                        getattr(handler, "_log_req", print)(
+                            f"    Could not send FRA reward conversation: {exc}")
                 getattr(handler, "_log_req", print)(
                     f"    FRA result recorded (won={won}); session cleaned")
                 return True

@@ -60,6 +60,7 @@ FRA_RANK_RANGES = {
     "Arena_Zakiir": (17, 19),
     "Arena_Hogarth": (20, 20),
 }
+FRA_BOSS_DECKS = frozenset(("Arena_Eternal_Guardian",))
 
 
 def parse_jsonl(records_path: Path) -> list[dict[str, Any]]:
@@ -172,6 +173,8 @@ def extract_rows(records_dir: Path, classifications: dict[str, dict[str, Any]]) 
         default_rank = FRA_RANK_RANGES.get(deck_name)
         if default_rank:
             classification.update({"min_rank": default_rank[0], "max_rank": default_rank[1]})
+        if deck_name in FRA_BOSS_DECKS:
+            classification["is_boss"] = True
         classification.update(
             classifications.get(deck_guid)
             or classifications.get(deck_name)

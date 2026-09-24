@@ -390,6 +390,18 @@ class EffectContext:
                     "target_map", self.bstate.get("ability_target_map") or {}),
                 variables=overrides.pop(
                     "variables", self.bstate.get("ability_variables") or {}))
+            # The session AbilityInstance stores its activation under an
+            # ``activation`` object.  Effect continuations are consumed by
+            # the host's generic target-map/variables boundary, so flatten
+            # that wrapper here while keeping the persisted shape typed.
+            if self.native_context:
+                activation = value.pop("activation", None)
+                if isinstance(activation, dict):
+                    value["target_map"] = dict(
+                        activation.get("target_map") or {})
+                    value["variables"] = dict(
+                        activation.get("variables") or
+                        value.get("variables") or {})
         else:
             value = AbilityContinuation.from_state(
                 self.bstate, resume_effect_order=resume_effect_order,
@@ -674,6 +686,53 @@ class EffectContext:
         event.new_damage_value = new_value
         self.game._push(event)
         return f"lose {amount} health -> {new_value}"
+
+    def gain_health(self, owner: int, amount: int) -> str:
+        """Apply champion health gain through the shared heal operation.
+
+        The client funnels every champion health gain — HealHeroModifier
+        effects such as Dragon Guard Stalwart's charge power and Daybreak's
+        start-of-turn constant, SpiritDrain lifelink and encounter modifiers —
+        through ``Session.HealChampion``, which refuses the gain while the
+        champion carries ``CantGainHealth`` (Emberspire Witch: "Champions
+        can't gain health.").  Keep that invariant on the operation itself so
+        every gain path observes the same authored constraint.
+        """
+        import game_engine
+        from rules_port.runtime_helpers import owner_uid
+
+        owner = int(owner or 0)
+        if self.bstate.get("pvp"):
+            # PvP resolution works on the FRA-shaped view, which names the
+            # health keys through pvp_health_map.  A raw checkpoint without
+            # the view keeps its hp_<pid> keys.
+            health_key = (self.bstate.get("pvp_health_map") or {}).get(
+                owner) or f"hp_{owner}"
+        else:
+            health_key = "player_health" if owner else "ai_health"
+        side = "ai" if health_key == "ai_health" else "player"
+        amount = max(0, int(amount or 0))
+        try:
+            from .static_rules import global_flags
+            if "cant_gain_health" in global_flags(
+                    self.db, self.session.session_id, self.bstate):
+                return "prevented: champions can't gain health"
+        except Exception:
+            pass
+        current = int(self.bstate.get(
+            health_key, getattr(self.game, health_key, 20)) or 0)
+        new_value = min(20, current + amount)
+        self.bstate[health_key] = new_value
+        setattr(self.game, health_key, new_value)
+        if new_value != current:
+            event = game_engine.ChampionHealthChangedSessionEventArgs()
+            event.player_id = owner_uid(owner, self.player_uid, self.ai_uid,
+                                        self.bstate)
+            event.old_damage_value = current
+            event.new_damage_value = new_value
+            self.game._push(event)
+            self.emit_champion_healed(owner, current, new_value)
+        return f"healed {side} {current}->{new_value}"
 
     def _effect_owner(self, target: int | None = None) -> int:
         """Resolve the controller for a modifier, including untargeted ones."""
@@ -1243,7 +1302,7 @@ class EffectContext:
         (``m_Variables``) must therefore be read from the live Records graph,
         not from the DB raw-json fallback that only covers card abilities.
         """
-        graph = getattr(getattr(self.ability, "metadata", None), "graph", None)
+        graph = self._ability_graph()
         source = getattr(graph, "source", None)
         to_dict = getattr(source, "to_dict", None)
         if callable(to_dict):
@@ -1258,6 +1317,23 @@ class EffectContext:
             except (TypeError, ValueError):
                 pass
         return ""
+
+    def _ability_graph(self):
+        """Return the Records graph for the resolving ability, if available.
+
+        Runtime ability instances carry their graph in metadata. Projected
+        chain abilities carry only an ability GUID, so resolve those through
+        the shared Records store as well. This keeps typed AbilityConstants
+        available for both projected PvE and PvP activations.
+        """
+        graph = getattr(getattr(self.ability, "metadata", None), "graph", None)
+        if graph is not None:
+            return graph
+        guid = self.ability_guid
+        if not guid:
+            return None
+        from gamedata import DEFAULT_RECORD_STORE, ability_graph
+        return ability_graph(DEFAULT_RECORD_STORE, guid)
 
     def modifier_value(self, param: dict | None, metadata: dict | None,
                        property_name: str) -> int:
@@ -1283,6 +1359,33 @@ class EffectContext:
                 int(self.bstate.get("resolving_source_uid") or 0),
                 int(self.bstate.get("resolving_owner_id", 0) or 0),
                 payload, raw)
+            if value is None or int(value[1] or 0) == 0:
+                # AbilityConstants are immutable literals on the typed
+                # ability graph. Some native effect paths have an empty or
+                # incomplete raw-JSON view even though the graph still carries
+                # the constant (for example ChargePointsModifier's input
+                # variable ``A`` on Inductocopter Bot). Keep the graph as the
+                # authority for that operand so a failed raw lookup does not
+                # turn an authored +1 into a zero-delta resource event.
+                graph = self._ability_graph()
+                wanted = str(payload.get("input_variable") or "")
+                for variable in getattr(graph, "variables", ()) or ():
+                    to_dict = getattr(variable, "to_dict", None)
+                    record = to_dict() if callable(to_dict) else {}
+                    if not isinstance(record, dict):
+                        continue
+                    if (str(record.get("m_Name") or "") != wanted or
+                            str(record.get("_t") or "").rsplit(".", 1)[-1]
+                            != "AbilityConstant"):
+                        continue
+                    try:
+                        constant = int(record.get("m_DefaultValue", 0) or 0)
+                        multiplier = int(payload.get("amount") or 0)
+                    except (TypeError, ValueError):
+                        break
+                    value = ("", constant * multiplier if multiplier
+                             else constant)
+                    break
             if value is None:
                 return 0
             return int(value[1] or 0)
@@ -1739,6 +1842,12 @@ class EffectContext:
             self.session.session_id, target, destination, position,
             new_state,
             clear_dead=clear_dead, clear_bits=clear_bits, conn=self.db)
+        if old_location == "warzone" and destination != "warzone":
+            # C# ``Session.DeactivateCard`` also drops the troop from its combat
+            # when an effect moves it out of play, so it cannot be treated as a
+            # blocker (or attacker) after it returns.
+            from rules_port.combat import remove_troop_from_combat
+            remove_troop_from_combat(self.bstate, target)
         if destination == "deck":
             # C# ``MoveCardToZone`` with an "Unknown"/random destination
             # location shuffles the card into the deck.  Leaving it at
@@ -2226,11 +2335,11 @@ class EffectContext:
             self.player_uid, self.ai_uid, self.bstate,
             self.effect_guid, self.param)
 
-    def battle_cards(self) -> str:
+    def battle_cards(self, effect=None) -> str:
         """Resolve the metadata Battle2Cards operation through RulesPort."""
         if self.native_context or self.bstate.get("_rules_port_native_effect"):
             from rules_port.battle_effects import battle_cards
-            return battle_cards(self)
+            return battle_cards(self, effect)
         from abilities.framework.bom import _battle_cards_legacy
 
         return _battle_cards_legacy(

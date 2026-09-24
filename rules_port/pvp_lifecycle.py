@@ -142,10 +142,23 @@ def queue_stack_item(state, item) -> int:
     return instance_id
 
 
+def skips_draw_phase(state) -> bool:
+    """Whether the format has no Draw phase at all for the active player.
+
+    Corinth's Merry-Melee format replaces the draw step with the champion
+    power's end-of-turn "draw four", so the authored "Skip your draw phase"
+    applies to every turn of the match.  The mode flags travel in the PvP
+    checkpoint, and both the legacy phase cycle and the native Prep branch
+    consume this one predicate.
+    """
+    return bool((state or {}).get("skip_draw_phase") or
+                (state or {}).get("corinth_mode"))
+
+
 def turn_phase_list(state, turn_pid, has_ready) -> list:
     phases = list(lifecycle.COMBAT_TURN_PHASES if has_ready
                   else lifecycle.BASE_TURN_PHASES)
-    if state.get("skip_draw_phase") or state.get("corinth_mode"):
+    if skips_draw_phase(state):
         phases = [phase for phase in phases
                   if phase != game_engine.ETurnPhases.Draw]
     entries = (state.get("extra_combats_this_turn") or {}).get(

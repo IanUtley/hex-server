@@ -72,6 +72,7 @@ class ProfileStreamMixin:
         # The client collects List<chest_bits> from the profile stream and
         # feeds them to CreateLocalTreasureCache (PlayerProfile.cs).
         self._push_chests_stream(p)
+        self._push_reckoning_flags_stream(p)
 
         now_str = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
         
@@ -408,6 +409,76 @@ class ProfileStreamMixin:
             "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
         }, dw)
         log_req(f">>> PUSH Chests stream (dt=2210) {len(chests)} chests, dw_sz={len(dw)}")
+
+    def _push_reckoning_flags_stream(self, profile):
+        """Include persistent account flags in PlayerProfile's login stream."""
+        if not profile:
+            return
+        from encoder import encode_profile_flag_list
+        from profile_db import db_get_reckoning_flags
+
+        flags = db_get_reckoning_flags(profile["id"], conn=_db)
+        inner = encode_profile_flag_list(flags)
+        profile_args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileStreamEventArgs",
+             "System.Byte[]", "System.Boolean"],
+            [("Data", "bytes", inner), ("done", "bool", False)])
+        dw = encode_datawrapper(
+            0, 2210, compress_gzip(profile_args), 1,
+            "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+            f"ServicePlayer.{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH Reckoning flags stream (dt=2210) "
+                f"{len(flags)} flags, dw_sz={len(dw)}")
+
+    def push_reckoning_flags_updated(self):
+        """Notify the active client after a server-awarded account flag."""
+        if not self.user_profile:
+            return
+        from profile_db import db_get_reckoning_flags
+        from objfmt_builder import ObjFmtBuilder
+
+        flags = db_get_reckoning_flags(self.user_profile["id"], conn=_db)
+        builder = ObjFmtBuilder(
+            "Game.Shared.Network.Profile.UserFlagsUpdatedEventArgs")
+        list_type = (
+            "System.Collections.Generic.List`1#"
+            "Reckoning.Profile.Messages.FlagData")
+        list_idx, list_start = builder.begin_list(
+            "UserFlags", list_type, len(flags))
+        for index, flag in enumerate(flags):
+            element_idx = builder.begin_element(
+                index, "Reckoning.Profile.Messages.FlagData", 4)
+            element_start = builder._element_starts[element_idx]
+            builder.field_str("Name", flag["name"])
+            builder.field_int("Progress", flag["progress"])
+            builder.field_int("Maximum", flag["maximum"])
+            builder.field_bool("Completed", flag["completed"])
+            builder._set_size(element_idx, element_start)
+        builder._set_size(list_idx, list_start)
+        builder.field_int("OriginClusterHash", 0)
+        builder.field_guid(
+            "RequestHandlerSessionId",
+            "00000000-0000-0000-0000-000000000000")
+        body = compress_gzip(builder.finish(3))
+        dw = encode_datawrapper(
+            0, 2201, body, 1, "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+            f"ServicePlayer.{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH UserFlagsUpdated (dt=2201) "
+                f"{len(flags)} flags, dw_sz={len(dw)}")
 
     def push_cards_to_client(self):
         """Push card instances from DB to the client via CardsAdded event (2205), chunked."""

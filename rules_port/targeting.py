@@ -155,6 +155,40 @@ def target_uses_both_players(db, template_id):
                 {"self", "you", "controller"})
 
 
+# ECardCollections names -> runtime zone names for authored target templates.
+_ZONE_MAP = {"Warzone": "warzone", "Hand": "hand", "Deck": "deck",
+             "Crypt": "discard", "Discard": "discard", "Void": "void",
+             "Champions": "champions", "CastSpells": "CastSpells",
+             "Underground": "underground"}
+
+
+def template_zones(template):
+    """Return one authored template's collection flags as runtime zone names."""
+    zones = [zone.strip() for zone in
+             str((template or {}).get("collection_flags") or "").split("|")
+             if zone.strip()]
+    return [_ZONE_MAP.get(zone, zone.lower()) for zone in zones]
+
+
+def template_targets_champions(template):
+    """Whether an authored target template can select a champion in play.
+
+    Champions are synthetic SessionCardIds with no ``game_cards`` row, so a
+    candidate pool only contains them when the template names the Champions
+    collection or filters with the client's ``IsHero`` filter.  Continuous
+    champion-scoped rules read the same contract when deciding whether a
+    static leaf applies to a champion rather than to a card in a zone.
+    """
+    if not template:
+        return False
+    try:
+        filter_json = json.loads(template.get("filter_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        filter_json = {}
+    return ("champions" in template_zones(template) or
+            _find_filter(filter_json, "IsHero") is not None)
+
+
 def implicit_champion_target(db, session, handler, battle_state, *,
                              opposing=False):
     """Resolve an authored implicit ``You``/opposing-champion target.
@@ -355,12 +389,7 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
         filter_json = {}
     from pvp_db import db_target_candidate_rows
     top_n = _find_filter(filter_json, "TopNOfDeck")
-    zones = [z.strip() for z in str(template["collection_flags"]).split("|") if z.strip()]
-    zone_map = {"Warzone": "warzone", "Hand": "hand", "Deck": "deck",
-                "Crypt": "discard", "Discard": "discard", "Void": "void",
-                "Champions": "champions", "CastSpells": "CastSpells",
-                "Underground": "underground"}
-    zones = [zone_map.get(z, z.lower()) for z in zones] or [
+    zones = template_zones(template) or [
         "warzone", "hand", "deck", "discard", "void", "underground"]
     if top_n is not None:
         zones = ["deck"]
@@ -439,7 +468,7 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
 
     out = [int(card["card_uid"]) for card in cards
            if matches(card, filter_json, cards)]
-    if champions and ("champions" in zones or "IsHero" in str(filter_json)):
+    if champions and template_targets_champions(template):
         for uid, owner, name, health in champions:
             if (not both_players and owner != controller_uid) or \
                     (self_only and owner != controller_uid) or \

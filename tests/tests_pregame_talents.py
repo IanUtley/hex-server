@@ -277,9 +277,97 @@ def test_starting_charges_survive_reattach_and_resource_plays():
     assert bstate["player_charges"] == starting_charges + 3, bstate
 
 
+def test_ai_owned_reattach_builds_combat_phase_facts():
+    """The host attach must derive its phase facts from the checkpoint fact
+    the native combat branch reads, even when the AI owns the live checkpoint.
+
+    Regression: an FRA mulligan keep re-attached with the AI as the active
+    participant, so the host evaluated a removed local (``ai_ready``) while
+    assembling ``sync_checkpoint``'s facts.  The ``NameError`` aborted the
+    attach ("refusing legacy fallback"), the keep transaction was reported
+    unhandled, and the client stayed stuck in Mulligan.
+    """
+    import game_engine
+    import ai
+    import hconnect_server as hcs
+    from rules_port import lifecycle
+
+    db, path = _database_copy()
+    old_hcs_db = hcs._db
+    old_ai_db = ai._db
+    hcs._db = db
+    ai._db = db
+    try:
+        class _Game:
+            player_uid = game_engine.UID.make(244, 5)
+            ai_uid = game_engine.UID.make(3, 1000)
+            player_health = 20
+            ai_health = 20
+
+        class _Session:
+            session_name = ""
+
+            def __init__(self):
+                self.session_id = 201718
+                self.seed_z = 12345
+                self.seed_w = 67890
+                self._rules_port_session = None
+                self._rules_port_battle_state = None
+                self.turn_order = {}
+                self.players = [(game_engine.UID.make(244, 5), 0),
+                                (game_engine.UID.make(3, 1000), 0)]
+
+            def _persist(self, *args, **kwargs):
+                pass
+
+        handler = object.__new__(hcs.HCPHandler)
+        handler._rules_port_auto_attach = True
+        handler.user_profile = {"id": 5}
+        handler._player_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(244, 5))
+        handler._ai_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(3, 1000))
+        session = _Session()
+        # The shape the FRA mulligan keep re-attached with: turn one, AI already
+        # the active participant of the live native checkpoint.
+        bstate = lifecycle.default_state(turn_player="ai")
+        bstate["player_health"] = 20
+        bstate["ai_health"] = 20
+        bstate["pvp"] = False
+        port = handler._maybe_attach_rules_port(session, _Game(), bstate)
+        assert port is session._rules_port_session
+        assert port.active_player_id == _Game.ai_uid
+        assert bstate["player_has_ready_troop"] is False
+        # A troop that entered play after Prep leaves the checkpoint fact stale;
+        # the re-attach refreshes it from the port's own attack predicate and
+        # feeds that same value into the native phase facts.
+        template_guid = db.execute(
+            "SELECT guid FROM card_templates WHERE card_type='Troop' LIMIT 1"
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO game_cards (session_id, user_id, card_uid, "
+            "card_template_id, template_guid, location, position, card_type, "
+            "card_abilities, card_attributes, owner_user_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (session.session_id, 0, 9001, 0, template_guid, "warzone", 0,
+             "Troop", "[]", int(game_engine.ECardAttributes.Speed), 0))
+        db.commit()
+        again = handler._maybe_attach_rules_port(session, _Game(), bstate)
+        assert again is port
+        assert bstate["player_has_ready_troop"] is True, bstate
+        assert port.has_legal_attackers is True
+        assert port.active_player_skips_attack is False
+    finally:
+        hcs._db = old_hcs_db
+        ai._db = old_ai_db
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     test_skylak_uses_original_deck_size_for_both_talents()
     test_expendable_lives_grants_and_resolves_one_shot_deathcry()
     test_devoted_cost_talent_applies_once_via_trigger()
     test_starting_charges_survive_reattach_and_resource_plays()
+    test_ai_owned_reattach_builds_combat_phase_facts()
     print("PASS Skylak PreGame deck insertions")

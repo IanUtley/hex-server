@@ -336,20 +336,7 @@ def _send_game_events(handler, game, session, pl_t):
 
 def _refresh_pvp_debug_options(tournament_game, session, state):
     """Rebuild the current PvP option projection after a debug state change."""
-    phase = int(state.get("phase", 0))
-    if state.get("stack"):
-        tournament_game.pvp_push_phase_options(
-            session, state, pid=state.get("priority_pid"))
-    elif phase in (game_engine.ETurnPhases.FirstMainPhase,
-                   game_engine.ETurnPhases.SecondMainPhase):
-        tournament_game.pvp_push_main_phase_options(session, state)
-    elif phase == game_engine.ETurnPhases.DeclareAttack:
-        tournament_game.pvp_push_attack_options(session, state)
-    elif phase == game_engine.ETurnPhases.DeclareDefense:
-        tournament_game.pvp_push_blocker_options(session, state)
-    elif phase not in (3, 4, 5, 6, 7, 8, 9):
-        tournament_game.pvp_push_phase_options(
-            session, state, pid=state.get("priority_pid"))
+    tournament_game.pvp_push_current_phase_options(session, state)
 
 
 def _cmd_encounter(handler, args):

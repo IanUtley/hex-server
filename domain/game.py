@@ -1064,6 +1064,27 @@ class Game:
                     visible_events.append(filtered)
                     continue
             visible_events.append(filtered or event)
+        # One packet announces each phase once.  The native scheduler publishes
+        # every transition through the event sink
+        # (``RulesPortSession.transition_to`` -> ``send_turn_phase_update``) and
+        # the host projection then announces the phase it stopped on, so the
+        # same TurnPhaseUpdated can be queued twice and delivered together.
+        # Unity re-enters the phase state on each one, and a state that
+        # auto-commits on entry (``BattleStateAssignDamage``) then issues a
+        # second, illegal AssignDamageOrderTransaction for the phase it already
+        # resolved.  Keep the later (projection) event, which carries the
+        # mapped player/priority ids the rest of the packet uses.
+        seen_phases = set()
+        deduped_events = []
+        for event in reversed(visible_events):
+            if isinstance(event, TurnPhaseUpdatedSessionEventArgs):
+                phase = event.turn_phase
+                if phase in seen_phases:
+                    continue
+                seen_phases.add(phase)
+            deduped_events.append(event)
+        deduped_events.reverse()
+        visible_events = deduped_events
         for event in visible_events:
             # RulesPort emits numeric service-player ids internally, while
             # the legacy event serializers require typed UID instances.  The

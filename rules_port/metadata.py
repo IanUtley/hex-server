@@ -10,6 +10,13 @@ from gamedata import DEFAULT_RECORD_STORE, ability_graph
 from gamedata.records import reference_guid
 
 
+# Typed modifier fields are projected to runtime param names by lower-casing
+# the Records field name, except for ``attribute_flags``: every RulesPort
+# attribute reader (and the legacy BOM merge it mirrors) uses that underscored
+# key, so map it explicitly instead of emitting ``attributeflags``.
+_PARAM_NAMES = {"m_AttributeFlags": "attribute_flags"}
+
+
 def modifier_metadata(effect_guid):
     """Return typed CardModifier fields from the Records effect template."""
     effect = DEFAULT_RECORD_STORE.get(
@@ -43,9 +50,10 @@ def modifier_metadata(effect_guid):
                 "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
                 "m_CardFilter", "m_SetThresholds", "m_RemoveAllCounters",
                 "m_ReplaceExistingValue", "m_IsCombatDamage", "m_CombatDamageOnly",
-                "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely"):
+                "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely",
+                "m_RandomLowestThreshold", "m_Random"):
         if key in modifier:
-            result[key[2:].lower()] = modifier[key]
+            result[_PARAM_NAMES.get(key, key[2:].lower())] = modifier[key]
     counter = modifier.get("m_CardCounterTemplateId")
     if isinstance(counter, dict) and counter.get("m_Guid"):
         result["counter_template_guid"] = str(counter["m_Guid"]).lower()

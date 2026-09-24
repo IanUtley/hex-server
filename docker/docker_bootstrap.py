@@ -5,6 +5,11 @@ deployment can point ``HEX_DB_PATH`` at persistent storage. If that file does
 not exist, this module creates it from the server schema and the mounted
 gamedata blob or a mounted ``Records/`` snapshot. Tests run only after a new
 database is created.
+
+An existing database is upgraded in place through ``static.ensure_schema``,
+which also re-syncs its client-derived projection (card, ability, champion and
+encounter rows) from the mounted gamedata or ``Records/`` source whenever that
+snapshot has moved on — player progress is never part of that projection.
 """
 
 from __future__ import annotations
@@ -177,7 +182,13 @@ def create_database(path: Path) -> None:
 
 
 def upgrade_database(path: Path) -> None:
-    """Apply current schema/data changes to an existing persistent database."""
+    """Apply current schema/data changes to an existing persistent database.
+
+    This is the container's client-data refresh point: ``ensure_schema`` owns
+    both the schema and the Records-derived projection, so a release that
+    changes game data brings the persistent database with it instead of
+    requiring a fresh database.
+    """
     connection = sqlite3.connect(str(path), timeout=30.0)
     try:
         _ensure_database_schema(connection)

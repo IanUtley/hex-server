@@ -14,7 +14,7 @@ The implemented flow supports:
 - fixed boss positions and elite/boss encounter selection;
 - recording wins, losses, and completed-fight history;
 - showing the current opponent and completed fights in the lobby;
-- accumulating one gold pouch for each non-boss win;
+- awarding gold bags equal to the opponent's tier for every win;
 - accumulating one treasure chest for each boss win.
 
 The arena run is stored per player in `arena_state`. A new deck assignment
@@ -26,13 +26,20 @@ Roster selection is kept separate from the protocol and database layers in
 [`gamemodes/arena.py`](../gamemodes/arena.py). The current rules are:
 
 - run length: 20 encounters;
-- fixed boss ranks: 10, 15, and 20;
-- known boss families are Phenteo, Eurig, Princess Cory, and Hogarth;
+- fixed boss ranks: 5, 10, 15, and 20;
+- the first tier ends with Eternal Guardian; later boss families are Phenteo,
+  Eurig, Princess Cory, and Hogarth;
 - elite ranks 9, 12, 14, 17, and 19 select an eligible elite version of a
   normal deck family;
 - all other non-boss ranks select a normal encounter;
-- elite upgrades are stored as non-boss fights, so they award gold rather than
-  a boss treasure chest.
+- elite upgrades are stored as non-boss fights, so they do not receive a boss
+  treasure chest.
+
+Players who win all five fights of Tier 1 receive the persistent
+`ARENA_TIER1_PERFECT` Reckoning flag. The client checks that account flag to
+show its Tier 1 skip button on later runs. `BuyoutArena` verifies the same
+flag server-side, marks the first five fights `SKIP`, and starts the run at
+the first fight of Tier 2 without granting Tier 1 rewards.
 
 Encounter data is persisted in `fra_encounters`, and the selected run is
 persisted in `fra_challengers`. The challenger response exposes the boss state
@@ -48,20 +55,41 @@ The `arena_state` table in [`static.py`](../static.py) contains:
 | `wins` / `losses` | Run result totals |
 | `challenger_index` | Zero-based next opponent index |
 | `fight_history` | JSON history for the twenty lobby fight slots |
-| `gold_earned` | Gold-pouch total for the current run |
+| `gold_earned` | Gold-bag count for the current run |
 | `chests_earned` | Treasure-chest total for the current run |
 | `sacks_earned` | Reserved for other reward types; currently unused |
 
 `db_record_arena_fight()` in [`pve_db.py`](../pve_db.py) records the result and
-advances the challenger index. On a win it checks the saved challenger's boss
-flag:
+advances the challenger index:
 
-- non-boss: `gold_earned += 1`;
-- boss: `chests_earned += 1`;
+- every opponent: `gold_earned += fight_tier` (five opponents per tier);
+- boss: `chests_earned += 1` in addition to the tier's gold bags;
 - loss: neither counter changes.
 
 The update occurs only when the fight-history slot is unfinished, so repeated
-game-end handling cannot award the same fight twice.
+game-end handling cannot award the same fight twice. `GoldPacks` projects the
+accumulated gold-bag count in the arena lobby, and cash-out returns that count
+as `GoldWin`.
+
+## FRA challenges
+
+Challenge definitions and encounter modifications come from the extracted
+`fra_challenges` records. A selected elite encounter receives one random
+ordinary challenge. After a win against an elite, the server sends its authored
+`... Reward` conversation at game end and stores the paired `... Boss
+Notification` challenge for the next boss fight. The notification's authored
+encounter modification is included in that boss's `GetArenaBattleMods` reply.
+
+For non-elite encounters after the first six opponents (zero-based challenger
+index greater than 5), the server selects an ordinary challenge and applies it
+only when its `probability_percent` roll succeeds. Reward and notification
+conversations are excluded from this selection. Selected challenge IDs and
+runtime card choices are persisted with fight history so lobby refreshes do
+not reroll them.
+
+`Starting Health 15` is a separate run-start challenge. The server rolls it
+when assigning the arena deck, stores it in fight-history slot 0, and applies
+its health modifier only for challenger index 0.
 
 ## Game-session result flow
 
@@ -112,7 +140,7 @@ cards, equipment, and sleeves. The current server cash-out path in
 empty `AllLoot` list. It also resets the run counters and clears the saved
 challenger roster.
 
-Consequently, the current implementation tracks and displays FRA gold-pouch
+Consequently, the current implementation tracks and displays FRA gold-bag
 and treasure-chest totals during a run, but does not yet convert those totals
 into inventory items or populated cash-out loot entries. That should be added
 separately from the run-counter logic.

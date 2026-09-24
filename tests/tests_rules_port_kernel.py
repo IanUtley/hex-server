@@ -265,10 +265,13 @@ def test_native_ai_attacker_declaration_is_idempotent_after_phase_entry():
     port = SimpleNamespace(
         combat_manager=SimpleNamespace(combats=[object(), object()]))
     session = SimpleNamespace(_rules_port_session=port)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = SimpleNamespace(_player_champ_scid=game_engine.SessionCardId(pl_t))
+    game = game_engine.Game(1, pl_t, ai_t)
 
     result = ai.ai_declare_attackers(
-        SimpleNamespace(), SimpleNamespace(), session,
-        "ai", "player", state)
+        handler, game, session, ai_t, pl_t, state)
 
     assert result is state
     assert state["ai_attackers"] == declarations
@@ -451,29 +454,30 @@ def test_pass_priority_accepts_equivalent_raw_wire_priority_identity():
     assert window.priority_player_id is None
 
 
-def test_checkpoint_phase_refresh_precedes_transaction_normalization():
-    """A pass must normalize against the phase it will be validated on.
+def test_checkpoint_phase_refresh_preserves_native_combat_window():
+    """A stale compatibility cursor must not rewind native combat progress.
 
-    Practice keeps two phase representations: the native port's
-    ``current_turn_phase`` and the compatibility checkpoint's ``phase_idx``.
-    When the AI driver advances one without the other, a client pass for the
-    checkpoint phase was normalized against the native phase and rejected as a
-    phase mismatch (the live symptom logged ``requirements=phase/player/handler``
-    while both requirements passed on re-inspection).
+    FRA can declare AI attackers and enter their trigger response while the
+    older ``phase_idx`` still names DeclareCombatPriorityWindow. Rewinding the
+    scheduler to that cursor makes its next pass skip DeclareDefense, even
+    though the native attack window and combat objects are already live.
     """
     player = game_engine.UID.make(244, 91)
     ai = game_engine.UID.make(3, 1000)
     phases = ["FirstMainPhase", "DeclareCombatPriorityWindow", "DeclareAttack"]
     game_session = SimpleNamespace(
         _rules_port_battle_state={"turn_phases": phases, "phase_idx": 1,
-                                  "turn_player": "ai"})
+                                  "turn_player": "ai",
+                                  "rules_port": {
+                                      "phase": "DeclareAttackPriorityWindow"}})
     session = AuthoritativeSession(
         190, (ai, player), seed_z=1, seed_w=2,
         snapshot=SimpleNamespace(game_session=game_session))
     session.runtime_facts = SimpleNamespace(battle_state={})
-    # Native port advanced to DeclareAttack; the compatibility checkpoint (and
-    # the client) are still at DeclareCombatPriorityWindow.
+    # Native port advanced beyond combat declaration; the compatibility
+    # checkpoint still points at DeclareCombatPriorityWindow.
     session.current_turn_phase = game_engine.ETurnPhases.DeclareAttack
+    session.has_legal_blockers = True
     session.active_player_id = ai
     window = PriorityWindowAction(TurnPhasePlayers.ALL)
     session.push_game_action(window)
@@ -485,7 +489,9 @@ def test_checkpoint_phase_refresh_precedes_transaction_normalization():
     assert submit_classified_transaction(session, command, player)
     from rules_port.phases import phase_name
     assert phase_name(session.current_turn_phase) == (
-        "DeclareCombatPriorityWindow")
+        "DeclareAttackPriorityWindow")
+    assert session.phase_states["DeclareAttackPriorityWindow"].get_next_turn_phase(
+        session) == "DeclareDefense"
 
 
 def test_choose_draw_first_reorders_players_like_client_transaction():
@@ -2054,6 +2060,29 @@ def test_wire_continuation_marker_outranks_fresh_activation():
     assert tx.requirements == ()
 
 
+def test_wire_class23_picker_answer_resumes_its_host_prompt():
+    """A class-23 deck/revealed-card picker answer must resume, not activate.
+
+    Oakhenge's revealed-card picker is a class-23 activation-data request whose
+    answer arrives as a SetAbilityActivationDataTransaction.  The host marks
+    that payload while its deck-search checkpoint is pending, so the
+    normalizer must produce the continuation intent instead of validating a
+    fresh activation of the picker's child ability (an instance the port does
+    not own) and dropping it.
+    """
+    player = game_engine.UID.make(244, 1)
+    command = SimpleNamespace(is_set_ability_data=True,
+                              is_ability_activate=False,
+                              pass_turn_phase=None,
+                              inner_bytes=b"SetAbilityActivationDataTransaction")
+    data = {"target_map": {"0": [903]}}
+    tx = normalize_player_transaction(
+        command, player,
+        payload={"_triggered_continuation": True, "activation_data": data})
+    assert tx.kind == "resolve_triggered_continuation"
+    assert tx.payload["activation_data"] == data
+
+
 def test_wire_normalizer_maps_play_card_transactions_from_typed_payload():
     player = game_engine.UID.make(244, 1)
     command = SimpleNamespace(is_play_troop=True, is_play_resource=False,
@@ -2284,6 +2313,35 @@ def test_players_who_control_matching_filter_counts_controller_cards():
                                  "required_quantity": 2,
                                  "comparison": "GreaterThanOrEqual"})
     assert filt.matches(card, session=session)
+
+
+def test_pack_raptors_count_other_controlled_copies_for_their_stats():
+    """Their authored self-buff counts friendly Raptors, excluding itself."""
+    import db
+    import pvp_db
+    from rules_port.static_rules import effective_stats
+
+    session_id = 987654321
+    template_guid = "b1c80936-b1a9-4a65-8919-2f89895ec4ac"
+    abilities = pvp_db.db_card_template_ability_payload(
+        template_guid, conn=db._db)
+    cards = ((987650001, 7), (987650002, 7), (987650003, 9))
+    try:
+        for position, (uid, owner) in enumerate(cards):
+            pvp_db.db_insert_generated_card(
+                session_id, owner, uid, template_guid, "warzone", "Troop",
+                abilities, 0, uid, conn=db._db, position=position)
+        db._db.commit()
+
+        for uid, owner in cards[:2]:
+            assert effective_stats(db._db, session_id, {}, uid)[:2] == (2, 2)
+        # A single opposing copy has no other opposing Raptor to count.
+        assert effective_stats(db._db, session_id, {}, cards[2][0])[:2] == (
+            1, 1)
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
 
 
 def test_wire_bridge_submits_classified_intent_against_port_phase():
@@ -3584,7 +3642,7 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
         def fake_played_spell(*_args, **_kwargs):
             calls.append(("bom", None))
 
-        def run(bstate):
+        def run(bstate, bom_completed):
             db.execute("UPDATE game_cards SET location='CastSpells' "
                        "WHERE session_id=1 AND card_uid=?", (uid,))
             db.commit()
@@ -3592,26 +3650,29 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
             previous_db = db_module._db
             db_module._db = db
             try:
+                from rules_port.chain_items import resolve_card_item
                 with mock.patch.object(host, "_db", db), \
                         mock.patch(
                             "rules_port.resolution.resolve_port_played_spell",
                             fake_played_spell):
-                    host.HCPHandler._resolve_native_card_chain_item(
-                        handler, SessionStub(), pl_t, ai_t, bstate, dict(item),
-                        game)
+                    resolve_card_item(
+                        handler, SessionStub(), db, game, bstate, dict(item),
+                        pl_t, ai_t, bom_completed)
             finally:
                 db_module._db = previous_db
             return db.execute(
                 "SELECT location FROM game_cards WHERE session_id=1 "
                 "AND card_uid=?", (uid,)).fetchone()[0]
 
-        assert run({"completed_chain_instance_id": 4}) == "discard"
+        # The chain boundary consumes the picker-continuation marker and
+        # passes the resulting flag down; the card still leaves CastSpells.
+        assert run({"completed_chain_instance_id": 4}, True) == "discard"
         assert ("bom", None) not in calls, calls
         assert ("trigger", "CardCastEvent") in calls, calls
 
         # A different chain instance still resolves its own BOM.
         calls.clear()
-        assert run({"completed_chain_instance_id": 99}) == "discard"
+        assert run({}, False) == "discard"
         assert ("bom", None) in calls, calls
     finally:
         db.close()

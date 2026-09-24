@@ -491,6 +491,178 @@ def test_champion_collection_updates_are_suppressed(db):
     assert len(game.events) == 1
 
 
+def test_champion_board_cards_are_reannounced_once_client_is_live(db):
+    """The champions' board views must be (re)placed once the client is in the
+    battle UI.
+
+    ``ChampionCardPlayed`` is the only event that moves a champion's card view
+    into the player's ChampionsView, which is what the client's
+    ``BattleStateDeclareAttackers``/``UIBattle.OnAttackDeclared`` use as the
+    defender for the troop-to-champion line.  It is sent once, inside the
+    game-start burst, while Unity is still entering the battle scene, so a view
+    created after that stays at the card root (the middle of the board) and the
+    line ends there.
+    """
+    import hconnect_server as hcs
+    from domain import game as gmod
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler.scnt = 0
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    player_champ = game_engine.SessionCardId(game_engine.UID.make(1, 1))
+    ai_champ = game_engine.SessionCardId(game_engine.UID.make(1, 2))
+    handler._player_champ_scid = player_champ
+    handler._ai_champ_scid = ai_champ
+    handler._player_champ_board = (
+        player_champ, False, "Poca", "4848068e-15fd-4f1d-8009-c136d9821a6d")
+    handler._ai_champ_board = (
+        ai_champ, True, "Dragon Guard Stalwart",
+        "56a21ecf-90cc-4f67-8022-c5f1fab765c5")
+    # Champion payloads come from the champion CardDefs rebuilt for the packet:
+    # abilities, persisted counters and the spell-power cost escalation.
+    charge_power = game_engine.ResourceId.from_str(
+        "3687a2ea-baf1-2dfe-25ca-b51cb1a95c28")
+    handler._player_champ_abilities = [charge_power]
+    handler._ai_champ_ability_guids = [str(charge_power.guid)]
+    # Champion HUD modifiers are CardCounterTemplates (Burning / Stealth /
+    # Dazed / Vulnerable); ``Decoy`` is one of the hidden (m_Secret) ones.
+    burning = "3932ad3a-9807-de2a-e1b9-a8b50e81def9"
+    stealth = "78db859d-02b9-fc97-e2fb-8aca1dfeed77"
+    dazed = "9c98dace-4cac-0fda-8242-f7ef2c1d3cf0"
+    decoy = "b49de870-9d87-6e0f-b4c8-3ed85350ffcc"
+    handler._current_bstate = {
+        "player_health": 18, "ai_health": 15,
+        "champion_counters": {
+            str(player_champ.uid.uid64): {burning: 3, stealth: 2, decoy: 1},
+            str(ai_champ.uid.uid64): {dazed: 1},
+        },
+        "player_sp_uses": {str(player_champ.uid.uid64): 0,
+                           str(charge_power.guid): 1},
+    }
+    session = SessionStub()
+    game = gmod.Game(1, pl_t, ai_t)
+    # A champion-sourced trigger can already be queued in the first packet
+    # received after the client enters battle. Its chain animation must run
+    # after ChampionCardPlayed, which moves this same card view to the board.
+    game.push_ability_on_chain(
+        ai_champ, charge_power, ability_instance_id=23)
+
+    # Nothing is projected before the client has answered a transaction.
+    assert handler._announce_champion_board_cards(game, session, pl_t) is False
+    assert [type(event).__name__ for event in game.events] == [
+        "AbilityPushedOnChainSessionEventArgs"]
+
+    # Once the client is in the battle UI the whole champion projection is
+    # repeated, so its card view is created and placed on a live board.
+    session._client_in_battle = session.session_id
+    assert handler._announce_champion_board_cards(game, session, pl_t) is True
+    types = [type(event).__name__ for event in game.events]
+    assert types == [
+        "CardUpdatedSessionEventArgs", "ChampionCardPlayedSessionEventArgs",
+        "CardUpdatedSessionEventArgs", "ChampionCardPlayedSessionEventArgs",
+        "PlayerUpdatedSessionEventArgs", "PlayerUpdatedSessionEventArgs",
+        "AbilityPushedOnChainSessionEventArgs",
+    ], types
+    updates = [event for event in game.events
+               if type(event).__name__ == "CardUpdatedSessionEventArgs"]
+    assert [event.session_card_id for event in updates] == [player_champ, ai_champ]
+    assert [event.defense for event in updates] == [18, 15]
+    assert all(event.collection == game_engine.ECardCollections.None_
+               and event.card_type == game_engine.ECardTypes.Champion
+               for event in updates)
+    # The champion abilities (charge/spell powers) survive the re-announce.
+    assert [[str(a.guid) for a in event.abilities] for event in updates] == \
+        [[str(charge_power.guid)]] * 2, [list(event.abilities)
+                                         for event in updates]
+    # So do the persisted counters and the spell-power cost escalation.
+    counters = [[(str(t.guid), c) for t, c in
+                 zip(event.counter_templates, event.counter_counts)]
+                for event in updates]
+    assert counters == [
+        [(burning, 3), (stealth, 2), (decoy, 1)],
+        [(dazed, 1)],
+    ], counters
+    # A hidden champion counter keeps the same viewer contract as the
+    # dedicated counter path: the event is marked with its secret guid and
+    # owner so the opponent's copy strips the value.
+    assert decoy in {str(guid) for guid in updates[0]._secret_counter_guids}, \
+        updates[0]._secret_counter_guids
+    assert int(updates[0]._secret_counter_owner_uid.uid64) == int(pl_t.uid64), \
+        updates[0]._secret_counter_owner_uid
+    assert not getattr(updates[1], "_secret_counter_guids", None)
+    assert {str(k.guid): v for k, v in
+            updates[0].spell_point_cost_mods.items()} == \
+        {str(charge_power.guid): 1}, updates[0].spell_point_cost_mods
+    played = [event for event in game.events
+              if type(event).__name__ == "ChampionCardPlayedSessionEventArgs"]
+    assert [(event.session_card_id, event.is_ai, event.player_name)
+            for event in played] == [
+        (player_champ, False, "Poca"),
+        (ai_champ, True, "Dragon Guard Stalwart"),
+    ]
+    assert [event.champion_id for event in game.events
+            if type(event).__name__ == "PlayerUpdatedSessionEventArgs"] == [
+        player_champ, ai_champ]
+    assert game.events[-1].source_card_id == ai_champ
+
+    # Exactly once per game: a later packet must not replay the placement (a
+    # repeated ChampionCardPlayed would re-run the champion HUD animation).
+    later = gmod.Game(1, pl_t, ai_t)
+    assert handler._announce_champion_board_cards(later, session, pl_t) is False
+    assert later.events == []
+
+
+def test_phase_stop_packet_announces_each_phase_once(db):
+    """One packet must not re-enter the same phase twice.
+
+    The native scheduler publishes every transition through the event sink
+    (``RulesPortSession.transition_to`` -> ``send_turn_phase_update``) and the
+    host projection then announces the phase it stopped on, so the same
+    ``TurnPhaseUpdated`` reached Unity twice in one packet.  Unity re-enters the
+    phase state for each one, and ``BattleStateAssignDamage`` auto-commits on
+    entry, so the client sent a second, empty ``AssignDamageOrderTransaction``
+    for the phase it had already resolved (the scheduler rejected it with
+    ``requirements=['OrRequirement']`` at phase 19 SecondMainPhase).
+    """
+    from rules_port.session import GameEngineEventSink
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    phase = game_engine.ETurnPhases.AssignDamage
+    tpu = game_engine.TurnPhaseUpdatedSessionEventArgs.CLASS_ID
+
+    # The port transitioned into the phase while the previous packet's Game was
+    # still the sink's projection.
+    previous = game_engine.Game(1, pl_t, ai_t)
+    sink = GameEngineEventSink(previous)
+    sink.turn_phase_updated(phase, ai_t, ai_t)
+    # The host stopped on that same phase and announces it for the packet.
+    packet_game = game_engine.Game(1, pl_t, ai_t)
+    sink.game = packet_game
+    packet_game.push_turn_phase(phase, pl_t, pl_t)
+    packet_game.push_green_light(pl_t)
+    sink.drain_into(packet_game)
+    pkt = packet_game.make_network_packet(pl_t)
+    assert pkt.event_ids.count(tpu) == 1, pkt.event_ids
+    # The projection's event wins, so the packet keeps the mapped priority ids
+    # the rest of the packet (GreenLight/PlayerUpdated/options) refers to.
+    def phase_bytes(priority):
+        reference = game_engine.Game(1, pl_t, ai_t)
+        reference.push_turn_phase(phase, priority, priority)
+        return reference.events[0].to_byte_array()
+
+    assert pkt.event_data[0] == phase_bytes(pl_t)
+    assert pkt.event_data[0] != phase_bytes(ai_t)
+
+    # A real phase progression inside one packet is preserved.
+    progression = game_engine.Game(1, pl_t, ai_t)
+    progression.push_turn_phase(game_engine.ETurnPhases.Prep, pl_t, pl_t)
+    progression.push_turn_phase(game_engine.ETurnPhases.Draw, pl_t, pl_t)
+    ids = progression.make_network_packet(pl_t).event_ids
+    assert ids.count(tpu) == 2, ids
+
+
 def test_basic_champion_power_is_not_activatable_on_chain(db):
     """Only manual champion powers are offered while a chain is pending."""
     import battle_engine as be
@@ -509,10 +681,15 @@ def test_basic_champion_power_is_not_activatable_on_chain(db):
     dbmod._db = object()
     try:
         def graph_for(_handler, guid):
-            return mock.Mock(manual=(guid == "basic-champion-power"),
-                             trigger_event_type=(
-                                 "" if guid == "basic-champion-power"
-                                 else "Game.Shared.Mechanics.CardCastEvent"))
+            is_basic = guid == "basic-champion-power"
+            # The availability check reads the authored ONE-SHOT limit from
+            # the graph's costs, so the double must model that field: a bare
+            # Mock auto-creates ``costs.uses_per_game`` and int() rejects it.
+            return mock.Mock(
+                manual=is_basic,
+                trigger_event_type=(
+                    "" if is_basic else "Game.Shared.Mechanics.CardCastEvent"),
+                costs=mock.Mock(uses_per_game=0, uses_per_turn=0))
 
         with mock.patch("hconnect_server._records_ability_graph",
                         side_effect=graph_for), \
@@ -954,6 +1131,100 @@ def test_x_cost_detection_and_damage(db):
         hcs._db = old_hcs_db
 
 
+def test_x_cost_recovers_labelled_resource_x_cost_from_raw_envelope(db):
+    """The RulesPort card-play path must recover the client's chosen X.
+
+    ``XCostData`` is a nested record the generic ObjFmt walker can stop
+    before, so the typed activation data can arrive without ``x_cost``.  The
+    raw envelope still labels the Int32, and the card-play path falls back to
+    it (as the legacy and tournament paths already did) — otherwise a
+    variable-cost spell resolves for 0.
+    """
+    import hconnect_server as hcs
+    raw = (
+        b";0;0;2;PlayerId;1;1;1;m_UID64;2;2;0;0101000000000000;"
+        b"Transaction;3;3;5;m_SessionCardId;4;4;1;value;5;1;1;m_UID64;"
+        b"6;2;0;0101000000000000;m_AbilityDataList;7;5;0;1;0;8;6;8;"
+        b"SourceCardId;9;4;1;value;10;1;1;m_UID64;11;2;0;0101000000000000;"
+        b"m_ResourceXCost;12;3;0;03000000;"
+        b"m_Variables;13;9;0;0;m_TransactionId;14;5;0;4A000000;"
+    )
+    assert hcs.HCPHandler._extract_int32_field(None, raw, "m_ResourceXCost") == 3
+    # An envelope without the label reports no X rather than a stale one.
+    assert hcs.HCPHandler._extract_int32_field(
+        None, b"m_AbilityDataList;7;5;0;0;", "m_ResourceXCost") is None
+
+
+def test_first_main_refresh_opens_combat_for_a_troop_played_this_turn(db):
+    """A troop played during First Main can still attack that turn.
+
+    ``player_has_ready_troop`` is persisted at Prep, so a Speed troop the
+    client played during First Main (hasted by the opposing champion's "when a
+    troop enters play" power, for instance) left the native FirstMainPhase
+    branch fact stale: the client's pass went straight from First Main (10) to
+    Second Main (19) and skipped Declare Attackers.  The host refreshes the
+    fact before that decision, and the plan must be rebuilt with it or the
+    DeclareAttack cursor does not exist.
+    """
+    import db as dbmod
+    import hconnect_server as hcs
+    from rules_port import lifecycle as _lifecycle
+    from rules_port.turn_states import default_phase_states
+
+    old_db = dbmod._db
+    old_hcs_db = hcs._db
+    dbmod._db = db
+    hcs._db = db
+    try:
+        tpl = "aaaaaaaa-1111-2222-3333-444444444444"
+        db.execute(
+            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "defense, attributes, abilities_json, threshold_json, subtype, "
+            "variable_cost, variable_cost_minimum) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tpl, "Hasted Recruit", "Troop", 1, 2, 2,
+             int(game_engine.ECardAttributes.Speed), "[]", "[]", "", 0, 0))
+        add_card(db, 7001, 5, tpl)
+        handler = object.__new__(hcs.HCPHandler)
+        handler.user_profile = {"id": 5}
+        session = SessionStub()
+        bstate = {"turn_player": "player", "player_has_ready_troop": False,
+                  "turn_phases": list(_lifecycle.BASE_TURN_PHASES),
+                  "_rules_port_attached": True}
+        handler._current_bstate = bstate
+        assert handler._refresh_native_combat_branch(
+            session, bstate, active_is_ai=False,
+            active_phase=game_engine.ETurnPhases.FirstMainPhase) is True
+        assert bstate["player_has_ready_troop"] is True, bstate
+        assert game_engine.ETurnPhases.DeclareAttack in bstate["turn_phases"]
+        # The rebuild only inserts the combat steps: the cursor for the phase
+        # already in progress keeps its index.
+        assert (list(bstate["turn_phases"])[:5] ==
+                list(_lifecycle.BASE_TURN_PHASES)[:5])
+        # The native graph now reaches DeclareAttack instead of Second Main.
+        states = default_phase_states(game_engine.ETurnPhases)
+        session.active_player_skips_attack = not bstate[
+            "player_has_ready_troop"]
+        session.has_legal_attackers = bstate["player_has_ready_troop"]
+        assert states["FirstMainPhase"].get_next_turn_phase(session) == \
+            "DeclareCombatPriorityWindow"
+        assert states["DeclareCombatPriorityWindow"].get_next_turn_phase(
+            session) == "DeclareAttack"
+        # Second Main is never rebuilt: the plan change would renumber the
+        # phase_idx cursor and strand the client's next pass.
+        later = {"turn_player": "player", "player_has_ready_troop": False,
+                 "turn_phases": list(_lifecycle.BASE_TURN_PHASES),
+                 "_rules_port_attached": True}
+        assert handler._refresh_native_combat_branch(
+            session, later, active_is_ai=False,
+            active_phase=game_engine.ETurnPhases.SecondMainPhase) is False
+        assert later["player_has_ready_troop"] is False, later
+        assert later["turn_phases"] == list(_lifecycle.BASE_TURN_PHASES)
+    finally:
+        dbmod._db = old_db
+        hcs._db = old_hcs_db
+
+
 def test_deck_search_prompt_target_id(db):
     """The deck-search class-39 prompt's TargetInstance must carry a real
     AbilityTargetTemplate id (the deathcry's target_template_ids), not the
@@ -1325,6 +1596,138 @@ def test_swiftstrike_kills_before_normal_damage(db):
         "SELECT location, card_damage FROM game_cards WHERE card_uid=101"
     ).fetchone()
     assert a_loc[0] == "warzone" and a_loc[1] == 0, a_loc
+
+
+def test_deathcry_return_does_not_rejoin_the_combat(db):
+    """A blocker killed in the Swiftstrike step never re-blocks the normal step.
+
+    C# drops a troop from its combat the moment the troop leaves play
+    (``Session.DeactivateCard`` -> ``Session.RemoveTroopFromCombat`` ->
+    ``Combat.EliminateTroop``) while ``ECombatFlags.AttackBlocked`` stays set.
+    Bone Warrior's and Spiritbound Spy's Deathcries return the *same* card to
+    play - with a fresh template and, for the buffed Spy, more than one health
+    and a body that could legally block - before the normal damage step.  A
+    returned body must not absorb (or deal) normal-step combat damage: the
+    attack stays blocked, so the champion takes nothing, and with Crush the
+    whole attack value lands on the champion because no live blocker remains.
+    """
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+    from rules_port.resolution import resolve_port_trigger
+    from rules_port.static_rules import effective_stats
+    from tests.tests_cards_fixes import _copy_card
+
+    BONE_WARRIOR = "f4822b71-b1f5-448d-a7e6-b7caf5f11374"
+    PILE_OF_BONES = "c72e6441-6717-4bbf-91f1-3fd6707d165d"
+    SPIRITBOUND_SPY = "3e59b02f-a9e5-4eb5-b03e-c1fe295906fb"
+    PHANTOM = "76030486-a9a8-429a-a4e6-f67f209d9baa"
+    ATTACK = 5
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+
+    def drain(bstate, game, handler):
+        """Resolve the trigger chain the way the Swiftstrike window does."""
+        resolved = []
+        for item in list(bstate.get("stack") or []):
+            bstate["stack"].remove(item)
+            resolve_port_trigger(handler, game, SessionStub(), db, pl_t, ai_t,
+                                 bstate, item)
+            resolved.append(item.get("ability_guid"))
+        return resolved
+
+    def run_case(label, attacker_uid, blocker_uid, blocker_tpl, returned_tpl,
+                 buff, blocker_defense, returned_defense, crush):
+        attack = ATTACK
+        attacker_tpl = "ffffffff-0000-0000-0000-0000000d1c%02d" % attacker_uid
+        attributes = int(game_engine.ECardAttributes.FirstStrike |
+                         game_engine.ECardAttributes.DualStrike |
+                         game_engine.ECardAttributes.Flight)
+        if crush:
+            attributes |= int(game_engine.ECardAttributes.Juggernaught)
+        db.execute(
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, "
+            "cost, attack, defense, attributes, abilities_json, "
+            "threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (attacker_tpl, f"{label} Double Striker", "Troop", 3, attack, 6,
+             attributes, "[]", "[]", ""))
+        _copy_card(db, blocker_tpl)
+        _copy_card(db, returned_tpl)
+        add_card(db, attacker_uid, 5, attacker_tpl, loc="warzone")
+        add_card(db, blocker_uid, 0, blocker_tpl, loc="warzone")
+        # A card in play carries its authored abilities on the instance row
+        # (the trigger discovery reads that payload, not the template's).
+        abilities = db.execute(
+            "SELECT abilities_json FROM card_templates WHERE guid=?",
+            (blocker_tpl,)).fetchone()[0]
+        db.execute("UPDATE game_cards SET card_abilities=? "
+                   "WHERE card_uid=?", (abilities, blocker_uid))
+        if buff:
+            # A buff that survives the death + transform, so the returned body
+            # has more than one health (Phantom 1/1 +2/+2) and can block.
+            db.execute(
+                "UPDATE game_cards SET permanent_buffs=? WHERE card_uid=?",
+                (json.dumps({"atk": buff, "def": buff}), blocker_uid))
+        db.commit()
+        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+                  "player_attackers": {str(attacker_uid): "0"},
+                  "ai_blockers": {str(attacker_uid): [str(blocker_uid)]},
+                  "player_damage_order": {str(attacker_uid): [str(blocker_uid)]},
+                  "_rules_port_attached": True, "stack": [],
+                  "_next_instance_id": 1}
+        handler = HandlerStub(db)
+        handler._current_bstate = bstate
+        game = game_engine.Game(1, pl_t, ai_t)
+        context = EffectContext.from_rules_port(
+            game, SessionStub(), db, handler, pl_t, ai_t, bstate, "",
+            ability=None)
+        # Swiftstrike step: only the double striker deals damage; the blocker
+        # dies and its Deathcry is queued.  Crush passes the excess over the
+        # still-live blocker to the champion in this step.
+        resolve_native(context, first_strike=True,
+                       attacker_key="player_attackers",
+                       blocker_key="ai_blockers")
+        expected = 20 - (attack - blocker_defense if crush else 0)
+        assert bstate["ai_health"] == expected, (label, bstate["ai_health"])
+        row = db.execute("SELECT location, card_state FROM game_cards "
+                         "WHERE card_uid=?", (blocker_uid,)).fetchone()
+        assert row[0] == "discard" and (row[1] & game_engine.ECardStates.Dead), \
+            (label, row)
+        assert drain(bstate, game, handler), label
+        row = db.execute("SELECT location, template_guid, card_damage FROM "
+                         "game_cards WHERE card_uid=?", (blocker_uid,)).fetchone()
+        assert row[0] == "warzone" and row[1] == returned_tpl, (label, row)
+        # The returned body is a legal blocker in its own right: Spiritbound
+        # Spy's Phantom keeps the +2/+2 buff (defense above one) and Pile of
+        # Bones is the only one of the two that cannot block at all.
+        stats = effective_stats(db, 1, bstate, blocker_uid)
+        assert stats[1] == returned_defense, (label, stats)
+        cannot_block = bool(stats[2] &
+                            int(game_engine.ECardAttributes.CantBlock))
+        if returned_tpl == PHANTOM:
+            assert stats[1] > 1 and not cannot_block, (label, stats)
+        else:
+            assert cannot_block, (label, stats)
+        # Normal step: the returned body is no longer part of the combat.
+        resolve_native(context, first_strike=False,
+                       attacker_key="player_attackers",
+                       blocker_key="ai_blockers")
+        row = db.execute("SELECT location, card_damage FROM game_cards "
+                         "WHERE card_uid=?", (blocker_uid,)).fetchone()
+        assert row == ("warzone", 0), (label, row)
+        # Blocked: no champion damage without Crush.  With Crush the normal
+        # step sends the *whole* attack at the champion, because no live
+        # blocker remains to absorb any of it.
+        expected = 20 - (attack - blocker_defense + attack if crush else 0)
+        assert bstate["ai_health"] == expected, (label, bstate["ai_health"])
+
+    run_case("Bone Warrior", 1201, 1202, BONE_WARRIOR, PILE_OF_BONES, 0, 2, 1,
+             False)
+    run_case("Spiritbound Spy", 1211, 1212, SPIRITBOUND_SPY, PHANTOM, 2, 3, 3,
+             False)
+    run_case("Bone Warrior crush", 1221, 1222, BONE_WARRIOR, PILE_OF_BONES, 0,
+             2, 1, True)
+    run_case("Spiritbound Spy crush", 1231, 1232, SPIRITBOUND_SPY, PHANTOM, 2,
+             3, 3, True)
 
 
 def test_spiritdrain_heals_actual_blocker_damage(db):
@@ -1727,6 +2130,10 @@ def main():
          test_champion_warm_rebuild_does_not_emit_card_updated),
         ("Champion collection updates suppressed",
          test_champion_collection_updates_are_suppressed),
+        ("Champion board cards re-announced once live",
+         test_champion_board_cards_are_reannounced_once_client_is_live),
+        ("Phase stop packet announces a phase once",
+         test_phase_stop_packet_announces_each_phase_once),
         ("Basic champion power not activatable on chain",
          test_basic_champion_power_is_not_activatable_on_chain),
         ("GameStarted chain auto-pass", test_game_started_chain_is_auto_passed),
@@ -1744,6 +2151,10 @@ def main():
         ("Ragefire escalation damage", test_ragefire_escalation_damage),
         ("AI discards to 7", test_ai_discard_down_to_seven),
         ("X-cost detection + damage", test_x_cost_detection_and_damage),
+        ("X-cost recovered from raw envelope",
+         test_x_cost_recovers_labelled_resource_x_cost_from_raw_envelope),
+        ("First-main combat refresh",
+         test_first_main_refresh_opens_combat_for_a_troop_played_this_turn),
         ("Deck-search prompt target id", test_deck_search_prompt_target_id),
         ("Gem abilities resolved at save", test_gem_abilities_resolved),
         ("Gem Rage applies as static", test_gem_rage_applies_as_static),
@@ -1756,6 +2167,8 @@ def main():
          test_simultaneous_combat_damage_cannot_be_undone_by_lifelink),
         ("SpiritDrain heals actual blocker damage",
          test_spiritdrain_heals_actual_blocker_damage),
+        ("Deathcry return does not rejoin the combat",
+         test_deathcry_return_does_not_rejoin_the_combat),
         ("Lethal kills high-defense blocker",
          test_lethal_kills_high_defense_blocker),
         ("Lethal attacker kills high-defense blocker (native)",

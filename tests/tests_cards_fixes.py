@@ -425,8 +425,11 @@ def test_ingenuity_engine_exhaust_cost_is_encoded_as_a_card_picker(db):
 
 
 def test_crazed_squirrel_titan_ai_battles_a_legal_opposing_troop(db):
-    """Crazed Titan's [This, opposing troop] target reaches Battle2Cards."""
-    from abilities.framework.triggers import resolve_stack_trigger, resolve_triggers
+    """Crazed Titan's selected target survives the native chain lifecycle."""
+    from types import SimpleNamespace
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    from rules_port.chain_items import resolve_chain_item
+    from rules_port.actions import AbilityResolutionState
 
     titan_tpl = "4523c2f4-8aba-4f3b-a974-108a40b3d5fb"
     target_tpl = "7325706e-6bf1-4ca4-8d6b-5da13ac069f4"  # Charge Bot, 1 DEF
@@ -442,18 +445,36 @@ def test_crazed_squirrel_titan_ai_battles_a_legal_opposing_troop(db):
     ai_t = game_engine.UID.make(244, 1002)
     game = game_engine.Game(1, pl_t, ai_t)
     handler = HandlerStub(db)
+    ability_guid = "f28e7b5b-9ab4-ee29-19ce-a45e2044fe72"
+    graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
+    target_index = next(i for i, target in enumerate(graph.targets)
+                        if target.requires_input)
+    descriptor = {
+        "kind": "trigger", "ability_guid": ability_guid,
+        "source_uid": 331, "source_owner_uid": 1002,
+        "target_uid": 332, "trigger_target_uid": 331,
+        "activation_data": {"target_map": {str(target_index): [332]}},
+        "instance_id": 17,
+    }
     bstate = {
         "pvp": True, "pids": [1001, 1002],
         "champ_map": {"1001": 10001, "1002": 10002},
         "pvp_health_map": {1001: "player_health", 1002: "ai_health"},
-        "player_health": 20, "ai_health": 20, "stack": [],
+        "player_health": 20, "ai_health": 20,
+        "stack": [dict(descriptor)],
     }
-    resolve_triggers(db, handler, game, SessionStub(), pl_t, ai_t, bstate,
-                     "CardEnteredZoneEvent", 331, 1002)
-    for item in list(bstate.get("stack") or []):
-        bstate["stack"].remove(item)
-        resolve_stack_trigger(handler, game, SessionStub(), db, pl_t, ai_t,
-                              bstate, item)
+    handler._remove_one_shot_ability = lambda *args, **kwargs: False
+    handler.chain_load = lambda _session: bstate
+    handler.chain_save = lambda _session, state: bstate.update(state)
+    handler.chain_new_game = lambda *_args: game
+    handler.chain_send = lambda *_args: None
+    handler.chain_push_empty = lambda _port, state, _item, pending: (
+        not pending and not state.get("stack"))
+    ability = SimpleNamespace(descriptor=descriptor, instance_id=17,
+                              ignores_chain=False)
+    result = resolve_chain_item(handler, None, SessionStub(), db, ability,
+                                pl_t, ai_t)
+    assert result is AbilityResolutionState.COMPLETED, result
     location = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=332").fetchone()[0]
     assert location == "discard", location
@@ -533,6 +554,151 @@ def test_oakhenge_moves_revealed_troop_to_hand_with_its_template(db):
     assert any(isinstance(ev, game_engine.CardDrawnSessionEventArgs)
                and int(ev.session_card_id.uid.uid64) == 362
                for ev in game.events)
+
+
+def test_oakhenge_reveal_opens_one_selectable_picker(db):
+    """Oakhenge reveals the top five once, asks one usable pick, and applies it.
+
+    The client only turns a reveal into a selectable target when the same
+    packet carries the class-23 activation-data request for the revealing
+    ability instance: ``NetworkPacketSessionEventArgs.CombineRevealAndChoose``
+    drops the informational Coverflow and adds the revealed cards that are
+    not legal targets as the picker's ``AdditionalTargets``.  The resolver
+    previously applied RevealCards once per resolved card (queueing one
+    Coverflow per copy) and the prompt asked with the class-39
+    triggered-ability request, so the client only ever showed the
+    informational Coverflow -- grayed cards whose OK button cannot select
+    anything.
+
+    The answer itself must resolve the child ability in one pass: "a revealed
+    troop" is a real picker while "the remaining cards" is an authored auto
+    target, and treating that second target as input asked the player to pick
+    twice, re-moved the first chosen troop and left the spell paused on the
+    chain without priority.
+    """
+    import types
+
+    import hconnect_server as hcs
+    import db as dbmod
+    from rules_port.resolution import resolve_port_played_spell
+
+    OAK = "f42da1e5-159c-41d2-9664-2e64be20257e"
+    OAK_AG = "200337da-9971-cf13-7e98-011a78b9ac64"
+    CHILD_AG = "d8203b7a-0080-f7e0-e2bf-dfac6429785e"
+    TROOP = "4a6efc34-4789-48e1-a660-4153ca6321e8"   # Howling Brave
+    SHARD = "cd41bd00-7585-4762-a721-6163bdaee3c3"   # Wild Shard
+    for guid in (OAK, TROOP, SHARD):
+        _copy_card(db, guid)
+
+    add_card(db, 361, 5, OAK, loc="CastSpells")
+    deck = []
+    for index, (uid, tpl, ctype) in enumerate((
+            (362, TROOP, "Troop"), (363, SHARD, "Resource"),
+            (364, TROOP, "Troop"), (365, TROOP, "Troop"),
+            (366, SHARD, "Resource"))):
+        add_card(db, uid, 5, tpl, loc="deck")
+        db.execute(
+            "UPDATE game_cards SET card_type=?, position=? WHERE card_uid=?",
+            (ctype, index, uid))
+        deck.append(uid)
+    db.commit()
+
+    old_db = dbmod._db
+    old_hcs_db = hcs._db
+    dbmod._db = db
+    hcs._db = db
+    try:
+        import battle_engine
+
+        prompts = []
+        handler = HandlerStub(db)
+        handler._checkpoint_engine = lambda session: battle_engine
+        handler._hide_candidates_to_deck = types.MethodType(
+            hcs.HCPHandler._hide_candidates_to_deck, handler)
+        handler._resolve_pending_revealed_choice = types.MethodType(
+            hcs.HCPHandler._resolve_pending_revealed_choice, handler)
+        # The picker packet and the 3055 acknowledgement have their own tests;
+        # this test owns the target contract and the resolved card state.
+        handler._send_battle_events = lambda *args, **kwargs: True
+        handler._push_transaction_ack = lambda *args, **kwargs: None
+        resolve_choice = types.MethodType(
+            hcs.HCPHandler._prompt_revealed_choice, handler)
+
+        def prompt(game, session, pl_t, ai_t, bstate, ability_guid, source_uid,
+                   owner_id, candidates, revealed_cards, optional=False,
+                   continuation=None):
+            prompts.append((
+                str(ability_guid).lower(),
+                (continuation or {}).get("target_index"),
+                [int(uid) for uid in (candidates or [])]))
+            return resolve_choice(
+                game, session, pl_t, ai_t, bstate, ability_guid, source_uid,
+                owner_id, candidates, revealed_cards, optional=optional,
+                continuation=continuation)
+        handler._prompt_revealed_choice = prompt
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        session = SessionStub()
+        bstate = {"resolving_source_uid": 361, "resolving_owner_id": 5,
+                  "player_health": 20, "ai_health": 20, "turn_number": 1}
+        resolve_port_played_spell(
+            game, session, db, handler, pl_t, ai_t, bstate, [OAK_AG])
+
+        reveals = [event for event in game.events if isinstance(
+            event, game_engine.CardsRevealedSessionEventArgs)]
+        assert len(reveals) == 1, len(reveals)
+        assert [int(card.uid.uid64)
+                for card in reveals[0].session_card_ids] == deck
+        assert reveals[0].inactive is True
+
+        requests = [event for event in game.events if isinstance(
+            event, game_engine.AbilityActivationDataRequiredSessionEventArgs)]
+        assert len(requests) == 1, requests
+        assert not [event for event in game.events if isinstance(
+            event,
+            game_engine.TriggeredAbilityActivationDataRequiredSessionEventArgs)]
+        assert requests[0].ability_instance_id == reveals[0].ability_instance_id
+
+        lists = [event for event in game.events if isinstance(
+            event, game_engine.PlayerOptionListSessionEventArgs)]
+        assert len(lists) == 1, lists
+        option = lists[0].options[0]
+        assert int(option.card.uid.uid64) == 361
+        assert (int(option.card.uid.uid64)
+                == int(requests[0].source_card_id.uid.uid64))
+        instance = option.instances[0]
+        assert str(instance.opt_id.guid) == CHILD_AG, instance.opt_id
+        assert list(instance.min_target_counts) == [1]
+        assert list(instance.max_target_counts) == [1]
+        target = instance.target_instances[0]
+        assert target.target_index == 0
+        assert [int(card.uid.uid64)
+                for card in target.targets] == [362, 364, 365]
+
+        # The player picks one revealed troop; the child ability's auto
+        # "remaining cards" target must not ask again.
+        pend = bstate["pending_deck_search"]
+        assert prompts == [(CHILD_AG, 0, [362, 364, 365])], prompts
+        bstate["paused_chain_instance_id"] = 6
+        handler._resolve_pending_revealed_choice(
+            session, pl_t, ai_t, bstate, pend, 364)
+    finally:
+        dbmod._db = old_db
+        hcs._db = old_hcs_db
+
+    assert not prompts[1:], f"the picker was raised twice: {prompts}"
+    rows = db.execute(
+        "SELECT card_uid, location FROM game_cards "
+        "WHERE card_uid BETWEEN 362 AND 366 ORDER BY card_uid").fetchall()
+    assert rows == [(362, "deck"), (363, "deck"), (364, "hand"),
+                    (365, "deck"), (366, "deck")], rows
+    assert not bstate.get("pending_deck_search"), bstate
+    assert not bstate.get("resolution_paused"), bstate
+    # The paused chain item is released so the next native pass finishes the
+    # spell (discard + chain empty + priority) instead of leaving it stuck.
+    assert bstate.pop("completed_chain_instance_id", None) == 6, bstate
 
 
 def test_cosmic_transmogrifier_preserves_type_and_cost(db):
@@ -1754,10 +1920,105 @@ def test_wind_whisperer_ai_exhausts_best_blocker(db):
         item = bstate["stack"][-1]
         assert item["ability_guid"] == ability_guid
         assert item["target_uid"] == 102, item
+        pushed = [ev for ev in game.events
+                  if isinstance(ev,
+                                game_engine.AbilityPushedOnChainSessionEventArgs)]
+        assert len(pushed) == 1, pushed
+        assert [int(target.uid.uid64) for target in
+                pushed[0].target_card_ids] == [102], pushed[0].target_card_ids
         assert bstate["ai_charges"] == 0, bstate
     finally:
         dbmod._db, ai._db = old_db, old_ai_db
     print("PASS Wind Whisperer AI targets best blocker")
+
+
+def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
+    """Removal/buffs follow C# target-side value rules; required targets
+    cannot silently degrade into a targetless action.
+    """
+    from types import SimpleNamespace
+    import ai
+    import ai_eval
+
+    selector = object.__new__(ai_eval.CardEvaluator)
+    selector.ai_warzone = [
+        SimpleNamespace(card_uid=101, value=20, is_troop=lambda: True,
+                        effective_attack=lambda: 2,
+                        effective_defense=lambda: 2),
+        SimpleNamespace(card_uid=102, value=30, is_troop=lambda: True,
+                        effective_attack=lambda: 3,
+                        effective_defense=lambda: 3),
+    ]
+    selector.player_warzone = [
+        SimpleNamespace(card_uid=201, value=5, is_troop=lambda: True,
+                        effective_attack=lambda: 2,
+                        effective_defense=lambda: 2),
+        SimpleNamespace(card_uid=202, value=10, is_troop=lambda: True,
+                        effective_attack=lambda: 3,
+                        effective_defense=lambda: 3),
+    ]
+    selector.handler = SimpleNamespace(_ai_champ_scid=None)
+    selector.player_champ_uid = None
+    selector.get_card_value = lambda card: card.value
+    legal_uids = [101, 102, 201, 202]
+    selector._metadata_action_targets = lambda _card, _ag: legal_uids
+    selector.effects_for = lambda ag: (
+        [("DestroyCardAbilityEffectTemplate", {})]
+        if ag == "removal" else
+        [("CardModifierAbilityEffectTemplate",
+          {"property": "attack", "amount": 1})])
+    selector.hints_for = lambda _card: SimpleNamespace(
+        removal=None, buff=None)
+
+    removal = SimpleNamespace(ability_guids=["removal"])
+    buff = SimpleNamespace(ability_guids=["buff"])
+    assert selector.choose_action_target(removal) == 202
+    assert selector.choose_action_target(buff) == 102
+
+    required_ability = "10000000-0000-0000-0000-000000000001"
+    optional_ability = "10000000-0000-0000-0000-000000000002"
+    required_template = "20000000-0000-0000-0000-000000000001"
+    optional_template = "20000000-0000-0000-0000-000000000002"
+    for ability, target_template in (
+            (required_ability, required_template),
+            (optional_ability, optional_template)):
+        db.execute(
+            "INSERT INTO card_abilities_meta VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ability, 0, "", "", "{}", 0, 0, 0, 0, 0,
+             json.dumps([target_template]), 0))
+    db.execute("INSERT INTO target_templates VALUES "
+               "(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (required_template, "Choose a troop", 0, 0, 0, 1, "", "",
+                1, 1, "{}", "CardTargetTemplate"))
+    db.execute("INSERT INTO target_templates VALUES "
+               "(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (optional_template, "May choose a troop", 0, 0, 1, 1, "", "",
+                1, 1, "{}", "CardTargetTemplate"))
+    db.commit()
+    required_card = SimpleNamespace(ability_guids=[required_ability])
+    optional_card = SimpleNamespace(ability_guids=[optional_ability])
+
+    guard_evaluator = object.__new__(ai_eval.CardEvaluator)
+    guard_evaluator.choose_action_target = lambda _card: None
+    old_ai_db, old_eval_db = ai._db, ai_eval._db
+    ai._db = ai_eval._db = db
+    try:
+        assert guard_evaluator.has_required_explicit_target(required_card)
+        assert not guard_evaluator.has_required_explicit_target(optional_card)
+        play_card = SimpleNamespace(
+            name="Targeted action", card_uid=999, cost=1,
+            variable_cost=False, ability_guids=[required_ability],
+            is_action=lambda: True, is_troop=lambda: False)
+        with mock.patch("rules_port.card_transactions.apply_card_play") as play:
+            played = ai.ai_play_hand_card(
+                None, None, SessionStub(), game_engine.UID.make(3, 1000),
+                {"ai_resources": 5}, play_card,
+                evaluator=guard_evaluator)
+        assert played is False
+        play.assert_not_called()
+    finally:
+        ai._db, ai_eval._db = old_ai_db, old_eval_db
 
 
 def test_concubunny_exhausts_selected_ready_shinhare(db):
@@ -1882,6 +2143,8 @@ def main():
          test_crazed_squirrel_titan_respects_verdant_wyldeboar_buff),
         ("Oakhenge preserves revealed troop identity",
          test_oakhenge_moves_revealed_troop_to_hand_with_its_template),
+        ("Oakhenge reveal opens one selectable picker",
+         test_oakhenge_reveal_opens_one_selectable_picker),
         ("Cosmic Transmogrifier preserves type and cost",
          test_cosmic_transmogrifier_preserves_type_and_cost),
         ("Crown of the Primals buffs its target troop",
@@ -1914,6 +2177,8 @@ def main():
          test_blood_cauldron_ai_pays_sacrifice_cost),
         ("Wind Whisperer AI targets best blocker",
          test_wind_whisperer_ai_exhausts_best_blocker),
+        ("AI action target side and required-target safety",
+         test_ai_action_targets_follow_effect_and_require_legal_selection),
         ("Concubunny exhausts selected ready Shin'hare",
          test_concubunny_exhausts_selected_ready_shinhare),
         ("Discard positions survive reconnect ordering",

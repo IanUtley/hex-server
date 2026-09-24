@@ -976,6 +976,86 @@ def test_constant_is_not_offered_as_pvp_attacker():
     print("PASS PvP Constants are not attackers")
 
 
+def test_pvp_declare_attack_priority_resync_keeps_attack_options():
+    """A DeclareAttack priority resync must project the attack option list.
+
+    The client replaces its entire PlayerOptionList on every push, so
+    answering a client RequestPrioritySync with the generic quick-action
+    window would clear ECardUsage.Attack and leave every ready troop
+    unselectable in BattleStateDeclareAttackers.
+    """
+    db = make_db(1001, 1002)
+    db.execute(
+        "UPDATE game_cards SET card_state=? WHERE card_uid=101",
+        (int(game_engine.ECardStates.StartedATurnOnYourSide),))
+    db.commit()
+
+    class Session:
+        session_id = 1
+        server_id = 100
+
+    class Handler:
+        scnt = 0
+        sid = "test"
+
+        def send(self, *_args, **_kwargs):
+            pass
+
+    previous_db = tournament_game._db
+    previous_pids = tournament_game.db_game_session_pids
+    previous_handlers = tournament_game.player_handlers
+    previous_encode = (
+        tournament_game.encode_datawrapper,
+        tournament_game.encode_sync_event,
+        tournament_game.compress_gzip,
+        tournament_game.client_session_guid,
+    )
+    original_packet = game_engine.Game.make_network_packet
+    captured = {}
+    try:
+        tournament_game._db = db
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        tournament_game.player_handlers = {1001: Handler()}
+        tournament_game.encode_datawrapper = lambda *_args: b""
+        tournament_game.encode_sync_event = lambda *_args: b""
+        tournament_game.compress_gzip = lambda value: value
+        tournament_game.client_session_guid = lambda _handler: ""
+
+        def capture_packet(game, _player):
+            captured["events"] = list(game.events)
+            return b""
+
+        game_engine.Game.make_network_packet = capture_packet
+        state = {
+            "pvp": True,
+            "pids": [1001, 1002],
+            "turn_pid": 1001,
+            "priority_pid": 1001,
+            "phase": int(game_engine.ETurnPhases.DeclareAttack),
+            "champ_map": {"1001": 9001, "1002": 9002},
+        }
+        # The priority-sync / phase-entry projection seam.
+        tournament_game.pvp_push_current_phase_options(Session(), state)
+    finally:
+        game_engine.Game.make_network_packet = original_packet
+        tournament_game._db = previous_db
+        tournament_game.db_game_session_pids = previous_pids
+        tournament_game.player_handlers = previous_handlers
+        (tournament_game.encode_datawrapper,
+         tournament_game.encode_sync_event,
+         tournament_game.compress_gzip,
+         tournament_game.client_session_guid) = previous_encode
+        db.close()
+
+    option_lists = [ev for ev in captured["events"]
+                    if isinstance(ev, game_engine.PlayerOptionListSessionEventArgs)]
+    assert option_lists, captured["events"]
+    offered = {(int(opt.card.uid.uid64), int(opt.state))
+               for opt in option_lists[0].options}
+    assert offered == {(101, int(game_engine.ECardUsage.Attack))}, offered
+    print("PASS PvP DeclareAttack resync keeps attack options")
+
+
 def test_pvp_steadfast_attacker_stays_untapped():
     """The PvP commit handler must preserve Steadfast on an attacker."""
     db = make_db(1001, 1002)
@@ -1283,6 +1363,7 @@ if __name__ == "__main__":
     test_mulligan_completion_reenables_both_clients()
     test_phase_start_resolves_defender_before_turn_phase_triggers()
     test_pvp_quick_action_handoff_updates_both_clients()
+    test_pvp_declare_attack_priority_resync_keeps_attack_options()
     test_pvp_steadfast_attacker_stays_untapped()
     test_pvp_choice_zone_target_resolves_child_then_parent()
     test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty()

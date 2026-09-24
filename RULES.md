@@ -71,6 +71,11 @@ when the server has granted priority to that player. Passing advances the
 stored phase/priority state according to the active stop and auto-pass rules.
 F10/auto-pass is a client preference plus server-side pass behavior; it must not
 skip a required user-input wait or leak priority to the wrong player.
+Card timing follows the client's speed check: quick-speed cards may be played
+when their controller has priority; non-quick cards (including troops and
+resources) require the active player in a main phase with an empty chain.
+Priority alone does not make a non-quick card legal while another item is
+resolving.
 
 Top-level troops, spells, champion abilities, and triggers use the persisted
 chain/stack model when the path supports responses:
@@ -169,6 +174,13 @@ offer its Play-or-Tunnel choice. A card with only the manual route receives
 - Lethal troops move to the graveyard, retain the death state needed by death
   triggers, and fire Deathcry through the ability resolver. State-based deaths
   occur after resolution/combat when the chain is empty.
+- Combat damage resolves once per damage phase, even when a damage trigger opens
+  a response window before the native phase advances. Resuming that phase after
+  the trigger resolves must continue the phase without applying damage again.
+  Acceptance scenario: an AI attacker damages a champion and queues a trigger;
+  passing through that trigger produces its effect once, changes champion
+  health once, and advances to the next phase. Cover first-strike and normal
+  damage separately.
 - Champion health is authoritative. Champion defeat and supported empty-deck
   draws end the game; withdrawal is a server loss and must publish the normal
   game-end/campaign continuation events.
@@ -191,6 +203,11 @@ Target lists must come from `AbilityTargetTemplate` filters, quantities, and
 relationships. Effects must use typed parameters, counters, variables, and
 durations where available. A custom adapter is a compatibility boundary for a
 known extraction/client gap and must be documented in `abilities/ABILITIES.md`.
+
+`CardCastEvent` uses the casting champion as its source and the played card as
+its target. Existing listeners can inspect the played card's type and cost,
+but a card does not observe its own cast when that cast first activates its
+Warzone trigger.
 
 The remaining ability gaps include less common leaves, complete target modes,
 condition trees, output variables, duration teardown, uses/cooldowns, and some

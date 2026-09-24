@@ -159,6 +159,7 @@ def complete_turn(state):
     state.pop("ai_attackers", None)
     state.pop("ai_blockers", None)
     state.pop("player_attackers", None)
+    state.pop("blocked_attackers", None)
     state.pop("player_damage_order", None)
     state[f"{next_player}_resource_played_this_turn"] = False
     return next_player

@@ -36,8 +36,7 @@ from .transactions import (AbilityExistsRequirement, AllDamageAssignedRequiremen
                            PlayerIsAtFrontOfTriggeredAbilityQueueRequirement,
                            AbilitiesAreTriggeredRequirement,
                            DefenseDeclarationsLegalRequirement, Requirement,
-                           MainPhaseRequirement, PriorityWindowRequirement,
-                           QuickActionCardRequirement,
+                           CardPlayTimingRequirement,
                            OrRequirement,
                            PlayerHasPriorityRequirement,
                            PlayerIsActiveRequirement,
@@ -298,10 +297,10 @@ class RulesTransaction:
 
     @classmethod
     def play_resource(cls, player_id, card_id) -> "RulesTransaction":
-        """Port ``PlayResourceTransaction`` (its sole C# requirement)."""
+        """Port resource-play validation and client card timing rules."""
         return cls(player_id, "play_resource", None,
                    payload={"card_id": card_id, "playing_for_free": False},
-                   requirements=(MainPhaseRequirement(),
+                   requirements=(CardPlayTimingRequirement(card_id),
                                  PlayerHasPriorityRequirement(player_id),
                                  CardCanBePlayedRequirement(card_id, False)))
 
@@ -310,15 +309,8 @@ class RulesTransaction:
                   playing_for_free=False, phase=None) -> "RulesTransaction":
         """Build troop/artifact/spell play transactions from typed payloads."""
         data = tuple(dict(item or {}) for item in (ability_data or ()))
-        # Permanents use the two main phases; actions may also be cast during
-        # a priority response window.  The requirement is evaluated against
-        # the authoritative port phase, never the phase claimed by the wire
-        # request.
-        phase_requirement = OrRequirement((MainPhaseRequirement(),
-                                           PriorityWindowRequirement(),
-                                           QuickActionCardRequirement(card_id)))
         requirements: list[Requirement] = [
-            phase_requirement,
+            CardPlayTimingRequirement(card_id),
             PlayerHasPriorityRequirement(player_id),
             CardCanBePlayedRequirement(card_id, bool(playing_for_free))]
         requirements.extend(XCostRequirement(item) for item in data)
@@ -473,13 +465,62 @@ class SQLiteRulesSnapshot:
 
 
 class GameEngineEventSink:
-    """Emit already-supported Python session events, not a parallel protocol."""
+    """Emit already-supported Python session events, not a parallel protocol.
+
+    A ``Game`` is one packet's projection: the host builds a fresh one per
+    packet and serializes it with ``make_network_packet``, which consumes its
+    events.  The port publishes through this sink, so the sink is the one place
+    that can tell when a projection is replaced before anything serialized it.
+    Pointing ``game`` at a new projection queues the outgoing one; the
+    session-level serializer then calls ``drain_into`` so those events ride the
+    next packet instead of being dropped.
+    """
 
     def __init__(self, game: game_engine.Game, *, mutation_adapter=None,
                  event_observer: Optional[Callable[[object], None]] = None) -> None:
-        self.game = game
+        self._unpublished: list[game_engine.Game] = []
+        self._game = game
         self.mutation_adapter = mutation_adapter
         self.event_observer = event_observer
+
+    @property
+    def game(self) -> game_engine.Game:
+        """Return the projection the port publishes onto."""
+        return self._game
+
+    @game.setter
+    def game(self, game: game_engine.Game) -> None:
+        """Publish onto ``game``, queueing the outgoing projection if unsent."""
+        previous = getattr(self, "_game", None)
+        # Test doubles and parity stubs implement only the publishing half of
+        # a Game, so read the queue duck-typed rather than demanding the field.
+        if previous is not game and getattr(previous, "events", None):
+            self._unpublished.append(previous)
+        self._game = game
+
+    def drain_into(self, packet_game: game_engine.Game) -> int:
+        """Move never-serialized events into ``packet_game``, oldest first.
+
+        This is the session-level serialization boundary: call it immediately
+        before building a packet from ``packet_game``, and consume that Game
+        after sending.  Events are prepended because they were published
+        before whatever the packet already queued for itself.  The queue is
+        cleared either way, so a projection is never delivered twice.
+        """
+        carried: list = []
+        for stale in self._unpublished:
+            if stale is packet_game:
+                continue
+            events = getattr(stale, "events", None)
+            if not events:
+                continue
+            carried.extend(events)
+            stale.events = []
+        self._unpublished = []
+        if carried:
+            packet_game.events = carried + list(
+                getattr(packet_game, "events", None) or ())
+        return len(carried)
 
     def _publish(self, event) -> None:
         self.game._push(event)
@@ -1285,12 +1326,24 @@ class AuthoritativeSession:
         if not (isinstance(live_state, dict) and live_state):
             return
         facts.battle_state = live_state
-        # Practice/PvE stores the native phase at the checkpoint cursor. PvP
-        # supplies its own raw-phase synchronization in
-        # PvpAuthoritativeSession.submit_transaction.
+        # The compatibility cursor can lag while an internal RulesPort phase
+        # is running (for example, AI attackers are declared before an
+        # attack trigger opens its response window). Prefer the nested native
+        # scheduler phase when it has been persisted; rewinding to the older
+        # cursor can send the next pass back through DeclareCombat and skip
+        # the defender's blocker window. Older checkpoints without a native
+        # snapshot still use the compatibility phase. PvP supplies its own
+        # raw-phase synchronization in PvpAuthoritativeSession.
         if not live_state.get("pvp"):
             from .persistence import current_phase
-            live_phase = current_phase(live_state)
+            native = live_state.get(SQLiteRulesSnapshot.KEY)
+            native_phase_name = (native.get("phase")
+                                 if isinstance(native, Mapping) else None)
+            live_phase = (getattr(game_engine.ETurnPhases,
+                                  str(native_phase_name), None)
+                          if native_phase_name else None)
+            if live_phase is None:
+                live_phase = current_phase(live_state)
             if live_phase is not None:
                 self.current_turn_phase = live_phase
 

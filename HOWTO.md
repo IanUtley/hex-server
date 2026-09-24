@@ -106,6 +106,8 @@ authored joins, `gamedata.ability_graph` for what an ability does), so it never
 opens `hconnect.db` and cannot disagree with the engine about static
 definitions. Run it directly, or register it with a Codex client:
 
+Use hex mcp if installed.
+
 ```toml
 [mcp_servers.hex]
 command = "/usr/bin/python3"
@@ -173,6 +175,15 @@ snapshot as well; this keeps a completed chain resolver from reappearing on a
 reconnect and blocking the next card transaction. A settled manual ability in
 First/Second Main also rebuilds the metadata-derived `PlayerOptionList` before
 returning the normal green light.
+In Practice/PvE, resolving AI combat damage can queue triggers while the native
+damage phase remains current for the response window. Persist that damage
+step's completion across the window and clear it only after RulesPort advances
+to another phase; a resumed trigger or picker must not apply the same combat
+damage again.
+While a chain item remains on the native RulesPort chain, main-phase
+projections must expose only priority actions (QuickActions and legal ability
+responses). Do not publish ordinary card options until the chain is empty, and
+leave a pending picker in control of its existing options.
 
 The service registry is the first dispatch path. Unsupported or not-yet-
 converted service types may use the compatibility path in HConnect until their
@@ -196,14 +207,16 @@ lifecycle (opposing troops can't attack a stealthed champion, that champion
 has Spellshield, and one counter is removed at the start of the controller's
 turn). Both run from the shared turn-boundary service and apply to PvE and PvP
 alike. Champions are synthetic SessionCardIds with no `game_cards` row, so
-their counters live in `battle_state["champion_counters"]` and their ONE-SHOT
-usage in `battle_state["champion_ability_uses"]`; resolve controller identity
+their counters live in `battle_state["champion_counters"]`, their ONE-SHOT
+usage in `battle_state["champion_ability_uses"]`, and per-turn usage in
+`battle_state["champion_ability_uses_per_turn"]`; resolve controller identity
 with `rules_port.runtime_helpers.champion_owner_id` / `champion_uid_for_owner`
 instead of converting a participant UID (`game_engine.UID` has no `__int__`).
 Manual champion powers are accepted, paid, and queued by the port
 (`MetadataCardTransactionExecutor`), which also gates and spends their
-authored `m_UsesPerGame`; the legacy HConnect champion-ability handler is not
-the live path, so a rule added only there never runs. A phase-entry resolver
+authored `m_UsesPerGame` and `m_UsesPerTurn`; the legacy HConnect
+champion-ability handler is not the live path, so a rule added only there
+never runs. A phase-entry resolver
 (`set_turn_phase_entry_resolver`) must publish the wire events its projection
 queued: readiness is applied at Prep, and leaving those events queued until
 the drive stops made Unity untap troops when Main began instead.
@@ -308,15 +321,106 @@ cost, target, and transaction identity before mutating state.
 - Every `SessionCardId` field must contain a client-recognized UID type. In
   particular, `PlayerUpdated.ChampionId` must be the real champion session-card
   ID, never `UID(0)` or an undefined type.
+- A variable-cost card or ability pays for the X the player chose in the
+  client's X dialog. That value lives in `AbilityActivationData.xCostData`,
+  whose private members keep their `m_` prefix on the wire
+  (`m_ResourceXCost`, `m_CardsToSacrifice`, ...). The generic ObjFmt walker can
+  stop before the nested record, so the card-play boundary must fall back to
+  the labelled Int32 (`_extract_int32_field(inner_bytes, "m_ResourceXCost")`)
+  and the activation normalizer must accept both label styles; otherwise X
+  silently becomes 0, the card resolves for nothing, and the client is
+  undercharged.
+- Trigger discovery scans each side that participates in the event, including
+  that side's champion. A champion power can be owner-agnostic ("when a troop
+  enters play, 25% chance it gets Speed and +1[ATK]" has no
+  `m_Your`/`m_Opposing` restriction), and champions have no `game_cards` row,
+  so only scanning the entering card's own champion leaves the opposing
+  champion's trait unfired. The authored trigger conditions still decide what
+  actually fires.
 - When moving a card, send `CardUpdated` with the destination collection before
   `CardMoved`. `CardDrawn` does not change the client's zone by itself.
+- A `CardUpdated` that re-announces a trigger source must carry its current
+  card-state bits. Omitting `state` defaults to `None`, which makes a tapped
+  attacking troop render ready until a later state refresh.
 - For every top-level chain item, allocate one instance ID and use it in the
   persisted stack item, `AbilityPushedOnChain`, `TopOfChainResolved`, and
   `RemovedTopOfChain`. Card plays may use the client's built-in
   `PLAY_CARD_ABILITY_TEMPLATE_ID` as the chain-rendering template.
+- A trigger chain item carries the card that raised the event in
+  `trigger_target_uid` and the card chosen for the ability's input-bearing
+  target in `target_uid`. Resolve the input target from `target_uid`: the event
+  card feeds only the templates that name it (`AbilityTriggerCardTargetTemplate`),
+  and using it for an input target makes "another target ..." abilities resolve
+  against the trigger's own source.
+- `CardCastEvent` keeps the client envelope: the casting champion is
+  `SourceCardId`, and the card being played is `TargetCardId`. Use that target
+  for cost/type conditions and trigger-target variables, but don't treat the
+  played card as a listener to its own cast; its Warzone trigger registration
+  becomes active after the cast event was queued.
+- A `Game` is one packet's event projection, and the port publishes through
+  `GameEngineEventSink`. Practice/PvE builds a fresh `Game` per packet, and a
+  native phase entry can publish after the previous packet was sent (the AI's
+  `DeclareAttack` declaration, for example), so pointing `event_sink.game` at
+  the new projection queues the outgoing one. The session-level serializer
+  drains that queue with `drain_into(game)` immediately before building its
+  packet and consumes the `Game` after sending; a projection that eschews the
+  drain silently loses the attacker-to-defender line. Drain only where the
+  packet covers the whole session (`_send_battle_events`,
+  `_pvp_send_same_events`): a per-recipient clone send must not drain, or the
+  events reach one client.
+- One packet announces each phase once. The native scheduler publishes every
+  transition through the event sink (`RulesPortSession.transition_to` ->
+  `send_turn_phase_update`) and the host projection then announces the phase it
+  stopped on, so the same `TurnPhaseUpdated` was queued twice and delivered
+  together. Unity re-enters the phase state for each one, and a state that
+  auto-commits on entry (`BattleStateAssignDamage`) then sends a second,
+  illegal `AssignDamageOrderTransaction` for the phase it already resolved.
+  `make_network_packet` keeps the last event per phase value, so the surviving
+  event is the projection's, with the mapped player/priority ids the rest of
+  the packet (GreenLight/PlayerUpdated/options) refers to.
 - Inventory, card, resource, phase, priority, and player events must be built
   from the same authoritative state after the mutation. A bare fresh `Game`
   can reset the client's displayed resources or champion to defaults.
+- A champion's card view is placed only by `ChampionCardPlayed`, which moves it
+  into that player's `ChampionsView` — the defender the client's
+  `BattleStateDeclareAttackers`/`UIBattle.OnAttackDeclared` connect the
+  troop-to-champion line to. The game-start burst sends it once, while Unity is
+  still entering the battle scene, so a champion view created after that (on
+  demand, at the card root) is never moved and the attack line ends in the
+  middle of the board. `_announce_champion_board_cards` repeats the champion
+  projection (CardUpdated + ChampionCardPlayed per side) in the first packet
+  the client sends from a battle UI state — the same "re-push so the board
+  matches the model" treatment `_push_warzone_card_updates` already gives every
+  warzone card — once per game. The champion `CardUpdated` reads its payload
+  from the champion `CardDef`, so it must be rebuilt first
+  (`_push_champions_warm`): a champion re-pushed without its abilities,
+  counters and spell-point cost modifiers wipes the client's champion ability
+  buttons and the spell-power escalation display.
+- `player_has_ready_troop` is the checkpoint fact the native
+  `FirstMainPhaseState` reads to choose between the combat step and Second
+  Main. It is written at Prep, so a troop that enters play during First Main
+  (or any later change to eligibility) leaves it stale and the client's pass
+  skips DeclareAttack. Refresh it for whoever is active — and rebuild
+  `turn_phases` with it so the DeclareAttack/AssignDamage cursors exist —
+  immediately before that decision (`_refresh_native_combat_branch`). Only
+  First Main may be rebuilt: from Second Main on, swapping the base plan for
+  the combat plan renumbers `phase_idx` and strands the client's next pass.
+- Client-derived tables (`card_templates`, `ability_effects`,
+  `card_abilities_meta`, `champion_abilities`, encounter scenes/decks, ...) are
+  a projection of `Records/`, and an existing database is never re-seeded:
+  `seed_database` is insert-if-missing and only fresh databases run it. When the
+  snapshot moves on, the projection rots silently — a modifier leaf keeps an old
+  lossy `param` JSON, a new champion ability never arrives — and a card behaves
+  as if the metadata were absent. `static.refresh_client_seed` keeps it in step
+  by upserting only the seed-owned columns, keyed by a snapshot fingerprint, so
+  a normal start is a no-op and columns/rows owned by other extractors survive.
+  Both entry points reach it through `static.ensure_schema` — `restart.sh`
+  locally and `docker/docker_bootstrap.py` (via `upgrade_database`) in the
+  container — so a container start refreshes a persistent database before any
+  service opens it.
+  Before changing engine code for a card whose Records entry looks right, check
+  the projection: `python3 -m AssetExtraction.gamedata_seed --compare-db
+  hconnect.db` reports per-table missing/extra/changed rows.
 - Hidden zones are filtered per recipient. The opponent must not receive card
   identity, hand contents, or private deck information unless an explicit game
   rule reveals it.

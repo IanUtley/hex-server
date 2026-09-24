@@ -207,8 +207,8 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         exhausted = getattr(facts, "champion_ability_uses_exhausted", None)
         if callable(exhausted) and exhausted(int(payload["source_card_id"]),
                                              graph):
-            # ONE-SHOT (m_UsesPerGame) champion powers are spent once; a
-            # replayed transaction must not resolve a second counter.
+            # Enforce authored per-game and per-turn limits before paying or
+            # queuing a champion power activation.
             return False
         if (getattr(graph, "additional_cost_targets", ()) and
                 self.activation_compatibility is not None):

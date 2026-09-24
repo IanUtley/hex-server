@@ -69,6 +69,22 @@ class RecordsTriggerDiscovery:
         profile = getattr(self.handler, "user_profile", None) or {}
         return 0 if int(owner_id or 0) else int(profile.get("id", 0) or 0)
 
+    def _owns_champion(self, champion_uid):
+        """Whether ``champion_uid`` is the champion this handler plays.
+
+        A handler's runtime champion-power list belongs to its own champion.
+        When the handler has not recorded one (test doubles, partial
+        checkpoints) keep the historical behaviour of trusting the list.
+        """
+        scid = getattr(self.handler, "_player_champ_scid", None)
+        if scid is None:
+            return True
+        try:
+            raw = getattr(getattr(scid, "uid", scid), "uid64", scid)
+            return int(raw) == int(champion_uid)
+        except (TypeError, ValueError):
+            return True
+
     def discover(self, event_type: str, source_uid=None,
                  source_owner_uid=None, extra_target=None, zones=None):
         """Return deterministic source/ability candidates for one event."""
@@ -122,8 +138,14 @@ class RecordsTriggerDiscovery:
                 if not champion_basic:
                     return {}
                 guid = champion_basic[0]
-                configured = getattr(
-                    self.handler, "_player_champ_abilities", [])
+                # Each participant's own handler carries only ITS champion's
+                # configured powers, so the runtime list may describe the
+                # local champion rather than the owner being resolved.  Apply
+                # it only to the champion this handler owns; an opposing
+                # champion's authored triggers come from its metadata.
+                configured = (
+                    getattr(self.handler, "_player_champ_abilities", [])
+                    if self._owns_champion(champion_uid) else [])
             else:
                 profile = getattr(self.handler, "user_profile", None) or {}
                 player_id = int(profile.get("id", 0) or 0)
@@ -200,7 +222,13 @@ class RecordsTriggerDiscovery:
         if source_uid is not None:
             uid = int(source_uid)
             candidates.setdefault(uid, []).extend(card_abilities(uid))
-        if extra_target is not None and int(extra_target) != int(source_uid or 0):
+        # CardCastEvent's target is the card being cast, not another
+        # registered trigger source. A troop that only gained Warzone trigger
+        # registration as this cast resolved cannot hear its own earlier cast
+        # event.
+        if (extra_target is not None and
+                int(extra_target) != int(source_uid or 0) and
+                event_type != "CardCastEvent"):
             uid = int(extra_target)
             candidates.setdefault(uid, []).extend(card_abilities(uid))
 
@@ -214,9 +242,6 @@ class RecordsTriggerDiscovery:
         if owner_id is None:
             return self._freeze(candidates)
 
-        for uid, abilities in champion_holders(owner_id).items():
-            candidates.setdefault(int(uid), []).extend(abilities)
-
         sides = [int(owner_id)]
         zone_sets = [tuple(zones or ("warzone",))]
         if zones is None and event_type in ("TurnStartedEvent", "TurnEndedEvent"):
@@ -226,6 +251,13 @@ class RecordsTriggerDiscovery:
             if other is not None:
                 sides.append(other)
                 zone_sets.append(("hand",))
+        elif event_type == "CardCastEvent":
+            # CardCastEvent listeners can react to a card cast by either
+            # champion. Their authored trigger conditions distinguish
+            # "you" from opponent casts, so discover both sides here.
+            other = self._opposing_owner(owner_id)
+            if other is not None:
+                sides.append(other)
         elif event_type == "CardEnteredZoneEvent":
             zone_sets.append(("underground",))
             other = self._opposing_owner(owner_id)
@@ -243,7 +275,15 @@ class RecordsTriggerDiscovery:
         # Each side has a corresponding zone-set.  Additional event-specific
         # zones are appended above; zip would silently drop a side, so retain
         # the legacy scanner's Cartesian product deliberately.
+        # A champion's authored trigger can observe the other side's cards
+        # ("When a troop enters play, there is a 25% chance it gets Speed and
+        # +1[ATK]" has no m_Your/m_Opposing restriction).  Champions have no
+        # ``game_cards`` row, so scan each considered side's champion rather
+        # than only the event owner's; the authored trigger conditions still
+        # decide which entries actually fire.
         for side in sides:
+            for uid, abilities in champion_holders(side).items():
+                candidates.setdefault(int(uid), []).extend(abilities)
             for zone_group in zone_sets:
                 for uid, abilities in zone_holders(side, zone_group).items():
                     if (event_type == "CardEnteredZoneEvent" or

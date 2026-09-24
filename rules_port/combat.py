@@ -232,6 +232,47 @@ def _card_key(card):
         return id(card)
 
 
+def remove_troop_from_combat(state, card_uid) -> bool:
+    """Port of C# ``Session.RemoveTroopFromCombat`` for the persisted combat.
+
+    ``Session.DeactivateCard`` runs it the moment a troop leaves play, so the
+    C# combat object drops the card (attacker -> cleared, blocker -> removed
+    from the list) while ``ECombatFlags.AttackBlocked`` stays set.  The
+    checkpoint's declaration maps *are* the port's combat, so a troop that
+    leaves play has to be removed from them as well: otherwise a blocker killed
+    in the Swiftstrike step that a Deathcry returns to play (Bone Warrior ->
+    Pile of Bones, Spiritbound Spy -> Phantom) is still treated as a live
+    blocker during the normal damage step and absorbs damage the C# gives to
+    nobody.  Pruning the last blocker also records the attack as blocked, the
+    way the client's sticky ``AttackBlocked`` flag keeps the normal step
+    blocked (no champion damage without Crush) once its blocker is gone.
+    """
+    if not isinstance(state, dict):
+        return False
+    uid = _card_key(card_uid)
+    removed = False
+    for key in ("player_attackers", "ai_attackers"):
+        declarations = state.get(key)
+        if not isinstance(declarations, dict):
+            continue
+        for declared in list(declarations):
+            if _card_key(declared) == uid:
+                del declarations[declared]
+                removed = True
+    blockers = state.get("ai_blockers")
+    if isinstance(blockers, dict):
+        for attacker, values in list(blockers.items()):
+            if not isinstance(values, (list, tuple)):
+                continue
+            kept = [value for value in values if _card_key(value) != uid]
+            if len(kept) == len(values):
+                continue
+            blockers[attacker] = kept
+            state.setdefault("blocked_attackers", {})[str(attacker)] = True
+            removed = True
+    return removed
+
+
 def _is_troop(card) -> bool:
     return bool(getattr(card, "is_troop", True))
 

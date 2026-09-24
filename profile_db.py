@@ -10,6 +10,9 @@ import json
 
 import db as _db_layer
 
+
+RECKONING_FLAG_ARENA_TIER1_PERFECT = "ARENA_TIER1_PERFECT"
+
 def _profile_connection(conn=None):
     return conn if conn is not None else _db_layer._db
 
@@ -124,6 +127,7 @@ def db_reset_account(user_id, conn=None):
         "DELETE FROM game_cards WHERE user_id=? OR owner_user_id=?", (uid, uid))
     for table in ("arena_state", "campaigns", "card_instances", "champions",
                   "collections", "decks", "emails", "fra_challengers",
+                  "reckoning_flags",
                   "friend_requests", "friends", "ignored_players",
                   "player_inventory", "stardust", "store_purchases",
                   "treasure_chests", "user_prefs", "chat_messages",
@@ -138,6 +142,36 @@ def db_reset_account(user_id, conn=None):
     new_player.grant_new_player(connection, uid)
     if conn is None:
         connection.commit()
+
+
+def db_get_reckoning_flags(user_id, conn=None):
+    """Return the persistent client-visible campaign/account flags."""
+    rows = _profile_connection(conn).execute(
+        "SELECT name, progress, maximum, completed FROM reckoning_flags "
+        "WHERE user_id=? ORDER BY name", (int(user_id),)).fetchall()
+    return [{"name": row[0], "progress": int(row[1] or 0),
+             "maximum": int(row[2] or 0), "completed": bool(row[3])}
+            for row in rows]
+
+
+def db_set_reckoning_flag(user_id, name, progress=0, maximum=0,
+                           completed=False, conn=None):
+    """Insert or update one Reckoning flag without committing caller work."""
+    connection = _profile_connection(conn)
+    cursor = connection.execute(
+        "INSERT INTO reckoning_flags "
+        "(user_id, name, progress, maximum, completed) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(user_id, name) DO UPDATE SET "
+        "progress=excluded.progress, maximum=excluded.maximum, "
+        "completed=excluded.completed WHERE "
+        "reckoning_flags.progress != excluded.progress OR "
+        "reckoning_flags.maximum != excluded.maximum OR "
+        "reckoning_flags.completed != excluded.completed",
+        (int(user_id), str(name), int(progress), int(maximum),
+         int(bool(completed))))
+    if conn is None:
+        connection.commit()
+    return bool(cursor.rowcount)
 
 
 # --- Social persistence ----------------------------------------------------

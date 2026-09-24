@@ -10,6 +10,18 @@ from __future__ import annotations
 import json
 
 
+# Effect templates that read their *whole* resolved target set from Records
+# instead of acting on a single target.  C# applies these once per
+# AbilityEffectInstance (``AbilityEffectTemplate.Apply``), so the resolver's
+# per-target loop must not invoke them once per member card.
+SELF_TARGETED_EFFECTS = frozenset({
+    # "Look at the top five cards of your deck": re-running the reveal for
+    # each of the five resolved cards revealed the same five cards five times
+    # and queued one client Coverflow per copy.
+    "RevealCardsAbilityEffectTemplate",
+})
+
+
 def dispatch(effect_type, context, effect=None):
     """Dispatch one Records effect through the native RulesPort leaf set."""
     native = {
@@ -86,7 +98,8 @@ def dispatch(effect_type, context, effect=None):
         "PlanCAbilityEffectTemplate": context.plan_c,
         "ShuffleCardCollectionAbilityEffectTemplate": context.shuffle_collection,
         "RevealCardsAbilityEffectTemplate": context.reveal_cards,
-        "Battle2CardsAbilityEffectTemplate": context.battle_cards,
+        "Battle2CardsAbilityEffectTemplate":
+            lambda: context.battle_cards(effect),
         "CounterSpellAbilityEffectTemplate": context.counter_spell,
         "InterruptSpellAbilityEffectTemplate": context.counter_spell,
         "DestroyCardAbilityEffectTemplate": context.destroy,
@@ -422,7 +435,42 @@ def _resource_modifier(context, effect):
     if property_name == "threshold":
         shard = str(param.get("shard") or "").rsplit(".", 1)[-1].lower()
         import game_engine
-        color = int(game_engine.SHARD_TO_FLAG.get(shard, 0))
+        random_lowest = param.get("randomlowestthreshold", False)
+        random_color = param.get("random", False)
+        random_lowest = (random_lowest is True or
+                         str(random_lowest).strip().lower() in ("1", "true"))
+        random_color = (random_color is True or
+                        str(random_color).strip().lower() in ("1", "true"))
+        if random_lowest or random_color:
+            # ThresholdModifier.Apply uses the session RNG. RandomLowestThreshold
+            # enumerates the player's five initialized thresholds in Player's
+            # constructor order; Random uses the five shard bits in enum order.
+            color_names = (("blood", "sapphire", "wild", "diamond", "ruby")
+                           if random_lowest else
+                           ("blood", "ruby", "sapphire", "wild", "diamond"))
+            colors = [int(game_engine.SHARD_TO_FLAG[name])
+                      for name in color_names]
+            if random_lowest:
+                thresholds = context.bstate.get(f"{side}_threshold") or {}
+                current = {
+                    flag: int(thresholds.get(
+                        flag, thresholds.get(str(flag), 0)) or 0)
+                    for flag in colors
+                }
+                minimum = min(current.values())
+                colors = [flag for flag in colors
+                          if current[flag] == minimum]
+            if len(colors) > 1:
+                rng = context.bstate.get("_rules_rng")
+                if rng is not None and hasattr(rng, "next"):
+                    color = colors[int(rng.next(0, len(colors))) % len(colors)]
+                else:
+                    import random
+                    color = random.choice(colors)
+            elif colors:
+                color = colors[0]
+        else:
+            color = int(game_engine.SHARD_TO_FLAG.get(shard, 0))
         if not color:
             return None
     from .resources import project_resource_change
@@ -514,10 +562,18 @@ def _card_modifier(context, effect):
             return "attribute: no target"
         text = str(param.get("attribute_flags") or param.get("text") or "")
         from .attribute_effects import apply_attribute_grant
+        resolving_owner = context.bstate.get("resolving_owner_id", 0)
+        # BeginningOfOwnersTurn is owned by the ability's responsible player
+        # (the source controller), even when it grants an attribute to an
+        # opposing card.  AfterCardsReadyOnPlayersTurn is the exception: that
+        # duration ends at the affected troop controller's next Ready step.
+        expiration_owner = resolving_owner
+        if param.get("duration") == "AfterCardsReadyOnPlayersTurn":
+            expiration_owner = context.target_owner(
+                target, default=resolving_owner)
         bits = apply_attribute_grant(context, int(target), {
             **param, "text": text,
-            "source_owner_id": context.target_owner(
-                target, default=context.bstate.get("resolving_owner_id", 0))})
+            "source_owner_id": expiration_owner})
         return f"attribute grant +{bits:b} target={hex(int(target))}"
     if property_name == "counter":
         if target is None:
@@ -550,26 +606,10 @@ def _card_modifier(context, effect):
 def _heal_hero(context, target, param):
     owner = context.target_owner(
         target, default=context.bstate.get("resolving_owner_id", 0))
-    side, health_key = context._side_keys(int(owner or 0))
     amount = context.modifier_value(param, param, "healhero")
     if not amount:
         amount = int(param.get("amount") or 0)
-    current = int(context.bstate.get(
-        health_key, getattr(context.game, health_key, 20)) or 0)
-    new_value = min(20, current + max(0, int(amount)))
-    context.bstate[health_key] = new_value
-    setattr(context.game, health_key, new_value)
-    if new_value != current:
-        import game_engine
-        event = game_engine.ChampionHealthChangedSessionEventArgs()
-        from .runtime_helpers import owner_uid
-        event.player_id = owner_uid(int(owner or 0), context.player_uid,
-                                    context.ai_uid, context.bstate)
-        event.old_damage_value = current
-        event.new_damage_value = new_value
-        context.game._push(event)
-        context.emit_champion_healed(owner, current, new_value)
-    return f"healed {side} {current}->{new_value}"
+    return context.gain_health(int(owner or 0), amount)
 
 
 def _card_cost(context, target, param):

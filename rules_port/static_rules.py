@@ -28,6 +28,16 @@ _MISSING = object()
 # Continuous leaf properties that change a card's projected view (thresholds
 # and subtype) rather than its combat numbers.
 _CARD_PROPERTY_LEAVES = frozenset({"cardthreshold", "subtype"})
+# IntAttr leaves that constrain champions themselves rather than a card's
+# combat numbers.  Champions are synthetic SessionCardIds without a
+# ``game_cards`` row, so a champion-targeted leaf of this shape is aggregated
+# by :func:`controller_flags` instead of by the per-card projection.
+_CHAMPION_INTATTR_FLAGS = {
+    "cantgainhealth": "cant_gain_health",
+    "cantlosehealth": "cant_lose_health",
+    "cantplaycards": "cant_play_cards",
+    "unlimitedhandsize": "no_max_hand_size",
+}
 
 
 class _ProjectionCache:
@@ -194,8 +204,12 @@ def _count_variable(db, session_id, battle_state, source_uid, owner, raw,
     source = _source_card(db, session_id, int(source_uid), int(owner))
     spec = variable.get("m_CardFilter") or {}
     cards = [_card(row) for row in candidates]
+    # The context adapter uses an explicitly supplied player ID for ownership
+    # filters. Without it, a battle-state context is converted to the
+    # threshold view and IsControlledBy compares card owners against that dict.
     return sum(1 for card in cards if records_filter_matches(
-        card, spec, source=source, context=dict(battle_state or {}, cards=cards)))
+        card, spec, source=source,
+        context=dict(battle_state or {}, cards=cards), player=int(owner)))
 
 
 def _sum_variable(db, session_id, battle_state, source_uid, owner, raw,
@@ -585,7 +599,7 @@ def _target_matches(db, session_id, source_uid, source_owner, target_uid,
     if entries is None:
         # An ability with no authored target template modifies its own source.
         return int(source_uid) == int(target_uid)
-    for template_id, self_only, both in entries:
+    for template_id, self_only, both, _champions in entries:
         if self_only:
             if int(source_uid) == int(target_uid):
                 return True
@@ -598,17 +612,21 @@ def _target_matches(db, session_id, source_uid, source_owner, target_uid,
 
 
 def _ability_target_entries(db, ability_guid, cache):
-    """Return ``(template_id, self_only, both_players)`` per authored target.
+    """Return ``(template_id, self_only, both_players, champions)`` per target.
 
     The template list and its game-text classification are authored data, so
     they are resolved once per projection instead of once per projected card.
-    ``None`` means the ability authors no target template at all.
+    ``champions`` records whether the template can select a champion in play,
+    which the per-card projection cannot observe (champions have no
+    ``game_cards`` row).  ``None`` means the ability authors no target
+    template at all.
     """
     key = str(ability_guid or "").lower()
     cached = cache.ability_targets.get(key, _MISSING)
     if cached is not _MISSING:
         return cached
     from pvp_db import db_ability_target_template_ids, db_static_target_template
+    from .targeting import template_targets_champions
     payload = db_ability_target_template_ids(ability_guid, conn=db)
     if not payload:
         cache.ability_targets[key] = None
@@ -627,10 +645,15 @@ def _ability_target_entries(db, ability_guid, cache):
         # abilities (including Emberleaf Duelist's attack-time Swiftstrike)
         # fail their target match and silently disappear from combat stats.
         text = str(row[1] or "").lower()
+        template = {"collection_flags": row[0] or "",
+                    "player_filter": row[1] or "",
+                    "filter_json": row[2] or "{}",
+                    "game_text": row[3] or ""}
         entries.append((template_id,
                         "this" in text or "#self#" in text or
                         text.strip() == "you",
-                        text in {"multipleplayers", "allplayers"}))
+                        text in {"multipleplayers", "allplayers"},
+                        template_targets_champions(template)))
     entries = tuple(entries)
     cache.ability_targets[key] = entries
     return entries
@@ -843,12 +866,7 @@ def _scan_static_deltas(db, session_id, battle_state, card_uid, cache):
                             "prevent_noncombat_damage")
                     elif attribute in {"cantgainhealth", "cantlosehealth",
                                        "cantplaycards", "unlimitedhandsize"}:
-                        total["flags"].add({
-                            "cantgainhealth": "cant_gain_health",
-                            "cantlosehealth": "cant_lose_health",
-                            "cantplaycards": "cant_play_cards",
-                            "unlimitedhandsize": "no_max_hand_size",
-                        }[attribute])
+                        total["flags"].add(_CHAMPION_INTATTR_FLAGS[attribute])
                     elif attribute in {"lethal", "crush"}:
                         total["flags"].add(attribute)
                     else:
@@ -974,6 +992,13 @@ def _instance_buffs(row):
         defense += int(buffs.get("def", 0) or 0)
         rage += int(buffs.get("rage", 0) or 0)
         attrs |= int(buffs.get("attributes", 0) or 0)
+        int_attrs = buffs.get("int_attrs", {})
+        if isinstance(int_attrs, dict):
+            rage += int(int_attrs.get("Rage", int_attrs.get("rage", 0)) or 0)
+            if int(int_attrs.get("Lethal", int_attrs.get("lethal", 0)) or 0) > 0:
+                flags.add("lethal")
+            if int(int_attrs.get("Crush", int_attrs.get("crush", 0)) or 0) > 0:
+                flags.add("crush")
         for rule in buffs.get("rule_modifiers", []) or []:
             if not isinstance(rule, dict) or rule.get("property") != "damagemultiplier":
                 continue
@@ -1086,10 +1111,53 @@ def effective_option_projection(db, session_id, battle_state, card_uid):
     return attributes, _cost_from_deltas(db, session_id, card_uid, native)
 
 
-def controller_flags(db, session_id, battle_state, owner):
-    """Return continuous combat flags granted by this controller's troops."""
-    from pvp_db import db_warzone_card_uids
+def _ability_targets_champions(db, ability_guid, cache):
+    """Whether one continuous ability authors a champion target template."""
+    entries = _ability_target_entries(db, ability_guid, cache)
+    return bool(entries) and any(entry[3] for entry in entries)
+
+
+def _champion_static_flags(db, session_id, battle_state, owner):
+    """Rule flags this controller's champion-scoped statics impose.
+
+    A continuous leaf only reaches a card through :func:`_scan_static_deltas`,
+    which projects ``game_cards`` rows.  Champions are synthetic
+    SessionCardIds with no such row, so a champion-targeted leaf never lands
+    anywhere.  Fold those leaves into the controller's flags while their
+    source is in play: Emberspire Witch's "Champions can't gain health" is a
+    ``WhileCardInPlay`` ``CantGainHealth`` intattr on an AllChampions target.
+    """
     flags = set()
+    with _projection_cache() as cache:
+        for source_uid in _owner_static_sources(db, session_id, owner, cache):
+            for ability_guid in _static_abilities(db, session_id, source_uid,
+                                                  cache):
+                if not _ability_targets_champions(db, ability_guid, cache):
+                    continue
+                for param, _raw in _static_leaves(db, ability_guid, cache):
+                    if str(param.get("property") or "").lower() != "intattr":
+                        continue
+                    flag = _CHAMPION_INTATTR_FLAGS.get(
+                        str(param.get("attribute") or "").lower())
+                    if not flag:
+                        continue
+                    if not _static_condition_matches(
+                            db, session_id, battle_state, param, source_uid,
+                            int(owner), source_uid):
+                        continue
+                    flags.add(flag)
+    return flags
+
+
+def controller_flags(db, session_id, battle_state, owner):
+    """Return continuous combat/rule flags active for this controller.
+
+    Per-card flags come from the controller's own warzone cards.  Flags that
+    constrain champions are aggregated separately because champions have no
+    card row for the per-card projection to land on.
+    """
+    from pvp_db import db_warzone_card_uids
+    flags = _champion_static_flags(db, session_id, battle_state, owner)
     for (uid,) in db_warzone_card_uids(session_id, owner, conn=db):
         flags |= effective_stats(db, session_id, battle_state, int(uid))[3]
     return flags

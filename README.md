@@ -133,9 +133,24 @@ docker run --rm \
   ghcr.io/ianutley/hex-server:0.4.0
 ```
 
-You can try using the `latest` tag to be on the bleeding edge. But you may
-need to occasionally rebuild the database (and lose all progress). You can to this
-by stopping the docker container, and deleting the files in the $HEX_STATE folder
+You can try using the `latest` tag to be on the bleeding edge.
+
+Every container start applies the current schema and re-syncs the server's card,
+ability, champion and encounter data from the mounted `gamedata`, in place, so
+an image update does not cost you your progress. Watch the container log for:
+
+  - `[docker] applying current schema and seeds to ...` — always printed for an
+    existing database.
+  - `Refreshed client-derived rows for ...` — the mounted game data was newer
+    than the database, which has now been updated.
+  - `Client-derived row refresh skipped (...); keeping the existing client data`
+    — no game data was mounted, so the database kept its old card data. Check
+    the `HEX_GAMEDATA` volume before playing.
+
+The first time the data is refreshed, the database is copied once to
+`hconnect.db.preseed.bak` next to it in `$HEX_STATE`, so a bad update can be
+rolled back by replacing `hconnect.db` with that file while the container is
+stopped.
 
 After starting the container, configure the Hex client to connect to the
 computer running the server.

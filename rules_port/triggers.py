@@ -127,7 +127,8 @@ class NativeTriggerBackend:
                  battle_state, event: TriggerEvent,
                  force_ignores_chain: bool = False):
         from gamedata import ability_graph, DEFAULT_RECORD_STORE
-        from pvp_db import db_card_basic, db_card_location, db_card_owner_id
+        from pvp_db import (db_card_basic, db_card_location,
+                            db_card_owner_id, db_card_state_value)
         from rules_port.counter_effects import TUNNELING_ABILITY_GUID
         from rules_port.conditions import ConditionContext, trigger_condition_met
         from rules_port.trigger_discovery import RecordsTriggerDiscovery
@@ -155,6 +156,11 @@ class NativeTriggerBackend:
                 event_name, event.source_card_id, event.source_player_id,
                 event.target_card_id, event.target_player_id,
                 dict(event.data or {}))
+        trigger_target_uid = (
+            event.target_card_id
+            if event_name == "CardCastEvent" and
+            event.target_card_id is not None
+            else event.source_card_id)
 
         # Keep event-local counters in the port state before condition
         # evaluation, matching the client's event ordering.
@@ -261,7 +267,9 @@ class NativeTriggerBackend:
                     scid, owner_uid(owner, player_uid, ai_uid, battle_state),
                     card_collection_for_location(location), ctype,
                     template_id=tpl, cost=cost, attack=attack,
-                    defense=defense, gems=gems)
+                    defense=defense, gems=gems,
+                    state=int(db_card_state_value(
+                        session.session_id, int(uid), conn=db) or 0))
             except Exception:
                 pass
 
@@ -401,7 +409,8 @@ class NativeTriggerBackend:
                             game, player_uid, ai_uid, session, battle_state,
                             source_uid, key[1],
                             tuple(graph.targets[index].guid for index in explicit),
-                            candidates)
+                            candidates, owner_id=source_card_owner,
+                            trigger_target_uid=event.target_card_id)
                         logs.append(f"{event_name} {key[1][:8]} -> awaiting target")
                         continue
                     target = candidates[0] if candidates else None
@@ -429,7 +438,7 @@ class NativeTriggerBackend:
                     battle_state["resolving_source_uid"] = source_uid
                     battle_state["resolving_owner_id"] = source_card_owner
                     battle_state["resolving_trigger_target_uid"] = \
-                        event.source_card_id
+                        trigger_target_uid
                     try:
                         result = resolve_port_ability(
                             handler, game, session, db, player_uid, ai_uid,
@@ -456,7 +465,7 @@ class NativeTriggerBackend:
                     chain.push(battle_state, {
                         "kind": "trigger", "ability_guid": key[1],
                         "source_uid": source_uid, "target_uid": target,
-                        "trigger_target_uid": event.source_card_id,
+                        "trigger_target_uid": trigger_target_uid,
                         "source_owner_uid": source_card_owner,
                         "instance_id": instance_id})
                     push_source(source_uid, source_card_owner)
@@ -494,7 +503,7 @@ class NativeTriggerBackend:
                             "ability_guid": key[1],
                             "source_uid": source_uid,
                             "target_uid": target,
-                            "trigger_target_uid": event.source_card_id,
+                            "trigger_target_uid": trigger_target_uid,
                             "source_owner_uid": source_card_owner,
                             "instance_id": instance_id,
                         }, source_card_owner, first_player_id=first_player)

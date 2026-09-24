@@ -1260,11 +1260,11 @@ def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map
                 state=int(st or 0))
         # PvP combat-triggered abilities belong to the authoritative PvP
         # priority loop.  Do not drain them here: this resolver can emit the
-        # trigger's AbilityPushedOnChain event, but only
-        # tournament_game._pvp_resolve_chain emits the matching
+        # trigger's AbilityPushedOnChain event, but only the shared chain seam
+        # (tournament_game._pvp_resolve_stack_item) emits the matching
         # TopOfChainResolved/RemovedTopOfChain pair that removes the client
-        # chain visual.  Draining here leaves the server stack empty while
-        # the client's champion/ability remains displayed on the chain.
+        # chain visual.  Draining here leaves the server stack empty while the
+        # client's champion/ability remains displayed on the chain.
         #
         # The legacy PvE path still drains its combat stack here so existing
         # discard-prompt and AI combat behavior remains unchanged.  Combat
@@ -1531,6 +1531,25 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                     f"!= ai={native_ai_id!r}")
                 return battle_state
             native_phase = port.current_turn_phase
+            # A combat damage step can queue a triggered ability and yield
+            # to the human while the native phase remains AssignDamage (or
+            # AssignFirstStrikeDamage). Keep the completed-step fact across
+            # that response window, then discard it as soon as RulesPort
+            # advances to another phase. This also survives picker handlers
+            # that consume ``ai_turn_phase_idx`` before resuming the AI.
+            try:
+                resolved_damage_phase = int(
+                    battle_state.get("_ai_native_damage_resolved_phase"))
+            except (TypeError, ValueError):
+                resolved_damage_phase = None
+            try:
+                current_native_phase = int(native_phase)
+            except (TypeError, ValueError):
+                current_native_phase = None
+            if (resolved_damage_phase is not None and
+                    current_native_phase != resolved_damage_phase):
+                battle_state.pop("_ai_native_damage_resolved_phase", None)
+                be.save_state(session, battle_state)
             trace_rules_port(log_req, "ai-loop", port, battle_state)
             if native_phase in (game_engine.ETurnPhases.FirstMainPhase,
                                 game_engine.ETurnPhases.DeclareCombatPriorityWindow,
@@ -1823,7 +1842,13 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             # flips the outcome (kills the blocker / saves our troop).
             if ai_play_combat_trick(handler, game, session, ai_t, pl_t,
                                     battle_state):
-                continue
+                if not native_mode:
+                    continue
+                # A native combat trick creates a chain-response priority
+                # action above this phase's priority action. Let the shared
+                # chain handling below publish the item and yield to the
+                # player; looping here would mistake that chain action for an
+                # unentered native phase and stop the AI driver.
         elif phase == game_engine.ETurnPhases.DeclareAttack:
             battle_state = ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state)
             log_req(
@@ -1836,10 +1861,30 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         elif phase == game_engine.ETurnPhases.AssignFirstStrikeDamage:
             # Swiftstrike step: FirstStrike/DualStrike combatants deal damage
             # now; casualties are removed before the normal step.
-            battle_state = resolve_ai_combat_damage(
-                handler, session, pl_t, ai_t, battle_state, first_strike=True)
+            if (native_mode and
+                    battle_state.get("_ai_native_damage_resolved_phase") ==
+                    int(phase)):
+                log_req("    AI native first-strike damage already resolved; "
+                        "resuming the phase after its trigger")
+            else:
+                battle_state = resolve_ai_combat_damage(
+                    handler, session, pl_t, ai_t, battle_state,
+                    first_strike=True)
+                if native_mode:
+                    battle_state["_ai_native_damage_resolved_phase"] = int(phase)
+                    be.save_state(session, battle_state)
         elif phase == game_engine.ETurnPhases.AssignDamage:
-            battle_state = resolve_ai_combat_damage(handler, session, pl_t, ai_t, battle_state)
+            if (native_mode and
+                    battle_state.get("_ai_native_damage_resolved_phase") ==
+                    int(phase)):
+                log_req("    AI native combat damage already resolved; "
+                        "resuming the phase after its trigger")
+            else:
+                battle_state = resolve_ai_combat_damage(
+                    handler, session, pl_t, ai_t, battle_state)
+                if native_mode:
+                    battle_state["_ai_native_damage_resolved_phase"] = int(phase)
+                    be.save_state(session, battle_state)
         elif phase == game_engine.ETurnPhases.Discard:
             # Downsize the AI's hand at end of turn (max 7; campaign 10). The
             # Discard phase is otherwise a no-op — without this the AI's hand
@@ -2396,6 +2441,12 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     if card.is_action() and not card.is_troop():
         if target_uid is None and evaluator is not None:
             target_uid = evaluator.choose_action_target(card)
+            requires_target = getattr(
+                evaluator, "has_required_explicit_target", None)
+            if (target_uid is None and callable(requires_target)
+                    and requires_target(card)):
+                log_req(f"    AI skipped {card.name}: no legal required target")
+                return False
         if card.variable_cost and x_cost <= 0:
             # "1X" costs X+1; pay the minimum the AI is willing to commit.
             min_x = 3 if evaluator is None else evaluator.personality.minimum_x_value
@@ -2670,16 +2721,120 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
     ai_champ_scid = getattr(handler, "_ai_champ_scid", None)
     if ai_champ_scid is None:
         return False
+    from rules_port.runtime_helpers import (
+        champion_ability_use_key, champion_ability_uses_this_turn,
+        record_champion_ability_use_this_turn,
+    )
+
+    # RulesPort callers may pass the player UID as a raw uint64, while older
+    # callers pass the game_engine.UID wrapper. Keep target ownership lookup
+    # valid for both forms.
+    player_instance_id = int(getattr(pl_t, "uid64", pl_t)) >> 8
+
+    legal_target_cache = {}
+    target_value_evaluator = None
+
+    def _legal_ability_targets(ability_guid):
+        """Get legal candidates for the first target slot this AI binds."""
+        ability_guid = str(ability_guid).lower()
+        if ability_guid in legal_target_cache:
+            return legal_target_cache[ability_guid]
+        payload = db_champion_ability_target_template_ids(
+            ability_guid, conn=_db)
+        try:
+            template_ids = [str(value).lower() for value in
+                            (_j.loads(payload) or []) if value]
+        except (TypeError, ValueError, _j.JSONDecodeError):
+            template_ids = []
+        if not template_ids:
+            result = (set(), False)
+            legal_target_cache[ability_guid] = result
+            return result
+        if getattr(session, "_rules_port_session", None) is not None:
+            from rules_port.targeting import (
+                legal_targets, target_uses_both_players,
+            )
+        else:
+            from abilities.framework.targeting import (
+                legal_targets, target_uses_both_players,
+            )
+        candidates = set()
+        for template_id in template_ids:
+            candidates = {int(uid) for uid in legal_targets(
+                _db, session.session_id, 0, template_id,
+                ai_champ_scid.uid.uid64,
+                both_players=target_uses_both_players(_db, template_id),
+                champions=handler._champion_targets(),
+                battle_state=battle_state)}
+            if candidates:
+                break
+        result = (candidates, True)
+        legal_target_cache[ability_guid] = result
+        return result
+
+    def _target_values(card_uids):
+        """Use the same per-card value ranking as the C# AI target selectors."""
+        nonlocal target_value_evaluator
+        if target_value_evaluator is None:
+            try:
+                import ai_eval as _aieval
+                target_value_evaluator = _aieval.build_evaluator(
+                    handler, session, battle_state, ai_t, pl_t)
+            except Exception:
+                target_value_evaluator = False
+        if not target_value_evaluator:
+            return {}
+        cards = {int(card.card_uid): card for card in (
+            target_value_evaluator.ai_warzone
+            + target_value_evaluator.player_warzone)}
+        values = {}
+        for uid in card_uids:
+            card = cards.get(int(uid))
+            if card is not None:
+                try:
+                    values[int(uid)] = target_value_evaluator.get_card_value(card)
+                except Exception:
+                    pass
+        return values
+
+    def _rank_target_uids(card_uids):
+        uids = {int(uid) for uid in card_uids}
+        values = _target_values(uids)
+        return sorted(uids,
+                      key=lambda uid: (values.get(uid, 0.0), -uid),
+                      reverse=True)
+
+    def _is_hostile_modifier(params):
+        try:
+            amount = int(params.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        operation = str(params.get("operation") or "").lower()
+        attribute = str(params.get("attribute") or
+                        params.get("attribute_name") or "")
+        attribute = attribute.lower().replace("_", "")
+        return (amount < 0 or operation in ("remove", "subtract")
+                or attribute in {
+                    "cantattack", "cantblock", "cantreadyautomatically",
+                    "cantready",
+                })
+
     for ag in ags:
         ag = str(ag)
-        # ONE-SHOT powers (m_UsesPerGame) are spent once per game.  The AI's
-        # champion is a synthetic SessionCardId, so the count lives in the
-        # shared battle state next to the champion counters.
+        # The AI's champion is a synthetic SessionCardId, so authored
+        # per-game and per-turn usage lives in the shared battle state rather
+        # than the ordinary card_uses table.
         graph = ability_graph(DEFAULT_RECORD_STORE, ag.lower())
-        uses_limit = int(getattr(getattr(graph, "costs", None),
-                                 "uses_per_game", 0) or 0)
+        costs = getattr(graph, "costs", None)
+        uses_limit = int(getattr(costs, "uses_per_game", 0) or 0)
         uses = battle_state.get("champion_ability_uses") or {}
         if uses_limit and int(uses.get(ag.lower(), 0) or 0) >= uses_limit:
+            continue
+        uses_per_turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
+        turn_use_key = champion_ability_use_key(ai_champ_scid.uid, ag)
+        if (uses_per_turn_limit and
+                champion_ability_uses_this_turn(
+                    battle_state, turn_use_key) >= uses_per_turn_limit):
             continue
         cost_row = db_champion_ability_costs(ag)
         if not cost_row:
@@ -2749,30 +2904,9 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             # template first, then choose the strongest legal opposing troop
             # that can actually block: exhausting a tapped or summoning-sick
             # troop does not remove a blocker from the upcoming combat.
-            target_ids = db_champion_ability_target_template_ids(ag, conn=_db)
-            try:
-                target_template_ids = [str(t).lower() for t in
-                                       (_j.loads(target_ids) or [])
-                                       if t] if target_ids else []
-            except (TypeError, ValueError, _j.JSONDecodeError):
-                target_template_ids = []
-            if target_template_ids:
-                if getattr(session, "_rules_port_session", None) is not None:
-                    from rules_port.targeting import (
-                        legal_targets, target_uses_both_players)
-                else:
-                    from abilities.framework.targeting import (
-                        legal_targets, target_uses_both_players)
-                candidate_uids = set()
-                for target_template_id in target_template_ids:
-                    candidate_uids.update(int(uid) for uid in legal_targets(
-                        _db, session.session_id, 0, target_template_id,
-                        ai_champ_scid.uid.uid64,
-                        both_players=target_uses_both_players(
-                            _db, target_template_id),
-                        champions=handler._champion_targets(),
-                        battle_state=battle_state))
-                opponent_id = int(pl_t.uid64) >> 8
+            candidate_uids, has_target_templates = _legal_ability_targets(ag)
+            if has_target_templates:
+                opponent_id = player_instance_id
                 marks = ",".join("?" for _ in candidate_uids)
                 if marks:
                     blocker_rows = db_card_state_rows(
@@ -2780,15 +2914,7 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                     blocker_rows = [row for row in blocker_rows if
                                     db_card_owner_id(session.session_id,
                                                      row[0], conn=_db) == opponent_id]
-                    try:
-                        import ai_eval as _aieval
-                        value_eval = _aieval.build_evaluator(
-                            handler, session, battle_state, ai_t, pl_t)
-                        value_by_uid = {
-                            int(card.card_uid): value_eval.get_card_value(card)
-                            for card in value_eval.player_warzone}
-                    except Exception:
-                        value_by_uid = {}
+                    value_by_uid = _target_values(candidate_uids)
                     from rules_port.static_rules import effective_stats
                     best_blocker = None
                     for blocker_uid, blocker_state in blocker_rows:
@@ -2890,63 +3016,52 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             # Direct-damage power: burn for lethal or kill a threat.
             amount = 0
             for pm in damages:
-                amount = int(pm.get("amount", 0) or 0)
+                try:
+                    amount = int(pm.get("amount", 0) or 0)
+                except (TypeError, ValueError):
+                    amount = 0
                 text = (pm.get("text") or "").lower()
                 m = __import__("re").search(r'deal\s+(\d+)\s+damage', text)
                 if m:
                     amount = int(m.group(1))
-                if amount >= player_health:
+            legal_uids, has_target_templates = _legal_ability_targets(ag)
+            opponent_id = player_instance_id
+            troops = db_warzone_troop_stats(
+                session.session_id, opponent_id, conn=_db)
+            if has_target_templates:
+                # C# DirectDamage first intersects authored targets with the
+                # opponent's board; only then does it test which troop dies.
+                troops = [row for row in troops
+                          if int(row[0]) in legal_uids]
+                champion_ids = {int(row[0]) for row in
+                                handler._champion_targets()}
+                own_champion_uid = int(ai_champ_scid.uid.uid64)
+                opposing_champions = sorted(
+                    (champion_ids - {own_champion_uid}) & legal_uids)
+                if target_uid is None and amount >= player_health \
+                        and opposing_champions:
+                    target_uid = opposing_champions[0]
                     worth = True
-                    break
-            # Respect the authored target template before applying the AI's
-            # tactical troop preference.  Champion-only powers (for example
-            # Psychotic Anarchist's charge power) must resolve against the
-            # opposing champion even when an opposing troop is available.
+
             if target_uid is None:
-                target_ids = db_champion_ability_target_template_ids(
-                    ag, conn=_db)
-                try:
-                    target_template_ids = [str(t).lower() for t in
-                                           (_j.loads(target_ids) or []) if t]
-                except (TypeError, ValueError, _j.JSONDecodeError):
-                    target_template_ids = []
-                if target_template_ids:
-                    if getattr(session, "_rules_port_session", None) is not None:
-                        from rules_port.targeting import (
-                            legal_targets, target_uses_both_players)
-                    else:
-                        from abilities.framework.targeting import (
-                            legal_targets, target_uses_both_players)
-                    champion_ids = {int(row[0]) for row in
-                                    handler._champion_targets()}
-                    authored_champions = []
-                    for target_template_id in target_template_ids:
-                        candidates = legal_targets(
-                            _db, session.session_id, 0, target_template_id,
-                            ai_champ_scid.uid.uid64,
-                            both_players=target_uses_both_players(
-                                _db, target_template_id),
-                            champions=handler._champion_targets(),
-                            battle_state=battle_state)
-                        authored_champions.extend(
-                            int(uid) for uid in candidates
-                            if int(uid) in champion_ids)
-                    if authored_champions:
-                        target_uid = authored_champions[0]
+                killable = [row for row in troops
+                            if 0 < ((row[2] or 0) + (row[3] or 0)
+                                    - (row[4] or 0)) <= amount]
+                if killable:
+                    target_uid = _rank_target_uids(
+                        int(row[0]) for row in killable)[0]
+                    worth = True
+                elif has_target_templates:
+                    # Face damage is only a fallback when the champion itself
+                    # is among the legal targets, never just because it exists.
+                    if opposing_champions and amount > 0:
+                        target_uid = opposing_champions[0]
                         worth = True
-            if not worth:
-                # Kill the weakest opposing troop the damage reaches.
-                troops = db_warzone_troop_stats(
-                    session.session_id,
-                    (handler.user_profile or {}).get("id", 5), conn=_db)
-                for cu, _atk, bdef, dmod, dmg, _state, _pos in troops:
-                    eff = (bdef or 0) + (dmod or 0) - (dmg or 0)
-                    if 0 < eff <= amount:
-                        worth = True
-                        target_uid = int(cu)
-                        break
-                if not worth and troops:
-                    worth = True  # chip the champion
+                elif amount >= player_health or troops:
+                    # Older/auto-targeted powers have no explicit card target;
+                    # preserve their legacy cast timing without manufacturing
+                    # a target that the metadata did not authorize.
+                    worth = True
         if (attribute_grants or grants) and not (
                 summons or heals or damages or draws):
             # Use the champion ability's target template when available. In
@@ -2956,56 +3071,43 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             # has no direct stat/heal/damage leaf for the AI classifier to see.
             # Keep the older troop heuristic only for champion rows whose
             # target metadata predates target-template extraction.
-            target_ids = db_champion_ability_target_template_ids(ag, conn=_db)
-            target_template_ids = []
-            if target_ids:
-                try:
-                    target_template_ids = [str(t).lower() for t in
-                                           (_j.loads(target_ids) or []) if t]
-                except (TypeError, ValueError):
-                    target_template_ids = []
-            if target_template_ids:
-                if getattr(session, "_rules_port_session", None) is not None:
-                    from rules_port.targeting import legal_targets
-                else:
-                    from abilities.framework.targeting import legal_targets
-                candidates = []
-                for target_template_id in target_template_ids:
-                    candidates = legal_targets(
-                        _db, session.session_id, 0, target_template_id,
-                        ai_champ_scid.uid.uid64, both_players=False,
-                        champions=[], battle_state=battle_state)
-                    if candidates:
-                        break
-                if ready_lock and not candidates:
+            opponent_id = player_instance_id
+            targets_opponent = ready_lock or any(
+                _is_hostile_modifier(pm) for pm in attribute_grants)
+            target_owner_id = opponent_id if targets_opponent else 0
+            candidate_uids, has_target_templates = _legal_ability_targets(ag)
+            if has_target_templates:
+                if ready_lock and not candidate_uids:
                     # Some older target-filter snapshots cannot evaluate the
                     # MultiplePlayers/Warzone filter for AI-owned abilities.
                     # The effect metadata still identifies the opposing troop
                     # collection, so use that authoritative zone as fallback.
-                    candidates = [r[0] for r in db_warzone_troop_stats(
-                        session.session_id,
-                        (handler.user_profile or {}).get("id", 5), conn=_db)]
-                if candidates:
-                    candidate_set = {int(uid) for uid in candidates}
-                    best = [row for row in db_warzone_card_stats(
-                        session.session_id, conn=_db)
-                             if int(row[0]) in candidate_set]
-                    best.sort(key=lambda row: (int(row[1] or 0),
-                                                -int(row[6] or 0)), reverse=True)
-                    best = best[0] if best else None
-                    if best is not None:
-                        worth = True
-                        target_uid = int(best[0])
+                    candidate_uids = {int(row[0]) for row in
+                                      db_warzone_troop_stats(
+                                          session.session_id, opponent_id,
+                                          conn=_db)}
+                candidate_uids = {
+                    uid for uid in candidate_uids
+                    if db_card_owner_id(session.session_id, uid, conn=_db)
+                    == target_owner_id
+                }
             else:
-                best = [row for row in db_warzone_troop_stats(
-                    session.session_id, 0, conn=_db)
-                        if not (int(row[5] or 0) & game_engine.ECardStates.Tapped)]
-                best.sort(key=lambda row: (int(row[1] or 0),
-                                            -int(row[6] or 0)), reverse=True)
-                best = best[0] if best else None
-                if best is not None:
-                    worth = True
-                    target_uid = int(best[0])
+                fallback_troops = db_warzone_troop_stats(
+                    session.session_id, target_owner_id, conn=_db)
+                if not targets_opponent:
+                    fallback_troops = [row for row in fallback_troops
+                                       if not (int(row[5] or 0)
+                                               & game_engine.ECardStates.Tapped)]
+                candidate_uids = {int(row[0]) for row in fallback_troops}
+
+            candidates = [row for row in db_warzone_card_stats(
+                session.session_id, target_owner_id, conn=_db)
+                          if int(row[0]) in candidate_uids]
+            if candidates:
+                target_order = _rank_target_uids(
+                    int(row[0]) for row in candidates)
+                worth = True
+                target_uid = target_order[0]
         if ag == "6249cb76-e4ce-45f2-c9fd-5bbe87159112":
             log_req("    debug final worth=%s target=%s" % (worth, target_uid))
         if not worth:
@@ -3090,10 +3192,16 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
         })
         game.push_ability_on_chain(
             ai_champ_scid, game_engine.ResourceId.from_str(ag),
-            ability_instance_id=inst_id)
+            ability_instance_id=inst_id,
+            target_card_ids=(
+                [game_engine.SessionCardId(game_engine.UID(int(target_uid)))]
+                if target_uid is not None else []))
         if uses_limit:
             uses = battle_state.setdefault("champion_ability_uses", {})
             uses[ag.lower()] = int(uses.get(ag.lower(), 0) or 0) + 1
+        if uses_per_turn_limit:
+            record_champion_ability_use_this_turn(
+                battle_state, turn_use_key)
         _be.save_state(session, battle_state)
         log_req(f"    AI champion ability {ag[:8]} on chain "
                 f"(charges {charges}->{battle_state['ai_charges']}, "
