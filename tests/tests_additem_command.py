@@ -1,4 +1,4 @@
-"""Developer test commands: !additem, !partycap, and !addchest."""
+"""Developer test commands: !additem, !partycap, !addchest, and !addgold."""
 
 import os
 import sys
@@ -123,6 +123,16 @@ def test_addchest_creates_set_chests():
     assert "Unknown set" in _command(handler, "!addchest rare 42")
 
 
+def test_addgold_adds_gold():
+    from profile_db import db_get_user_currency
+    handler = _handler(9308)
+    result = _command(handler, "!addgold 50,000")
+    assert result.startswith("Added 50,000 gold; you now have"), result
+    assert db_get_user_currency(9308, "gold", conn=db._db) >= 50000
+    assert "Usage" in _command(handler, "!addgold lots")
+    assert "Usage" in _command(handler, "!addgold 0")
+
+
 if __name__ == "__main__":
     run("adds a mercenary by exact name", test_adds_mercenary_by_exact_name)
     run("quantity and partial name", test_quantity_and_partial_name)
@@ -131,5 +141,6 @@ if __name__ == "__main__":
     run("whispered command runs", test_whispered_command_runs)
     run("!partycap sets flag", test_partycap_sets_flag)
     run("!addchest creates set chests", test_addchest_creates_set_chests)
+    run("!addgold adds gold", test_addgold_adds_gold)
     if FAILURES:
         sys.exit(1)

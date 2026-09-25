@@ -177,6 +177,7 @@ def _full_help_lines():
         "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
         "!partycap <0-4> — set mercenary party slots (applies after relog)",
         "!addchest <rarity> [set] [xN] — add booster treasure chests (applies after relog)",
+        "!addgold <amount> — add gold, e.g. to spin the Wheels of Fate (applies after relog)",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!hand — list cards in hand (name [id])",
         "!playable [id|name ...] — set golden outlines (no args = all)",
@@ -270,6 +271,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "addchest":
         try:
             return _cmd_addchest(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "addgold":
+        try:
+            return _cmd_addgold(handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "challenge":
@@ -475,6 +481,18 @@ def _cmd_addchest(handler, args):
     hconnect_server._db.commit()
     return (f"Added {quantity}x {rarity} {set_name} chest; "
             "log out and back in to see it")
+
+
+def _cmd_addgold(handler, args):
+    """Add gold: !addgold <amount>.  The client shows it after the next login."""
+    from profile_db import db_adjust_user_currency
+    amount = args[0].replace(",", "") if args else ""
+    if not amount.isdigit() or not 0 < int(amount) <= 10_000_000:
+        return "Usage: !addgold <amount up to 10,000,000>  (then log out and back in)"
+    gold, _platinum = db_adjust_user_currency(
+        handler.user_profile["id"], gold_delta=int(amount), conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return f"Added {int(amount):,} gold; you now have {gold:,}. Log out and back in to see it"
 
 
 def _cmd_partycap(handler, args):
