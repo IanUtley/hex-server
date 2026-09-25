@@ -21,6 +21,7 @@ authoritative in-game list.
 | `!reload` | `!reload` | Implemented | Reload runtime modules. |
 | `!additem` | `!additem <item name> [xN]` | Implemented | Add any inventory item (mercenary, equipment, chest, sleeve...) by exact or unique partial name; available outside an active game. |
 | `!partycap` | `!partycap <0-4>` | Implemented | Set the `CAMP_PARTYCAP` profile flag (unlocked mercenary party slots); applies after the next login. |
+| `!addchest` | `!addchest <rarity> [set] [xN]` | Implemented | Add booster treasure chests of a rarity (Common-Primal) for a set (number 1-9 or name, default Set 1), to test chest loot; they appear after the next login. |
 
 ## Card Info & Manipulation
 

@@ -176,6 +176,7 @@ def _full_help_lines():
         "!arena-cleanup — clear your Frost Ring Arena run",
         "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
         "!partycap <0-4> — set mercenary party slots (applies after relog)",
+        "!addchest <rarity> [set] [xN] — add booster treasure chests (applies after relog)",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!hand — list cards in hand (name [id])",
         "!playable [id|name ...] — set golden outlines (no args = all)",
@@ -264,6 +265,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "additem":
         try:
             return _cmd_additem(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "addchest":
+        try:
+            return _cmd_addchest(handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "challenge":
@@ -416,6 +422,59 @@ def _cmd_additem(handler, args):
             qty=total, template_guid=template_guid, item_id=item_uid)
     total = updates[-1][2] if updates else quantity
     return f"Added {quantity}x {names[0]} ({item.field('m_Type')}); you now have {total}"
+
+
+# Booster sets in release order, so "!addchest rare 2" means Shattered Destiny.
+BOOSTER_SETS = (
+    ("Shards of Fate", "0382f729-7710-432b-b761-13677982dcd2"),
+    ("Shattered Destiny", "b05e69d2-299a-4eed-ac31-3f1b4fa36470"),
+    ("Armies of Myth", "fce480eb-15f9-4096-8d12-6beee9118652"),
+    ("Primal Dawn", "2d05262c-d7a0-408f-a280-36d206a29344"),
+    ("Herofall", "ecdbc188-5750-48ef-acac-05e2bcbcc46f"),
+    ("Scars of War", "fbbac856-2264-4d31-97b0-0d8a646b9597"),
+    ("Frostheart", "326602fa-e183-4dfe-8300-55cc0c7c4ce8"),
+    ("Dead of Winter", "9a824393-cd11-4273-a05e-41e35eb50dbe"),
+    ("Doombringer", "54f14f51-2afe-4a26-be28-d251b06a9cc4"),
+)
+CHEST_RARITIES = ("Common", "Uncommon", "Rare", "Legendary", "Primal")
+
+
+def _cmd_addchest(handler, args):
+    """Add booster treasure chests: !addchest <rarity> [set] [xN].
+
+    ``set`` is a set number (1 = Shards of Fate) or name and defaults to
+    Set 1.  The client builds its chest list from the login profile stream,
+    so the chests appear after the next login.
+    """
+    from profile_db import db_create_treasure_chest
+    usage = ("Usage: !addchest <common|uncommon|rare|legendary|primal> "
+             "[set number or name] [xN]  (then log out and back in)")
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(50, int(args[-1][1:])))
+        args = args[:-1]
+    if not args:
+        return usage
+    rarity = next((r for r in CHEST_RARITIES if r.lower() == args[0].lower()), None)
+    if rarity is None:
+        return usage
+    wanted = _item_name_key(" ".join(args[1:]).removeprefix("set"))
+    if not wanted:
+        set_name, set_guid = BOOSTER_SETS[0]
+    elif wanted.isdigit() and 1 <= int(wanted) <= len(BOOSTER_SETS):
+        set_name, set_guid = BOOSTER_SETS[int(wanted) - 1]
+    else:
+        matches = [s for s in BOOSTER_SETS if wanted in _item_name_key(s[0])]
+        if len(matches) != 1:
+            return ("Unknown set. Sets: " + ", ".join(
+                f"{i} {name}" for i, (name, _) in enumerate(BOOSTER_SETS, 1)))
+        set_name, set_guid = matches[0]
+    for _ in range(quantity):
+        db_create_treasure_chest(handler.user_profile["id"], set_guid, rarity,
+                                 conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return (f"Added {quantity}x {rarity} {set_name} chest; "
+            "log out and back in to see it")
 
 
 def _cmd_partycap(handler, args):

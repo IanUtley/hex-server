@@ -1,4 +1,4 @@
-"""Developer test commands: !additem and !partycap."""
+"""Developer test commands: !additem, !partycap, and !addchest."""
 
 import os
 import sys
@@ -106,6 +106,23 @@ def test_partycap_sets_flag():
     assert "Usage" in _command(handler, "!partycap")
 
 
+def test_addchest_creates_set_chests():
+    from profile_db import db_get_unopened_chests_full
+    handler = _handler(9307)
+    result = _command(handler, "!addchest primal 2 x3")
+    assert result.startswith("Added 3x Primal Shattered Destiny chest"), result
+    assert "Added 1x Rare Shards of Fate" in _command(handler, "!addchest Rare")
+    assert "Herofall" in _command(handler, "!addchest legendary herofall")
+    rows = db_get_unopened_chests_full(9307, conn=db._db)
+    chests = sorted((row[1], row[2]) for row in rows)
+    assert chests == sorted(
+        [("b05e69d2-299a-4eed-ac31-3f1b4fa36470", "Primal")] * 3
+        + [("0382f729-7710-432b-b761-13677982dcd2", "Rare"),
+           ("ecdbc188-5750-48ef-acac-05e2bcbcc46f", "Legendary")]), chests
+    assert "Usage" in _command(handler, "!addchest shiny")
+    assert "Unknown set" in _command(handler, "!addchest rare 42")
+
+
 if __name__ == "__main__":
     run("adds a mercenary by exact name", test_adds_mercenary_by_exact_name)
     run("quantity and partial name", test_quantity_and_partial_name)
@@ -113,5 +130,6 @@ if __name__ == "__main__":
     run("forgiving names from real attempts", test_forgiving_names_from_real_attempts)
     run("whispered command runs", test_whispered_command_runs)
     run("!partycap sets flag", test_partycap_sets_flag)
+    run("!addchest creates set chests", test_addchest_creates_set_chests)
     if FAILURES:
         sys.exit(1)
