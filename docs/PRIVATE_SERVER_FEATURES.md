@@ -56,7 +56,7 @@ Frost Ring Arena implementation details are in
   pack of the chest's set (Legendary and Primal). Odds follow the July 2015
   community chest-drop survey; see `services/chest_loot.py`. Confirmed in the
   client: 50 Set 1 chests of every rarity, opened singly and in groups,
-  showed every prize kind (booster packs were added afterwards).
+  showed every prize kind; booster packs confirmed in a later test.
 - [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
   prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
   cards. Duplicate-sleeve rules are not modelled.
