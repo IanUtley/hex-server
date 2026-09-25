@@ -52,14 +52,14 @@ Frost Ring Arena implementation details are in
 - [x] Booster treasure chests award their set's chest loot (1 item for
   Common-Rare, 2 for Legendary, 3 for Primal) through both `SpinWheelOfFate`
   and `OpenChest`: equipment, Stardust, AA cards, PvE cards, the set's chest
-  mercenaries (Rare and up), and their sleeves (Primal). Odds follow the
-  July 2015 community chest-drop survey; see `services/chest_loot.py`.
-  Confirmed in the client: 50 Set 1 chests of every rarity, opened singly
-  and in groups, showed every prize kind.
+  mercenaries (Rare and up), their sleeves (Primal), and, rarely, a booster
+  pack of the chest's set (Legendary and Primal). Odds follow the July 2015
+  community chest-drop survey; see `services/chest_loot.py`. Confirmed in the
+  client: 50 Set 1 chests of every rarity, opened singly and in groups,
+  showed every prize kind (booster packs were added afterwards).
 - [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
   prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
-  cards. Duplicate-sleeve rules and the rare booster-pack prize are not
-  modelled.
+  cards. Duplicate-sleeve rules are not modelled.
 - [ ] Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
 - [x] Deck equipment: `UpdateDeck` saves owned `EquipmentIDs` (one per
   equipment type), `GetDeckInfo`, `deck_bits`, and `EncodedDecks` return them,

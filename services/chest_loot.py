@@ -11,13 +11,14 @@ a prize from the chest's set:
 * an alternate-art (AA) PvP card of the set;
 * a PvE card from the set's PvE promo cards;
 * one of the set's three chest mercenaries (Rare chests and up);
-* one of those mercenaries' deck sleeves (Primal chests only).
+* one of those mercenaries' deck sleeves (Primal chests only);
+* a booster pack of the chest's set (Legendary and Primal chests, rarely).
 
 The weights are the observed frequencies (per mille, per chest rarity) from
 the community chest-drop survey of July 2015, which logged ~1,700 typed drops
 from Set 1-3 chests ("Aggregated Chest distribution",
 docs.google.com/spreadsheets/d/193MgoYZ5OJc5F7UMXq39-GBmzBUhCT7s9ltcKGWtIVs).
-Rare one-off reports (e.g. booster packs from Legendary chests) are left out.
+Reports the survey could not type are left out.
 
 Mercenaries and sleeves come from the client data, which labels them
 "<set name> Chest".  The client data does not mark which AA or PvE cards were
@@ -63,6 +64,7 @@ CHEST_CONTENT_WEIGHTS = {
         ("aa_card", "any"): 65,
         ("pve_card", "any"): 154,
         ("mercenary", ""): 136,
+        ("booster", ""): 12,
     },
     "Primal": {
         ("equipment", "Rare"): 85, ("equipment", "Legendary"): 237,
@@ -71,6 +73,7 @@ CHEST_CONTENT_WEIGHTS = {
         ("pve_card", "any"): 204,
         ("mercenary", ""): 110,
         ("sleeve", ""): 102,
+        ("booster", ""): 8,
     },
 }
 
@@ -125,6 +128,14 @@ def chest_loot_pool(db, set_guid):
     for guid, rarity in rows:
         pool.setdefault(rarity, []).append(guid)
     return pool
+
+
+def booster_pack_pool(db, set_guid):
+    """The set's standard booster pack (not the full-set or Primal pack)."""
+    return [row[0] for row in db.execute(
+        "SELECT pack_guid FROM pack_set_map WHERE set_guid=? "
+        "AND is_full_set=0 AND is_primal=0 ORDER BY pack_guid",
+        (set_guid,)).fetchall()]
 
 
 def _first_per_name(cards):
@@ -205,6 +216,8 @@ def roll_chest_loot(db, card_templates, set_guid, chest_rarity, rng=random):
             pool = pve_card_pool(card_templates, set_guid, tier)
         elif kind == "mercenary":
             pool = list(mercenaries)
+        elif kind == "booster":
+            pool = booster_pack_pool(db, set_guid)
         else:
             pool = list(sleeves)
         if pool:

@@ -17,7 +17,8 @@ import hconnect_server
 from profile_db import db_create_treasure_chest, db_inventory_item
 from db import STARDUST_TEMPLATES
 from services.chest_loot import (CHEST_CONTENT_WEIGHTS, ITEMS_PER_CHEST,
-                                 aa_card_pool, chest_inventory_items,
+                                 aa_card_pool, booster_pack_pool,
+                                 chest_inventory_items,
                                  chest_loot_pool, pve_card_pool, roll_chest_loot)
 
 SET1 = "0382f729-7710-432b-b761-13677982dcd2"
@@ -98,6 +99,8 @@ def test_set1_prize_pools():
         "Count Davian", "Spirit of the Triumverate", "The Transcended"]
     assert _item_names(sleeves) == [
         "Count Davian Sleeve", "Transcended Sleeve", "Triumverate Sleeve"]
+    # The standard Shards of Fate booster, not the full-set or Primal pack.
+    assert booster_pack_pool(db._db, SET1) == ["a8b78207-686a-4994-b6cd-4548d1349841"]
 
 
 def _classify(guid, kind, templates):
@@ -137,6 +140,7 @@ def test_item_counts_and_prize_eligibility():
         assert "equipment" in seen, (chest_rarity, seen)
     assert ("sleeve", "") not in CHEST_CONTENT_WEIGHTS["Legendary"]
     assert ("mercenary", "") not in CHEST_CONTENT_WEIGHTS["Uncommon"]
+    assert ("booster", "") not in CHEST_CONTENT_WEIGHTS["Rare"]
 
 
 def test_common_chest_odds_follow_the_survey():
@@ -181,8 +185,10 @@ def test_opening_set_chest_awards_inventory_prizes():
     user_id = _new_user(9101)
     handler = SimpleNamespace(user_profile={"id": user_id})
     mercenaries, _ = chest_inventory_items(SET1)
+    boosters = booster_pack_pool(db._db, SET1)
     for prize, check in ((("equipment", "Legendary"), _is_equipment),
-                         (("mercenary", ""), lambda guid: guid in mercenaries)):
+                         (("mercenary", ""), lambda guid: guid in mercenaries),
+                         (("booster", ""), lambda guid: guid in boosters)):
         chest_db_id = db_create_treasure_chest(user_id, SET1, "Legendary", conn=db._db)
         with _only(prize):
             summary = hconnect_server._open_client_chests(handler, [9000 + chest_db_id])
