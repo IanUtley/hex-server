@@ -215,61 +215,6 @@ def test_opening_set_chest_awards_cards():
     assert set(summary["card_template_ids"]) <= aa_cards, summary["card_template_ids"]
 
 
-class _SpinHandler(hconnect_server.HCPHandler):
-    """Drives the real SpinWheelOfFate handler with the transport replaced."""
-
-    def __init__(self, user_id):
-        self.user_profile = {"id": user_id}
-        self.client_uid = 1
-        self.scnt = 0
-        self.sid = "test"
-        self.sent = []
-        self.inventory_pushes = []
-        self.card_chunks = []
-
-    def send(self, headers, body=b""):
-        self.sent.append(body)
-
-    def push_inventory_to_client(self, qty=1, template_guid="", item_id=1001):
-        self.inventory_pushes.append((template_guid, item_id, qty))
-
-    def _send_cards_chunk(self, cards):
-        self.card_chunks.append(cards)
-
-    def _send_inventory_updated(self, *a, **k):
-        pass
-
-
-def test_spin_wheel_of_fate_reports_equipment():
-    user_id = _new_user(9102)
-    chest_db_id = db_create_treasure_chest(user_id, SET1, "Rare", conn=db._db)
-    handler = _SpinHandler(user_id)
-    with _only(("equipment", "Rare")):
-        handler._handle_service_request_legacy(
-            "t", "i", 2049, 2, 0, "00000000-0000-0000-0000-000000000000", 0,
-            {"ChestID": str(9000 + chest_db_id)}, b"")
-    assert handler.sent, "no response sent"
-    assert not handler.card_chunks
-    pushed = [guid for guid, _, _ in handler.inventory_pushes if _is_equipment(guid)]
-    assert len(pushed) == 1, handler.inventory_pushes
-    body = handler.sent[0]
-    assert b"RewardItems" in body and pushed[0].encode() in body
-
-
-def test_spin_wheel_of_fate_reports_cards():
-    user_id = _new_user(9104)
-    chest_db_id = db_create_treasure_chest(user_id, SET1, "Rare", conn=db._db)
-    handler = _SpinHandler(user_id)
-    with _only(("pve_card", "rare")):
-        handler._handle_service_request_legacy(
-            "t", "i", 2049, 2, 0, "00000000-0000-0000-0000-000000000000", 0,
-            {"ChestID": str(9000 + chest_db_id)}, b"")
-    assert handler.sent, "no response sent"
-    assert len(handler.card_chunks) == 1 and len(handler.card_chunks[0]) == 1
-    guid = handler.card_chunks[0][0][0]
-    assert b"RewardCards" in handler.sent[0] and guid.encode() in handler.sent[0]
-
-
 if __name__ == "__main__":
     run("equipment catalog is seeded", test_equipment_catalog_seeded)
     run("set 1 chest pool matches client data", test_set1_pool_matches_client_data)
@@ -280,7 +225,5 @@ if __name__ == "__main__":
     run("set without chest loot rolls nothing", test_set_without_chest_loot_rolls_nothing)
     run("opening a set chest awards inventory prizes", test_opening_set_chest_awards_inventory_prizes)
     run("opening a set chest awards cards", test_opening_set_chest_awards_cards)
-    run("SpinWheelOfFate reports equipment", test_spin_wheel_of_fate_reports_equipment)
-    run("SpinWheelOfFate reports cards", test_spin_wheel_of_fate_reports_cards)
     if FAILURES:
         sys.exit(1)

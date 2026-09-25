@@ -60,7 +60,17 @@ Frost Ring Arena implementation details are in
 - [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
   prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
   cards. Duplicate-sleeve rules are not modelled.
-- [ ] Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
+- [x] Wheels of Fate: `SpinWheelOfFate` charges the client's spin cost
+  (free for Primal chests and free re-spins), keeps the chest unopened, and
+  rolls the payout table the client displays: paid/free re-spins, chest
+  upgrades (once, twice, or with a re-spin), the set's Wheel mercenaries, PvE
+  cards and their equipment, and PvP rare cards, plus gold and exclusive
+  booster packs from gold/red reels. Re-spins survive a relog. Odds follow the
+  2014 community spin survey; see `services/wheel_of_fate.py`.
+- [ ] Wheels of Fate estimates: reel-color (gold/red) odds and the split
+  between the two single-upgrade rows were not recorded; Wheel AA cards and
+  sleeves are only known for Set 1; Doombringer has no Wheel PvE cards in the
+  client data. `UpgradeChest` is not handled.
 - [x] Deck equipment: `UpdateDeck` saves owned `EquipmentIDs` (one per
   equipment type), `GetDeckInfo`, `deck_bits`, and `EncodedDecks` return them,
   and PvE battles swap each card for the equipment-modified template

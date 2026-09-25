@@ -94,7 +94,8 @@ CHEST_AA_CARDS = {
 
 # Each set's PvE chest cards live in a SetNN_PvE_Promo card set.  Sets 1-3
 # share Set03_PvE_Promo, so Sets 1 and 2 list the cards the survey reported
-# and Set 3 takes the rest of that set.
+# and Set 3 takes the rest of that set.  The Wheels of Fate PvE cards in those
+# sets are Wheel prizes, not chest prizes.
 PVE_PROMO_SETS = {
     SET1: "3cc27cc9-b3af-44c7-a5de-4126f78d96ed",
     SET2: "3cc27cc9-b3af-44c7-a5de-4126f78d96ed",
@@ -157,11 +158,13 @@ def aa_card_pool(card_templates, set_guid, tier):
 
 def pve_card_pool(card_templates, set_guid, tier):
     """The set's PvE chest cards allowed for a tier ("rare" or "any")."""
+    from services.wheel_of_fate import WOF_PVE_CARD_NAMES
     promo_set = PVE_PROMO_SETS.get(set_guid)
     if not promo_set:
         return []
     cards = [card for card in card_templates.get(promo_set, ())
-             if card[2] in _PVE_CARD_RARITIES[tier]]
+             if card[2] in _PVE_CARD_RARITIES[tier]
+             and card[1] not in WOF_PVE_CARD_NAMES]
     if set_guid in CHEST_PVE_CARDS:
         cards = [card for card in cards if card[1] in CHEST_PVE_CARDS[set_guid]]
     elif set_guid == SET3:

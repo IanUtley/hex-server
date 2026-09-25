@@ -189,7 +189,9 @@ DDL = [
         chest_rarity TEXT NOT NULL,
         opened INTEGER DEFAULT 0,
         template_guid TEXT DEFAULT '',
-        created_at TEXT
+        created_at TEXT,
+        wof_spun INTEGER DEFAULT 0,
+        wof_status INTEGER DEFAULT 0
     )
     """,
     """
@@ -1797,6 +1799,12 @@ def ensure_schema(db):
         if "template_guid" not in chest_cols:
             db.execute("ALTER TABLE treasure_chests ADD COLUMN template_guid TEXT DEFAULT ''")
             db.commit()
+        # Wheels of Fate state: whether the chest was spun and the re-spin
+        # (EChestSpinStatus) it holds.
+        for column in ("wof_spun", "wof_status"):
+            if column not in chest_cols:
+                db.execute(f"ALTER TABLE treasure_chests ADD COLUMN {column} INTEGER DEFAULT 0")
+        db.commit()
     except Exception:
         pass
 
