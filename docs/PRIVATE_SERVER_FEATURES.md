@@ -49,11 +49,16 @@ Frost Ring Arena implementation details are in
 - [x] Immediate client inventory removal for direct chest/pack opening using
   the client-compatible `InventoryUpdated` event; other inventory paths still
   need broader auditing.
-- [x] Booster treasure chests award equipment from their set's chest-loot
-  pool (1 item for Common-Rare, 2 for Legendary, 3 for Primal) through both
-  `SpinWheelOfFate` and `OpenChest`; see `services/chest_loot.py`.
-- [ ] Retail chest equipment-rarity odds (current weights are estimates),
-  Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
+- [x] Booster treasure chests award their set's chest loot (1 item for
+  Common-Rare, 2 for Legendary, 3 for Primal) through both `SpinWheelOfFate`
+  and `OpenChest`: equipment, Stardust, AA cards, PvE cards, the set's chest
+  mercenaries (Rare and up), and their sleeves (Primal). Odds follow the
+  July 2015 community chest-drop survey; see `services/chest_loot.py`.
+- [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
+  prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
+  cards. Duplicate-sleeve rules and the rare booster-pack prize are not
+  modelled.
+- [ ] Wheel of Fate upgrades and bonus prizes, and `UpgradeChest`.
 - [x] Deck equipment: `UpdateDeck` saves owned `EquipmentIDs` (one per
   equipment type), `GetDeckInfo`, `deck_bits`, and `EncodedDecks` return them,
   and PvE battles swap each card for the equipment-modified template

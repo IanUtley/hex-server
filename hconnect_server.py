@@ -565,7 +565,8 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
     ``cards`` are ``(guid, name, cost, attack, defense)`` rows and
     ``inventory_rewards`` are ``(template_guid, kind)`` pairs.  Campaign packs
     and Crayburn promo chests are authored by template; booster treasure chests
-    award their set's chest-loot equipment, and chests from sets without
+    award their set's chest loot (see ``services/chest_loot.py``), and chests
+    from sets without
     chest loot fall back to the set booster trimmed to the chest rarity.
     """
     rng = rng or random
@@ -583,11 +584,11 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
         return list(reward.cards), inventory_rewards
     cards = _generate_crayburn_chest(card_templates, chest.template_guid)
     if cards is None:
-        from services.chest_loot import roll_chest_equipment
-        equipment = roll_chest_equipment(
-            _db, chest.set_guid, chest.chest_type, rng)
-        if equipment:
-            return [], [(guid, "equipment") for guid in equipment]
+        from services.chest_loot import roll_chest_loot
+        loot_cards, inventory_rewards = roll_chest_loot(
+            _db, card_templates, chest.set_guid, chest.chest_type, rng)
+        if loot_cards or inventory_rewards:
+            return loot_cards, inventory_rewards
         cards = _generate_booster(card_templates, chest.set_guid)
         keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
         if len(cards) > keep_count:
