@@ -1,5 +1,6 @@
 """Wheels of Fate: spinning booster treasure chests."""
 
+import io
 import os
 import random
 import sys
@@ -281,12 +282,88 @@ class _SpinHandler(hconnect_server.HCPHandler):
         pass
 
 
+# Member names of the client types in a SpinWheelOfFateResponse.
+_CLIENT_MEMBERS = {
+    "Game.Client.Network.Profile.SpinWheelOfFateResponse":
+        {"Error", "ErrorMessage", "Chest", "GoldAward", "RewardedItems",
+         "RewardCards", "SpinEntryColors", "SpinEntrySymbols"},
+    "Game.Shared.Domain.chest_bits":
+        {"ChestRarity", "WOFSpinStatus", "BoosterPackType", "WasOpened",
+         "InventoryId", "PromoID", "TempateID", "Vendor"},
+    "Game.Shared.Domain.inventory_bits":
+        {"Id", "TemplateID", "BoundToProfile", "ItemQuantity", "ClaimDate",
+         "EscrowStatus"},
+    "Game.Shared.Domain.card_instance_bits":
+        {"Id", "TemplateID", "CardStats", "IsFoil", "IsExtended", "SocketedGems",
+         "IsNotTradeable", "EscrowStatus"},
+    "Game.Shared.ResourceId": {"guid", "m_Guid"},
+    "Game.Shared.Network.Profile.ESpinWheelOfFateError": {"value__"},
+}
+
+
+class _ClientDecoder:
+    """Decodes ObjFmt the way the client's ObjFmt.Decoder does.
+
+    The size table follows the last newline and the type table starts at
+    sizes[0]; member names the client type lacks are rejected (the client
+    would silently skip them and leave the member null).
+    """
+
+    def __init__(self, data):
+        newline = data.rindex(b"\n")
+        self.sizes = [int(x) for x in data[newline + 1:].decode().split(";")]
+        self.types = data[self.sizes[0]:newline].decode().split(";")
+        self.stream = io.BytesIO(data)
+
+    def _token(self):
+        out = b""
+        while True:
+            char = self.stream.read(1)
+            if char in (b";", b""):
+                return out.decode()
+            out += char
+
+    def _decode(self, parent=None, in_list=False):
+        name = self._token()
+        int(self._token())
+        type_name = self.types[int(self._token())]
+        props = int(self._token())
+        if parent is not None and not in_list:
+            assert name in _CLIENT_MEMBERS[parent], f"{parent} has no member {name!r}"
+        if props:
+            return name, dict(self._decode(type_name) for _ in range(props))
+        if type_name == "System.Boolean":
+            return name, self.stream.read(1) == b"1"
+        if type_name in ("System.Guid", "System.String", "System.DateTime"):
+            return name, self.stream.read(int(self._token())).decode()
+        if type_name.startswith("System.Collections.Generic.List`1#"):
+            element = type_name.split("#", 1)[1]
+            return name, [self._decode(element, True)[1]
+                          for _ in range(int(self._token()))]
+        return name, int.from_bytes(bytes.fromhex(self._token()), "little")
+
+    def root(self):
+        _name, value = self._decode()
+        assert self.stream.tell() == self.sizes[0], "trailing bytes before type table"
+        return value
+
+
 def _spin_request(handler, chest_db_id):
-    handler._handle_service_request_legacy(
-        "t", "i", 2049, 2, 0, "00000000-0000-0000-0000-000000000000", 0,
-        {"ChestID": str(9000 + chest_db_id)}, b"")
-    assert handler.sent, "no response sent"
-    return handler.sent[-1]
+    """Send a SpinWheelOfFate request; return the reply inside its DataWrapper."""
+    replies = []
+    encode = hconnect_server._encode_spin_response
+
+    def capture(spin, chest_uid):
+        replies.append(encode(spin, chest_uid))
+        return replies[-1]
+
+    with mock.patch.object(hconnect_server, "_encode_spin_response", capture):
+        handler._handle_service_request_legacy(
+            "t", "i", 2049, 2, 0, "00000000-0000-0000-0000-000000000000", 0,
+            {"ChestID": str(9000 + chest_db_id)}, b"")
+    assert handler.sent and replies, "no response sent"
+    assert replies[-1] in handler.sent[-1], "reply was not sent"
+    return replies[-1]
 
 
 def test_spin_request_reports_prizes():
@@ -296,14 +373,36 @@ def test_spin_request_reports_prizes():
     with _Patched(_only("mercenary")):
         body = _spin_request(handler, chest_db_id)
     pushed = [guid for guid, _, _ in handler.inventory_pushes]
-    assert len(pushed) == 1 and b"RewardItems" in body and pushed[0].encode() in body
-    assert b"SpinEntrySymbols" in body and not handler.card_chunks
+    assert len(pushed) == 1 and not handler.card_chunks
+    reply = _ClientDecoder(body).root()
+    assert [item["TemplateID"]["guid"] for item in reply["RewardedItems"]] == pushed
+    assert reply["SpinEntrySymbols"] == [wof.STAR] * 3 and reply["RewardCards"] == []
+    assert reply["Chest"]["WasOpened"] is False
+    assert reply["Chest"]["WOFSpinStatus"] == wof.PAID_SPIN
 
     chest_db_id = db_create_treasure_chest(user_id, SET1, "Rare", conn=db._db)
     with _Patched(_only("aa_card")):
         body = _spin_request(handler, chest_db_id)
     assert len(handler.card_chunks) == 1 and len(handler.card_chunks[0]) == 1
-    assert handler.card_chunks[0][0][0].encode() in body
+    reply = _ClientDecoder(body).root()
+    assert [c["TemplateID"]["guid"] for c in reply["RewardCards"]] ==         [handler.card_chunks[0][0][0]]
+
+
+def test_every_spin_reply_decodes_in_the_client():
+    user_id = _new_user(9405, 10 ** 7)
+    handler = _SpinHandler(user_id)
+    for outcome in wof.OUTCOMES:
+        chest_db_id = db_create_treasure_chest(user_id, SET1, "Rare", conn=db._db)
+        with _Patched(_only(outcome)):
+            reply = _ClientDecoder(_spin_request(handler, chest_db_id)).root()
+        assert set(reply) == _CLIENT_MEMBERS[
+            "Game.Client.Network.Profile.SpinWheelOfFateResponse"], (outcome, reply)
+        assert reply["Error"]["value__"] == wof.OK, (outcome, reply)
+    # Refusals decode too, so the client can show "not enough gold".
+    poor = _SpinHandler(_new_user(9406, 0))
+    chest_db_id = db_create_treasure_chest(9406, SET1, "Rare", conn=db._db)
+    reply = _ClientDecoder(_spin_request(poor, chest_db_id)).root()
+    assert reply["Error"]["value__"] == wof.NOT_ENOUGH_GOLD, reply
 
 
 if __name__ == "__main__":
@@ -317,5 +416,6 @@ if __name__ == "__main__":
     run("free spins and Primal chests cost nothing", test_free_spins_and_primal_chests_cost_nothing)
     run("spin prizes reach the collection", test_spin_prizes_reach_the_collection)
     run("SpinWheelOfFate reports prizes", test_spin_request_reports_prizes)
+    run("every spin reply decodes in the client", test_every_spin_reply_decodes_in_the_client)
     if FAILURES:
         sys.exit(1)
