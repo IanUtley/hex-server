@@ -54,6 +54,8 @@ Frost Ring Arena implementation details are in
   and `OpenChest`: equipment, Stardust, AA cards, PvE cards, the set's chest
   mercenaries (Rare and up), and their sleeves (Primal). Odds follow the
   July 2015 community chest-drop survey; see `services/chest_loot.py`.
+  Confirmed in the client: 50 Set 1 chests of every rarity, opened singly
+  and in groups, showed every prize kind.
 - [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
   prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
   cards. Duplicate-sleeve rules and the rare booster-pack prize are not
