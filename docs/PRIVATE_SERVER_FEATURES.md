@@ -66,7 +66,8 @@ Frost Ring Arena implementation details are in
   upgrades (once, twice, or with a re-spin), the set's Wheel mercenaries, PvE
   cards and their equipment, and PvP rare cards, plus gold and exclusive
   booster packs from gold/red reels. Re-spins survive a relog. Odds follow the
-  2014 community spin survey; see `services/wheel_of_fate.py`.
+  2014 community spin survey; see `services/wheel_of_fate.py`. Confirmed in
+  the client: prizes, gold, upgrades, and paid/free re-spins.
 - [ ] Wheels of Fate estimates: reel-color (gold/red) odds and the split
   between the two single-upgrade rows were not recorded; Wheel AA cards and
   sleeves are only known for Set 1; Doombringer has no Wheel PvE cards in the
