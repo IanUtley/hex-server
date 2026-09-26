@@ -317,6 +317,8 @@ _CLIENT_MEMBERS = {
          "IsNotTradeable", "EscrowStatus"},
     "Game.Shared.ResourceId": {"guid", "m_Guid"},
     "Game.Shared.Network.Profile.ESpinWheelOfFateError": {"value__"},
+    "Game.Shared.Network.Profile.BalanceUpdateEventArgs":
+        {"GoldBalance", "PlatinumBalance"},
 }
 
 
@@ -407,6 +409,28 @@ def test_spin_request_reports_prizes():
     assert [c["TemplateID"]["guid"] for c in reply["RewardCards"]] ==         [handler.card_chunks[0][0][0]]
 
 
+def test_spin_refreshes_the_gold_balance():
+    # The pack screen resets its gold display from PlayerProfile.Gold, which
+    # only a BalanceUpdate event (dt=2209) refreshes.
+    import application.profile_stream as profile_stream
+    user_id = _new_user(9408, 10000)
+    handler = _SpinHandler(user_id)
+    chest_db_id = db_create_treasure_chest(user_id, SET1, "Uncommon", conn=db._db)
+    pushed = []   # message bodies before compression
+
+    def record(body):
+        pushed.append(body)
+        return body
+
+    with _Patched(_only("paid_spin")), \
+            mock.patch.object(profile_stream, "compress_gzip", record):
+        _spin_request(handler, chest_db_id)
+    balances = [body for body in pushed if b"BalanceUpdateEventArgs" in body]
+    assert len(balances) == 1, len(balances)
+    reply = _ClientDecoder(balances[0]).root()
+    assert reply == {"GoldBalance": 10000 - 3100, "PlatinumBalance": 0}, reply
+
+
 def test_every_spin_reply_decodes_in_the_client():
     user_id = _new_user(9405, 10 ** 7)
     handler = _SpinHandler(user_id)
@@ -437,5 +461,6 @@ if __name__ == "__main__":
     run("spin prizes reach the collection", test_spin_prizes_reach_the_collection)
     run("SpinWheelOfFate reports prizes", test_spin_request_reports_prizes)
     run("every spin reply decodes in the client", test_every_spin_reply_decodes_in_the_client)
+    run("spin refreshes the gold balance", test_spin_refreshes_the_gold_balance)
     if FAILURES:
         sys.exit(1)

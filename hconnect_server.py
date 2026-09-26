@@ -20474,6 +20474,8 @@ class HCPHandler(ProfileStreamMixin):
                     self.push_inventory_to_client(
                         qty=quantity, template_guid=template_guid,
                         item_id=item_uid)
+                if not spin["error"]:
+                    self.push_balance_to_client()
 
                 resp_inner = _encode_spin_response(spin, chest_uid)
 

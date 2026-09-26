@@ -704,6 +704,35 @@ class ProfileStreamMixin:
             "reqid": 0, "c": 0, "conh": 0, "sid": self.sid}, dw)
         log_req(f">>> PUSH CardsAdded (dt=2205) {len(cards)} cards, dw_sz={len(dw)}")
 
+    def push_balance_to_client(self):
+        """Push the player's gold and platinum (BalanceUpdate, dt=2209).
+
+        The client only refreshes PlayerProfile.Gold from this event or at
+        login; the pack screen resets its gold display from it after a
+        Wheels of Fate spin.
+        """
+        from objfmt_builder import ObjFmtBuilder
+        from profile_db import db_get_user_currency
+        if not self.user_profile:
+            return
+        user_id = self.user_profile["id"]
+        gold = db_get_user_currency(user_id, "gold", conn=_db)
+        platinum = db_get_user_currency(user_id, "platinum", conn=_db)
+        b = ObjFmtBuilder("Game.Shared.Network.Profile.BalanceUpdateEventArgs")
+        b.field_int("GoldBalance", int(gold))
+        b.field_int("PlatinumBalance", int(platinum))
+        dw = encode_datawrapper(0, 2209, compress_gzip(b.finish(2)), 1,
+                                "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+            f"ServicePlayer.{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH BalanceUpdate (dt=2209) gold={gold} platinum={platinum}")
+
     def _send_inventory_updated(self, template_guid, inventory_id, quantity=0):
         """Push the authoritative quantity for one inventory item.
 
