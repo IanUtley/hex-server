@@ -68,6 +68,12 @@ Frost Ring Arena implementation details are in
   booster packs from gold/red reels. Re-spins survive a relog. Odds follow the
   2014 community spin survey; see `services/wheel_of_fate.py`. Confirmed in
   the client: prizes, gold, upgrades, and paid/free re-spins.
+- [x] Opening packs awards one treasure chest per pack (the client's
+  "Each Booster Pack contains ... 1 Treasure Chest"); Primal Packs award a
+  Legendary chest. Booster chest rarity odds (`chest_probabilities`) are
+  unchanged estimates.
+- [ ] Primal Pack card contents: the client lists 13 Rares and 2 Legendaries,
+  but the server opens Primal Packs like ordinary boosters.
 - [ ] Wheels of Fate estimates: reel-color (gold/red) odds and the split
   between the two single-upgrade rows were not recorded; Wheel AA cards and
   sleeves are only known for Set 1; Doombringer has no Wheel PvE cards in the

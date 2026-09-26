@@ -667,6 +667,22 @@ def _grant_pack_inventory_rewards(handler, inventory_rewards):
             for guid, (client_uid, quantity) in updates.items()]
 
 
+def _roll_pack_chest_rarities(pack_count, is_primal=False, rng=None):
+    """Return the rarity of the treasure chest in each opened pack.
+
+    Booster packs roll ``chest_probabilities``; Primal Packs always contain a
+    Legendary chest (DisplayRewards_ItemDescription_PrimalPack).
+    """
+    if is_primal:
+        return ["Legendary"] * pack_count
+    probs = db_chest_probabilities(conn=_db)
+    if not probs:
+        return []
+    rng = rng or random
+    return rng.choices([rarity for rarity, _ in probs],
+                       weights=[weight for _, weight in probs], k=pack_count)
+
+
 def _grant_reward_cards(user_id, cards):
     """Add reward cards to a player's collection.
 
@@ -19326,8 +19342,7 @@ class HCPHandler(ProfileStreamMixin):
     
             # Track instance IDs for response encoding (fallback: 5000+)
             card_instance_ids = [5000 + i for i in range(len(all_cards))]
-            chest_rarity = None
-            chest_db_id = None
+            new_chests = []   # (chest rarity, treasure_chests.id)
     
             # Persist generated cards to user's collection
             if self.user_profile and not pack_error:
@@ -19380,26 +19395,20 @@ class HCPHandler(ProfileStreamMixin):
                         self, pack_inventory_rewards)
                     _db.commit()
 
-                # Generate treasure chest for normal boosters.  Campaign
-                # packs already contain their two equipment/Stardust slots;
-                # they do not award the standard booster chest.
-                import random as _rand
-                probs = [] if campaign_pack_config else db_chest_probabilities(
-                    conn=_db)
-                if probs:
-                    total_weight = sum(p[1] for p in probs)
-                    roll = _rand.randint(1, total_weight)
-                    cumulative = 0
-                    for rarity, weight in probs:
-                        cumulative += weight
-                        if roll <= cumulative:
-                            chest_rarity = rarity
-                            break
-                    if chest_rarity:
+                # Every booster pack contains one treasure chest
+                # (BoosterPack_Content_Combined), and a Primal Pack a
+                # Legendary one.  Campaign packs already contain their two
+                # equipment/Stardust slots; they do not award a chest.
+                if not campaign_pack_config:
+                    for chest_rarity in _roll_pack_chest_rarities(
+                            open_amount, is_primal):
                         chest_db_id = db_create_treasure_chest(
                             self.user_profile["id"], set_guid, chest_rarity,
                             conn=_db)
-                        log_req(f"    Generated {chest_rarity} chest id={chest_db_id}")
+                        new_chests.append((chest_rarity, chest_db_id))
+                    _db.commit()
+                    log_req(f"    Generated {len(new_chests)} chests: "
+                            f"{[rarity for rarity, _ in new_chests]}")
     
             # Encode OpenCardPackResponse using builder
             from objfmt_builder import ObjFmtBuilder
@@ -19417,20 +19426,17 @@ class HCPHandler(ProfileStreamMixin):
             b.begin_list("NewGemInstances",
                 "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits", 0)
 
-            # NewChestInstances
-            if chest_rarity and chest_db_id:
-                b.begin_list("NewChestInstances",
-                    "System.Collections.Generic.List`1#Game.Shared.Domain.chest_bits", 1)
-                b.begin_element(0, "Game.Shared.Domain.chest_bits", 8)
-                chest_map = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4}
-                # A new booster chest holds one paid Wheels of Fate spin.
-                from services.wheel_of_fate import PAID_SPIN
+            # NewChestInstances: one chest per opened pack.  A new booster
+            # chest holds one paid Wheels of Fate spin.
+            from services.wheel_of_fate import PAID_SPIN
+            chest_map = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4}
+            b.begin_list("NewChestInstances",
+                "System.Collections.Generic.List`1#Game.Shared.Domain.chest_bits",
+                len(new_chests))
+            for index, (chest_rarity, chest_db_id) in enumerate(new_chests):
+                b.begin_element(index, "Game.Shared.Domain.chest_bits", 8)
                 b.chest_fields(chest_map.get(chest_rarity, 0), PAID_SPIN, set_guid,
                                9000 + chest_db_id)
-                # Override BoosterPackType with set_guid
-            else:
-                b.begin_list("NewChestInstances",
-                    "System.Collections.Generic.List`1#Game.Shared.Domain.chest_bits", 0)
 
             # Error + ErrorMessage
             error_val = 5 if pack_error else 0
