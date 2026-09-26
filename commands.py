@@ -174,6 +174,10 @@ def _full_help_lines():
         "=== Commands ===",
         "!version — show the server version",
         "!arena-cleanup — clear your Frost Ring Arena run",
+        "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
+        "!partycap <0-4> — set mercenary party slots (applies after relog)",
+        "!addchest <rarity> [set] [xN] — add booster treasure chests (applies after relog)",
+        "!addgold <amount> — add gold, e.g. to spin the Wheels of Fate (applies after relog)",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!hand — list cards in hand (name [id])",
         "!playable [id|name ...] — set golden outlines (no args = all)",
@@ -252,6 +256,26 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "encounter":
         try:
             return _cmd_encounter(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "partycap":
+        try:
+            return _cmd_partycap(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "additem":
+        try:
+            return _cmd_additem(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "addchest":
+        try:
+            return _cmd_addchest(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    if action == "addgold":
+        try:
+            return _cmd_addgold(handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "challenge":
@@ -350,6 +374,141 @@ def _refresh_pvp_debug_options(tournament_game, session, state):
     elif phase not in (3, 4, 5, 6, 7, 8, 9):
         tournament_game.pvp_push_phase_options(
             session, state, pid=state.get("priority_pid"))
+
+
+def _item_name_key(name):
+    """Lowercase alphanumerics only, so "bebo" matches "B.E.B.O."."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _cmd_additem(handler, args):
+    """Grant an inventory item by name: !additem <item name> [xN].
+
+    Works for any InventoryItemData (mercenaries, equipment, chests,
+    sleeves, ...).  Names ignore case and punctuation; an exact name wins,
+    then a unique partial match, then spelling suggestions.
+    """
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(99, int(args[-1][1:])))
+        args = args[:-1]
+    wanted_text = " ".join(args).strip()
+    wanted = _item_name_key(wanted_text)
+    if not wanted:
+        return "Usage: !additem <item name> [xN]"
+    from gamedata import DEFAULT_RECORD_STORE
+    items = [record for record in DEFAULT_RECORD_STORE.load("InventoryItemData")
+             if record.field("m_Name")]
+    matches = [r for r in items if _item_name_key(r.field("m_Name")) == wanted]
+    if not matches:
+        matches = [r for r in items if wanted in _item_name_key(r.field("m_Name"))]
+    names = sorted({r.field("m_Name") for r in matches})
+    if not matches:
+        import difflib
+        by_key = {_item_name_key(r.field("m_Name")): r.field("m_Name") for r in items}
+        close = difflib.get_close_matches(wanted, list(by_key), n=5, cutoff=0.7)
+        if close:
+            return (f"No item named '{wanted_text}'. Did you mean: "
+                    + ", ".join(by_key[key] for key in close) + "?")
+        if hconnect_server._db.execute(
+                "SELECT 1 FROM card_templates WHERE lower(name)=lower(?) LIMIT 1",
+                (wanted_text,)).fetchone():
+            return f"'{wanted_text}' is a card, not an inventory item"
+        return f"No item named '{wanted_text}'"
+    if len(names) > 1:
+        return (f"{len(names)} items match: " + ", ".join(names[:8])
+                + (" ..." if len(names) > 8 else ""))
+    item = matches[0]
+    kind = str(item.field("m_Type") or "item").lower()
+    updates = hconnect_server._grant_pack_inventory_rewards(
+        handler, [(item.guid, kind)] * quantity)
+    hconnect_server._db.commit()
+    for template_guid, item_uid, total in updates:
+        handler.push_inventory_to_client(
+            qty=total, template_guid=template_guid, item_id=item_uid)
+    total = updates[-1][2] if updates else quantity
+    return f"Added {quantity}x {names[0]} ({item.field('m_Type')}); you now have {total}"
+
+
+# Booster sets in release order, so "!addchest rare 2" means Shattered Destiny.
+BOOSTER_SETS = (
+    ("Shards of Fate", "0382f729-7710-432b-b761-13677982dcd2"),
+    ("Shattered Destiny", "b05e69d2-299a-4eed-ac31-3f1b4fa36470"),
+    ("Armies of Myth", "fce480eb-15f9-4096-8d12-6beee9118652"),
+    ("Primal Dawn", "2d05262c-d7a0-408f-a280-36d206a29344"),
+    ("Herofall", "ecdbc188-5750-48ef-acac-05e2bcbcc46f"),
+    ("Scars of War", "fbbac856-2264-4d31-97b0-0d8a646b9597"),
+    ("Frostheart", "326602fa-e183-4dfe-8300-55cc0c7c4ce8"),
+    ("Dead of Winter", "9a824393-cd11-4273-a05e-41e35eb50dbe"),
+    ("Doombringer", "54f14f51-2afe-4a26-be28-d251b06a9cc4"),
+)
+CHEST_RARITIES = ("Common", "Uncommon", "Rare", "Legendary", "Primal")
+
+
+def _cmd_addchest(handler, args):
+    """Add booster treasure chests: !addchest <rarity> [set] [xN].
+
+    ``set`` is a set number (1 = Shards of Fate) or name and defaults to
+    Set 1.  The client builds its chest list from the login profile stream,
+    so the chests appear after the next login.
+    """
+    from profile_db import db_create_treasure_chest
+    usage = ("Usage: !addchest <common|uncommon|rare|legendary|primal> "
+             "[set number or name] [xN]  (then log out and back in)")
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(50, int(args[-1][1:])))
+        args = args[:-1]
+    if not args:
+        return usage
+    rarity = next((r for r in CHEST_RARITIES if r.lower() == args[0].lower()), None)
+    if rarity is None:
+        return usage
+    wanted = _item_name_key(" ".join(args[1:]).removeprefix("set"))
+    if not wanted:
+        set_name, set_guid = BOOSTER_SETS[0]
+    elif wanted.isdigit() and 1 <= int(wanted) <= len(BOOSTER_SETS):
+        set_name, set_guid = BOOSTER_SETS[int(wanted) - 1]
+    else:
+        matches = [s for s in BOOSTER_SETS if wanted in _item_name_key(s[0])]
+        if len(matches) != 1:
+            return ("Unknown set. Sets: " + ", ".join(
+                f"{i} {name}" for i, (name, _) in enumerate(BOOSTER_SETS, 1)))
+        set_name, set_guid = matches[0]
+    for _ in range(quantity):
+        db_create_treasure_chest(handler.user_profile["id"], set_guid, rarity,
+                                 conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return (f"Added {quantity}x {rarity} {set_name} chest; "
+            "log out and back in to see it")
+
+
+def _cmd_addgold(handler, args):
+    """Add gold: !addgold <amount>.  The client shows it after the next login."""
+    from profile_db import db_adjust_user_currency
+    amount = args[0].replace(",", "") if args else ""
+    if not amount.isdigit() or not 0 < int(amount) <= 10_000_000:
+        return "Usage: !addgold <amount up to 10,000,000>  (then log out and back in)"
+    gold, _platinum = db_adjust_user_currency(
+        handler.user_profile["id"], gold_delta=int(amount), conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return f"Added {int(amount):,} gold; you now have {gold:,}. Log out and back in to see it"
+
+
+def _cmd_partycap(handler, args):
+    """Set the mercenary party-slot flag: !partycap <0-4>.
+
+    The client reads CAMP_PARTYCAP from the login profile stream, so the new
+    value applies after the next login.
+    """
+    from services import mercenaries
+    if not args or not args[0].isdigit():
+        return "Usage: !partycap <0-4>  (then log out and back in)"
+    slots = max(0, min(4, int(args[0])))
+    mercenaries.set_flag(hconnect_server._db, handler.user_profile["id"],
+                         mercenaries.PARTY_CAP_FLAG, slots, 4)
+    hconnect_server._db.commit()
+    return f"Mercenary party slots set to {slots}; log out and back in to apply"
 
 
 def _cmd_encounter(handler, args):

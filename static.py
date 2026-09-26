@@ -189,7 +189,9 @@ DDL = [
         chest_rarity TEXT NOT NULL,
         opened INTEGER DEFAULT 0,
         template_guid TEXT DEFAULT '',
-        created_at TEXT
+        created_at TEXT,
+        wof_spun INTEGER DEFAULT 0,
+        wof_status INTEGER DEFAULT 0
     )
     """,
     """
@@ -207,6 +209,54 @@ DDL = [
         chest_type TEXT NOT NULL DEFAULT 'Common',
         spin_type TEXT NOT NULL DEFAULT 'NoSpin',
         promotional_id INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS equipment_templates (
+        guid TEXT PRIMARY KEY,
+        name TEXT,
+        set_guid TEXT,
+        rarity TEXT,
+        equipment_type TEXT,
+        modifiers TEXT,
+        description TEXT,
+        design_notes TEXT,
+        is_chest_loot INTEGER NOT NULL DEFAULT 0,
+        is_live INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS profile_flags (
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        maximum INTEGER NOT NULL DEFAULT 0,
+        completed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, name)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS profile_deck_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL DEFAULT '',
+        data BLOB NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS champion_parties (
+        champion_id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        party_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS equipment_card_variants (
+        base_guid TEXT NOT NULL,
+        equipment_key TEXT NOT NULL,
+        variant_guid TEXT NOT NULL,
+        PRIMARY KEY (base_guid, equipment_key)
     )
     """,
     """
@@ -676,7 +726,8 @@ DDL = [
         deck_sleeve_guid TEXT DEFAULT NULL,
         gameboard_guid TEXT DEFAULT NULL,
         coin_guid TEXT DEFAULT NULL,
-        last_saved TEXT DEFAULT ''
+        last_saved TEXT DEFAULT '',
+        equipment TEXT DEFAULT '[]'
     )
     """,
     """
@@ -1492,6 +1543,54 @@ def ensure_schema(db):
     except Exception as exc:
         print(f"Campaign node conversation seed skipped: {exc}")
 
+    # Equipment catalog used for chest loot and deck equipment.  Seed it
+    # incrementally so databases created before the table existed gain it.
+    try:
+        if not db.execute("SELECT 1 FROM equipment_templates LIMIT 1").fetchone():
+            from AssetExtraction.gamedata_seed import extract_equipment
+            equipment_rows = extract_equipment()
+            db.executemany(
+                "INSERT OR IGNORE INTO equipment_templates "
+                "(guid,name,set_guid,rarity,equipment_type,modifiers,"
+                "description,design_notes,is_chest_loot,is_live) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)", equipment_rows)
+            db.commit()
+            print(f"Seeded equipment templates: {len(equipment_rows)} rows")
+        if not db.execute("SELECT 1 FROM equipment_card_variants LIMIT 1").fetchone():
+            from AssetExtraction.gamedata_seed import extract_equipment_variants
+            variant_rows = extract_equipment_variants()
+            db.executemany(
+                "INSERT OR IGNORE INTO equipment_card_variants "
+                "(base_guid,equipment_key,variant_guid) VALUES (?,?,?)",
+                variant_rows)
+            db.commit()
+            print(f"Seeded equipment card variants: {len(variant_rows)} rows")
+    except Exception as exc:
+        print(f"Equipment template seed skipped: {exc}")
+
+    # Mercenary champions (health, champion abilities, ability effects) were
+    # added to the champion catalog after databases already existed.  Fresh
+    # databases receive them from the full client seed below, so only backfill
+    # an already-seeded catalog.  B.E.B.O. is a MercenaryTemplate in every
+    # client build, so use it as the marker.
+    try:
+        if db.execute("SELECT 1 FROM champion_templates_extended LIMIT 1").fetchone()                 and not db.execute(
+                "SELECT 1 FROM champion_templates_extended WHERE guid=?",
+                ("8a336fec-d970-4613-9308-c0afd41b62eb",)).fetchone():
+            from AssetExtraction.gamedata_seed import (
+                extract_mercenary_champions, seed_database)
+            mercs = extract_mercenary_champions()
+            inserted = seed_database(db, {"tables": {
+                "champion_templates_extended": mercs["champion_templates_extended"],
+                "champion_template_data": mercs["champion_template_data"],
+                "champion_abilities": mercs["champion_abilities"],
+                "ability_effects": mercs["champion_ability_effects"],
+                "card_abilities_meta": mercs["champion_ability_meta"],
+            }})
+            print(f"Seeded mercenary champions: {inserted}")
+    except Exception as exc:
+        print(f"Mercenary champion seed skipped: {exc}")
+
     # QuestTemplate records provide the objective definitions while authored
     # conversation names identify the NPC/node and quest stage.  Keep both in
     # server-owned tables so campaign.py can grant quests and show !/? markers
@@ -1700,6 +1799,12 @@ def ensure_schema(db):
         if "template_guid" not in chest_cols:
             db.execute("ALTER TABLE treasure_chests ADD COLUMN template_guid TEXT DEFAULT ''")
             db.commit()
+        # Wheels of Fate state: whether the chest was spun and the re-spin
+        # (EChestSpinStatus) it holds.
+        for column in ("wof_spun", "wof_status"):
+            if column not in chest_cols:
+                db.execute(f"ALTER TABLE treasure_chests ADD COLUMN {column} INTEGER DEFAULT 0")
+        db.commit()
     except Exception:
         pass
 
@@ -1722,6 +1827,8 @@ def ensure_schema(db):
             db.execute("ALTER TABLE card_templates ADD COLUMN equipment_modified INTEGER DEFAULT 0")
         if "gem_abilities" not in dcols:
             db.execute("ALTER TABLE decks ADD COLUMN gem_abilities TEXT DEFAULT '{}'")
+        if "equipment" not in dcols:
+            db.execute("ALTER TABLE decks ADD COLUMN equipment TEXT DEFAULT '[]'")
         if "effect_group_id" not in ecols:
             db.execute("ALTER TABLE ability_effects ADD COLUMN effect_group_id INTEGER DEFAULT 0")
         if "condition_id" not in ecols:

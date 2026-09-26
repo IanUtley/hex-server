@@ -564,8 +564,10 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
 
     ``cards`` are ``(guid, name, cost, attack, defense)`` rows and
     ``inventory_rewards`` are ``(template_guid, kind)`` pairs.  Campaign packs
-    and Crayburn promo chests are authored by template; every other chest falls
-    back to its set booster trimmed to the chest rarity.
+    and Crayburn promo chests are authored by template; booster treasure chests
+    award their set's chest loot (see ``services/chest_loot.py``), and chests
+    from sets without
+    chest loot fall back to the set booster trimmed to the chest rarity.
     """
     rng = rng or random
     pack_config = CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
@@ -582,6 +584,11 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
         return list(reward.cards), inventory_rewards
     cards = _generate_crayburn_chest(card_templates, chest.template_guid)
     if cards is None:
+        from services.chest_loot import roll_chest_loot
+        loot_cards, inventory_rewards = roll_chest_loot(
+            _db, card_templates, chest.set_guid, chest.chest_type, rng)
+        if loot_cards or inventory_rewards:
+            return loot_cards, inventory_rewards
         cards = _generate_booster(card_templates, chest.set_guid)
         keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
         if len(cards) > keep_count:
@@ -614,6 +621,109 @@ def _grant_pack_inventory_rewards(handler, inventory_rewards):
             for guid, (client_uid, quantity) in updates.items()]
 
 
+def _grant_reward_cards(user_id, cards):
+    """Add reward cards to a player's collection.
+
+    ``cards`` are ``(guid, name, cost, attack, defense)`` rows; returns the
+    ``card_instance_bits`` tuples to show and push to the client.
+    """
+    granted = []
+    next_id = db_next_card_instance_id(user_id, conn=_db)
+    for offset, (guid, name, cost, atk, def_) in enumerate(cards):
+        instance_id = next_id + offset
+        db_add_card(user_id, guid, conn=_db)
+        db_create_card_instance(user_id, instance_id, guid, conn=_db)
+        granted.append((guid, name, cost, atk, def_, instance_id, 0))
+    return granted
+
+
+def _spin_client_chest(handler, chest_uid, rng=None):
+    """Spin a booster chest on the Wheels of Fate; nothing is sent.
+
+    Returns a summary with ``error`` (ESpinWheelOfFateError), the chest's
+    ``rarity``/``spin_status``/``set_guid`` after the spin, reward ``cards``
+    (``card_instance_bits`` tuples), ``inventory_updates``, ``gold`` and the
+    reel ``colors``/``symbols``.  The chest stays unopened.
+    """
+    from profile_db import db_adjust_user_currency, db_get_user_currency
+    from services import wheel_of_fate as wof
+    user_id = handler.user_profile["id"]
+    chest = _resolve_client_chest(user_id, chest_uid)
+    summary = {"error": wof.OK, "rarity": "Common", "spin_status": wof.NO_SPIN,
+               "set_guid": "00000000-0000-0000-0000-000000000000",
+               "cards": [], "inventory_updates": [], "gold": 0,
+               "colors": [0, 0, 0], "symbols": [0, 1, 2], "outcome": ""}
+    # Only booster chests (not promo/campaign packs) spin.
+    if chest is None or chest.db_id is None or chest.template_guid:
+        summary["error"] = (wof.NOT_PLAYERS_CHEST if chest is None
+                            else wof.NO_SPIN_LEFT)
+        return summary
+    spun, spin_status = wof.chest_spin_state(_db, chest.db_id)
+    summary.update(rarity=chest.chest_type, spin_status=spin_status,
+                   set_guid=chest.set_guid)
+    if not wof.can_spin(spun, spin_status):
+        summary["error"] = wof.NO_SPIN_LEFT
+        return summary
+    cost = wof.spin_cost(chest.chest_type, spin_status)
+    if db_get_user_currency(user_id, "gold", conn=_db) < cost:
+        summary["error"] = wof.NOT_ENOUGH_GOLD
+        return summary
+
+    result = wof.roll_spin(_db, _load_card_templates(), chest.set_guid,
+                           chest.chest_type, rng or random)
+    db_adjust_user_currency(user_id, gold_delta=result.gold - cost, conn=_db)
+    wof.save_spin(_db, chest.db_id, result)
+    summary.update(
+        rarity=result.rarity, spin_status=result.spin_status,
+        gold=result.gold, colors=result.colors, symbols=result.symbols,
+        outcome=result.outcome,
+        cards=_grant_reward_cards(user_id, result.cards),
+        inventory_updates=_grant_pack_inventory_rewards(
+            handler, result.inventory_rewards))
+    _db.commit()
+    log_req(f"    Spun chest {chest_uid} ({chest.chest_type}, cost {cost}): "
+            f"{result.outcome} symbols={result.symbols} colors={result.colors} "
+            f"gold={result.gold} -> {result.rarity} status={result.spin_status}")
+    return summary
+
+
+def _encode_spin_response(spin, chest_uid):
+    """Encode a SpinWheelOfFateResponse for a ``_spin_client_chest`` summary.
+
+    Member names and shapes follow the client's SpinWheelOfFateResponse:
+    ``Chest`` is a chest_bits object and the item prizes are
+    ``RewardedItems``.
+    """
+    from objfmt_builder import ObjFmtBuilder
+    rarities = {"Common": 0, "Uncommon": 1, "Rare": 2, "Legendary": 3,
+                "Primal": 4, "Promo": 5}
+    b = ObjFmtBuilder("Game.Client.Network.Profile.SpinWheelOfFateResponse")
+    b.begin_element("Chest", "Game.Shared.Domain.chest_bits", b.CHEST_PROPS)
+    b.chest_fields(rarities.get(spin["rarity"], 0), spin["spin_status"],
+                   spin["set_guid"], chest_uid)
+    b.field_int("GoldAward", spin["gold"])
+    items = spin["inventory_updates"]
+    b.begin_list("RewardedItems",
+                 "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+                 len(items))
+    for index, (template_guid, item_uid, _total) in enumerate(items):
+        b.begin_element(index, "Game.Shared.Domain.inventory_bits", b.INVENTORY_PROPS)
+        b.inventory_fields(template_guid, item_uid, quantity=1)
+    cards = spin["cards"]
+    b.begin_list("RewardCards",
+                 "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
+                 len(cards))
+    for index, card in enumerate(cards):
+        b.begin_element(index, "Game.Shared.Domain.card_instance_bits", b.CARD_PROPS)
+        b.card_fields(card[0], card[5], card[6])
+    b.int_list("SpinEntryColors", spin["colors"])
+    b.int_list("SpinEntrySymbols", spin["symbols"])
+    b.field_enum("Error", "Game.Shared.Network.Profile.ESpinWheelOfFateError",
+                 spin["error"])
+    b.field_str("ErrorMessage", "")
+    return b.finish(8)
+
+
 def _open_client_chests(handler, chest_uids):
     """Award and consume client-addressed chests without sending packets.
 
@@ -636,13 +746,9 @@ def _open_client_chests(handler, chest_uids):
             summary["invalid"].append(chest_uid)
             continue
         cards, inventory_rewards = _generate_chest_rewards(chest, card_templates)
-        next_id = db_next_card_instance_id(user_id, conn=_db)
-        for offset, (guid, name, cost, atk, def_) in enumerate(cards):
-            instance_id = next_id + offset
-            db_add_card(user_id, guid, conn=_db)
-            db_create_card_instance(user_id, instance_id, guid, conn=_db)
-            summary["card_template_ids"].append(guid)
-            summary["cards"].append((guid, name, cost, atk, def_, instance_id, 0))
+        for card in _grant_reward_cards(user_id, cards):
+            summary["card_template_ids"].append(card[0])
+            summary["cards"].append(card)
         for guid, item_uid, quantity in _grant_pack_inventory_rewards(
                 handler, inventory_rewards):
             summary["inventory_template_ids"].append(guid)
@@ -10438,6 +10544,10 @@ class HCPHandler(ProfileStreamMixin):
             from services.chat import handle_chat_message
             handle_chat_message(self, body)
 
+        elif target == "Session" and instance == "whsp":
+            from services.chat import handle_whisper_message
+            handle_whisper_message(self, body)
+
         # === ROUTED SERVICE MESSAGES ===
         elif instance and instance != "ping":
             log_req(f">>> Routed msg target={target} instance={instance}")
@@ -13989,12 +14099,21 @@ class HCPHandler(ProfileStreamMixin):
                 env_json = json.loads(envelope.decode("utf-8"))
             except (TypeError, ValueError, UnicodeDecodeError):
                 env_json = {}
+            template_envelope = None
+            if isinstance(env_json, dict) and self.user_profile and                     env_json.get("action") in ("pdecktsave", "pdeckdel"):
+                from services.deck_templates import handle_profile_action
+                template_envelope = handle_profile_action(
+                    _db, self.user_profile["id"], env_json)
             if isinstance(env_json, dict) and env_json.get("action") == "qreplaylst":
                 from replay import replay_list
                 resp_envelope = json.dumps(
                     replay_list(env_json), separators=(",", ":")
                 ).encode("utf-8")
                 log_req("    Replay list returned from game_replays")
+            elif template_envelope is not None:
+                resp_envelope = template_envelope
+                log_req(f"    Deck template {env_json.get('action')} handled "
+                        f"({len(resp_envelope)}b)")
             else:
                 resp_envelope = b"{}"
             resp_inner = encode_profile_response(resp_envelope)
@@ -14842,7 +14961,9 @@ class HCPHandler(ProfileStreamMixin):
                     "fortune_ability_guid")
                 self._campaign_fortune_starting_hand_bonus = int(
                     cfg.get("fortune_starting_hand_bonus", 0) or 0)
-                log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}")
+                mercenary_deck_cards = cfg.get("mercenary_deck_cards")
+                log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}"
+                        + (f" mercenary_deck={len(mercenary_deck_cards)} cards" if mercenary_deck_cards else ""))
             else:
                 # Get player champion from the selected deck. Practice uses
                 # this same deck as the AI's mirror; FRA uses it only as the
@@ -15070,7 +15191,10 @@ class HCPHandler(ProfileStreamMixin):
             import json as _json
             db_clear_session_cards(session.session_id)
             deck_rows = None
-            if deck_db_id and self.user_profile:
+            if is_campaign and mercenary_deck_cards:
+                # Mercenary decks are template GUID lists, like starter decks.
+                deck_rows = (_json.dumps(mercenary_deck_cards),)
+            elif deck_db_id and self.user_profile:
                 deck_cards_json = db_deck_cards_json(
                     deck_db_id, self.user_profile["id"], conn=_db)
                 deck_rows = (deck_cards_json,) if deck_cards_json is not None else None
@@ -15100,6 +15224,15 @@ class HCPHandler(ProfileStreamMixin):
             player_ref_cache = {}
             player_card_data = []
             player_insert_rows = []
+            # Equipped items replace their cards with the equipment-modified
+            # templates the client data provides for each combination.
+            from profile_db import db_deck_equipment
+            from services.equipment import equipped_variant
+            deck_equipment = (db_deck_equipment(deck_db_id, conn=_db)
+                              if deck_db_id and not (is_campaign and mercenary_deck_cards)
+                              else [])
+            if deck_equipment:
+                log_req(f"    Deck equipment: {deck_equipment}")
             if deck_rows and deck_rows[0]:
                 card_ids = _json.loads(deck_rows[0])
                 random.shuffle(card_ids)
@@ -15117,8 +15250,18 @@ class HCPHandler(ProfileStreamMixin):
                                if isinstance(card_tpl_id, str)
                                else ("instance", card_tpl_id))
                     if ref_key not in player_ref_cache:
-                        player_ref_cache[ref_key] = self._resolve_card_ref(
+                        resolved = self._resolve_card_ref(
                             card_tpl_id, self.user_profile["id"])
+                        variant = equipped_variant(
+                            _db, resolved[0], deck_equipment)
+                        if variant:
+                            upgraded = self._resolve_card_ref(
+                                variant, self.user_profile["id"])
+                            if upgraded[0]:
+                                log_req(f"    Equipped {resolved[2]}: "
+                                        f"{resolved[0]} -> {variant}")
+                                resolved = upgraded
+                        player_ref_cache[ref_key] = resolved
                     _tpl, ctype, _n, _c, _a, _d = player_ref_cache[ref_key]
                     player_resolved_tpl_ids.append(_tpl)
                     setup_data = self._battle_setup_template_data(
@@ -17150,6 +17293,9 @@ class HCPHandler(ProfileStreamMixin):
                                     elif fname == b'CoinId': coin_guid = val
                                 except: pass
             log_req(f"    Parsed: id={deck_id}, name={deck_name}, cards={len(card_ids) if card_ids else 0}, gems={len(active_gems)}, sleeve={deck_sleeve_guid}")
+            from services.equipment import (parse_request_equipment_ids,
+                                            sanitize_deck_equipment)
+            equipment_ids = parse_request_equipment_ids(inner_bytes)
 
             success = False
             owner_id = None
@@ -17172,11 +17318,19 @@ class HCPHandler(ProfileStreamMixin):
                 ag_json = json.dumps(active_gems)
                 gem_abilities = self._resolve_gem_abilities(active_gems)
                 ga_json = json.dumps(gem_abilities)
+                equipment_json = None
+                if equipment_ids is not None:
+                    kept_equipment = sanitize_deck_equipment(
+                        _db, owner_id, equipment_ids)
+                    equipment_json = json.dumps(kept_equipment)
+                    log_req(f"    Equipment: requested={len(equipment_ids)} "
+                            f"kept={kept_equipment}")
                 success = db_update_deck(deck_id, owner_id,
                     deck_name=deck_name, cards_json=cards_json,
                     pve_champion_id=pve_champion_id, pvp_champion_guid=pvp_champion_guid,
                     active_gems_json=ag_json, gem_abilities_json=ga_json,
-                    deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+                    deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid,
+                    equipment_json=equipment_json)
                 log_req(f"    DB update: {'OK' if success else 'FAILED'} "
                         f"(owner={owner_id})")
                 # Link this deck as the champion's last used deck (pve_champion_id
@@ -17296,7 +17450,11 @@ class HCPHandler(ProfileStreamMixin):
                 for ci, cid in enumerate(card_ids):
                     b.add_list_item_uint64(ci, cid)
                 b.begin_list("SideboardCardIDs", "System.Collections.Generic.List`1#System.UInt64", 0)
-                b.begin_list("EquipmentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
+                try:
+                    deck_equipment = json.loads(db_deck.get("equipment") or "[]")
+                except (TypeError, ValueError):
+                    deck_equipment = []
+                b.field_resource_id_list("EquipmentIDs", deck_equipment)
                 b.begin_list("TalentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
                 b.field_resource_id("DeckSleeveId", db_deck.get("deck_sleeve_guid") or "00000000-0000-0000-0000-000000000000")
                 b.field_resource_id("GameboardId", db_deck.get("gameboard_guid") or "00000000-0000-0000-0000-000000000000")
@@ -17585,7 +17743,10 @@ class HCPHandler(ProfileStreamMixin):
                     "System.Collections.Generic.List`1#Game.Shared.Domain.chest_bits", 1)
                 b.begin_element(0, "Game.Shared.Domain.chest_bits", 8)
                 chest_map = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4}
-                b.chest_fields(chest_map.get(chest_rarity, 0), 2, set_guid, 9000 + chest_db_id)
+                # A new booster chest holds one paid Wheels of Fate spin.
+                from services.wheel_of_fate import PAID_SPIN
+                b.chest_fields(chest_map.get(chest_rarity, 0), PAID_SPIN, set_guid,
+                               9000 + chest_db_id)
                 # Override BoosterPackType with set_guid
             else:
                 b.begin_list("NewChestInstances",
@@ -18617,193 +18778,24 @@ class HCPHandler(ProfileStreamMixin):
                 chest_uid = 0
             log_req(f">>> SpinWheelOfFate: ChestID={chest_uid}")
 
-            chest = (_resolve_client_chest(self.user_profile["id"], chest_uid)
-                     if self.user_profile else None)
-            if chest is None:
-                log_req(f"    Invalid chest or no profile")
+            spin = (_spin_client_chest(self, chest_uid)
+                    if self.user_profile else None)
+            if spin is None:
+                log_req(f"    No profile")
                 resp_inner = b""
             else:
-                summary = _open_client_chests(self, [chest_uid])
-                reward_card_bits = summary["cards"]
-                log_req(f"    Spun chest {chest.chest_type} uid={chest_uid}, "
-                        f"awarded {len(reward_card_bits)} cards")
-
+                if spin["error"]:
+                    log_req(f"    Spin refused: error={spin['error']}")
+                reward_card_bits = spin["cards"]
                 # Push reward cards and inventory changes to client
-                self._send_cards_chunk(reward_card_bits)
-                for template_guid, item_uid, quantity in summary["inventory_updates"]:
+                if reward_card_bits:
+                    self._send_cards_chunk(reward_card_bits)
+                for template_guid, item_uid, quantity in spin["inventory_updates"]:
                     self.push_inventory_to_client(
                         qty=quantity, template_guid=template_guid,
                         item_id=item_uid)
-                for template_guid, opened_uid, remaining in summary["opened"]:
-                    if remaining:
-                        self.push_inventory_to_client(
-                            qty=remaining, template_guid=template_guid,
-                            item_id=opened_uid)
-                    else:
-                        self._send_inventory_updated(
-                            template_guid, opened_uid, quantity=0)
 
-                # Encode SpinWheelOfFateResponse
-                # Chest (chest_bits, marked opened), RewardCards (List<card_instance_bits>), RewardItems (empty)
-                rtn = ["Game.Client.Network.Profile.SpinWheelOfFateResponse",
-                       "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
-                       "Game.Shared.Domain.card_instance_bits",
-                       "Game.Shared.ResourceId", "System.Guid", "System.UInt64",
-                       "System.Boolean", "System.String", "System.Int32",
-                       "System.UInt32",
-                       "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
-                       "Game.Shared.Domain.chest_bits"]
-                def rft(tn):
-                    if tn not in rtn: rtn.append(tn)
-                    return rtn.index(tn)
-                rsizes = []; rbuf = io.BytesIO()
-                rw = lambda s: rbuf.write(s.encode("utf-8"))
-                rsep = lambda: rbuf.write(b";")
-                rsizes.append(0)
-                rw(""); rsep(); rw("0"); rsep(); rw(str(rft(rtn[0]))); rsep(); rw("6"); rsep()
-
-                # Chest field (chest_bits, 8 props, WasOpened=true)
-                rc = rbuf.tell(); rsizes.append(0)
-                rw("Chest"); rsep(); rw("1"); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("0"); rsep()
-                rw("1"); rsep()
-                rfe = rbuf.tell(); rsizes.append(0); reidx = len(rsizes)-1
-                rw("0"); rsep(); rw(str(reidx)); rsep(); rw(str(rft("Game.Shared.Domain.chest_bits"))); rsep(); rw("8"); rsep()
-                # ChestRarity
-                rf1 = rbuf.tell(); rsizes.append(0)
-                rw("ChestRarity"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                cmap = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4, "Promo":5}
-                rw(hexlify(struct.pack("<i", cmap.get(chest.chest_type, 0))).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - rf1
-                # WOFSpinStatus = 0
-                rf2 = rbuf.tell(); rsizes.append(0)
-                rw("WOFSpinStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - rf2
-                # BoosterPackType
-                rf3 = rbuf.tell(); rsizes.append(0); rti = len(rsizes)-1
-                rw("BoosterPackType"); rsep(); rw(str(rti)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                rgs = rbuf.tell(); rsizes.append(0); rgi = len(rsizes)-1
-                rw("guid"); rsep(); rw(str(rgi)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                booster_type_guid = chest.template_guid or chest.set_guid
-                rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
-                rsizes[rgi] = rbuf.tell() - rgs; rsizes[rti] = rbuf.tell() - rf3
-                # WasOpened = true
-                rf4 = rbuf.tell(); rsizes.append(0)
-                rw("WasOpened"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
-                rw("1"); rsizes[-1] = rbuf.tell() - rf4
-                # InventoryId
-                rf5 = rbuf.tell(); rsizes.append(0)
-                rw("InventoryId"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<Q", chest_uid)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - rf5
-                # PromoID
-                rf6 = rbuf.tell(); rsizes.append(0)
-                rw("PromoID"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt32"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<I", 0)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - rf6
-                # TempateID
-                rf7 = rbuf.tell(); rsizes.append(0); rti2 = len(rsizes)-1
-                rw("TempateID"); rsep(); rw(str(rti2)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                rgs2 = rbuf.tell(); rsizes.append(0); rgi2 = len(rsizes)-1
-                rw("guid"); rsep(); rw(str(rgi2)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                rw("36"); rsep(); rbuf.write(booster_type_guid.encode())
-                rsizes[rgi2] = rbuf.tell() - rgs2; rsizes[rti2] = rbuf.tell() - rf7
-                # Vendor
-                rf8 = rbuf.tell(); rsizes.append(0)
-                rw("Vendor"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - rf8
-                rsizes[reidx] = rbuf.tell() - rfe
-                rsizes[1] = rbuf.tell() - rc
-
-                # RewardCards (List<card_instance_bits>, encoded with reward cards)
-                rfc = rbuf.tell(); rsizes.append(0)
-                rw("RewardCards"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[1]))); rsep(); rw("0"); rsep()
-                rw(str(len(reward_card_bits))); rsep()
-                for ri, (guid, name, cost, atk, def_, cid, iext) in enumerate(reward_card_bits):
-                    rfe2 = rbuf.tell(); rsizes.append(0); rei = len(rsizes)-1
-                    rw(str(ri)); rsep(); rw(str(rei)); rsep(); rw(str(rft(rtn[2]))); rsep(); rw("6"); rsep()
-                    # Id
-                    f1c = rbuf.tell(); rsizes.append(0)
-                    rw("Id"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.UInt64"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<Q", cid)).decode("ascii")); rsep()
-                    rsizes[-1] = rbuf.tell() - f1c
-                    # TemplateID
-                    f2c = rbuf.tell(); rsizes.append(0); rti3 = len(rsizes)-1
-                    rw("TemplateID"); rsep(); rw(str(rti3)); rsep(); rw(str(rft("Game.Shared.ResourceId"))); rsep(); rw("1"); rsep()
-                    rgs3 = rbuf.tell(); rsizes.append(0); rgi3 = len(rsizes)-1
-                    rw("guid"); rsep(); rw(str(rgi3)); rsep(); rw(str(rft("System.Guid"))); rsep(); rw("0"); rsep()
-                    rw("36"); rsep(); rbuf.write(guid.encode())
-                    rsizes[rgi3] = rbuf.tell() - rgs3; rsizes[rti3] = rbuf.tell() - f2c
-                    for bname in ("IsFoil", "IsExtended", "IsNotTradeable"):
-                        tb = rbuf.tell(); rsizes.append(0)
-                        rw(bname); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Boolean"))); rsep(); rw("0"); rsep()
-                        rw("0"); rsizes[-1] = rbuf.tell() - tb
-                    # EscrowStatus
-                    te = rbuf.tell(); rsizes.append(0)
-                    rw("EscrowStatus"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
-                    enc = b"Clean"; rw(str(len(enc))); rsep(); rbuf.write(enc)
-                    rsizes[-1] = rbuf.tell() - te
-                    rsizes[rei] = rbuf.tell() - rfe2
-                rsizes[-1] = rbuf.tell() - rfc
-
-                # RewardItems (empty list)
-                fri = rbuf.tell(); rsizes.append(0)
-                rw("RewardItems"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft(rtn[10]))); rsep(); rw("0"); rsep()
-                rw("0"); rsep()
-                rsizes[-1] = rbuf.tell() - fri
-
-                # GoldAward (int 0)
-                fga = rbuf.tell(); rsizes.append(0)
-                rw("GoldAward"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - fga
-
-                # SpinEntryColors (List<int>, 3 entries — random symbols for slot reels)
-                import random as _rand3
-                fsc = rbuf.tell(); rsizes.append(0)
-                rw("SpinEntryColors"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
-                colors = [_rand3.randint(0, 2) for _ in range(3)]
-                rw(str(len(colors))); rsep()
-                for ci, cv in enumerate(colors):
-                    fec = rbuf.tell(); rsizes.append(0); eci = len(rsizes)-1
-                    rw(str(ci)); rsep(); rw(str(eci)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", cv)).decode("ascii")); rsep()
-                    rsizes[eci] = rbuf.tell() - fec
-                rsizes[-1] = rbuf.tell() - fsc
-
-                # SpinEntrySymbols (List<int>, 3 entries)
-                fss = rbuf.tell(); rsizes.append(0)
-                rw("SpinEntrySymbols"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Collections.Generic.List`1#System.Int32"))); rsep(); rw("0"); rsep()
-                symbols = [_rand3.randint(0, 7) for _ in range(3)]
-                rw(str(len(symbols))); rsep()
-                for si, sv in enumerate(symbols):
-                    fes = rbuf.tell(); rsizes.append(0); esi = len(rsizes)-1
-                    rw(str(si)); rsep(); rw(str(esi)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                    rw(hexlify(struct.pack("<i", sv)).decode("ascii")); rsep()
-                    rsizes[esi] = rbuf.tell() - fes
-                rsizes[-1] = rbuf.tell() - fss
-
-                # Error (Ok=0) — enum struct format
-                ferr = rbuf.tell(); rsizes.append(0)
-                rw("Error"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("Game.Shared.Network.Profile.ESpinWheelOfFateError"))); rsep(); rw("1"); rsep()
-                ferrv = rbuf.tell(); rsizes.append(0)
-                rw("value__"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.Int32"))); rsep(); rw("0"); rsep()
-                rw(hexlify(struct.pack("<i", 0)).decode("ascii")); rsep()
-                rsizes[-1] = rbuf.tell() - ferrv; rsizes[-2] = rbuf.tell() - ferr
-
-                # ErrorMessage (empty string)
-                fem = rbuf.tell(); rsizes.append(0)
-                rw("ErrorMessage"); rsep(); rw(str(len(rsizes)-1)); rsep(); rw(str(rft("System.String"))); rsep(); rw("0"); rsep()
-                rw("0"); rsep()
-                rsizes[-1] = rbuf.tell() - fem
-
-                rsizes[0] = rbuf.tell()
-                rw(";".join(rtn))
-                for i, s in enumerate(rsizes):
-                    if i > 0: rw(";")
-                    rw(str(s))
-                resp_inner = rbuf.getvalue()
+                resp_inner = _encode_spin_response(spin, chest_uid)
 
             if not resp_inner:
                 resp_inner = encode_objfmt_response(

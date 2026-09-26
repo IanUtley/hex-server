@@ -72,6 +72,8 @@ class ProfileStreamMixin:
         # The client collects List<chest_bits> from the profile stream and
         # feeds them to CreateLocalTreasureCache (PlayerProfile.cs).
         self._push_chests_stream(p)
+        # Profile flags (e.g. CAMP_PARTYCAP) and mercenary parties.
+        self._push_mercenary_stream(p)
 
         now_str = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
         
@@ -134,7 +136,13 @@ class ProfileStreamMixin:
                 except:
                     card_ids = []
                 card_guids = []  # CardsInDeck kept empty in profile push
-                deck_data.append((deck_uid64, dname, deck_uid, champ_id, dk.get("cards", "[]"), card_guids))
+                try:
+                    deck_equipment = _json.loads(dk.get("equipment") or "[]")
+                except (TypeError, ValueError):
+                    deck_equipment = []
+                from services.equipment import equipment_slots
+                deck_data.append((deck_uid64, dname, deck_uid, champ_id, dk.get("cards", "[]"), card_guids,
+                                  equipment_slots(_db, deck_equipment)))
         deck_count = len(deck_data)
         log(f">>> Profile push: {deck_count} decks from DB")
         
@@ -371,6 +379,46 @@ class ProfileStreamMixin:
         log_req(f">>> PUSH Iconoclast BannedCardList (dt=2214) "
                  f"{len(banned)} cards, dw_sz={len(packet)}")
 
+    def _push_profile_stream_object(self, inner, label):
+        """Send one standalone object in the login profile stream (dt=2210)."""
+        profile_args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileStreamEventArgs",
+             "System.Byte[]", "System.Boolean"],
+            [("Data", "bytes", inner),
+             ("done", "bool", False)]
+        )
+        dw = encode_datawrapper(0, 2210, compress_gzip(profile_args), 1,
+                                "00000000-0000-0000-0000-000000000000")
+        issuer = f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer.{self.client_uid}.{self.scnt}"
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH {label} (dt=2210) dw_sz={len(dw)}")
+
+    def _push_mercenary_stream(self, profile):
+        """Push List<FlagData> and List<ChampionParty> for mercenary parties."""
+        from services import mercenaries
+        if not profile:
+            return
+        flags = mercenaries.get_flags(_db, profile["id"])
+        if flags:
+            self._push_profile_stream_object(
+                mercenaries.encode_flag_list(flags),
+                f"FlagData list {[f[0] + '=' + str(f[1]) for f in flags]}")
+        from services import deck_templates
+        templates = deck_templates.list_templates(_db, profile["id"])
+        if templates:
+            self._push_profile_stream_object(
+                deck_templates.encode_saved_template_list(templates),
+                f"SavedProfileDeckTemplate list ({len(templates)} templates)")
+        parties = mercenaries.get_parties(_db, profile["id"])
+        if parties:
+            self._push_profile_stream_object(
+                mercenaries.encode_party_list(parties),
+                f"ChampionParty list ({len(parties)} parties)")
+
     def _push_chests_stream(self, profile):
         """Push unopened treasure chests in the login profile stream.
 
@@ -391,7 +439,11 @@ class ProfileStreamMixin:
             return
         chest_map = {"Common": 0, "Uncommon": 1, "Rare": 2,
                      "Legendary": 3, "Primal": 4, "Promo": 5}
-        chests = [(chest_map.get(r[2], 0), 0, r[1], 9000 + r[0]) for r in rows]
+        from services.wheel_of_fate import client_spin_status
+        chests = [(chest_map.get(r[2], 0),
+                   client_spin_status(int(r[5] or 0), int(r[4] or 0)),
+                   r[1], 9000 + r[0])
+                  for r in rows]
         inner = encode_chest_list(chests)
         profile_args = encode_objfmt_response(
             ["Game.Shared.Network.Profile.ProfileStreamEventArgs",

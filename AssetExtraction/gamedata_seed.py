@@ -16,6 +16,7 @@ that name.
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import json
 import os
@@ -69,6 +70,7 @@ RECORD_SECTIONS = (
     "DeckTemplate",
     "EncounterDeck",
     "InventoryItemData",
+    "MercenaryTemplate",
     "QuestTemplate",
     "SceneData",
     "ConversationTemplate",
@@ -582,7 +584,8 @@ def _extract_gems(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...
     return sorted(gem_rows), sorted(meta_rows), gem_bom
 
 
-def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
+def _extract_champions(data: str, sections=("ChampionTemplate", "MercenaryTemplate")
+                       ) -> dict[str, list[tuple[Any, ...]]]:
     helpers = _card_helpers()
     ability_records = {}
     for _, record in records(data, "AbilityTemplate")[0]:
@@ -592,7 +595,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
     extended_rows = []
     ability_rows = []
     ability_guids: set[str] = set()
-    for _, record in records(data, "ChampionTemplate")[0]:
+    champion_records = [record for section in sections
+                        for _, record in records(data, section)[0]]
+    for record in champion_records:
         champion_guid = nested_guid(record, "m_Id")
         if not champion_guid:
             continue
@@ -608,7 +613,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
                     1,
                 )
             )
-        if champion_type != "PvPChampion":
+        # Mercenaries are fixed-stat champions like PvP champions: a starting
+        # health, champion abilities, and no talents.
+        if champion_type not in ("PvPChampion", "Mercenary"):
             continue
         extended_rows.append(
             (
@@ -625,6 +632,10 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
         for entry in record.get("m_ChampionAbilities") or []:
             ability_guid = guid(entry.get("m_CardAbilityId")) if isinstance(entry, dict) else ""
             if not ability_guid:
+                continue
+            # Some unreleased mercenaries (e.g. Andres the Supremo) reference
+            # abilities that are absent from the client's AbilityTemplates.
+            if champion_type == "Mercenary" and ability_guid not in ability_records:
                 continue
             ability_guids.add(ability_guid)
             ability = ability_records.get(ability_guid) or {}
@@ -1191,6 +1202,89 @@ def extract_quest_conversations(path: str | None = None) -> list[tuple[Any, ...]
     return _extract_quest_conversations(load_records_text(configured_records_path()))
 
 
+def _extract_equipment(data: str) -> list[tuple[Any, ...]]:
+    """Extract InventoryEquipmentData items.
+
+    ``is_chest_loot`` marks the per-set treasure-chest pools; the client data
+    only identifies them through design notes such as "Set 1 Chest Loot",
+    "Scars Chest", or "Frostheart Chest Loot".
+    """
+    rows = []
+    for _, record in records(data, "InventoryItemData")[0]:
+        if not str(record.get("_t") or "").endswith("InventoryEquipmentData"):
+            continue
+        notes = str(record.get("m_DesignNotes") or "").strip()
+        rows.append(
+            (
+                nested_guid(record, "m_Id"),
+                record.get("m_Name") or "",
+                nested_guid(record, "m_SetId"),
+                record.get("m_Rarity") or "",
+                record.get("m_EquipmentType") or "",
+                record.get("m_Modifiers") or "",
+                record.get("m_Description") or "",
+                notes,
+                1 if "chest" in notes.lower() else 0,
+                int_value(record.get("m_IsLive")),
+            )
+        )
+    return sorted(set(row for row in rows if row[0]))
+
+
+_TAC_GUID = re.compile(
+    rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _extract_equipment_variants(data: str) -> list[tuple[Any, ...]]:
+    """Map (base card, equipped items) to the equipment-modified card.
+
+    Equipment-modified CardTemplates (``m_EquipmentModifiedCard``) carry a
+    serialized TAC whose first GUID is the base card and whose remaining GUIDs
+    are the equipment that produces this variant.  ``equipment_key`` is the
+    sorted, comma-joined equipment GUID list.
+    """
+    rows = []
+    for _, record in records(data, "CardTemplate")[0]:
+        if not int_value(record.get("m_EquipmentModifiedCard")):
+            continue
+        tac = record.get("m_SerializedTAC") or {}
+        payload = tac.get("data") if isinstance(tac, dict) else None
+        if not payload:
+            continue
+        try:
+            guids = [g.decode() for g in _TAC_GUID.findall(base64.b64decode(payload))]
+        except (ValueError, TypeError):
+            continue
+        if len(guids) < 2:
+            continue
+        rows.append((guids[0], ",".join(sorted(set(guids[1:]))),
+                     nested_guid(record, "m_Id")))
+    return sorted(set(row for row in rows if row[2]))
+
+
+def extract_equipment_variants(path: str | None = None) -> list[tuple[Any, ...]]:
+    """Extract equipment-modified card variants from gamedata or Records."""
+    if path or configured_path():
+        return _extract_equipment_variants(load_text(path))
+    return _extract_equipment_variants(load_records_text(configured_records_path()))
+
+
+def extract_mercenary_champions(path: str | None = None) -> dict[str, list[tuple[Any, ...]]]:
+    """Extract champion tables for MercenaryTemplate records only."""
+    if path or configured_path():
+        data = load_text(path)
+    else:
+        data = load_records_text(configured_records_path())
+    return _extract_champions(data, sections=("MercenaryTemplate",))
+
+
+def extract_equipment(path: str | None = None) -> list[tuple[Any, ...]]:
+    """Extract equipment items from gamedata or the checked-in Records."""
+    if path or configured_path():
+        return _extract_equipment(load_text(path))
+    return _extract_equipment(load_records_text(configured_records_path()))
+
+
 def _extract_chests(data: str) -> list[tuple[Any, ...]]:
     rows = []
     for _, record in records(data, "InventoryItemData")[0]:
@@ -1224,6 +1318,8 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
+# Bump when extract() output changes so on-disk caches are rebuilt.
+_EXTRACT_VERSION = 2
 
 
 def _extract_cache_file(cache_key: str) -> str:
@@ -1251,9 +1347,10 @@ def extract(path: str | None = None) -> dict[str, Any]:
         source_stat = os.stat(cache_key)
         with open(cache_file, "rb") as stream:
             disk = pickle.load(stream)
-        if (isinstance(disk, tuple) and len(disk) == 3 and
+        if (isinstance(disk, tuple) and len(disk) == 4 and
                 disk[0] == int(source_stat.st_mtime_ns) and
                 disk[1] == int(source_stat.st_size) and
+                disk[3] == _EXTRACT_VERSION and
                 isinstance(disk[2], dict)):
             _EXTRACT_CACHE[cache_key] = disk[2]
             return disk[2]
@@ -1326,6 +1423,8 @@ def extract(path: str | None = None) -> dict[str, Any]:
             "quest_templates": quest_templates,
             "quest_conversations": quest_conversations,
             "chest_templates": _extract_chests(data),
+            "equipment_templates": _extract_equipment(data),
+            "equipment_card_variants": _extract_equipment_variants(data),
             "pack_set_map": _extract_pack_map(data),
         },
     }
@@ -1334,7 +1433,8 @@ def extract(path: str | None = None) -> dict[str, Any]:
         source_stat = os.stat(cache_key)
         with open(cache_file, "wb") as stream:
             pickle.dump((int(source_stat.st_mtime_ns), int(source_stat.st_size),
-                         result), stream, protocol=pickle.HIGHEST_PROTOCOL)
+                         result, _EXTRACT_VERSION), stream,
+                        protocol=pickle.HIGHEST_PROTOCOL)
     except (OSError, pickle.PickleError):
         pass
     return result
@@ -1367,6 +1467,8 @@ TABLE_COLUMNS = {
     "quest_templates": ("script_name", "name", "title", "objectives_json", "campaign_group", "start_hook", "enabled"),
     "quest_conversations": ("quest_script", "conversation_guid", "campaign_template", "node_id", "npc", "role", "faction", "conversation_name", "start_hook", "conditions_json", "priority", "enabled"),
     "chest_templates": ("guid", "name", "set_guid", "chest_type", "spin_type", "promotional_id"),
+    "equipment_templates": ("guid", "name", "set_guid", "rarity", "equipment_type", "modifiers", "description", "design_notes", "is_chest_loot", "is_live"),
+    "equipment_card_variants": ("base_guid", "equipment_key", "variant_guid"),
     "pack_set_map": ("pack_guid", "set_guid", "is_full_set", "is_primal"),
 }
 

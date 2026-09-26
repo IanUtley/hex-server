@@ -41,7 +41,7 @@ from abilities.framework.triggers import (
 )
 
 SET1 = "0382f729-7710-432b-b761-13677982dcd2"
-OUT = "/tmp/set1_sweep_failures.txt"
+OUT = os.path.join(tempfile.gettempdir(), "set1_sweep_failures.txt")
 
 
 def _set1_abilities(db):

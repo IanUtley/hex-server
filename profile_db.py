@@ -439,8 +439,8 @@ def db_create_treasure_chest(user_id, set_guid, rarity, conn=None,
 
 def db_get_unopened_chests_full(user_id, conn=None):
     return _profile_connection(conn).execute(
-        "SELECT id, set_guid, chest_rarity, template_guid FROM treasure_chests "
-        "WHERE user_id=? AND opened=0", (user_id,)).fetchall()
+        "SELECT id, set_guid, chest_rarity, template_guid, wof_status, wof_spun "
+        "FROM treasure_chests WHERE user_id=? AND opened=0", (user_id,)).fetchall()
 
 
 def db_get_chest_by_id(chest_db_id, user_id, conn=None):
@@ -725,12 +725,13 @@ def db_get_decks(user_id, conn=None):
     """Return saved decks in the profile projection used by the client."""
     rows = _profile_connection(conn).execute(
         "SELECT id, deck_name, cards, pve_champion_id, pvp_champion_guid, "
-        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid "
+        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid, equipment "
         "FROM decks WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
     return [{"id": row[0], "name": row[1], "cards": row[2],
              "pve_champion_id": row[3], "pvp_champion_guid": row[4],
              "active_gems": row[5], "deck_sleeve_guid": row[6],
-             "gameboard_guid": row[7], "coin_guid": row[8]}
+             "gameboard_guid": row[7], "coin_guid": row[8],
+             "equipment": row[9]}
             for row in rows]
 
 
@@ -1122,14 +1123,15 @@ def db_update_deck(deck_id, user_id, deck_name=None, cards_json=None,
                    pve_champion_id=None, pvp_champion_guid=None,
                    active_gems_json=None, gem_abilities_json=None,
                    deck_sleeve_guid=None, gameboard_guid=None, coin_guid=None,
-                   conn=None):
+                   equipment_json=None, conn=None):
     values = (("deck_name", deck_name), ("cards", cards_json),
               ("pve_champion_id", pve_champion_id),
               ("pvp_champion_guid", pvp_champion_guid),
               ("active_gems", active_gems_json),
               ("gem_abilities", gem_abilities_json),
               ("deck_sleeve_guid", deck_sleeve_guid),
-              ("gameboard_guid", gameboard_guid), ("coin_guid", coin_guid))
+              ("gameboard_guid", gameboard_guid), ("coin_guid", coin_guid),
+              ("equipment", equipment_json))
     selected = [(column, value) for column, value in values if value is not None]
     if not selected:
         return False
@@ -1147,15 +1149,26 @@ def db_update_deck(deck_id, user_id, deck_name=None, cards_json=None,
 def db_get_deck_by_id(deck_id, conn=None):
     row = _profile_connection(conn).execute(
         "SELECT id, deck_name, cards, pve_champion_id, pvp_champion_guid, "
-        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid "
+        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid, equipment "
         "FROM decks WHERE id=?", (deck_id,)).fetchone()
     if not row:
         return None
     fields = ("id", "deck_name", "cards", "pve_champion_id",
               "pvp_champion_guid", "active_gems", "deck_sleeve_guid",
-              "gameboard_guid", "coin_guid")
+              "gameboard_guid", "coin_guid", "equipment")
     return {field: _row_value(row, field, index)
             for index, field in enumerate(fields)}
+
+
+def db_deck_equipment(deck_id, conn=None):
+    """Return a deck's equipped item GUIDs."""
+    row = _profile_connection(conn).execute(
+        "SELECT equipment FROM decks WHERE id=?", (int(deck_id),)).fetchone()
+    try:
+        value = json.loads(_row_value(row, "equipment", 0) or "[]") if row else []
+    except (TypeError, ValueError):
+        return []
+    return [str(guid).lower() for guid in value] if isinstance(value, list) else []
 
 
 def db_find_deck_owner(deck_id, conn=None):

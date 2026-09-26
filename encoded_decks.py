@@ -7,6 +7,7 @@ import struct
 import json
 
 from profile_db import db_card_instance_for_encoded_deck
+from services.equipment import ZERO_GUID, equipment_slots as _equipment_slots
 
 def write_varint(buf, val):
     while val >= 0x80:
@@ -31,13 +32,21 @@ def write_guid(buf, guid_str):
     buf.write(guid_le)
     buf.write(b[8:16])
 
-def encode_profile_deck_template(buf, name, champ_guid, sleeve_guid, cards, extended_data=None, card_gems=None):
+def encode_profile_deck_template(buf, name, champ_guid, sleeve_guid, cards, extended_data=None, card_gems=None,
+                                 equipment_slots=None):
     """Encode a ProfileDeckTemplate.ToBytes() payload.
-    card_gems: dict of {instance_id: gem_type_int} for per-instance gem data."""
+    card_gems: dict of {instance_id: gem_type_int} for per-instance gem data.
+    equipment_slots: six GUIDs indexed by EEquipmentType (Head=0..Trinket=5)."""
     write_csharp_string(buf, name)
     write_guid(buf, champ_guid)
     write_guid(buf, sleeve_guid)
-    write_varint(buf, 0)                    # Equip count
+    # Equip: Dictionary<EEquipmentType, ResourceId>, invalid entries omitted
+    equipped = [(slot, guid) for slot, guid in enumerate(equipment_slots or [])
+                if guid and guid != ZERO_GUID]
+    write_varint(buf, len(equipped))
+    for slot, guid in equipped:
+        write_varint(buf, slot)
+        write_guid(buf, guid)
     write_varint(buf, len(cards))
     for (tguid, count, is_ext, is_foil, is_reserve) in cards:
         write_guid(buf, tguid)
@@ -71,6 +80,18 @@ def encode_card_group_id(buf, template_guid, is_extended, card_ids):
         delta = cid - prev
         write_varint(buf, delta)
         prev = cid
+
+def _deck_equipment_slots(deck, conn):
+    try:
+        equipment = json.loads(deck.get("equipment") or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not equipment:
+        return []
+    if conn is None:
+        from db import _db as conn
+    return _equipment_slots(conn, equipment)
+
 
 def encode_encoded_decks(db_decks, user_id, conn=None):
     """Create the full EncodedDecks binary payload."""
@@ -111,6 +132,7 @@ def encode_encoded_decks(db_decks, user_id, conn=None):
             'id': dk.get('id', 0),
             'cards': cards,
             'active_gems': active_gems,
+            'equipment': _deck_equipment_slots(dk, conn),
         })
 
     buf.write(struct.pack('<i', 1))  # version
@@ -119,7 +141,8 @@ def encode_encoded_decks(db_decks, user_id, conn=None):
     for dk in deck_entries:
         # ProfileDeckTemplate.ToBytes()
         pt_buf = io.BytesIO()
-        encode_profile_deck_template(pt_buf, dk['name'], dk['champ'], dk['sleeve'], dk['cards'], card_gems=dk['active_gems'])
+        encode_profile_deck_template(pt_buf, dk['name'], dk['champ'], dk['sleeve'], dk['cards'], card_gems=dk['active_gems'],
+                                     equipment_slots=dk['equipment'])
         pt_bytes = pt_buf.getvalue()
 
         buf.write(struct.pack('<i', len(pt_bytes)))  # template length

@@ -199,7 +199,8 @@ def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, i
 
 
 def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did,
-                     card_guids, idx, pvp_champion_guid=None):
+                     card_guids, idx, pvp_champion_guid=None,
+                     equipment_slots=None):
     """Encode one deck_bits inline WITH element header (for use in cardlist/decklist)."""
     f = buf.tell(); sizes.append(0)
     sidx = len(sizes) - 1
@@ -207,13 +208,14 @@ def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did,
     sep = lambda: buf.write(b";")
     w(str(idx)); sep(); w(str(sidx)); sep(); w(str(ft("Game.Shared.Domain.deck_bits"))); sep(); w("25"); sep()
     encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
-                            card_guids, pvp_champion_guid)
+                            card_guids, pvp_champion_guid, equipment_slots)
     sizes[sidx] = buf.tell() - f
     return sidx
 
 
 def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
-                            card_guids, pvp_champion_guid=None):
+                            card_guids, pvp_champion_guid=None,
+                            equipment_slots=None):
     """Encode the 25 deck_bits fields directly (no element wrapper)."""
     w = lambda s: buf.write(s.encode("utf-8"))
     sep = lambda: buf.write(b";")
@@ -249,9 +251,11 @@ def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
     # 5-9. Talents 1-5
     for tn in ("talent_1","talent_2","talent_3","talent_4","talent_5"):
         wf_rid(tn, b"00000000-0000-0000-0000-000000000000")
-    # 10-15. Equipment 1-6
-    for en in ("equipment_1","equipment_2","equipment_3","equipment_4","equipment_5","equipment_6"):
-        wf_rid(en, b"00000000-0000-0000-0000-000000000000")
+    # 10-15. Equipment 1-6 (Head, Chest, Gloves, Feet, Weapon, Trinket)
+    slots = list(equipment_slots or [])
+    for n, en in enumerate(("equipment_1","equipment_2","equipment_3","equipment_4","equipment_5","equipment_6")):
+        wf_rid(en, (slots[n] if n < len(slots) and slots[n] else
+                    b"00000000-0000-0000-0000-000000000000"))
     # 16. CardsInDeck.  Tournament construction snapshots may provide a
     # fixed starting deck separately from the sideboard/pool.  Ordinary
     # callers still pass a flat GUID list and retain the empty default.
@@ -595,8 +599,12 @@ def encode_objfmt_response(type_names, fields):
         elif tcode == "decklist":
             w(str(ecount))
             sep()
-            for i, (did, dname, did_val, champ_did, cards_json, card_guids) in enumerate(deck_data):
-                encode_deck_bits(buf, sizes, find_type, did, dname, did_val, champ_did, card_guids, i)
+            for i, entry in enumerate(deck_data):
+                did, dname, did_val, champ_did, cards_json, card_guids = entry[:6]
+                equipment = entry[6] if len(entry) > 6 else None
+                encode_deck_bits(buf, sizes, find_type, did, dname, did_val,
+                                 champ_did, card_guids, i,
+                                 equipment_slots=equipment)
         elif tcode == "deckbits":
             did, dname, did_val, champ_did, card_guids = val[:5]
             pvp_champion_guid = val[5] if len(val) > 5 else None

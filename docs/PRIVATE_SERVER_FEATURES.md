@@ -9,7 +9,8 @@ than a promise that the feature is entirely absent.
 The gameplay rules are defined in [RULES.md](../RULES.md). The wire-level
 overview is in [CLIENT_SERVER_PROTOCOL.md](CLIENT_SERVER_PROTOCOL.md).
 Frost Ring Arena implementation details are in
-[FROST_RING_ARENA.md](FROST_RING_ARENA.md).
+[FROST_RING_ARENA.md](FROST_RING_ARENA.md), and mercenary parties in
+[MERCENARIES.md](MERCENARIES.md).
 
 ## Server foundation and persistence
 
@@ -48,6 +49,48 @@ Frost Ring Arena implementation details are in
 - [x] Immediate client inventory removal for direct chest/pack opening using
   the client-compatible `InventoryUpdated` event; other inventory paths still
   need broader auditing.
+- [x] Booster treasure chests award their set's chest loot (1 item for
+  Common-Rare, 2 for Legendary, 3 for Primal) through both `SpinWheelOfFate`
+  and `OpenChest`: equipment, Stardust, AA cards, PvE cards, the set's chest
+  mercenaries (Rare and up), their sleeves (Primal), and, rarely, a booster
+  pack of the chest's set (Legendary and Primal). Odds follow the July 2015
+  community chest-drop survey; see `services/chest_loot.py`. Confirmed in the
+  client: 50 Set 1 chests of every rarity, opened singly and in groups,
+  showed every prize kind; booster packs confirmed in a later test.
+- [ ] Chest AA cards are only known for Sets 1-2 (later sets skip AA
+  prizes), and Set 3+ PvE chest cards are inferred from each set's PvE promo
+  cards. Duplicate-sleeve rules are not modelled.
+- [x] Wheels of Fate: `SpinWheelOfFate` charges the client's spin cost
+  (free for Primal chests and free re-spins), keeps the chest unopened, and
+  rolls the payout table the client displays: paid/free re-spins, chest
+  upgrades (once, twice, or with a re-spin), the set's Wheel mercenaries, PvE
+  cards and their equipment, and PvP rare cards, plus gold and exclusive
+  booster packs from gold/red reels. Re-spins survive a relog. Odds follow the
+  2014 community spin survey; see `services/wheel_of_fate.py`. Confirmed in
+  the client: prizes, gold, upgrades, and paid/free re-spins.
+- [ ] Wheels of Fate estimates: reel-color (gold/red) odds and the split
+  between the two single-upgrade rows were not recorded; Wheel AA cards and
+  sleeves are only known for Set 1; Doombringer has no Wheel PvE cards in the
+  client data. `UpgradeChest` is not handled.
+- [x] Deck equipment: `UpdateDeck` saves owned `EquipmentIDs` (one per
+  equipment type), `GetDeckInfo`, `deck_bits`, and `EncodedDecks` return them,
+  and PvE battles swap each card for the equipment-modified template
+  extracted into `equipment_card_variants`; see `services/equipment.py`.
+- [ ] `RemoveEquipmentFromAllDecks` and the `EquipmentSet` battle event.
+- [x] Mercenary parties: the `CAMP_PARTYCAP` profile flag, `partysave`/
+  `partyload`, mercenary deck templates (`pdecktsave`/`pdeckdel`), and the
+  login `FlagData`/`ChampionParty`/`SavedProfileDeckTemplate` lists; see
+  `services/mercenaries.py` and `services/deck_templates.py`.
+- [x] Campaign encounters started with a party mercenary use its champion
+  template, health, abilities, and saved deck.
+- [ ] Raise `CAMP_PARTYCAP` when the AZ2 mercenary recruitment encounters are
+  won (Katsuhiro, Augustine); `!partycap` stands in for testing. See
+  `docs/MERCENARIES.md`.
+- [ ] Mercenary party passives, upgrades (`mercupd`, `MercLeveling`), and
+  dungeon mercenary nodes (`/merc_node_ch`, `/passivemercs`).
+- [ ] Known mercenary ability issues: B.E.B.O.'s passive only exhausts its
+  controller's non-Robot troops; its charge power offers one "Over-" card
+  instead of two and then loops.
 - [ ] Auction House protocol and persistence.
 
 ## Mail and notifications

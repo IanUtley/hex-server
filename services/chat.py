@@ -32,6 +32,24 @@ def handle_chat_message(handler, body):
         log_req(f">>> Chat parse error: {e}")
 
 
+def handle_whisper_message(handler, body):
+    """Process target=Session, instance=whsp.
+
+    Player-to-player whispers are not implemented, but the client sends chat
+    typed outside a joined room as a whisper, so run developer commands from
+    here too and answer in the general room.
+    """
+    try:
+        whisper = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log_req(f">>> Whisper parse error: {exc}")
+        return
+    msg_text = str(whisper.get("msg") or "")
+    log_req(f">>> Whisper to={whisper.get('target')} msg={msg_text[:50]}")
+    if msg_text.startswith("/") or msg_text.startswith("!"):
+        _handle_rchat(handler, "general", {"msg": msg_text})
+
+
 def _handle_rjoin(handler, room, chat_data):
     log_req(f">>> Chat join room={room}")
     if not hasattr(handler, "_chat_rooms"):
