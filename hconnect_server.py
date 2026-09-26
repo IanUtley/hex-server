@@ -17743,7 +17743,10 @@ class HCPHandler(ProfileStreamMixin):
                     "System.Collections.Generic.List`1#Game.Shared.Domain.chest_bits", 1)
                 b.begin_element(0, "Game.Shared.Domain.chest_bits", 8)
                 chest_map = {"Common":0, "Uncommon":1, "Rare":2, "Legendary":3, "Primal":4}
-                b.chest_fields(chest_map.get(chest_rarity, 0), 2, set_guid, 9000 + chest_db_id)
+                # A new booster chest holds one paid Wheels of Fate spin.
+                from services.wheel_of_fate import PAID_SPIN
+                b.chest_fields(chest_map.get(chest_rarity, 0), PAID_SPIN, set_guid,
+                               9000 + chest_db_id)
                 # Override BoosterPackType with set_guid
             else:
                 b.begin_list("NewChestInstances",

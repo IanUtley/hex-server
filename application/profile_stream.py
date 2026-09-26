@@ -439,7 +439,10 @@ class ProfileStreamMixin:
             return
         chest_map = {"Common": 0, "Uncommon": 1, "Rare": 2,
                      "Legendary": 3, "Primal": 4, "Promo": 5}
-        chests = [(chest_map.get(r[2], 0), int(r[4] or 0), r[1], 9000 + r[0])
+        from services.wheel_of_fate import client_spin_status
+        chests = [(chest_map.get(r[2], 0),
+                   client_spin_status(int(r[5] or 0), int(r[4] or 0)),
+                   r[1], 9000 + r[0])
                   for r in rows]
         inner = encode_chest_list(chests)
         profile_args = encode_objfmt_response(

@@ -146,6 +146,15 @@ def can_spin(spun, spin_status):
     return not spun or spin_status in (PAID_SPIN, FREE_SPIN)
 
 
+def client_spin_status(spun, spin_status):
+    """The chest_bits WOFSpinStatus the client shows for a chest.
+
+    The client only offers a spin for PaidSpin/FreeSpin chests and labels
+    NoSpin chests "No Spin", so an unspun chest holds one paid spin.
+    """
+    return spin_status if spun else PAID_SPIN
+
+
 def _tiered(items, tier_of):
     """Group items into [common, uncommon, rare] tiers by rank of ``tier_of``."""
     ranks = sorted({tier_of(item) for item in items})

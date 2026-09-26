@@ -439,7 +439,7 @@ def db_create_treasure_chest(user_id, set_guid, rarity, conn=None,
 
 def db_get_unopened_chests_full(user_id, conn=None):
     return _profile_connection(conn).execute(
-        "SELECT id, set_guid, chest_rarity, template_guid, wof_status "
+        "SELECT id, set_guid, chest_rarity, template_guid, wof_status, wof_spun "
         "FROM treasure_chests WHERE user_id=? AND opened=0", (user_id,)).fetchall()
 
 

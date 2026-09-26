@@ -224,6 +224,25 @@ def test_spin_costs_gold_and_keeps_the_chest():
     assert summary["invalid"] == [] and summary["opened"], summary
 
 
+def _login_spin_status(user_id, chest_db_id):
+    row = [r for r in db_get_unopened_chests_full(user_id, conn=db._db)
+           if r[0] == chest_db_id][0]
+    return wof.client_spin_status(int(row[5] or 0), int(row[4] or 0))
+
+
+def test_new_chests_offer_one_paid_spin():
+    # The client only shows the Spin button for PaidSpin/FreeSpin chests.
+    user_id = _new_user(9407, 5000)
+    handler = _handler(user_id)
+    chest_db_id = db_create_treasure_chest(user_id, SET1, "Common", conn=db._db)
+    assert _login_spin_status(user_id, chest_db_id) == wof.PAID_SPIN
+    with _Patched(_only("fail")):
+        spin = hconnect_server._spin_client_chest(handler, 9000 + chest_db_id)
+    assert spin["spin_status"] == wof.NO_SPIN
+    assert _login_spin_status(user_id, chest_db_id) == wof.NO_SPIN
+    assert db_get_user_currency(user_id, "gold", conn=db._db) == 3800
+
+
 def test_free_spins_and_primal_chests_cost_nothing():
     user_id = _new_user(9402, 0)
     handler = _handler(user_id)
@@ -413,6 +432,7 @@ if __name__ == "__main__":
     run("outcome odds follow the survey", test_outcome_odds_follow_the_survey)
     run("upgrades cap at Primal", test_upgrades_cap_at_primal)
     run("spin costs gold and keeps the chest", test_spin_costs_gold_and_keeps_the_chest)
+    run("new chests offer one paid spin", test_new_chests_offer_one_paid_spin)
     run("free spins and Primal chests cost nothing", test_free_spins_and_primal_chests_cost_nothing)
     run("spin prizes reach the collection", test_spin_prizes_reach_the_collection)
     run("SpinWheelOfFate reports prizes", test_spin_request_reports_prizes)
