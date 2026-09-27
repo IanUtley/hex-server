@@ -1345,7 +1345,7 @@ class PortAbilityResolver:
 
 
 def build_port_ability(ability_guid, source_uid, owner_id, *, instance_id=1,
-                       target_map=None, variables=None):
+                       target_map=None, variables=None, cost_target_map=None):
     """Build one typed ability instance from the authoritative Records graph."""
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from gamedata.play_plan import AbilityInstance as MetadataAbility
@@ -1360,8 +1360,14 @@ def build_port_ability(ability_guid, source_uid, owner_id, *, instance_id=1,
     ability = AbilityInstance(
         instance_id=int(instance_id), metadata=metadata,
         activating_player_id=owner_id, responsible_player_id=owner_id)
-    ability.bind_activation({"target_map": target_map or {},
-                             "variables": variables or {}})
+    activation = {"target_map": target_map or {},
+                  "variables": variables or {}}
+    if cost_target_map:
+        # Additional-cost selections (exhaust/sacrifice/...) paid when the
+        # ability was activated; effects such as Construction Plans count
+        # them ("for each troop exhausted this way").
+        activation["cost_target_map"] = cost_target_map
+    ability.bind_activation(activation)
     return ability
 
 
@@ -1370,7 +1376,8 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
                          *, target_map=None, variables=None,
                          resume_from_order=None, instance_id=1,
                          native_effect=None,
-                         effect_groups=None, event_tac=None):
+                         effect_groups=None, event_tac=None,
+                         cost_target_map=None):
     """Resolve a persisted continuation through the port-owned lifecycle."""
     log_targets = target_map
     if not log_targets:
@@ -1383,7 +1390,8 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
                        log_targets)
     ability = build_port_ability(
         ability_guid, source_uid, owner_id, instance_id=instance_id,
-        target_map=target_map, variables=variables)
+        target_map=target_map, variables=variables,
+        cost_target_map=cost_target_map)
     # The resume offset is persisted in the existing session snapshot because
     # the continuation may have crossed a reconnect boundary.
     if resume_from_order is not None:

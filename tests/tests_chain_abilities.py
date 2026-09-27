@@ -2545,11 +2545,15 @@ def test_construction_plans_count_the_exhausted_troops(db):
     bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
               "stack": [], "_rules_port_attached": True}
 
-    def activate(exhausted):
+    def activate(*exhausted):
+        # The live chain resolves the saved descriptor: an empty TargetMap and
+        # the exhaust selections in its cost_target_map (string keys, as
+        # persisted).
         resolve_port_ability(
             HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(), db,
             pl_t, ai_t, bstate, "257418ed-24ec-98cd-d6f7-faeb02de4d50", 0x401, 5,
-            target_map={0: (exhausted,)}, instance_id=1)
+            target_map={}, cost_target_map={"0": list(exhausted)},
+            instance_id=1)
 
     def plan_row():
         return db.execute("SELECT template_guid, permanent_buffs FROM game_cards "
@@ -2562,10 +2566,28 @@ def test_construction_plans_count_the_exhausted_troops(db):
                       or "{}").get("counters", {}) == {}
     activate(0x501)   # two counters: remove them and become a Hornet Bot
     assert plan_row()[0] == hornet, plan_row()
+    # Exhausting two troops at once adds two counters in one activation.
+    db.execute("UPDATE game_cards SET template_guid=?, card_template_id=?, "
+               "permanent_buffs='{}', card_state=0 WHERE card_uid=?",
+               (plan, plan, 0x401))
+    db.commit()
+    activate(0x301, 0x501)
+    assert plan_row()[0] == hornet, plan_row()
+
+
+def test_dictionary_with_struct_keys_decodes(db):
+    """A Dictionary whose keys are structs decoded to dict keys and failed
+    the whole transaction with "unhashable type: 'dict'"."""
+    from application.objfmt_wire import _hashable_key
+    assert _hashable_key({"m_UID64": 0x301}) == 0x301
+    assert _hashable_key({"a": 1, "b": 2}) == '{"a": 1, "b": 2}'
+    assert _hashable_key(3) == 3
+    assert hash(_hashable_key([{"m_UID64": 1}, 2])) is not None
 
 
 def _main():
     tests = (test_construction_plans_count_the_exhausted_troops,
+             test_dictionary_with_struct_keys_decodes,
              test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
