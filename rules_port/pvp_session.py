@@ -241,6 +241,16 @@ class PvpAuthoritativeSession(AuthoritativeSession):
         self.drive_until_input(max_steps=max_steps)
         return True
 
+    def drive_after_combat_declaration(self, *, max_steps=64) -> int:
+        """Finish the phase boundary after a projected combat declaration.
+
+        CommitTroopsToAttack/Defense consume their phase priority as part of
+        the accepted transaction. The host projection publishes the resulting
+        combat events; only after it returns can the native scheduler advance
+        and emit the next phase/options packet.
+        """
+        return self.drive_until_input(max_steps=max_steps)
+
     def begin_pvp_turn(self, *, max_steps=128) -> int:
         """Leave mulligan and run the native first-turn lifecycle.
 

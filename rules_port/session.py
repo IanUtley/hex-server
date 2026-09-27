@@ -12,6 +12,7 @@ Source counterparts: ``Session.cs:InternalTick2`` and
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Mapping, Optional
@@ -1507,18 +1508,25 @@ class AuthoritativeSession:
         if not self._transactions:
             return False
         transaction = self._transactions.popleft()
+        profile_callback = getattr(self, "_transaction_profile_callback", None)
+        started = time.perf_counter() if callable(profile_callback) else None
         handler = self._transaction_handlers.get(transaction.kind)
-        self._in_transaction_handler = True
         try:
-            handled = bool(handler and handler(transaction))
+            self._in_transaction_handler = True
+            try:
+                handled = bool(handler and handler(transaction))
+            finally:
+                self._in_transaction_handler = False
+            # A successful mutation is the authoritative transaction boundary.
+            # Rejected/unknown intents are not persisted, matching the host's
+            # existing DB ownership and avoiding snapshots that imply a mutation.
+            if handled:
+                self.persist()
+            return handled
         finally:
-            self._in_transaction_handler = False
-        # A successful mutation is the authoritative transaction boundary.
-        # Rejected/unknown intents are not persisted, matching the host's
-        # existing DB ownership and avoiding snapshots that imply a mutation.
-        if handled:
-            self.persist()
-        return handled
+            if started is not None:
+                profile_callback(
+                    transaction.kind, time.perf_counter() - started)
 
     def _resolve_pass_priority(self, transaction: RulesTransaction) -> bool:
         resolver = self.projection("priority_transaction")
@@ -1637,6 +1645,15 @@ class AuthoritativeSession:
             if not handled:
                 for combat in staged:
                     self.combat_manager.remove_combat(combat.combat_id)
+            else:
+                # The PvP compatibility adapter only publishes the accepted
+                # attack. Let its native scheduler consume the empty Declare
+                # Attack window after that projection returns; advancing from
+                # inside the adapter would run phase callbacks before the
+                # attack mutation and wire events are complete.
+                drive = getattr(self, "drive_after_combat_declaration", None)
+                if callable(drive):
+                    drive()
             return handled
         return True
 
@@ -1675,6 +1692,10 @@ class AuthoritativeSession:
                     combat.flags &= ~(CombatFlags.BLOCKERS_DECLARED |
                                       CombatFlags.ATTACK_BLOCKED |
                                       CombatFlags.DAMAGE_ASSIGNED)
+            else:
+                drive = getattr(self, "drive_after_combat_declaration", None)
+                if callable(drive):
+                    drive()
             return handled
         return True
 

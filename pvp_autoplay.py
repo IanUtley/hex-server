@@ -19,9 +19,33 @@ import json
 import random
 import sqlite3
 import sys
+import tempfile
+import threading
 import time
 import traceback
 from collections import Counter
+
+# A command-line simulation should never clean up rows in the server's live
+# database.  SQLite's online backup includes committed WAL state and gives the
+# runner a disposable snapshot with the authored metadata it needs.
+_SIMULATION_DB_TEMP = None
+_SIMULATION_DB_COPY = None
+if __name__ == "__main__" and "--fra" in sys.argv:
+    _source_db = os.environ.get(
+        "HEX_DB_PATH", os.path.join(os.path.dirname(__file__), "hconnect.db"))
+    if _source_db != ":memory:" and os.path.isfile(_source_db):
+        _SIMULATION_DB_TEMP = tempfile.TemporaryDirectory(
+            prefix="hex-pvp-simulation-")
+        _SIMULATION_DB_COPY = os.path.join(
+            _SIMULATION_DB_TEMP.name, "simulation.db")
+        _source_connection = sqlite3.connect(_source_db, timeout=30)
+        _copy_connection = sqlite3.connect(_SIMULATION_DB_COPY, timeout=30)
+        try:
+            _source_connection.backup(_copy_connection)
+        finally:
+            _copy_connection.close()
+            _source_connection.close()
+        os.environ["HEX_DB_PATH"] = _SIMULATION_DB_COPY
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,12 +55,13 @@ import hconnect_server as hcs
 import encoder
 from db import _db, log_req
 from pvp_db import (
-    db_ai_hand_playables, db_card_combat_identity, db_clear_session_cards,
+    db_ai_hand_playables, db_clear_session_cards,
     db_copy_template_payload, db_delete_game_session,
     db_hand_resources_with_template, db_insert_generated_card,
     db_next_game_card_row_id, db_set_constructed_guids, db_set_resource_guids,
-    db_static_card_rows, db_warzone_troop_attributes,
-    db_warzone_troop_stats, db_zone_card_count, db_encounter_deck_cards,
+    db_gem_templates, db_static_card_rows, db_warzone_troop_attributes,
+    db_zone_card_count, db_encounter_deck_cards, db_is_champion_template,
+    db_warzone_attack_candidates,
 )
 from domain.constants import (CARD_UID_TYPE, PLAYER_UID_TYPE,
                               PLAYER_TRANSACTION_DATA_TYPE,
@@ -108,15 +133,30 @@ def _make_handler(pid, session):
 
 def _seed_deck(session_id, pid, deck, uid_offset=0):
     ctr = [uid_offset]
-    for pos, tpl in enumerate(deck):
+    for pos, card_spec in enumerate(deck):
+        if isinstance(card_spec, (tuple, list)):
+            tpl, gem_type, gem_abilities = card_spec
+        else:
+            tpl, gem_type, gem_abilities = card_spec, 0, ()
         ctr[0] += 1
         cu = game_engine.UID.make(CARD_UID_TYPE, ctr[0]).uid64
         card = db_copy_template_payload(tpl)
         if not card:
             raise ValueError(f"unknown autoplay template {tpl}")
+        try:
+            abilities = [str(value).lower()
+                         for value in json.loads(card[1] or "[]")]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            abilities = []
+        for ability_guid in gem_abilities or ():
+            value = str(ability_guid).lower()
+            if value not in abilities:
+                abilities.append(value)
         db_insert_generated_card(
-            session_id, pid, cu, tpl, "deck", card[0], card[1], card[2],
-            db_next_game_card_row_id(session_id), position=pos)
+            session_id, pid, cu, tpl, "deck", card[0],
+            json.dumps(abilities), card[2],
+            db_next_game_card_row_id(session_id), position=pos,
+            gems=int(gem_type or 0))
 
 
 def _seed_champion(session_id, pid, champ_guid, uid_offset=0):
@@ -124,12 +164,22 @@ def _seed_champion(session_id, pid, champ_guid, uid_offset=0):
     ctr[0] += 1
     cu = game_engine.UID.make(CARD_UID_TYPE, ctr[0]).uid64
     card = db_copy_template_payload(champ_guid)
-    if not card:
+    is_catalog_champion = db_is_champion_template(champ_guid)
+    if not card and not is_catalog_champion:
         raise ValueError(f"unknown autoplay champion {champ_guid}")
+    # Authored FRA champions are stored in champion_templates(_extended),
+    # not necessarily in card_templates.  The production PvP projection uses
+    # this same catalog check and obtains signature abilities from
+    # champion_abilities when it builds the champion card.
+    card_type, abilities, attributes = (
+        ("Champion", "[]", 0) if is_catalog_champion else card)
     db_insert_generated_card(
-        session_id, pid, cu, champ_guid, "champions", card[0], card[1],
-        card[2], db_next_game_card_row_id(session_id),
+        session_id, pid, cu, champ_guid, "champions", card_type, abilities,
+        attributes, db_next_game_card_row_id(session_id),
         position=CARD_POSITION_CHAMPION)
+    _db.execute(
+        "UPDATE game_cards SET is_champion=1 "
+        "WHERE session_id=? AND card_uid=?", (session_id, int(cu)))
     return int(cu)
 
 
@@ -169,11 +219,16 @@ def _transaction(handler, session, inner_bytes, typed_payload=None,
             session.session_id, 0, inner_obj, inner_bytes)
     finally:
         if profiler is not None:
-            profiler["rules_transactions"] += 1
-            profiler["rules_transaction_seconds"] += (
-                time.perf_counter() - started)
+            _profile_add(profiler, "rules_transactions", 1)
+            _profile_add(profiler, "rules_transaction_seconds",
+                         time.perf_counter() - started)
     cur = gs.find_session_by_player(
         _ge.UID.make(PLAYER_UID_TYPE, int(handler.client_reck_id)).to_uint64()) or session
+    port = getattr(cur, "_rules_port_session", None)
+    if port is not None and profiler is not None:
+        port._transaction_profile_callback = (
+            lambda kind, elapsed: _record_rules_port_dispatch(
+                profiler, kind, elapsed))
     if os.environ.get("PVP_TRACE"):
         if isinstance(cur.turn_order, dict) and "turn_player" in cur.turn_order:
             log_req(f"    [pvp-trace] after {inner_bytes[:36]!r} — turn_order "
@@ -228,8 +283,8 @@ def _defense_bytes(attacker_uids, blocker_map, champ_uid):
     out = b"CommitTroopsToDefenseTransaction;"
     for a in attacker_uids:
         out += _mk_uid_bytes(a)
-    for b in blocker_map:
-        out += _mk_uid_bytes(b)
+        for b in blocker_map.get(int(a), ()):
+            out += _mk_uid_bytes(b)
     out += _mk_uid_bytes(champ_uid)
     return out
 
@@ -251,11 +306,37 @@ def _fra_encounter_specs(deck_guids=None):
         chosen = rows
 
     specs = []
+    gem_templates = {
+        str(name): (int(gem_type or 0),
+                    [str(value).lower() for value in
+                     json.loads(abilities_json or "[]")])
+        for name, gem_type, abilities_json in db_gem_templates(conn=_db)
+    }
     for deck_guid, name, champion_guid in chosen:
         cards = []
-        for card_guid, quantity, _gems in db_encounter_deck_cards(
+        for card_guid, quantity, gem_json in db_encounter_deck_cards(
                 deck_guid, conn=_db):
-            cards.extend([card_guid] * max(0, int(quantity or 0)))
+            try:
+                gem_slots = json.loads(gem_json or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                gem_slots = []
+            for copy_index in range(max(0, int(quantity or 0))):
+                socket_names = (gem_slots[copy_index]
+                                if copy_index < len(gem_slots) else [])
+                if not isinstance(socket_names, list):
+                    socket_names = [socket_names]
+                gem_type = 0
+                gem_abilities = []
+                for socket_name in socket_names:
+                    gem_data = gem_templates.get(str(socket_name))
+                    if not gem_data:
+                        continue
+                    if not gem_type:
+                        gem_type = gem_data[0]
+                    for ability_guid in gem_data[1]:
+                        if ability_guid not in gem_abilities:
+                            gem_abilities.append(ability_guid)
+                cards.append((str(card_guid), gem_type, gem_abilities))
         if not cards or not champion_guid:
             continue
         specs.append({"deck_guid": str(deck_guid), "name": str(name),
@@ -299,11 +380,16 @@ def _ai_evaluator_for_seat(handler, session, state, owner_id, opponent_id,
     return evaluator
 
 
-def _record_card_decision(report, evaluator, chosen, choice_reason):
+def _record_card_decision(report, evaluator, chosen, choice_reason,
+                          only_quick_actions=False):
     if report is None:
         return
-    decisions = report.setdefault("card_decisions", {})
+    owner_id = int(evaluator.ai_owner_id)
+    decisions = report.setdefault("card_decisions", {}).setdefault(
+        str(owner_id), {})
     for card in evaluator.hand:
+        if only_quick_actions and not card.is_quick_action():
+            continue
         key = f"{card.template_guid}:{card.name}"
         entry = decisions.setdefault(key, {
             "template_guid": card.template_guid,
@@ -316,12 +402,25 @@ def _record_card_decision(report, evaluator, chosen, choice_reason):
         entry["seen"] += 1
         playability = evaluator.is_playable(card)
         if playability == "False":
-            reason = "threshold_or_target_unavailable"
+            if not evaluator.handler._thresholds_met(
+                    card.threshold_json, evaluator.threshold):
+                reason = "threshold_unavailable"
+            elif (card.is_action()
+                  and evaluator.has_required_explicit_target(card)
+                  and evaluator.choose_action_target(card) is None):
+                reason = "required_target_unavailable"
+            else:
+                reason = "other_legality_or_target_unavailable"
         elif playability == "NeedsResources":
             reason = "needs_resources"
         elif card is chosen:
             reason = choice_reason or "selected"
             entry["selected"] += 1
+        elif card.is_resource():
+            reason = "resource_slot_used_or_not_selected"
+        elif card.is_quick_action():
+            reason = (choice_reason if only_quick_actions else
+                      "quick_action_not_selected_in_main_phase")
         elif chosen is None:
             reason = "no_preferred_action"
         else:
@@ -329,8 +428,243 @@ def _record_card_decision(report, evaluator, chosen, choice_reason):
         entry["reasons"][reason] += 1
 
 
+def _record_resource_decision(report, owner_id, row, played):
+    """Account for a resource choice made before the hand evaluator runs."""
+    if report is None:
+        return
+    template_guid = str(row[2])
+    card_uid = int(row[1])
+    name_row = _db.execute(
+        "SELECT name FROM card_templates WHERE guid=?", (template_guid,)
+    ).fetchone()
+    name = str(name_row[0] if name_row else template_guid)
+    key = f"{template_guid}:{name}"
+    entry = report.setdefault("card_decisions", {}).setdefault(
+        str(int(owner_id)), {}).setdefault(key, {
+            "template_guid": template_guid,
+            "name": name,
+            "seen": 0,
+            "selected": 0,
+            "played": 0,
+            "reasons": Counter(),
+        })
+    entry["seen"] += 1
+    entry["selected"] += 1
+    entry["reasons"]["resource_play"] += 1
+    if played:
+        entry["played"] += 1
+    else:
+        entry["reasons"]["selected_but_not_played"] += 1
+
+
+def _record_failed_card_play(report, owner_id, chosen):
+    if report is None or chosen is None:
+        return
+    key = f"{chosen.template_guid}:{chosen.name}"
+    entry = report.get("card_decisions", {}).get(str(int(owner_id)), {}).get(key)
+    if entry is not None:
+        entry["reasons"]["selected_but_not_played"] += 1
+
+
+def _effective_combat_attributes(session_id, owner_id, battle_state, cards):
+    """Refresh evaluator cards with dynamic card attributes for combat."""
+    from rules_port.static_rules import effective_stats
+
+    by_uid = {card.card_uid: card for card in cards}
+    for row in db_warzone_troop_attributes(session_id, owner_id):
+        card_uid = int(row[0])
+        card = by_uid.get(card_uid)
+        if card is None:
+            continue
+        card.attributes = int(effective_stats(
+            _db, session_id, battle_state, card_uid)[2] or 0)
+        card.card_state = int(row[1] or 0)
+    return by_uid
+
+
+def _ai_attack_decision(handler, session, state, owner_id, opponent_id,
+                        profiler=None, report=None):
+    """Use the shared AI combat valuation for a FRA seat's attack choice."""
+    started = time.perf_counter()
+    evaluator = _ai_evaluator_for_seat(
+        handler, session, state, owner_id, opponent_id, profiler, report)
+    import ai as ai_policy
+
+    own_cards = _effective_combat_attributes(
+        session.session_id, owner_id, state, evaluator.ai_warzone)
+    opposing_cards = _effective_combat_attributes(
+        session.session_id, opponent_id, state, evaluator.player_warzone)
+    blockers = [card for card in opposing_cards.values()
+                if card.is_troop()
+                and not (int(card.card_state or 0)
+                         & game_engine.ECardStates.Tapped)
+                and not card.has_attribute(game_engine.ECardAttributes.CantBlock)]
+
+    eligible = []
+    for card_uid, _template, attrs, _card_attrs, card_state, _attack in \
+            db_warzone_attack_candidates(session.session_id, owner_id):
+        card_uid = int(card_uid)
+        card = own_cards.get(card_uid)
+        if card is None:
+            continue
+        card_state = int(card_state or 0)
+        attrs = int(attrs or 0) | int(_card_attrs or 0) | int(
+            card.attributes or 0)
+        if card_state & game_engine.ECardStates.Tapped:
+            continue
+        if attrs & (game_engine.ECardAttributes.CantAttack |
+                    game_engine.ECardAttributes.Defensive):
+            continue
+        if not (card_state & game_engine.ECardStates.StartedATurnOnYourSide) \
+                and not attrs & game_engine.ECardAttributes.Speed:
+            continue
+        card.attributes = attrs
+        eligible.append(card)
+
+    chosen = []
+    reason = "no_eligible_attackers"
+    personality = ai_policy.personality(handler)
+    min_value = int(personality.get("min_x_value", 3) or 3)
+    alpha = bool(personality.get("alpha_strike", True))
+    if eligible and not blockers:
+        chosen = eligible
+        reason = "open_attack"
+    elif eligible and evaluator.alpha_strike_wins(
+            int(state.get(f"hp_{opponent_id}", 20) or 0), eligible, blockers):
+        chosen = eligible
+        reason = "alpha_strike_lethal"
+    elif eligible and alpha and ai_policy._aieval_attack_set_value(
+            evaluator, eligible, blockers) > 0:
+        chosen = eligible
+        reason = "profitable_group_attack"
+    elif eligible:
+        for card in eligible:
+            if card.has_attribute(game_engine.ECardAttributes.ForceAttack):
+                chosen.append(card)
+                continue
+            attack = card.effective_attack(in_play=True)
+            if attack <= 0:
+                continue
+            _damage, value = ai_policy._aieval_best_attack_value(
+                evaluator, card, blockers)
+            if value > 0 and (attack >= min_value or alpha):
+                chosen.append(card)
+        reason = "positive_individual_combat_value" if chosen \
+            else "combat_value_below_threshold"
+
+    if profiler is not None:
+        _profile_add(profiler, "combat_evaluations", 1)
+        _profile_add(profiler, "combat_evaluation_seconds",
+                     time.perf_counter() - started)
+    if report is not None:
+        report.setdefault("combat_decisions", []).append({
+            "turn": int(state.get("turn", 0) or 0),
+            "player_id": int(owner_id),
+            "kind": "attack",
+            "reason": reason,
+            "attackers": [int(card.card_uid) for card in chosen],
+            "eligible": [int(card.card_uid) for card in eligible],
+            "blockers": [int(card.card_uid) for card in blockers],
+        })
+    return [int(card.card_uid) for card in chosen], reason
+
+
+def _ai_block_decision(handler, session, state, owner_id, opponent_id,
+                       attacker_uids, profiler=None, report=None):
+    """Select legal, value-positive one-to-one blocks with AICombat values."""
+    started = time.perf_counter()
+    evaluator = _ai_evaluator_for_seat(
+        handler, session, state, owner_id, opponent_id, profiler, report)
+    from ai_eval import ECardAttributes
+
+    own_cards = _effective_combat_attributes(
+        session.session_id, owner_id, state, evaluator.ai_warzone)
+    opposing_cards = _effective_combat_attributes(
+        session.session_id, opponent_id, state, evaluator.player_warzone)
+    blockers = [card for card in own_cards.values()
+                if card.is_troop()
+                and not (int(card.card_state or 0)
+                         & game_engine.ECardStates.Tapped)
+                and not card.has_attribute(ECardAttributes.CantBlock)]
+    attackers = [opposing_cards[int(uid)] for uid in attacker_uids
+                 if int(uid) in opposing_cards]
+    attackers.sort(key=lambda card: -card.effective_attack(in_play=True))
+    available = list(blockers)
+    blocker_map = {}
+    details = []
+    for attacker in attackers:
+        best = None
+        for blocker in available:
+            if not evaluator._can_block(blocker, attacker):
+                continue
+            damage, blocker_value, attacker_dies, attacker_value = \
+                evaluator._damage_through(attacker, [blocker])
+            prevented = max(0, attacker.effective_attack(in_play=True) - damage)
+            blocker_dies = attacker.effective_attack(in_play=True) >= \
+                blocker.effective_defense(in_play=True) and not \
+                blocker.has_attribute(ECardAttributes.Immortal)
+            score = (attacker_value if attacker_dies else 0.0) - \
+                (blocker_value if blocker_dies else 0.0) + \
+                prevented * evaluator.personality.values["DamageParityValue"] / 20.0
+            if best is None or score > best[0]:
+                best = (score, blocker, damage, attacker_dies, blocker_dies)
+        if best is not None and best[0] > 0:
+            score, blocker, damage, attacker_dies, blocker_dies = best
+            blocker_map[int(attacker.card_uid)] = [int(blocker.card_uid)]
+            available.remove(blocker)
+            details.append({
+                "attacker": int(attacker.card_uid),
+                "blocker": int(blocker.card_uid),
+                "score": round(float(score), 4),
+                "attacker_dies": bool(attacker_dies),
+                "blocker_dies": bool(blocker_dies),
+                "damage_through": int(damage),
+            })
+
+    if profiler is not None:
+        _profile_add(profiler, "combat_evaluations", 1)
+        _profile_add(profiler, "combat_evaluation_seconds",
+                     time.perf_counter() - started)
+    if report is not None:
+        report.setdefault("combat_decisions", []).append({
+            "turn": int(state.get("turn", 0) or 0),
+            "player_id": int(owner_id),
+            "kind": "block",
+            "attackers": [int(uid) for uid in attacker_uids],
+            "blocks": details,
+        })
+    return blocker_map
+
+
+def _profile_add(profiler, key, amount):
+    lock = profiler.get("_lock")
+    if lock is None:
+        profiler[key] = profiler.get(key, 0) + amount
+    else:
+        with lock:
+            profiler[key] = profiler.get(key, 0) + amount
+
+
+def _record_rules_port_dispatch(profiler, kind, elapsed):
+    lock = profiler.get("_lock")
+
+    def record():
+        profiler["rules_port_dispatches"] += 1
+        profiler["rules_port_dispatch_seconds"] += float(elapsed)
+        by_kind = profiler["rules_port_by_kind"]
+        item = by_kind.setdefault(str(kind), {"count": 0, "seconds": 0.0})
+        item["count"] += 1
+        item["seconds"] += float(elapsed)
+
+    if lock is None:
+        record()
+    else:
+        with lock:
+            record()
+
+
 def _ai_main_decision(handler, session, state, owner_id, opponent_id,
-                      profiler=None, report=None):
+                      profiler=None, report=None, pre_combat=True):
     """Apply the production evaluator's removal and board-building order."""
     started = time.perf_counter()
     evaluator = _ai_evaluator_for_seat(
@@ -364,16 +698,88 @@ def _ai_main_decision(handler, session, state, owner_id, opponent_id,
                 break
     if chosen is None:
         chosen = evaluator.get_best_board_builder(
-            pre_combat=True, include_resources=False)
+            pre_combat=pre_combat, include_resources=False)
         if chosen is not None:
             reason = "best_board_builder"
             target_uid = evaluator.choose_action_target(chosen)
 
     _record_card_decision(report, evaluator, chosen, reason)
     if profiler is not None:
-        profiler["ai_evaluations"] += 1
-        profiler["ai_evaluation_seconds"] += time.perf_counter() - started
+        _profile_add(profiler, "ai_evaluations", 1)
+        _profile_add(profiler, "ai_evaluation_seconds",
+                     time.perf_counter() - started)
     return chosen, target_uid, x_cost, reason
+
+
+def _ai_quick_decision(handler, session, state, owner_id, opponent_id,
+                       profiler=None, report=None):
+    """Choose a legal quick removal after the opponent makes a play."""
+    started = time.perf_counter()
+    evaluator = _ai_evaluator_for_seat(
+        handler, session, state, owner_id, opponent_id, profiler, report)
+    chosen = target_uid = None
+    x_cost = 0
+    reason = "no_preferred_quick_action"
+    for threat in evaluator.threatening_targets():
+        candidate, variable_cost, target = evaluator.find_removal_for(
+            threat, quick=True)
+        if (candidate is not None
+                and evaluator.is_playable(candidate) == "True"):
+            chosen, x_cost, target_uid = (
+                candidate, variable_cost, target)
+            reason = "quick_threat_removal"
+            break
+
+    _record_card_decision(
+        report, evaluator, chosen, reason, only_quick_actions=True)
+    if profiler is not None:
+        _profile_add(profiler, "ai_evaluations", 1)
+        _profile_add(profiler, "ai_evaluation_seconds",
+                     time.perf_counter() - started)
+    return chosen, target_uid, x_cost, reason
+
+
+def _play_quick_response(handler, session, session_id, state,
+                         owner_id, opponent_id, player_name, turn_number,
+                         profiler=None, report=None):
+    """Play one threat-removal quick action in the current response window."""
+    quick, target_uid, x_cost, reason = _ai_quick_decision(
+        handler, session, state, owner_id, opponent_id,
+        profiler=profiler, report=report)
+    if quick is None:
+        return False
+    payload = {"ability_data": [{
+        "target_map": ({0: [int(target_uid)]}
+                       if target_uid is not None else {}),
+        "x_cost": int(x_cost or 0),
+    }]}
+    _transaction(
+        handler, session,
+        _card_play_bytes(quick.card_uid, quick.card_type),
+        typed_payload=payload, profiler=profiler)
+    location = _db.execute(
+        "SELECT location FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session_id, int(quick.card_uid))).fetchone()
+    played = bool(location and location[0] != "hand")
+    if report is not None:
+        key = f"{quick.template_guid}:{quick.name}"
+        entry = report["card_decisions"].get(
+            str(int(owner_id)), {}).get(key)
+        if played and entry is not None:
+            entry["played"] += 1
+        elif not played:
+            _record_failed_card_play(report, owner_id, quick)
+        report["actions"].append({
+            "turn": int(turn_number),
+            "player_id": int(owner_id),
+            "player": player_name,
+            "card": quick.name,
+            "action": "quick_response",
+            "reason": reason,
+            "target_uid": target_uid,
+            "played": played,
+        })
+    return played
 
 
 def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
@@ -482,6 +888,7 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
             f"turn={state.get('turn_pid')}")
 
     turns = 0
+    observed_turn_number = int(state.get("turn_number", 1) or 1)
     guard = 0
     try:
         while turns < turns_cap and guard < AUTOPLAY_GUARD_CAP:
@@ -494,9 +901,24 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
                         f"turn_order keys="
                         f"{list(cur_session.turn_order.keys()) if isinstance(cur_session.turn_order, dict) else type(cur_session.turn_order)}")
                 break
+            # The native scheduler can enter EndTurn and the next StartTurn
+            # inside one priority pass, so sampling phase 22 misses completed
+            # turns. The persisted turn number advances exactly once at that
+            # boundary and remains observable after the scheduler settles.
+            current_turn_number = int(
+                state.get("turn_number", observed_turn_number) or
+                observed_turn_number)
+            if current_turn_number > observed_turn_number:
+                turns += current_turn_number - observed_turn_number
+                observed_turn_number = current_turn_number
+                if turns >= turns_cap:
+                    break
             phase = state.get("phase")
             turn_pid = state.get("turn_pid")
             opp_pid = pids[1] if turn_pid == pids[0] else pids[0]
+            if any(int(state.get(f"hp_{pid}", 20) or 0) <= 0
+                   for pid in pids):
+                break
             # A triggered ability is awaiting a target: answer it (choose the
             # first legal candidate) before doing anything else.
             pend = state.get("pending_trigger")
@@ -514,13 +936,22 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
                 if candidates:
                     _transaction(player_handlers[chooser_pid], session,
                                  b"SetAbilityActivationDataTransaction;" +
-                                 _mk_uid_bytes(candidates[0]))
+                                 _mk_uid_bytes(candidates[0]),
+                                 typed_payload={
+                                     "AbilityInstanceId": int(
+                                         pend.get("instance_id", 1) or 1),
+                                     "AbilityActivationData": {
+                                         "TargetMap": {
+                                             str(int(pend.get(
+                                                 "target_index", 0) or 0)):
+                                             [int(candidates[0])]
+                                         }
+                                     }
+                                 })
                     continue
             if phase in OPENING_SETUP_PHASES:
                 # Setup phases are driven above; a stray pass should not loop.
                 break
-            if phase == game_engine.ETurnPhases.EndTurn:
-                turns += 1
             # Main phases: the turn player plays a resource then an affordable
             # troop; the opponent passes immediately.
             if phase in (game_engine.ETurnPhases.FirstMainPhase,
@@ -531,13 +962,37 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
                     h = player_handlers[turn_pid]
                     res_rows = db_hand_resources_with_template(
                         session_id, turn_pid)
-                    if res_rows and not db_zone_card_count(
-                            session_id, turn_pid, "PlayedResources"):
+                    if res_rows and not state.get(
+                            f"res_played_{turn_pid}", 0):
+                        resource_row = res_rows[0]
                         _transaction(h, session,
                                      _card_play_bytes(
-                                         res_rows[0][1], "Resource"))
+                                         resource_row[1], "Resource"),
+                                     profiler=profiler)
                         _transaction(player_handlers[opp_pid], session,
-                                     b"PassPriorityTransaction;")
+                                     b"PassPriorityTransaction;",
+                                     profiler=profiler)
+                        resource_location = _db.execute(
+                            "SELECT location FROM game_cards WHERE session_id=? "
+                            "AND card_uid=?", (session_id,
+                                                 int(resource_row[1]))).fetchone()
+                        resource_played = bool(
+                            resource_location
+                            and resource_location[0] != "hand")
+                        _record_resource_decision(
+                            report, turn_pid, resource_row,
+                            resource_played)
+                        if report is not None:
+                            report["actions"].append({
+                                "turn": turns + 1,
+                                "player_id": int(turn_pid),
+                                "player": deck_specs[pids.index(turn_pid)]["name"],
+                                "card": _db.execute(
+                                    "SELECT name FROM card_templates WHERE guid=?",
+                                    (str(resource_row[2]),)).fetchone()[0],
+                                "reason": "resource_play",
+                                "played": resource_played,
+                            })
 
                     latest = gs.find_session_by_player(
                         game_engine.UID.make(
@@ -546,7 +1001,9 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
 
                     chosen, target_uid, x_cost, reason = _ai_main_decision(
                         h, session, state, turn_pid, opp_pid,
-                        profiler=profiler, report=report)
+                        profiler=profiler, report=report,
+                        pre_combat=(phase ==
+                                    game_engine.ETurnPhases.FirstMainPhase))
                     if chosen is not None:
                         typed_payload = {"ability_data": [{
                             "target_map": ({0: [int(target_uid)]}
@@ -565,21 +1022,41 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
                         played = bool(location and location[0] != "hand")
                         if report is not None:
                             key = f"{chosen.template_guid}:{chosen.name}"
-                            entry = report["card_decisions"].get(key)
+                            entry = report["card_decisions"].get(
+                                str(int(turn_pid)), {}).get(key)
                             if entry is not None and played:
                                 entry["played"] += 1
+                            elif not played:
+                                _record_failed_card_play(
+                                    report, turn_pid, chosen)
                             report["actions"].append({
                                 "turn": turns + 1,
+                                "player_id": int(turn_pid),
                                 "player": deck_specs[pids.index(turn_pid)]["name"],
                                 "card": chosen.name,
                                 "reason": reason,
                                 "target_uid": target_uid,
                                 "played": played,
                             })
-                    _transaction(player_handlers[opp_pid], session,
-                                 b"PassPriorityTransaction;")
+                    if chosen is not None:
+                        latest = gs.find_session_by_player(
+                            game_engine.UID.make(
+                                PLAYER_UID_TYPE, pids[0]).to_uint64()) or session
+                        response_state = pvp_load_state(latest) or state
+                        deck_name = deck_specs[pids.index(opp_pid)]["name"]
+                        quick_played = _play_quick_response(
+                            player_handlers[opp_pid], session, session_id,
+                            response_state, opp_pid, turn_pid, deck_name,
+                            turns + 1, profiler=profiler, report=report)
+                    else:
+                        quick_played = False
+                    if not quick_played:
+                        _transaction(player_handlers[opp_pid], session,
+                                     b"PassPriorityTransaction;",
+                                     profiler=profiler)
                     _transaction(player_handlers[turn_pid], session,
-                                 b"PassPriorityTransaction;")
+                                 b"PassPriorityTransaction;",
+                                 profiler=profiler)
                     continue
 
                 _transaction(player_handlers[opp_pid], session,
@@ -604,77 +1081,76 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
                 continue
             # DeclareAttack: the turn player swings with all eligible troops.
             if phase == game_engine.ETurnPhases.DeclareAttack:
-                rows = db_warzone_troop_attributes(session_id, turn_pid)
-                attackers = []
-                for cu, cstate, c_a, temporary_a, t_a, abilities in rows:
-                    cstate = cstate or 0
-                    attrs = (t_a or 0) | (c_a or 0) | (temporary_a or 0)
-                    if (cstate & game_engine.ECardStates.Tapped) \
-                            or (attrs & game_engine.ECardAttributes.CantAttack):
-                        continue
-                    if not (cstate & game_engine.ECardStates.StartedATurnOnYourSide) \
-                            and not (attrs & game_engine.ECardAttributes.Speed):
-                        continue
-                    attackers.append(int(cu))
+                attackers, attack_reason = _ai_attack_decision(
+                    player_handlers[turn_pid], session, state, turn_pid,
+                    opp_pid, profiler=profiler, report=report)
                 champ_map = state.get("champ_map") or {}
-                my_champ = int(champ_map.get(str(turn_pid), 0))
+                opp_champ = int(champ_map.get(str(opp_pid), 0))
                 if attackers:
                     _transaction(player_handlers[turn_pid], session,
-                                 _attack_bytes(attackers, my_champ))
-                _transaction(player_handlers[opp_pid], session,
-                             b"PassPriorityTransaction;")
+                                 _attack_bytes(attackers, opp_champ),
+                                 typed_payload={"m_Attacks": [{
+                                     "DefendingCardId": opp_champ,
+                                     "AttackingCardIds": attackers,
+                                 }]},
+                                 profiler=profiler)
+                if report is not None:
+                    report["actions"].append({
+                        "turn": turns + 1,
+                        "player_id": int(turn_pid),
+                        "player": deck_specs[pids.index(turn_pid)]["name"],
+                        "action": "attack",
+                        "reason": attack_reason,
+                        "attacker_uids": attackers,
+                    })
+                quick_played = False
+                if attackers:
+                    latest = gs.find_session_by_player(
+                        game_engine.UID.make(
+                            PLAYER_UID_TYPE, pids[0]).to_uint64()) or session
+                    response_state = pvp_load_state(latest) or state
+                    deck_name = deck_specs[pids.index(opp_pid)]["name"]
+                    quick_played = _play_quick_response(
+                        player_handlers[opp_pid], session, session_id,
+                        response_state, opp_pid, turn_pid, deck_name,
+                        turns + 1, profiler=profiler, report=report)
+                if not quick_played:
+                    _transaction(player_handlers[opp_pid], session,
+                                 b"PassPriorityTransaction;",
+                                 profiler=profiler)
                 _transaction(player_handlers[turn_pid], session,
-                             b"PassPriorityTransaction;")
+                             b"PassPriorityTransaction;",
+                             profiler=profiler)
                 continue
             # DeclareDefense: the defender blocks with every eligible troop.
             if phase == game_engine.ETurnPhases.DeclareDefense:
                 att_state = state
                 attacker_uids = [int(k) for k in
                                  (att_state.get("attackers") or {})]
-                blocker_rows = db_warzone_troop_stats(session_id, opp_pid)
-                blocker_attrs = {
-                    row[0]: (row[2] or 0) | (row[3] or 0) | (row[4] or 0)
-                    for row in db_warzone_troop_attributes(session_id, opp_pid)
-                }
-                avail = []
-                for cu, atk, bdef, dmod, dmg, cstate, position in blocker_rows:
-                    cstate = cstate or 0
-                    if (cstate & game_engine.ECardStates.Tapped) or (
-                            blocker_attrs.get(cu, 0)
-                            & game_engine.ECardAttributes.CantBlock):
-                        continue
-                    avail.append((int(cu), atk or 0,
-                                  (bdef or 0) + (dmod or 0) - (dmg or 0)))
-                # Best single blocker per attacker: the cheapest that survives
-                # the hit, else the biggest (trades), else chump the biggest
-                # threat.  One blocker per attacker — damage gets through.
-                blockers = []
-                att_stats = {}
-                for a_uid in attacker_uids:
-                    row = db_card_combat_identity(session_id, int(a_uid))
-                    att_stats[int(a_uid)] = int(row[3] or 0) if row else 0
-                for a_uid in sorted(attacker_uids,
-                                    key=lambda u: -att_stats.get(int(u), 0)):
-                    a_atk = att_stats.get(int(a_uid), 0)
-                    if not avail:
-                        break
-                    survivors = [b for b in avail if b[2] > a_atk]
-                    if survivors:
-                        pick = min(survivors, key=lambda b: b[2])
-                    else:
-                        pick = max(avail, key=lambda b: b[1])
-                    blockers.append(pick[0])
-                    avail.remove(pick)
+                blockers = _ai_block_decision(
+                    player_handlers[opp_pid], session, state, opp_pid,
+                    turn_pid, attacker_uids, profiler=profiler,
+                    report=report)
                 champ_map = state.get("champ_map") or {}
                 opp_champ = int(champ_map.get(str(opp_pid), 0))
-                if attacker_uids and blockers:
+                if attacker_uids:
                     _transaction(player_handlers[opp_pid], session,
                                  _defense_bytes(attacker_uids, blockers,
-                                                opp_champ))
+                                                opp_champ),
+                                 typed_payload={"m_DefenseDeclarations": [
+                                     {"AttackerId": int(attacker),
+                                      "DefendingCardIds": [
+                                          int(uid) for uid in blocker_list]}
+                                     for attacker, blocker_list in
+                                     blockers.items()
+                                 ]},
+                                 profiler=profiler)
                 _transaction(player_handlers[opp_pid], session,
-                             b"PassPriorityTransaction;")
+                             b"PassPriorityTransaction;",
+                             profiler=profiler)
                 _transaction(player_handlers[turn_pid], session,
-                             b"PassPriorityTransaction;")
+                             b"PassPriorityTransaction;",
+                             profiler=profiler)
                 continue
             # Both players pass the phase (the non-turn player passes first so
             # the turn player's pass completes the pair).
@@ -715,61 +1191,151 @@ def main(games=DEFAULT_AUTOPLAY_GAMES):
 def _json_report(report):
     copied = dict(report)
     copied["card_decisions"] = {
-        key: {**entry, "reasons": dict(entry["reasons"])}
-        for key, entry in report.get("card_decisions", {}).items()
+        owner: {
+            key: {**entry, "reasons": dict(entry["reasons"])}
+            for key, entry in decisions.items()
+        }
+        for owner, decisions in report.get("card_decisions", {}).items()
+    }
+    copied["profile"] = {
+        key: value for key, value in report.get("profile", {}).items()
+        if not key.startswith("_")
     }
     return copied
 
 
 def main_fra(deck_guids=None, turns_cap=30, show_profile=False,
-             report_path=None):
+             report_path=None, runs=1, seed=900):
     specs = _fra_encounter_specs(deck_guids)
     profiler = {
+        "_lock": threading.Lock(),
         "rules_transactions": 0,
         "rules_transaction_seconds": 0.0,
+        "rules_port_dispatches": 0,
+        "rules_port_dispatch_seconds": 0.0,
+        "rules_port_by_kind": {},
         "ai_evaluations": 0,
         "ai_evaluation_seconds": 0.0,
+        "combat_evaluations": 0,
+        "combat_evaluation_seconds": 0.0,
     }
-    report = {"decks": {}, "champion_uids": {}, "actions": [],
-              "card_decisions": {}}
-    turns, err = _play_one_game(
-        900, turns_cap=max(0, int(turns_cap)), deck_specs=specs,
-        profiler=profiler, report=report)
-    print(f"FRA duel: {specs[0]['name']} vs {specs[1]['name']} — "
-          f"{turns}/{turns_cap} turns")
-    if err:
-        report["error"] = err
-        print("simulation stopped with an error:")
-        print(err[:3000])
+    turn_limit = max(0, int(turns_cap))
+    run_count = max(1, int(runs))
+    first_seed = int(seed)
+    report = {"decks": {}, "runs": [], "actions": [],
+              "combat_decisions": [], "card_decisions": {}}
+    any_error = False
+    for run_index in range(run_count):
+        run_seed = first_seed + run_index
+        run_report = {"champion_uids": {}, "actions": [],
+                      "combat_decisions": [], "card_decisions": {}}
+        turns, err = _play_one_game(
+            run_seed, turns_cap=turn_limit, deck_specs=specs,
+            profiler=profiler, report=run_report)
+        if not report["decks"]:
+            report["decks"] = dict(run_report.get("decks") or {})
+        run_summary = {
+            "seed": run_seed,
+            "turns": turns,
+            "health": dict(run_report.get("health") or {}),
+            "last_phase": run_report.get("last_phase"),
+        }
+        if err:
+            any_error = True
+            run_summary["error"] = err
+            print(f"FRA run seed {run_seed}: stopped after {turns} turns")
+            print(err)
+        else:
+            print(f"FRA run seed {run_seed}: {turns}/{turn_limit} turns; "
+                  f"health={run_summary['health']}")
+        report["runs"].append(run_summary)
+        for action in run_report.get("actions", ()):
+            report["actions"].append({
+                "run": run_index + 1, "seed": run_seed, **action})
+        for decision in run_report.get("combat_decisions", ()):
+            report["combat_decisions"].append({
+                "run": run_index + 1, "seed": run_seed, **decision})
+        for owner_id, decisions in run_report.get(
+                "card_decisions", {}).items():
+            destination = report["card_decisions"].setdefault(owner_id, {})
+            for key, entry in decisions.items():
+                total = destination.setdefault(key, {
+                    "template_guid": entry["template_guid"],
+                    "name": entry["name"],
+                    "seen": 0,
+                    "selected": 0,
+                    "played": 0,
+                    "reasons": Counter(),
+                })
+                total["seen"] += entry["seen"]
+                total["selected"] += entry["selected"]
+                total["played"] += entry["played"]
+                total["reasons"].update(entry["reasons"])
 
-    print("AI card decisions (played / selected / seen; unplayed reasons):")
-    entries = sorted(report["card_decisions"].values(),
-                     key=lambda item: (item["played"], -item["seen"],
-                                       item["name"].lower()))
-    for entry in entries:
-        if entry["played"] >= entry["seen"]:
-            continue
-        reasons = ", ".join(
-            f"{reason}={count}" for reason, count in
-            sorted(entry["reasons"].items()))
-        print(f"  {entry['name']}: {entry['played']}/{entry['selected']} / "
-              f"{entry['seen']} — {reasons}")
+    print(f"FRA duel: {specs[0]['name']} vs {specs[1]['name']} — "
+          f"{run_count} run(s), max {turn_limit} turns each")
+
+    print("AI card decisions by seat (played / selected / seen):")
+    for owner_id, deck in report["decks"].items():
+        print(f"  {deck['name']} (seat {owner_id})")
+        entries = sorted(report["card_decisions"].get(owner_id, {}).values(),
+                         key=lambda item: (item["played"], -item["seen"],
+                                           item["name"].lower()))
+        for entry in entries:
+            if entry["played"] >= entry["seen"]:
+                continue
+            reasons = ", ".join(
+                f"{reason}={count}" for reason, count in
+                sorted(entry["reasons"].items()))
+            print(f"    {entry['name']}: {entry['played']}/"
+                  f"{entry['selected']} / {entry['seen']} — {reasons}")
 
     if show_profile:
+        evaluations = int(profiler["ai_evaluations"])
+        combat_evaluations = int(profiler["combat_evaluations"])
+        port_dispatches = int(profiler["rules_port_dispatches"])
         print("Profile:")
-        print(f"  AI evaluator: {profiler['ai_evaluation_seconds'] * 1000:.2f} ms "
-              f"across {profiler['ai_evaluations']} decisions")
-        print(f"  Rules transaction path: "
+        if evaluations:
+            average = profiler["ai_evaluation_seconds"] * 1000 / evaluations
+            print(f"  AI evaluator: "
+                  f"{profiler['ai_evaluation_seconds'] * 1000:.2f} ms "
+                  f"across {evaluations} decisions ({average:.2f} ms/decision)")
+        else:
+            print("  AI evaluator: 0 decisions")
+        if combat_evaluations:
+            average = profiler["combat_evaluation_seconds"] * 1000 / \
+                combat_evaluations
+            print(f"  AI combat evaluator: "
+                  f"{profiler['combat_evaluation_seconds'] * 1000:.2f} ms "
+                  f"across {combat_evaluations} decisions "
+                  f"({average:.2f} ms/decision)")
+        else:
+            print("  AI combat evaluator: 0 decisions")
+        if port_dispatches:
+            print(f"  RulesPort dispatch: "
+                  f"{profiler['rules_port_dispatch_seconds'] * 1000:.2f} ms "
+                  f"across {port_dispatches} queued transaction dispatches "
+                  f"(includes PvP projection callbacks)")
+        else:
+            print("  RulesPort dispatch: no queued transactions")
+        for kind, item in sorted(profiler["rules_port_by_kind"].items()):
+            print(f"    {kind}: {item['seconds'] * 1000:.2f} ms "
+                  f"across {item['count']}")
+        print(f"  End-to-end transaction path: "
               f"{profiler['rules_transaction_seconds'] * 1000:.2f} ms "
               f"across {profiler['rules_transactions']} transactions")
-    report["profile"] = profiler
-    report["max_turns"] = int(turns_cap)
+    report["profile"] = {
+        key: value for key, value in profiler.items()
+        if not key.startswith("_")
+    }
+    report["max_turns"] = turn_limit
+    report["seed"] = first_seed
     if report_path:
         with open(report_path, "w", encoding="utf-8") as output:
             json.dump(_json_report(report), output, indent=2, sort_keys=True)
             output.write("\n")
         print(f"Wrote report: {report_path}")
-    return 1 if err else 0
+    return 1 if any_error else 0
 
 
 if __name__ == "__main__":
@@ -780,15 +1346,24 @@ if __name__ == "__main__":
                         help="run a duel between two FRA encounter decks")
     parser.add_argument("--turn-limit", type=int, default=30,
                         help="maximum completed turns in FRA mode (default: 30)")
+    parser.add_argument("--runs", type=int, default=1,
+                        help="number of seeded FRA duels to aggregate")
+    parser.add_argument("--seed", type=int, default=900,
+                        help="first shuffle seed for FRA mode (default: 900)")
     parser.add_argument("--profile", action="store_true",
-                        help="print evaluator and PvP transaction timings")
+                        help="print AI, RulesPort, and transaction timings")
     parser.add_argument("--json-report", metavar="PATH",
                         help="write card decisions and actions as JSON")
     args = parser.parse_args()
     if args.fra is not None:
         if len(args.fra) not in (0, 2):
             parser.error("--fra accepts either no GUIDs or exactly two")
+        if args.runs < 1:
+            parser.error("--runs must be at least 1")
+        if _SIMULATION_DB_COPY:
+            print("Simulation database: disposable snapshot")
         raise SystemExit(main_fra(
             args.fra or None, turns_cap=args.turn_limit,
-            show_profile=args.profile, report_path=args.json_report))
+            show_profile=args.profile, report_path=args.json_report,
+            runs=args.runs, seed=args.seed))
     main(args.games)

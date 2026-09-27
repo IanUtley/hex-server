@@ -552,9 +552,17 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
                 current, session, raw, my_pid))
         return True
     if kind == "attack":
-        return bool(_pvp_declare_attackers(current, session, raw, my_pid))
+        # RulesPort has already validated and staged these declarations.
+        # Pass the accepted attacker IDs through so the legacy event
+        # projection does not re-check them against a stale PvP snapshot and
+        # accidentally drop a valid attack.
+        return bool(_pvp_declare_attackers(
+            current, session, raw, my_pid,
+            declarations=payload.get("declarations")))
     if kind == "defense":
-        return bool(_pvp_declare_blockers(current, session, raw, my_pid))
+        return bool(_pvp_declare_blockers(
+            current, session, raw, my_pid,
+            declarations=payload.get("declarations")))
     if kind == "ready":
         return True
     if kind == "damage":
@@ -1264,6 +1272,17 @@ def attach_pvp_rules_port(handler, session, game, state):
             live["priority_pid"] = (defender
                                      if phase == _ge.ETurnPhases.DeclareDefense
                                      else turn_pid)
+        if (phase == _ge.ETurnPhases.DeclareDefensePriorityWindow and
+                live.get("attackers") and not live.get("blockers") and
+                _pvp_defender_blockable_count(session, live) <= 0):
+            # The native graph skips DeclareDefense when nobody can block.
+            # Keep the client-visible empty declaration from the old
+            # auto-pass path, and persist it to prevent duplicate publication
+            # if this phase is re-entered after reconnect.
+            pvp_push_empty_blockers(session, live)
+            live["blockers"] = {
+                str(attacker): []
+                for attacker in (live.get("attackers") or {})}
         if phase == _ge.ETurnPhases.Discard:
             try:
                 live["discard_required"] = (
@@ -7740,7 +7759,11 @@ def _pvp_send_same_events(session, game, pl_t, ai_t):
                    "event_sink", None)
     if sink is not None:
         sink.drain_into(game)
-    pids = [int(pl_t.uid64) >> 8, int(ai_t.uid64) >> 8]
+    # Native RulesPort projections can retain packed integer UIDs, while the
+    # legacy callers usually pass UID wrappers.  Both represent the same
+    # ServicePlayer identity at this packet boundary.
+    pids = [int(getattr(pl_t, "uid64", pl_t)) >> 8,
+            int(getattr(ai_t, "uid64", ai_t)) >> 8]
     # Visibility projection belongs at the shared packet boundary as deck
     # movement can change the authorized top card outside an options refresh.
     # The event itself is tagged for its owner and filtered per recipient by
@@ -8020,6 +8043,11 @@ class _PvpChainHost:
 
     def chain_card_data(self, game, scid, template_guid):
         return self.handler._card_full_data(game, scid, template_guid)
+
+    def _card_full_data(self, game, scid, template_guid, instance_id=None):
+        """Expose the shared effect-context card projection hook."""
+        return self.handler._card_full_data(
+            game, scid, template_guid, instance_id)
 
     def chain_dispatch(self, session, game, state, player_uid, ai_uid,
                        event_type, source_uid, owner_id, **event_data):
@@ -9494,7 +9522,8 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
+def _pvp_declare_attackers(handler, session, inner_bytes, my_pid,
+                           declarations=None):
     """Record the turn player's declared attackers and push the combat
     listing to both players."""
     pids = db_game_session_pids(session.session_id)
@@ -9505,7 +9534,14 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
     if state.get("turn_pid") != my_pid:
         return False
     attacker_uids = []
-    if isinstance(inner_bytes, bytes):
+    if declarations is not None:
+        for _defender, declared in declarations:
+            for attacker in declared or ():
+                try:
+                    attacker_uids.append(int(attacker))
+                except (TypeError, ValueError):
+                    continue
+    elif isinstance(inner_bytes, bytes):
         for m_du in re.finditer(rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});',
                                 inner_bytes):
             try:
@@ -9515,32 +9551,31 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
                     attacker_uids.append(int(uid64))
             except Exception:
                 continue
-    # Treat the transaction as untrusted input.  The client normally only
-    # includes cards marked with ECardUsage.Attack, but a stale/forged
-    # transaction must not turn Constants, Artifacts, or summoning-sick cards
-    # into attackers.  This also keeps the server rule identical to the list
-    # offered by pvp_push_attack_options above.
-    wz_rows = [
-        (uid, card_state, attrs)
-        for uid, card_state, _card_type, attrs in
-        db_warzone_attack_option_rows(
-            session.session_id, my_pid, conn=_db)
-    ]
-    from rules_port.static_rules import effective_attributes
-    wz = set()
-    for uid, cstate, attrs in wz_rows:
-        cstate = int(cstate or 0)
-        attrs = int(attrs or 0) | int(effective_attributes(
-            _db, session.session_id, state, int(uid)) or 0)
-        if ((cstate & (_ge.ECardStates.Tapped |
-                       _ge.ECardStates.Attacking)) or
-                attrs & (_ge.ECardAttributes.CantAttack |
-                         _ge.ECardAttributes.Defensive) or
-                not ((cstate & _ge.ECardStates.StartedATurnOnYourSide) or
-                     attrs & _ge.ECardAttributes.Speed)):
-            continue
-        wz.add(int(uid))
-    attacker_uids = [u for u in attacker_uids if u in wz]
+    if declarations is None:
+        # Legacy ingress has not crossed RulesPort validation, so still treat
+        # the raw transaction as untrusted and enforce the authored combat
+        # eligibility checks here.
+        wz_rows = [
+            (uid, card_state, attrs)
+            for uid, card_state, _card_type, attrs in
+            db_warzone_attack_option_rows(
+                session.session_id, my_pid, conn=_db)
+        ]
+        from rules_port.static_rules import effective_attributes
+        wz = set()
+        for uid, cstate, attrs in wz_rows:
+            cstate = int(cstate or 0)
+            attrs = int(attrs or 0) | int(effective_attributes(
+                _db, session.session_id, state, int(uid)) or 0)
+            if ((cstate & (_ge.ECardStates.Tapped |
+                           _ge.ECardStates.Attacking)) or
+                    attrs & (_ge.ECardAttributes.CantAttack |
+                             _ge.ECardAttributes.Defensive) or
+                    not ((cstate & _ge.ECardStates.StartedATurnOnYourSide) or
+                         attrs & _ge.ECardAttributes.Speed)):
+                continue
+            wz.add(int(uid))
+        attacker_uids = [u for u in attacker_uids if u in wz]
     champ_map = state.get("champ_map") or {}
     my_champ = int(champ_map.get(str(my_pid), 0))
     # MERGE the manually-committed attackers with what's ALREADY declared in
@@ -9638,7 +9673,7 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
     # No attackers declared (e.g. every troop is summoning sick): skip the
     # remaining combat steps straight to SecondMainPhase instead of leaving
     # the game stuck waiting for passes through DeclareDefense/AssignDamage.
-    if not attackers:
+    if not attackers and declarations is None:
         pvp_skip_to_second_main(session, state)
         return True
     # Attackers WERE declared: the combat now moves to the defender.  Advance
@@ -9646,7 +9681,8 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
     # DeclareDefense (14) and hand the DEFENDER priority + blocker options so
     # they can set up blockers.  The responder (attacker) gets a QuickAction
     # window at 13; the defender acts at 14.
-    pvp_advance_to_declare_defense(session, state)
+    if declarations is None:
+        pvp_advance_to_declare_defense(session, state)
     return True
 
 
@@ -9808,7 +9844,8 @@ def pvp_phase_after_blockers(session, state):
         pvp_combat_has_swiftstrike(session, state))
 
 
-def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
+def _pvp_declare_blockers(handler, session, inner_bytes, my_pid,
+                          declarations=None):
     """Record the defender's declared blockers and push BlockersAssigned to
     both players."""
     pids = db_game_session_pids(session.session_id)
@@ -9822,7 +9859,21 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
     my_wz = set(r[0] for r in db_card_uids_in_zone(
         session.session_id, my_pid, "warzone", conn=_db))
     all_uids = []
-    if isinstance(inner_bytes, bytes):
+    blockers_map = {}
+    if declarations is not None:
+        for attacker, blockers in declarations:
+            try:
+                attacker_uid = int(getattr(attacker, "uid64", attacker))
+            except (TypeError, ValueError):
+                continue
+            parsed = []
+            for blocker in blockers or ():
+                try:
+                    parsed.append(int(getattr(blocker, "uid64", blocker)))
+                except (TypeError, ValueError):
+                    continue
+            blockers_map[attacker_uid] = parsed
+    elif isinstance(inner_bytes, bytes):
         for m_du in re.finditer(rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});',
                                 inner_bytes):
             try:
@@ -9832,17 +9883,17 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
                     all_uids.append(int(uid64))
             except Exception:
                 continue
-    blockers_map = {}
-    cur = None
-    for u in all_uids:
-        if u in attackers:
-            cur = u
-            blockers_map.setdefault(cur, [])
-        elif cur is not None and u in my_wz:
-            from rules_port.combat_rules import can_block
-            if can_block(_db, session.session_id, _pvp_fra_view(state, opp_pid, my_pid),
-                         cur, u):
-                blockers_map[cur].append(u)
+    if declarations is None:
+        cur = None
+        for u in all_uids:
+            if u in attackers:
+                cur = u
+                blockers_map.setdefault(cur, [])
+            elif cur is not None and u in my_wz:
+                from rules_port.combat_rules import can_block
+                if can_block(_db, session.session_id, _pvp_fra_view(state, opp_pid, my_pid),
+                             cur, u):
+                    blockers_map[cur].append(u)
     state["blockers"] = {str(k): [str(b) for b in v]
                          for k, v in blockers_map.items()}
     # Mark each blocker Blocking in the DB so reconnect / HasBlocked logic and
@@ -9889,7 +9940,8 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
     # StrikeDamage (16) -> ... -> AssignDamage (18) -> SecondMain (19).
     # (Without this the game sat on DeclareDefense forever once the defender
     # declared — even declaring NO blockers.)
-    _pvp_advance_past_declare_defense(session, state)
+    if declarations is None:
+        _pvp_advance_past_declare_defense(session, state)
     return True
 
 

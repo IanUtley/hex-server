@@ -2179,17 +2179,18 @@ class HCPHandler(ProfileStreamMixin):
                     payload = dict(payload or {})
                     payload["_triggered_continuation"] = True
                     command = replace(command, typed_payload=payload)
-            elif (getattr(command, "is_set_ability_data", False) and
-                    _be_trigger_bridge.load_state(session).get(
-                        "pending_deck_search")):
-                # A class-23 deck/revealed-card picker ("put a revealed troop
-                # into your hand") is a host checkpoint rather than a live
-                # RulesPort ability instance, so its answer must reach the
-                # same continuation resolver instead of being normalized into
-                # an activation of an unknown instance and dropped.
-                payload = dict(payload or {})
-                payload["_triggered_continuation"] = True
-                command = replace(command, typed_payload=payload)
+            elif getattr(command, "is_set_ability_data", False):
+                _bridge_state = _be_trigger_bridge.load_state(session)
+                if (_bridge_state.get("pending_trigger") or
+                        _bridge_state.get("pending_deck_search")):
+                    # Class-23 target/search answers are persisted host
+                    # continuations rather than hydrated RulesPort ability
+                    # instances. Route them through the continuation
+                    # projection instead of trying to resume a missing native
+                    # activation instance.
+                    payload = dict(payload or {})
+                    payload["_triggered_continuation"] = True
+                    command = replace(command, typed_payload=payload)
         except Exception:
             pass
         facts = getattr(port, "runtime_facts", None)
