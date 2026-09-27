@@ -2522,8 +2522,51 @@ def test_booby_trap_damages_its_owners_champion(db):
     assert bstate["player_health"] == 20, bstate
 
 
+def test_construction_plans_count_the_exhausted_troops(db):
+    """"Exhaust one or more Dwarves and/or Robots you control: add a
+    construction counter to this for each troop exhausted this way."  The
+    count comes from the ability's ExhaustedCards list, and the counter goes
+    on the Plans, not on the exhausted troop the client flattened into
+    TargetMap[0]."""
+    from rules_port.resolution import resolve_port_ability
+    plan, bot, hornet = "aa325145-6d3d-474e-b990-608619620fe8", "02ed9695-207a-4c23-a3f8-13c7b001203d", "93cf512d-8b01-4e30-bf22-f02bf81cf12b"
+    db.execute("DELETE FROM game_cards")
+    db.execute("CREATE TABLE IF NOT EXISTS card_counter_templates "
+               "(template_id TEXT PRIMARY KEY, name TEXT, description TEXT)")
+    db.execute("INSERT OR IGNORE INTO card_counter_templates VALUES "
+               "('c277b077-04ae-5020-09fb-d5831d3358b8', 'Construction', '')")
+    for tpl in (plan, bot, hornet):
+        _copy_card(db, tpl)
+    add_card(db, 0x401, 5, plan, loc="warzone")
+    add_card(db, 0x301, 5, bot, loc="warzone")
+    add_card(db, 0x501, 5, bot, loc="warzone")
+    db.commit()
+    pl_t, ai_t = _pl_ai()
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "stack": [], "_rules_port_attached": True}
+
+    def activate(exhausted):
+        resolve_port_ability(
+            HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(), db,
+            pl_t, ai_t, bstate, "257418ed-24ec-98cd-d6f7-faeb02de4d50", 0x401, 5,
+            target_map={0: (exhausted,)}, instance_id=1)
+
+    def plan_row():
+        return db.execute("SELECT template_guid, permanent_buffs FROM game_cards "
+                          "WHERE card_uid=?", (0x401,)).fetchone()
+
+    activate(0x301)
+    assert json.loads(plan_row()[1])["counters"] == {"construction": 1}, plan_row()
+    assert json.loads(db.execute("SELECT permanent_buffs FROM game_cards "
+                                 "WHERE card_uid=?", (0x301,)).fetchone()[0]
+                      or "{}").get("counters", {}) == {}
+    activate(0x501)   # two counters: remove them and become a Hornet Bot
+    assert plan_row()[0] == hornet, plan_row()
+
+
 def _main():
-    tests = (test_brood_creeper_damage_to_opposing_champion_summons,
+    tests = (test_construction_plans_count_the_exhausted_troops,
+             test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
              test_lose_life_modifier_is_not_damage,
