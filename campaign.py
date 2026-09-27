@@ -969,7 +969,7 @@ def _activate_az1_transition(db, champ_id, cfg):
     row = pve_db.db_latest_campaign_state(champ_id, "PANORAMA", db)
     if not row:
         return None
-    pano_id, state_json = row
+    pano_id, _uid_lo, _uid_hi, state_json = row
     state = json.loads(state_json) if state_json else None
     if not state:
         return None

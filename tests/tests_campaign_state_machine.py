@@ -1526,6 +1526,44 @@ def test_dungeon_win_count_tracks_streak_for_pregame_talents():
         os.unlink(path)
 
 
+def test_post_crayburn_report_opens_the_az1_transition():
+    """Finishing the Crayburn report conversation hands the race NPC the
+    Feralroot travel conversation (every race; it used to crash on the
+    four-column campaign row and drop the connection)."""
+    import pve_db
+    db, path = cloned_db()
+    try:
+        for race, cfg in campaign._AZ0_RACE_CONFIG.items():
+            if not cfg.get("transition_conv"):
+                continue
+            champion_id = 9000 + race
+            state = {"CurState": "EXPLORE", "ALoc": cfg["quest_npc"],
+                     "PostCrayburnReport": True, "VisLocs": [
+                         campaign._convo_location(cfg["intro_npc"], cfg["intro_conv"]),
+                         campaign._convo_location(cfg["quest_npc"], "report",
+                                                  turninquest=True)]}
+            pano_id = campaign._new_camp_id(db)
+            pve_db.db_create_campaign(pano_id, 1, champion_id, 1, "Tester",
+                                      "AZ1", "PANORAMA", json.dumps(state), db,
+                                      is_started=True)
+            result = campaign._activate_az1_transition(db, champion_id, cfg)
+            assert result, race
+            assert result[0] == pano_id
+            saved = json.loads(db.execute(
+                "SELECT state_json FROM campaigns WHERE id=?",
+                (pano_id,)).fetchone()[0])
+            locs = {loc["Data"].get("node") or loc["Data"].get("name"): loc["Data"]
+                    for loc in saved["VisLocs"]}
+            assert locs[cfg["quest_npc"]]["completed"] is True, (race, locs)
+            intro = locs[cfg["intro_npc"]]
+            assert intro["conversationId"] == cfg["transition_conv"], (race, intro)
+            assert intro["enabled"] and intro["visible"] and not intro["completed"]
+            assert saved["ALoc"] is None and saved["CurState"] == "EXPLORE"
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     tests = [
         test_cross_zila_objective_is_linked_to_savage_lord,
@@ -1555,6 +1593,7 @@ if __name__ == "__main__":
         test_crayburn_defeat_conversation_keeps_encounter_retryable,
         test_crayburn_locked_future_node_does_not_replace_tower_gate_start,
         test_dungeon_win_count_tracks_streak_for_pregame_talents,
+        test_post_crayburn_report_opens_the_az1_transition,
     ]
     for test in tests:
         test()
