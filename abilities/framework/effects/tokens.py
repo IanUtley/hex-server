@@ -4,6 +4,7 @@ import json
 import random
 import re
 import sqlite3
+from typing import Any, cast
 
 import game_engine
 
@@ -490,7 +491,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     typed_exhausted = effect_template_value(
         db, bstate, effect_guid, "m_EntersPlayExhausted")
     if typed_exhausted is not None:
-        enters_exhausted = int(typed_exhausted or 0)
+        enters_exhausted = int(cast(Any, typed_exhausted) or 0)
     typed_attacking = effect_template_value(
         db, bstate, effect_guid, "m_EntersPlayAttacking")
     copy_gems = bool(effect_template_value(

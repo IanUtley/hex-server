@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from .actions import AbilityResolutionState
 
 
@@ -80,7 +82,8 @@ def _uids(values):
     return tuple(out)
 
 
-def _list_target_values(battle_state, ability, kind, source_uid):
+def _list_target_values(battle_state, ability, kind, source_uid, target_spec,
+                        db, session_id):
     """Resolve the per-ability stored/drawn/buried/voided/created card lists.
 
     C# SourceStored/Drawn/Buried/Created/VoidedTargetTemplate enumerate the
@@ -91,17 +94,43 @@ def _list_target_values(battle_state, ability, kind, source_uid):
     state = battle_state or {}
     raw_guid = str(getattr(ability, "ability_template_id", "") or "")
     guid = raw_guid.lower()
+    from gamedata import DEFAULT_RECORD_STORE
+    record = DEFAULT_RECORD_STORE.get(
+        "AbilityTargetTemplate", str(target_spec.guid).lower())
+
+    def field(name, default=None):
+        return record.field(name, default) if record is not None else default
+
     if kind == "SourceStoredTargetTemplate":
-        stored = state.get("stored_targets") or {}
-        turn = state.get("stored_targets_this_turn") or {}
-        values = stored.get(guid, stored.get(raw_guid, ()))
-        if not values:
-            values = turn.get(guid, turn.get(raw_guid, ()))
+        values = []
+        if bool(field("m_StoredInAbility", True)):
+            for key in ("stored_targets", "stored_targets_this_turn"):
+                store = state.get(key) or {}
+                values.extend(store.get(guid, store.get(raw_guid, ())) or ())
+            values.extend((state.get("ability_lists") or {}).get(
+                "StoredTargets", ()) or ())
+            values.extend(((state.get("list_attrs") or {}).get(guid) or {}).get(
+                "StoredTargets", ()) or ())
+        if bool(field("m_StoredInCard", True)):
+            for key in ("stored_targets_by_card",
+                        "stored_targets_by_card_this_turn"):
+                store = state.get(key) or {}
+                values.extend(store.get(str(int(source_uid or 0)),
+                                        store.get(int(source_uid or 0), ())) or ())
+            from .statistics import tac_list
+            for scope in ("PermanentData", "ThisTurnsData"):
+                values.extend(tac_list(
+                    state, "cards", int(source_uid or 0), scope,
+                    "StoredTargets"))
         return _uids(values)
-    list_name = _LIST_ATTR_BY_KIND.get(kind, "")
+
+    list_name = (str(field("m_ListAttrName", "BuriedCards") or
+                     "BuriedCards")
+                 if kind == "SourceBuriedTargetTemplate" else
+                 _LIST_ATTR_BY_KIND.get(kind, ""))
     lists = state.get("list_attrs") or {}
     entries = (lists.get(guid) or {}).get(list_name) or []
-    out = []
+    out = list(_uids((state.get("ability_lists") or {}).get(list_name, ())))
     for entry in entries:
         uid = (entry.get("source_uid", entry.get("Id", entry.get("id")))
                if isinstance(entry, dict) else entry)
@@ -110,25 +139,119 @@ def _list_target_values(battle_state, ability, kind, source_uid):
                 out.append(int(uid))
         except (TypeError, ValueError):
             continue
-    if not out and kind == "VoidedTargetTemplate":
-        voided = state.get("voided_by") or {}
-        for uid, sources in voided.items():
+
+    if (kind == "VoidedTargetTemplate" and field("m_VoidedBy") is None
+            and source_uid is not None):
+        # "put each card voided by it into play": the source card's own void
+        # ledger, mirroring the legacy resolver's ``voided_by`` fallback.
+        out.extend(_uids((state.get("voided_by") or {}).get(
+            str(int(source_uid)))))
+
+    if kind == "VoidedTargetTemplate" and field("m_VoidedBy") is not None:
+        from .targeting import _source_card
+        from .filters import records_filter_matches
+        source = _source_card(db, session_id, source_uid,
+                              ability.responsible_player_id)
+        voided_by_filter = field("m_VoidedBy")
+        card_filter = field("m_CardFilter")
+        out = []
+        voided_by_kind = str(
+            getattr(voided_by_filter, "type_name", "")
+            or (voided_by_filter.get("_t", "")
+                if isinstance(voided_by_filter, dict) else "")
+        ).rsplit(".", 1)[-1]
+        for voider_uid, targets in (state.get("voided_by") or {}).items():
             try:
-                if int(source_uid or 0) in {int(s) for s in (sources or ())}:
-                    out.append(int(uid))
+                voider = _source_card(
+                    db, session_id, int(voider_uid),
+                    ability.responsible_player_id)
+                # ``IsAbilitySource`` is an identity predicate: the voider must
+                # be the ability's own source card.  Evaluating it through the
+                # generic filter context picked up a stale event source and
+                # matched every voider.
+                if voided_by_kind == "IsAbilitySource":
+                    matched = int(voider_uid) == int(source_uid or 0)
+                else:
+                    matched = bool(voider and records_filter_matches(
+                        voider, voided_by_filter, source=source,
+                        context=state))
+                if matched:
+                    for uid in _uids(targets):
+                        target = _source_card(
+                            db, session_id, uid,
+                            ability.responsible_player_id)
+                        if (not target or str(target.get("location") or "")
+                                .lower() != "void"):
+                            continue
+                        if card_filter and not records_filter_matches(
+                                target, card_filter, source=source,
+                                context=state,
+                                player=int(ability.responsible_player_id or 0)):
+                            continue
+                        out.append(uid)
             except (TypeError, ValueError):
                 continue
-    return tuple(out)
+
+    # These special list templates still inherit CardFilter and collection
+    # semantics.  The VoidedBy form instead filters the card which caused the
+    # void and the client does not apply CollectionFlags in that branch.
+    if kind != "VoidedTargetTemplate" or field("m_VoidedBy") is None:
+        from .targeting import _source_card, template_zones
+        from .filters import records_filter_matches
+        zones = {zone.lower() for zone in template_zones({
+            "collection_flags": str(field("m_CollectionFlags", "None") or "")})}
+        source = _source_card(db, session_id, source_uid,
+                              ability.responsible_player_id)
+        card_filter = field("m_CardFilter")
+        filtered = []
+        for uid in dict.fromkeys(out):
+            card = _source_card(db, session_id, uid,
+                                ability.responsible_player_id)
+            if not card:
+                continue
+            if zones and str(card.get("location") or "").lower() not in zones:
+                continue
+            if card_filter and not records_filter_matches(
+                    card, card_filter, source=source, context=state,
+                    player=int(ability.responsible_player_id or 0)):
+                continue
+            filtered.append(int(uid))
+        out = filtered
+    return tuple(dict.fromkeys(out))
 
 
 def _shares_subtype(left, right):
-    left = {part.strip().lower() for part in str(left or "").split() if part.strip()}
-    right = {part.strip().lower() for part in str(right or "").split() if part.strip()}
+    left = {part.strip().lower() for part in str(left or "").split()
+            if part.strip() and part.strip().lower() != "of"}
+    right = {part.strip().lower() for part in str(right or "").split()
+             if part.strip() and part.strip().lower() != "of"}
     return bool(left & right)
 
 
+def _current_match_card(db, session_id, uid, owner_id, battle_state):
+    """Project the properties used by C# Card.SharesSubtype/Cost."""
+    from .targeting import _source_card
+    card = _source_card(db, session_id, int(uid), owner_id)
+    if not card:
+        return None
+    try:
+        from .static_rules import effective_card_properties, effective_cost
+        thresholds, subtype = effective_card_properties(
+            db, session_id, battle_state or {}, int(uid))
+        card["thresholds"] = thresholds
+        card["shards"] = thresholds
+        card["subtype"] = subtype
+        card["cost"] = effective_cost(
+            db, session_id, battle_state or {}, int(uid))
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        # Basic card rows are still usable in compact test/older schemas; the
+        # native live path supplies the current effective values above.
+        pass
+    return card
+
+
 def _match_secondary_values(db, session_id, ability, effect, target_spec,
-                            battle_state):
+                            battle_state, champions=None):
     """Port of ``MatchSecondaryTargetTemplate.EnumerateLegalTargets``.
 
     Emits the legal cards that are related to the contingent effect's resolved
@@ -153,9 +276,6 @@ def _match_secondary_values(db, session_id, ability, effect, target_spec,
     doesnt_share_race = flag("m_DoesntShareRace")
     same_name = flag("m_SameName")
     cant_be_prev = flag("m_CantBePreviousTarget")
-    if not (same_cost or same_owner or shares_race or doesnt_share_race or
-            same_name or cant_be_prev):
-        return ()
     sec_value = (effect.get("secondary_target_index", -1)
                  if isinstance(effect, dict)
                  else getattr(effect, "secondary_target_index", -1))
@@ -168,19 +288,22 @@ def _match_secondary_values(db, session_id, ability, effect, target_spec,
     for value in raw:
         if value is None:
             continue
-        view = _source_card(db, session_id, int(value),
-                            ability.responsible_player_id)
+        view = _current_match_card(
+            db, session_id, int(value), ability.responsible_player_id,
+            battle_state)
         if view:
             secondary.append((int(value), view))
     if not secondary:
         return ()
     candidates = legal_targets(
         db, session_id, ability.responsible_player_id, target_spec.guid,
-        ability.source_uid, both_players=True, battle_state=battle_state)
+        ability.source_uid, both_players=True, champions=champions,
+        battle_state=battle_state)
     out = []
     for uid in candidates:
-        view = _source_card(db, session_id, int(uid),
-                            ability.responsible_player_id)
+        view = _current_match_card(
+            db, session_id, int(uid), ability.responsible_player_id,
+            battle_state)
         if not view:
             continue
         for other_uid, other in secondary:
@@ -249,12 +372,19 @@ class NativeEffectBackend:
         from .effects import SELF_TARGETED_EFFECTS
         from rules_port.context import EffectContext
         from rules_port.conditions import ConditionContext, evaluate_effect_condition
+        # Opt-in resolver trace: per-leaf card/event deltas for audits.
+        from .trace import begin_effect, end_effect
 
         old = {key: battle_state.get(key) for key in (
             "resolving_ability", "resolving_source_uid",
             "resolving_owner_id", "resolving_target_uid",
             "resolving_responsible_player_id", "resolving_effect_order",
-            "ability_target_map", "_rules_port_native_effect")}
+            "resolving_effect_guid", "resolving_secondary_target_uid",
+            "ability_target_map", "_rules_port_native_effect",
+            "resolving_ability_instance_id", "_ability_damage_dealt",
+            "ability_variables", "session_id", "player_mod_target",
+            "player_spell_target", "grant_target", "_skip_transform",
+            "rules_port_resolution_depth")}
         # An ability's list attrs (``VoidedCards`` and friends) belong to one
         # resolution: a nested child must see its parent's list, and a
         # finished resolution must not leave its list behind for the next
@@ -267,6 +397,32 @@ class NativeEffectBackend:
             previous_lists = {
                 key: (list(value) if isinstance(value, list) else value)
                 for key, value in previous_lists.items()}
+        # The legacy resolver guards pathological ability cycles with a depth
+        # cap; mirror it so a malformed child chain cannot recurse forever.
+        depth = int(battle_state.get("rules_port_resolution_depth", 0) or 0)
+        if depth > 16:
+            return "resolution depth exceeded"
+        # Effect instance ids are only unique within one ability, so a
+        # top-level activation starts a fresh m_WasApplied map.  A continuation
+        # resumes the same instance and keeps its flags, while a nested child
+        # runs against its own map that is restored to the parent's on exit.
+        # This mirrors the legacy resolver's per-call local ``applied`` dict;
+        # sharing one flat map let an earlier ability's flags satisfy a later
+        # ability's contingencies.
+        previous_applied = None
+        if depth > 0:
+            previous_applied = battle_state.get("applied_effects")
+            battle_state["applied_effects"] = {}
+        elif resume_from_order is None:
+            battle_state["applied_effects"] = {}
+        battle_state["rules_port_resolution_depth"] = depth + 1
+        # Card-count/sum variables evaluate against the live game_cards rows,
+        # and ``rules_port.fields.effect_field`` reads the session id from the
+        # battle state to query them.  Without it a "for each ..." amount
+        # resolved against session 0 and silently became zero (Woeful Webbing
+        # summoned no Spider).  The legacy resolver sets the same key; mirror
+        # it here, then restore the caller's value on exit.
+        battle_state["session_id"] = int(session.session_id)
         battle_state["resolving_ability"] = ability.ability_template_id
         battle_state["resolving_source_uid"] = ability.source_uid
         battle_state["resolving_owner_id"] = int(
@@ -275,9 +431,33 @@ class NativeEffectBackend:
             ability.responsible_player_id or 0)
         battle_state["ability_target_map"] = dict(
             getattr(ability.activation, "target_map", {}) or {})
+        # EffectInputVariable.GetValue resolves through the active C# ability
+        # instance: explicit activation values win, with authored variable
+        # defaults as fallback. Target filters use this same scope while the
+        # resolver computes automatic targets, so expose it for the duration
+        # of this ability and restore a nested parent's scope on exit.
+        from .fields import ability_variables
+        active_variables = ability_variables(ability)
+        active_variables.update(
+            getattr(ability.activation, "variables", {}) or {})
+        battle_state["ability_variables"] = active_variables
+        runtime_instance_id = int(getattr(ability, "instance_id", 0) or 0)
+        instance_key = str(runtime_instance_id)
+        runtime_values = battle_state.setdefault("ability_runtime_state", {})
+        instance_values = runtime_values.setdefault(instance_key, {})
+        battle_state["resolving_ability_instance_id"] = runtime_instance_id
+        battle_state["_ability_damage_dealt"] = int(
+            instance_values.get("DamageDealt", 0) or 0)
         from .targeting import legal_targets
         battle_state["_rules_port_native_effect"] = True
         applied = battle_state.setdefault("applied_effects", {})
+        champion_targets = ()
+        try:
+            champion_targets = tuple(
+                getattr(handler, "_champion_targets", lambda: [])() or ())
+        except Exception:
+            champion_targets = ()
+
         def field(item, name, default=None):
             value = getattr(item, name, None)
             if value is not None:
@@ -303,17 +483,108 @@ class NativeEffectBackend:
                 ability_source_owner_id=ability.responsible_player_id,
                 trigger_uid=target_value,
                 pl_t=player_uid, ai_t=ai_uid,
+                champions=champion_targets,
                 event_int_attribute=None)
             return bool(evaluate_effect_condition(
                 db, condition_id, condition_context))
+
+        def dispatch_nested_effect(parent_context, template, loop_count):
+            """Run a typed child as C# Apply(effectInstance) does."""
+            from gamedata.semantics import EffectSpec, _effect_param
+            from rules_port.fields import _as_dict
+            raw = _as_dict(template)
+            short_type = str(raw.get("_t", "")).rsplit(".", 1)[-1]
+            if not short_type:
+                short_type = str(getattr(template, "short_type", "") or "")
+            if not short_type:
+                return "repeat: invalid nested effect"
+            nested_spec = EffectSpec(
+                guid=(str(getattr(template, "guid", "") or "") or
+                      str(parent_context.effect_guid)),
+                concrete_type=short_type,
+                operation=short_type.removesuffix("AbilityEffectTemplate")
+                or short_type,
+                name=str(raw.get("m_Name", "") or ""),
+                target_index=-1,
+                effect_instance_id=int(battle_state.get(
+                    "resolving_effect_order", 0) or 0),
+                effect_group_id=0,
+                duration=parent_context.effect_duration,
+                condition_guid="", optional=False,
+                recalculate_targets="UseDefault",
+                secondary_target_index=-1,
+                output_variables={}, template=template)
+            param = _effect_param(nested_spec)
+            bases = set()
+            for entry in raw.get("_v", ()) or ():
+                if isinstance(entry, dict):
+                    bases.update(str(name).rsplit(".", 1)[-1]
+                                 for name in entry)
+            # CardAbilityEffectTemplate.Apply iterates each member of the
+            # current target instance. A child which overrides the whole
+            # instance (such as another repeat) runs once with that list.
+            card_scoped = ("CardAbilityEffectTemplate" in bases and
+                           short_type not in SELF_TARGETED_EFFECTS)
+            targets = tuple(parent_context.effect_targets or (None,))
+            apply_targets = targets if card_scoped else (None,)
+            state_keys = ("resolving_target_uid", "player_mod_target",
+                          "player_spell_target", "grant_target")
+            previous = {key: battle_state.get(key) for key in state_keys}
+            results = []
+            try:
+                for _iteration in range(max(0, int(loop_count or 0))):
+                    for target_value in apply_targets:
+                        if target_value is None:
+                            for key in state_keys:
+                                battle_state.pop(key, None)
+                        else:
+                            target_value = int(target_value)
+                            battle_state["resolving_target_uid"] = target_value
+                            battle_state["player_mod_target"] = target_value
+                            battle_state["player_spell_target"] = target_value
+                            battle_state["grant_target"] = target_value
+                        child_context = parent_context.nested_effect_context(
+                            template, param, targets)
+                        result = native_effect(
+                            short_type, child_context, {"param": param})
+                        if result is None:
+                            raise RuntimeError(
+                                "RulesPort nested effect has no handler: "
+                                f"{short_type}")
+                        results.append(str(result))
+                        if battle_state.get("resolution_paused"):
+                            break
+                    if battle_state.get("resolution_paused"):
+                        break
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        battle_state.pop(key, None)
+                    else:
+                        battle_state[key] = value
+            return (f"repeat {short_type} x{max(0, int(loop_count or 0))}: "
+                    + "; ".join(results))
 
         try:
             effects = ability.ordered_effects
             start = int(resume_from_order or 0)
             allowed_groups = (None if effect_groups is None else
                               {int(group) for group in effect_groups})
+            # Effect-instance positions let a contingency reject a forward
+            # reference the way the client does, and let a continuation mark
+            # every already-executed effect as applied (m_WasApplied) so its
+            # dependents still run after the pause.
+            instance_positions = {
+                int(field(item, "effect_instance_id", index)): index
+                for index, item in enumerate(effects)}
+            # The first card each effect instance resolved, for the
+            # ``resolving_secondary_target_uid`` alias a leaf such as a
+            # damage-shield reads.
+            resolved_by_instance = {}
             for position, effect in enumerate(effects):
+                instance_id = int(field(effect, "effect_instance_id", position))
                 if position < start:
+                    applied[instance_id] = True
                     continue
                 battle_state["resolving_effect_order"] = position
                 effect_guid = str(field(effect, "guid", "")).lower()
@@ -322,12 +593,15 @@ class NativeEffectBackend:
                 if allowed_groups is not None and effect_group not in allowed_groups:
                     continue
                 target_index = int(field(effect, "target_index", -1))
-                instance_id = int(field(effect, "effect_instance_id", position))
                 contingent = int(field(
                     effect, "contingent_effect_instance_id", -1))
-                if contingent >= 0 and not applied.get(contingent, False):
+                if contingent >= 0 and (
+                        instance_positions.get(contingent, len(effects))
+                        >= position or
+                        not applied.get(contingent, False)):
                     applied[instance_id] = False
                     continue
+                battle_state["resolving_effect_guid"] = effect_guid
                 target_values = ability.activation.target_map.get(
                     target_index, ()) if target_index >= 0 else ()
                 native_waiting = False
@@ -345,11 +619,22 @@ class NativeEffectBackend:
                             # player id.  In PvE the AI controller is ``0``;
                             # preserving that value made a "You get ..."
                             # GrantAbility look for card UID 0 instead of the
-                            # AI champion's synthetic SessionCardId.
+                            # AI champion's synthetic SessionCardId.  Resolve
+                            # the slot actually being processed: deriving the
+                            # champion from the ability's first template made
+                            # Booby Trap's target-index-1 "You" damage resolve
+                            # against its target-index-0 "Self" instead and
+                            # report "damage: no target".
                             from .targeting import implicit_champion_target
+                            player_filter = str(
+                                getattr(target_spec, "player_filter", "")
+                                or "").lower()
                             champion = implicit_champion_target(
                                 db, session, handler, battle_state,
-                                opposing=False)
+                                opposing=player_filter in {
+                                    "opponent", "opposing",
+                                    "singleopponent", "multipleopponents"},
+                                template_id=getattr(target_spec, "guid", None))
                             target_values = ((champion,) if champion is not None
                                              else ())
                         elif (int(ability.responsible_player_id or 0) == 0 and
@@ -376,6 +661,14 @@ class NativeEffectBackend:
                                     handler, "_champion_targets", lambda: [])()
                                            or []),
                                 battle_state=battle_state))
+                            if effect_type == "SacrificeCardAbilityEffectTemplate":
+                                # "another troop you control" never sacrifices
+                                # the source as its own payment.
+                                source_uid = ability.source_uid
+                                candidates = tuple(
+                                    uid for uid in candidates
+                                    if (source_uid is None or
+                                        int(uid) != int(source_uid)))
                             if target_spec.is_random:
                                 candidates = _random_target_sample(
                                     candidates,
@@ -389,8 +682,30 @@ class NativeEffectBackend:
                                 target_values = (candidates[:maximum]
                                                  if maximum > 0 else candidates[:1])
                         elif kind == "AbilityTriggerCardTargetTemplate":
-                            target_values = (battle_state.get(
-                                "resolving_trigger_target_uid"),)
+                            from .targeting import _target_field
+                            selector = str(_target_field(
+                                target_spec.guid, "m_TriggerSelector",
+                                "TriggerSource") or "TriggerSource").rsplit(
+                                    ".", 1)[-1]
+                            key = ("resolving_trigger_target_uid"
+                                   if selector == "TriggerTarget" else
+                                   "resolving_trigger_source_uid"
+                                   if selector == "TriggerSource" else None)
+                            selected = battle_state.get(key) if key else None
+                            if selected is None:
+                                # Some event classes carry only one of the
+                                # trigger cards; the legacy resolver's
+                                # transient target is the next fallback, then
+                                # the ability source (the card that raised the
+                                # event for #TRIGGER_SOURCE#).
+                                selected = (
+                                    battle_state.get("player_spell_target")
+                                    or battle_state.get("player_mod_target")
+                                    or battle_state.get("resolving_target_uid"))
+                            if selected is None:
+                                selected = ability.source_uid
+                            target_values = ((int(selected),)
+                                             if selected is not None else ())
                         elif kind in ("SourceDrawnTargetTemplate",
                                       "SourceBuriedTargetTemplate",
                                       "SourceStoredTargetTemplate",
@@ -398,7 +713,8 @@ class NativeEffectBackend:
                                       "VoidedTargetTemplate"):
                             target_values = _list_target_values(
                                 battle_state, ability, kind,
-                                ability.source_uid)
+                                ability.source_uid, target_spec, db,
+                                session.session_id)
                             if not target_values:
                                 # C# disables an effect whose authored list
                                 # target enumerates nothing; it never falls
@@ -420,19 +736,21 @@ class NativeEffectBackend:
                             # target (m_SecondaryTargetIndex), filtered by the
                             # template card filter.
                             sec = int(field(effect, "secondary_target_index", -1))
-                            raw = ()
-                            if sec >= 0:
-                                raw = ability.activation.target_map.get(
-                                    sec, ability.activation.target_map.get(
-                                        str(sec), ()))
-                            if not isinstance(raw, (tuple, list, set)):
-                                raw = (raw,)
-                            target_values = tuple(
-                                int(value) for value in raw if value is not None)
+                            raw = (_resolved_target_values(
+                                ability, sec, battle_state) if sec >= 0 else ())
+                            from .targeting import filter_resolved_targets
+                            target_values = filter_resolved_targets(
+                                db, session.session_id,
+                                ability.responsible_player_id,
+                                target_spec.guid, ability.source_uid, raw,
+                                battle_state)
                         elif kind == "MatchSecondaryTargetTemplate":
                             target_values = _match_secondary_values(
                                 db, session.session_id, ability, effect,
-                                target_spec, battle_state)
+                                target_spec, battle_state,
+                                champions=(getattr(
+                                    handler, "_champion_targets",
+                                    lambda: [])() or []))
                         elif target_spec.target_kind == "SourceRevealedTargetTemplate":
                             from .targeting import (revealed_target_uids,
                                                     _target_ignore_acted_on)
@@ -571,7 +889,24 @@ class NativeEffectBackend:
                     target_values = (None,)
                 if not isinstance(target_values, (tuple, list)):
                     target_values = (target_values,)
+                effect_targets = tuple(target_values)
+                resolved_by_instance[instance_id] = tuple(
+                    int(value) for value in effect_targets
+                    if value is not None)
                 effect_param = field(effect, "param", "")
+                # ``m_SecondaryTargetIndex`` names an earlier effect instance,
+                # and the client answers it with that instance's resolved
+                # card (e.g. the damage dealer a shield is restricted to).
+                # Expose the same alias the legacy resolver published; a leaf
+                # with no such reference must not inherit a previous effect's.
+                secondary_index = int(field(effect, "secondary_target_index", -1))
+                secondary_values = (resolved_by_instance.get(secondary_index, ())
+                                    if secondary_index >= 0 else ())
+                if secondary_values:
+                    battle_state["resolving_secondary_target_uid"] = int(
+                        secondary_values[0])
+                else:
+                    battle_state.pop("resolving_secondary_target_uid", None)
                 # C# runs a non-card AbilityEffectTemplate once per effect
                 # instance with that instance's whole target list, while the
                 # card-scoped leaves below expect one call per target.  A
@@ -597,15 +932,45 @@ class NativeEffectBackend:
                     effect_context = EffectContext.from_rules_port(
                         game, session, db, handler, player_uid, ai_uid,
                         battle_state, effect_guid, effect_param,
-                        ability=ability)
+                        ability=ability, effect_targets=effect_targets,
+                        nested_effect_dispatch=dispatch_nested_effect)
                     if not condition_passes(effect, target):
                         applied[instance_id] = False
+                        # Incantation-style BOMs put the five-counter gate on
+                        # the remove-counters effect while the following
+                        # transform leaf has no condition of its own; carry
+                        # the failed gate forward instead of transforming the
+                        # first target anyway.
+                        if effect_type == "CardModifierAbilityEffectTemplate":
+                            try:
+                                modifier = json.loads(effect_param or "{}")
+                            except (TypeError, ValueError,
+                                    json.JSONDecodeError):
+                                modifier = {}
+                            if (str(modifier.get("property") or "") == "counter"
+                                    and int(modifier.get("amount") or 0) <= 0):
+                                battle_state["_skip_transform"] = True
                         continue
-                    result = native_effect(effect_type, effect_context, effect)
+                    trace_effect = {
+                        "effect_guid": effect_guid,
+                        "effect_type": effect_type,
+                        "effect_order": position,
+                    }
+                    trace = begin_effect(
+                        db, session, game, battle_state, trace_effect, target)
+                    try:
+                        result = native_effect(
+                            effect_type, effect_context, effect)
+                    except Exception as exc:
+                        end_effect(
+                            db, session, game, battle_state, trace, error=exc)
+                        raise
                     if result is None:
                         raise RuntimeError(
                             "RulesPort native effect has no handler: "
                             f"{effect_type} ({effect_guid})")
+                    end_effect(
+                        db, session, game, battle_state, trace, result=result)
                     applied[instance_id] = True
                     battle_state.setdefault("rules_port_effect_results", []).append(
                         {"instance_id": instance_id, "result": str(result)})
@@ -613,6 +978,23 @@ class NativeEffectBackend:
                     battle_state["rules_port_resume_effect_order"] = position
                     break
         finally:
+            runtime_values = battle_state.get("ability_runtime_state") or {}
+            instance_values = runtime_values.get(instance_key)
+            if isinstance(instance_values, dict):
+                if battle_state.get("resolution_paused"):
+                    instance_values["DamageDealt"] = int(
+                        battle_state.get("_ability_damage_dealt", 0) or 0)
+                else:
+                    runtime_values.pop(instance_key, None)
+                    if not runtime_values:
+                        battle_state.pop("ability_runtime_state", None)
+            cache = battle_state.get("ability_variable_cache") or {}
+            if battle_state.get("resolution_paused"):
+                pass
+            else:
+                cache.pop(instance_key, None)
+                if not cache:
+                    battle_state.pop("ability_variable_cache", None)
             for key, value in old.items():
                 if value is None:
                     battle_state.pop(key, None)
@@ -622,6 +1004,14 @@ class NativeEffectBackend:
                 battle_state.pop("ability_lists", None)
             else:
                 battle_state["ability_lists"] = previous_lists
+            if depth > 0:
+                # A nested child ran against its own m_WasApplied map; give
+                # the parent's back so the remainder of the parent walk sees
+                # the flags it set before the child was activated.
+                if previous_applied is None:
+                    battle_state.pop("applied_effects", None)
+                else:
+                    battle_state["applied_effects"] = previous_applied
 
 
 class PortAbilityResolver:
@@ -814,7 +1204,8 @@ def resume_ability_continuation_parents(
             parent_guid = str((item or {}).get("ability_guid") or "").lower()
             parent_graph = (ability_graph(DEFAULT_RECORD_STORE, parent_guid)
                             if parent_guid else None)
-            if (chain_id > 0 and child_guid and parent_graph is not None and
+            if (chain_id > 0 and child_guid and item is not None and
+                    parent_graph is not None and
                     parent_guid != child_guid):
                 for order, effect in enumerate(parent_graph.effects):
                     if effect.concrete_type not in (
@@ -879,7 +1270,7 @@ def resume_ability_continuation_parents(
         # prompt after its chain item has been completed.
         port_session = getattr(session, "_rules_port_session", None)
         pending_activation = getattr(port_session, "pending_activation", None)
-        if isinstance(pending_activation, dict):
+        if port_session is not None and isinstance(pending_activation, dict):
             try:
                 pending_id = int(pending_activation.get(
                     "ability_instance_id", -1))
@@ -910,10 +1301,15 @@ def resolve_port_played_spell(game, session, db, handler, player_uid, ai_uid,
     target_uid = bstate.get("player_spell_target")
     source_uid = bstate.get("resolving_source_uid")
     owner_id = bstate.get("resolving_owner_id")
-    if owner_id is None and source_uid is not None:
+    if source_uid is not None:
+        # A played card's real owner is authoritative: a stale
+        # resolving_owner_id (for example 0 left by an earlier AI trigger)
+        # must not resolve the spell as the opponent's.
         from pvp_db import db_card_owner_id
-        owner_id = db_card_owner_id(
+        source_owner = db_card_owner_id(
             session.session_id, int(source_uid), conn=db)
+        if source_owner is not None:
+            owner_id = source_owner
     if owner_id is None:
         owner_id = handler.user_profile["id"] if handler.user_profile else 0
 
@@ -923,6 +1319,11 @@ def resolve_port_played_spell(game, session, db, handler, player_uid, ai_uid,
     }
     previous = bstate.get("_esc_counted_this_resolution")
     bstate["_esc_counted_this_resolution"] = False
+    previous_lists = bstate.get("ability_lists")
+    if isinstance(previous_lists, dict):
+        previous_lists = {
+            key: (list(value) if isinstance(value, list) else value)
+            for key, value in previous_lists.items()}
     logs = []
     try:
         for instance_id, guid_value in enumerate(ability_guids or [], 1):
@@ -940,7 +1341,7 @@ def resolve_port_played_spell(game, session, db, handler, player_uid, ai_uid,
             if not target_map and target_uid is not None:
                 for index, target in enumerate(graph.targets):
                     if target.requires_input:
-                        target_map[index] = int(target_uid)
+                        target_map[index] = (int(target_uid),)
                         break
             state = resolve_port_ability(
                 handler, game, session, db, player_uid, ai_uid, bstate,
@@ -951,6 +1352,11 @@ def resolve_port_played_spell(game, session, db, handler, player_uid, ai_uid,
             if bstate.get("resolution_paused"):
                 break
     finally:
+        if not bstate.get("resolution_paused"):
+            if previous_lists is None:
+                bstate.pop("ability_lists", None)
+            else:
+                bstate["ability_lists"] = previous_lists
         if previous is None:
             bstate.pop("_esc_counted_this_resolution", None)
         else:
@@ -991,6 +1397,8 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
             "kind": "ability", "ability_guid": activated,
             "source_uid": item.get("activated_source_uid"),
             "target_uid": item.get("activated_target_uid"),
+            "instance_id": item.get("activated_ability_instance_id"),
+            "activation_data": item.get("activated_activation_data") or {},
         }
     # ``target_uid`` is the card chosen for the authored input-bearing target
     # (a player picker, or the AI's legal pool), while ``trigger_target_uid``
@@ -1000,9 +1408,10 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
     # Armitron instead of the selected Robot).  Keep the event card only for
     # the templates that name it, such as AbilityTriggerCardTargetTemplate.
     selected_target = item.get("target_uid")
+    # Keep the authored event target distinct from the card selected for this
+    # trigger's effect target. C# TriggerTargetPropertyVariable reads the
+    # triggering event, even when the ability also selected another card.
     trigger_target = item.get("trigger_target_uid")
-    if trigger_target is None:
-        trigger_target = selected_target
     activation_data = item.get("activation_data") or {}
     target_map = (dict(activation_data.get("target_map") or {})
                   if isinstance(activation_data, dict) else {})
@@ -1013,9 +1422,26 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
                 break
     old_source = battle_state.get("resolving_source_uid")
     old_owner = battle_state.get("resolving_owner_id")
+    old_target = battle_state.get("resolving_target_uid")
+    old_trigger_source = battle_state.get("resolving_trigger_source_uid")
     old_trigger_target = battle_state.get("resolving_trigger_target_uid")
+    old_event_type = battle_state.get("resolving_trigger_event_type")
+    old_event_data = battle_state.get("resolving_trigger_event_data")
     battle_state["resolving_source_uid"] = source_uid
     battle_state["resolving_owner_id"] = owner_id
+    # The legacy trigger boundary exposed the trigger's selected card as the
+    # transient target so an #TRIGGER_SOURCE#/#TRIGGER_TARGET# template whose
+    # event class has no TargetCardId could still resolve the card that raised
+    # it.  Publish the same alias for the remainder of this resolution.
+    if selected_target is None:
+        battle_state.pop("resolving_target_uid", None)
+    else:
+        battle_state["resolving_target_uid"] = int(selected_target)
+    trigger_source = item.get("trigger_source_uid")
+    if trigger_source is None:
+        battle_state.pop("resolving_trigger_source_uid", None)
+    else:
+        battle_state["resolving_trigger_source_uid"] = int(trigger_source)
     # C# keeps the triggering event on the ability instance, so a target
     # template of kind AbilityTriggerCardTargetTemplate ("TriggerSource")
     # still resolves the event's card when the trigger waits on the chain for
@@ -1024,6 +1450,11 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
         battle_state.pop("resolving_trigger_target_uid", None)
     else:
         battle_state["resolving_trigger_target_uid"] = int(trigger_target)
+    battle_state["resolving_trigger_event_type"] = str(
+        item.get("trigger_event_type") or "")
+    event_data = item.get("trigger_event_data") or {}
+    battle_state["resolving_trigger_event_data"] = (
+        dict(event_data) if isinstance(event_data, dict) else {})
     try:
         state = resolve_port_ability(
             handler, game, session, db, player_uid, ai_uid, battle_state,
@@ -1042,7 +1473,23 @@ def resolve_port_trigger(handler, game, session, db, player_uid, ai_uid,
     finally:
         battle_state["resolving_source_uid"] = old_source
         battle_state["resolving_owner_id"] = old_owner
+        if old_target is None:
+            battle_state.pop("resolving_target_uid", None)
+        else:
+            battle_state["resolving_target_uid"] = old_target
+        if old_trigger_source is None:
+            battle_state.pop("resolving_trigger_source_uid", None)
+        else:
+            battle_state["resolving_trigger_source_uid"] = old_trigger_source
         if old_trigger_target is None:
             battle_state.pop("resolving_trigger_target_uid", None)
         else:
             battle_state["resolving_trigger_target_uid"] = old_trigger_target
+        if old_event_type is None:
+            battle_state.pop("resolving_trigger_event_type", None)
+        else:
+            battle_state["resolving_trigger_event_type"] = old_event_type
+        if old_event_data is None:
+            battle_state.pop("resolving_trigger_event_data", None)
+        else:
+            battle_state["resolving_trigger_event_data"] = old_event_data

@@ -36,6 +36,18 @@ from tests.tests_combat import (
     make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER, TPL_GLADIATOR,
 )
 
+def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
+                    ability_guid, source_uid, owner_id, target_map=None):
+    """Legacy-shaped adapter retained until these fixtures migrate.
+
+    TODO(native): re-point to ``rules_port.resolution.resolve_port_ability``
+    once the explicit-target fixtures below are migrated.
+    """
+    from abilities.framework.resolution import resolve_ability as _walk
+    return _walk(handler, game, session, db, pl_t, ai_t, bstate,
+                 ability_guid, source_uid, owner_id, target_map or {})
+
+
 
 
 def _copy_card(db, guid):
@@ -259,8 +271,8 @@ def test_native_resource_modifier_maps_pvp_owner_to_effect_view_side(db):
         bstate={"pvp": True, "pids": [1001, 1002],
                 "resolving_owner_id": 1002},
         effect_guid="c002e375-b897-4d97-431a-4a16217659c3",
-        game=object(), session=object(), db=object(), player_uid=object(),
-        ai_uid=object(),
+        game=object(), session=SimpleNamespace(session_id=1), db=None,
+        player_uid=object(), ai_uid=object(),
         resolved_target=lambda: 1002,
         target_owner=lambda target, default=None: 1002,
         modifier_value=lambda *args: 1,
@@ -523,7 +535,6 @@ def test_crazed_squirrel_titan_respects_verdant_wyldeboar_buff(db):
 
 def test_oakhenge_moves_revealed_troop_to_hand_with_its_template(db):
     """Oakhenge must hand over the selected troop's card identity."""
-    from abilities.framework.resolution import resolve_ability
 
     oak_tpl = "f42da1e5-159c-41d2-9664-2e64be20257e"
     caterpillar_tpl = "4a8bca1b-db0f-4c14-b3cf-70502fd411ba"
@@ -803,7 +814,6 @@ def test_cosmic_transmogrifier_preserves_type_and_cost(db):
 def test_crown_of_the_primals_buffs_target_troop(db):
     """Crown's card ability must resolve as a card ability, not as a
     champion payment that voids the source and selected troop."""
-    from abilities.framework.resolution import resolve_ability
 
     crown_tpl = "54691a8a-77c5-4d54-a21d-cbaa5739d944"
     crown_ag = "10db0828-a6ce-1526-9eed-33387dfe33ba"
@@ -840,7 +850,6 @@ def test_crown_of_the_primals_buffs_target_troop(db):
 
 def test_strength_of_redwood_uses_each_typed_stat_value(db):
     """Strength of the Redwood must resolve P1=1 and P3=3 independently."""
-    from abilities.framework.resolution import resolve_ability
 
     redwood_tpl = "27e20321-3e24-4802-8ffe-b4579616ff5c"
     redwood_ag = "90f5fcfe-aeff-13e1-0f8c-60d0f7b3b972"
@@ -871,9 +880,9 @@ def test_primordial_caves_adds_entering_cost_secretly_and_chains_threshold(db):
     tyrannosaurus_tpl = "306051ab-e7df-48a4-ad59-015c38551f03"
     caves_ag = "12cf8e9a-13d5-71de-c8e0-959db1c44aaa"
     roar_guid = "b056a29b-b013-1915-86d0-fe1cab4f168b"
-    db.execute("CREATE TABLE card_counter_templates ("
+    db.execute("CREATE TABLE IF NOT EXISTS card_counter_templates ("
                "template_id TEXT PRIMARY KEY, name TEXT, description TEXT)")
-    db.execute("INSERT INTO card_counter_templates VALUES (?,?,?)",
+    db.execute("INSERT OR REPLACE INTO card_counter_templates VALUES (?,?,?)",
                (roar_guid, "Roar", ""))
     # The production card_templates schema carries these random-pool fields;
     # add them to this focused fixture so the typed Dinosaur filter can be
@@ -1024,7 +1033,6 @@ def test_primordial_caves_adds_entering_cost_secretly_and_chains_threshold(db):
 def test_spam_bot_charge_power_targets_one_robot_and_one_stat(db):
     """S.P.A.M. Bot's charge power must resolve its two random branches
     against one chosen Robot, not every Robot and not both stats."""
-    from abilities.framework.resolution import resolve_ability
 
     spam_ag = "d9b0ebb0-74ca-b6da-da1b-3523d9fc7da4"
     robot_tpl = "00c0456e-a081-48c8-81a6-e719a26eb6f8"
@@ -1485,6 +1493,154 @@ def test_shard_of_cunning_ai_plays_choice_and_gains_threshold(db):
          "8cd3251f-2d73-44f1-8874-84d88fea809a")).fetchone()[0] == 1
 
 
+def test_primal_shard_grants_the_thresholds_the_hand_needs(db):
+    """Primal Shard grants the thresholds the controller's hand still needs.
+
+    The client displays "Gain all the thresholds that you need." while the
+    authored data is five condition-gated threshold leaves.  The AI resource
+    path defaulted every colourless resource name to Wild, so a Primal Shard
+    granted Wild even when no Wild card was in hand, and never granted the
+    Ruby/Blood the hand actually needed.
+    """
+    import ai
+    from rules_port.resources import resource_threshold_grants
+    primal = "4b0e888e-ea2b-4674-acc8-a0292ad3b9ed"
+    _copy_card(db, primal)
+    for column in ("current_resources_granted", "max_resources_granted"):
+        db.execute(
+            f"ALTER TABLE card_templates ADD COLUMN {column} INTEGER DEFAULT 0")
+    db.execute(
+        "UPDATE card_templates SET current_resources_granted=1, "
+        "max_resources_granted=1 WHERE guid=?", (primal,))
+
+    # Hand: a 2-ruby card, a 1-wild card and a 2-blood card.  The AI already
+    # has one threshold of each colour, so only Ruby and Blood are still
+    # needed (the playable Wild card grants nothing).
+    hand = {
+        401: ("11111111-1111-1111-1111-111111111111", [2, 2]),
+        402: ("22222222-2222-2222-2222-222222222222", [4]),
+        403: ("33333333-3333-3333-3333-333333333333", [1, 1]),
+    }
+    for uid, (tpl, requirements) in hand.items():
+        db.execute(
+            "INSERT INTO card_templates (guid, name, card_type, cost, "
+            "threshold_json) VALUES (?,?,?,?,?)",
+            (tpl, f"Threshold {uid}", "Troop", 1,
+             json.dumps({"list": requirements})))
+        add_card(db, uid, 0, tpl, loc="hand")
+    add_card(db, 350, 0, primal, loc="hand")
+    db.execute("UPDATE game_cards SET card_type='Resource' WHERE card_uid=350")
+    db.commit()
+
+    class AIHandler(HandlerStub):
+        def _template_by_guid(self, guid):
+            return self._db.execute(
+                "SELECT guid, name, card_type, cost, attack, defense "
+                "FROM card_templates WHERE guid=?", (guid,)).fetchone()
+
+    handler = AIHandler(db)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {
+        "pvp": False,
+        "ai_threshold": {4: 1, 8: 1, 32: 1}, "ai_resources": 0,
+        "ai_total_resources": 0, "ai_charges": 0,
+        "player_threshold": {}, "player_resources": 0,
+        "player_total_resources": 0, "player_charges": 0,
+        "turn_number": 1,
+    }
+    old_db = ai._db
+    ai._db = db
+    try:
+        with mock.patch("battle_engine.save_state"):
+            ai.ai_play_resource(handler, game, SessionStub(), ai_t, bstate)
+    finally:
+        ai._db = old_db
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=350").fetchone()[0] \
+        == "PlayedResources"
+    assert bstate["ai_threshold"] == {4: 2, 8: 2, 32: 1}, bstate["ai_threshold"]
+    events = [event for event in game.events
+              if isinstance(
+                  event,
+                  game_engine.PlayerResourceThresholdChangedSessionEventArgs)]
+    assert sorted(event.color for event in events) == [4, 8], events
+    assert all(event.delta == 1 for event in events), events
+
+    # The PvP checkpoint keeps each player's thresholds under ``thresh_<pid>``
+    # and its hand cards under that participant id; the same grant computation
+    # must serve tournament games.
+    primal_ags = json.loads(db.execute(
+        "SELECT abilities_json FROM card_templates WHERE guid=?",
+        (primal,)).fetchone()[0])
+    db.execute(
+        "UPDATE game_cards SET user_id=401 WHERE card_uid IN (350,401,402,403)")
+    grants = resource_threshold_grants(
+        db, 1, 401, primal_ags,
+        {"pvp": True, "thresh_401": {4: 1, 8: 1, 32: 1}},
+        source_uid=350)
+    assert grants == [(4, 1), (8, 1)], grants
+
+    # A colourless-named fixed resource grants its authored colour instead of
+    # defaulting to Wild.
+    _copy_card(db, "452ced33-880a-4a3f-9cf6-0f56c23b948a")  # Bloodstone
+    bloodstone_ags = json.loads(db.execute(
+        "SELECT abilities_json FROM card_templates WHERE guid=?",
+        ("452ced33-880a-4a3f-9cf6-0f56c23b948a",)).fetchone()[0])
+    assert resource_threshold_grants(
+        db, 1, 0, bloodstone_ags, {"ai_threshold": {}}) == [(4, 1)]
+
+
+def test_woeful_webbing_summons_a_random_spider(db):
+    """Woeful Webbing's "for each different Underworld race" count resolves.
+
+    The count is a CardCountAbilityVariable, so the port resolver must expose
+    the live session id to ``rules_port.fields.effect_field``; without it the
+    variable was evaluated against session 0, found no game_cards, and the
+    summon amount silently became zero.
+    """
+    from rules_port.resolution import resolve_port_played_spell
+
+    webbing = "15bacb06-c91d-5c4e-7e6f-cdfad5c6325d"
+    vennen = "24bbc1cc-bf14-4d81-948d-1689c40e7794"   # Runeweb Spellweaver
+    spiders = ("048a5bc7-ab7c-42f3-87c1-c00f9243b7e8",  # Winter Widow
+               "5d49bc7d-9bfe-4789-b32a-f40ae44c6935")  # Giant Spiderspawn
+    for guid in (webbing, vennen) + spiders:
+        _copy_card(db, guid)
+    add_card(db, 501, 0, TPL_GLADIATOR, loc="warzone")   # stun target
+    add_card(db, 502, 5, vennen, loc="warzone")           # one Underworld race
+    add_card(db, 503, 5, webbing, loc="CastSpells")
+    db.execute("UPDATE game_cards SET card_type='QuickAction' WHERE card_uid=503")
+    db.commit()
+
+    old_db = dbmod._db
+    dbmod._db = db
+    try:
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        handler = HandlerStub(db)
+        bstate = {"resolving_source_uid": 503, "resolving_owner_id": 5,
+                  "player_spell_target": 501, "turn_number": 1}
+        ability_guids = json.loads(db.execute(
+            "SELECT abilities_json FROM card_templates WHERE guid=?",
+            (webbing,)).fetchone()[0])
+        resolve_port_played_spell(
+            game, SessionStub(), db, handler, pl_t, ai_t, bstate, ability_guids)
+    finally:
+        dbmod._db = old_db
+
+    created = db.execute(
+        "SELECT template_guid, user_id, location FROM game_cards "
+        "WHERE card_uid > 503").fetchall()
+    assert len(created) == 1, created
+    assert created[0][0] in spiders, created
+    assert created[0][1:] == (5, "warzone"), created
+    # The resolution scope key must not leak into the checkpoint.
+    assert "session_id" not in bstate, bstate
+
+
 def test_resource_grant_columns_from_gamedata(db):
     """The resource-grant fields are populated from the gamedata template:
     basic shards grant 1/1 current/max; Shards of Fate grants 0/1 (it
@@ -1751,7 +1907,6 @@ def test_single_card_reinsert_stays_within_deck(db):
 def test_incubation_slave_egg_summon_and_sacrifice(db):
     """Incubation Slave's manual ability (cost 6, auto 'You' target): remove
     all egg counters, sacrifice the slave, summon one Spiderspawn per egg."""
-    from abilities.framework.resolution import resolve_ability
     _copy_card(db, "a77f395f-41b1-45e0-9f8e-7f63286a8797")  # Incubation Slave
     _copy_card(db, "a9ebe40e-ef30-4c9e-b4dd-1b414dc35d0c")  # Spiderspawn
     add_card(db, 401, 5, "a77f395f-41b1-45e0-9f8e-7f63286a8797")
@@ -1788,7 +1943,6 @@ def test_incubation_slave_egg_summon_and_sacrifice(db):
 def test_bunjitsu_charge_power_summon_and_buff(db):
     """Bun'jitsu's charge power (re-seeded from gamedata): summon an exhausted
     Abomination and buff it with the voided troop's ATK/DEF + 3."""
-    from abilities.framework.resolution import resolve_ability
     _copy_ability(db, "32d0d36a-55fd-2cff-0d3d-341319536a57")
     _copy_card(db, "c776499e-53c1-4526-9be4-acba62050d06")  # Abomination
     _copy_card(db, "2b575216-e5a9-421b-988c-badf120d7443")  # Bun'jitsu troop
@@ -2070,6 +2224,9 @@ def test_concubunny_exhausts_selected_ready_shinhare(db):
     handler._current_bstate = bstate
     handler._send_battle_events = lambda *args: None
     handler._play_plan_store = gamedata.DEFAULT_RECORD_STORE
+    # Isolate the production activation helper; this fixture has no full
+    # session schema for the mandatory native host attachment.
+    handler._maybe_attach_rules_port = lambda *args, **kwargs: None
 
     old_hcs_db, old_db = hcs._db, dbmod._db
     hcs._db = dbmod._db = db
@@ -2169,6 +2326,10 @@ def main():
          test_shards_of_fate_detection_and_ai_threshold),
         ("Shard of Cunning AI choice threshold",
          test_shard_of_cunning_ai_plays_choice_and_gains_threshold),
+        ("Primal Shard needed hand thresholds",
+         test_primal_shard_grants_the_thresholds_the_hand_needs),
+        ("Woeful Webbing summons a random Spider",
+         test_woeful_webbing_summons_a_random_spider),
         ("Incubation Slave egg summon + sacrifice",
          test_incubation_slave_egg_summon_and_sacrifice),
         ("Bun'jitsu charge power summon + buff",

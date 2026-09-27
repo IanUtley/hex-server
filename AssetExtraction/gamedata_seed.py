@@ -140,8 +140,9 @@ def load_records_text(path: str | Path | None = None) -> str:
 
 def source_available() -> bool:
     """Whether the configured gamedata or local Records source exists."""
-    if configured_path():
-        return os.path.isfile(os.path.abspath(os.path.expanduser(configured_path())))
+    path = configured_path()
+    if path:
+        return os.path.isfile(os.path.abspath(os.path.expanduser(path)))
     return records_available()
 
 
@@ -982,7 +983,7 @@ def _extract_quest_templates(data: str) -> list[tuple[Any, ...]]:
         for objective in record.get("m_Objectives") or []:
             if not isinstance(objective, dict):
                 continue
-            item = {
+            item: dict[str, Any] = {
                 "id": str(objective.get("m_QuestLocationId") or ""),
                 "title": _quest_text(objective.get("m_Title"))
                          or str(objective.get("m_TitleOld") or ""),

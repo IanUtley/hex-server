@@ -74,5 +74,7 @@ def draw_cards(context, count, owner=None):
         context._emit_trigger(
             "CardDrawnEvent", _champion_uid(context, owner), owner,
             target_card_id=card_uid)
+        from .statistics import record_ability_card_list
+        record_ability_card_list(context.bstate, "DrawnCards", card_uid)
         drawn += 1
     return f"draw {drawn} for owner {owner}"

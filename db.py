@@ -24,6 +24,7 @@ from collections import Counter
 from contextlib import contextmanager
 from binascii import hexlify
 from datetime import datetime, timezone
+from typing import Any, Callable, TypeVar
 
 DB_PATH = os.environ.get(
     "HEX_DB_PATH",
@@ -49,6 +50,7 @@ _sqlite_retry_stats_lock = threading.Lock()
 _SQLITE_RETRY_LOG_MILESTONES = {1, 2, 3, 5, 10, 25, 50, 100}
 
 _named_row_types = {}
+_RetryResult = TypeVar("_RetryResult")
 
 
 def _named_row_factory(cursor, values):
@@ -144,7 +146,8 @@ class RetryingConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._retry_lock = threading.RLock()
 
-    def _with_retry(self, label, operation, *args, **kwargs):
+    def _with_retry(self, label: str, operation: Callable[..., _RetryResult],
+                    *args: Any, **kwargs: Any) -> _RetryResult:
         for attempt, delay in enumerate((0.0,) + _SQLITE_RETRY_DELAYS):
             try:
                 return operation(*args, **kwargs)
@@ -155,35 +158,36 @@ class RetryingConnection(sqlite3.Connection):
                 _record_sqlite_retry(label)
                 if delay:
                     time.sleep(delay)
+        raise RuntimeError("SQLite retry loop exhausted without a result")
 
-    def execute(self, sql, parameters=()):
+    def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql)
             return self._with_retry(
                 f"execute {_sqlite_sql_shape(sql)}",
                 super().execute, sql, parameters)
 
-    def executemany(self, sql, parameters):
+    def executemany(self, sql: str, parameters: Any) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql)
             return self._with_retry(
                 f"executemany {_sqlite_sql_shape(sql)}",
                 super().executemany, sql, parameters)
 
-    def executescript(self, sql_script):
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql_script)
             return self._with_retry(
                 f"executescript {_sqlite_sql_shape(sql_script)}",
                 super().executescript, sql_script)
 
-    def commit(self):
+    def commit(self) -> None:
         with self._retry_lock:
             return self._with_retry(
                 f"commit after {getattr(self, '_last_sql_shape', '(unknown)')}",
                 super().commit)
 
-    def rollback(self):
+    def rollback(self) -> None:
         with self._retry_lock:
             return super().rollback()
 
@@ -643,6 +647,7 @@ def db_get_or_create_user(name, steam_id=None):
                 log(f"    WARN: catch-up new-player grant failed: {e}")
         old_last_login = row[7] if len(row) > 7 else None
         daily_bonus_xp = 0
+        new_xp = row[4] or 0
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if old_last_login:
             try:
@@ -1593,7 +1598,7 @@ def db_get_decks(user_id):
 
 # === Sessions (reconnect) ===
 
-def db_save_session(sid, user_id, username, auth_id, reck_id, uid, addr):
+def db_save_connection_session(sid, user_id, username, auth_id, reck_id, uid, addr):
     _db.execute("INSERT OR REPLACE INTO sessions (sid, user_id, username, client_auth_id, client_reck_id, client_uid, addr) VALUES (?,?,?,?,?,?,?)",
                 (sid, user_id, username, auth_id, reck_id, uid, addr))
     _db.commit()
@@ -1704,7 +1709,7 @@ def db_record_session_transaction(session_id, player_uid, request_id,
              json.dumps(classification or {}, sort_keys=True, default=str),
              payload, str(pre_state_hash or "")))
         capture_db.commit()
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
     except BaseException:
         capture_db.rollback()
         raise
@@ -3692,13 +3697,6 @@ def db_get_chest_by_id(chest_db_id, user_id):
         "SELECT id, set_guid, chest_rarity, opened, template_guid FROM treasure_chests "
         "WHERE id=? AND user_id=? AND opened=0",
         (chest_db_id, user_id)).fetchone()
-
-
-def db_next_card_instance_id():
-    """Return the next free card_instances.instance_id."""
-    row = _db.execute(
-        "SELECT COALESCE(MAX(instance_id), 5000) FROM card_instances").fetchone()
-    return row[0] + 1 if row else 5001
 
 
 def db_create_card_instance(user_id, instance_id, template_guid):

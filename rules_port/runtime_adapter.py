@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import importlib
 import json
 import sqlite3
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, MutableMapping, cast
 
 import game_engine
 from domain.enums import ECardAttributes, ECardTypes, card_type_from_db
@@ -116,14 +116,19 @@ class SQLiteCardMutationAdapter:
     def _card_uid(event) -> int | None:
         value = getattr(event, "session_card_id", None)
         value = getattr(value, "uid", value)
+        if value is None:
+            return None
         try:
-            return int(getattr(value, "uid64", value))
+            return int(cast(Any, getattr(value, "uid64", value)))
         except (TypeError, ValueError):
             return None
 
     def apply_card_moved(self, event) -> bool:
         card_uid = self._card_uid(event)
-        location = _LOCATION_BY_COLLECTION.get(getattr(event, "collection", None))
+        collection = getattr(event, "collection", None)
+        if collection is None:
+            return False
+        location = _LOCATION_BY_COLLECTION.get(collection)
         if card_uid is None or location is None:
             return False
         self._pvp.db_set_card_location(self.session_id, card_uid, location)
@@ -141,10 +146,14 @@ class PvpRuntimeFacts:
     its owner/zone/phase/resource/threshold constraints.
     """
 
-    def __init__(self, session_id, battle_state: Mapping[str, Any], *,
+    client_player_uid: Any
+    player_owner_id: int
+    ai_owner_id: int
+
+    def __init__(self, session_id, battle_state: MutableMapping[str, Any], *,
                  player_uid, ai_uid, play_validator: Callable | None = None,
                  target_validator: Callable | None = None, pvp_api=None) -> None:
-        self.session_id = session_id
+        self.session_id = int(session_id)
         self.battle_state = battle_state
         self.player_uid = player_uid
         self.ai_uid = ai_uid
@@ -184,8 +193,9 @@ class PvpRuntimeFacts:
         resolver = getattr(self._pvp, "db_game_card_effective_cost", None)
         if callable(resolver):
             try:
-                return max(0, int(resolver(
-                    self.session_id, int(card_uid), self.battle_state)))
+                return max(0, int(cast(Any, resolver(
+                    self.session_id, int(cast(Any, card_uid)),
+                    self.battle_state))))
             except (TypeError, ValueError, sqlite3.Error):
                 if self.battle_state.get("_rules_port_attached"):
                     raise
@@ -210,18 +220,19 @@ class PvpRuntimeFacts:
         """
         resolver = getattr(self._pvp, "db_game_card_effective_attributes", None)
         if callable(resolver):
-            return int(resolver(self.session_id, int(card_uid),
-                                self.battle_state) or 0)
+            return int(cast(Any, resolver(
+                self.session_id, int(cast(Any, card_uid)),
+                self.battle_state)) or 0)
         if self.battle_state.get("_rules_port_attached"):
             raise RuntimeError(
                 "RulesPort runtime facts require the effective-attribute facade")
         # Focused test doubles and older non-battle callers project the
         # instance column until they expose the facade.
-        return int(stored or 0)
+        return int(cast(Any, stored) or 0)
 
     def get_card(self, card_id) -> RuntimeCard | None:
         location, row = self._location_row(card_id)
-        if row is None:
+        if row is None or location is None:
             return None
         card_uid, template_guid, owner, type_name, state, abilities, attributes = row
         cost = self._effective_cost(card_uid, template_guid)
@@ -283,8 +294,25 @@ class PvpRuntimeFacts:
                 owner_id = getattr(self, "ai_owner_id", None)
         if owner_id is None:
             owner_id = player.player_id
-        if card.owner_id != int(owner_id) or card.location != "hand":
+        if card.owner_id != int(owner_id):
             return False
+        location = str(card.location or "").lower()
+        if location != "hand":
+            if location != "deck":
+                return False
+            from .static_rules import player_int_attributes
+            db = getattr(getattr(self._pvp, "_db_layer", None), "_db", None)
+            if db is None:
+                import db as db_layer
+                db = db_layer._db
+            attrs = player_int_attributes(
+                db, self.session_id, self.battle_state, owner_id)
+            if int(attrs.get("CanPlayTopOfDeck", 0) or 0) <= 0:
+                return False
+            top = self._pvp.db_deck_top_card_details(
+                self.session_id, int(owner_id))
+            if not top or int(top[1]) != int(card.session_card_id):
+                return False
         if not self._has_thresholds(card, player):
             return False
         return bool(playing_for_free or player.current_resource_pool >= card.casting_cost)
@@ -320,6 +348,20 @@ class PvpRuntimeFacts:
         if flags and str(card.location or "").lower() not in {
                 zone.strip().lower() for zone in flags.split("|") if zone.strip()}:
             return False
+        if graph is not None:
+            from pvp_db import db_card_ability_use_counts, db_card_cooldown_counts
+            game_uses, turn_uses = db_card_ability_use_counts(
+                self.session_id, card.session_card_id, graph.guid,
+                self.battle_state.get("turn_number", 1))
+            costs = getattr(graph, "costs", None)
+            game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
+            turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
+            if ((game_limit > 0 and game_uses >= game_limit) or
+                    (turn_limit > 0 and turn_uses >= turn_limit) or
+                    int(db_card_cooldown_counts(
+                        self.session_id, card.session_card_id).get(
+                            str(graph.guid).lower(), 0) or 0) > 0):
+                return False
         validator = getattr(self, "ability_validator", None)
         return (bool(validator(card, player_id, ability_template_id))
                 if callable(validator) else True)
@@ -344,14 +386,14 @@ class PvpRuntimeFacts:
             expected = getattr(self, "ai_champion_card_id", None)
         try:
             expected = getattr(expected, "uid", expected)
-            expected = int(getattr(expected, "uid64", expected))
+            expected = int(cast(Any, getattr(expected, "uid64", expected)))
         except (TypeError, ValueError):
             expected = 0
         # Practice/reconnected sessions can omit the handler champion fields,
         # while battle state still carries the authoritative champion map.
         # Accept the matching mapped SessionCardId rather than rejecting the
         # synthetic champion source as an ordinary missing game_cards row.
-        valid_ids = {expected} if expected else set()
+        valid_ids: set[int] = {expected} if expected else set()
         for value in (getattr(self, "battle_state", {}) or {}).get(
                 "champ_map", {}).values():
             try:
@@ -410,11 +452,19 @@ class PvpRuntimeFacts:
         key = self._champion_power_key(source_card_id, graph)
         if key is None:
             return False
+        from .cooldowns import champion_cooldown
+        cooldown = champion_cooldown(
+            self.battle_state, source_card_id, key)
+        if cooldown > 0:
+            return True
         costs = getattr(graph, "costs", None)
         per_game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
         if per_game_limit > 0:
+            source = int(getattr(source_card_id, "uid64", source_card_id))
+            usage_key = f"{source}:{key}"
+            uses = self.battle_state.get("champion_ability_uses") or {}
             used = int((self.battle_state.get("champion_ability_uses") or {}).get(
-                key, 0) or 0)
+                usage_key, uses.get(key, 0)) or 0)
             if used >= per_game_limit:
                 return True
         per_turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
@@ -433,8 +483,20 @@ class PvpRuntimeFacts:
         key = self._champion_power_key(source_card_id, graph)
         if key is None:
             return 0
+        cooldown = int(getattr(getattr(graph, "costs", None),
+                               "cooldown", 0) or 0)
+        if cooldown > 0:
+            from .cooldowns import set_champion_cooldown
+            set_champion_cooldown(
+                self.battle_state, source_card_id, key, cooldown)
+        source = int(getattr(source_card_id, "uid64", source_card_id))
         uses = self.battle_state.setdefault("champion_ability_uses", {})
-        uses[key] = int(uses.get(key, 0) or 0) + 1
+        usage_key = f"{source}:{key}"
+        per_game_limit = int(getattr(getattr(graph, "costs", None),
+                                     "uses_per_game", 0) or 0)
+        if per_game_limit > 0:
+            uses[usage_key] = int(
+                uses.get(usage_key, uses.get(key, 0)) or 0) + 1
         per_turn_limit = int(getattr(getattr(graph, "costs", None),
                                      "uses_per_turn", 0) or 0)
         if per_turn_limit > 0:
@@ -444,7 +506,32 @@ class PvpRuntimeFacts:
             )
             turn_key = champion_ability_use_key(source_card_id, key)
             record_champion_ability_use_this_turn(self.battle_state, turn_key)
-        return uses[key]
+        return int(uses.get(usage_key, 0) or 0)
+
+    def consume_card_ability_use(self, source_card_id, graph) -> tuple[int, int]:
+        """Record authored card ability limits and cooldowns after payment."""
+        source = int(getattr(source_card_id, "uid64", source_card_id))
+        guid = str(getattr(graph, "guid", "") or "").lower()
+        if not guid or self._champion_power_key(source, graph) is not None:
+            return 0, 0
+        costs = getattr(graph, "costs", None)
+        uses_per_game = int(getattr(costs, "uses_per_game", 0) or 0) > 0
+        uses_per_turn = int(getattr(costs, "uses_per_turn", 0) or 0) > 0
+        if not (uses_per_game or uses_per_turn):
+            game_count, turn_count = 0, 0
+        else:
+            from pvp_db import db_record_card_ability_use
+            game_count, turn_count = db_record_card_ability_use(
+                self.session_id, source, guid,
+                self.battle_state.get("turn_number", 1),
+                uses_per_game=uses_per_game,
+                uses_per_turn=uses_per_turn)
+        from pvp_db import db_set_card_cooldown
+        cooldown = int(getattr(getattr(graph, "costs", None),
+                               "cooldown", 0) or 0)
+        if cooldown > 0:
+            db_set_card_cooldown(self.session_id, source, guid, cooldown)
+        return game_count, turn_count
 
     def can_pay_ability_cost(self, ability) -> bool:
         """Check authored activation costs before an ability enters the chain.

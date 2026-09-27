@@ -96,7 +96,8 @@ def effect_template(ability, effect_guid):
         template = _as_dict(getattr(effect, "template", None))
         if not template and isinstance(effect, dict):
             from gamedata import DEFAULT_RECORD_STORE
-            record = DEFAULT_RECORD_STORE.get("AbilityEffectTemplate", guid)
+            record = DEFAULT_RECORD_STORE.get(
+                "AbilityEffectTemplate", str(guid or ""))
             template = _as_dict(record)
         return template
     return {}

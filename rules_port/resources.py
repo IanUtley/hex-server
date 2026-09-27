@@ -142,6 +142,68 @@ def _resource_grant_property(param):
     }
 
 
+class _ResourceSession:
+    """Minimal session view needed by the shared authored-condition engine."""
+
+    def __init__(self, session_id):
+        self.session_id = int(session_id)
+
+
+def resource_threshold_grants(db, session_id, owner_id, ability_guids, state,
+                              *, source_uid=None):
+    """Return the ``(shard_flag, amount)`` thresholds a resource grants.
+
+    The typed ``ThresholdModifier`` color and amount and the effect's authored
+    condition are the source of truth. Missing metadata produces no grant.
+
+    Conditions are evaluated from their authored metadata against the
+    controller's current hand. A qualifying card enables that effect's own
+    threshold amount; unrelated card costs in hand do not change the grant.
+    """
+    from pvp_db import db_ability_effect_rows
+    from rules_port.metadata import modifier_metadata
+    leaves = []
+    for guid in ability_guids or ():
+        for effect_guid, effect_type, param in db_ability_effect_rows(
+                str(guid).lower(), conn=db):
+            if effect_type != "CardModifierAbilityEffectTemplate":
+                continue
+            try:
+                value = json.loads(param or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            typed = modifier_metadata(effect_guid)
+            property_name = str(typed.get("property") or
+                                value.get("property") or "").lower()
+            if property_name != "threshold":
+                continue
+            threshold_color = (typed.get("thresholdcolor") or
+                               value.get("thresholdcolor"))
+            color_name = str(threshold_color or "").rsplit(".", 1)[-1].lower()
+            flag = int(game_engine.SHARD_TO_FLAG.get(color_name, 0))
+            if not flag:
+                continue
+            amount = int(value.get("amount") or 0)
+            if amount <= 0:
+                continue
+            condition_id = str(value.get("condition_id") or "")
+            if condition_id.lower() == "0" * 36:
+                condition_id = ""
+            leaves.append((flag, amount, condition_id))
+    if leaves:
+        from rules_port.condition_context import ConditionContext
+        from rules_port.conditions import evaluate_effect_condition
+        context = ConditionContext(
+            db, _ResourceSession(session_id), state,
+            ability_source_uid=(int(source_uid) if source_uid is not None
+                               else None),
+            ability_source_owner_id=int(owner_id or 0))
+        return [(flag, amount) for flag, amount, condition_id in leaves
+                if not condition_id or evaluate_effect_condition(
+                    db, condition_id, context)]
+    return []
+
+
 def apply_resource_change(state: MutableMapping, side: str, property: str,
                           amount: int, *, color: int = 0) -> ResourceChange:
     """Apply one typed resource change and return its client-facing delta."""
@@ -168,7 +230,31 @@ def apply_resource_change(state: MutableMapping, side: str, property: str,
     old = int(state.get(key, 0) or 0)
     new = max(0, old + amount)
     state[key] = new
+    if property == "chargepoints" and new > old:
+        from .statistics import record_charge_gained
+        record_charge_gained(state, _owner_for_side(state, side), new - old)
     return ResourceChange(side, property, amount, old, new)
+
+
+def _owner_for_side(state, side):
+    """Return a raw participant ID from either the PvP or practice view."""
+    if isinstance(state, dict):
+        pids = [int(pid) for pid in (state.get("pids") or ())]
+        if state.get("pvp") and len(pids) >= 2:
+            return pids[0] if str(side).lower() == "player" else pids[1]
+        mapping = state.get("champ_map") or {}
+        for pid in mapping:
+            try:
+                value = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if (str(side).lower() == "ai" and value == 0) or (
+                    str(side).lower() == "player" and value != 0):
+                return value
+        if str(side).lower() == "ai":
+            return 0
+        return int(state.get("player_owner_id", 0) or 0)
+    return 0
 
 
 def play_resource(state: MutableMapping, side: str, current_amount: int,
@@ -236,6 +322,10 @@ def play_resource_for_player(state: MutableMapping, player_id,
     threshold = (change("threshold", 1, color=int(threshold_color))
                  if threshold_color is not None else None)
     charge = change("chargepoints", charge_amount)
+    if charge.new_value > charge.old_value:
+        from .statistics import record_charge_gained
+        record_charge_gained(state, pid,
+                             charge.new_value - charge.old_value)
     state[played_key] = 1
     return ResourcePlay(current, total, charge, threshold)
 

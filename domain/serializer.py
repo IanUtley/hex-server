@@ -1,6 +1,6 @@
 """SessionEventArgs binary serializer (.NET BinaryWriter format)."""
 
-from typing import List, Dict
+from typing import List, Dict, cast
 
 from domain.binary_io import BinaryWriter, BinaryReader
 from domain.types import UID, ResourceId, SessionCardId, CombatId
@@ -8,8 +8,8 @@ from domain.types import UID, ResourceId, SessionCardId, CombatId
 
 class Serializer:
     def __init__(self):
-        self.w: BinaryWriter = None
-        self.r: BinaryReader = None
+        self.w = cast(BinaryWriter, None)
+        self.r = cast(BinaryReader, None)
 
     def begin_write(self):
         self.w = BinaryWriter()
@@ -21,7 +21,7 @@ class Serializer:
         self.r = BinaryReader(data)
 
     def end_read(self):
-        self.r = None
+        self.r = cast(BinaryReader, None)
 
     def add_int(self, v: int): self.w.write_int32(v)
     def add_long(self, v: int): self.w.write_int64(v)

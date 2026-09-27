@@ -132,6 +132,47 @@ def project_visible_hands(db, session, handler, game, pl_t, ai_t, state):
     return projected
 
 
+def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
+    """Send the active top card only to players with the authored permission."""
+    from pvp_db import db_deck_top_card_details
+    from .static_rules import player_int_attributes
+    owners = set()
+    if state.get("pvp"):
+        owners.update(int(pid) for pid in state.get("pids", ()) or ())
+    else:
+        profile = getattr(handler, "user_profile", None) or {}
+        owners.update((int(profile.get("id", 0) or 0), 0))
+    for owner in owners:
+        attrs = player_int_attributes(db, session.session_id, state, owner)
+        if int(attrs.get("CanSeeTopOfDeck", 0) or 0) <= 0:
+            continue
+        top = db_deck_top_card_details(session.session_id, owner, conn=db)
+        if not top:
+            continue
+        _row_id, uid, _instance_template, template_guid = top
+        if any(
+                isinstance(event, game_engine.CardUpdatedSessionEventArgs) and
+                int(event.session_card_id.uid.uid64) == int(uid) and
+                event.collection == game_engine.ECardCollections.Deck and
+                not bool(getattr(event, "nulling", False))
+                for event in game.events):
+            continue
+        scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
+        try:
+            _tpl, card_type, _name, cost, attack, defense, gems = \
+                handler._card_full_data(game, scid, template_guid)
+        except Exception:
+            continue
+        recipient = _owner_uid(game, owner, state)
+        game.push_card_updated(
+            scid, recipient, game_engine.ECardCollections.Deck, card_type,
+            template_id=template_guid, cost=cost, attack=attack,
+            defense=defense, gems=gems, nulling=False)
+        # Reuse the packet's viewer-only filtering rule; the visible card is
+        # not sent to the other participant's client.
+        game.events[-1]._hand_reveal_viewer_uid = recipient
+
+
 def _apply_player_flags(game, state):
     game._visibility_by_uid = {
         int(getattr(_owner_uid(game, int(owner), state), "uid64",

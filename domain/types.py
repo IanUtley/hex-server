@@ -1,7 +1,10 @@
 """Hex TCG domain types: UID, ResourceId, SessionCardId, CombatId."""
 
+from __future__ import annotations
+
 import struct
 import uuid
+from typing import Optional
 
 from domain.binary_io import BinaryWriter, BinaryReader
 
@@ -14,7 +17,7 @@ class UID:
     """8 bytes: low byte = Type enum, high 56 bits = instance ID shifted."""
     INVALID = 0
 
-    def __init__(self, uid64: int = 0):
+    def __init__(self, uid64: int | UID | SessionCardId | None = 0):
         # Defensive unwrap: callers occasionally pass a UID or SessionCardId
         # where an int was expected.  Storing a wrapper object makes the wire
         # writer crash with "SessionCardId' object has no attribute
@@ -23,7 +26,7 @@ class UID:
             uid64 = uid64.uid
         if isinstance(uid64, UID):
             uid64 = uid64.uid64
-        self.uid64 = uid64
+        self.uid64 = int(uid64 or 0)
 
     @property
     def uid_type(self) -> int:
@@ -34,6 +37,9 @@ class UID:
         return self.uid64 >> 8
 
     def to_uint64(self) -> int:
+        return self.uid64
+
+    def __int__(self) -> int:
         return self.uid64
 
     def to_hex(self) -> str:
@@ -70,7 +76,7 @@ class UID:
 
 class ResourceId:
     """Wraps a 16-byte GUID. Wire format: int32(16) + 16 bytes."""
-    def __init__(self, guid: uuid.UUID = None):
+    def __init__(self, guid: Optional[uuid.UUID] = None):
         self.guid = guid or uuid.UUID(int=0)
 
     def to_bytes(self) -> bytes:
@@ -88,7 +94,9 @@ class ResourceId:
         return ResourceId(uuid.UUID(bytes_le=guid_bytes))
 
     @staticmethod
-    def from_str(s: str) -> 'ResourceId':
+    def from_str(s: str | None) -> 'ResourceId':
+        if not s:
+            return ResourceId.invalid()
         return ResourceId(uuid.UUID(s))
 
     @staticmethod
@@ -105,21 +113,22 @@ class ResourceId:
 
 class SessionCardId:
     """Wraps UID. Wire format: 8 bytes uint64."""
-    def __init__(self, uid=None):
+    def __init__(self, uid: int | UID | SessionCardId | None = None):
         # Defensive unwrap: a SessionCardId passed to another SessionCardId
         # (e.g. PreGame re-asserting deck cards) would serialize its UID as a
         # SessionCardId and crash make_network_packet.  Unwrap to the inner
         # UID so double-wraps are harmless.
         if isinstance(uid, SessionCardId):
             uid = uid.uid
-        if isinstance(uid, UID):
-            pass
-        elif isinstance(uid, int):
+        if isinstance(uid, int):
             uid = UID(uid)
-        self.uid = uid if uid else UID.invalid()
+        self.uid: UID = uid if isinstance(uid, UID) else UID.invalid()
 
     def write(self, w: BinaryWriter):
         w.write_uint64(self.uid.to_uint64())
+
+    def __int__(self) -> int:
+        return int(self.uid)
 
     @staticmethod
     def read(r: BinaryReader) -> 'SessionCardId':
@@ -135,7 +144,7 @@ class SessionCardId:
 
 class CombatId:
     """Identifies one attacker's combat. Wire format: UID + int64 serial."""
-    def __init__(self, attacker: UID = None, serial: int = 0):
+    def __init__(self, attacker: UID | int | None = None, serial: int = 0):
         # ``RulesPort`` has its own ``rules_port.combat.CombatId`` whose
         # ``attacker_id`` is a raw uid64 int.  Callers that cross the two
         # namespaces (notably the combat-listing projection) can hand that

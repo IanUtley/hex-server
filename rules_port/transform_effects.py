@@ -31,12 +31,13 @@ def linked_template_guids(db, ability_guid):
     return found
 
 
-def transform_instance(context, card_uid, new_template_guid, *, keep_zone=False):
+def transform_instance(context, card_uid, new_template_guid, *, keep_zone=False,
+                       reverted=False):
     """Transform one live card while preserving its SessionCardId/state."""
     from pvp_db import (db_card_owner_location_position,
                         db_card_owner_zone_state, db_copy_template_payload,
                         db_transform_card_instance, db_card_attribute_value,
-                        db_card_owner_id)
+                        db_card_owner_id, db_reset_card_modifiers)
     row = db_card_owner_location_position(
         context.session.session_id, int(card_uid), conn=context.db)
     if not row:
@@ -49,6 +50,14 @@ def transform_instance(context, card_uid, new_template_guid, *, keep_zone=False)
     if not payload:
         return "transform: template not found"
     card_type = payload[0] or "Troop"
+    if reverted:
+        old_state &= ~int(game_engine.ECardStates.Damaged)
+        db_reset_card_modifiers(
+            context.session.session_id, int(card_uid), "{}", conn=context.db)
+        context.db.execute(
+            "UPDATE game_cards SET card_damage=0, cost_mod_json='[]', "
+            "card_state=? WHERE session_id=? AND card_uid=?",
+            (old_state, context.session.session_id, int(card_uid)))
     new_zone, new_position = (old_zone, old_position) if keep_zone else ("warzone", 0)
     db_transform_card_instance(
         context.session.session_id, int(card_uid), new_template_guid, card_type,
@@ -68,7 +77,10 @@ def transform_instance(context, card_uid, new_template_guid, *, keep_zone=False)
     recipient = owner_uid(owner_id, context.player_uid, context.ai_uid,
                           context.bstate)
     collection = card_collection_for_location(new_zone)
-    context.game.push_card_transformed(scid, new_template_guid, gems=gems)
+    if reverted:
+        context.game.push_card_reverted(scid, new_template_guid)
+    else:
+        context.game.push_card_transformed(scid, new_template_guid, gems=gems)
     context.game.push_card_updated(
         scid, recipient, collection, rendered_type, attack=attack,
         defense=defense, cost=cost, template_id=new_template_guid, gems=gems,
@@ -76,16 +88,33 @@ def transform_instance(context, card_uid, new_template_guid, *, keep_zone=False)
     context.game.push_card_moved(
         scid, recipient, collection, game_engine.ECardLocations.Top,
         new_position)
-    from .triggers import dispatch_trigger
-    dispatch_trigger(context, "CardTransformedEvent", int(card_uid), owner_id,
-                     data={"event_source_collection": old_zone,
-                           "event_destination_collection": new_zone,
-                           "event_previous_state": old_state})
-    dispatch_trigger(context, "CardTransformsEvent", int(card_uid), owner_id,
-                     data={"event_source_collection": old_zone,
-                           "event_destination_collection": new_zone,
-                           "event_previous_state": old_state})
+    if not reverted:
+        from .triggers import dispatch_trigger
+        dispatch_trigger(context, "CardTransformedEvent", int(card_uid), owner_id,
+                         data={"event_source_collection": old_zone,
+                               "event_destination_collection": new_zone,
+                               "event_previous_state": old_state})
+        dispatch_trigger(context, "CardTransformsEvent", int(card_uid), owner_id,
+                         data={"event_source_collection": old_zone,
+                               "event_destination_collection": new_zone,
+                               "event_previous_state": old_state})
     return int(card_uid)
+
+
+def revert_instance(context, card_uid):
+    """Restore one transformed card to its recorded original template."""
+    from pvp_db import db_card_original_and_template
+    row = db_card_original_and_template(
+        context.session.session_id, int(card_uid), conn=context.db)
+    original = str(row[0] or "").lower() if row else ""
+    current = str(row[1] or "").lower() if row else ""
+    if not original or original == current:
+        return "revert transform: no original template"
+    result = transform_instance(
+        context, int(card_uid), original, keep_zone=True, reverted=True)
+    if isinstance(result, str):
+        return result
+    return f"reverted {hex(int(card_uid))}"
 
 
 def transform_card_at_random(context):
@@ -133,6 +162,7 @@ def transform_card_at_random(context):
             saved = {}
         data["counters"] = saved.get("counters") or {}
         data["counter_guids"] = saved.get("counter_guids") or {}
+        data["tags"] = saved.get("tags") or {}
         return data
 
     source_card = card_record(target_row, target)

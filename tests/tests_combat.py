@@ -1,10 +1,10 @@
 """Regression tests for the Shamed Gladiator vs Darkspire Priestess combat.
 
 The user's Orc-deck game reported "Darkspire Priestess blocked Shamed
-Gladiator and neither died".  The shared resolve_combat must kill both (2/2 vs
-2/1), push the two CardUpdated+CardMoved deaths to the discard, resolve the
-priestess's Deathcry AFTER all combat damage (not mid-fight), and never treat
-the gladiator's Deploy (enters-play) trigger as a Deathcry.
+Gladiator and neither died".  The shared native combat resolver must kill both
+(2/2 vs 2/1), push the two CardUpdated+CardMoved deaths to the discard, resolve
+the priestess's Deathcry AFTER all combat damage (not mid-fight), and never
+treat the gladiator's Deploy (enters-play) trigger as a Deathcry.
 """
 
 import json
@@ -56,6 +56,14 @@ def make_db():
         defense INTEGER, attributes INTEGER, abilities_json TEXT,
         threshold_json TEXT, subtype TEXT, variable_cost INTEGER DEFAULT 0,
         variable_cost_minimum INTEGER DEFAULT 0, rage_value INTEGER DEFAULT 0)""")
+    db.execute("""CREATE TABLE card_counter_templates (
+        template_id TEXT PRIMARY KEY, name TEXT, description TEXT)""")
+    src = sqlite3.connect(SRC)
+    for row in src.execute("SELECT * FROM card_counter_templates"):
+        db.execute(
+            "INSERT OR IGNORE INTO card_counter_templates VALUES (?,?,?)",
+            row)
+    src.close()
     db.execute("""CREATE TABLE card_abilities_meta (
         ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
         game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
@@ -151,6 +159,10 @@ def make_db():
 
 
 def add_card(db, uid, owner, tpl, loc="warzone", state=0):
+    row = db.execute(
+        "SELECT abilities_json FROM card_templates WHERE guid=?", (tpl,)
+    ).fetchone()
+    abilities = (row[0] if row else "[]") or "[]"
     db.execute(
         "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
         "card_template_id, location, position, card_state, card_abilities, "
@@ -158,7 +170,7 @@ def add_card(db, uid, owner, tpl, loc="warzone", state=0):
         "card_cost_mod, card_damage, permanent_buffs, temporary_buffs, "
         "card_uses, resolved_at, original_template_guid) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (1, owner, uid, tpl, tpl, loc, 0, state, "[]", "Troop", 0,
+        (1, owner, uid, tpl, tpl, loc, 0, state, abilities, "Troop", 0,
          0, 0, 0, 0, "{}", "{}", "{}", 0, tpl))
     db.commit()
 
@@ -212,6 +224,18 @@ class HandlerStub:
             (int(self._ai_champ_scid.uid.uid64), 0, "AI", 20),
         ]
 
+    def _completed_rules_port_chain(self, session, bstate):
+        # Delegate to the production seam: with no live RulesPort on the
+        # session double it returns None, which is the correct answer here.
+        import hconnect_server as hcs
+        return hcs.HCPHandler._completed_rules_port_chain(self, session, bstate)
+
+    def _resume_completed_rules_port_chain(self, session, bstate,
+                                           completed_chain=None):
+        import hconnect_server as hcs
+        return hcs.HCPHandler._resume_completed_rules_port_chain(
+            self, session, bstate, completed_chain)
+
     def _max_hand_size(self, session):
         return 7
 
@@ -241,7 +265,7 @@ class HandlerStub:
 
     def _prompt_deck_search(self, game, session, pl_t, ai_t, bstate,
                             ability_guid, source_uid, owner_id, candidates,
-                            kind="search"):
+                            kind="search", **kwargs):
         """Harness: auto-pick a random candidate and move it to hand (the real
         fallback used when no interactive prompt exists)."""
         import random as _rnd
@@ -253,6 +277,11 @@ class HandlerStub:
                                       chosen, owner_id, bstate)
 
     def _push_discard_prompt(self, *a, **k):
+        return None
+
+    def _rules_port_deck_out(self, *a, **k):
+        """Harness: the host projection for a deck-out draw; the focused
+        fixtures do not publish a wire GameEnded packet."""
         return None
 
     def _bom_has_discard(self, ability_guid):
@@ -303,6 +332,37 @@ class HandlerStub:
         pass
 
 
+def resolve_native_combat(handler, session, pl_t, ai_t, bstate, attackers,
+                          blockers, first_strike=False):
+    """Run the native RulesPort combat resolver with explicit declarations.
+
+    Mirrors the production path: the declarations are projected onto the port's
+    battle-state keys, damage is resolved natively, then any queued chain
+    items (combat-death Deathcries) are drained.
+    """
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+    bstate.setdefault("stack", [])
+    bstate.setdefault("_next_instance_id", 1)
+    bstate["_rules_port_attached"] = True
+    bstate["ai_attackers"] = {str(k): str(v) for k, v in attackers.items()}
+    bstate["ai_blockers"] = {str(k): [str(b) for b in v]
+                             for k, v in blockers.items()}
+    game = handler._fresh_game(session, pl_t, ai_t, bstate)
+    context = EffectContext.from_rules_port(
+        game, session, handler._db, handler, pl_t, ai_t, bstate,
+        "", ability=None)
+    resolve_native(context, first_strike=first_strike,
+                   attacker_key="ai_attackers", blocker_key="ai_blockers")
+    from abilities.framework import triggers as _legacy_triggers
+    stack = bstate.get("stack") or []
+    while stack:
+        item = stack.pop()
+        _legacy_triggers.resolve_stack_trigger(
+            handler, game, session, handler._db, pl_t, ai_t, bstate, item)
+    return game
+
+
 def run_combat(db, player_deck_has_enforcer=False):
     """FRA combat: AI Shamed Gladiator (2/2) attacks, the player's Darkspire
     Priestess (2/1) blocks.  Returns (locations, states, game, bstate)."""
@@ -324,9 +384,8 @@ def run_combat(db, player_deck_has_enforcer=False):
         captured["game"] = game
 
     ai._db = db
-    ai.resolve_combat(handler, SessionStub(), pl_t, ai_t, bstate, attackers,
-                      blockers, ai_t, pl_t, "ai_attackers",
-                      send_events=_capture)
+    _capture(resolve_native_combat(handler, SessionStub(), pl_t, ai_t, bstate,
+                                   attackers, blockers), pl_t, ai_t, bstate)
     loc_a = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0]
     loc_b = db.execute(
@@ -754,6 +813,9 @@ def test_ai_turn_chain_pass_resolves_before_resuming_ai(db):
     handler = object.__new__(HCPHandler)
     handler.client_reck_id = 5
     handler.user_profile = {"id": 5}
+    # This unit isolates the host pass-priority helper; the mandatory native
+    # host attachment needs a full session schema this fixture does not build.
+    handler._maybe_attach_rules_port = lambda *args, **kwargs: None
     session = SessionStub()
     phase_idx = be.COMBAT_TURN_PHASES.index(
         game_engine.ETurnPhases.AssignDamage)
@@ -836,7 +898,8 @@ class PromptHandlerStub(HandlerStub):
         self.prompt_calls = []
 
     def _prompt_deck_search(self, game, session, pl_t, ai_t, bstate,
-                            ability_guid, source_uid, owner_id, candidates):
+                            ability_guid, source_uid, owner_id, candidates,
+                            **kwargs):
         self.prompt_calls.append((ability_guid, int(source_uid), int(owner_id),
                                   [int(c) for c in candidates]))
         return "deck search: awaiting candidates"
@@ -967,6 +1030,9 @@ def test_speed_troop_can_attack_same_turn(db):
             game_engine.UID.make(244, 5))
         h._ai_champ_scid = game_engine.SessionCardId(
             game_engine.UID.make(3, 1000))
+        # Isolate the attack-option projection; this fixture has no full
+        # session schema for the mandatory native host attachment.
+        h._maybe_attach_rules_port = lambda *args, **kwargs: None
         h._send_battle_events = lambda s, g, pl_t: captured.append(g)
         pl_t = game_engine.UID.make(244, 5)
         ai_t = game_engine.UID.make(3, 1000)
@@ -986,10 +1052,11 @@ def test_speed_troop_can_attack_same_turn(db):
 
 def test_ragefire_escalation_damage(db):
     """Ragefire ("Deal ESC:2 damage", Escalation) deals 2 to a targeted
-    champion on the first cast, escalates the counter, then deals 4, and moves
-    itself into the deck."""
+    champion on the first cast, increments same-name card instances, then a
+    second copy deals 4 from its own incremented EscalationCount."""
     import abilities
     src = sqlite3.connect(SRC)
+    target_guids = set()
     for ag in ("3e29a0c9-f636-0d1f-a829-2c5bf2e4101b",
                "5e434cd5-22ca-93ad-3cc0-43c2ead48949"):
         meta = src.execute(
@@ -1000,13 +1067,27 @@ def test_ragefire_escalation_damage(db):
         db.execute(
             "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             meta)
+        target_guids.update(json.loads(meta[10] or "[]"))
         for eff in src.execute(
                 "SELECT ability_guid, effect_guid, effect_order, effect_type, "
                 "param FROM ability_effects WHERE ability_guid=?", (ag,)).fetchall():
             db.execute(
                 "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)", eff)
+    for target_guid in target_guids:
+        target_row = src.execute(
+            "SELECT template_id, game_text, is_auto_target, is_random_target, "
+            "optional, explicit, player_filter, collection_flags, "
+            "min_target_count, max_target_count, filter_json, target_kind "
+            "FROM target_templates WHERE template_id=?",
+            (target_guid,)).fetchone()
+        if target_row:
+            db.execute(
+                "INSERT OR REPLACE INTO target_templates VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?)", target_row)
     src.close()
-    add_card(db, 101, 5, TPL_ENFORCER, loc="CastSpells")
+    db.commit()
+    for uid in (101, 102):
+        add_card(db, uid, 5, TPL_ENFORCER, loc="CastSpells")
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
     handler = HandlerStub(db)
@@ -1016,19 +1097,22 @@ def test_ragefire_escalation_damage(db):
               "resolving_source_uid": 101,
               "resolving_owner_id": 5,
               "player_health": 20, "ai_health": 20,
-              "player_escalation_uses": 0, "turn_number": 1}
+              "turn_number": 1}
     game = game_engine.Game(1, pl_t, ai_t)
     abilities.resolve_played_spell(
         game, SessionStub(), db, handler, pl_t, ai_t, bstate,
         ["3e29a0c9-f636-0d1f-a829-2c5bf2e4101b",
          "5e434cd5-22ca-93ad-3cc0-43c2ead48949"])
     assert bstate["ai_health"] == 18, bstate
-    assert bstate["player_escalation_uses"] == 1, bstate
+    for uid in (101, 102):
+        buffs = json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0])
+        assert buffs["escalation_count"] == 2, (uid, buffs)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0]
     assert loc == "deck", loc
-    # Second cast escalates to 4 damage.
-    add_card(db, 102, 5, TPL_ENFORCER, loc="CastSpells")
+    # Second copy was escalated by the first copy's authored target list.
     bstate["resolving_source_uid"] = 102
     bstate["player_spell_target"] = int(ai_champ.uid.uid64)
     bstate["ai_health"] = 20
@@ -1037,7 +1121,11 @@ def test_ragefire_escalation_damage(db):
         ["3e29a0c9-f636-0d1f-a829-2c5bf2e4101b",
          "5e434cd5-22ca-93ad-3cc0-43c2ead48949"])
     assert bstate["ai_health"] == 16, bstate
-    assert bstate["player_escalation_uses"] == 2, bstate
+    for uid in (101, 102):
+        buffs = json.loads(db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0])
+        assert buffs["escalation_count"] == 3, (uid, buffs)
 
 
 def test_ai_discard_down_to_seven(db):
@@ -1405,6 +1493,9 @@ def test_champion_zero_health_state_check(db):
     try:
         h = object.__new__(hcs.HCPHandler)
         h.user_profile = {"id": 5}
+        # Isolate the health state check; this fixture has no full session
+        # schema for the mandatory native host attachment.
+        h._maybe_attach_rules_port = lambda *args, **kwargs: None
         pl_t = game_engine.UID.make(244, 5)
         ai_t = game_engine.UID.make(3, 1000)
         with mock.patch("commands.push_battle_game_end") as pbe:
@@ -1430,7 +1521,7 @@ def test_authoritative_resolution_deathcry(db):
     data-driven: the RandomizeVariable leaf sets RandomNumber, and the
     conditioned ActivateAbility branches gate on it — roll 1 damages the
     opposing champion, roll 2 resolves the deck search with the mapped target."""
-    from abilities.framework.resolution import resolve_ability
+    from rules_port.resolution import resolve_port_ability
     import db as dbmod
     old_db = dbmod._db
     dbmod._db = db
@@ -1451,17 +1542,22 @@ def test_authoritative_resolution_deathcry(db):
                   "resolving_source_uid": 200}
         game = game_engine.Game(1, pl_t, ai_t)
         with mock.patch("random.randint", return_value=1):
-            resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t,
-                            bstate, AG_DEATHCRY, 200, 5, {})
+            resolve_port_ability(handler, game, SessionStub(), db, pl_t, ai_t,
+                                 bstate, AG_DEATHCRY, 200, 5)
         assert bstate["ai_health"] == 17, bstate
         # Roll 2 -> the search branch: move the mapped deck card to hand.
         bstate = {"player_health": 20, "ai_health": 20,
                   "turn_number": 1, "resolving_owner_id": 5,
                   "resolving_source_uid": 200}
         game = game_engine.Game(1, pl_t, ai_t)
-        with mock.patch("random.randint", return_value=2):
-            resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t,
-                            bstate, AG_DEATHCRY, 200, 5, {0: 102})
+        # The deck-search branch opens the native picker; the harness stub
+        # auto-picks, so pin its random choice to the mapped deck card or the
+        # two Darkspire Enforcers make the assertion order-dependent.
+        with mock.patch("random.randint", return_value=2), \
+                mock.patch("random.choice", return_value=102):
+            resolve_port_ability(handler, game, SessionStub(), db, pl_t, ai_t,
+                                 bstate, AG_DEATHCRY, 200, 5,
+                                 target_map={0: 102})
         loc = db.execute(
             "SELECT location FROM game_cards WHERE card_uid=102").fetchone()[0]
         assert loc == "hand", loc
@@ -1753,10 +1849,8 @@ def test_spiritdrain_heals_actual_blocker_damage(db):
               "turn_number": 1}
     handler = HandlerStub(db)
     ai._db = db
-    ai.resolve_combat(
-        handler, SessionStub(), pl_t, ai_t, bstate,
-        {101: 0}, {101: [102]}, ai_t, pl_t, "ai_attackers",
-        send_events=lambda *args: None)
+    resolve_native_combat(handler, SessionStub(), pl_t, ai_t, bstate,
+                          {101: 0}, {101: [102]})
     assert bstate["ai_health"] == 12, bstate
 
 
@@ -1831,10 +1925,8 @@ def test_lethal_kills_high_defense_blocker(db):
     bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
     handler = HandlerStub(db)
     ai._db = db
-    ai.resolve_combat(
-        handler, SessionStub(), pl_t, ai_t, bstate,
-        {101: 0}, {101: [102]}, ai_t, pl_t, "ai_attackers",
-        send_events=lambda *args: None)
+    resolve_native_combat(handler, SessionStub(), pl_t, ai_t, bstate,
+                          {101: 0}, {101: [102]})
     blocker = db.execute(
         "SELECT location, card_state FROM game_cards WHERE card_uid=102"
     ).fetchone()
@@ -2057,13 +2149,11 @@ def test_block_rule_filter_uses_card_owner_and_zone(db):
     assert combat_rules.can_block(db, 1, battle_state, 401, 402) is False
 
 
-def test_transform_bom_returns_string(db):
+def test_transform_bom_applies_bone_warrior(db):
     """Pile of Bones's manual "transform into a Bone Warrior" ability resolves
-    without the 'sequence item 0: expected str instance, int found' crash —
-    every BOM leaf logs a string even when transform_card returns a card_uid."""
+    through the native port and replaces the card's template in play."""
     import db as dbmod
-    from abilities.framework.bom import _LEAFS
-    import abilities
+    from rules_port.resolution import resolve_port_ability
     db.execute(
         "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (TPL_PILE := "c72e6441-6717-4bbf-91f1-3fd6707d165d", "Pile of Bones",
@@ -2102,21 +2192,15 @@ def test_transform_bom_returns_string(db):
     old_db = dbmod._db
     dbmod._db = db
     try:
-        fn = abilities.resolve_effect("4d7b43dd-0a42-be5b-b998-ce8030501e6c")
-        out = fn(game, SessionStub(), db, HandlerStub(db), pl_t, ai_t,
-                 bstate, "4d7b43dd-0a42-be5b-b998-ce8030501e6c", None)
-        assert isinstance(out, str), out
-        assert "transformed" in out.lower(), out
+        resolve_port_ability(
+            HandlerStub(db), game, SessionStub(), db, pl_t, ai_t, bstate,
+            "4d7b43dd-0a42-be5b-b998-ce8030501e6c", 101, 5)
     finally:
         dbmod._db = old_db
     row = db.execute(
         "SELECT template_guid, location FROM game_cards WHERE card_uid=101"
     ).fetchone()
     assert row[0] == TPL_BONE and row[1] == "warzone", row
-    # The leaf itself also returns a string now.
-    assert isinstance(_LEAFS["TransformCardAbilityEffectTemplate"](
-        game, SessionStub(), db, HandlerStub(db), pl_t, ai_t,
-        bstate, "e", None), str)
 
 
 def main():
@@ -2145,7 +2229,8 @@ def main():
         ("Priestess Deathcry human picker", test_priestess_deathcry_human_picker),
         ("Blocker options exclude CantBlock", test_player_can_block_excludes_cantblock),
         ("Block rules read owner/zone", test_block_rule_filter_uses_card_owner_and_zone),
-        ("Transform BOM returns string", test_transform_bom_returns_string),
+        ("Transform BOM applies Bone Warrior",
+         test_transform_bom_applies_bone_warrior),
         ("Poca summons Blaze Elemental", test_poca_summons_blaze_elemental),
         ("Speed troop attacks same turn", test_speed_troop_can_attack_same_turn),
         ("Ragefire escalation damage", test_ragefire_escalation_damage),

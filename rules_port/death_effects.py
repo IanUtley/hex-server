@@ -76,8 +76,20 @@ def kill_troop(context, target, *, cause="effect"):
         event_source_collection="warzone",
         event_destination_collection="discard",
         event_previous_state=int(game_engine.ECardStates.Dead))
+    if cause == "effect":
+        # Session.DestroyCard enqueues CardDestroyedEvent after MoveCard has
+        # published the exit/entry transition. GraveyardCard (state-based
+        # lethal cleanup) and SacrificeCard use distinct event contracts.
+        context._emit_trigger(
+            "CardDestroyedEvent", target,
+            int(context.bstate.get("resolving_owner_id", owner) or 0))
     if cause == "sacrifice":
         context._emit_trigger("CardSacrificedEvent", target, owner)
+    from .statistics import record_ability_card_list
+    if cause == "sacrifice":
+        record_ability_card_list(context.bstate, "SacrificedCards", target)
+    elif cause == "effect":
+        record_ability_card_list(context.bstate, "DestroyedCards", target)
     # Deathcry resolution belongs to the trigger engine: the warzone->discard
     # CardEnteredZoneEvent above already discovers the card's authored
     # Deathcry triggers and resolves them through the chain with their real

@@ -9,6 +9,7 @@ historical module while live RulesPort sessions have one condition boundary.
 from __future__ import annotations
 
 import datetime
+from typing import Any, cast
 
 
 _UNSUPPORTED = object()
@@ -152,8 +153,12 @@ def _native_condition(node, ctx):
         counter_count = getattr(ctx, "_counter_count", None)
         if not callable(counter_count):
             return _UNSUPPORTED
-        return counter_count(card, str(guid or "").lower()) >= int(
-            node.get("m_RequiredCount", 1) or 1)
+        try:
+            count = int(cast(Any, counter_count(
+                card, str(guid or "").lower())))
+        except (TypeError, ValueError):
+            return _UNSUPPORTED
+        return count >= int(node.get("m_RequiredCount", 1) or 1)
     if kind == "TriggerPlayerHealth":
         side = _side(ctx.ability_source_owner_id)
         value = int(ctx.bstate.get(f"{side}_health", 20) or 0)
@@ -259,6 +264,7 @@ def _native_condition(node, ctx):
         if target is None:
             return False
         source = ctx.card(ctx.ability_source_uid)
+        from rules_port.filters import records_filter_matches
         return records_filter_matches(
             target, node.get("m_Filter") or {}, source=source, context=ctx)
     if kind in ("AbilityControllerIsActiveAbilityCondition",
@@ -285,7 +291,7 @@ def _native_condition(node, ctx):
             side = _side(owner)
             value = int(ctx.bstate.get(f"{side}_health", 20) or 0)
         else:
-            value = int(health(owner))
+            value = int(cast(Any, health(owner)) or 0)
         required = int(node.get("m_RequiredQuantity", 0) or 0)
         return _compare(value, node.get("m_ComparisonOp"), required)
     if kind == "RequiresChampionCharges":
@@ -374,6 +380,7 @@ def _native_condition(node, ctx):
         source_side = _side(owner)
         count = 0
         from rules_port.filters import records_filter_matches
+        source = ctx.card(ctx.ability_source_uid)
         for card in ctx._cards_in_zones(zones):
             card_owner = int(card.get("user_id", 0) or 0)
             if player_filter in ("Self", "You", "Controller"):
@@ -386,8 +393,9 @@ def _native_condition(node, ctx):
                         (not ctx.bstate.get("pvp") and
                          _side(card_owner) == source_side)):
                     continue
-            if records_filter_matches(card, node.get("m_CardFilter") or {},
-                                      context=ctx):
+            if records_filter_matches(
+                    card, node.get("m_CardFilter") or {}, source=source,
+                    context=ctx):
                 count += 1
         return _compare(count, node.get("m_ComparisonOp"), required)
     if kind == "AbilityVariableCondition":
@@ -397,6 +405,9 @@ def _native_condition(node, ctx):
             return False
         try:
             left_value = int(variables[lhs])
+        except (TypeError, ValueError):
+            return False
+        try:
             right_value = int(rhs)
         except (TypeError, ValueError):
             if rhs not in variables:
@@ -508,7 +519,10 @@ def evaluate_condition(node, context):
         kind = _last(node.get("_t")) if isinstance(node, dict) else "<invalid>"
         raise RuntimeError(
             "RulesPort condition has no native handler: " + kind)
-    return _provider().evaluate_condition(node, context)
+    evaluator = getattr(_provider(), "evaluate_condition", None)
+    if callable(evaluator):
+        return evaluator(node, context)
+    raise RuntimeError("legacy condition evaluator is unavailable")
 
 
 def evaluate_effect_condition(db, condition_id, context):

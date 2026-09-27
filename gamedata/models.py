@@ -8,7 +8,7 @@ available even before a dedicated semantic property is added.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from .records import RecordObject, reference_guid, register_type
 
@@ -259,7 +259,7 @@ class AbilityTemplate(RecordObject):
 
     @property
     def effect_mappings(self) -> tuple["AbilityEffectMapping", ...]:
-        return tuple(AbilityEffectMapping.from_value(value)
+        return tuple(cast(Any, AbilityEffectMapping).from_value(value)
                      for value in (self.field("m_AbilityEffectList") or []))
 
     @property

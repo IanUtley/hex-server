@@ -87,21 +87,27 @@ def _queue_stack_item(session, state, item, owner_id=None):
 def _dispatch_triggers(db, handler, game, session, pl_t, ai_t, battle_state,
                        event_type, source_card_id, source_owner_uid=None,
                        extra_target=None, **event_data):
-    """Emit an AI event through the attached RulesPort when available."""
-    if (getattr(session, "_rules_port_session", None) is not None or
-            (battle_state or {}).get("_rules_port_attached")):
-        from rules_port.triggers import dispatch_native_trigger
+    """Emit an AI event through the RulesPort trigger boundary."""
+    from rules_port.triggers import dispatch_native_trigger
+    # The threshold colour is an event-local condition input; scope it to this
+    # dispatch so it cannot leak into the next event evaluation.
+    color = event_data.pop("gain_threshold_color", None)
+    old_color = (battle_state or {}).get("gain_threshold_color")
+    if color is not None and isinstance(battle_state, dict):
+        battle_state["gain_threshold_color"] = int(color)
+    try:
         return dispatch_native_trigger(
             db=db, handler=handler, game=game, session=session,
             player_uid=pl_t, ai_uid=ai_t, battle_state=battle_state,
             event_type=event_type, source_card_id=source_card_id,
             source_player_id=source_owner_uid,
             target_card_id=extra_target, data=event_data)
-    import ability
-    return ability.resolve_triggers(
-        db, handler, game, session, pl_t, ai_t, battle_state,
-        event_type, source_card_id, source_owner_uid=source_owner_uid,
-        extra_target=extra_target, **event_data)
+    finally:
+        if color is not None and isinstance(battle_state, dict):
+            if old_color is None:
+                battle_state.pop("gain_threshold_color", None)
+            else:
+                battle_state["gain_threshold_color"] = old_color
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +589,7 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
     attitude = battle_state.get("ai_attitude") or "Aggressive"
     min_x = {"Aggressive": 3, "Comfortable": 4, "Defensive": 5}.get(
         attitude, pers.get("min_x_value", 3))
+    min_x = int(min_x or 3)
     # The handler normally owns the canonical opponent champion SessionCardId.
     # A fresh native projection can be built before that handler field is
     # restored, though; use the Game projection as the same authoritative
@@ -858,486 +865,26 @@ def _aieval_attack_set_value(ev, attackers, blockers):
             total += best_delta
     return total
 
-def resolve_combat(handler, session, pl_t, ai_t, bstate, attackers, blockers_map,
-                  attacker_uid, defender_uid, attacker_key, order_map=None,
-                  send_events=None, first_strike=False):
-    """Shared combat-damage resolution used by BOTH the AI-attacks-player path
-    (resolve_ai_combat_damage) and the player-attacks-AI path
-    (handler._resolve_combat_damage) — the two are the same battle, just with
-    the attacking/defending players swapped.
-
-    `attackers` = {attacker_uid: defender_uid} (bstate[attacker_key]),
-    `blockers_map` = {attacker_uid: [blocker_uids]} (the defender's troops).
-    Blocked attackers fight each of their blockers (attacker deals its attack
-    to each; each blocker deals its attack back — troops with defense <= damage
-    taken die, firing Deathcry). A combatant with Lethal kills a troop it
-    damages. Unblocked attackers hit the defender's
-    champion. Lifelink (SpiritDrain) heals each controller for the damage their
-    side dealt. Combat events are wrapped in Begin/EndCombatResolution, and
-    combat-death Deathcries are drained. Returns the updated bstate.
-
-    ``first_strike=True`` is the Swiftstrike damage step: only combatants with
-    FirstStrike/DualStrike deal damage, and the casualties are removed so the
-    normal step (``first_strike=False``) only fights survivors.  In the normal
-    step FirstStrike-only troops have already dealt and stay quiet; DualStrike
-    deals in BOTH steps (the client's Card.CaresAboutCombatPhase).
-    """
-    if (getattr(session, "_rules_port_session", None) is not None or
-            (bstate or {}).get("_rules_port_attached")):
-        raise RuntimeError(
-            "legacy ai.resolve_combat cannot run in an attached session; "
-            "use rules_port.combat_damage.resolve")
-    import battle_engine as _be
-    import ability as _abil
-    if not attackers:
-        return bstate
-
-    def health_key(uid):
-        return "player_health" if uid == pl_t else "ai_health"
-
-    def _owner_of(uid):
-        if bstate.get("pvp"):
-            # The pid is encoded in the player UID: (pid << 8) | 244.
-            return int(uid.uid64) >> 8
-        return 0 if uid == ai_t else (handler.user_profile["id"]
-                                      if handler.user_profile else 0)
-
-    def champ_scid(uid):
-        if bstate.get("pvp"):
-            cm = bstate.get("champ_map") or {}
-            pid = int(uid.uid64) >> 8
-            cu = int(cm.get(str(pid), 0))
-            if cu:
-                return game_engine.SessionCardId(game_engine.UID(cu))
-            return game_engine.SessionCardId(uid)
-        if uid == pl_t:
-            return getattr(handler, "_player_champ_scid", None) or game_engine.SessionCardId(pl_t)
-        return getattr(handler, "_ai_champ_scid", None) or game_engine.SessionCardId(ai_t)
-
-    def _would_deal_damage(source_uid, target_uid, amount):
-        """Run CardWouldDealDamage replacement triggers for one combat hit."""
-        if int(amount or 0) <= 0:
-            return False
-        source_owner = db_card_owner_id(session.session_id, int(source_uid), conn=_db)
-        source_owner = source_owner if source_owner is not None else _owner_of(
-            attacker_uid if int(source_uid) in {
-                int(x) for x in attackers.keys()
-            } else defender_uid)
-        return bool(_dispatch_triggers(
-            _db, handler, game, session, pl_t, ai_t, bstate,
-            "CardWouldDealDamageEvent", int(source_uid),
-            source_owner_uid=source_owner, extra_target=int(target_uid),
-            event_tac={"damage": int(amount), "is_combat_damage": 1}))
-
-    att_health = health_key(attacker_uid)
-    def_health = health_key(defender_uid)
-    defender_champ = champ_scid(defender_uid)
-
-    game = handler._fresh_game(session, pl_t, ai_t, bstate)
-    # A normal combat pair raises two directional CardBattledEvents (one for
-    # each troop).  The same resolver is called for first-strike and normal
-    # damage, so persist a pair marker to keep the lifecycle event single-shot.
-    combat_pairs = []
-    for attacker in attackers:
-        for blocker in blockers_map.get(int(attacker), []):
-            combat_pairs.append((int(attacker), int(blocker)))
-    combat_marker = "%d:%s" % (
-        int(bstate.get("turn_number", 0) or 0),
-        ";".join("%d-%d" % pair for pair in sorted(combat_pairs)))
-    if combat_pairs and bstate.get("_card_battled_event_marker") != combat_marker:
-        for attacker, blocker in combat_pairs:
-            attacker_owner = db_card_owner_id(
-                session.session_id, attacker, conn=_db)
-            blocker_owner = db_card_owner_id(
-                session.session_id, blocker, conn=_db)
-            attacker_owner = attacker_owner if attacker_owner is not None else 0
-            blocker_owner = blocker_owner if blocker_owner is not None else 0
-            _dispatch_triggers(
-                _db, handler, game, session, pl_t, ai_t, bstate,
-                "CardBattledEvent", attacker, attacker_owner,
-                extra_target=blocker)
-            _dispatch_triggers(
-                _db, handler, game, session, pl_t, ai_t, bstate,
-                "CardBattledEvent", blocker, blocker_owner,
-                extra_target=attacker)
-        bstate["_card_battled_event_marker"] = combat_marker
-    # DeclareAttackState enqueues one CardsAttackedEvent before combat damage
-    # begins. Dispatch it from the shared combat resolver so PvE and PvP
-    # receive the same metadata TAC (Diligent Counselor uses NumAttackers).
-    if not first_strike:
-        attacker_champ = champ_scid(attacker_uid)
-        _dispatch_triggers(
-            _db, handler, game, session, pl_t, ai_t, bstate,
-            "CardsAttackedEvent", int(attacker_champ.uid.uid64),
-            source_owner_uid=_owner_of(attacker_uid),
-            event_tac={"NumAttackers": len(attackers)})
-    def_health_before = bstate.get(def_health, 20)
-    att_health_before = bstate.get(att_health, 20)
-    att_lifegain = 0
-    def_lifegain = 0
-
-    game.push_begin_combat_resolution()
-    combats = []
-    deferred_deaths = []  # (card_uid, template_guid, owner_id) — Deathcries
-    # resolve only after ALL combat damage has been assigned (Hex: combat
-    # damage is simultaneous; a blocker's Deathcry cannot resolve mid-fight).
-    for u in attackers:
-        if db_card_location(session.session_id, u, conn=_db) != "warzone":
-            continue  # died in the earlier Swiftstrike damage step
-        scid = game_engine.SessionCardId(game_engine.UID(int(u)))
-        from rules_port.static_rules import controller_flags, effective_stats
-        atk, a_def, a_attrs, a_flags, _a_rage = effective_stats(
-            _db, session.session_id, bstate, u)
-        a_dmg = 0  # effective_stats already nets combat damage out of defense
-        a_basic = db_card_basic(session.session_id, u, conn=_db)
-        a_tpl = a_basic[0] if a_basic else ""
-        a_att_flags = controller_flags(_db, session.session_id, bstate,
-                                       _owner_of(attacker_uid))
-        if "double_damage" in a_flags or "double_damage" in a_att_flags:
-            atk *= 2
-        a_has_fs = bool(a_attrs & (game_engine.ECardAttributes.FirstStrike |
-                                   game_engine.ECardAttributes.DualStrike))
-        a_deals = a_has_fs if first_strike else (
-            (not (a_attrs & game_engine.ECardAttributes.FirstStrike))
-            or bool(a_attrs & game_engine.ECardAttributes.DualStrike))
-        step_atk = atk if a_deals else 0
-        a_prevent = "prevent_combat_damage" in a_flags
-        a_lethal = "lethal" in a_flags
-        combat_id = game_engine.CombatId(attacker_uid, int(u) & 0xFFFF)
-        blockers = [game_engine.SessionCardId(game_engine.UID(b))
-                    for b in blockers_map.get(int(u), [])]
-        game.push_combat_phase_resolved(combat_id, scid, defender_champ, blockers)
-        combats.append((combat_id, scid, defender_champ, blockers))
-        # Damage targets for CardDealtDamageEvent ("when this deals damage to
-        # an opposing champion/troop"): the client fires one event per damaged
-        # card, so the trigger conditions (TriggerTarget IsHero, controls-target
-        # checks) evaluate against the actual damaged card.
-        dmg_targets = []
-        if blockers:
-            # Blocked. The ATTACKER chooses the order its damage is assigned
-            # among the blockers: the first blocker takes as much as it needs to
-            # die, then the leftover damage flows to the next, and so on. The
-            # human attacker's order arrives via AssignDamageOrderTransaction
-            # (order_map); otherwise default weakest-first.
-            b_uids = [b for b in blockers_map.get(int(u), [])]
-            if order_map and int(u) in order_map:
-                ordered = [b for b in order_map[int(u)] if b in b_uids]
-                ordered += [b for b in b_uids if b not in ordered]
-            else:
-                eff = {}
-                for b in b_uids:
-                    r0 = next((row for row in db_warzone_troop_stats(
-                        session.session_id, db_card_owner_id(
-                            session.session_id, b, conn=_db), conn=_db)
-                               if int(row[0]) == int(b)), None)
-                    eff[b] = ((r0[2] or 0) + (r0[3] or 0) - (r0[4] or 0)
-                              if r0 else 0)
-                ordered = sorted(b_uids, key=lambda b: eff[b])
-            remaining = step_atk
-            total_block_atk = 0
-            lethal_blocker_hit = False
-            for b in ordered:
-                if db_card_location(session.session_id, b, conn=_db) != "warzone":
-                    continue  # died in the Swiftstrike step
-                b_atk, b_def, b_attrs, b_flags, _b_rage = effective_stats(
-                    _db, session.session_id, bstate, b)
-                b_dmg = 0
-                b_basic = db_card_basic(session.session_id, b, conn=_db)
-                b_tpl = b_basic[0] if b_basic else ""
-                b_def_flags = controller_flags(_db, session.session_id, bstate,
-                                               _owner_of(defender_uid))
-                if "double_damage" in b_flags or "double_damage" in b_def_flags:
-                    b_atk *= 2
-                b_has_fs = bool(b_attrs & (game_engine.ECardAttributes.FirstStrike |
-                                           game_engine.ECardAttributes.DualStrike))
-                b_deals = b_has_fs if first_strike else (
-                    (not (b_attrs & game_engine.ECardAttributes.FirstStrike))
-                    or bool(b_attrs & game_engine.ECardAttributes.DualStrike))
-                step_b_atk = b_atk if b_deals else 0
-                b_prevent = "prevent_combat_damage" in b_flags
-                b_lethal = "lethal" in b_flags
-                if b_prevent:
-                    log_req(f"    Blocked combat: {hex(b)} prevents combat damage")
-                    continue
-                if step_b_atk and _would_deal_damage(b, u, step_b_atk):
-                    log_req(f"    Blocked combat: {hex(b)} damage was replaced")
-                    step_b_atk = 0
-                total_block_atk += step_b_atk
-                # The attacker assigns its remaining damage to this blocker: it
-                # needs `b_def - b_dmg` to die; leftover carries to the next.
-                b_need = max(0, b_def - b_dmg)
-                if a_lethal and b_need > 0:
-                    # The client only assigns one damage to a non-Immortal
-                    # blocker when the attacker has Lethal, preserving the
-                    # rest for another blocker or Juggernaught overflow.
-                    b_need = 1
-                dealt = min(remaining, b_need) if remaining > 0 else 0
-                remaining = max(0, remaining - dealt)
-                if b_need > 0 and dealt >= b_need:
-                    _abil.kill_troop(game, session, _db, handler, pl_t, ai_t, b,
-                                     bstate, cause="damage",
-                                     defer_deathcry=True,
-                                     deferred=deferred_deaths)
-                    dmg_targets.append(int(b))
-                    log_req(f"    Blocked combat: {hex(u)} assigns {dealt} -> kills blocker {hex(b)} (def {b_def}-{b_dmg}); {remaining} leftover")
-                elif dealt > 0 and a_lethal:
-                    # Lethal is a combat-damage property, not an attribute
-                    # bit. Any non-prevented damage from a Lethal troop is
-                    # lethal to the troop it damaged, even when below that
-                    # troop's remaining defense.
-                    _abil.kill_troop(game, session, _db, handler, pl_t, ai_t, b,
-                                     bstate, cause="damage",
-                                     defer_deathcry=True,
-                                     deferred=deferred_deaths)
-                    dmg_targets.append(int(b))
-                    log_req(f"    Blocked combat: {hex(u)} assigns {dealt} -> lethal kills blocker {hex(b)} (def {b_def}-{b_dmg}); {remaining} leftover")
-                elif dealt > 0:
-                    # The blocker survives: mark the damage dealt so the client
-                    # shows the reduced defense in red. PRESERVE its current
-                    # combat state (Blocking) and just add Damaged.
-                    db_add_card_damage(session.session_id, b, dealt, conn=_db)
-                    pstate = int(db_card_state_value(session.session_id, b, conn=_db) or 0)
-                    b_scid = game_engine.SessionCardId(game_engine.UID(b))
-                    handler._card_full_data(game, b_scid, b_tpl)
-                    game.push_card_updated(
-                        b_scid, defender_uid, game_engine.ECardCollections.Warzone,
-                        game_engine.ECardTypes.Troop, template_id=b_tpl,
-                        state=pstate | game_engine.ECardStates.Damaged)
-                    dmg_targets.append(int(b))
-                    log_req(f"    Blocked combat: {hex(u)} assigns {dealt} -> vs blocker {hex(b)} (def {b_def}-{b_dmg}); blocker survives, {remaining} leftover")
-                # Lifelink (SpiritDrain): the blocker's controller heals for the
-                # damage the blocker dealt to the attacker.
-                if b_attrs & game_engine.ECardAttributes.SpiritDrain and step_b_atk:
-                    def_lifegain += step_b_atk
-                if b_lethal and step_b_atk > 0:
-                    lethal_blocker_hit = True
-            # Trample / Crush (Juggernaught): after assigning enough damage to
-            # kill the blockers, any remaining damage breaks through to the
-            # defender's champion.
-            if remaining > 0 and (a_attrs & game_engine.ECardAttributes.Juggernaught):
-                if _would_deal_damage(u, defender_champ.uid.uid64,
-                                       remaining):
-                    log_req(f"    Trample: {hex(u)} damage was replaced")
-                else:
-                    old_health = bstate.get(def_health, 20)
-                    bstate[def_health] = max(0, old_health - remaining)
-                    log_req(f"    Trample: {hex(u)} deals {remaining} leftover -> defender health {old_health}->{bstate[def_health]}")
-            # SpiritDrain heals for actual combat damage dealt, not the
-            # attacker's full power.  `remaining` is the damage left after
-            # assigning damage to blockers; Juggernaught carries that
-            # remainder through to the champion.
-            a_dealt_this_step = step_atk - remaining
-            if (a_attrs & game_engine.ECardAttributes.Juggernaught
-                    and remaining > 0):
-                a_dealt_this_step += remaining
-            # Each blocker deals its full attack back to the attacker.
-            if a_prevent:
-                log_req(f"    Blocked combat: {hex(u)} prevents combat damage")
-            elif ((a_def - a_dmg <= total_block_atk) or lethal_blocker_hit):
-                _abil.kill_troop(game, session, _db, handler, pl_t, ai_t, u,
-                                 bstate, cause="damage",
-                                 defer_deathcry=True,
-                                 deferred=deferred_deaths)
-                if lethal_blocker_hit and a_def - a_dmg > total_block_atk:
-                    log_req(f"    Blocked combat: a Lethal blocker kills attacker {hex(u)} (def {a_def}-{a_dmg})")
-                else:
-                    log_req(f"    Blocked combat: blockers ({total_block_atk}) kill attacker {hex(u)} (def {a_def}-{a_dmg})")
-            elif total_block_atk > 0:
-                # The attacker survives: mark temporary damage on it. PRESERVE
-                # its current combat state (Attacking|HasAttacked|Tapped) and
-                # just add Damaged — state=Damaged alone would untap/un-attack it
-                # on the client (the flicker seen mid-combat).
-                db_add_card_damage(session.session_id, u, total_block_atk, conn=_db)
-                apstate = int(db_card_state_value(session.session_id, u, conn=_db) or 0)
-                handler._card_full_data(game, scid, a_tpl)
-                game.push_card_updated(
-                    scid, attacker_uid, game_engine.ECardCollections.Warzone,
-                    game_engine.ECardTypes.Troop, template_id=a_tpl,
-                    state=apstate | game_engine.ECardStates.Damaged)
-                log_req(f"    Blocked combat: blockers ({total_block_atk}) vs attacker {hex(u)} (def {a_def}-{a_dmg}); attacker survives")
-            elif not a_deals:
-                log_req(f"    Blocked combat: {hex(u)} does not deal damage this step")
-            # Lifelink (SpiritDrain): heal only for damage the attacker
-            # actually dealt to blockers (plus any trample damage).
-            if a_attrs & game_engine.ECardAttributes.SpiritDrain and a_dealt_this_step:
-                att_lifegain += a_dealt_this_step
-        else:
-            # Unblocked: the attacker hits the defender's champion.
-            if a_deals:
-                if _would_deal_damage(u, defender_champ.uid.uid64, step_atk):
-                    log_req(f"    Combat damage: {hex(u)} was replaced")
-                else:
-                    old_health = bstate.get(def_health, 20)
-                    bstate[def_health] = max(0, old_health - step_atk)
-                    if step_atk > 0:
-                        dmg_targets.append(int(defender_champ.uid.uid64))
-                    tnow = int(bstate.get("turn_number", 1))
-                    if bstate.get("damaged_opponent_turn") != tnow:
-                        bstate["damaged_opponent_this_turn"] = []
-                        bstate["damaged_opponent_turn"] = tnow
-                    damaged = bstate.setdefault("damaged_opponent_this_turn", [])
-                    if int(u) not in damaged:
-                        damaged.append(int(u))
-                    log_req(f"    Combat damage: {hex(u)} deals {step_atk} -> defender health {old_health}->{bstate[def_health]}")
-                    if a_attrs & game_engine.ECardAttributes.SpiritDrain:
-                        att_lifegain += step_atk
-            else:
-                log_req(f"    Combat damage: {hex(u)} does not deal damage this step")
-        # Damage-trigger events: one CardDealtDamageEvent per damaged card
-        # (the client fires one per damage event; the conditions gate the side).
-        for dmg_target in dmg_targets:
-            _dispatch_triggers(
-                _db, handler, game, session, pl_t, ai_t, bstate,
-                "CardDealtDamageEvent", int(u),
-                _owner_of(attacker_uid), extra_target=dmg_target)
-        # CardBlockedEvent / CardAttackedOrBlockedEvent / CardWasBlockedEvent
-        # are emitted where the client emits them: when blockers are DECLARED
-        # (Session.EmitBlockerEvents), so the abilities resolve before combat
-        # damage instead of after it.  Dispatching them here as well fired each
-        # trigger twice.
-    _db.commit()
-    # Lifelink heals for each controller's damage dealt.  Route through
-    # _apply_health_gain so "when you gain health" triggers (e.g. Incantation
-    # of Righteousness) fire for the healed player, then apply the max cap.
-    if att_lifegain:
-        from abilities.framework.triggers import _apply_health_gain
-        healed_owner = _owner_of(attacker_uid)
-        _apply_health_gain(game, bstate, pl_t, ai_t, att_lifegain,
-                           healed_owner, db=_db, handler=handler,
-                           session=session)
-        max_key = "player_max_health" if attacker_uid == pl_t else "ai_max_health"
-        if bstate.get(max_key):
-            bstate[att_health] = min(bstate[att_health], bstate[max_key])
-        log_req(f"    Lifelink: attacker gains {att_lifegain} life -> {bstate[att_health]}")
-        att_health_before = bstate.get(att_health, 20)
-    if def_lifegain:
-        from abilities.framework.triggers import _apply_health_gain
-        healed_owner = _owner_of(defender_uid)
-        _apply_health_gain(game, bstate, pl_t, ai_t, def_lifegain,
-                           healed_owner, db=_db, handler=handler,
-                           session=session)
-        max_key = "player_max_health" if defender_uid == pl_t else "ai_max_health"
-        if bstate.get(max_key):
-            bstate[def_health] = min(bstate[def_health], bstate[max_key])
-        log_req(f"    Lifelink: defender gains {def_lifegain} life -> {bstate[def_health]}")
-        def_health_before = bstate.get(def_health, 20)
-    # Reflect each player's net health change to the client.
-    game.player_health = bstate.get("player_health", 20)
-    game.ai_health = bstate.get("ai_health", 10)
-    for uid, health, before in ((attacker_uid, att_health, att_health_before),
-                                (defender_uid, def_health, def_health_before)):
-        if bstate.get(health, 20) != before:
-            ev = game_engine.ChampionHealthChangedSessionEventArgs()
-            ev.player_id = uid
-            ev.old_damage_value = before
-            ev.new_damage_value = bstate.get(health, 20)
-            game._push(ev)
-            game.push_player_updated(uid, champ_id=champ_scid(uid))
-    for combat_id, scid, champ, blockers in combats:
-        game.push_combat_removed(combat_id, scid, champ, blockers)
-    game.push_end_combat_resolution()
-    if not first_strike:
-        # End of combat: clear the combat states (Attacking / HasAttacked /
-        # Blocking / HasBlocked) from every warzone troop — a Steadfast attacker
-        # never tapped, so without this it would keep its "attacking" visuals
-        # through the opponent's turn.  Tapped persists until the next Ready.
-        # Only at the FINAL (normal) damage step, so the client still sees the
-        # attackers/blockers engaged during the Swiftstrike step.
-        combat_bits = (game_engine.ECardStates.Attacking |
-                       game_engine.ECardStates.HasAttacked |
-                       game_engine.ECardStates.Blocking |
-                       game_engine.ECardStates.HasBlocked)
-        db_clear_warzone_states(session.session_id, combat_bits, conn=_db)
-        for wzr in db_warzone_cards_with_state(session.session_id, conn=_db):
-            cu, tpl, owner, st = wzr
-            scid = game_engine.SessionCardId(game_engine.UID(cu))
-            _tpl, ct, _n, _c, _a, _d, _g = handler._card_full_data(game, scid, tpl)
-            from abilities.framework._shared import owner_uid as _ou
-            owner_uid = _ou(owner, pl_t, ai_t, bstate)
-            game.push_card_updated(
-                scid, owner_uid, game_engine.ECardCollections.Warzone,
-                ct, template_id=tpl,
-                state=int(st or 0))
-        # PvP combat-triggered abilities belong to the authoritative PvP
-        # priority loop.  Do not drain them here: this resolver can emit the
-        # trigger's AbilityPushedOnChain event, but only the shared chain seam
-        # (tournament_game._pvp_resolve_stack_item) emits the matching
-        # TopOfChainResolved/RemovedTopOfChain pair that removes the client
-        # chain visual.  Draining here leaves the server stack empty while the
-        # client's champion/ability remains displayed on the chain.
-        #
-        # The legacy PvE path still drains its combat stack here so existing
-        # discard-prompt and AI combat behavior remains unchanged.  Combat
-        # Deathcries are deferred below and therefore do not rely on this
-        # drain.
-        if not _be.stack_empty(bstate) and not bstate.get("pvp"):
-            _be.stack_set_pass(bstate, _be.PLAYER, True)
-            _be.stack_set_pass(bstate, _be.AI, True)
-            while not _be.stack_empty(bstate):
-                item = _be.stack_pop(bstate)
-                _be.stack_reset_passes(bstate)
-                handler._resolve_stack_item(session, pl_t, ai_t, bstate, item, game)
-                if _be.stack_empty(bstate):
-                    game.push_chain_empty()
-            bstate["player_passed"] = False
-            bstate["ai_passed"] = False
-    # Deathcries from combat deaths: deferred so the blocker/attacker deaths
-    # all happened during the simultaneous damage assignment above.  They are
-    # IgnoresChain triggers and execute immediately, pushing their own events
-    # (champion damage / deck search) after the combat envelope.
-    if deferred_deaths:
-        from abilities.framework.deathcry import resolve_deathcry
-        for cu, tpl, _owner in deferred_deaths:
-            resolve_deathcry(game, session, _db, handler, pl_t, ai_t, cu,
-                             tpl, bstate)
-    if not first_strike:
-        bstate[attacker_key] = {}
-        bstate.pop("ai_blockers", None)
-        # CombatEndedEvent is a distinct client lifecycle event.  It has no
-        # source card, so the shared dispatcher gathers persistent triggers
-        # from both controllers after the combat state has been removed.
-        _dispatch_triggers(
-            _db, handler, game, session, pl_t, ai_t, bstate,
-            "CombatEndedEvent", None,
-            source_owner_uid=_owner_of(attacker_uid))
-    _be.save_state(session, bstate)
-    if game.events:
-        if send_events is not None:
-            send_events(game, pl_t, ai_t, bstate)
-        else:
-            handler._send_battle_events(session, game, pl_t)
-    return bstate
-
-
 def resolve_ai_combat_damage(handler, session, pl_t, ai_t, bstate,
                              first_strike=False):
-    """Resolve AI combat damage (the AI attacks the player). Thin wrapper over
-    the shared resolve_combat with the AI as the attacker."""
-    if (getattr(session, "_rules_port_session", None) is not None or
-            (bstate or {}).get("_rules_port_attached")):
-        from rules_port.combat_damage import resolve as resolve_native
-        from rules_port.context import EffectContext
-        game = handler._fresh_game(session, pl_t, ai_t, bstate)
-        context = EffectContext.from_rules_port(
-            game, session, _db, handler, pl_t, ai_t, bstate, "", ability=None)
-        result = resolve_native(
-            context, first_strike=first_strike,
-            attacker_key="ai_attackers", blocker_key="ai_blockers")
-        if game.events:
-            handler._send_battle_events(session, game, pl_t)
-        # Simultaneous combat damage is fully applied before the champion's
-        # defeat is decided (the client's state-based check runs after the
-        # step), so publish a champion loss here rather than on a later phase.
-        check_health = getattr(handler, "_check_champion_health", None)
-        if callable(check_health):
-            check_health(session, pl_t, ai_t, bstate)
-        return result
-    attackers = {int(k): int(v) for k, v in (bstate.get("ai_attackers") or {}).items()}
-    blockers = {int(k): [int(b) for b in (v or [])]
-                for k, v in (bstate.get("ai_blockers") or {}).items()}
-    return resolve_combat(handler, session, pl_t, ai_t, bstate,
-                          attackers, blockers, ai_t, pl_t, "ai_attackers",
-                          first_strike=first_strike)
+    """Resolve AI combat damage (the AI attacks the player) natively."""
+    from rules_port.combat_damage import resolve as resolve_native
+    from rules_port.context import EffectContext
+    game = handler._fresh_game(session, pl_t, ai_t, bstate)
+    context = EffectContext.from_rules_port(
+        game, session, _db, handler, pl_t, ai_t, bstate, "", ability=None)
+    result = resolve_native(
+        context, first_strike=first_strike,
+        attacker_key="ai_attackers", blocker_key="ai_blockers")
+    if game.events:
+        handler._send_battle_events(session, game, pl_t)
+    # Simultaneous combat damage is fully applied before the champion's defeat
+    # is decided (the client's state-based check runs after the step), so
+    # publish a champion loss here rather than on a later phase.
+    check_health = getattr(handler, "_check_champion_health", None)
+    if callable(check_health):
+        check_health(session, pl_t, ai_t, bstate)
+    return result
 
 
 def combat_has_swiftstrike(db, session, bstate):
@@ -1633,9 +1180,9 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
              isinstance(port.action_stack.peek(), PriorityWindowAction) and
              getattr(port.action_stack.peek(), "_rules_port_phase", None) ==
              native_phase_name(phase)))
-        if (phase_was_entered_natively and
+        if (port is not None and phase_was_entered_natively and
                 getattr(port, "_native_phase_already_entered", None) == phase):
-            port._native_phase_already_entered = None
+            setattr(port, "_native_phase_already_entered", None)
         if native_lifecycle and not phase_was_entered_natively:
             # A native phase must already have been entered by
             # drive_until_input()/transition_to(). The old compatibility
@@ -1704,11 +1251,7 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             # RulesPort owns the refill and once-per-turn resource reset.
             from rules_port.resources import begin_turn_resources
             begin_turn_resources(battle_state, "ai")
-            if (getattr(session, "_rules_port_session", None) is not None or
-                    battle_state.get("_rules_port_attached")):
-                from rules_port.lifecycle import clear_expired_temporary_attributes
-            else:
-                from abilities.framework._shared import clear_expired_temporary_attributes
+            from rules_port.lifecycle import clear_expired_temporary_attributes
             clear_expired_temporary_attributes(
                 _db, session.session_id, 0, "start_turn",
                 clear_stat_buffs=True)
@@ -1738,6 +1281,14 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                             battle_state, "CardReadiedEvent", uid,
                             source_owner_uid=0,
                             event_previous_state=previous_state)
+                from rules_port.cooldowns import decrement_and_project_ready_cooldowns
+                decrement_and_project_ready_cooldowns(
+                    _db, session, handler, game, 0, ai_t, pl_t,
+                    battle_state)
+                clear_expired_temporary_attributes(
+                    _db, session.session_id, 0, "prep",
+                    clear_stat_buffs=True, battle_state=battle_state,
+                    handler=handler)
             # Clear summoning sickness on AI warzone troops (persist to DB).
             ai_wz = [(row[0], row[1]) for row in
                      db_warzone_cards_with_state(session.session_id, conn=_db)
@@ -1783,11 +1334,7 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                         source_owner_uid=0,
                         event_previous_state=previous_state)
             _db.commit()
-            if (getattr(session, "_rules_port_session", None) is not None or
-                    battle_state.get("_rules_port_attached")):
-                from rules_port.lifecycle import clear_expired_temporary_attributes
-            else:
-                from abilities.framework._shared import clear_expired_temporary_attributes
+            from rules_port.lifecycle import clear_expired_temporary_attributes
             clear_expired_temporary_attributes(
                 _db, session.session_id, 0, "prep", clear_stat_buffs=True)
         elif phase in (game_engine.ETurnPhases.FirstMainPhase,
@@ -1888,10 +1435,24 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         elif phase == game_engine.ETurnPhases.Discard:
             # Downsize the AI's hand at end of turn (max 7; campaign 10). The
             # Discard phase is otherwise a no-op — without this the AI's hand
-            # grows forever once it stops playing cards.
+            # grows forever once it stops playing cards.  A champion static
+            # ("Champions have no maximum hand size") lifts the limit for both
+            # sides, so check it before discarding.
             max_hand = handler._max_hand_size(session)
+            unlimited = False
+            try:
+                checker = getattr(handler, "_hand_size_unlimited", None)
+                if callable(checker):
+                    unlimited = checker(session, battle_state)
+                else:
+                    from rules_port.static_rules import hand_size_unlimited
+                    unlimited = hand_size_unlimited(
+                        _db, session.session_id, battle_state)
+            except Exception:
+                unlimited = False
             guard = 0
-            while (db_hand_card_count(session.session_id, 0) > max_hand
+            while (not unlimited and
+                   db_hand_card_count(session.session_id, 0) > max_hand
                    and guard < 30):
                 ai_discard_card(handler, game, session, pl_t, ai_t)
                 guard += 1
@@ -1911,13 +1472,8 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             # "Until end of turn" attribute grants on the AI's cards expire now.
             # Remove combat damage before expiring the AI's temporary
             # end-of-turn bonuses, matching the PvP cleanup ordering.
-            if (getattr(session, "_rules_port_session", None) is not None or
-                    battle_state.get("_rules_port_attached")):
-                from rules_port.lifecycle import (
-                    clear_combat_damage, clear_expired_temporary_attributes)
-            else:
-                from abilities.framework._shared import (
-                    clear_combat_damage, clear_expired_temporary_attributes)
+            from rules_port.lifecycle import (
+                clear_combat_damage, clear_expired_temporary_attributes)
             clear_combat_damage(_db, session.session_id)
             clear_expired_temporary_attributes(
                 _db, session.session_id, 0, "end_turn",
@@ -2041,7 +1597,8 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
                 _chain_port = getattr(session, "_rules_port_session", None)
                 _chain_action = (_chain_port.action_stack.peek()
                                  if _chain_port is not None else None)
-                if (isinstance(_chain_action, PriorityWindowAction)
+                if (_chain_port is not None and
+                        isinstance(_chain_action, PriorityWindowAction)
                         and _chain_action.priority_player_id == native_ai_id):
                     _chain_port.pass_player_priority(native_ai_id)
             battle_state["ai_turn_phase_idx"] = idx + 1
@@ -2060,7 +1617,7 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         if native_lifecycle:
             port = getattr(session, "_rules_port_session", None)
             action = port.action_stack.peek() if port is not None else None
-            if isinstance(action, PriorityWindowAction):
+            if port is not None and isinstance(action, PriorityWindowAction):
                 if action.priority_player_id == native_ai_id:
                     port.pass_player_priority(native_ai_id)
                 native_waiting_for_human = (
@@ -2073,6 +1630,30 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
             # (no blocker UI, no priority handoff).
             if phase == game_engine.ETurnPhases.DeclareDefense and not handler._player_can_block(session):
                 log_req("    No player blockers — DeclareDefense auto-passed (attackers unblocked)")
+                if native_lifecycle and port is not None:
+                    # Advancing only the compatibility cursor loops here:
+                    # native_mode re-reads the authoritative phase at the
+                    # top of the next iteration, which is still
+                    # DeclareDefense. Commit an explicit empty blocker set
+                    # through the same RulesPort transaction/projection path
+                    # as a client defense response so the combat flags,
+                    # events, and native phase all advance together.
+                    from rules_port.session import RulesTransaction
+                    declarations = tuple(
+                        (int(attacker_uid), ())
+                        for attacker_uid in
+                        (battle_state.get("ai_attackers") or {}))
+                    transaction = RulesTransaction.commit_troops_to_defense(
+                        pl_t, phase, declarations)
+                    if (port.submit_transaction(transaction) and
+                            port.handle_transaction()):
+                        return battle_state
+                    log_req(
+                        "    RulesPort failed to commit empty DeclareDefense "
+                        f"declarations: phase={port.current_turn_phase!r} "
+                        f"priority={port.action_stack.priority_player_id!r} "
+                        f"attackers={len(declarations)}")
+                    return battle_state
                 idx += 1
                 continue
             battle_state["ai_turn_phase_idx"] = idx + 1
@@ -2222,6 +1803,7 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
     # Standard resource from its deck, gains that threshold, and grants the
     # template's resource fields (m_MaxResourcesGranted=1 -> +1 max resources only).
     shard_ability = shard_tpl = resource_choice_ability = None
+    _ai_ags = []
     if row[5]:
         try:
             _ai_ags = json.loads(row[5])
@@ -2234,20 +1816,6 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
             from rules_port.resources import printed_resource_choice_ability
             resource_choice_ability = printed_resource_choice_ability(_ai_ags)
     t = handler._template_by_guid(row[2])
-    # A printed resource choice supplies its threshold through its authored
-    # ability.  Ordinary named shards supply one fixed threshold.
-    color = None
-    if not shard_tpl and not resource_choice_ability:
-        col_map = {
-            'Ruby': game_engine.ECardShards.Ruby,
-            'Sapphire': game_engine.ECardShards.Sapphire,
-            'Blood': game_engine.ECardShards.Blood,
-            'Diamond': game_engine.ECardShards.Diamond,
-            'Wild': game_engine.ECardShards.Wild,
-        }
-        color = col_map.get(
-            str(t[2] if t else "").split()[0],
-            game_engine.ECardShards.Wild)
     from domain.constants import PLAYED_CARD_POSITION
     from rules_port.zone_effects import move_card_to_zone
     move_card_to_zone(
@@ -2255,11 +1823,19 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
         position=PLAYED_CARD_POSITION)
     from rules_port.cast_stats import record_card_cast
     record_card_cast(battle_state, 0, resource=True)
-    from rules_port.resources import play_resource
-    resource_play = play_resource(
-        battle_state, "ai", cur_grant, max_grant,
-        threshold_color=color if not shard_tpl and not resource_choice_ability
-        else None)
+    # A printed resource choice supplies its threshold through its authored
+    # ability.  Every other resource supplies the threshold named by its
+    # authored CardModifier leaves; an unknown name must never default to
+    # Wild.  Condition-gated threshold leaves are evaluated against the
+    # controller's hand using their authored Records conditions.
+    from rules_port.resources import (apply_resource_change, play_resource,
+                                      resource_threshold_grants)
+    threshold_grants = []
+    if not shard_tpl and not resource_choice_ability:
+        threshold_grants = resource_threshold_grants(
+            _db, session.session_id, 0, _ai_ags, battle_state,
+            source_uid=card_uid)
+    play_resource(battle_state, "ai", cur_grant, max_grant)
     if shard_tpl:
         game.ai_charges = battle_state["ai_charges"]
         ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
@@ -2310,20 +1886,22 @@ def ai_play_resource(handler, game, session, ai_t, battle_state):
         resolve_port_ability(
             handler, game, session, _db, pl_t, ai_t, battle_state,
             resource_choice_ability, card_uid, 0, target_map={})
-    if color is not None:
+    for flag, amount in threshold_grants:
+        change = apply_resource_change(
+            battle_state, "ai", "threshold", amount, color=flag)
         ev_th = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
-        ev_th.player_id = ai_t; ev_th.color = color; ev_th.operation = 1; ev_th.delta = 1
-        ev_th.new_value = resource_play.threshold.new_value
+        ev_th.player_id = ai_t; ev_th.color = flag; ev_th.operation = 1
+        ev_th.delta = amount; ev_th.new_value = change.new_value
         game._push(ev_th)
         ai_champion = (getattr(handler, "_ai_champ_scid", None) or
                        game_engine.SessionCardId(ai_t))
         old_color = battle_state.get("gain_threshold_color")
-        battle_state["gain_threshold_color"] = int(color)
+        battle_state["gain_threshold_color"] = int(flag)
         try:
             _dispatch_triggers(
                 _db, handler, game, session, pl_t, ai_t, battle_state,
                 "GainThresholdEvent", int(ai_champion.uid.uid64), 0,
-                gain_threshold_color=int(color))
+                gain_threshold_color=int(flag))
         finally:
             if old_color is None:
                 battle_state.pop("gain_threshold_color", None)
@@ -2706,9 +2284,10 @@ def ai_main_phase_play(handler, game, session, ai_t, pl_t, battle_state,
 def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
     """Port of AITactical.UseAbilities for the AI champion: scan the AI's
     charge powers (champion_abilities gamedata), decide if one is worth
-    activating now (summon / buff / heal / burn / draw), pick a target from
-    the BOM, pay the charge cost, and push the ability onto the chain exactly
-    like the human path.  Returns True when an ability went on the chain."""
+    activating now (summon / buff / heal / burn / draw / transform), pick a
+    target from the BOM, pay the charge cost, and push the ability onto the
+    chain exactly like the human path. Returns True when an ability went on
+    the chain."""
     import json as _j
     _be = _checkpoint_engine(session, battle_state)
     ags = getattr(handler, "_ai_champ_ability_guids", None) or []
@@ -2742,22 +2321,20 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
         payload = db_champion_ability_target_template_ids(
             ability_guid, conn=_db)
         try:
+            raw_template_ids = (_j.loads(payload)
+                                if isinstance(payload, (str, bytes)) and payload
+                                else [])
             template_ids = [str(value).lower() for value in
-                            (_j.loads(payload) or []) if value]
+                            (raw_template_ids or []) if value]
         except (TypeError, ValueError, _j.JSONDecodeError):
             template_ids = []
         if not template_ids:
             result = (set(), False)
             legal_target_cache[ability_guid] = result
             return result
-        if getattr(session, "_rules_port_session", None) is not None:
-            from rules_port.targeting import (
-                legal_targets, target_uses_both_players,
-            )
-        else:
-            from abilities.framework.targeting import (
-                legal_targets, target_uses_both_players,
-            )
+        from rules_port.targeting import (
+            legal_targets, target_uses_both_players,
+        )
         candidates = set()
         for template_id in template_ids:
             candidates = {int(uid) for uid in legal_targets(
@@ -2781,7 +2358,7 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                 target_value_evaluator = _aieval.build_evaluator(
                     handler, session, battle_state, ai_t, pl_t)
             except Exception:
-                target_value_evaluator = False
+                target_value_evaluator = None
         if not target_value_evaluator:
             return {}
         cards = {int(card.card_uid): card for card in (
@@ -2894,6 +2471,10 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                  if t == "DrawNCardsAbilityEffectTemplate"]
         moves = [pm for t, pm in params
                  if t == "MoveCardToZoneEffectTemplate"]
+        random_transforms = [
+            pm for t, pm in params
+            if t == "TransformCardAtRandomAbilityEffectTemplate"
+        ]
         target_uid = None
         worth = False
         ai_health = int(battle_state.get("ai_health", 20))
@@ -3012,6 +2593,21 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                         # that omitted the auto-target flag.
                         target_uid = int(candidates[0])
                         break
+        if random_transforms:
+            # For an AI-controlled random-transform target, spend the power on
+            # the highest-evaluated legal troop, matching the client's
+            # Transform target ranking. The authored target template remains
+            # the source of target legality and ownership.
+            candidate_uids, has_target_templates = _legal_ability_targets(ag)
+            if has_target_templates:
+                friendly_uids = {
+                    int(uid) for uid in candidate_uids
+                    if db_card_owner_id(
+                        session.session_id, int(uid), conn=_db) == 0
+                }
+                if friendly_uids:
+                    target_uid = _rank_target_uids(friendly_uids)[0]
+                    worth = True
         if damages:
             # Direct-damage power: burn for lethal or kill a threat.
             amount = 0
@@ -3026,6 +2622,7 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                     amount = int(m.group(1))
             legal_uids, has_target_templates = _legal_ability_targets(ag)
             opponent_id = player_instance_id
+            opposing_champions = []
             troops = db_warzone_troop_stats(
                 session.session_id, opponent_id, conn=_db)
             if has_target_templates:
@@ -3127,6 +2724,8 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
             else:
                 from abilities.framework.targeting import legal_targets
             used_targets = {int(target_uid)} if target_uid else set()
+            candidates = []
+            sacrifice_rows = []
             for target_template_id, cost_type in cost_templates(ag):
                 if int(cost_type) != 2:  # EAbilityCostType.Sacrifice
                     continue
@@ -3161,8 +2760,7 @@ def ai_use_champion_ability(handler, game, session, ai_t, pl_t, battle_state):
                 1 for _tid, ctype in cost_templates(ag) if int(ctype) == 2)
             if len(sacrifice_uids) != sacrifice_cost_count:
                 log_req("    AI sacrifice migration mismatch: candidates=%s rows=%s costs=%s" %
-                        (candidates if 'candidates' in locals() else None,
-                         sacrifice_rows if 'sacrifice_rows' in locals() else None,
+                        (candidates, sacrifice_rows,
                          sacrifice_cost_count))
                 continue
         # ---- pay + push (mirror the human ability-activation path) -------
@@ -3310,14 +2908,9 @@ def ai_use_warzone_ability(handler, game, session, ai_t, pl_t, battle_state,
                 target_templates = _j.loads(target_ids) if target_ids else []
             except (TypeError, ValueError, _j.JSONDecodeError):
                 target_templates = []
-            if getattr(session, "_rules_port_session", None) is not None:
-                from rules_port.targeting import (
-                    legal_targets, target_uses_both_players,
-                )
-            else:
-                from abilities.framework.targeting import (
-                    legal_targets, target_uses_both_players,
-                )
+            from rules_port.targeting import (
+                legal_targets, target_uses_both_players,
+            )
             if resource_sink:
                 worth = True
                 # Let the authoritative resolver handle source/player/choice
@@ -3855,7 +3448,8 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
         # sends it to the graveyard) when both players pass.
         _queue_stack_item(session, battle_state, {
             "kind": "spell", "source_uid": int(tid),
-            "ability_guids": ability_guids, "target_uid": int(target_uid),
+            "ability_guids": ability_guids,
+            "target_uid": (int(target_uid) if target_uid is not None else None),
             "instance_id": inst_id, "x_cost": int(x_cost or 0),
         })
         game.ai_resources = battle_state["ai_resources"]
@@ -3867,7 +3461,7 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
         game._push(ev_cur)
         _be.save_state(session, battle_state)
         log_req(f"    AI cast spell {row[2][:8]} (cost={cost}+{x_cost}, "
-                f"dmg={amount}, target={hex(target_uid)}) — resources left "
+                f"dmg={amount}, target={hex(int(target_uid)) if target_uid is not None else 'none'}) — resources left "
                 f"{battle_state['ai_resources']}")
         return
 

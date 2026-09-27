@@ -161,6 +161,8 @@ def db_select_fra_challenge(kind, rng=None, conn=None):
     candidates = []
     for row in rows:
         challenge = _fra_challenge_from_row(row)
+        if challenge is None:
+            continue
         name = str(challenge.get("challenge_name") or "")
         if kind == "reward":
             eligible = name.endswith(" Reward")

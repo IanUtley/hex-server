@@ -45,6 +45,8 @@ GORTEZUMA = "b24b07cf-3da5-0014-fa56-8936700c3f52"  # self Invincible if opponen
 GORTEZUMA_COND = "180773b3-b10b-5633-f60c-42eb3556fd9d"
 ELECTROID = "e0c9f434-86e1-20a8-47c0-2a1c5f27f5ff"
 ELECTROID_COND = "c96dccfd-f714-4508-a3a6-f21779918aae"
+FOREMAN = "155ecb0a-a471-42d6-b754-04961add4d67"           # champion passive
+FOREMAN_PASSIVE = "ccbd7f1a-0531-e6d9-7ca6-6a511ea61f85"   # no maximum hand size
 
 TPL_PLAIN = "11111111-1111-1111-1111-111111111111"
 TPL_SOUL = "22222222-2222-2222-2222-222222222222"
@@ -89,8 +91,20 @@ def make_db():
             player_filter TEXT, collection_flags TEXT, min_target_count INTEGER,
             max_target_count INTEGER, filter_json TEXT)""",
         "ALTER TABLE target_templates ADD COLUMN target_kind TEXT DEFAULT ''",
+        """CREATE TABLE champion_abilities (
+            champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
+            ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
+            threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
+            thresholds_json TEXT, target_template_ids TEXT)""",
     ):
         db.execute(ddl)
+
+    for row in src.execute(
+            "SELECT * FROM champion_abilities WHERE champion_guid=?",
+            (FOREMAN,)):
+        db.execute(
+            "INSERT INTO champion_abilities VALUES (%s)"
+            % ",".join("?" * len(row)), tuple(row))
 
     def copy_ability(ag):
         m = src.execute(
@@ -111,7 +125,7 @@ def make_db():
 
     for ag in (LIGHT, SOUL, TECH, ROCK, WALL, OZAWA, DANDELION, EMBER,
                TE_TALCA, HARVESTER, AIR_SUP, OATH, HIGH_TOMB, ENDBRINGER,
-               GORTEZUMA, ELECTROID):
+               GORTEZUMA, ELECTROID, FOREMAN_PASSIVE):
         copy_ability(ag)
     for cid in ("1b5793b0", "d4a01cea", "72c15be6", GORTEZUMA_COND,
                 ELECTROID_COND):
@@ -301,6 +315,24 @@ def test_ember_cant_gain_health(db):
     card(db, 101, 0, "11111111-1111-1111-1111-111111111116", "warzone",
          json.dumps([EMBER]))
     assert "cant_gain_health" in global_flags(db, 1, {})
+
+
+def test_champion_passive_lifts_max_hand_size(db):
+    """Construct Foreman's champion passive removes the hand limit.
+
+    "Champions have no maximum hand size." is a WhileCardInPlay
+    UnlimitedHandSize intattr authored on the champion itself.  A champion has
+    no ``game_cards`` row, so the continuous-static scan must read the
+    checkpoint's ``champ_guid_map``; without it the AI discarded down to 7
+    every end of turn.
+    """
+    from rules_port.static_rules import hand_size_unlimited
+    bstate = {"champ_map": {"5": 257, "0": 513},
+              "champ_guid_map": {"5": "00000000-0000-0000-0000-000000000001",
+                                 "0": FOREMAN}}
+    assert hand_size_unlimited(db, 1, bstate) is True
+    assert hand_size_unlimited(
+        db, 1, {"champ_map": {"5": 257, "0": 513}}) is False
 
 
 def test_ember_cant_gain_health_reaches_the_native_heal_path(db):
@@ -496,11 +528,7 @@ def test_count_list_attribute_uses_gamedata_list_name(db):
 
 
 def test_damage_esc_variable(db):
-    """'Deal ESC:2 damage' — ESC * 2 from the escalation counter.
-
-    Ragefire's escalation sequence is 2 -> 4 -> 6, so an escalation count of
-    three produces 6 damage.
-    """
+    """'Deal ESC:2 damage' reads the active source card's escalation count."""
     from abilities.framework.statics import _leaf_numeric_value
     src = sqlite3.connect(SRC)
     raw = src.execute(
@@ -508,10 +536,11 @@ def test_damage_esc_variable(db):
         ("36dc9fbf-c870-1796-a9e9-a3f84994d934",)).fetchone()[0]
     src.close()
     pm = {"property": "damage", "amount": 0, "text": "Deal ESC:2 damage"}
-    for uses, expected in ((0, 2), (1, 4), (2, 6)):
-        bstate = {"player_escalation_uses": uses}
-        amount = _leaf_numeric_value(db, 1, bstate, pm, raw, 5, 0, "damage")
-        assert amount == expected, (uses, amount)
+    for count, expected in ((1, 2), (2, 4), (3, 6)):
+        bstate = {"escalation_counts_by_card": {"820801": count}}
+        amount = _leaf_numeric_value(
+            db, 1, bstate, pm, raw, 5, 820801, "damage")
+        assert amount == expected, (count, amount)
 
 
 def test_champion_damage(db):
@@ -881,6 +910,8 @@ if __name__ == "__main__":
     run("Ozawa scales with champion health", test_ozawa_health)
     run("Dandelion Sprite needs WILD x3", test_dandelion_threshold_keywords)
     run("Emberspire Witch blocks health gain", test_ember_cant_gain_health)
+    run("Construct Foreman lifts the maximum hand size",
+        test_champion_passive_lifts_max_hand_size)
     run("Emberspire Witch blocks the native heal path",
         test_ember_cant_gain_health_reaches_the_native_heal_path)
     run("Harvester only blocked by artifact/blood", test_unblockable_except)

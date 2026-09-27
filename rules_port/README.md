@@ -1,5 +1,8 @@
 # Python RulesPort runtime
 
+Semantic coverage, source evidence, focused acceptance and remaining gaps are
+tracked in [`docs/RULES_PORT_PARITY.md`](../docs/RULES_PORT_PARITY.md).
+
 `rules_port` is the Python implementation of the behavioral
 contracts extracted from `HexClient/Game.Shared`. It is deliberately isolated
 from transport and storage:
@@ -100,9 +103,9 @@ writing checkpoint counters directly. `AbilityCostPlan` is also applied by a
 RulesPort transition before the host projects its resource, charge, spell-point,
 or life events.
 
-The live HConnect host attaches one fully wired RulesPort session by default
-(`HEX_RULES_PORT_AUTO_ATTACH=1`); `HEX_RULES_PORT_AUTO_ATTACH=0` is the explicit
-rollback switch. A mode can also create one fully wired host with
+The live HConnect host attaches one fully wired RulesPort session for every
+game; there is no legacy rollback mode. A mode can also create one fully wired
+host with
 `enable_rules_port(game_session, game, battle_state)`, or use
 `rules_session_for(game_session, game)` when supplying adapters separately, then
 feed classified commands through `submit_classified_transaction`, and compare
@@ -117,8 +120,8 @@ never fall through to the legacy dispatcher after a RulesPort rejection.
 outside the gameplay rules boundary. With the port attached, a request the
 decoder cannot classify is acknowledged and dropped instead of being handed to
 the legacy engine; the class belongs in `classify_player_transaction` before it
-can be played. `HEX_RULES_PORT_AUTO_ATTACH=0` is the only mode that still
-dispatches a PlayerTransaction through the legacy handlers.
+can be played. No mode dispatches a live PlayerTransaction through the legacy
+handlers.
 
 Live attached sessions use `NativeEffectBackend`, `NativeTriggerBackend`, and
 the native target evaluator;

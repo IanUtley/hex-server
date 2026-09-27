@@ -73,12 +73,16 @@ def _flags(value, text=""):
         "can't ready": game_engine.ECardAttributes.CantReadyAutomatically,
         "defensive": game_engine.ECardAttributes.Defensive,
     }
-    raw = str(value or text or "")
-    for part in re.split(r"[|, ]+", raw.lower()):
-        bits |= int(names.get(part, 0) or 0)
-    if value and not bits:
+    raw = re.sub(r"<[^<>]*>", " ", str(value or text or "")).lower()
+    for part in re.split(r"[|, ]+", raw):
+        if part:
+            bits |= int(names.get(part, 0) or 0)
+    if not bits:
+        # Localized text wraps the keyword in HTML tags ("<b>Flight</b>"), so
+        # token equality after tag stripping is not enough; fall back to a
+        # substring search for the authored keyword names.
         for name, flag in names.items():
-            if name in raw.lower():
+            if name and name in raw:
                 bits |= int(flag)
     if text and "can't attack or block" in text.lower():
         bits |= int(game_engine.ECardAttributes.CantAttack | game_engine.ECardAttributes.CantBlock)
@@ -253,8 +257,12 @@ def apply_attribute_grant(context, target, param):
         _tpl, card_type, _name, cost, attack, defense, gems = \
             context.handler._card_full_data(context.game, scid, row[0])
         card_def = getattr(context.game, "card_defs", {}).get(scid)
-        projected_attributes = int(
-            getattr(card_def, "attributes", current | granted_bits) or 0)
+        # The immediate CardUpdated must announce the attribute it just
+        # granted even when the cached CardDef was projected before the DB
+        # write (the legacy leaf always pushed ``current | bits``).
+        projected_attributes = (
+            int(getattr(card_def, "attributes", 0) or 0)
+            | current | granted_bits)
         projected_int_attrs = dict(
             getattr(card_def, "int_attrs", {}) or {})
         # _card_full_data reconstructs permanent IntAttrs. Temporary IntAttrs
@@ -284,4 +292,4 @@ def apply_attribute_grant(context, target, param):
             gems=gems, attributes=projected_attributes,
             int_attrs=projected_int_attrs,
             nulling=str(row[2]).lower() == "deck")
-    return int(boon if int_attr else granted_bits)
+    return int((boon or 0) if int_attr else granted_bits)

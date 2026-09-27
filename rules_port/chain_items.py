@@ -47,6 +47,8 @@ test.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import game_engine
 
 from .actions import AbilityResolutionState
@@ -92,11 +94,11 @@ def dispatch(host, session, game, state, player_uid, ai_uid, event_type,
 
 def dispatch_card_cast(host, session, game, state, player_uid, ai_uid,
                        card_uid, owner_id):
-    """Dispatch CardCastEvent with the client's champion/card envelope.
+    """Dispatch the one CardCastEvent emitted when a card is played.
 
-    A permanent's cast event is queued before it enters the warzone. Its new
-    trigger must not be treated as an already-active listener when the chain
-    item finishes resolving.
+    This runs while the card is entering CastSpells, before a permanent gains
+    Warzone trigger registration. Do not dispatch it again when the chain item
+    resolves.
     """
     from .runtime_helpers import champion_uid_for_owner
     state["card_cast_copy_target"] = int(card_uid)
@@ -108,6 +110,37 @@ def dispatch_card_cast(host, session, game, state, player_uid, ai_uid,
             target_card_id=int(card_uid))
     finally:
         state.pop("card_cast_copy_target", None)
+
+
+def dispatch_card_zone_transition(host, session, game, state, player_uid,
+                                  ai_uid, card_uid, owner_id,
+                                  source_collection, destination_collection,
+                                  previous_state=0, *, hidden=True):
+    """Publish the C# MoveCard trigger sequence at a play transition."""
+    names = {
+        "hand": "Hand", "deck": "Deck", "champions": "Champions",
+        "warzone": "Warzone", "discard": "Discard", "crypt": "Discard",
+        "void": "Void", "playedresources": "PlayedResources",
+        "castspells": "CastSpells", "underground": "Underground",
+        "choosing": "Choosing", "mod": "Mod", "simulacrum": "Simulacrum",
+    }
+    raw_source = str(source_collection or "").rsplit(".", 1)[-1]
+    raw_destination = str(destination_collection or "").rsplit(".", 1)[-1]
+    source = names.get(raw_source.lower(), raw_source)
+    destination = names.get(raw_destination.lower(), raw_destination)
+    payload = {
+        "event_source_collection": source,
+        "event_destination_collection": destination,
+        "event_previous_state": int(previous_state or 0),
+    }
+    dispatch(host, session, game, state, player_uid, ai_uid,
+             "CardExitedZoneEvent", int(card_uid), owner_id, **payload)
+    dispatch(host, session, game, state, player_uid, ai_uid,
+             "CardEnteredZoneEvent", int(card_uid), owner_id, **payload)
+    if hidden:
+        dispatch(host, session, game, state, player_uid, ai_uid,
+                 "HiddenCardEnteredZoneEvent", int(card_uid), owner_id,
+                 **payload)
 
 
 def resolve_chain_item(host, port, session, db, ability, player_uid, ai_uid):
@@ -194,10 +227,7 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
                         db_set_card_location)
 
     kind = str(item.get("kind") or "")
-    instance_id = int(item.get("instance_id", 1) or 1)
     source_uid = int(item.get("source_uid") or 0)
-    game.push_top_of_chain_resolved(instance_id)
-    game.push_removed_top_of_chain(instance_id)
     if not source_uid:
         return
     details = db_card_owner_zone_state(session.session_id, source_uid, conn=db)
@@ -215,12 +245,13 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
         db_set_card_location(
             session.session_id, source_uid, "warzone",
             extra_set="position=?, card_state=(card_state | ?)",
-            extra_params=[0, game_engine.ECardStates.CameOutThisTurn])
+            extra_params=[0, game_engine.ECardStates.CameOutThisTurn],
+            conn=db)
         mark_entry = _hook(host, "chain_mark_warzone_entry")
         if mark_entry is not None:
             mark_entry(session, source_uid)
-        _tpl, ctype, _name, cost, attack, defense, gems = card_data(
-            host, game, scid, row[0])
+        _tpl, ctype, _name, cost, attack, defense, gems = cast(
+            Any, card_data(host, game, scid, row[0]))
         game.push_card_updated(
             scid, owner_sid, game_engine.ECardCollections.Warzone, ctype,
             template_id=row[0], cost=cost, attack=attack, defense=defense,
@@ -233,18 +264,14 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
         else:
             game.push_troop_card_played(scid, owner_sid)
         # CardEnteredZoneEvent is the native trigger boundary for a permanent
-        # reaching the warzone. CardCastEvent keeps the client's champion
-        # source and played-card target so the new permanent cannot observe
-        # the cast that first activated its own warzone trigger.
+        # reaching the warzone. CardCastEvent was emitted when the play was
+        # queued, before this permanent gained Warzone trigger registration.
         dispatch(
             host,
             session, game, state, player_uid, ai_uid,
             "CardEnteredZoneEvent", source_uid, owner_id,
             event_source_collection="CastSpells",
             event_destination_collection="warzone")
-        dispatch_card_cast(
-            host, session, game, state, player_uid, ai_uid,
-            source_uid, owner_id)
         return
 
     if loc != "CastSpells":
@@ -270,9 +297,6 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
             activations=item.get("activations"))
         if state.get("resolution_paused"):
             return
-    dispatch_card_cast(
-        host, session, game, state, player_uid, ai_uid,
-        source_uid, owner_id)
     state.pop("player_spell_target", None)
     state.pop("resolving_source_uid", None)
     state.pop("resolving_owner_id", None)
@@ -329,8 +353,8 @@ def resolve_ability_item(host, session, db, game, state, item, player_uid,
     owner_id = int(owner_id or 0)
     normalizer = _hook(host, "chain_ability_owner")
     if normalizer is not None:
-        owner_id = int(normalizer(
-            state, item, owner_id, player_uid, ai_uid) or 0)
+        owner_id = int(cast(Any, normalizer(
+            state, item, owner_id, player_uid, ai_uid)) or 0)
     ability_guid = str(item.get("ability_guid") or "").lower()
     if bom_completed:
         # A picker continuation already applied this ability's effects; only

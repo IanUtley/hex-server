@@ -8,7 +8,9 @@ it does not create a second rules state or implement PvP decisions.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 from .session import (AuthoritativeSession, _json_value,
                       projected_ability_ignores_chain)
@@ -110,7 +112,10 @@ class PvpAuthoritativeSession(AuthoritativeSession):
         if not isinstance(state, dict) or not state.get("pvp"):
             return False
         try:
-            self.current_turn_phase = int(state.get("phase"))
+            phase = state.get("phase")
+            if phase is None:
+                return False
+            self.current_turn_phase = int(phase)
         except (TypeError, ValueError):
             return False
         active = self._uid_for_raw_player(state.get("turn_pid"))
@@ -124,11 +129,11 @@ class PvpAuthoritativeSession(AuthoritativeSession):
         # insufficient: PriorityWindowAction reads its owner from its private
         # APNAP queue, so a reattach could reject a valid card/resource action
         # for the player shown by GreenLight.
-        from collections import deque
         from .kernel import PriorityWindowAction
         action = self.action_stack.peek()
         if isinstance(action, PriorityWindowAction) and priority is not None:
-            queue = list(getattr(action, "_priority_queue", ()) or ())
+            queue: list[Any] = list(
+                getattr(action, "_priority_queue", ()) or ())
             if priority in queue:
                 queue.remove(priority)
             queue.insert(0, priority)

@@ -80,6 +80,10 @@ class GameSession:
         self.seed_z = 12345
         self.seed_w = 67890
         self.deck_template_id = "00000000-0000-0000-0000-000000000000"
+        # Transient HConnect projection marker reset around each RulesPort
+        # transaction.  Keeping it on the shared session lets both client
+        # handlers report whether a mutation packet was already emitted.
+        self._rules_port_mutation_emitted = False
 
     def add_player(self, player_uid, player_position, conn=None):
         self.players.append((player_uid, player_position))

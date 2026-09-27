@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import struct
 
@@ -41,7 +42,7 @@ def tunneling_value(db, template_guid, persisted_int_attrs=None):
         if offset >= 0 and offset + 8 <= len(raw):
             return max(0, int(struct.unpack_from("<i", raw, offset + 4)[0]))
     except (AttributeError, TypeError, ValueError, struct.error,
-            base64.binascii.Error):
+            binascii.Error):
         pass
     return 0
 

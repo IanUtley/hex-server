@@ -1,4 +1,4 @@
-"""Headless two-player PvP autoplay smoke runner.
+"""Headless PvP runner for engine smoke checks and FRA AI duels.
 
 Drives a real tournament PvP session (tourney-N) through the production
 paths: 3029 PassPriority / ChoosePlay / AcceptStartingHand transactions,
@@ -7,14 +7,21 @@ fake HCPHandlers pushing events to no client.  The goal is to catch crashes
 and stuck phases in the PvP state machine (GreenLight sync, phase wrapping,
 combat).
 
-Run: python3 pvp_autoplay.py [games]
+Run the original Set 1 smoke runner with ``python3 pvp_autoplay.py [games]``.
+Run two FRA opponents with ``python3 pvp_autoplay.py --fra [GUID GUID]
+--turn-limit 30 --profile``. If no GUIDs are given, the first two authored
+encounters with complete decks are used.
 """
 
 import os
+import argparse
+import json
 import random
 import sqlite3
 import sys
+import time
 import traceback
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,7 +36,7 @@ from pvp_db import (
     db_hand_resources_with_template, db_insert_generated_card,
     db_next_game_card_row_id, db_set_constructed_guids, db_set_resource_guids,
     db_static_card_rows, db_warzone_troop_attributes,
-    db_warzone_troop_stats, db_zone_card_count,
+    db_warzone_troop_stats, db_zone_card_count, db_encounter_deck_cards,
 )
 from domain.constants import (CARD_UID_TYPE, PLAYER_UID_TYPE,
                               PLAYER_TRANSACTION_DATA_TYPE,
@@ -79,7 +86,7 @@ def _make_handler(pid, session):
     h.client_uid = f"pvp-{pid}"
     h._ai_turn_depth = 0
     h._current_bstate = None
-    h._player_autopass = False
+    setattr(h, "_player_autopass", False)
     h._pending_player_stops = None
     h._pending_player_draws_first = None
     h._player_champ_scid = None
@@ -88,13 +95,9 @@ def _make_handler(pid, session):
     h._ai_champ_guid = None
     h._player_starting_health = game_engine.DEFAULT_STARTING_HEALTH
     h._ai_starting_health = game_engine.DEFAULT_STARTING_HEALTH
-    h._autoplay_drive_ai_turn = True
-    h._campaign_gameend = lambda *a, **k: None
-    # Select the live controller explicitly for smoke runs.  The historical
-    # adapter remains available for rollback comparison, while native mode
-    # exercises the same PvP RulesPort attachment used by HConnect.
-    h._rules_port_auto_attach = os.environ.get(
-        "PVP_AUTOPLAY_RULES_PORT", "1").lower() in ("1", "true", "yes")
+    setattr(h, "_autoplay_drive_ai_turn", True)
+    setattr(h, "_campaign_gameend", lambda *a, **k: None)
+    # Native mode exercises the same PvP RulesPort attachment used by HConnect.
     h._application = hcs.ApplicationCommandDispatcher(
         event_publisher=h._publish_application_events)
     h.send = lambda *a, **k: None
@@ -130,7 +133,8 @@ def _seed_champion(session_id, pid, champ_guid, uid_offset=0):
     return int(cu)
 
 
-def _transaction(handler, session, inner_bytes):
+def _transaction(handler, session, inner_bytes, typed_payload=None,
+                 profiler=None):
     """Push a 3029 PlayerTransaction through the production handler.
 
     ``inner_obj`` carries the labelled raw envelope so the handler recovers
@@ -141,6 +145,8 @@ def _transaction(handler, session, inner_bytes):
     # The 3029 handler reloads the session via find_session_by_player; use the
     # same lookup so our view of the state stays in sync with the DB.
     pid = int(handler.client_reck_id)
+    if profiler is None:
+        profiler = getattr(handler, "_autoplay_profiler", None)
     session = gs.find_session_by_player(_ge.UID.make(PLAYER_UID_TYPE, pid).to_uint64()) \
         or session
     if os.environ.get("PVP_TRACE"):
@@ -149,10 +155,23 @@ def _transaction(handler, session, inner_bytes):
                 f"name={session.session_name} turn_order_type="
                 f"{type(to).__name__} keys="
                 f"{list(to.keys())[:6] if isinstance(to, dict) else 'n/a'}")
-    handler.handle_service_request(
-        "ServiceGameSession", str(session.server_id),
-        PLAYER_TRANSACTION_DATA_TYPE, 1, 1,
-        session.session_id, 0, {"__raw__": inner_bytes}, inner_bytes)
+    inner_obj = {"__raw__": inner_bytes}
+    if isinstance(typed_payload, dict):
+        # Add the same labeled decoder fields that the client request parser
+        # supplies. This supports target selections without bypassing the
+        # production application dispatcher or PvP RulesPort adapter.
+        inner_obj.update(typed_payload)
+    started = time.perf_counter()
+    try:
+        handler.handle_service_request(
+            "ServiceGameSession", str(session.server_id),
+            PLAYER_TRANSACTION_DATA_TYPE, 1, 1,
+            session.session_id, 0, inner_obj, inner_bytes)
+    finally:
+        if profiler is not None:
+            profiler["rules_transactions"] += 1
+            profiler["rules_transaction_seconds"] += (
+                time.perf_counter() - started)
     cur = gs.find_session_by_player(
         _ge.UID.make(PLAYER_UID_TYPE, int(handler.client_reck_id)).to_uint64()) or session
     if os.environ.get("PVP_TRACE"):
@@ -215,7 +234,150 @@ def _defense_bytes(attacker_uids, blocker_map, champ_uid):
     return out
 
 
-def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
+def _fra_encounter_specs(deck_guids=None):
+    """Load two authored FRA lists as disposable PvP decks."""
+    rows = _db.execute(
+        "SELECT deck_guid, deck_name, champion_guid FROM fra_encounters "
+        "ORDER BY deck_name, deck_guid").fetchall()
+    by_guid = {str(row[0]).lower(): row for row in rows}
+    if deck_guids:
+        chosen = []
+        for guid in deck_guids:
+            row = by_guid.get(str(guid).lower())
+            if row is None:
+                raise ValueError(f"unknown FRA encounter deck {guid!r}")
+            chosen.append(row)
+    else:
+        chosen = rows
+
+    specs = []
+    for deck_guid, name, champion_guid in chosen:
+        cards = []
+        for card_guid, quantity, _gems in db_encounter_deck_cards(
+                deck_guid, conn=_db):
+            cards.extend([card_guid] * max(0, int(quantity or 0)))
+        if not cards or not champion_guid:
+            continue
+        specs.append({"deck_guid": str(deck_guid), "name": str(name),
+                      "champion_guid": str(champion_guid), "cards": cards})
+        if len(specs) == 2:
+            break
+    if len(specs) != 2:
+        raise ValueError("need two FRA encounter decks with champions and cards")
+    return specs
+
+
+def _ai_evaluator_for_seat(handler, session, state, owner_id, opponent_id,
+                           profiler, report):
+    """Build the existing hand evaluator with this PvP seat as its AI side."""
+    from ai_eval import build_evaluator
+
+    champ_map = state.get("champ_map") or {}
+    own_champ = int(champ_map.get(str(owner_id), 0) or 0)
+    opp_champ = int(champ_map.get(str(opponent_id), 0) or 0)
+    handler.user_profile = {"id": int(owner_id), "name": f"FRA-{owner_id}"}
+    handler._ai_champ_scid = (game_engine.SessionCardId(
+        game_engine.UID(own_champ)) if own_champ else None)
+    handler._player_champ_scid = (game_engine.SessionCardId(
+        game_engine.UID(opp_champ)) if opp_champ else None)
+
+    view = dict(state)
+    view.update({
+        "ai_resources": int(state.get(f"res_{owner_id}", 0) or 0),
+        "ai_total_resources": int(
+            state.get(f"res_total_{owner_id}", 0) or 0),
+        "ai_threshold": state.get(f"thresh_{owner_id}") or {},
+        "ai_health": int(state.get(f"hp_{owner_id}", 20) or 0),
+        "player_health": int(state.get(f"hp_{opponent_id}", 20) or 0),
+    })
+    handler._current_bstate = view
+    evaluator = build_evaluator(
+        handler, session, view,
+        game_engine.UID.make(PLAYER_UID_TYPE, owner_id),
+        game_engine.UID.make(PLAYER_UID_TYPE, opponent_id),
+        ai_owner_id=owner_id, player_owner_id=opponent_id)
+    return evaluator
+
+
+def _record_card_decision(report, evaluator, chosen, choice_reason):
+    if report is None:
+        return
+    decisions = report.setdefault("card_decisions", {})
+    for card in evaluator.hand:
+        key = f"{card.template_guid}:{card.name}"
+        entry = decisions.setdefault(key, {
+            "template_guid": card.template_guid,
+            "name": card.name,
+            "seen": 0,
+            "selected": 0,
+            "played": 0,
+            "reasons": Counter(),
+        })
+        entry["seen"] += 1
+        playability = evaluator.is_playable(card)
+        if playability == "False":
+            reason = "threshold_or_target_unavailable"
+        elif playability == "NeedsResources":
+            reason = "needs_resources"
+        elif card is chosen:
+            reason = choice_reason or "selected"
+            entry["selected"] += 1
+        elif chosen is None:
+            reason = "no_preferred_action"
+        else:
+            reason = "lower_priority_than_selected"
+        entry["reasons"][reason] += 1
+
+
+def _ai_main_decision(handler, session, state, owner_id, opponent_id,
+                      profiler=None, report=None):
+    """Apply the production evaluator's removal and board-building order."""
+    started = time.perf_counter()
+    evaluator = _ai_evaluator_for_seat(
+        handler, session, state, owner_id, opponent_id, profiler, report)
+    chosen = target_uid = None
+    x_cost = 0
+    reason = "pass_no_play"
+
+    chosen = evaluator.burn_to_win()
+    if chosen is not None:
+        reason = "burn_to_win"
+    if chosen is None:
+        sweep = evaluator.best_sweeper()
+        if sweep is not None:
+            chosen, x_cost = sweep
+            reason = "sweeper"
+    if chosen is None:
+        lockdown = evaluator.lockdown_removal()
+        if lockdown is not None:
+            chosen, target_uid = lockdown
+            reason = "lockdown_removal"
+    if chosen is None:
+        for threat in evaluator.threatening_targets():
+            removal, removal_x, removal_target = evaluator.find_removal_for(
+                threat)
+            if (removal is not None
+                    and evaluator.is_playable(removal) == "True"):
+                chosen, x_cost, target_uid = (
+                    removal, removal_x, removal_target)
+                reason = "threat_removal"
+                break
+    if chosen is None:
+        chosen = evaluator.get_best_board_builder(
+            pre_combat=True, include_resources=False)
+        if chosen is not None:
+            reason = "best_board_builder"
+            target_uid = evaluator.choose_action_target(chosen)
+
+    _record_card_decision(report, evaluator, chosen, reason)
+    if profiler is not None:
+        profiler["ai_evaluations"] += 1
+        profiler["ai_evaluation_seconds"] += time.perf_counter() - started
+    return chosen, target_uid, x_cost, reason
+
+
+def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP, deck_specs=None,
+                   profiler=None, report=None):
     rnd = random.Random(seed)
     session_id = SCRATCH_SESSION_BASE + seed
     pids = list(AUTOPLAY_PLAYER_IDS)
@@ -226,29 +388,57 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
     for pid in pids:
         session.add_player(encoder.make_uid(PLAYER_UID_TYPE, pid), 0)
 
-    # Seed both players' decks from Set 1 (12 shards + 28 cards each).
+    # Seed FRA encounter decks when requested; otherwise retain the Set 1
+    # smoke fixture used by the original runner.
     shards = db_set_resource_guids(SET1)
     others = db_set_constructed_guids(SET1)
     for i, pid in enumerate(pids):
-        rnd.shuffle(others)
-        deck = (shards * AUTOPLAY_DECK_RESOURCE_COUNT)[:AUTOPLAY_DECK_RESOURCE_COUNT] + others[:AUTOPLAY_DECK_SPELL_COUNT]
-        rnd.shuffle(deck)
+        if deck_specs:
+            spec = deck_specs[i]
+            deck = list(spec["cards"])
+            champ_guid = spec["champion_guid"]
+            rnd.shuffle(deck)
+        else:
+            rnd.shuffle(others)
+            deck = ((shards * AUTOPLAY_DECK_RESOURCE_COUNT)
+                    [:AUTOPLAY_DECK_RESOURCE_COUNT]
+                    + others[:AUTOPLAY_DECK_SPELL_COUNT])
+            champ_guid = "1ae73dcf-e96e-4536-aec3-f53efb5e1c96"
+            rnd.shuffle(deck)
         _seed_deck(session_id, pid, deck,
                    uid_offset=i * AUTOPLAY_PLAYER_UID_STRIDE)
-        _seed_champion(session_id, pid, "1ae73dcf-e96e-4536-aec3-f53efb5e1c96",
-                       uid_offset=i * AUTOPLAY_PLAYER_UID_STRIDE +
-                       AUTOPLAY_CHAMPION_UID_OFFSET)
+        champ_uid = _seed_champion(
+            session_id, pid, champ_guid,
+            uid_offset=i * AUTOPLAY_PLAYER_UID_STRIDE +
+            AUTOPLAY_CHAMPION_UID_OFFSET)
+        if report is not None:
+            report["champion_uids"][str(pid)] = champ_uid
     _db.commit()
 
     h1 = _make_handler(pids[0], session)
     h2 = _make_handler(pids[1], session)
+    if profiler is not None:
+        h1._autoplay_profiler = profiler
+        h2._autoplay_profiler = profiler
     player_handlers[pids[0]] = h1
     player_handlers[pids[1]] = h2
+    if report is not None:
+        report["decks"] = {
+            str(pid): {
+                "name": (deck_specs[index]["name"] if deck_specs
+                         else "Set 1 smoke deck"),
+                "deck_guid": (deck_specs[index]["deck_guid"]
+                              if deck_specs else None),
+                "champion_guid": (deck_specs[index]["champion_guid"]
+                                  if deck_specs else None),
+            }
+            for index, pid in enumerate(pids)
+        }
 
     # Ready setup (both players) — persists the coin flip.
     handle_ready_for_game_setup(h1, session, {}, player_handlers)
     handle_ready_for_game_setup(h2, session, {}, player_handlers)
-    state = pvp_load_state(session)
+    state = pvp_load_state(session) or {}
     if not state:
         state = pvp_default_state(pids[0], pids[0])
         state["goes_first_pid"] = pids[0]
@@ -286,6 +476,8 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
             break
 
     state = pvp_load_state(session)
+    if state is None:
+        state = {}
     log_req(f"    PvP game {seed}: phase={state.get('phase')} "
             f"turn={state.get('turn_pid')}")
 
@@ -333,6 +525,63 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
             # troop; the opponent passes immediately.
             if phase in (game_engine.ETurnPhases.FirstMainPhase,
                          game_engine.ETurnPhases.SecondMainPhase):
+                if deck_specs:
+                    _transaction(player_handlers[opp_pid], session,
+                                 b"PassPriorityTransaction;")
+                    h = player_handlers[turn_pid]
+                    res_rows = db_hand_resources_with_template(
+                        session_id, turn_pid)
+                    if res_rows and not db_zone_card_count(
+                            session_id, turn_pid, "PlayedResources"):
+                        _transaction(h, session,
+                                     _card_play_bytes(
+                                         res_rows[0][1], "Resource"))
+                        _transaction(player_handlers[opp_pid], session,
+                                     b"PassPriorityTransaction;")
+
+                    latest = gs.find_session_by_player(
+                        game_engine.UID.make(
+                            PLAYER_UID_TYPE, pids[0]).to_uint64()) or session
+                    state = pvp_load_state(latest) or state
+
+                    chosen, target_uid, x_cost, reason = _ai_main_decision(
+                        h, session, state, turn_pid, opp_pid,
+                        profiler=profiler, report=report)
+                    if chosen is not None:
+                        typed_payload = {"ability_data": [{
+                            "target_map": ({0: [int(target_uid)]}
+                                           if target_uid is not None else {}),
+                            "x_cost": int(x_cost or 0),
+                        }]}
+                        _transaction(
+                            h, session,
+                            _card_play_bytes(chosen.card_uid, chosen.card_type),
+                            typed_payload=typed_payload,
+                            profiler=profiler)
+                        location = _db.execute(
+                            "SELECT location FROM game_cards WHERE session_id=? "
+                            "AND card_uid=?", (session_id,
+                                                 int(chosen.card_uid))).fetchone()
+                        played = bool(location and location[0] != "hand")
+                        if report is not None:
+                            key = f"{chosen.template_guid}:{chosen.name}"
+                            entry = report["card_decisions"].get(key)
+                            if entry is not None and played:
+                                entry["played"] += 1
+                            report["actions"].append({
+                                "turn": turns + 1,
+                                "player": deck_specs[pids.index(turn_pid)]["name"],
+                                "card": chosen.name,
+                                "reason": reason,
+                                "target_uid": target_uid,
+                                "played": played,
+                            })
+                    _transaction(player_handlers[opp_pid], session,
+                                 b"PassPriorityTransaction;")
+                    _transaction(player_handlers[turn_pid], session,
+                                 b"PassPriorityTransaction;")
+                    continue
+
                 _transaction(player_handlers[opp_pid], session,
                              b"PassPriorityTransaction;")
                 h = player_handlers[turn_pid]
@@ -436,6 +685,16 @@ def _play_one_game(seed, turns_cap=AUTOPLAY_TURN_CAP):
     except Exception:
         return turns, traceback.format_exc()
     finally:
+        if report is not None:
+            last_session = gs.find_session_by_player(
+                game_engine.UID.make(PLAYER_UID_TYPE, pids[0]).to_uint64())
+            last_state = pvp_load_state(last_session or session) or {}
+            report["turns"] = turns
+            report["last_phase"] = str(last_state.get("phase"))
+            report["health"] = {
+                str(pid): int(last_state.get(f"hp_{pid}", 20) or 0)
+                for pid in pids
+            }
         _cleanup(session_id, pids)
     return turns, None
 
@@ -453,5 +712,83 @@ def main(games=DEFAULT_AUTOPLAY_GAMES):
     print(f"PvP autoplay: {ok}/{games} games completed")
 
 
+def _json_report(report):
+    copied = dict(report)
+    copied["card_decisions"] = {
+        key: {**entry, "reasons": dict(entry["reasons"])}
+        for key, entry in report.get("card_decisions", {}).items()
+    }
+    return copied
+
+
+def main_fra(deck_guids=None, turns_cap=30, show_profile=False,
+             report_path=None):
+    specs = _fra_encounter_specs(deck_guids)
+    profiler = {
+        "rules_transactions": 0,
+        "rules_transaction_seconds": 0.0,
+        "ai_evaluations": 0,
+        "ai_evaluation_seconds": 0.0,
+    }
+    report = {"decks": {}, "champion_uids": {}, "actions": [],
+              "card_decisions": {}}
+    turns, err = _play_one_game(
+        900, turns_cap=max(0, int(turns_cap)), deck_specs=specs,
+        profiler=profiler, report=report)
+    print(f"FRA duel: {specs[0]['name']} vs {specs[1]['name']} — "
+          f"{turns}/{turns_cap} turns")
+    if err:
+        report["error"] = err
+        print("simulation stopped with an error:")
+        print(err[:3000])
+
+    print("AI card decisions (played / selected / seen; unplayed reasons):")
+    entries = sorted(report["card_decisions"].values(),
+                     key=lambda item: (item["played"], -item["seen"],
+                                       item["name"].lower()))
+    for entry in entries:
+        if entry["played"] >= entry["seen"]:
+            continue
+        reasons = ", ".join(
+            f"{reason}={count}" for reason, count in
+            sorted(entry["reasons"].items()))
+        print(f"  {entry['name']}: {entry['played']}/{entry['selected']} / "
+              f"{entry['seen']} — {reasons}")
+
+    if show_profile:
+        print("Profile:")
+        print(f"  AI evaluator: {profiler['ai_evaluation_seconds'] * 1000:.2f} ms "
+              f"across {profiler['ai_evaluations']} decisions")
+        print(f"  Rules transaction path: "
+              f"{profiler['rules_transaction_seconds'] * 1000:.2f} ms "
+              f"across {profiler['rules_transactions']} transactions")
+    report["profile"] = profiler
+    report["max_turns"] = int(turns_cap)
+    if report_path:
+        with open(report_path, "w", encoding="utf-8") as output:
+            json.dump(_json_report(report), output, indent=2, sort_keys=True)
+            output.write("\n")
+        print(f"Wrote report: {report_path}")
+    return 1 if err else 0
+
+
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_AUTOPLAY_GAMES)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("games", nargs="?", type=int,
+                        default=DEFAULT_AUTOPLAY_GAMES)
+    parser.add_argument("--fra", nargs="*", metavar="DECK_GUID",
+                        help="run a duel between two FRA encounter decks")
+    parser.add_argument("--turn-limit", type=int, default=30,
+                        help="maximum completed turns in FRA mode (default: 30)")
+    parser.add_argument("--profile", action="store_true",
+                        help="print evaluator and PvP transaction timings")
+    parser.add_argument("--json-report", metavar="PATH",
+                        help="write card decisions and actions as JSON")
+    args = parser.parse_args()
+    if args.fra is not None:
+        if len(args.fra) not in (0, 2):
+            parser.error("--fra accepts either no GUIDs or exactly two")
+        raise SystemExit(main_fra(
+            args.fra or None, turns_cap=args.turn_limit,
+            show_profile=args.profile, report_path=args.json_report))
+    main(args.games)

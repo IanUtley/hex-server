@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import struct
+from typing import Any, cast
 
 
 def _tac_attr_hash(name):
@@ -27,13 +28,22 @@ _CONTAINERS = {_tac_attr_hash(name) for name in (
     "Condition", "DataToAppend", "HasAsSubset", "MinimumValues",
     "PlayerStatsThisTurn", "PlayerGameStats", "PlayerHighestTurnStats",
     "PermanentData", "ThisTurnsData")}
-_LISTS = {_tac_attr_hash("Conditions"), _tac_attr_hash("RequiredEquipment")}
+_LISTS = {_tac_attr_hash(name) for name in (
+    "Abilities", "AlternateVersions", "BuriedCards", "CardsThatDied",
+    "CardsPutIntoDeck", "CardsPutIntoHand", "ChampionTalents",
+    "ChosenShards", "Conditions", "CreatedCards", "CounteredCards",
+    "DamagedCards", "DestroyedCards", "DiscardedCards", "DrawnCards",
+    "ExhaustedCards", "FusedComponents", "GrantedPowers", "GUIDs",
+    "InterruptedCards", "MovedCards", "PlayerOptions", "RequiredEquipment",
+    "RequiredTalents", "RevealedCards", "RevertedCards", "SacrificedCards",
+    "SpellPointCostModifiers", "StoredTargets", "TamedCards", "VoidedCards",
+    "ExtraCombatsThisTurn")}
 _STRINGS = {_tac_attr_hash(name) for name in (
     "Guid", "FunctionName", "ListName", "Where", "SourceCardGuid",
     "GainedCounterType", "RemovedCounterType", "CompareWith", "Name")}
 
 
-def decode_tac_tree(data):
+def decode_tac_tree(data: Any) -> dict[int, Any]:
     try:
         raw = base64.b64decode(data)
     except Exception:
@@ -78,7 +88,7 @@ def decode_tac_tree(data):
         return {}
 
 
-def decode_tac(data):
+def decode_tac(data: Any) -> dict[int, Any]:
     tree = decode_tac_tree(data)
     result = {}
     def flatten(value):
@@ -87,7 +97,7 @@ def decode_tac(data):
         if isinstance(value, list):
             return [flatten(child) for child in value]
         return value
-    return flatten(tree)
+    return cast(dict[int, Any], flatten(tree))
 
 
 def tac_int(data, name, default=0):

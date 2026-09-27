@@ -38,7 +38,8 @@ from objfmt_builder import ObjFmtBuilder
 
 def _active_clients():
     """Return the _active_clients dict from hconnect_server without circular import."""
-    return sys.modules.get("hconnect_server", sys.modules.get("__main__"))._active_clients
+    server = sys.modules.get("hconnect_server") or sys.modules.get("__main__")
+    return getattr(server, "_active_clients", {}) if server is not None else {}
 
 
 def _extract_keepname(inner_bytes):

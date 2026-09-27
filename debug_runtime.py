@@ -20,7 +20,7 @@ def enable_debugpy(log) -> bool:
             _enabled(os.environ.get("HEX_DEBUGPY_LAUNCHED"))):
         return False
     try:
-        import debugpy
+        import debugpy  # pyright: ignore[reportMissingImports] -- debugger-only dependency
     except ImportError:
         log("[debugpy] requested but package is not installed")
         return False

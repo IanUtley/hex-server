@@ -170,7 +170,6 @@ if [[ "${HEX_USE_SUPERVISOR:-0}" == "1" ]]; then
     command -v supervisord >/dev/null 2>&1 || die \
         "HEX_USE_SUPERVISOR=1 but supervisord is not installed (pip install -r requirements.txt)"
     log "Starting Supervisor-managed Hex services ..."
-    export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
     setsid nohup supervisord -n -c "$BASE_DIR/supervisord.conf" \
         >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
     SUPERVISOR_PID=$!
@@ -179,10 +178,8 @@ if [[ "${HEX_USE_SUPERVISOR:-0}" == "1" ]]; then
     REPLAY_PID=$SUPERVISOR_PID
 else
 log "Starting HConnect server on :$SERVER_PORT ..."
-# The migrated RulesPort is the active transaction path for live client
-# sessions.  Keep an explicit override for rollback/probes, but make a plain
-# restart deterministic so the port cannot be silently skipped.
-export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
+# The migrated RulesPort is the only transaction path for live client
+# sessions; there is no legacy rollback mode.
 setsid nohup "$BASE_DIR/run_hconnect.sh" \
     >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
 SERVER_PID=$!

@@ -100,6 +100,8 @@ def advance_turn_state(state, player_ids, *, incoming_player_id=None) -> dict:
     (resource-play flags, combat facts, autopass, and temporary turn facts)
     without selecting a second, potentially different cursor.
     """
+    from .damage_effects import expire_champion_shields
+    expire_champion_shields(state)
     players = [int(value) for value in player_ids]
     outgoing = int(state.get("turn_pid") or 0)
     bonus = int(state.pop("bonus_turn_pid", 0) or 0)

@@ -435,7 +435,7 @@ def typed_payload_from_decoded(command, decoded):
                     # their labelled card fields independently; using the
                     # last UID in the envelope makes Bunoshi buff the troop
                     # selected for sacrifice and then fail the cost check.
-                    def labelled_card(label):
+                    def labelled_activation_card(label):
                         pos = raw.find(label)
                         if pos < 0:
                             return None
@@ -443,8 +443,8 @@ def typed_payload_from_decoded(command, decoded):
                         if values:
                             return int(values[0])
                         return None
-                    effect_target = labelled_card(b"TargetMap")
-                    sacrifice_target = labelled_card(b"CardsToSacrifice")
+                    effect_target = labelled_activation_card(b"TargetMap")
+                    sacrifice_target = labelled_activation_card(b"CardsToSacrifice")
                     if effect_target is None:
                         effect_target = card_uids[-1]
                     raw_payload["activation_data"] = {

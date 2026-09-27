@@ -160,12 +160,11 @@ session. `rules_port.adapter.rules_session_for` caches that host on a live
 session wrapper; `enable_rules_port` supplies the SQLite mutation and PvP-facts
 adapters, and a newly loaded wrapper rehydrates from its namespaced snapshot.
 
-`restart.sh` enables live RulesPort attachment (`HEX_RULES_PORT_AUTO_ATTACH=1`)
-by default. Payload-bearing card, ability, choice, discard, combat, and phase
+Live RulesPort attachment is unconditional: every session gets the native
+rules host and there is no legacy rollback mode. Payload-bearing card, ability,
+choice, discard, combat, and phase
 transactions are consumed by the port, acknowledged on both success and
-rejection, and never reinterpreted by a legacy handler. Set
-`HEX_RULES_PORT_AUTO_ATTACH=0` only as an explicit rollback switch while
-diagnosing a migration regression. The port requires typed nested values from
+rejection, and never reinterpreted by a legacy handler. The port requires typed nested values from
 the decoder; it never guesses card IDs or ability targets from display text.
 When a rule pauses for UI input, its continuation is persisted and the matching
 typed response resumes the same ability instance before the next priority
@@ -174,7 +173,10 @@ After each RulesPort scheduler tick, the host persists the post-action-stack
 snapshot as well; this keeps a completed chain resolver from reappearing on a
 reconnect and blocking the next card transaction. A settled manual ability in
 First/Second Main also rebuilds the metadata-derived `PlayerOptionList` before
-returning the normal green light.
+returning the normal green light. PVE setup still projects `PickGoesFirst` and
+`Mulligan` through HConnect; save each matching native phase and priority
+checkpoint before sending its packet so the next typed transaction validates
+against the phase shown to the client.
 In Practice/PvE, resolving AI combat damage can queue triggers while the native
 damage phase remains current for the response window. Persist that damage
 step's completion across the window and clear it only after RulesPort advances
@@ -198,7 +200,11 @@ simple leaves should use `abilities.framework.context.EffectContext` through
 the `@effect` decorator. `AbilityBuilder` must wrap the authoritative
 `AbilityGraph`/`AbilityInstance` and reuse its costs, target templates, typed
 fields, ordering, conditions, and continuation behavior; it must not introduce
-a parallel card-rules source.
+a parallel card-rules source. The resolver publishes the live `session_id` in
+the battle state for the duration of one ability resolution because
+`rules_port.fields.effect_field` reads it to evaluate `CardCount`/`CardSum`
+variables against `game_cards`; without it a "for each ..." amount silently
+evaluates against session 0 (Woeful Webbing summoned no Spider).
 
 Counter keywords the client ships as `BuiltInResources` rather than Records
 rows are server rules: `rules_port/tunneling.py` owns the underground
@@ -242,7 +248,15 @@ resource transitions for current/total pools, thresholds, charges, spell
 points, resource-play resets, and payments; mode services and AI may only
 project their returned deltas into SQLite and client events. The raw
 player-ID variants are for the tournament checkpoint schema, while the
-canonical `player`/`ai` variants are for Practice/PvE sessions.
+canonical `player`/`ai` variants are for Practice/PvE sessions. A resource's
+played thresholds come from its authored `CardModifier` threshold leaves
+(`rules_port.resources.resource_threshold_grants`), never from a colour guess
+in the card name: the Adventure-zone coins carry their colour only in the
+ability, and an unknown resource must not default to Wild. A resource whose
+leaves are all "you have a card of that colour in hand" conditioned is the
+"Gain all the thresholds that you need." shape (Primal Shard); it instead
+grants the largest missing threshold requirement per colour among the
+controller's hand cards.
 `AbilityCostPlan` and its application transition own numeric ability costs;
 the host must not decrement those counters directly after planning.
 Attached-session card display costs must use `rules_port.static_rules.effective_cost`

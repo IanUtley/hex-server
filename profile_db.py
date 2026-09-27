@@ -484,13 +484,6 @@ def db_get_chest_by_id(chest_db_id, user_id, conn=None):
         (chest_db_id, user_id)).fetchone()
 
 
-def db_next_card_instance_id(conn=None):
-    row = _profile_connection(conn).execute(
-        "SELECT COALESCE(MAX(instance_id), 5000) + 1 AS next_id "
-        "FROM card_instances").fetchone()
-    return int(_row_value(row, "next_id", 0)) if row else 5001
-
-
 def db_create_card_instance(user_id, instance_id, template_guid, conn=None):
     connection = _profile_connection(conn)
     connection.execute(

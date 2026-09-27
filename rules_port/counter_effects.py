@@ -128,28 +128,64 @@ def counter_spell(context):
     if card_int_attr(context.db, context.session.session_id, target,
                      "CantBeInterrupted") > 0:
         return "counter spell: cannot be interrupted"
-    # Session.CounterCard removes the ability from the chain; the card itself
-    # is discarded by the resolution boundary.
+    # Session.CounterCard removes the countered card's own ability from the
+    # chain, then discards the card.  The native chain is keyed by ability
+    # instance id, so find the item whose source is the target card instead of
+    # passing the card UID to ``remove_ability`` (which silently did nothing).
     port = getattr(context.session, "_rules_port_session", None)
     if port is not None:
+        chain = getattr(port, "chain", None)
         try:
-            port.chain.remove_ability(target)
-            port.forget_projected_chain(target)
+            for ability in list(chain or ()):
+                if int(getattr(ability, "source_uid", -1) or -1) != target:
+                    continue
+                instance_id = int(getattr(ability, "instance_id", 0) or 0)
+                if chain is None:
+                    break
+                chain.remove_ability(instance_id)
+                port.forget_projected_chain(instance_id)
         except (AttributeError, TypeError, ValueError):
             pass
-    result = context.discard(target)
+    from pvp_db import db_card_chain_info, db_card_owner_id, db_discard_card
+    from .runtime_helpers import owner_uid
+    owner_id = int(db_card_owner_id(
+        context.session.session_id, target, conn=context.db) or 0)
+    scid = game_engine.SessionCardId(game_engine.UID(target))
+    tpl_row = db_card_chain_info(
+        context.session.session_id, target, conn=context.db)
+    db_discard_card(context.session.session_id, target,
+                    connection=context.db,
+                    extra_set="card_state=0, card_damage=0, temporary_buffs=?, "
+                              "temporary_attributes=0",
+                    extra_params=["{}"])
+    context.db.commit()
+    owner = owner_uid(owner_id, context.player_uid, context.ai_uid,
+                      context.bstate)
+    context.game.push_card_moved(
+        scid, owner, game_engine.ECardCollections.Discard,
+        game_engine.ECardLocations.Top, 0)
+    if tpl_row:
+        _tpl, card_type, _name, cost, attack, defense, gems = \
+            context.handler._card_full_data(
+                context.game, scid, tpl_row[0])
+        context.game.push_card_updated(
+            scid, owner, game_engine.ECardCollections.Discard,
+            game_engine.card_type_from_db(card_type),
+            template_id=tpl_row[0], cost=cost, attack=attack,
+            defense=defense, gems=gems)
     context._emit_trigger(
         "CardCounteredEvent", target,
         context.bstate.get("resolving_owner_id", 0),
         event_source_collection="CastSpells",
         event_destination_collection="discard")
-    return f"countered {hex(target)}; {result}"
+    return f"countered {hex(target)}"
 
 
 def change_counter(context, target, name, counter_guid, amount, operation):
     """Apply one typed counter operation and emit its client projection."""
     from pvp_db import db_card_mutation_field, db_set_card_mutation_field
     target = int(target)
+    from .statistics import add_ability_stat
     name = str(name or "counter").lower()
     guid = str(counter_guid or _counter_guid(context.db, name)).lower()
     champion_owner = _champion_owner(context, target)
@@ -167,6 +203,8 @@ def change_counter(context, target, name, counter_guid, amount, operation):
         else:
             values.pop(guid, None)
         _project(context, target, champion_owner, guid, old, new, champion=True)
+        if new < old:
+            add_ability_stat(context.bstate, "CountersRemoved", old - new)
         return old, new
     raw = db_card_mutation_field(context.session.session_id, target,
                                  "permanent_buffs", conn=context.db)
@@ -193,4 +231,6 @@ def change_counter(context, target, name, counter_guid, amount, operation):
     from pvp_db import db_card_owner_id
     owner = db_card_owner_id(context.session.session_id, target, conn=context.db)
     _project(context, target, owner if owner is not None else 0, guid, old, new)
+    if new < old:
+        add_ability_stat(context.bstate, "CountersRemoved", old - new)
     return old, new

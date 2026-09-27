@@ -105,6 +105,8 @@ Frost Ring Arena implementation details are in
   contents.
 - [ ] Complete parity for all combat keywords, prevention/replacement effects,
   simultaneous damage, and every edge case in the original client.
+  See [RulesPort parity evidence](RULES_PORT_PARITY.md) for the damage-order,
+  shield, multiplier and lifedrain fixes and their validation boundaries.
 
 ## Gamedata-driven abilities and rules
 
@@ -120,13 +122,21 @@ Frost Ring Arena implementation details are in
   registry where the original data needs a server-side adapter.
 - [x] Set 1 sweep coverage: 425/425 abilities resolved cleanly in the focused
   server sweep at the time of the last validation.
-- [ ] Remaining ability leaves such as full discard/void, tap/untap,
-  grant/play/fire-event/reveal/revert/store-targets/verdict behavior.
-- [ ] Complete generic target filters and all target-selection modes.
-- [ ] Full condition trees, variables/output variables, option lists, effect
-  durations/teardown, uses/cooldowns, and every trigger type.
-- [ ] Eliminate the remaining game-text compatibility fallbacks where typed
-  gamedata fields are available.
+- [x] Shared executors for the current Records effect leaves, including
+  discard/void, tap/untap, grant/play/fire-event/reveal/revert/store-targets,
+  verdict, repeating effects, and typed variable/effect fields. See
+  [`abilities/ABILITIES.md`](../abilities/ABILITIES.md) and the field audit in
+  [`RULES_PORT_PARITY.md`](RULES_PORT_PARITY.md); leaf registration alone does
+  not establish client or trigger-event parity.
+- [ ] Complete parity for every target filter and selection mode, including
+  edge-case condition combinations and their PvP/PvE acceptance paths.
+- [ ] Complete end-to-end acceptance for all 45 authored trigger event types
+  in Practice/PvE and PvP. The C# producer-to-server publication map and the
+  shared ordered-resolution path are documented in
+  [`RULES_PORT_PARITY.md`](RULES_PORT_PARITY.md); client packet/UI completion
+  still needs fresh mode-specific traces.
+- [ ] Remove game-text compatibility fallbacks only after confirming the
+  corresponding Records field is present and authoritative.
 
 ## Campaign, tournaments, chat, and replay
 

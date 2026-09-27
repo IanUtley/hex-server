@@ -1,7 +1,7 @@
 """CardDef, Game (event queue / tutorial engine), and script parser."""
 
 import random as _random
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, cast
 
 from domain.types import UID, ResourceId, SessionCardId, CombatId
 from domain.enums import *
@@ -15,6 +15,11 @@ from domain.constants import PLAY_CARD_ABILITY_TEMPLATE_ID
 
 
 _SECRET_COUNTER_CACHE = {}
+
+
+def _uid64(value: Any) -> int:
+    """Return the numeric wire value for an int or typed UID."""
+    return int(cast(Any, getattr(value, "uid64", value)) or 0)
 
 
 def _guid_text(value):
@@ -51,7 +56,8 @@ class CardDef:
     """Definition of a card in the game."""
     def __init__(self, name: str, card_type: int = ECardTypes.Troop,
                  cost: int = 0, attack: int = 0, defense: int = 0,
-                 shards: List[int] = None, abilities: List[ResourceId] = None,
+                 shards: Optional[List[int]] = None,
+                 abilities: Optional[List[ResourceId]] = None,
                  attributes: int = ECardAttributes.Unknown, lethal: bool = False,
                  subtype: str = ""):
         self.name = name
@@ -67,7 +73,8 @@ class CardDef:
         self.escalation = 0
         self.spell_point_cost_mods: Dict[ResourceId, int] = {}
         self.uses_per_game_counts: Dict[ResourceId, int] = {}
-        self.orig_template: str = None
+        self.cooldown_counts: Dict[ResourceId, int] = {}
+        self.orig_template: Optional[str] = None
         self.counters: Dict[str, int] = {}
         self.related_cards: List[SessionCardId] = []
         self.gems = 0
@@ -138,6 +145,7 @@ class Game:
 
         self.player_health = 20
         self.ai_health = 20
+        self.max_hand_size = 7
         self.player_resources = 0
         self.ai_resources = 0
         self.player_total_resources = 0
@@ -167,6 +175,12 @@ class Game:
         # the player who has the permission.  They are projected into
         # PlayerUpdated and used to redact opposing hand CardUpdated events.
         self._visibility_by_uid: Dict[int, Dict[str, int]] = {}
+        # Deck sleeves are established once (GameStarted/DeckCreated) and then
+        # must survive every later PlayerUpdated.  The client's
+        # PlayerRepresentation.Update assigns DeckSleeveId unconditionally, so
+        # an omitted field reverts the opponent's cards to the default Hex
+        # sleeve as soon as any other player state is pushed.
+        self.deck_sleeve_ids: Dict[int, str] = {}
 
         self.events: List[SessionEventArgs] = []
 
@@ -375,6 +389,32 @@ class Game:
             ev.thresholds = [s for s in cdef.shards]
         if cdef and cdef.abilities:
             ev.abilities = list(cdef.abilities)
+        uses_per_game_counts = kwargs.get(
+            'uses_per_game_counts',
+            getattr(cdef, 'uses_per_game_counts', {}) if cdef else {}) or {}
+        ev.uses_per_game_counts = {}
+        for key, value in uses_per_game_counts.items():
+            try:
+                value = int(value or 0)
+                if value > 0:
+                    rid = (key if isinstance(key, ResourceId)
+                           else ResourceId.from_str(key))
+                    ev.uses_per_game_counts[rid] = value
+            except (TypeError, ValueError):
+                continue
+        cooldown_counts = kwargs.get(
+            'cooldown_counts', getattr(cdef, 'cooldown_counts', {})
+            if cdef else {}) or {}
+        ev.cooldown_counts = {}
+        for key, value in cooldown_counts.items():
+            try:
+                value = int(value or 0)
+                if value > 0:
+                    rid = (key if isinstance(key, ResourceId)
+                           else ResourceId.from_str(key))
+                    ev.cooldown_counts[rid] = value
+            except (TypeError, ValueError):
+                continue
         if cdef and cdef.spell_point_cost_mods:
             ev.spell_point_cost_mods = dict(cdef.spell_point_cost_mods)
         ev.damage_shield = kwargs.get(
@@ -389,7 +429,7 @@ class Game:
     def push_card_counters_changed(self, cid: SessionCardId,
                                    counter_template: ResourceId,
                                    new_value: int, old_value: int,
-                                   private_player_uid: UID = None):
+                                   private_player_uid: Optional[UID] = None):
         """Push the class-54 UI refresh event used by the client counter renderer."""
         ev = self._make_event(CardCountersChangedSessionEventArgs)
         ev.session_card_id = cid
@@ -427,7 +467,7 @@ class Game:
         self._push(ev)
 
     def push_card_destroyed(self, cid: SessionCardId, player_uid: UID,
-                            responsible_cid: SessionCardId = None):
+                            responsible_cid: Optional[SessionCardId] = None):
         ev = self._make_event(CardDestroyedSessionEventArgs)
         ev.player_id = player_uid
         ev.session_card_id = cid
@@ -449,7 +489,7 @@ class Game:
     def push_ability_on_chain(self, source_scid: SessionCardId,
                               ability_template_id: ResourceId,
                               ability_instance_id: int = 1,
-                              target_card_ids: List[SessionCardId] = None,
+                              target_card_ids: Optional[List[SessionCardId]] = None,
                               ignores_chain: bool = False):
         ev = self._make_event(AbilityPushedOnChainSessionEventArgs)
         ev.source_card_id = source_scid
@@ -546,7 +586,8 @@ class Game:
         ev.combats = list(combats)
         self._push(ev)
 
-    def push_turn_phase(self, phase: int, active_uid: UID = None, prior_uid: UID = None):
+    def push_turn_phase(self, phase: int, active_uid: Optional[UID] = None,
+                        prior_uid: Optional[UID] = None):
         ev = self._make_event(TurnPhaseUpdatedSessionEventArgs)
         ev.turn_phase = phase
         ev.active_player_id = active_uid or self.active_player
@@ -599,8 +640,27 @@ class Game:
             ev_list.options.append(opt)
         self._push(ev_list)
 
-    def push_player_updated(self, player_uid: UID, deck_sleeve_id: str = None,
-                            champ_id: 'SessionCardId' = None):
+    def set_deck_sleeve(self, player_uid: UID, sleeve_guid: Optional[str]):
+        """Record a player's deck sleeve so later updates cannot clear it."""
+        guid = str(sleeve_guid or "").strip().lower()
+        if not guid or guid == "00000000-0000-0000-0000-000000000000":
+            return
+        try:
+            key = _uid64(player_uid)
+        except (TypeError, ValueError):
+            return
+        self.deck_sleeve_ids[key] = guid
+
+    def deck_sleeve_for(self, player_uid: UID):
+        try:
+            key = _uid64(player_uid)
+        except (TypeError, ValueError):
+            return None
+        return self.deck_sleeve_ids.get(key)
+
+    def push_player_updated(self, player_uid: UID,
+                            deck_sleeve_id: Optional[str] = None,
+                            champ_id: Optional['SessionCardId'] = None):
         is_player = player_uid == self.player_uid
         ev = self._make_event(PlayerUpdatedSessionEventArgs)
         ev.player_id = player_uid
@@ -631,9 +691,12 @@ class Game:
             ev.champion_id = cid
         ev.max_hand_size = int(getattr(self, "max_hand_size", 7))
         if deck_sleeve_id:
-            ev.deck_sleeve_id = ResourceId.from_str(deck_sleeve_id)
+            self.set_deck_sleeve(player_uid, deck_sleeve_id)
+        identified_sleeve = deck_sleeve_id or self.deck_sleeve_for(player_uid)
+        if identified_sleeve:
+            ev.deck_sleeve_id = ResourceId.from_str(identified_sleeve)
         visibility = self._visibility_by_uid.get(
-            int(getattr(player_uid, "uid64", player_uid) or 0), {})
+            _uid64(player_uid), {})
         ev.can_see_enemy_hand = bool(
             int(visibility.get("CanSeeOpponentsHand", 0) or 0))
         ev.can_see_enemy_underground = bool(
@@ -657,7 +720,7 @@ class Game:
         self.interface_disabled = disabled
         self._push(ev)
 
-    def push_waiting_on_player(self, player_uid: UID):
+    def push_waiting_on_player(self, player_uid: UID | None):
         """Publish which participant the game is waiting on (class 79).
 
         The client shows its "waiting for opponent" state when the named
@@ -694,6 +757,10 @@ class Game:
         ev.sleeve_template_ids = [
             ResourceId.from_str(value) for value in (sleeve_template_ids or [])
             if value]
+        # Remember the sleeves so every later PlayerUpdated preserves them.
+        for _uid, _sleeve in zip(
+                (self.player_uid, self.ai_uid), sleeve_template_ids or ()):
+            self.set_deck_sleeve(_uid, _sleeve)
         ev.board_template_ids = []
         ev.coin_template_ids = []
         ev.divisions = [1, 1]
@@ -711,23 +778,27 @@ class Game:
 
     def push_deck_created_with_cards(self, player_uid: UID,
                                      card_ids: List[SessionCardId],
-                                     sleeve_guid: str = None):
+                                     sleeve_guid: Optional[str] = None):
         ev = self._make_event(DeckCreatedSessionEventArgs)
         ev.player_id = player_uid
         ev.session_card_ids = card_ids
         ev.deck_sleeve_id = ResourceId.from_str(
             sleeve_guid or "c508cdd3-77ad-4dbf-b1b4-b201eae5a690")
+        self.set_deck_sleeve(player_uid, sleeve_guid)
         ev.gameboard_id = ResourceId.from_str("3da4e3b7-e8e9-416a-b36c-e56cbc0aec47")
         ev.coin_id = ResourceId.from_str("c08eb0fa-8f98-43ee-afe7-25f05595cfb3")
         self._push(ev)
 
-    def push_deck_created(self, player_uid: UID):
+    def push_deck_created(self, player_uid: UID,
+                          sleeve_guid: Optional[str] = None):
         is_player = player_uid == self.player_uid
         deck = self.player_deck if is_player else self.ai_deck
         ev = self._make_event(DeckCreatedSessionEventArgs)
         ev.player_id = player_uid
         ev.session_card_ids = [cid for cid, _ in deck]
-        ev.deck_sleeve_id = ResourceId.from_str("ab34d0b0-25e4-4afb-3ed1-30aceed4c69c")
+        ev.deck_sleeve_id = ResourceId.from_str(
+            sleeve_guid or "ab34d0b0-25e4-4afb-3ed1-30aceed4c69c")
+        self.set_deck_sleeve(player_uid, sleeve_guid)
         ev.gameboard_id = ResourceId.from_str("a619833d-897f-b665-3645-3a26d55369a8")
         ev.coin_id = ResourceId.from_str("242b5ef9-4028-9b7a-a0bf-9e910f93d9a0")
         self._push(ev)
@@ -794,7 +865,8 @@ class Game:
         self._push(ev)
 
     def push_card_transformed(self, cid: SessionCardId, template_id: str,
-                              is_replica: bool = False, gems: int = None):
+                              is_replica: bool = False,
+                              gems: Optional[int] = None):
         ev = self._make_event(CardTransformedSessionEventArgs)
         ev.session_card_id = cid
         ev.card_template_id = (template_id if isinstance(template_id, ResourceId)
@@ -842,8 +914,10 @@ class Game:
         self._push(ev)
 
     def add_champion_to_options(self, player_uid: UID, champ_scid: SessionCardId,
-                                ability_ids: List[ResourceId], discard_costs: dict = None,
-                                target_data: dict = None, cost_data: dict = None):
+                                ability_ids: List[ResourceId],
+                                discard_costs: Optional[dict] = None,
+                                target_data: Optional[dict] = None,
+                                cost_data: Optional[dict] = None):
         """Append champion ability options (ECardUsage.Activate) to the most
         recent PlayerOptionList, one OptionInstance per affordable ability.
 
@@ -968,7 +1042,7 @@ class Game:
         # Transaction adapters may carry the decoded numeric UID; the wire
         # encoder requires the typed UID object with ``to_uint64``.
         if not isinstance(player_uid, UID):
-            player_uid = UID(int(getattr(player_uid, "uid64", player_uid)))
+            player_uid = UID(_uid64(player_uid))
         pkt = NetworkPacketSessionEventArgs()
         pkt.session_id = self.session_id
         pkt.player_id = player_uid
@@ -989,15 +1063,13 @@ class Game:
             if (isinstance(event, CardUpdatedSessionEventArgs)
                 and event.collection == ECardCollections.Hand
                 and getattr(event, "_hand_reveal_viewer_uid", None) is not None
-                and int(player_value or 0) == int(getattr(
-                    getattr(event, "_hand_reveal_viewer_uid"), "uid64",
-                    getattr(event, "_hand_reveal_viewer_uid")) or 0))
+                    and _uid64(player_value) == _uid64(
+                        getattr(event, "_hand_reveal_viewer_uid")))
         }
         for event in self.events:
             reveal_viewer = getattr(event, "_hand_reveal_viewer_uid", None)
             if (reveal_viewer is not None and
-                    int(player_value or 0) != int(getattr(
-                        reveal_viewer, "uid64", reveal_viewer) or 0)):
+                    _uid64(player_value) != _uid64(reveal_viewer)):
                 continue
             underground_owner = getattr(event, "_underground_owner_uid", None)
             filtered = None

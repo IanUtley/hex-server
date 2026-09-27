@@ -154,6 +154,9 @@ def reveal_cards(context):
 
     uids = [int(row[0]) for row in rows]
     context.bstate["revealed_cards"] = uids
+    from .statistics import record_ability_card_list
+    for uid in uids:
+        record_ability_card_list(context.bstate, "RevealedCards", uid)
     if not uids:
         return "revealed 0"
 

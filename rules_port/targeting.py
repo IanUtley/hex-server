@@ -9,6 +9,7 @@ Records filter through the native filter port.
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 from rules_port.filters import (records_filter_evaluator,
                                 records_filter_matches)
@@ -77,6 +78,76 @@ def _protected_target(db, session_id, battle_state, card, source, source_owner,
     return _targeting_immune(db, session_id, battle_state, card, source)
 
 
+def _is_spectral(db, session_id, battle_state, card, source, controller_uid):
+    """Evaluate the client's always-on spectral target restriction."""
+    if int(card.get("card_uid") or 0) == int((source or {}).get("card_uid") or 0):
+        return False
+    return int((card.get("int_attrs") or {}).get("Spectral", 0) or 0) > 0
+
+
+def _target_owner(card):
+    try:
+        return int(card.get("controller_id", card.get("user_id", 0)) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _player_filter_accepts(player_filter, target_owner, responsible_owner):
+    """Mirror ``AbilityTargetTemplate.IsCardValidTarget`` player checks."""
+    kind = str(player_filter or "").rsplit(".", 1)[-1].lower()
+    if kind in {"self", "you", "controller"}:
+        return int(target_owner) == int(responsible_owner)
+    if kind in {"singleopponent", "multipleopponents", "opponent",
+                "opposing"}:
+        return int(target_owner) != int(responsible_owner)
+    if kind in {"singleplayer", "multipleplayers", "allplayers"}:
+        return True
+    return False
+
+
+def _target_in_collection(card, template):
+    """Mirror the direct target validation collection check.
+
+    A None mask is permissive in ``IsCardValidTarget`` even though the base
+    enumerator returns no candidate for it. Some derived templates override
+    one or both sides of that contract.
+    """
+    zones = template_zones(template)
+    if not zones:
+        return True
+    return str(card.get("location") or "").lower() in {
+        str(zone).lower() for zone in zones}
+
+
+def _special_target_card(db, session_id, uid, controller_uid, state,
+                         champions=None):
+    """Resolve a selected SessionCardId, including synthetic champions."""
+    card = _source_card(db, session_id, int(uid), controller_uid)
+    champ_owners = {}
+    for owner, champion_uid in (state.get("champ_map") or {}).items():
+        try:
+            champ_owners[int(champion_uid)] = int(owner)
+        except (TypeError, ValueError):
+            continue
+    for row in champions or ():
+        try:
+            champ_owners[int(row[0])] = int(row[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+    owner = champ_owners.get(int(uid))
+    if owner is not None:
+        matching = next((row for row in (champions or ())
+                         if int(row[0]) == int(uid)), None)
+        name = matching[2] if matching and len(matching) > 2 else "Champion"
+        health = matching[3] if matching and len(matching) > 3 else 0
+        return {"card_uid": int(uid), "card_type": "Champion",
+                "location": "champions", "user_id": owner,
+                "owner_id": owner, "controller_id": owner,
+                "name": name or "Champion", "defense": int(health or 0),
+                "attack": 0, "attributes": 0, "int_attrs": {}}
+    return card
+
+
 def _last(value):
     return str(value or "").rsplit(".", 1)[-1]
 
@@ -95,6 +166,30 @@ def _find_filter(node, kind):
             if found is not None:
                 return found
     return None
+
+
+def _requires_global_filter_pool(node):
+    """Whether a filter operand scans another zone or trigger-card identity."""
+    if isinstance(node, dict):
+        kind = _last(node.get("_t"))
+        if kind == "HasResourceCost" and (
+                node.get("m_ResourceCostCardFilter") is not None or
+                bool(node.get("m_AddSumListAttrName"))):
+            return True
+        if kind == "HasAttackValue" and (
+                node.get("m_CompareToSourceControlledCardFilterCount") is not None or
+                bool(node.get("m_CompareToStoredTarget")) or
+                bool(node.get("m_CompareToTriggerSource"))):
+            return True
+        if kind == "IsCardName" and (
+                bool(node.get("m_CompareToTriggerSource")) or
+                bool(node.get("m_CompareToTriggerTarget"))):
+            return True
+        return any(_requires_global_filter_pool(value)
+                   for value in node.values())
+    if isinstance(node, list):
+        return any(_requires_global_filter_pool(value) for value in node)
+    return False
 
 
 def _side(uid):
@@ -137,16 +232,49 @@ def shards_from_threshold(value):
     return _shards(value)
 
 
+def _target_record(template_id):
+    """Return the immutable authored target record for one target template.
+
+    ``target_templates`` is a client projection and intentionally omits fields
+    added by specialized target classes.  Resolve those fields from Records at
+    the interpreter boundary instead of extending SQLite or guessing from the
+    display text.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    return DEFAULT_RECORD_STORE.get(
+        "AbilityTargetTemplate", str(template_id or "").lower())
+
+
+def _target_field(template_id, name, default=None):
+    record = _target_record(template_id)
+    if record is None:
+        return default
+    try:
+        return record.field(name, default)
+    except AttributeError:
+        return default
+
+
+def _target_spec(template_id):
+    record = _target_record(template_id)
+    return getattr(record, "target_spec", None) if record is not None else None
+
+
 def target_template(db, template_id):
     from pvp_db import db_target_template_row
     row = db_target_template_row(template_id, conn=db)
     if not row:
         return None
+    spec = _target_spec(template_id)
     return {"template_id": row[0], "is_auto_target": row[2],
             "is_random_target": row[3], "optional": row[4], "explicit": row[5],
             "player_filter": row[6] or "", "collection_flags": row[7] or "",
             "min_target_count": row[8], "max_target_count": row[9],
-            "filter_json": row[10] or "{}", "target_kind": row[11] or ""}
+            "filter_json": row[10] or "{}", "target_kind": row[11] or "",
+            "allow_best_effort_minimum": bool(
+                getattr(spec, "allow_best_effort_minimum", False)),
+            "min_variable": str(getattr(spec, "min_variable", "") or ""),
+            "max_variable": str(getattr(spec, "max_variable", "") or "")}
 
 
 def target_uses_both_players(db, template_id):
@@ -159,14 +287,19 @@ def target_uses_both_players(db, template_id):
 _ZONE_MAP = {"Warzone": "warzone", "Hand": "hand", "Deck": "deck",
              "Crypt": "discard", "Discard": "discard", "Void": "void",
              "Champions": "champions", "CastSpells": "CastSpells",
-             "Underground": "underground"}
+             "PlayedResources": "PlayedResources",
+             "Underground": "underground", "Choosing": "choosing",
+             "Mod": "mod", "Simulacrum": "simulacrum"}
 
 
 def template_zones(template):
     """Return one authored template's collection flags as runtime zone names."""
-    zones = [zone.strip() for zone in
-             str((template or {}).get("collection_flags") or "").split("|")
-             if zone.strip()]
+    raw = str((template or {}).get("collection_flags") or "")
+    if not raw.strip() or raw.strip().lower() in {"none", "null"}:
+        # C# enumerates every collection when ECardCollections.None is
+        # authored; it does not mean a collection named "None".
+        return []
+    zones = [zone.strip() for zone in raw.split("|") if zone.strip()]
     return [_ZONE_MAP.get(zone, zone.lower()) for zone in zones]
 
 
@@ -185,18 +318,22 @@ def template_targets_champions(template):
         filter_json = json.loads(template.get("filter_json") or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         filter_json = {}
-    return ("champions" in template_zones(template) or
+    return (_last(template.get("target_kind")) == "PlayerTargetTemplate" or
+            "champions" in template_zones(template) or
             _find_filter(filter_json, "IsHero") is not None)
 
 
 def implicit_champion_target(db, session, handler, battle_state, *,
-                             opposing=False):
+                             opposing=False, template_id=None):
     """Resolve an authored implicit ``You``/opposing-champion target.
 
     Some damage modifiers have no explicit target slot.  The client derives
     their champion target from the first Records target template; keep that
     inference in RulesPort so native effects do not import the historical BOM
-    target helper.
+    target helper.  A resolver that already knows which authored target slot
+    it is resolving (for example Booby Trap's target-index-1 ``You``) passes
+    that ``template_id`` explicitly, because deriving it from the first
+    template picked the ability's ``Self`` target instead.
     """
     import json as _json
     from pvp_db import (db_ability_target_template_ids,
@@ -213,7 +350,11 @@ def implicit_champion_target(db, session, handler, battle_state, *,
         return None
     if not template_ids:
         return None
-    template_id = template_ids[0]
+    if template_id is None:
+        template_id = template_ids[0]
+    elif str(template_id).lower() not in {str(value).lower()
+                                          for value in template_ids}:
+        return None
     info = db_target_template_info(template_id, conn=db)
     if not info:
         return None
@@ -264,15 +405,15 @@ def implicit_champion_target(db, session, handler, battle_state, *,
 
 
 def _card(row, battle_state=None, db=None, session_id=None):
-    row = tuple(row)
-    if len(row) >= 19:
+    row_data: Any = tuple(row)
+    if len(row_data) >= 19:
         (uid, card_type, location, owner, template_guid, state, attack, defense,
          name, cost, subtype, threshold, abilities, buffs, rarity, sockets, gems,
-         original_guid, card_attributes) = row[:19]
+         original_guid, card_attributes) = row_data[:19]
     else:
         (uid, card_type, location, owner, template_guid, state, attack, defense,
          name, cost, subtype, threshold, abilities, buffs, rarity, sockets, gems,
-         original_guid) = row[:18]
+         original_guid) = row_data[:18]
         card_attributes = 0
     try:
         saved = json.loads(buffs or "{}")
@@ -296,6 +437,7 @@ def _card(row, battle_state=None, db=None, session_id=None):
             if isinstance(abilities, str) else (abilities or []),
             "counters": saved.get("counters", {}),
             "counter_guids": saved.get("counter_guids", {}),
+            "tags": saved.get("tags", {}) or {},
             "parent_uid": int(saved.get("parent_uid", 0) or 0),
             "original_template_guid": original_guid or ""}
     if (db is not None and session_id is not None and
@@ -317,6 +459,12 @@ def _source_card(db, session_id, source_uid, controller_uid):
             (uid, card_type, location, owner, state, attack, defense,
              template_guid, name, cost, subtype, threshold, attributes,
              rarity, sockets, gems, original_guid, abilities, buffs) = row
+            try:
+                saved = json.loads(buffs or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                saved = {}
+            if not isinstance(saved, dict):
+                saved = {}
             return {"card_uid": int(uid), "card_type": card_type or "",
                     "location": location or "", "user_id": int(owner or 0),
                     "owner_id": int(owner or 0), "controller_id": int(owner or 0),
@@ -327,11 +475,24 @@ def _source_card(db, session_id, source_uid, controller_uid):
                     "shards": _shards(threshold), "rarity": rarity or "",
                     "socket_count": int(sockets or 0), "gems": int(gems or 0),
                     "original_template_guid": original_guid or "",
+                    "int_attrs": saved.get("int_attrs", {}) or {},
+                    "card_integer_variables": saved.get(
+                        "card_integer_variables", {}) or {},
                     "card_abilities": json.loads(abilities or "[]")
-                    if isinstance(abilities, str) else (abilities or [])}
-    return {"card_uid": int(source_uid or 0), "user_id": int(controller_uid or 0),
+                    if isinstance(abilities, str) else (abilities or []),
+                    "parent_uid": _parent_uid(buffs)}
+    return {"card_uid": int(source_uid or 0), "location": "champions",
+            "user_id": int(controller_uid or 0),
             "owner_id": int(controller_uid or 0), "controller_id": int(controller_uid or 0),
             "card_type": "Champion", "attack": 0, "defense": 0}
+
+
+def _parent_uid(serialized_buffs):
+    try:
+        value = json.loads(serialized_buffs or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0
+    return int(value.get("parent_uid", 0) or 0) if isinstance(value, dict) else 0
 
 
 def evaluate_card_filter(card, spec, source_uid=None, *, ability_state=None,
@@ -380,23 +541,74 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
     template = target_template(db, template_id)
     if not template:
         return []
-    if (_last(template.get("target_kind")) == "AbilitySourceCardTargetTemplate"
-            and source_uid is not None):
-        return [int(source_uid)]
+    kind = _last(template.get("target_kind"))
+    state = battle_state or {}
+    if kind == "AbilitySourceCardTargetTemplate" and source_uid is not None:
+        source_uid = int(source_uid)
+        source_card = _source_card(db, session_id, source_uid, controller_uid)
+        if (bool(_target_field(template_id, "m_ChoiceOverride", False)) and
+                int((source_card or {}).get("parent_uid") or 0)):
+            source_uid = int(source_card["parent_uid"])
+            source_card = _source_card(db, session_id, source_uid,
+                                       controller_uid)
+        try:
+            filter_json = json.loads(template.get("filter_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            filter_json = {}
+        return ([int(source_uid)] if records_filter_matches(
+            source_card, filter_json, source=source_card,
+            context=_FilterContext(state), player=int(controller_uid or 0))
+                else [])
+    if kind == "AbilityTriggerCardTargetTemplate":
+        selector = str(_target_field(
+            template_id, "m_TriggerSelector", "TriggerSource") or
+            "TriggerSource").rsplit(".", 1)[-1]
+        key = ("resolving_trigger_target_uid" if selector == "TriggerTarget"
+               else "resolving_trigger_source_uid" if selector == "TriggerSource"
+               else None)
+        trigger_uid = state.get(key) if key else None
+        if trigger_uid is None:
+            return []
+        card = _source_card(db, session_id, int(trigger_uid), controller_uid)
+        try:
+            filter_json = json.loads(template.get("filter_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            filter_json = {}
+        return ([int(trigger_uid)] if records_filter_matches(
+            card, filter_json,
+            source=_source_card(db, session_id, source_uid, controller_uid),
+            context=_FilterContext(state), player=int(controller_uid or 0))
+                else [])
+    if kind == "TargetsAPlayerOrHisStuff":
+        return _chain_action_targets(
+            db, session_id, controller_uid, template, template_id,
+            source_uid, state, champions)
     try:
         filter_json = json.loads(template["filter_json"] or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         filter_json = {}
     from pvp_db import db_target_candidate_rows
     top_n = _find_filter(filter_json, "TopNOfDeck")
-    zones = template_zones(template) or [
-        "warzone", "hand", "deck", "discard", "void", "underground"]
+    zones = template_zones(template)
+    # MatchSecondaryTargetTemplate overrides the base enumerator and calls
+    # Session.GetAllCards when its collection mask is None. The base target
+    # enumerator instead offers no candidates for None.
+    if kind == "MatchSecondaryTargetTemplate" and not zones:
+        zones = ["champions", "warzone", "hand", "deck", "discard", "void",
+                 "underground", "PlayedResources", "CastSpells",
+                 "choosing", "mod", "simulacrum"]
     if top_n is not None:
-        zones = ["deck"]
-    rows = db_target_candidate_rows(session_id, zones,
-                                    controller_uid=controller_uid,
-                                    both_players=both_players,
-                                    top_n=top_n is not None, conn=db)
+        zones = ["deck"] if "deck" in zones else []
+    if kind == "PlayerTargetTemplate":
+        rows = []  # its C# enumerator visits champions only
+    elif zones:
+        rows = db_target_candidate_rows(
+            session_id, zones, controller_uid=controller_uid,
+            both_players=(True if kind == "MatchSecondaryTargetTemplate"
+                          else both_players),
+            top_n=top_n is not None, conn=db)
+    else:
+        rows = []
     player_filter = str(template["player_filter"]).lower()
     self_only = player_filter in {"self", "you", "controller"}
     opposing = player_filter in {"opponent", "opposing", "singleopponent", "multipleopponents"}
@@ -407,21 +619,63 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
     by_owner = {}
     for row in rows:
         card = _card(row, battle_state, db, session_id)
-        if self_only and card["user_id"] != int(controller_uid or 0):
+        if kind not in {"TargetsAPlayerOrHisStuff",
+                        "MatchSecondaryTargetTemplate"} and self_only and \
+                card["user_id"] != int(controller_uid or 0):
             continue
-        if opposing and card["user_id"] == int(controller_uid or 0):
+        if kind not in {"TargetsAPlayerOrHisStuff",
+                        "MatchSecondaryTargetTemplate"} and opposing and \
+                card["user_id"] == int(controller_uid or 0):
             continue
-        # Spell-Shielded, Stealth-Spellshielded and Targeting-Immune opposing
-        # permanents are not legal non-auto targets.  Without this the
-        # picker/AI offered untargetable cards as legal.
-        if _protected_target(db, session_id, battle_state, card, source,
-                             source_owner, is_auto):
+        # These derived enumerators do not run the base target's protections.
+        # Duplicate applies only the spectral check; SharedName and
+        # MatchSecondary enumerate from CardFilter and validate separately.
+        if (kind not in {"MatchSecondaryTargetTemplate",
+                         "SharedNameTargetTemplate",
+                         "DuplicateCardTargetTemplate"} and
+                _protected_target(db, session_id, battle_state, card, source,
+                                  int(controller_uid or 0), is_auto)):
             continue
-        if (int((card.get("int_attrs") or {}).get("Spectral", 0) or 0) >= 1
-                and int(card["card_uid"]) != int(source_uid or 0)):
+        if (kind in {"AbilityTargetTemplate", "DuplicateCardTargetTemplate"}
+                and _is_spectral(db, session_id, battle_state, card, source,
+                                 controller_uid)):
             continue
         cards.append(card)
         by_owner.setdefault(card["user_id"], []).append(card)
+    global_pool_kinds = (
+        "CompareAttackToLowestFilter", "CompareAttackToHighestFilter",
+        "CompareDefenseToLowestFilter", "CompareHealthToLowestFilter",
+        "CompareHealthToHighestFilter", "CompareResourceCostToHighestFilter",
+        "CompareResourceCostToMyHighestFilter",
+        "PlayersWhoControlMatchingFilter", "TopNOfDeck")
+    use_global_pool = any(_find_filter(filter_json, item)
+                          for item in global_pool_kinds)
+    use_global_pool = use_global_pool or _requires_global_filter_pool(
+        filter_json)
+    global_cards = list(cards)
+    if use_global_pool:
+        all_zones = sorted(set(_ZONE_MAP.values()))
+        global_rows = db_target_candidate_rows(
+            session_id, all_zones, controller_uid=controller_uid,
+            both_players=True, top_n=False, conn=db)
+        global_cards = [_card(row, battle_state, db, session_id)
+                        for row in global_rows]
+        for champion in champions or ():
+            try:
+                from domain.enums import ECardCollections
+                uid, owner = int(champion[0]), int(champion[1])
+                global_cards.append({
+                    "card_uid": uid, "card_type": "Champion",
+                    "location": "champions", "user_id": owner,
+                    "owner_id": owner, "controller_id": owner,
+                    "name": champion[2] if len(champion) > 2 else "Champion",
+                    "attack": 0,
+                    "defense": int(champion[3] or 0)
+                    if len(champion) > 3 else 0,
+                    "collection": int(ECardCollections.Champions),
+                })
+            except (IndexError, TypeError, ValueError):
+                continue
     # One template filter is evaluated against every candidate in the scanned
     # zones, so compile it once per (spec, candidate-pool) pair: rebuilding the
     # Records filter tree per candidate dominated target/static evaluation.
@@ -434,8 +688,8 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
         predicate = evaluators.get(key)
         if predicate is None:
             context = _FilterContext(battle_state or {})
-            context["cards"] = pool
-            context["all_cards"] = pool
+            context["cards"] = global_cards if use_global_pool else pool
+            context["all_cards"] = global_cards if use_global_pool else pool
             context["active_player_id"] = (battle_state or {}).get(
                 "active_player_id", controller_uid)
             # The activating player is the authoritative ``player`` operand for
@@ -448,44 +702,303 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
             evaluators[key] = predicate
         return predicate(card)
     if top_n is not None:
-        nested = top_n.get("m_Filter") or {}
-        amount = int(top_n.get("m_Amount", 1) or 1)
-        selected = []
-        for owner_cards in by_owner.values():
-            ordered = (list(reversed(owner_cards)) if
-                       top_n.get("m_CountFromBottom") else list(owner_cards))
-            if top_n.get("m_TopHalfOfDeck"):
-                ordered = ordered[:(len(ordered) + 1) // 2]
-            count = 0
-            for card in ordered:
-                if matches(card, nested, owner_cards):
-                    selected.append(int(card["card_uid"]))
-                    count += 1
-                    if count >= amount:
-                        break
-        return selected
+        # TopNOfDeck is a CardFilter and can be nested in And/Or/Not. Evaluate
+        # the complete Records tree against each card; the filter leaf owns
+        # amount modifiers, bottom counting and spectral expansion.
+        context = _FilterContext(battle_state or {})
+        context["cards"] = global_cards
+        context["all_cards"] = global_cards
+        context["active_player_id"] = (battle_state or {}).get(
+            "active_player_id", controller_uid)
+        predicate = records_filter_evaluator(
+            filter_json, source=source, context=context,
+            player=int(controller_uid or 0))
+        return [int(card["card_uid"]) for card in cards if predicate(card)]
 
 
     out = [int(card["card_uid"]) for card in cards
-           if matches(card, filter_json, cards)]
-    if champions and template_targets_champions(template):
+           if (kind == "TargetsAPlayerOrHisStuff" or
+               matches(card, filter_json, cards))]
+    if champions and (kind == "PlayerTargetTemplate" or
+                       "champions" in zones):
+        player_target = kind == "PlayerTargetTemplate"
         for uid, owner, name, health in champions:
-            if (not both_players and owner != controller_uid) or \
-                    (self_only and owner != controller_uid) or \
-                    (opposing and owner == controller_uid):
+            if kind == "MatchSecondaryTargetTemplate":
+                player_allowed = True
+            elif player_target:
+                player_allowed = _player_filter_accepts(
+                    player_filter, owner, controller_uid)
+            else:
+                player_allowed = ((both_players or owner == controller_uid) and
+                                  (not self_only or owner == controller_uid) and
+                                  (not opposing or owner != controller_uid))
+            if not player_allowed:
                 continue
             card = {"card_uid": int(uid), "card_type": "Champion",
-                    "location": "warzone", "user_id": owner,
+                    "location": "champions", "user_id": owner,
                     "controller_id": owner, "name": name or "Champion",
                     "defense": int(health or 0), "attack": 0}
-            # Champions join the pool as synthetic cards, so the same
-            # opposing-target protections apply to them.
-            if _protected_target(db, session_id, battle_state, card, source,
-                                 source_owner, is_auto):
+            # PlayerTargetTemplate overrides IsCardValidTarget in C# and
+            # checks only champion identity, player filter and its own filter.
+            if (not player_target and kind not in {
+                    "MatchSecondaryTargetTemplate",
+                    "SharedNameTargetTemplate"} and _protected_target(
+                    db, session_id, battle_state, card, source,
+                    int(controller_uid or 0), is_auto)):
                 continue
-            if matches(card, filter_json, cards):
+            filter_source = card if player_target else source
+            try:
+                predicate = records_filter_evaluator(
+                    filter_json, source=filter_source,
+                    context=_FilterContext(battle_state or {}),
+                    player=int(controller_uid or 0))
+                is_match = predicate(card)
+            except (TypeError, ValueError, KeyError):
+                is_match = False
+            if is_match:
                 out.append(int(uid))
+    if kind == "MatchSecondaryTargetTemplate":
+        return out
+    if kind == "SharedNameTargetTemplate":
+        # The C# override returns no candidates when the authored minimum
+        # TargetField is absent, even though the base minimum resolves to 0.
+        if _target_field(template_id, "m_MinTargetCount") is None:
+            return []
+        minimum, _maximum = _resolved_target_counts(
+            template_id, template, state)
+        groups = {}
+        for card in cards:
+            uid = int(card["card_uid"])
+            if uid in out:
+                groups.setdefault(str(card.get("name") or "").lower(), []).append(uid)
+        allowed = {uid for group in groups.values() if len(group) >= minimum
+                    for uid in group}
+        return [uid for uid in out if uid in allowed]
+    if kind == "DuplicateCardTargetTemplate":
+        matches_by_collection = {}
+        legal_by_uid = set(out)
+        for card in cards:
+            if int(card["card_uid"]) not in legal_by_uid:
+                continue
+            key = (int(card.get("user_id") or 0),
+                   str(card.get("location") or "").lower(),
+                   str(card.get("name") or ""))
+            matches_by_collection[key] = matches_by_collection.get(key, 0) + 1
+        duplicate_uids = []
+        for uid in out:
+            card = next((candidate for candidate in cards
+                         if int(candidate["card_uid"]) == uid), None)
+            if card is None:
+                continue
+            key = (int(card.get("user_id") or 0),
+                   str(card.get("location") or "").lower(),
+                   str(card.get("name") or ""))
+            if matches_by_collection.get(key, 0) > 1:
+                duplicate_uids.append(uid)
+        return duplicate_uids
     return out
+
+
+def _resolved_target_counts(template_id, template, battle_state=None,
+                            variables=None):
+    """Resolve TargetField bounds, including null max and TargetVariable."""
+    state = battle_state or {}
+    if variables is None:
+        variables = state.get("ability_variables") or {}
+    spec = _target_spec(template_id)
+    if spec is not None:
+        minimum = int(spec.resolved_minimum(variables) or 0)
+        maximum_field = _target_field(template_id, "m_MaxTargetCount")
+        maximum = (2 ** 31 - 1 if maximum_field is None else
+                   int(spec.resolved_maximum(variables) or 0))
+        return max(0, minimum), max(0, maximum)
+    minimum = int((template or {}).get("min_target_count") or 0)
+    maximum = int((template or {}).get("max_target_count") or 0)
+    return max(0, minimum), maximum if maximum else 2 ** 31 - 1
+
+
+def filter_resolved_targets(db, session_id, controller_uid, template_id,
+                            source_uid, selected, battle_state=None, *,
+                            apply_collection=False):
+    """Filter an already-resolved target set through a Records target.
+
+    C# ``SecondaryTargetTemplate`` enumerates the previous target instance and
+    applies only its CardFilter. Its PlayerFilter and CollectionFlags do not
+    rescan or narrow that already-selected set.
+    """
+    template = target_template(db, template_id)
+    if not template:
+        return ()
+    try:
+        filter_json = json.loads(template.get("filter_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        filter_json = {}
+    source = _source_card(db, session_id, source_uid, controller_uid)
+    zones = set(template_zones(template)) if apply_collection else set()
+    result = []
+    for raw_uid in selected or ():
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        card = _source_card(db, session_id, uid, controller_uid)
+        if not card:
+            continue
+        if zones and str(card.get("location") or "") not in zones:
+            continue
+        if records_filter_matches(
+                card, filter_json, source=source,
+                context=_FilterContext(battle_state or {}),
+                player=int(controller_uid or 0)):
+            result.append(uid)
+    return tuple(dict.fromkeys(result))
+
+
+def _chain_action_targets(db, session_id, controller_uid, template,
+                          template_id, source_uid, state, champions=None):
+    """Port ``TargetsAPlayerOrHisStuff`` against native projected chain data."""
+    from pvp_db import db_target_candidate_rows
+    try:
+        filter_json = json.loads(template.get("filter_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        filter_json = {}
+    # The client enumerates chain cards from the CastSpells collection
+    # regardless of this template's advertised collection mask.
+    zones = ["CastSpells"]
+    rows = db_target_candidate_rows(
+        session_id, zones, controller_uid=controller_uid, both_players=True,
+        conn=db)
+    descriptors = [item for item in state.get("stack", ())
+                   if isinstance(item, dict)]
+    champ_owners = {}
+    for owner, uid in (state.get("champ_map") or {}).items():
+        try:
+            champ_owners[int(uid)] = int(owner)
+        except (TypeError, ValueError):
+            continue
+    for item in champions or ():
+        try:
+            uid, owner = int(item[0]), int(item[1])
+            champ_owners[uid] = owner
+        except (IndexError, TypeError, ValueError):
+            continue
+    player_filter = str(template.get("player_filter") or "").lower()
+    result = []
+    for row in rows:
+        spell = _card(row, state, db, session_id)
+        spell_uid = int(spell["card_uid"])
+        descriptor = next((item for item in descriptors
+                           if int(item.get("source_uid") or 0) == spell_uid and
+                           str(item.get("kind") or "").lower() in
+                           {"spell", "troop", "artifact"}), None)
+        if descriptor is None:
+            continue
+        activations = []
+        activation = descriptor.get("activation_data") or {}
+        if isinstance(activation, dict):
+            activations.append(activation)
+        # Native PvP card-play descriptors keep one activation per ability;
+        # C# exposes their flattened TargetMap to this target template.
+        nested = descriptor.get("activations") or {}
+        if isinstance(nested, dict):
+            activations.extend(value for value in nested.values()
+                               if isinstance(value, dict))
+        elif isinstance(nested, (list, tuple)):
+            activations.extend(value for value in nested
+                               if isinstance(value, dict))
+        target_map = {}
+        for entry in activations:
+            target_map.update(entry.get("target_map") or {})
+        target_values = []
+        for selected in target_map.values():
+            if isinstance(selected, dict):
+                selected = selected.get("value", selected.get("uid64", selected))
+            if isinstance(selected, (tuple, list, set)):
+                target_values.extend(selected)
+            else:
+                target_values.append(selected)
+        for value in target_values:
+            try:
+                target_uid = int(value)
+            except (TypeError, ValueError):
+                continue
+            card = None
+            target_owner = champ_owners.get(target_uid)
+            if target_owner is None:
+                card = _source_card(db, session_id, target_uid, controller_uid)
+                target_owner = int(card.get("user_id") or 0) if card else None
+            if target_owner is None:
+                continue
+            if player_filter in {"self", "you", "controller"} and \
+                    target_owner != int(controller_uid or 0):
+                continue
+            if player_filter in {"opponent", "opposing", "singleopponent",
+                                 "multipleopponents"} and \
+                    target_owner == int(controller_uid or 0):
+                continue
+            if target_uid in champ_owners:
+                result.append(spell_uid)
+                break
+            if card is not None and records_filter_matches(
+                    card, filter_json, source=spell,
+                    context=_FilterContext(state),
+                    player=int(controller_uid or 0)):
+                result.append(spell_uid)
+                break
+    return result
+
+
+def _shared_name_card_is_valid(db, session_id, card, template_id, template,
+                               battle_state, controller_uid, champions,
+                               variables=None):
+    """Mirror SharedNameTargetTemplate.IsCardValidTarget's class override."""
+    if _target_field(template_id, "m_MinTargetCount") is None:
+        return False
+    minimum, _maximum = _resolved_target_counts(
+        template_id, template, battle_state, variables)
+    zones = template_zones(template)
+    if not zones:
+        return minimum <= 0
+    owner = _target_owner(card)
+    player_filter = _last(template.get("player_filter")).lower()
+    rows = []
+    from pvp_db import db_target_candidate_rows
+    rows.extend(db_target_candidate_rows(
+        session_id, zones, controller_uid=controller_uid,
+        both_players=True, conn=db))
+    name = str(card.get("name") or "").lower()
+    matching = 0
+    for row in rows:
+        candidate = _card(row, battle_state, db, session_id)
+        candidate_owner = _target_owner(candidate)
+        if player_filter in {"self", "you", "controller"}:
+            if candidate_owner != owner:
+                continue
+        elif player_filter in {"singleopponent", "multipleopponents"}:
+            # The C# SharedName per-card override excludes the selected
+            # target's controller here (the unlike-named base target check
+            # is retained exactly as implemented by the client).
+            if candidate_owner == owner:
+                continue
+        if str(candidate.get("name") or "").lower() == name:
+            matching += 1
+    if "champions" in {zone.lower() for zone in zones}:
+        for entry in champions or ():
+            try:
+                uid, candidate_owner = int(entry[0]), int(entry[1])
+                candidate_name = str(entry[2] if len(entry) > 2 else
+                                      "Champion").lower()
+            except (IndexError, TypeError, ValueError):
+                continue
+            if player_filter in {"self", "you", "controller"} and \
+                    candidate_owner != owner:
+                continue
+            if player_filter in {"singleopponent", "multipleopponents"} and \
+                    candidate_owner == owner:
+                continue
+            if candidate_name == name:
+                matching += 1
+    return matching >= minimum
 
 
 def _target_ignore_acted_on(template_id):
@@ -557,23 +1070,172 @@ def legal_targets_for(db, session_id, controller_uid, target, source_uid, *,
 
 def validate_target_selection(db, session_id, controller_uid, template_id,
                               source_uid, selected, both_players=False,
-                              champions=None, battle_state=None):
+                              champions=None, battle_state=None,
+                              variables=None):
+    """Validate a submitted TargetInstance like C# IsTargetValid.
+
+    Target enumeration and target validation are deliberately separate. Some
+    C# subclasses enumerate a constrained choice but validate against their
+    own override, while the base class's None collection mask offers no
+    options yet accepts a directly supplied card in any collection.
+    """
     template = target_template(db, template_id)
-    values = selected if isinstance(selected, (list, tuple)) else [selected]
-    values = [int(v) for v in values if v is not None]
+    values = selected if isinstance(selected, (list, tuple, set)) else [selected]
+    try:
+        values = [int(getattr(v, "uid64", v)) for v in values if v is not None]
+    except (TypeError, ValueError):
+        return []
     if not template:
         return values
-    if len(values) > int(template.get("max_target_count") or 1):
+    minimum, maximum = _resolved_target_counts(
+        template_id, template, battle_state, variables)
+    if len(values) > maximum:
         return []
     if not values and template.get("optional"):
         return []
-    legal = set(legal_targets(db, session_id, controller_uid, template_id, source_uid,
-                              both_players=both_players, champions=champions,
-                              battle_state=battle_state))
-    if not values or any(value not in legal for value in values):
-        return []
-    if len(values) < int(template.get("min_target_count") or 0):
-        return []
+    if len(values) < minimum:
+        if not template.get("allow_best_effort_minimum"):
+            return []
+        legal_values = legal_targets(
+            db, session_id, controller_uid, template_id, source_uid,
+            both_players=both_players, champions=champions,
+            battle_state=battle_state)
+        # Client ValidateMinimumTargetCount accepts a short target only when
+        # it contains every target the client itself considered legal.
+        if (len(legal_values) > len(values) or any(
+                value not in values for value in legal_values)):
+            return []
+
+    kind = _last(template.get("target_kind"))
+    state = battle_state or {}
+    if values:
+        actual = [_special_target_card(
+            db, session_id, uid, controller_uid, state, champions)
+                  for uid in values]
+        if any(card is None for card in actual):
+            return []
+        source = _source_card(db, session_id, source_uid, controller_uid)
+        try:
+            filter_json = json.loads(template.get("filter_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            filter_json = {}
+        source_owner = _target_owner(source or {})
+        player_filter = template.get("player_filter")
+        if kind == "AbilitySourceCardTargetTemplate":
+            expected_uid = int(source_uid or 0)
+            if (bool(_target_field(template_id, "m_ChoiceOverride", False)) and
+                    int((source or {}).get("parent_uid") or 0)):
+                expected_uid = int(source["parent_uid"])
+                source = _source_card(db, session_id, expected_uid,
+                                      controller_uid)
+            if len(values) != 1 or values[0] != expected_uid:
+                return []
+            if not records_filter_matches(
+                    source, filter_json, source=source,
+                    context=_FilterContext(state),
+                    player=int(controller_uid or 0)):
+                return []
+        elif kind == "PlayerTargetTemplate":
+            for card in actual:
+                if str(card.get("card_type") or "").lower() != "champion":
+                    return []
+                if not _player_filter_accepts(
+                        player_filter, _target_owner(card), controller_uid):
+                    return []
+                if not records_filter_matches(
+                        card, filter_json, source=card,
+                        context=_FilterContext(state),
+                        player=int(controller_uid or 0)):
+                    return []
+        elif kind == "SharedNameTargetTemplate":
+            if any(not _shared_name_card_is_valid(
+                    db, session_id, card, template_id, template, state,
+                    controller_uid, champions, variables) for card in actual):
+                return []
+        elif kind == "TargetsAPlayerOrHisStuff":
+            available = set(_chain_action_targets(
+                db, session_id, controller_uid, template, template_id,
+                source_uid, state, champions))
+            if any(uid not in available for uid in values):
+                return []
+        else:
+            for card in actual:
+                owner = _target_owner(card)
+                if not _player_filter_accepts(
+                        player_filter, owner, controller_uid):
+                    return []
+                if not _target_in_collection(card, template):
+                    return []
+                if kind == "DuplicateCardTargetTemplate":
+                    if _is_spectral(db, session_id, state, card, source,
+                                    controller_uid):
+                        return []
+                    if not records_filter_matches(
+                            card, filter_json, source=source,
+                            context=_FilterContext(state),
+                            player=int(controller_uid or 0)):
+                        return []
+                    from pvp_db import db_target_candidate_rows
+                    siblings = db_target_candidate_rows(
+                        session_id, [card.get("location")],
+                        controller_uid=owner, both_players=False, conn=db)
+                    same_name = any(
+                        int(row[0]) != int(card.get("card_uid") or 0) and
+                        str(row[8] or "") == str(card.get("name") or "")
+                        for row in siblings)
+                    if not same_name:
+                        return []
+                    continue
+
+                # The base IsCardValidTarget protection path keys the
+                # SpellShield exception to the source card's controller, but
+                # TargetingImmunity is checked against the responsible player.
+                in_protected_zone = str(card.get("location") or "").lower() \
+                    in {"warzone", "champions"}
+                if (not bool(template.get("is_auto_target")) and
+                        in_protected_zone and owner != source_owner):
+                    if int(card.get("attributes", 0) or 0) & _SPELL_SHIELD_ATTR:
+                        return []
+                    from .stealth import champion_target_is_spellshielded
+                    if champion_target_is_spellshielded(state, card):
+                        return []
+                if (not bool(template.get("is_auto_target")) and
+                        in_protected_zone and owner != int(controller_uid or 0)
+                        and _targeting_immune(
+                            db, session_id, state, card, source)):
+                    return []
+                if _is_spectral(db, session_id, state, card, source,
+                                controller_uid):
+                    return []
+                if not records_filter_matches(
+                        card, filter_json, source=source,
+                        context=_FilterContext(state),
+                        player=int(controller_uid or 0)):
+                    return []
+
+        if kind == "SharedNameTargetTemplate":
+            names = [str(card.get("name") or "").lower() for card in actual]
+            if names and any(name != names[0] for name in names[1:]):
+                return []
+
+        # C# stores the distinct controlling players separately on the
+        # TargetInstance. Derive that set from authoritative selected cards.
+        owners = {_target_owner(card) for card in actual}
+        pf = str(player_filter or "").rsplit(".", 1)[-1].lower()
+        responsible = int(controller_uid or 0)
+        if kind != "AbilitySourceCardTargetTemplate":
+            if pf in {"self", "you", "controller"} and owners != {responsible}:
+                return []
+            if pf == "singleopponent" and (
+                    len(owners) != 1 or responsible in owners):
+                return []
+            if pf == "singleplayer" and len(owners) != 1:
+                return []
+            if pf == "multipleopponents" and (
+                    not owners or responsible in owners):
+                return []
+            if pf in {"multipleplayers", "allplayers"} and not owners:
+                return []
     return values
 
 
@@ -601,6 +1263,12 @@ def ai_trigger_target(db, session, ability_guid, source_uid, owner_id,
         candidates = legal_targets(
             db, session.session_id, owner_id, template_id, source_uid,
             both_players=True, champions=champions, battle_state=battle_state)
+        # Some authored sacrifice target filters say only "a troop you
+        # control".  For a deploy sacrifice, the source is not an eligible
+        # replacement for the optional "another troop" choice.
+        if str(_effect_type) == "SacrificeCardAbilityEffectTemplate":
+            candidates = [uid for uid in candidates
+                          if int(uid) != int(source_uid or 0)]
         if candidates:
             return candidates[0]
     return None

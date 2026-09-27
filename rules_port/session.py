@@ -86,6 +86,11 @@ def _json_value(value):
     return str(value)
 
 
+def _serial_combatant_id(value):
+    """Serialize a runtime combat participant or its raw card identity."""
+    return _serial_id(getattr(value, "session_card_id", value))
+
+
 @dataclass(frozen=True)
 class RulesTransaction:
     """Normalized server intent; never a client-provided state snapshot."""
@@ -478,7 +483,7 @@ class GameEngineEventSink:
 
     def __init__(self, game: game_engine.Game, *, mutation_adapter=None,
                  event_observer: Optional[Callable[[object], None]] = None) -> None:
-        self._unpublished: list[game_engine.Game] = []
+        self._unpublished: list[Any] = []
         self._game = game
         self.mutation_adapter = mutation_adapter
         self.event_observer = event_observer
@@ -494,7 +499,8 @@ class GameEngineEventSink:
         previous = getattr(self, "_game", None)
         # Test doubles and parity stubs implement only the publishing half of
         # a Game, so read the queue duck-typed rather than demanding the field.
-        if previous is not game and getattr(previous, "events", None):
+        if (previous is not None and previous is not game and
+                getattr(previous, "events", None)):
             self._unpublished.append(previous)
         self._game = game
 
@@ -557,6 +563,8 @@ class GameEngineEventSink:
         projection, leaving the client showing only the cost change.
         """
         source_uid = getattr(ability, "source_uid", None)
+        if source_uid is None:
+            source_uid = 0
         try:
             source_uid = int(getattr(source_uid, "uid64", source_uid))
         except (TypeError, ValueError):
@@ -677,7 +685,7 @@ class AuthoritativeSession:
 
     def __init__(self, session_id, player_ids, *, seed_z: int, seed_w: int,
                  event_sink: Optional[GameEngineEventSink] = None,
-                 snapshot: Optional[SQLiteRulesSnapshot] = None) -> None:
+                 snapshot: Any = None) -> None:
         players = tuple(player_ids)
         if not players:
             raise ValueError("an authoritative session needs at least one player")
@@ -693,6 +701,7 @@ class AuthoritativeSession:
         self.action_stack = GameActionStack(self)
         self.event_sink = event_sink
         self.snapshot_store = snapshot
+        self._native_phase_already_entered = False
         self._transactions: Deque[RulesTransaction] = deque()
         self._transaction_history: list[dict[str, Any]] = []
         self._trigger_events: Deque[object] = deque()
@@ -706,6 +715,7 @@ class AuthoritativeSession:
         self._turn_start_resolver: Optional[Callable[[], object]] = None
         self._turn_boundary_resolver: Optional[Callable[[object], object]] = None
         self._turn_phase_entry_resolver: Optional[Callable[[object], object]] = None
+        self._turn_phase_exit_resolver: Optional[Callable[[object], object]] = None
         self._phase_priority_resolver: Optional[Callable[[object, object], object]] = None
         self._ability_resolver: Optional[Callable[[object], AbilityResolutionState]] = None
         self._activation_requester: Optional[Callable[[object, tuple], None]] = None
@@ -821,6 +831,14 @@ class AuthoritativeSession:
         """
         self._turn_phase_entry_resolver = resolver
 
+    def set_turn_phase_exit_resolver(self, resolver) -> None:
+        """Register the mode projection run when a native phase exits.
+
+        The callback mirrors C# phase OnExit mutations/events. Phase choice and
+        action ordering remain owned by the native scheduler.
+        """
+        self._turn_phase_exit_resolver = resolver
+
     def set_phase_priority_resolver(self, resolver) -> None:
         """Register the mode's stop policy for newly entered phase windows."""
         self._phase_priority_resolver = resolver
@@ -847,6 +865,15 @@ class AuthoritativeSession:
         if self._turn_phase_entry_resolver is None:
             return None
         result = self._turn_phase_entry_resolver(
+            self.current_turn_phase if phase is None else phase)
+        self.persist()
+        return result
+
+    def resolve_turn_phase_exit(self, phase=None):
+        """Run mode mutations/events at the native phase-exit boundary."""
+        if self._turn_phase_exit_resolver is None:
+            return None
+        result = self._turn_phase_exit_resolver(
             self.current_turn_phase if phase is None else phase)
         self.persist()
         return result
@@ -1410,7 +1437,8 @@ class AuthoritativeSession:
                 self.action_stack.priority_player_id, desired):
             return False
 
-        queue = list(getattr(top, "_priority_queue", ()) or ())
+        queue: list[object] = list(
+            getattr(top, "_priority_queue", ()) or ())
         queue = [player for player in queue if not same(player, desired)]
         if (top.priority_players is TurnPhasePlayers.ACTIVE and
                 not same(desired, self.active_player_id)):
@@ -1744,12 +1772,12 @@ class AuthoritativeSession:
                 ability = self.ability_manager.get(int(instance_id))
             except (TypeError, ValueError):
                 return False
-            if (ability is None or
+            bind_activation = getattr(ability, "bind_activation", None)
+            if (ability is None or not callable(bind_activation) or
                     getattr(ability, "responsible_player_id", None) !=
-                    transaction.player_id or
-                    not hasattr(ability, "bind_activation")):
+                    transaction.player_id):
                 return False
-            if not ability.bind_activation(activation):
+            if not bind_activation(activation):
                 return False
             if not self.pay_ability_cost(ability):
                 return False
@@ -1899,12 +1927,13 @@ class AuthoritativeSession:
         except (TypeError, ValueError):
             return False
         ability = self.ability_manager.get(instance_id)
-        if ability is None or not hasattr(ability, "bind_activation"):
+        bind_activation = getattr(ability, "bind_activation", None)
+        if ability is None or not callable(bind_activation):
             return False
         responsible = getattr(ability, "responsible_player_id", None)
         if responsible != player_id:
             return False
-        if not ability.bind_activation(activation_data):
+        if not bind_activation(activation_data):
             return False
         if not self.pay_ability_cost(ability):
             return False
@@ -2056,7 +2085,8 @@ class AuthoritativeSession:
                     card = getter(int(raw_uid))
                 except (TypeError, ValueError):
                     card = None
-                if card is not None and card.cares_about_combat_phase(
+                phase_check = getattr(card, "cares_about_combat_phase", None)
+                if callable(phase_check) and phase_check(
                         CombatPhase.FIRST_STRIKE):
                     return True
         return False
@@ -2511,13 +2541,11 @@ class AuthoritativeSession:
             "chain_instance_ids": [int(instance_id)
                                    for instance_id in self.chain._instance_ids],
             "combats": [
-                {"attacker_id": _serial_id(combat.attacker.session_card_id),
-                 "defender_id": _serial_id(combat.defender.session_card_id)
-                 if hasattr(combat.defender, "session_card_id")
-                 else _serial_id(combat.defender),
+                {"attacker_id": _serial_combatant_id(combat.attacker),
+                 "defender_id": _serial_combatant_id(combat.defender),
                  "combat_serial": int(combat.combat_id.serial_number),
                  "blocker_ids": [
-                     _serial_id(blocker.session_card_id)
+                     _serial_combatant_id(blocker)
                      for blocker in combat.blockers
                      if hasattr(blocker, "session_card_id")
                  ],

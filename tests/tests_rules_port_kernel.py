@@ -4,7 +4,9 @@ import os
 import sys
 import asyncio
 import json
+from typing import Any
 from types import SimpleNamespace
+from collections.abc import Mapping
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -131,10 +133,12 @@ class AbilityStub:
         self.instance_id = instance_id
 
 
-class PersistedSessionStub:
+class PersistedSessionStub(SimpleNamespace):
+    turn_order: dict[str, Any]
+    persisted: int
+
     def __init__(self):
-        self.turn_order = {"legacy_phase_idx": 4}
-        self.persisted = 0
+        super().__init__(turn_order={"legacy_phase_idx": 4}, persisted=0)
 
     def _persist(self, conn=None):
         self.persisted += 1
@@ -541,6 +545,7 @@ def test_native_combat_descriptors_rehydrate_after_reconnect():
     session.runtime_facts = SimpleNamespace(
         get_card=lambda uid: {1001: attacker, 1002: blocker}.get(int(uid)))
     combat = session.declare_attack(player, defender, attacker)
+    assert combat is not None
     combat.declare_blockers((blocker,))
     saved = session.snapshot()
     restored = AuthoritativeSession(56, (player,), seed_z=8, seed_w=9)
@@ -560,7 +565,9 @@ def test_ported_ability_instance_preserves_metadata_effect_order_and_identity():
     ability = AbilityFactory(90).create(metadata, activating_player_id=7)
     assert ability.instance_id == 90
     assert ability.source_uid == 123
-    assert [item["effect_group_id"] for item in ability.ordered_effects] == [0, 1]
+    assert [(item["effect_group_id"] if isinstance(item, Mapping)
+             else item.effect_group_id)
+            for item in ability.ordered_effects] == [0, 1]
     assert ability.continuation()["ability_instance_id"] == 90
 
 
@@ -1535,11 +1542,11 @@ def test_ai_events_use_native_trigger_backend_when_port_is_attached():
         _rules_port_session = object()
 
     old = ai._dispatch_triggers
+    import rules_port.triggers as port_triggers
+    native = port_triggers.dispatch_native_trigger
     try:
         # Exercise the actual helper's branch while replacing only its
         # transport-independent native dispatcher.
-        import rules_port.triggers as port_triggers
-        native = port_triggers.dispatch_native_trigger
         port_triggers.dispatch_native_trigger = lambda **kwargs: calls.append(kwargs) or "native"
         result = old(None, object(), object(), Session(), "p", "a", {},
                      "CardDrawnEvent", 12, source_owner_uid=0,
@@ -1821,7 +1828,8 @@ def test_metadata_filters_cover_attributes_cost_keywords_and_flags():
                             InCollection, IsQuick, IsResource, IsToken)
     card = {"collection": 4, "attributes": 8, "casting_cost": 3,
             "abilities": ("Swiftstrike",), "is_token": True,
-            "is_resource": True, "quick_action": True}
+            "is_resource": True, "is_basic_resource": True,
+            "quick_action": True}
     assert InCollection(4).matches(card)
     assert HasAnyAttributeFlags(8).matches(card)
     assert HasCastingCost(3).matches(card)
@@ -1876,9 +1884,25 @@ def test_type_and_print_variant_filters_use_runtime_flags():
 
 def test_socket_filters_use_socket_counts_and_comparison_metadata():
     from rules_port import IsSocketable, IsSocketed
+    from rules_port.filters import _gem_minor_types, _gem_rows
     card = {"socket_count": 2, "socketed_count": 1}
     assert IsSocketable(2).matches(card)
-    assert IsSocketed().matches(card)
+    assert IsSocketed(socketed_value=1,
+                      comparison="GreaterThanOrEqual").matches(card)
+
+    packed = (1 << 10) | 3
+    assert IsSocketed(socketed_value=2, comparison="Equals").matches(
+        {"gems": packed})
+    assert IsSocketed(compare_to_ability_source=True).matches(
+        {"gems": 1}, source={"gems": 3})
+    minor = sorted(_gem_minor_types())
+    assert minor, "gem seed missing"
+    major = next(int(row[0]) for row in _gem_rows()
+                 if int(row[0]) not in set(minor))
+    assert IsSocketed(socketed_value=1, must_be_minor=True).matches(
+        {"gems": minor[0]})
+    assert not IsSocketed(socketed_value=1, must_be_minor=True).matches(
+        {"gems": major})
 
 
 def test_tag_subtype_and_threshold_filters_match_client_metadata():
@@ -1936,7 +1960,7 @@ def test_target_factory_builds_filter_backed_target_from_normalized_metadata():
     from rules_port import target_from_metadata
     adapter = target_from_metadata(
         {"filter": {"type": "IsArtifact"}},
-        lambda: ({"card_type": 4}, {"card_type": 2}))
+        lambda: ({"card_type": 32}, {"card_type": 2}))
     assert len(adapter.candidates()) == 1
 
 
@@ -2123,11 +2147,13 @@ def test_common_client_filter_primitives_are_metadata_constructible():
 def test_combat_and_source_filter_primitives_use_runtime_relationships():
     from rules_port.filters import filter_from_metadata
     source = {"session_card_id": 1, "card_type": 2}
-    card = {"session_card_id": 2, "card_type": 2,
-            "is_blocking": True, "is_blocked": True}
+    card = {"session_card_id": 2, "card_type": 2}
+    session = {"ai_blockers": {1: (2,)}}
     assert filter_from_metadata({"type": "OtherTroops"}).matches(card, source=source)
-    assert filter_from_metadata({"type": "BlockingFilter"}).matches(card)
-    assert filter_from_metadata({"type": "BeingBlockedByFilter"}).matches(card)
+    assert filter_from_metadata({"type": "BlockingFilter"}).matches(
+        card, session=session)
+    assert filter_from_metadata({"type": "BeingBlockedByFilter"}).matches(
+        source, session=session)
     assert filter_from_metadata({"type": "IsAbilitySource"}).matches(source, source=source)
 
 
@@ -2144,9 +2170,10 @@ def test_compare_attack_and_defense_filter_matches_client_direction_flags():
 
 def test_runtime_flag_filters_cover_pve_transformed_equipped_and_stored_cards():
     from rules_port.filters import filter_from_metadata
-    card = {"is_pve": True, "is_transformed": True,
+    card = {"card_type": 1, "is_pve": True, "is_transformed": True,
             "is_equipped": True, "is_stored": True, "is_mercenary": True,
-            "color_flags": 4, "is_prismatic": True}
+            "color_flags": 4, "is_prismatic": True,
+            "thresholds": ({"color": "ruby"}, {"color": "diamond"})}
     for kind in ("IsPvECard", "IsTranformed", "IsEquippedCardFilter",
                  "IsStoredCardFilter", "IsMercenaryFilter"):
         assert filter_from_metadata({"type": kind}).matches(card)
@@ -2159,43 +2186,51 @@ def test_runtime_flag_filters_cover_pve_transformed_equipped_and_stored_cards():
 
 def test_attack_extrema_filters_use_explicit_runtime_card_collection():
     from rules_port.filters import filter_from_metadata
-    session = type("S", (), {"cards": ({"attack": 2}, {"attack": 5})})()
+    session = type("S", (), {"cards": (
+        {"collection": 8, "attack": 2},
+        {"collection": 8, "attack": 5})})()
     low = filter_from_metadata({"type": "CompareAttackToLowestFilter",
-                                "comparison": "Equals"})
+                                "comparison": "Equals", "collection": 8})
     high = filter_from_metadata({"type": "CompareAttackToHighestFilter",
-                                 "comparison": "Equals"})
-    assert low.matches({"attack": 2}, session=session)
-    assert high.matches({"attack": 5}, session=session)
+                                 "comparison": "Equals", "collection": 8})
+    assert low.matches({"collection": 8, "attack": 2}, session=session)
+    assert high.matches({"collection": 8, "attack": 5}, session=session)
 
 
 def test_defense_and_champion_health_extrema_filters():
     from rules_port.filters import filter_from_metadata
     session = type("S", (), {"cards": (
-        {"card_type": 1, "health": 8, "defense": 8},
-        {"card_type": 1, "health": 12, "defense": 12},
+        {"card_type": 1, "location": "warzone", "health": 8, "defense": 8},
+        {"card_type": 1, "location": "warzone", "health": 12, "defense": 12},
     )})()
     assert filter_from_metadata({"type": "CompareDefenseToLowestFilter"}).matches(
-        {"defense": 8}, session=session)
-    assert filter_from_metadata({"type": "CompareHealthToHighestFilter"}).matches(
+        {"card_type": 1, "location": "warzone", "defense": 8}, session=session)
+    assert filter_from_metadata({"type": "CompareHealthToHighestFilter",
+                                 "comparison": "Equals"}).matches(
         {"card_type": 1, "health": 12}, session=session)
 
 
 def test_resource_cost_highest_filter_uses_runtime_candidates():
     from rules_port.filters import filter_from_metadata
-    session = type("S", (), {"cards": ({"resource_cost": 1}, {"resource_cost": 4})})()
-    filt = filter_from_metadata({"type": "CompareResourceCostToHighestFilter"})
-    assert filt.matches({"resource_cost": 4}, session=session)
+    session = type("S", (), {"cards": (
+        {"collection": 8, "resource_cost": 1},
+        {"collection": 8, "resource_cost": 4})})()
+    filt = filter_from_metadata({"type": "CompareResourceCostToHighestFilter",
+                                 "collection": 8, "comparison": "Equals"})
+    assert filt.matches({"collection": 8, "resource_cost": 4}, session=session)
 
 
 def test_resource_cost_my_highest_filter_scopes_to_source_owner():
     from rules_port.filters import filter_from_metadata
     source = {"owner_id": 1}
     session = type("S", (), {"cards": (
-        {"owner_id": 1, "resource_cost": 3},
-        {"owner_id": 2, "resource_cost": 9},
+        {"owner_id": 1, "location": "warzone", "resource_cost": 3},
+        {"owner_id": 2, "location": "warzone", "resource_cost": 9},
     )})()
-    filt = filter_from_metadata({"type": "CompareResourceCostToMyHighestFilter"})
-    assert filt.matches({"owner_id": 1, "resource_cost": 3},
+    filt = filter_from_metadata({"type": "CompareResourceCostToMyHighestFilter",
+                                 "comparison": "Equals"})
+    assert filt.matches({"owner_id": 1, "location": "warzone",
+                         "resource_cost": 3},
                         session=session, source=source)
 
 
@@ -2208,7 +2243,8 @@ def test_source_relative_filters_compare_runtime_card_metadata():
     assert filter_from_metadata({"type": "HasSourceTypeFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasSourceResourceCost",
                                 "comparison": "LessThan"}).matches(card, source=source)
-    assert filter_from_metadata({"type": "HasSourceCastingCostFilter"}).matches(card, source=source)
+    assert filter_from_metadata({"type": "HasSourceCastingCostFilter",
+                                 "comparison": "Equals"}).matches(card, source=source)
 
 
 def test_shared_source_filters_and_owner_filter():
@@ -2239,8 +2275,9 @@ def test_source_relationship_and_damage_filters():
 
 def test_shared_shard_and_champion_metadata_filters():
     from rules_port.filters import filter_from_metadata
-    source = {"shards": 3, "classes": ("Warrior",), "subtypes": ("Elf",)}
-    card = {"shards": 1, "classes": ("Warrior",), "subtypes": ("Elf",)}
+    source = {"shards": 4, "classes": ("Warrior",), "subtypes": ("Elf",)}
+    card = {"shards": 4, "classes": ("Warrior",),
+            "subtypes": ("Elf", "Warrior")}
     assert filter_from_metadata({"type": "HasASharedShardWithSourceFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasASharedClassWithSourceChampionFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasASharedSubtypeWithSourceChampionFilter"}).matches(card, source=source)
@@ -2261,8 +2298,8 @@ def test_casting_cost_source_counter_filter_uses_named_counter():
     filt = filter_from_metadata({"type": "CompareCastingCostToSourceCountersFilter",
                                  "comparison": "Equals", "counter_type": "charge"})
     source = {"counters": {"charge": 3}}
-    assert filt.matches({"casting_cost": 3}, source=source)
-    assert not filt.matches({"casting_cost": 2}, source=source)
+    assert filt.matches({"resource_cost": 3}, source=source)
+    assert not filt.matches({"resource_cost": 2}, source=source)
 
 
 def test_has_counters_value_compares_card_counter_amount():
@@ -2278,7 +2315,8 @@ def test_attribute_and_set_filters_read_nested_runtime_metadata():
     from rules_port.filters import filter_from_metadata
     card = {"stats": {"power": 4}, "name": "Alpha", "set_id": "set-a", "set_number": 7}
     assert filter_from_metadata({"type": "IntAttrFilter", "attribute": "stats>power",
-                                "value": 4}).matches(card)
+                                "value": 4,
+                                "comparison": "Equals"}).matches(card)
     assert filter_from_metadata({"type": "StringAttrFilter", "attribute": "name",
                                 "value": "Alpha"}).matches(card)
     assert filter_from_metadata({"type": "SetIdFilter", "set_id": "set-a"}).matches(card)
@@ -2287,10 +2325,11 @@ def test_attribute_and_set_filters_read_nested_runtime_metadata():
 
 def test_target_top_deck_and_tac_filters_use_explicit_context():
     from rules_port.filters import filter_from_metadata
-    card = {"name": "Alpha", "is_quick_action": True}
+    card = {"name": "Alpha", "is_quick_action": True, "location": "deck",
+            "position": 0}
     effect = {"targets": {"0": ({"name": "Alpha"},)}}
     assert filter_from_metadata({"type": "MatchesTargetFilter"}).matches(card, effect=effect)
-    session = type("S", (), {"deck_top": (card,)})()
+    session = type("S", (), {"cards": (card,)})()
     assert filter_from_metadata({"type": "TopNOfDeck", "amount": 1}).matches(card, session=session)
     assert filter_from_metadata({"type": "TACFilter", "template": "IsQuick"}).matches(card)
 
@@ -3665,15 +3704,18 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
                 "AND card_uid=?", (uid,)).fetchone()[0]
 
         # The chain boundary consumes the picker-continuation marker and
-        # passes the resulting flag down; the card still leaves CastSpells.
+        # passes the resulting flag down; the card still leaves CastSpells. Its
+        # CardCastEvent was emitted when played, so resolution must not emit it
+        # again.
         assert run({"completed_chain_instance_id": 4}, True) == "discard"
         assert ("bom", None) not in calls, calls
-        assert ("trigger", "CardCastEvent") in calls, calls
+        assert ("trigger", "CardCastEvent") not in calls, calls
 
         # A different chain instance still resolves its own BOM.
         calls.clear()
         assert run({}, False) == "discard"
         assert ("bom", None) in calls, calls
+        assert ("trigger", "CardCastEvent") not in calls, calls
     finally:
         db.close()
 

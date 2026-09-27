@@ -17,6 +17,7 @@ Supported trigger events:
 
 import json
 import random
+from typing import Any, cast
 
 import game_engine
 from gamedata import DEFAULT_RECORD_STORE, ability_graph
@@ -911,7 +912,7 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
             cand.setdefault(champion_uid, []).extend(champion_ags)
     if owner_id is not None:
         sides = [owner_id]
-        zone_sets = [zones or ("warzone",)]
+        zone_sets: list[tuple[str, ...]] = [zones or ("warzone",)]
         # Turn-boundary triggers may be carried by cards in any persistent
         # card zone (for example Argus's "At the start of your turn, reveal
         # Argus from your hand").  The PvP start-turn path calls this
@@ -1112,8 +1113,10 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                     # card's self-trigger; otherwise Underground triggers are
                     # incorrectly checked against the stale pre-move zone.
                     try:
-                        event_uid = int(getattr(source_uid, "uid64", source_uid))
-                        candidate_uid = int(getattr(cu, "uid64", cu))
+                        event_uid = int(cast(Any, getattr(
+                            source_uid, "uid64", source_uid)))
+                        candidate_uid = int(cast(Any, getattr(
+                            cu, "uid64", cu)))
                     except (TypeError, ValueError):
                         event_uid = candidate_uid = None
                     if event_uid is not None and event_uid == candidate_uid:
@@ -1234,13 +1237,13 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
                 src_scid = game_engine.SessionCardId(game_engine.UID(cu))
                 from pvp_db import db_card_is_battleboard, db_card_location
                 hidden_battleboard = bool(db_card_is_battleboard(
-                    session.session_id, int(cu), conn=db))
+                    session.session_id, int(cast(Any, cu)), conn=db))
                 # Underground trigger effects are hidden state maintenance
                 # (for example a tunneled troop's self-buff).  The client does
                 # not put these on the public chain; resolving them there
                 # would expose a hidden card and steal a priority window.
                 underground_trigger = (str(db_card_location(
-                    session.session_id, int(cu), conn=db) or "").lower()
+                    session.session_id, int(cast(Any, cu)), conn=db) or "").lower()
                     == "underground")
                 if underground_trigger:
                     ignores = True

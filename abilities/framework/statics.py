@@ -327,10 +327,11 @@ def _variable_value(db, session_id, bstate, raw, var_name, owner, source_uid,
                 if value is None:
                     value = _constant_value(raw, name)
                 if value is None and name == "ESC":
-                    # The client's ESC variable is SourceCard.EscalationCount,
-                    # which starts at 1 and increments with each Escalate.
-                    side = ("ai" if owner == 0 else "player")
-                    value = int(bstate.get(f"{side}_escalation_uses", 0)) + 1
+                    # C# resolves ESC from the active source card, not from
+                    # an owner-wide cast counter.
+                    from rules_port.statistics import card_escalation_count
+                    value = card_escalation_count(
+                        db, session_id, bstate, source_uid)
                 return value
 
             return _evaluate_numeric_expression(

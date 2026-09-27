@@ -40,14 +40,9 @@ def reload_runtime_modules():
     import application.dispatcher as application_dispatcher
     import application.player_transactions as player_transactions
     import gamedata.play_plan as play_plan
-    import abilities.framework.bom as ability_bom
-    import abilities.framework.targeting as ability_targeting
-    import abilities.framework.resolution as ability_resolution
-    import abilities.framework.triggers as ability_triggers
     import rules_port.wire as rules_wire
     import rules_port.runtime_adapter as rules_runtime
     import rules_port.transactions as rules_transactions
-    import abilities as abilities_pkg, ability as ability_compat
 
     # Reload foundational modules first, then all already-loaded modules in
     # the application/runtime packages.  Filtering sys.modules avoids
@@ -58,8 +53,6 @@ def reload_runtime_modules():
          replay_db_module, tournament_db_module],
         [game_engine_module, game_session_module, battle_engine_module,
          application_dispatcher, player_transactions, play_plan, campaign],
-        [ability_targeting, ability_resolution, ability_bom, ability_triggers,
-         abilities_pkg, ability_compat],
         [rules_transactions, rules_runtime, rules_wire],
         [aim, te, ts, tg, sch, arena_service, mail_service, en],
     ]
@@ -96,7 +89,7 @@ def reload_runtime_modules():
     # hconnect_server.py itself is intentionally not reloaded while clients
     # are connected. Rebind profile helpers added to its legacy handler so a
     # SIGUSR1 reload can still expose newly imported DB APIs.
-    hc.db_get_store_item = profile_db_module.db_get_store_item
+    setattr(hc, "db_get_store_item", profile_db_module.db_get_store_item)
     # HCPHandler inherits ProfileStreamMixin at server import time. Reloading
     # application.profile_stream alone creates a new mixin class, but cannot
     # change methods already copied onto the live handler class. Rebind those
@@ -111,19 +104,22 @@ def reload_runtime_modules():
             if not name.startswith("__") and callable(value):
                 setattr(handler_cls, name, value)
                 rebound += 1
-    hc.tournament_server = ts
-    hc.campaign = campaign
-    hc.player_handlers = te.player_handlers
-    hc.player_handler_lock = te.player_handler_lock
-    hc.player_decks = te.player_decks
-    hc.push_tournament_room_data = te.push_tournament_room_data
-    hc.build_tournament_desc_json = te.build_tournament_desc_json
-    hc.build_waiting_room_data = te.build_waiting_room_data
-    hc.build_tournament_info_data = te.build_tournament_info_data
-    hc.uid_instance = te.uid_instance
-    hc.start_waiting_room_game = te.start_waiting_room_game
-    hc._encode_enter_tournament_error = te._encode_enter_tournament_error
-    hc._make_deck_data = te._make_deck_data
+    for name, value in {
+        "tournament_server": ts,
+        "campaign": campaign,
+        "player_handlers": te.player_handlers,
+        "player_handler_lock": te.player_handler_lock,
+        "player_decks": te.player_decks,
+        "push_tournament_room_data": te.push_tournament_room_data,
+        "build_tournament_desc_json": te.build_tournament_desc_json,
+        "build_waiting_room_data": te.build_waiting_room_data,
+        "build_tournament_info_data": te.build_tournament_info_data,
+        "uid_instance": te.uid_instance,
+        "start_waiting_room_game": te.start_waiting_room_game,
+        "_encode_enter_tournament_error": te._encode_enter_tournament_error,
+        "_make_deck_data": te._make_deck_data,
+    }.items():
+        setattr(hc, name, value)
     return (f"Reloaded {len(reloaded)} runtime modules + {rebound} "
             "ProfileStream methods + tournament globals rebound: "
             + ", ".join(reloaded))
@@ -433,6 +429,8 @@ def _cmd_challenge(handler, args):
     """Challenge a friend to a duel: !challenge <player_name>"""
     import sys as _sys
     _hcs = _sys.modules.get("hconnect_server") or _sys.modules.get("__main__")
+    if _hcs is None:
+        return "The HConnect server module is unavailable"
     if not args:
         return "Usage: !challenge <player_name>"
 
@@ -495,6 +493,8 @@ def _challenge_push_25072_25060(h, room_id, sess_uid, session_name, deck_uid64, 
     """Push DeckConstructionStarted (25072) + TournamentSessionStart (25060) to one player."""
     import sys as _sys
     _hcs = _sys.modules.get("hconnect_server") or _sys.modules.get("__main__")
+    if _hcs is None:
+        return
     from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper
 
     # 25072 — sets CurrentTournament
@@ -625,7 +625,8 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
                     td = _json.loads(srow[4])
                     shard_flags_map = {0:0, 1:4, 2:8, 3:16, 4:32, 5:64}
                     raw_list = td.get('list', [])
-                    shards = [shard_flags_map.get(s, s) for s in raw_list]
+                    shards = [value for s in raw_list
+                              if (value := shard_flags_map.get(s, s)) is not None]
                 except: pass
             if srow[5]:
                 try:

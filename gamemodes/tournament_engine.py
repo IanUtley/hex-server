@@ -21,7 +21,8 @@ from tournament_db import (
     db_tournament_pool_replace, db_tournament_pool_delete,
     db_seed_tournament_pool, db_tournament_pool,
     db_tournament_signup_set_async_state, db_tournament_async_ready_players,
-    db_tournament_player_score, db_tournament_finalize_player_run)
+    db_tournament_player_score, db_tournament_finalize_player_run,
+    db_tournament_player_run_live)
 from pvp_db import db_game_deck_cards, db_delete_game_session
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, client_session_guid
 import gamemodes.tournament_server as tournament_server

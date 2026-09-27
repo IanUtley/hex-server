@@ -94,7 +94,7 @@ def champion_uid_for_owner(handler, battle_state, owner_id):
         owner = int(owner_id if owner_id is not None else 0)
     except (TypeError, ValueError):
         return None
-    if state.get("pvp"):
+    if state.get("pvp") or isinstance(state.get("champ_map"), dict):
         champions = state.get("champ_map") or {}
         value = champions.get(owner, champions.get(str(owner)))
         if value is None:

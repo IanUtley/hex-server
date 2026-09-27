@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, cast
 
 from .phases import phase_name
 
@@ -72,8 +72,8 @@ def _same_player_id(session, left, right) -> bool:
     if left == right:
         return True
     try:
-        return int(getattr(left, "uid64", left)) == int(
-            getattr(right, "uid64", right))
+        return int(cast(Any, getattr(left, "uid64", left))) == int(
+            cast(Any, getattr(right, "uid64", right)))
     except (TypeError, ValueError):
         return False
 
@@ -208,7 +208,8 @@ class CardCountRequirement:
         if not callable(checker):
             return False
         try:
-            return _compare(int(checker(self.player_id, self.collection)),
+            return _compare(int(cast(Any, checker(
+                self.player_id, self.collection))),
                             self.comparison, int(self.quantity))
         except (TypeError, ValueError):
             return False

@@ -17,10 +17,12 @@ from gamedata.records import reference_guid
 _PARAM_NAMES = {"m_AttributeFlags": "attribute_flags"}
 
 
-def modifier_metadata(effect_guid):
+def modifier_metadata(effect_guid=None, *, template=None):
     """Return typed CardModifier fields from the Records effect template."""
-    effect = DEFAULT_RECORD_STORE.get(
-        "AbilityEffectTemplate", str(effect_guid or "").lower())
+    effect = template
+    if effect is None:
+        effect = DEFAULT_RECORD_STORE.get(
+            "AbilityEffectTemplate", str(effect_guid or "").lower())
     if effect is None:
         return {}
     modifier = effect.field("m_Modifier", {})
@@ -44,10 +46,12 @@ def modifier_metadata(effect_guid):
         "BlockRestrictionModifier": "blockrestriction",
         "TargetingImmunityModifier": "targetingimmunity",
         "AttackImmunityModifier": "attackimmunity", "SubTypeModifier": "subtype",
+        "TagModifier": "tag",
     }
     result = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
                 "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_Tag",
                 "m_CardFilter", "m_SetThresholds", "m_RemoveAllCounters",
                 "m_ReplaceExistingValue", "m_IsCombatDamage", "m_CombatDamageOnly",
                 "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely",

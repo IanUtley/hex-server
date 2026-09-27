@@ -177,7 +177,12 @@ class RecordsTriggerDiscovery:
                     abilities.append(key)
             dynamic = getattr(self.handler,
                               "_champion_granted_ability_guids", {}) or {}
-            for value in dynamic.get(int(champion_uid), ()):
+            from .effect_lifetimes import champion_grants
+            dynamic_values: list[str] = list(
+                dynamic.get(int(champion_uid), ()) or ())
+            dynamic_values.extend(champion_grants(
+                self.battle_state, int(champion_uid)))
+            for value in dict.fromkeys(dynamic_values):
                 key = str(value).lower()
                 graph = ability_graph(DEFAULT_RECORD_STORE, key)
                 if graph is None:
@@ -222,6 +227,12 @@ class RecordsTriggerDiscovery:
         if source_uid is not None:
             uid = int(source_uid)
             candidates.setdefault(uid, []).extend(card_abilities(uid))
+        # CardCreatedEvent is the synchronous client call to
+        # ActivateCardCreationAbilities(newCard). It is scoped to that new
+        # card's own trigger collection; unlike OtherCardCreatedEvent it is
+        # not broadcast to every registered trigger listener.
+        if event_type == "CardCreatedEvent":
+            return self._freeze(candidates)
         # CardCastEvent's target is the card being cast, not another
         # registered trigger source. A troop that only gained Warzone trigger
         # registration as this cast resolved cannot hear its own earlier cast
@@ -243,9 +254,20 @@ class RecordsTriggerDiscovery:
             return self._freeze(candidates)
 
         sides = [int(owner_id)]
-        zone_sets = [tuple(zones or ("warzone",))]
+        zone_sets: list[tuple[str, ...]] = [
+            tuple(zones or ("warzone",))]
         if zones is None and event_type in ("TurnStartedEvent", "TurnEndedEvent"):
             zone_sets = [("warzone", "hand", "deck", "discard", "underground")]
+            # A turn boundary is broadcast to every trigger listener in the
+            # session, not just the active champion's cards.  "At the start of
+            # each champion's turn" (Cerebral Fulmination) and "at the end of
+            # each champion's turn" are owned by cards on either side, so an
+            # AI-owned copy must fire on the human's turn too.  The authored
+            # conditions (TriggerPlayerIsActivePlayer and friends) still decide
+            # which side a particular trigger actually belongs to.
+            other = self._opposing_owner(owner_id)
+            if other is not None and other not in sides:
+                sides.append(other)
         if event_type == "CardDrawnEvent":
             other = self._opposing_owner(owner_id)
             if other is not None:

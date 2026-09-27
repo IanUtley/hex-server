@@ -321,7 +321,6 @@ def test_ai_owned_reattach_builds_combat_phase_facts():
                 pass
 
         handler = object.__new__(hcs.HCPHandler)
-        handler._rules_port_auto_attach = True
         handler.user_profile = {"id": 5}
         handler._player_champ_scid = game_engine.SessionCardId(
             game_engine.UID.make(244, 5))

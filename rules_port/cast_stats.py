@@ -10,7 +10,8 @@ def _side(owner_id, battle_state):
 
 
 def record_card_cast(battle_state: dict, owner_id: int, *, resource: bool,
-                     turn_number: int | None = None) -> None:
+                     turn_number: int | None = None, card_uid=None,
+                     card_type="", resource_cost=0) -> None:
     """Record one accepted card play for typed condition evaluation."""
     side = _side(owner_id, battle_state)
     if turn_number is None:
@@ -30,3 +31,24 @@ def record_card_cast(battle_state: dict, owner_id: int, *, resource: bool,
     battle_state[total_key] = int(battle_state.get(total_key, 0) or 0) + 1
     total_kind = f"{side}_{kind}_cards_cast"
     battle_state[total_kind] = int(battle_state.get(total_kind, 0) or 0) + 1
+    if card_uid is None:
+        return
+    from .statistics import add_card_stat, set_tac_max
+    add_card_stat(battle_state, int(card_uid), owner_id, "CardsCast", 1)
+    champion_map = battle_state.get("champ_map") or {}
+    champion_uid = champion_map.get(
+        int(owner_id), champion_map.get(str(int(owner_id))))
+    if champion_uid is None:
+        return
+    add_card_stat(
+        battle_state, int(champion_uid), owner_id,
+        "ResourceCardsCast" if resource else "NonResourceCardsCast", 1)
+    set_tac_max(battle_state, "cards", int(champion_uid),
+                "PlayerStatsThisTurn", "HighestCostCardsCast", resource_cost)
+    kind_name = str(card_type or "").lower()
+    if "basicaction" in kind_name or "quickaction" in kind_name:
+        add_card_stat(battle_state, int(champion_uid), owner_id,
+                      "ActionsCast", 1)
+    if "troop" in kind_name:
+        add_card_stat(battle_state, int(champion_uid), owner_id,
+                      "TroopsCast", 1)

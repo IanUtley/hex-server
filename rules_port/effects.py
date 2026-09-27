@@ -8,6 +8,9 @@ through the typed EffectContext without entering the legacy BOM leaf.
 from __future__ import annotations
 
 import json
+from typing import Any, cast
+
+import game_engine
 
 
 # Effect templates that read their *whole* resolved target set from Records
@@ -19,6 +22,10 @@ SELF_TARGETED_EFFECTS = frozenset({
     # each of the five resolved cards revealed the same five cards five times
     # and queued one client Coverflow per copy.
     "RevealCardsAbilityEffectTemplate",
+    # C# overrides Apply(AbilityEffectInstance) and applies its nested child
+    # to the whole target instance once. Calling it once per target multiplies
+    # the authored loop count by the target count.
+    "RepeatingAbilityEffectTemplate",
 })
 
 
@@ -157,14 +164,26 @@ def _copy_ability(context):
         "source_uid": original.get("source_uid"),
         "target_uid": original.get("target_uid"),
         "instance_id": instance_id,
+        "activation_data": dict(original.get("activation_data") or {}),
     }
     chain.push(context.bstate, copied)
     source = original.get("source_uid")
     if source is not None:
+        activation = copied["activation_data"]
+        target_map = activation.get("target_map") or {}
+        target_ids = []
+        for selected in target_map.values() if isinstance(target_map, dict) else ():
+            selected = selected if isinstance(selected, (tuple, list, set)) else (selected,)
+            for value in selected:
+                try:
+                    target_ids.append(int(getattr(value, "uid64", value)))
+                except (TypeError, ValueError):
+                    continue
         context.game.push_ability_on_chain(
             game_engine.SessionCardId(game_engine.UID(int(source))),
             game_engine.ResourceId.from_str(str(original["ability_guid"])),
-            ability_instance_id=instance_id)
+            ability_instance_id=instance_id,
+            target_card_ids=target_ids)
     return f"copied ability {str(original['ability_guid'])[:8]}"
 
 
@@ -197,6 +216,101 @@ def grant_ability(context):
     template = context.template_value("m_AbilityIsUnique", True)
     unique = bool(template)
 
+    # Port of GrantAbilityEffectTemplate.Apply's typed power sources.  The
+    # random powers are picked once per ability instance (the client caches
+    # the choice in the ability instance's RandomPowerTemplate string).
+    source_uid = context.bstate.get("resolving_source_uid")
+    random_inspire = bool(context.template_value("m_RandomInspirePower", False))
+    random_charge = bool(context.template_value(
+        "m_RandomChampionChargePower", False))
+    all_socket_source = bool(context.template_value(
+        "m_AllSocketedPowersOfSource", False))
+    all_socket_target = bool(context.template_value(
+        "m_AllSocketedPowersOfTarget", False))
+    all_socket_master = bool(context.template_value(
+        "m_AllSocketedPowersOfMyMaster", False))
+    all_pay_source = bool(context.template_value(
+        "m_AllPaymentPowersOfSource", False))
+    all_pay_target = bool(context.template_value(
+        "m_AllPaymentPowersOfTarget", False))
+    all_remembered = bool(context.template_value("m_AllRememberedPowers", False))
+    if (random_inspire or random_charge) and not granted_values:
+        picked = context.bstate.get("random_power_template")
+        if not picked:
+            from pvp_db import (db_champion_charge_power_guids,
+                                db_inspire_ability_guids)
+            pool = (db_inspire_ability_guids(conn=context.db) if random_inspire
+                    else db_champion_charge_power_guids(conn=context.db))
+            if pool:
+                rng = context.bstate.get("_rules_rng")
+                if rng is not None and hasattr(rng, "next"):
+                    picked = pool[int(rng.next(len(pool))) % len(pool)]
+                else:
+                    import random as _random
+                    picked = pool[_random.randrange(len(pool))]
+                context.bstate["random_power_template"] = picked
+        if picked:
+            granted_values = [str(picked).lower()]
+    if (all_socket_source or all_socket_target or all_socket_master or
+            all_pay_source or all_pay_target or all_remembered):
+        from pvp_db import (db_card_gem_ability_guids,
+                            db_card_manual_ability_guids)
+        values = set(granted_values)
+        if source_uid is not None and (all_socket_source or all_socket_master):
+            # ParentLink.GemAbilities is the master's socketed powers.  The
+            # master link is not materialized server-side, so the source's own
+            # socketed gems are the available authored set.
+            values.update(db_card_gem_ability_guids(
+                context.session.session_id, int(source_uid), conn=context.db))
+        if all_socket_target:
+            values.update(db_card_gem_ability_guids(
+                context.session.session_id, int(target), conn=context.db))
+        if source_uid is not None and all_pay_source:
+            values.update(db_card_manual_ability_guids(
+                context.session.session_id, int(source_uid), conn=context.db))
+        if all_pay_target:
+            values.update(db_card_manual_ability_guids(
+                context.session.session_id, int(target), conn=context.db))
+        if all_remembered:
+            remembered = context.bstate.get("remembered_powers") or {}
+            for guid in remembered.get(
+                    context.bstate.get("resolving_ability"), []):
+                if guid:
+                    values.add(str(guid).lower())
+        granted_values = list(dict.fromkeys(
+            str(value).lower() for value in values if value))
+    # C# grants "powers of the target" to the ability's source card (Mega-Bot
+    # 9000, Gemborn Prowler); every other source grants to the target.
+    destination = target
+    if (all_socket_target or all_pay_target) and source_uid is not None:
+        destination = source_uid
+    duration = context.effect_duration
+    grant_owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
+
+    def record_duration_bound_grants(added_values, target_owner):
+        if not added_values:
+            return
+        from .effect_lifetimes import record_grant
+        expiration_owner = grant_owner
+        if duration == "BeginningOfOpponentsTurn":
+            if context.bstate.get("pvp"):
+                expiration_owner = next((int(pid) for pid in
+                    context.bstate.get("pids", ())
+                    if int(pid) != grant_owner), 0)
+            else:
+                profile = getattr(context.handler, "user_profile", None) or {}
+                player_id = int(profile.get("id", 0) or 0)
+                expiration_owner = 0 if grant_owner else player_id
+        elif duration == "AfterCardsReadyOnPlayersTurn":
+            expiration_owner = int(target_owner or grant_owner)
+        for granted_guid in added_values:
+            record_grant(
+                context.bstate, source_uid=source_uid,
+                target_uid=int(destination), ability_guid=granted_guid,
+                duration=duration, owner_id=grant_owner,
+                target_owner_id=target_owner,
+                expiration_owner_id=expiration_owner)
+
     # Champions are represented in the client session by SessionCardId, but
     # deliberately have no ``game_cards`` row.  Encounter setup cards can
     # grant an ability to a champion (for example Cockatwice grants its
@@ -208,7 +322,7 @@ def grant_ability(context):
                         ("_ai_champ_scid", 0)):
         champion = getattr(context.handler, attr, None)
         try:
-            champion_uid = int(champion.uid.uid64)
+            champion_uid = int(getattr(cast(Any, champion), "uid").uid64)
         except (AttributeError, TypeError, ValueError):
             continue
         if champion_uid != int(target):
@@ -227,6 +341,8 @@ def grant_ability(context):
                 continue
             abilities.append(guid)
             added.append(guid)
+        record_duration_bound_grants(
+            added, context.target_owner(int(destination), default=grant_owner))
         # A hidden encounter setup card can grant a GameStarted ability while
         # the event is already traversing the opposing side.  That champion's
         # normal discovery pass has then finished, so run the newly granted
@@ -256,7 +372,7 @@ def grant_ability(context):
         return f"granted {len(added)} champion ability(s) to {hex(champion_uid)}"
 
     row = db_card_grant_info(
-        context.session.session_id, int(target), conn=context.db)
+        context.session.session_id, int(destination), conn=context.db)
     if not row:
         return "grant: target card not found"
     try:
@@ -272,11 +388,36 @@ def grant_ability(context):
             continue
         abilities.append(guid)
         added.append(guid)
+    record_duration_bound_grants(
+        added, context.target_owner(int(destination), default=grant_owner))
     db_set_card_abilities(
-        context.session.session_id, int(target), json.dumps(abilities),
+        context.session.session_id, int(destination), json.dumps(abilities),
         conn=context.db)
     context.db.commit()
-    scid = game_engine.SessionCardId(game_engine.UID(int(target)))
+    if random_inspire:
+        # C# sets the Inspire IntAttr on the granted card in the target loop.
+        from pvp_db import db_card_mutation_field, db_set_card_mutation_field
+        try:
+            buffs = json.loads(db_card_mutation_field(
+                context.session.session_id, int(target), "permanent_buffs",
+                conn=context.db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            buffs = {}
+        if not isinstance(buffs, dict):
+            buffs = {}
+        attrs = buffs.get("int_attrs")
+        if not isinstance(attrs, dict):
+            attrs = {}
+        previous_inspire = int(attrs.get("Inspire", 0) or 0)
+        attrs["Inspire"] = 1
+        buffs["int_attrs"] = attrs
+        db_set_card_mutation_field(
+            context.session.session_id, int(target), "permanent_buffs",
+            json.dumps(buffs), conn=context.db)
+        context.db.commit()
+        context.emit_int_attribute_gained(
+            int(target), "Inspire", previous_inspire, 1)
+    scid = game_engine.SessionCardId(game_engine.UID(int(destination)))
     from .runtime_helpers import card_collection_for_location, owner_uid
     owner = owner_uid(row[2], context.player_uid, context.ai_uid,
                       context.bstate)
@@ -289,11 +430,17 @@ def grant_ability(context):
         attack=attack, defense=defense, cost=cost,
         state=int(row[4] or 0), template_id=tpl, gems=gems,
         nulling=(row[3] == "deck"))
-    return f"granted {len(added)} ability(s) to {hex(int(target))}"
+    return f"granted {len(added)} ability(s) to {hex(int(destination))}"
 
 
 def create_and_cast_spell(context):
-    """Copy the selected spell and resolve its authored abilities natively."""
+    """Copy the selected spell and resolve its authored abilities natively.
+
+    ``m_AmountField`` is the typed copy count (C# ``CopyCardAndPutOnChain``
+    runs once per amount); the typed single-copy form defaults to one.
+    ``m_SendPlayAction`` is a client-side presentation flag and does not alter
+    the server's chain behavior.
+    """
     from pvp_db import (db_card_zone_details, db_copy_template_payload,
                         db_next_game_card_row_id, db_insert_generated_card,
                         db_discard_card)
@@ -310,37 +457,49 @@ def create_and_cast_spell(context):
     payload = db_copy_template_payload(template_guid, conn=context.db)
     if not payload:
         return "copy spell: template not found"
+    try:
+        amount = int(context.value("m_AmountField", 1) or 1)
+    except (TypeError, ValueError):
+        amount = 1
+    amount = max(1, min(amount, 20))
     owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
-    card_uid = next_game_card_uid(context.db, context.session.session_id)
-    db_insert_generated_card(
-        context.session.session_id, owner, card_uid, template_guid,
-        "CastSpells", payload[0], payload[1], payload[2],
-        db_next_game_card_row_id(context.session.session_id, conn=context.db),
-        conn=context.db)
-    context.db.commit()
     try:
         ability_guids = [str(value).lower() for value in json.loads(
             payload[1] or "[]") if value]
     except (TypeError, ValueError, json.JSONDecodeError):
         ability_guids = []
-    scid = game_engine.SessionCardId(game_engine.UID(card_uid))
-    player = context.player_uid if owner else context.ai_uid
-    _tpl, card_type, _name, cost, attack, defense, gems = \
-        context.handler._card_full_data(context.game, scid, template_guid)
-    context.game.push_card_moved(
-        scid, player, game_engine.ECardCollections.CastSpells,
-        game_engine.ECardLocations.Top, 0)
-    context.game.push_card_updated(
-        scid, player, game_engine.ECardCollections.CastSpells, card_type,
-        template_id=template_guid, cost=cost, attack=attack,
-        defense=defense, gems=gems)
     from rules_port.resolution import resolve_port_played_spell
-    resolve_port_played_spell(
-        context.game, context.session, context.db, context.handler,
-        context.player_uid, context.ai_uid, context.bstate, ability_guids)
-    db_discard_card(
-        context.session.session_id, card_uid, connection=context.db)
-    return f"copied+cast {template_guid[:8]}"
+    copied = 0
+    for _ in range(amount):
+        card_uid = next_game_card_uid(context.db, context.session.session_id)
+        db_insert_generated_card(
+            context.session.session_id, owner, card_uid, template_guid,
+            "CastSpells", payload[0], payload[1], payload[2],
+            db_next_game_card_row_id(context.session.session_id, conn=context.db),
+            conn=context.db)
+        context.db.commit()
+        scid = game_engine.SessionCardId(game_engine.UID(card_uid))
+        player = context.player_uid if owner else context.ai_uid
+        _tpl, card_type, _name, cost, attack, defense, gems = \
+            context.handler._card_full_data(context.game, scid, template_guid)
+        context.game.push_card_moved(
+            scid, player, game_engine.ECardCollections.CastSpells,
+            game_engine.ECardLocations.Top, 0)
+        context.game.push_card_updated(
+            scid, player, game_engine.ECardCollections.CastSpells, card_type,
+            template_id=template_guid, cost=cost, attack=attack,
+            defense=defense, gems=gems)
+        resolve_port_played_spell(
+            context.game, context.session, context.db, context.handler,
+            context.player_uid, context.ai_uid, context.bstate, ability_guids)
+        db_discard_card(
+            context.session.session_id, card_uid, connection=context.db)
+        copied += 1
+        # A copy that opened a picker/continuation must finish before the
+        # next copy is created, exactly like one chain item at a time.
+        if context.bstate.get("resolution_paused"):
+            break
+    return f"copied+cast {template_guid[:8]} x{copied}"
 
 
 def _store_list_attr(context):
@@ -366,21 +525,15 @@ def _animation_trigger(context):
 
 
 def _repeating(context, effect):
-    """Port of ``RepeatingAbilityEffectTemplate``.
-
-    The effect repeats a nested effect ``m_LoopCount`` times.  The extractor
-    records the nested effect GUID in ``param``; when the nested template
-    cannot be resolved the repeat is skipped rather than raising and aborting
-    the whole ability (the port previously had no handler at all).
-    """
+    """Apply C#'s nested ``RepeatingEffect`` on the shared target instance."""
     try:
         loops = int(context.value("m_LoopCount", 1) or 1)
     except (TypeError, ValueError):
         loops = 1
-    child = str(getattr(effect, "param", "") or "").strip()
-    if not child:
+    child = context.template_value("m_RepeatingEffect", None)
+    if child is None:
         return "repeat: no nested effect"
-    return f"repeat {child[:8]} x{max(0, loops)}"
+    return context.apply_repeating_effect(child, max(0, loops))
 
 
 def _lose_threshold(context, effect):
@@ -478,6 +631,33 @@ def _resource_modifier(context, effect):
         context.game, context.session, context.bstate,
         context.player_uid, context.ai_uid, side, property_name, amount,
         color=color)
+    # The C# resource modifiers keep per-effect-instance accounting alongside
+    # the player pool mutation. These values back shipped IntAttr operands such
+    # as ResourcesDepleted and ChargePointsDrained.
+    target_info = None
+    if target is not None:
+        from pvp_db import db_card_source_info
+        target_info = db_card_source_info(
+            context.session.session_id, int(target), conn=context.db)
+    is_resource_card = bool(
+        target_info and "Resource" in str(target_info[1] or ""))
+    if not is_resource_card:
+        from .statistics import add_ability_stat
+        delta = int(change.new_value) - int(change.old_value)
+        if property_name == "currentresource":
+            if delta > 0:
+                add_ability_stat(context.bstate, "ResourcesReplenished", delta)
+            elif delta < 0:
+                add_ability_stat(context.bstate, "ResourcesDepleted", -delta)
+        elif property_name == "totalresource":
+            if delta > 0:
+                add_ability_stat(context.bstate, "ResourcesGained", delta)
+            elif delta < 0:
+                add_ability_stat(context.bstate, "ResourcesLost", -delta)
+        elif property_name == "chargepoints" and delta < 0:
+            add_ability_stat(
+                context.bstate, "ChargePointsDrained",
+                min(-delta, int(change.old_value)))
     # TurnStarted triggers resolve before the following Prep refill. Preserve
     # positive temporary current-resource gains so Prep restores the normal
     # total and then reapplies the authored bonus (for example Lithe
@@ -515,7 +695,9 @@ def _card_modifier(context, effect):
     # duration/attribute flags are not lost at the RulesPort boundary.
     try:
         from .metadata import modifier_metadata
-        metadata = modifier_metadata(context.effect_guid) or {}
+        metadata = modifier_metadata(
+            context.effect_guid,
+            template=getattr(context, "effect_template_override", None)) or {}
     except Exception:
         metadata = {}
     for key, value in metadata.items():
@@ -557,6 +739,8 @@ def _card_modifier(context, effect):
         return _card_cost(context, target, param)
     if property_name == "intattr":
         return _int_attribute(context, target, param)
+    if property_name == "tag":
+        return _card_tag(context, target, param)
     if property_name == "attribute":
         if target is None:
             return "attribute: no target"
@@ -617,7 +801,8 @@ def _card_cost(context, target, param):
         target = context.bstate.get("resolving_source_uid")
     if target is None:
         return "cardcost: no target"
-    from pvp_db import db_add_card_cost_modifier, db_card_zone_details
+    from pvp_db import (db_add_card_cost_modifier, db_card_zone_details,
+                        db_card_mutation_field, db_set_card_mutation_field)
     amount = int(param.get("amount") or 0)
     if not amount:
         amount = context.modifier_value(param, param, "cardcost")
@@ -634,8 +819,27 @@ def _card_cost(context, target, param):
             amount = -value if match.group(1) == "-" else value
     if not amount:
         return "cardcost: no change"
-    db_add_card_cost_modifier(
-        context.session.session_id, int(target), amount, conn=context.db)
+    duration = str(param.get("duration") or context.effect_duration)
+    if duration == "UntilItLeavesYourHand":
+        try:
+            buffs = json.loads(db_card_mutation_field(
+                context.session.session_id, int(target), "temporary_buffs",
+                conn=context.db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            buffs = {}
+        if not isinstance(buffs, dict):
+            buffs = {}
+        mods = buffs.setdefault("temporary_cost_modifiers", [])
+        mods.append({"delta": int(amount), "duration": duration,
+                     "source_uid": context.bstate.get("resolving_source_uid"),
+                     "target_uid": int(target)})
+        db_set_card_mutation_field(
+            context.session.session_id, int(target), "temporary_buffs",
+            json.dumps(buffs, separators=(",", ":"), sort_keys=True),
+            conn=context.db)
+    else:
+        db_add_card_cost_modifier(
+            context.session.session_id, int(target), amount, conn=context.db)
     context.db.commit()
     row = db_card_zone_details(
         context.session.session_id, int(target), conn=context.db)
@@ -654,9 +858,68 @@ def _int_attribute(context, target, param):
     if not amount:
         amount = context.modifier_value(param, param, "intattr")
     operation = str(param.get("operation") or "set").lower()
+    duration = str(param.get("duration") or context.effect_duration)
+    temporary_durations = {
+        "EndOfTurn", "EndOfNextTurn", "BeginningOfOwnersTurn",
+        "BeginningOfOpponentsTurn", "AfterCardsReadyOnPlayersTurn",
+        "UntilDamaged", "UntilItLeavesYourHand",
+    }
+    resolving_owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
+    if duration == "BeginningOfOwnersTurn":
+        expiration_owner = resolving_owner
+    elif duration == "BeginningOfOpponentsTurn":
+        if context.bstate.get("pvp"):
+            expiration_owner = next((int(pid) for pid in
+                context.bstate.get("pids", ())
+                if int(pid) != resolving_owner), 0)
+        else:
+            profile = getattr(context.handler, "user_profile", None) or {}
+            player_owner = int(profile.get("id", 0) or 0)
+            expiration_owner = (0 if resolving_owner == player_owner
+                                else player_owner)
+    elif duration == "AfterCardsReadyOnPlayersTurn":
+        expiration_owner = int(context.target_owner(
+            target, default=resolving_owner) or resolving_owner)
+    else:
+        expiration_owner = None
+    champion_owner = context._champion_owner(target)
+    if champion_owner is not None:
+        uid_key = str(int(target))
+        all_attrs = context.bstate.setdefault("champion_int_attrs", {})
+        attrs = all_attrs.setdefault(uid_key, {})
+        previous = attrs.get(attr)
+        if operation in ("add", "increment"):
+            value = int(previous or 0) + amount
+        elif operation in ("remove", "subtract"):
+            value = int(previous or 0) - amount
+        else:
+            value = amount
+        if value:
+            attrs[attr] = value
+        else:
+            attrs.pop(attr, None)
+        if duration in temporary_durations:
+            from .effect_lifetimes import record_temporary_intattr
+            record_temporary_intattr(
+                context.bstate, int(target), attr, previous, attrs.get(attr),
+                champion=True, duration=duration,
+                owner_id=resolving_owner,
+                target_owner_id=champion_owner,
+                source_uid=context.bstate.get("resolving_source_uid"),
+                expiration_owner_id=expiration_owner)
+        context._push_champion_intattrs(champion_owner, int(target))
+        context.emit_int_attribute_gained(target, attr, previous, value)
+        return f"intattr {attr}={value} champion={hex(int(target))}"
+
     from pvp_db import db_card_mutation_field, db_set_card_mutation_field
+    temporary = duration in {
+        "EndOfTurn", "EndOfNextTurn", "BeginningOfOwnersTurn",
+        "BeginningOfOpponentsTurn",
+        "AfterCardsReadyOnPlayersTurn", "UntilDamaged",
+        "UntilItLeavesYourHand"}
+    column = "temporary_buffs" if temporary else "permanent_buffs"
     raw = db_card_mutation_field(
-        context.session.session_id, int(target), "permanent_buffs", conn=context.db)
+        context.session.session_id, int(target), column, conn=context.db)
     try:
         buffs = json.loads(raw or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -674,11 +937,80 @@ def _int_attribute(context, target, param):
     else:
         attrs.pop(attr, None)
     db_set_card_mutation_field(
-        context.session.session_id, int(target), "permanent_buffs",
+        context.session.session_id, int(target), column,
         json.dumps(buffs), conn=context.db)
     context.db.commit()
+    if duration in temporary_durations:
+        from .effect_lifetimes import record_temporary_intattr
+        record_temporary_intattr(
+            context.bstate, int(target), attr, old if old else None,
+            attrs.get(attr), duration=duration,
+            owner_id=resolving_owner,
+            target_owner_id=context.target_owner(int(target), default=None),
+            source_uid=context.bstate.get("resolving_source_uid"),
+            expiration_owner_id=expiration_owner)
     context._push_modifier_card(int(target), int_attrs=attrs)
+    context.emit_int_attribute_gained(target, attr, old, value)
     return f"intattr {attr}={value} target={hex(int(target))}"
+
+
+def _card_tag(context, target, param):
+    if target is None:
+        target = context.bstate.get("resolving_source_uid")
+    if target is None:
+        return "tag: no target"
+    tag = str(param.get("tag") or "")
+    if not tag:
+        return "tag: missing tag"
+    amount = int(param.get("amount") or 0)
+    if not amount:
+        amount = context.modifier_value(param, param, "tag")
+    amount = int(amount or 0)
+    operation = str(param.get("operation") or "add").lower()
+    duration = str(param.get("duration") or context.effect_duration)
+    temporary = duration in {
+        "EndOfTurn", "EndOfNextTurn", "BeginningOfOwnersTurn",
+        "BeginningOfOpponentsTurn", "AfterCardsReadyOnPlayersTurn",
+        "UntilDamaged", "UntilItLeavesYourHand"}
+    from pvp_db import db_card_mutation_field, db_set_card_mutation_field
+    column = "temporary_buffs" if temporary else "permanent_buffs"
+    raw = db_card_mutation_field(
+        context.session.session_id, int(target), column, conn=context.db)
+    try:
+        buffs = json.loads(raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        buffs = {}
+    if not isinstance(buffs, dict):
+        buffs = {}
+    tags = buffs.get("tags")
+    if not isinstance(tags, dict):
+        tags = {}
+    key = tag.lower()
+    old = int(tags.get(key, 0) or 0)
+    if operation in ("add", "increment"):
+        tags[key] = old + amount
+    elif operation in ("remove", "subtract"):
+        if amount == 0:
+            tags.pop(key, None)
+        else:
+            tags[key] = max(0, old - amount)
+    elif operation == "set":
+        if amount:
+            tags[key] = amount
+        else:
+            tags.pop(key, None)
+    else:
+        return f"tag: unsupported operation {operation}"
+    if tags:
+        buffs["tags"] = tags
+    else:
+        buffs.pop("tags", None)
+    db_set_card_mutation_field(
+        context.session.session_id, int(target), column,
+        json.dumps(buffs), conn=context.db)
+    context.db.commit()
+    context._push_modifier_card(int(target))
+    return f"tag {key}={int(tags.get(key, 0) or 0)} target={hex(int(target))}"
 
 
 def _targets(context):

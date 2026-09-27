@@ -186,6 +186,8 @@ def _handle_rchat(handler, room, chat_data):
         server = sys.modules.get("hconnect_server")
         if server is None or not hasattr(server, "_active_clients"):
             server = sys.modules.get("__main__")
+        if server is None:
+            return
         server.touch_session(handler)
         server.cleanup_stale_sessions()
 

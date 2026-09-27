@@ -7,8 +7,12 @@ second database file.
 
 import db as _db_layer
 import json
+import threading
 from domain.constants import DEFAULT_STARTING_HEALTH, PLAYED_CARD_POSITION
 from domain.enums import ECardStates, ECardTypes, ETurnPhases
+
+_CARD_COOLDOWN_LOCK = threading.RLock()
+_CARD_COOLDOWNS_KEY = "__cooldown_counts__"
 
 def db_next_session_instance(conn=None):
     """Atomically allocate the next persisted game-session instance."""
@@ -344,6 +348,22 @@ def db_get_card_type(template_guid, conn=None):
     return row[0] if row else "Troop"
 
 
+def db_apply_replica_mods(session_id, card_uid, card_type, buffs_json,
+                          conn=None):
+    """Persist the client's ``HandleReplicaMods`` projection on a card.
+
+    The Replica modification adds Artifact to the card type, adds the Replica
+    subtype (and Robot for troops), clears thresholds, deletes Unique and sets
+    the permanent-data IsReplica markers.  Type/subtype/threshold views read
+    the columns and permanent-buffs payload this writes.
+    """
+    return (conn or _db_layer._db).execute(
+        "UPDATE game_cards SET card_type=?, "
+        "card_attributes=(COALESCE(card_attributes,0) & ~?), "
+        "permanent_buffs=? WHERE session_id=? AND card_uid=?",
+        (card_type, 256, buffs_json, session_id, int(card_uid)))
+
+
 def db_set_card_state_or(session_id, card_uid, state_bits, conn=None):
     """OR state bits onto a card without committing explicit transactions."""
     connection = conn or _db_layer._db
@@ -590,9 +610,10 @@ def db_card_ability_list(session_id, card_uid, conn=None):
 
 def db_card_uses(session_id, card_uid, conn=None):
     """Return per-instance ability usage counts."""
-    row = (conn or _db_layer._db).execute(
-        "SELECT card_uses FROM game_cards WHERE session_id=? AND card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+    with _CARD_COOLDOWN_LOCK:
+        row = (conn or _db_layer._db).execute(
+            "SELECT card_uses FROM game_cards WHERE session_id=? AND card_uid=?",
+            (session_id, int(card_uid))).fetchone()
     if not row or not row[0]:
         return {}
     try:
@@ -604,14 +625,166 @@ def db_card_uses(session_id, card_uid, conn=None):
 def db_bump_card_use(session_id, card_uid, ability_guid, conn=None):
     """Increment and return one instance ability's usage count."""
     connection = conn or _db_layer._db
-    uses = db_card_uses(session_id, card_uid, conn=connection)
-    uses[ability_guid] = int(uses.get(ability_guid, 0)) + 1
-    connection.execute(
-        "UPDATE game_cards SET card_uses=? WHERE session_id=? AND card_uid=?",
-        (json.dumps(uses), session_id, int(card_uid)))
-    if conn is None:
-        connection.commit()
-    return uses[ability_guid]
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, card_uid, conn=connection)
+        uses[ability_guid] = int(uses.get(ability_guid, 0)) + 1
+        connection.execute(
+            "UPDATE game_cards SET card_uses=? WHERE session_id=? AND card_uid=?",
+            (json.dumps(uses), session_id, int(card_uid)))
+        if conn is None:
+            connection.commit()
+        return uses[ability_guid]
+
+
+def db_card_ability_use_counts(session_id, card_uid, ability_guid,
+                              turn_number, conn=None):
+    """Return ``(game, this-turn)`` uses without conflating their limits."""
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, card_uid, conn=conn)
+        guid = str(ability_guid or "").lower()
+        try:
+            game_count = int(uses.get(guid, 0) or 0)
+        except (TypeError, ValueError):
+            game_count = 0
+        per_turn = uses.get("__turn_uses__", {})
+        key = f"{int(turn_number or 1)}:{guid}"
+        try:
+            turn_count = int(per_turn.get(key, 0) or 0) if isinstance(
+                per_turn, dict) else 0
+        except (TypeError, ValueError):
+            turn_count = 0
+        return game_count, turn_count
+
+
+def db_record_card_ability_use(session_id, card_uid, ability_guid,
+                               turn_number, conn=None, *,
+                               uses_per_game=True, uses_per_turn=True):
+    """Record one activation in independent game and turn counters."""
+    connection = conn or _db_layer._db
+    key = str(ability_guid or "").lower()
+    if not key or not (uses_per_game or uses_per_turn):
+        return 0, 0
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, card_uid, conn=connection)
+        game_count = 0
+        turn_count = 0
+        if uses_per_game:
+            try:
+                game_count = int(uses.get(key, 0) or 0) + 1
+            except (TypeError, ValueError):
+                game_count = 1
+            uses[key] = game_count
+        if uses_per_turn:
+            turn_key = f"{int(turn_number or 1)}:{key}"
+            per_turn = uses.get("__turn_uses__", {})
+            per_turn = dict(per_turn) if isinstance(per_turn, dict) else {}
+            try:
+                turn_count = int(per_turn.get(turn_key, 0) or 0) + 1
+            except (TypeError, ValueError):
+                turn_count = 1
+            per_turn[turn_key] = turn_count
+            uses["__turn_uses__"] = per_turn
+        connection.execute(
+            "UPDATE game_cards SET card_uses=? WHERE session_id=? AND card_uid=?",
+            (json.dumps(uses, separators=(",", ":")),
+             session_id, int(card_uid)))
+        if conn is None:
+            connection.commit()
+        return game_count, turn_count
+
+
+def db_card_cooldown_counts(session_id, card_uid, conn=None):
+    """Return positive, per-ability cooldowns for a card instance."""
+    with _CARD_COOLDOWN_LOCK:
+        raw = db_card_uses(session_id, card_uid, conn=conn)
+        counts = raw.get(_CARD_COOLDOWNS_KEY, {})
+        if not isinstance(counts, dict):
+            return {}
+        result = {}
+        for guid, value in counts.items():
+            try:
+                remaining = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if remaining > 0:
+                result[str(guid).lower()] = remaining
+        return result
+
+
+def db_set_card_cooldown(session_id, card_uid, ability_guid, turns,
+                         conn=None):
+    """Set one authored ability cooldown without disturbing use counters."""
+    connection = conn or _db_layer._db
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, card_uid, conn=connection)
+        counts = uses.get(_CARD_COOLDOWNS_KEY)
+        counts = dict(counts) if isinstance(counts, dict) else {}
+        key = str(ability_guid or "").lower()
+        if not key:
+            return 0
+        remaining = max(0, int(turns or 0))
+        if remaining:
+            counts[key] = remaining
+        else:
+            counts.pop(key, None)
+        if counts:
+            uses[_CARD_COOLDOWNS_KEY] = counts
+        else:
+            uses.pop(_CARD_COOLDOWNS_KEY, None)
+        connection.execute(
+            "UPDATE game_cards SET card_uses=? WHERE session_id=? AND card_uid=?",
+            (json.dumps(uses, separators=(",", ":")),
+             session_id, int(card_uid)))
+        if conn is None:
+            connection.commit()
+        return remaining
+
+
+def db_decrement_card_cooldowns_for_owner(session_id, owner_id, conn=None):
+    """Decrement the active player's card cooldowns at the Ready boundary.
+
+    C# processes Warzone, Champions, then Hand for the active player. The
+    mutable session projection represents those regular cards in
+    ``game_cards``; synthetic champion cooldowns live in battle state.
+    """
+    connection = conn or _db_layer._db
+    owner = int(owner_id or 0)
+    with _CARD_COOLDOWN_LOCK:
+        rows = connection.execute(
+            "SELECT card_uid, card_uses FROM game_cards "
+            "WHERE session_id=? AND user_id=? "
+            "AND location IN ('warzone','champions','hand')",
+            (session_id, owner)).fetchall()
+        changed = []
+        for card_uid, raw in rows:
+            try:
+                uses = dict(json.loads(raw or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                uses = {}
+            counts = uses.get(_CARD_COOLDOWNS_KEY)
+            if not isinstance(counts, dict) or not counts:
+                continue
+            updated = {}
+            for guid, value in counts.items():
+                try:
+                    remaining = int(value or 0) - 1
+                except (TypeError, ValueError):
+                    continue
+                if remaining > 0:
+                    updated[str(guid).lower()] = remaining
+            if updated:
+                uses[_CARD_COOLDOWNS_KEY] = updated
+            else:
+                uses.pop(_CARD_COOLDOWNS_KEY, None)
+            connection.execute(
+                "UPDATE game_cards SET card_uses=? "
+                "WHERE session_id=? AND card_uid=?",
+                (json.dumps(uses, separators=(",", ":")),
+                 session_id, int(card_uid)))
+            changed.append(int(card_uid))
+        if conn is None:
+            connection.commit()
+        return changed
 
 
 def db_card_template_thresholds(template_guid, conn=None):
@@ -915,6 +1088,16 @@ def db_card_damage_shield_fields(session_id, card_uid, conn=None):
         "WHERE session_id=? AND card_uid=?",
         (session_id, int(card_uid)),
     ).fetchone()
+
+
+def db_card_current_damage(session_id, card_uid, conn=None):
+    """Return the persisted damage currently marked on one card."""
+    row = (conn or _db_layer._db).execute(
+        "SELECT card_damage FROM game_cards "
+        "WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid)),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 def db_condition_card_row(session_id, card_uid, conn=None):
@@ -1409,6 +1592,14 @@ def db_playable_hand_rows(session_id, user_id, limit=7, conn=None):
         (session_id, int(user_id), int(limit))).fetchall()
 
 
+def db_card_template_abilities_by_name_prefix(prefix, conn=None):
+    """Return (guid, abilities_json) for templates whose name starts with prefix."""
+    return (conn or _db_layer._db).execute(
+        "SELECT guid, abilities_json FROM card_templates "
+        "WHERE name LIKE ? ORDER BY name",
+        (str(prefix) + "%",)).fetchall()
+
+
 def db_gencard_template(name, conn=None):
     """Return the preferred authored template for a debug card grant."""
     connection = conn or _db_layer._db
@@ -1800,14 +1991,6 @@ def db_any_ability_raw_json(ability_guid, conn=None):
             (str(ability_guid).lower(),)).fetchone()
     except Exception:
         row = None
-    return row[0] if row else None
-
-
-def db_ability_target_template_ids(ability_guid, conn=None):
-    """Return serialized authored target-template IDs for an ability."""
-    row = (conn or _db_layer._db).execute(
-        "SELECT target_template_ids FROM card_abilities_meta "
-        "WHERE ability_guid=?", (str(ability_guid).lower(),)).fetchone()
     return row[0] if row else None
 
 
@@ -2242,6 +2425,94 @@ def db_gem_abilities(gem_type, conn=None):
     return row[0] if row else None
 
 
+def db_card_gem_ability_guids(session_id, card_uid, conn=None):
+    """Return the ability GUIDs granted by a card's socketed gems.
+
+    Session gems are stored either as one legacy gem type or as the packed
+    positional bitfield the client uses (ten bits per socket, bit 62 marks the
+    packed form).  Both shapes decode against ``gem_templates``.
+    """
+    row = db_card_gem_type(session_id, int(card_uid), conn=conn)
+    try:
+        raw = int(row or 0)
+    except (TypeError, ValueError):
+        return []
+    if not raw:
+        return []
+    values = []
+    if raw & (1 << 62):
+        for slot in range(6):
+            value = (raw >> (slot * 10)) & 0x3FF
+            if value:
+                values.append(value)
+    else:
+        values = [raw]
+    guids = []
+    for value in dict.fromkeys(values):
+        payload = db_gem_abilities(value, conn=conn)
+        if not payload:
+            continue
+        try:
+            abilities = json.loads(payload or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for ability in abilities:
+            if ability:
+                guids.append(str(ability).lower())
+    return list(dict.fromkeys(guids))
+
+
+def db_card_template_creation_profile(template_guid, conn=None):
+    """Return (cost, subtype, card_type) for a would-be created template."""
+    row = (conn or _db_layer._db).execute(
+        "SELECT cost, subtype, card_type FROM card_templates WHERE guid=?",
+        (str(template_guid).lower(),)).fetchone()
+    if not row:
+        return None
+    return (int(row[0] or 0), str(row[1] or ""), str(row[2] or ""))
+
+
+def db_card_manual_ability_guids(session_id, card_uid, conn=None):
+    """Return the card's current abilities whose metadata marks them manual."""
+    connection = conn or _db_layer._db
+    row = connection.execute(
+        "SELECT card_abilities FROM game_cards WHERE session_id=? AND card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+    if not row:
+        return []
+    try:
+        abilities = json.loads(row[0] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    out = []
+    for ability in abilities:
+        guid = str(ability or "").lower()
+        if not guid:
+            continue
+        manual = connection.execute(
+            "SELECT is_manual FROM card_abilities_meta WHERE ability_guid=?",
+            (guid,)).fetchone()
+        if manual and int(manual[0] or 0):
+            out.append(guid)
+    return out
+
+
+def db_champion_charge_power_guids(conn=None):
+    """Return the distinct authored champion charge-power ability GUIDs."""
+    return [str(row[0]).lower() for row in (
+        conn or _db_layer._db).execute(
+            "SELECT DISTINCT ability_guid FROM champion_abilities "
+            "WHERE ability_guid IS NOT NULL AND ability_guid<>''")]
+
+
+def db_inspire_ability_guids(conn=None):
+    """Return ability GUIDs whose game text starts with the Inspire prefix."""
+    return [str(row[0]).lower() for row in (
+        conn or _db_layer._db).execute(
+            "SELECT ability_guid FROM card_abilities_meta "
+            "WHERE game_text LIKE '<b>Inspire</b>%'")]
+
+
 def db_set_card_abilities(session_id, card_uid, abilities_json, conn=None):
     """Persist the effective ability list for one materialized card."""
     connection = conn or _db_layer._db
@@ -2614,7 +2885,7 @@ def db_resolve_talent_modified_template(template_guid, talent_guids,
     if not active:
         return str(template_guid).lower()
     from gamedata import DEFAULT_RECORD_STORE
-    from abilities.framework.tac import (_tac_attr_hash, decode_tac_tree)
+    from rules_port.tac import (_tac_attr_hash, decode_tac_tree)
     record = DEFAULT_RECORD_STORE.get("CardTemplate", str(template_guid))
     if record is None:
         return str(template_guid).lower()

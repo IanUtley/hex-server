@@ -82,7 +82,8 @@ def _consume_damage_shields(db, session, bstate, target_uid, dealer_uid,
                 session.session_id, int(target_uid),
                 "permanent_buffs" if index == 0 else "temporary_buffs",
                 json.dumps(buffs), conn=db)
-        db.commit()
+        if db is not None:
+            db.commit()
     return remaining
 
 
@@ -281,7 +282,7 @@ def deal_damage(game, session, db, handler, pl_t, ai_t, bstate, uid, amount):
                     (not is_combat and "double_noncombat_damage" in controller)):
                 amount *= 2
     if row[0] == "Champion":
-        owner = row[1]
+        owner = int(row[1] or 0)
         if (bstate or {}).get("pvp"):
             key = hmap.get(int(owner), "player_health")
         else:

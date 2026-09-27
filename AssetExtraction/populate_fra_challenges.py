@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from typing import Any
 import sqlite3
 import sys
 from pathlib import Path
@@ -366,7 +367,7 @@ def apply(db_path: Path, records_dir: Path, dry_run: bool) -> int:
         rows = []
         for row in conversations:
             mods = modifications(db, card_index, row)
-            metadata = {
+            metadata: dict[str, Any] = {
                 "source": "ConversationTemplate",
                 "trigger": "challenge",
                 "probability_basis": "default_1_in_20",

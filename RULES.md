@@ -95,8 +95,8 @@ Typed card/ability activations, choices, costs, combat declarations, and phase
 passes are validated and ordered by `rules_port`; SQLite and `Game` events are
 the host projection of an accepted decision. A UI checkpoint persists its
 continuation and resumes the same ability instance, then emits the next
-priority event. `HEX_RULES_PORT_AUTO_ATTACH=0` is an explicit rollback switch;
-normal `restart.sh` startup enables the port.
+priority event. The port is attached unconditionally; there is no legacy
+rollback mode.
 
 ## Setup, first turn, and mulligan
 
@@ -189,6 +189,15 @@ Combat and uncommon replacement/prevention effects still have incomplete
 original-client parity. Extend shared combat/effect logic and test both player
 and AI directions rather than adding a one-card branch.
 
+Damage immunity is checked before consumable shields. Outgoing multipliers
+apply before shield consumption (before assignment for combat), and
+replacement checks receive the remaining damage. Minimum-to-kill assignment
+follows prevention; shielded damage consumes the attacker's remaining damage
+budget. SpiritDrain heals damage actually dealt, for effects as well as combat.
+Champion shields persist in the session checkpoint and temporary shields expire
+at either player's end of turn. See `docs/RULES_PORT_PARITY.md` for C# evidence,
+focused acceptance scenarios and the remaining damage-system gaps.
+
 ## Abilities and triggers
 
 The metadata-driven ability pipeline is:
@@ -209,10 +218,15 @@ its target. Existing listeners can inspect the played card's type and cost,
 but a card does not observe its own cast when that cast first activates its
 Warzone trigger.
 
-The remaining ability gaps include less common leaves, complete target modes,
-condition trees, output variables, duration teardown, uses/cooldowns, and some
-trigger types. A new implementation should add a generic leaf or metadata
-correction first and add a focused regression test.
+The Records ability interpreter has shared paths for the shipped effect
+leaves, target and condition metadata, output variables, duration boundaries,
+usage limits, cooldowns, and trigger dispatch. The remaining parity work is
+edge-case coverage for target/condition combinations and a complete
+event-publisher trace for every authored trigger type in PvE and PvP. The
+ability field and card-text audits are evidence about the current Records
+snapshot; they do not prove every event path or Unity projection. A new gap
+should be fixed in its shared metadata or event layer and covered by a focused
+acceptance scenario.
 
 ## PVE, PVP, AI, and tournaments
 

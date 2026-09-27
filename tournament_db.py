@@ -2,6 +2,7 @@
 
 import json
 import random
+from typing import Any
 
 import db as _db_layer
 from replay_db import db_get_replay_match, db_get_tournament_signup_names
@@ -34,7 +35,7 @@ _TOURNEY_KEYS_EXPIRY = ("id", "type_id", "status", "players_json",
                         "max_players", "games_count", "set_id")
 
 
-def _tourney_row_to_dict(row):
+def _tourney_row_to_dict(row) -> dict[str, Any] | None:
     if not row:
         return None
     keys = _TOURNEY_KEYS_EXPIRY if len(row) == len(_TOURNEY_KEYS_EXPIRY) \
@@ -66,10 +67,11 @@ def db_tournament_banned_card_guids(tournament_type_id, conn=None):
     return {str(row[0]).lower() for row in rows if row[0]}
 
 
-def db_tournament_list(status=None, conn=None, enabled_only=False):
+def db_tournament_list(status=None, conn=None, enabled_only=False) -> list[dict[str, Any]]:
     connection = conn or _db_layer._db
     query = _tourney_select() + " ORDER BY t.id"
     params = ()
+    columns = set()
     if enabled_only:
         columns = {row[1] for row in connection.execute(
             "PRAGMA table_info(tournament_types)")}
@@ -81,11 +83,11 @@ def db_tournament_list(status=None, conn=None, enabled_only=False):
             clause += " AND tt.enabled=1"
         query = _tourney_select() + clause + " ORDER BY t.id"
         params = (status,)
-    return [_tourney_row_to_dict(row)
-            for row in connection.execute(query, params).fetchall()]
+    return [room for row in connection.execute(query, params).fetchall()
+            if (room := _tourney_row_to_dict(row)) is not None]
 
 
-def db_tournament_completed_for_player(player_uid, conn=None):
+def db_tournament_completed_for_player(player_uid, conn=None) -> list[dict[str, Any]]:
     query = _tourney_select(
         "DISTINCT t.*, tt.name AS type_name, tt.style, tt.format, "
         "tt.min_players, tt.max_players, tt.games_count, tt.set_id") + \
@@ -93,7 +95,8 @@ def db_tournament_completed_for_player(player_uid, conn=None):
         "WHERE LOWER(t.status) IN ('complete', 'closed') " \
         "AND ts.player_uid=? ORDER BY t.id"
     rows = (conn or _db_layer._db).execute(query, (int(player_uid),)).fetchall()
-    return [_tourney_row_to_dict(row) for row in rows]
+    return [room for row in rows
+            if (room := _tourney_row_to_dict(row)) is not None]
 
 
 def db_tournament_create(inst_id, type_id, conn=None):
@@ -588,7 +591,8 @@ def db_tournament_signup_by_player(tid, player_uid, conn=None):
     return rows[0] if rows else None
 
 
-def db_tournament_signups_by_tournament(tid, status="active", conn=None):
+def db_tournament_signups_by_tournament(
+        tid, status: str | None = "active", conn=None):
     """Return tournament signups, optionally restricted by status."""
     connection = conn or _db_layer._db
     if status is None:

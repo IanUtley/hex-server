@@ -148,6 +148,8 @@ def complete_turn(state):
     """
     if not isinstance(state, dict):
         return None
+    from .damage_effects import expire_champion_shields
+    expire_champion_shields(state)
     next_player = next_turn_player(state)
     state["turn_player"] = next_player
     state["turn_number"] = int(state.get("turn_number", 1) or 1) + 1
@@ -397,6 +399,24 @@ def ready_cards_for_turn(db, session_id, owner_id):
     return changed
 
 
+def decrement_ability_cooldowns(db, session_id, owner_id, battle_state=None):
+    """Apply C# ReadyState's active-player cooldown tick.
+
+    Ordinary card counts stay with their game_cards rows; synthetic champion
+    counts stay in the shared battle checkpoint. The caller projects updates
+    for the returned card UIDs and any non-empty champion ability GUID list.
+    """
+    from pvp_db import db_decrement_card_cooldowns_for_owner
+    cards = db_decrement_card_cooldowns_for_owner(
+        session_id, owner_id, conn=db)
+    champions = {}
+    if isinstance(battle_state, dict):
+        from .cooldowns import decrement_champion_cooldowns
+        champions = decrement_champion_cooldowns(
+            battle_state, owner_id)
+    return cards, champions
+
+
 def clear_combat_damage(db, session_id):
     from pvp_db import db_clear_warzone_damage
     db_clear_warzone_damage(session_id, conn=db)
@@ -404,10 +424,20 @@ def clear_combat_damage(db, session_id):
 
 
 def clear_expired_temporary_attributes(db, session_id, owner_id, boundary,
-                                       clear_stat_buffs=False):
+                                       clear_stat_buffs=False,
+                                       battle_state=None, handler=None):
     """Expire temporary attributes and stat grants at an authored boundary."""
     from pvp_db import (db_temporary_attribute_rows,
                         db_set_temporary_card_state)
+    if isinstance(battle_state, dict):
+        from .effect_lifetimes import (expire_grants,
+                                       expire_temporary_intattrs)
+        expire_temporary_intattrs(
+            db, session_id, battle_state, boundary=boundary,
+            boundary_owner=owner_id)
+        expire_grants(
+            db, session_id, battle_state, boundary=boundary,
+            boundary_owner=owner_id, handler=handler)
     changed = []
     for card_uid, target_owner, attrs, raw_buffs in db_temporary_attribute_rows(
             session_id, conn=db):
@@ -439,8 +469,29 @@ def clear_expired_temporary_attributes(db, session_id, owner_id, boundary,
         else:
             buffs.pop(_EXPIRATIONS, None)
         if clear_stat_buffs:
-            buffs = {key: value for key, value in buffs.items()
-                     if key == _EXPIRATIONS}
+            # Keep payloads whose own metadata says they remain active beyond
+            # turn cleanup. Temporary cost changes use the source card's
+            # UntilItLeavesYourHand lifetime; IntAttrs with another boundary
+            # are listed in the battle checkpoint until that boundary fires.
+            retained = {}
+            for key in (_EXPIRATIONS, "temporary_cost_modifiers"):
+                if key in buffs:
+                    retained[key] = buffs[key]
+            if isinstance(battle_state, dict):
+                pending = {
+                    str(item.get("attribute") or "")
+                    for item in battle_state.get(
+                        "temporary_card_int_attrs", ()) or ()
+                    if isinstance(item, dict) and
+                    int(item.get("uid", -1)) == int(card_uid)
+                }
+                int_attrs_payload = buffs.get("int_attrs")
+                if isinstance(int_attrs_payload, dict):
+                    active_attrs = {name: value for name, value in int_attrs_payload.items()
+                                    if name in pending}
+                    if active_attrs:
+                        retained["int_attrs"] = active_attrs
+            buffs = retained
         new_buffs = json.dumps(buffs, separators=(",", ":"), sort_keys=True)
         if (new_attrs == int(attrs or 0) and
                 new_buffs == (raw_buffs or "{}")):

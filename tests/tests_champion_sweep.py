@@ -26,7 +26,7 @@ SRC = fresh_database()
 
 import game_engine
 
-from abilities.framework.resolution import resolve_ability
+from rules_port.resolution import resolve_port_ability
 from abilities.framework.triggers import resolve_stack_trigger, resolve_triggers
 from tests.tests_combat import HandlerStub, SessionStub
 from tests.tests_set1_sweep import (
@@ -80,9 +80,9 @@ def _run_one(db, handler, game, session, pl_t, ai_t, bstate, ability_guid,
         return
 
     target_map = _explicit_target_map(db, ability_guid)
-    resolve_ability(
+    resolve_port_ability(
         handler, game, session, db, pl_t, ai_t, bstate, ability_guid,
-        source_uid, 5, target_map)
+        source_uid, 5, target_map=target_map)
 
 
 def _run_sweep():

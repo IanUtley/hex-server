@@ -17,6 +17,7 @@ import json
 import re
 import struct
 
+import battle_engine
 import game_engine as _ge
 from db import _db, log_req
 from pvp_db import (
@@ -391,7 +392,6 @@ def _set_life(handler, session, state, pid, value, game):
     if native is not None:
         bstate = native
     else:
-        import battle_engine
         bstate = battle_engine.load_state(session)
     bstate["player_health"] = max(0, int(value))
     if native is not None:
@@ -440,10 +440,9 @@ def _handle(handler, session, raw):
                 elif action == 1:
                     native_practice = bool(
                         state is not None and state.get("_rules_port_attached"))
-                    if native_practice:
+                    if state is not None and state.get("_rules_port_attached"):
                         bstate = state
                     else:
-                        import battle_engine
                         bstate = battle_engine.load_state(session)
                     cost = int(tpl[3] or 0)
                     bstate["player_resources"] = max(
@@ -483,7 +482,7 @@ def _handle(handler, session, raw):
                         if ctype & (_ge.ECardTypes.BasicAction | _ge.ECardTypes.QuickAction):
                             _pvp_play_spell(handler, session, card_uid, pid, raw)
                         elif ctype & (_ge.ECardTypes.Troop | _ge.ECardTypes.Artifact | _ge.ECardTypes.Constant):
-                            _pvp_play_troop(handler, session, card_uid, pid)
+                            _pvp_play_troop(handler, session, card_uid, pid, raw)
                         else:
                             log_req(f"    Debug cheat Play: unsupported card type {tpl[1]}")
                         return True
@@ -528,10 +527,9 @@ def _handle(handler, session, raw):
         else:
             native_practice = bool(
                 state is not None and state.get("_rules_port_attached"))
-            if native_practice:
+            if state is not None and state.get("_rules_port_attached"):
                 bstate = state
             else:
-                import battle_engine
                 bstate = battle_engine.load_state(session)
             key = {"res": "player_resources", "chg": "player_charges", "sp": "player_spell_points"}[field]
             bstate[key] = max(0, int(bstate.get(key, 0)) + count)
@@ -556,7 +554,10 @@ def _handle(handler, session, raw):
                 for field in ("res", "chg", "sp"):
                     _apply_pool_change(state, pid, field, count)
             if action in (5, 6, 7):
-                colors = [int(_enum(handler, raw, "ThresholdColor"))] if action == 6 and _enum(handler, raw, "ThresholdColor") is not None else [4, 8, 16, 32, 64]
+                threshold_color = _enum(handler, raw, "ThresholdColor")
+                colors = ([int(threshold_color)]
+                          if action == 6 and threshold_color is not None
+                          else [4, 8, 16, 32, 64])
                 thresholds = state.setdefault(f"thresh_{pid}", {})
                 for color in colors:
                     thresholds[str(color)] = max(0, int(thresholds.get(str(color), thresholds.get(color, 0))) + count)
@@ -568,17 +569,17 @@ def _handle(handler, session, raw):
         else:
             native_practice = bool(
                 state is not None and state.get("_rules_port_attached"))
-            if native_practice:
+            if state is not None and state.get("_rules_port_attached"):
                 bstate = state
             else:
-                import battle_engine
                 bstate = battle_engine.load_state(session)
             if action == 5:
                 for key in ("player_resources", "player_total_resources",
                             "player_charges", "player_spell_points"):
                     bstate[key] = max(0, int(bstate.get(key, 0)) + count)
-            colors = ([int(_enum(handler, raw, "ThresholdColor"))]
-                      if action == 6 and _enum(handler, raw, "ThresholdColor") is not None
+            threshold_color = _enum(handler, raw, "ThresholdColor")
+            colors = ([int(threshold_color)]
+                      if action == 6 and threshold_color is not None
                       else [4, 8, 16, 32, 64])
             thresholds = bstate.setdefault("player_threshold", {})
             for color in colors:

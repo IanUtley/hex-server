@@ -446,6 +446,25 @@ def encode_objfmt_response(type_names, fields):
 
     def encode_field(name, tcode, val):
         """Encode a single field and return. Updates sizes."""
+        # Values are selected by tcode below. Initialize all payload variants
+        # so the encoder remains statically verifiable while each branch only
+        # reads the payload it assigned.
+        evalue = ""
+        evalue_int = 0
+        ecount = 0
+        elem_data = []
+        card_data = []
+        deck_data = []
+        champ_data = []
+        elems = []
+        threshold_data = []
+        fight_data = []
+        mod_data = []
+        uid_val = 0
+        sub_fields = []
+        raw_bytes = b""
+        player_data = []
+        uid_data = []
         if tcode == "long":
             tname = "System.Int64"
         elif tcode == "ulong":
@@ -976,10 +995,10 @@ def encode_profile_flag_list(flags):
             w(field_name); sep(); w(str(field_size_index)); sep()
             w(str(ft(type_name))); sep(); w("0"); sep()
             if type_name == "System.String":
-                encoded = value.encode("utf-8")
+                encoded = str(value).encode("utf-8")
                 w(str(len(encoded))); sep(); buf.write(encoded)
             elif type_name == "System.Int32":
-                w(hexlify(struct.pack("<i", value)).decode("ascii")); sep()
+                w(hexlify(struct.pack("<i", int(value))).decode("ascii")); sep()
             else:
                 w("1" if value else "0")
             sizes[field_size_index] = buf.tell() - field_start

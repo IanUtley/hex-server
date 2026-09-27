@@ -1,6 +1,15 @@
 """Profile/reward output projection mixin for HConnect connections."""
 
+from typing import TYPE_CHECKING, Any
+
 from profile_db import db_get_unopened_chests
+
+if TYPE_CHECKING:
+    # HConnect still binds these legacy protocol and DB names into this
+    # module at startup. Import them for static analysis without creating a
+    # runtime dependency cycle.
+    from hconnect_server import *  # noqa: F403
+    from hconnect_server import _db
 
 
 def bind_runtime_globals(namespace):
@@ -9,6 +18,11 @@ def bind_runtime_globals(namespace):
 
 
 class ProfileStreamMixin:
+    def __getattr__(self, name: str) -> Any:
+        # The mixin is attached to HCPHandler after its runtime dependencies
+        # and protocol state have been assembled.
+        raise AttributeError(name)
+
     def _handle_chat_command(self, cmd: str, room: str, username: str) -> str:
         import commands
         return commands.handle_command(self, cmd, room, username)

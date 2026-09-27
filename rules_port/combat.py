@@ -302,7 +302,8 @@ class CombatResolver:
     """The source algorithm with session damage delegated through ``damage``.
 
     ``damage(source, target, amount, only_minimum_to_kill)`` must mutate the
-    authoritative state and return actual damage dealt.  That makes simultaneous
+    authoritative state and return damage absorbed (dealt plus prevention),
+    matching Session.DamageCard's out parameter. That makes simultaneous
     result accumulation and existing trigger/event order testable at the
     adapter boundary.
     """
@@ -324,11 +325,14 @@ class CombatResolver:
         if _cares_about_phase(attacker, phase):
             remaining = _combat_damage(attacker)
             if combat.blockers:
-                last = combat.blockers[-1]
                 for blocker in combat.blockers:
                     if _in_warzone(blocker) and _is_troop(blocker):
-                        minimum = blocker is not last or _has_juggernaut(attacker)
-                        dealt = int(damage(attacker, blocker, remaining, minimum))
+                        # C#'s assignment gives each blocker only the minimum
+                        # lethal damage; the remainder stays with the attacker
+                        # and breaks through to the champion only with Crush.
+                        # Overkill is therefore not dealt (nor healed by
+                        # SpiritDrain) unless Juggernaut applies.
+                        dealt = int(damage(attacker, blocker, remaining, True))
                         remaining -= dealt
                         results.append(CombatResult(attacker, blocker, dealt))
             if not combat.is_attack_blocked or _has_juggernaut(attacker):

@@ -85,13 +85,16 @@ class ConditionContext:
                     except (TypeError, ValueError):
                         continue
             counters, guids = self._counter_counts(uid)
+            int_attrs = dict((self.bstate.get("champion_int_attrs") or {}).get(
+                str(uid), {}) or {})
             return {"card_uid": uid, "card_type": "Champion",
                     "location": "champions", "user_id": owner,
                     "owner_id": owner, "controller_id": owner,
                     "attack": 0, "defense": int(health or 0),
                     "name": name or "Champion", "cost": 0,
                     "shards": [], "attributes": 0,
-                    "counters": counters, "counter_guids": guids}
+                    "counters": counters, "counter_guids": guids,
+                    "int_attrs": int_attrs}
         if uid in self._cards:
             return self._cards[uid]
         from pvp_db import db_condition_card_row
@@ -118,6 +121,7 @@ class ConditionContext:
                 "attributes": int(row[12] or 0) | int(row[13] or 0),
                 "int_attrs": buffs.get("int_attrs", {}),
                 "counters": counters, "counter_guids": guids,
+                "tags": buffs.get("tags", {}) or {},
                 "damaged_opponent_this_turn": list(
                     self.bstate.get("damaged_opponent_this_turn") or [])}
         self._cards[uid] = card

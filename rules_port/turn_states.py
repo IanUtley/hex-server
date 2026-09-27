@@ -8,6 +8,7 @@ priority windows without encoding each phase transition in service handlers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
 
 from .kernel import PriorityWindowAction, TurnPhasePlayers
 from .phases import permitted_next_phases, phase_name
@@ -59,7 +60,10 @@ class TurnPhaseState:
             configure(action)
 
     def on_exit(self, session) -> None:
-        pass
+        # CombatEndedEvent is an OnExit rule on two C# phase states. The mode
+        # adapter owns event publication, while this native lifecycle owns the
+        # exact phase boundary and callback ordering.
+        session.resolve_turn_phase_exit(self.phase)
 
 
 class FirstMainPhaseState(TurnPhaseState):
@@ -141,6 +145,8 @@ def _live_has_legal_blockers(session):
     defenders = getattr(session, "defending_player_ids", None)
     participants = (defenders() if callable(defenders)
                     else getattr(session, "player_ids", ()))
+    if not isinstance(participants, Iterable):
+        participants = ()
     for combat in session.combat_manager.combats:
         attacker = combat.attacker
         attacker_uid = int(getattr(attacker, "session_card_id",

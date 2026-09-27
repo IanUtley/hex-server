@@ -9,7 +9,7 @@ second rules engine.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping, cast
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,8 @@ def ability_cost_targets(graph, db, session_id: int, owner_id: int,
     from .targeting import legal_targets_for
     from gamedata import DEFAULT_RECORD_STORE
     result = []
-    for index, (kind, guid) in enumerate(graph.additional_cost_targets or ()):
+    for index, (kind, guid) in enumerate(cast(
+            Any, graph.additional_cost_targets or ())):
         target = next((value for value in graph.targets
                        if str(value.guid).lower() == str(guid).lower()), None)
         if target is None:

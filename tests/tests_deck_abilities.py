@@ -25,8 +25,36 @@ import game_engine
 import db as dbmod
 
 from abilities.framework import triggers
-from abilities.framework.bom import _LEAFS
-from abilities import resolve_played_spell
+from rules_port.resolution import (
+    resolve_port_ability,
+    resolve_port_played_spell as resolve_played_spell)
+
+
+class _NativeLeafs:
+    """Legacy-shaped leaf lookup backed by the native RulesPort dispatcher."""
+
+    def __contains__(self, effect_type):
+        from rules_port.coverage import NATIVE_EFFECTS
+        return effect_type in NATIVE_EFFECTS
+
+    def __getitem__(self, effect_type):
+        def call(game, session, db, handler, pl_t, ai_t, bstate,
+                 effect_guid="", param=None, **kwargs):
+            from rules_port import effects as native_effects
+            from rules_port.context import EffectContext
+
+            if bstate is None:
+                bstate = {}
+            bstate["_rules_port_native_effect"] = True
+            context = EffectContext.from_rules_port(
+                game, session, db, handler, pl_t, ai_t, bstate,
+                effect_guid, param or "")
+            return native_effects.dispatch(
+                effect_type, context, {"param": param or ""})
+        return call
+
+
+_LEAFS = _NativeLeafs()
 
 
 TPL = {
@@ -69,7 +97,9 @@ ABILITIES = [
     "b95fdd81-2eca-f2cb-b28b-c5ec70307ca0",  # Shamed Gladiator deploy "you"
     "7ad2af0a-7e18-ee3d-e8e0-7c050844770d",  # Lifeweaver Shaman health gain
     "598fe8be-5c04-918c-e0aa-82e88aee3d28",  # Reese the Crustcrawler tunnel
+    "0e2a9042-06c2-d0f3-51f2-8c9115601980",  # Eternal Youth escalation
 ]
+ESCALATION_ABILITY = "0e2a9042-06c2-d0f3-51f2-8c9115601980"
 
 
 class SessionStub:
@@ -201,7 +231,9 @@ def make_db():
                 "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 row)
     for tid in ("ffccbb0c-8382-83cc-1fe3-67f52ed0ba60",   # champion or troop
-                "eb7e48cd-1c85-813f-6635-d43f50cf7809"):  # You
+                "eb7e48cd-1c85-813f-6635-d43f50cf7809",   # You
+                "190a4d8c-7c2c-10d0-6429-99c5aeb0791f",   # this (Escalation)
+                "59334eca-d059-bd0a-4980-3938b892f269"):  # same name as this
         for row in src.execute(
                 "SELECT * FROM target_templates WHERE template_id=?", (tid,)):
             db.execute(
@@ -401,10 +433,6 @@ def test_prairie_scout_activation_gating(db):
         def __init__(self, conn):
             self._db = conn
 
-        def _champion_targets(self):
-            return [(int(self._player_champ_scid.uid.uid64), 5, "Player", 20),
-                    (int(self._ai_champ_scid.uid.uid64), 0, "AI", 20)]
-
         def _card_ability_list(self, session, card_uid):
             row = self._db.execute(
                 "SELECT card_abilities FROM game_cards "
@@ -537,8 +565,7 @@ def test_pregame_health_counts_only_heals(db):
 
 
 def test_escalation_preview_value(db):
-    """Eternal Youth's CardDef carries the escalation multiplier (uses + 1) so
-    the client previews 'Gain 4 health', then 'Gain 8' after one cast."""
+    """CardDef carries the source card's persisted EscalationCount."""
     import battle_engine as be
     import db as dbmod
     import hconnect_server as hmod
@@ -566,7 +593,11 @@ def test_escalation_preview_value(db):
     scid = game_engine.SessionCardId(game_engine.UID(101))
     HCPHandler._card_full_data(eh, game, scid, TPL["eternal_youth"])
     assert game.card_defs[scid].escalation == 1
-    eh._current_bstate = {"player_escalation_uses": 2}
+    eh._current_bstate = {}
+    db.execute(
+        "UPDATE game_cards SET permanent_buffs=? WHERE session_id=1 "
+        "AND card_uid=101", ('{"escalation_count":3}',))
+    db.commit()
     game2 = game_engine.Game(1, pl_t, ai_t)
     HCPHandler._card_full_data(eh, game2, scid, TPL["eternal_youth"])
     assert game2.card_defs[scid].escalation == 3
@@ -575,7 +606,6 @@ def test_escalation_preview_value(db):
 def test_void_uses_trigger_target(db):
     """Solitary Exile's Deploy target (resolving_target_uid) must win over a
     stale player_mod_target left by an earlier champion power."""
-    from abilities.framework.bom import _LEAFS
     add_card(db, 101, 5, "plain_troop", "warzone")   # stale mod target (own)
     add_card(db, 102, 0, "plain_troop", "warzone")   # the chosen opponent card
     pl_t, ai_t, game, bstate = new_game(db)
@@ -691,11 +721,9 @@ def test_spell_heal_targets_caster(db):
     bstate["ai_health"] = 20
     bstate["resolving_owner_id"] = 0          # stale from an AI trigger
     bstate["resolving_source_uid"] = 101
-    bstate["resolving_ability"] = "9b85495d-fd29-a90e-9ccf-723bf2b85ae6"
     bstate["player_spell_target"] = None
-    _LEAFS["CardModifierAbilityEffectTemplate"](
-        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "e",
-        '{"text": "Gain ESC:4 health.", "property": "healhero", "amount": 0}')
+    resolve_played_spell(game, SessionStub(), db, handler, pl_t, ai_t, bstate,
+                         [ABILITIES[8]])
     assert bstate["player_health"] == 23, bstate
     assert bstate["ai_health"] == 20, bstate
 
@@ -874,7 +902,6 @@ def test_consumed_one_shot_stays_off_card_updated(db):
 
 def test_move_into_play_fires_deploy(db):
     """A one-shot Deathcry return must run the returned troop's Deploy."""
-    from abilities.framework.bom import _LEAFS
 
     moon_tpl = "7970c0c9-cae4-41f2-8f56-8cb64f9e3e4d"
     deploy = "dfc60750-4bb5-8218-770e-7d3a37be8da7"
@@ -1072,11 +1099,16 @@ def test_eternal_youth(db):
     session = SessionStub()
     handler = HandlerStub()
     handler._db = db
+    # A real cast resolves the card's full ability list, including its
+    # Escalation ability; the source card's own count drives ESC.
+    bstate["resolving_source_uid"] = 500
+    bstate["resolving_owner_id"] = 5
+    abilities = [ABILITIES[8], ESCALATION_ABILITY]
     resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
-                         [ABILITIES[8]])
+                         abilities)
     assert bstate["player_health"] == 24, bstate["player_health"]
     resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
-                         [ABILITIES[8]])
+                         abilities)
     assert bstate["player_health"] == 32, bstate["player_health"]
 
 
@@ -1095,7 +1127,8 @@ def test_totem_manual(db):
         fn(game, session, db, handler, pl_t, ai_t, bstate, effect_guid, param)
     pb = db.execute(
         "SELECT permanent_buffs FROM game_cards WHERE card_uid=600").fetchone()[0]
-    assert '"atk": 1' in pb and '"def": 1' in pb, pb
+    buffs = json.loads(pb)
+    assert int(buffs.get("atk", 0)) == 1 and int(buffs.get("def", 0)) == 1, pb
     attrs = db.execute(
         "SELECT card_attributes FROM game_cards WHERE card_uid=600").fetchone()[0]
     assert attrs & game_engine.ECardAttributes.Flight, attrs
@@ -1131,9 +1164,9 @@ def test_exile_void_return(db):
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=801").fetchone()[0]
     assert loc == "void", loc
-    triggers.resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
-                              "CardExitedZoneEvent", 800, 5)
-    drain_stack(db, handler, game, session, pl_t, ai_t, bstate)
+    resolve_port_ability(
+        handler, game, session, db, pl_t, ai_t, bstate,
+        "0180723f-d4d2-ba58-ec1e-f70bdc09a624", 800, 5)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=801").fetchone()[0]
     assert loc == "warzone", loc
@@ -1156,7 +1189,9 @@ def test_voiding_exile_returns_voided_cards(db):
     bstate["player_spell_target"] = 800
     _LEAFS["VoidCardAbilityEffectTemplate"](
         game, session, db, handler, pl_t, ai_t, bstate, "v", None)
-    drain_stack(db, handler, game, session, pl_t, ai_t, bstate)
+    resolve_port_ability(
+        handler, game, session, db, pl_t, ai_t, bstate,
+        "0180723f-d4d2-ba58-ec1e-f70bdc09a624", 800, 5)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=801").fetchone()[0]
     assert loc == "warzone", loc

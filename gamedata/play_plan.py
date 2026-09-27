@@ -638,6 +638,8 @@ class PlayPlan:
             if bound is ability.activation:
                 prompts.extend(ability.required_prompts())
             else:
+                if ability.graph is None:
+                    continue
                 prompts.extend(AbilityInstance.from_graph(
                     ability.graph, source_uid=ability.source_uid,
                     owner_id=ability.owner_id, activation=bound,
@@ -703,6 +705,10 @@ class PlayPlan:
             bound = activation_map.get(ability.ability_guid.lower())
             if bound is None:
                 bound = ability.activation
+            if ability.graph is None:
+                errors.append(
+                    f"ability {ability.ability_guid} has no metadata graph")
+                continue
             errors.extend(AbilityInstance.from_graph(
                 ability.graph, source_uid=ability.source_uid,
                 owner_id=ability.owner_id, activation=bound,

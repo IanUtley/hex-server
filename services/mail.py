@@ -47,6 +47,8 @@ def push_unread_notification(handler, count=None):
         return
 
     server = _server_module()
+    if server is None:
+        return
     inner = encode_objfmt_response(
         ["Game.Shared.Network.Mail.NewMailReceivedEventArgs"], [])
     compressed = compress_gzip(inner)
@@ -68,6 +70,8 @@ def push_unread_notification(handler, count=None):
 def notify_new_mail(user_id):
     """Notify all connected sessions for a newly delivered message."""
     server = _server_module()
+    if server is None:
+        return
     for handler, _last_active in list(server._active_clients.get(int(user_id), [])):
         push_unread_notification(handler, count=1)
 
