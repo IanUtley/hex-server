@@ -972,6 +972,21 @@ class NativeEffectBackend:
                                 target_spec.guid,
                                 battle_state.get("revealed_cards") or [],
                                 battle_state=battle_state, acted_on_uids=acted_on)
+                            if not candidates:
+                                # Nothing revealed matches (no artifact among
+                                # the cards, or every card was already taken).
+                                # C# enumerates an empty target list and the
+                                # effect does nothing; it must not fall back
+                                # to the source card (Gearsmith moved itself
+                                # into the deck).
+                                applied[instance_id] = condition_passes(
+                                    effect, None)
+                                for key in ("resolving_target_uid",
+                                            "player_mod_target",
+                                            "player_spell_target",
+                                            "grant_target"):
+                                    battle_state.pop(key, None)
+                                continue
                             # A SourceRevealed target is input-bearing only when
                             # the authored template asks the player to choose.
                             # Oakhenge's child ability targets "a revealed troop"
@@ -1006,7 +1021,11 @@ class NativeEffectBackend:
                                         int(ability.responsible_player_id),
                                         candidates,
                                         list(battle_state.get("revealed_cards") or []),
-                                        optional=bool(target_spec.optional),
+                                        # "Up to one" (minimum 0) may be
+                                        # declined like an optional target.
+                                        optional=bool(
+                                            target_spec.optional or
+                                            int(target_spec.minimum or 0) == 0),
                                         continuation=continuation)
                                     battle_state["resolution_paused"] = True
                                     native_waiting = True
@@ -1099,6 +1118,14 @@ class NativeEffectBackend:
                     target_values = (None,)
                 if not isinstance(target_values, (tuple, list)):
                     target_values = (target_values,)
+                if (effect_type == "RevealCardsAbilityEffectTemplate" and
+                        len(target_values) > 1):
+                    # C# RevealCards reveals the whole target set in one
+                    # CardsRevealed event, and reveal_cards selects that set
+                    # itself.  Running it once per card ("the top three cards
+                    # of your deck") revealed the same three cards three
+                    # times, replaying the client's reveal presentation.
+                    target_values = tuple(target_values[:1])
                 effect_targets = tuple(target_values)
                 resolved_by_instance[instance_id] = tuple(
                     int(value) for value in effect_targets

@@ -2202,6 +2202,7 @@ class EffectContext:
             return f"{label}: card not found"
         old_location, old_state = str(old[1] or "").lower(), int(old[2] or 0)
         position = 100 if destination == "hand" else 0
+        client_location = game_engine.ECardLocations.Top
         clear_dead = destination == "warzone"
         clear_bits = game_engine.ECardStates.Dead if clear_dead else 0
         new_state = old_state if destination == "warzone" else 0
@@ -2236,6 +2237,7 @@ class EffectContext:
             top_half = bool(self.template_value("m_TopHalfOfDeck", False))
             if dest_location in ("", "unknown", "random") or \
                     random_location >= 0 or top_half:
+                client_location = game_engine.ECardLocations.Unknown
                 from pvp_db import db_randomly_insert_deck_cards
                 db_randomly_insert_deck_cards(
                     self.session.session_id, int(old[0] or 0), [target],
@@ -2253,8 +2255,11 @@ class EffectContext:
         collection = card_collection_for_location(destination)
         if destination == "discard":
             self.game.push_card_discarded(scid, owner)
+        # A card put into a random deck slot is reported at an Unknown
+        # location; reporting Top showed Gearsmith's revealed cards on top of
+        # the deck in the client.
         self.game.push_card_moved(
-            scid, owner, collection, game_engine.ECardLocations.Top, 0)
+            scid, owner, collection, client_location, 0)
         self.game.push_card_updated(
             scid, owner, collection, ct, template_id=tpl, cost=cost,
             attack=attack, defense=defense, gems=gem,

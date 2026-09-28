@@ -2746,8 +2746,153 @@ def test_hand_card_shows_its_current_cost(db):
     live.commit()
 
 
+AG_GEARSMITH_DEPLOY = "8f2d3151-c6c2-1831-27e6-7bc96df000e5"
+AG_GEARSMITH_PICK = "f1a8b50a-cdb2-775b-3c7e-615e2bf221f3"
+
+
+def _template_by_name(name):
+    source = sqlite3.connect(SRC)
+    try:
+        return source.execute(
+            "SELECT guid FROM card_templates WHERE name=? AND rarity!='Epic' "
+            "ORDER BY guid", (name,)).fetchone()[0]
+    finally:
+        source.close()
+
+
+def _gearsmith_board(db, owner, deck_names):
+    """Gearsmith in play and a known deck order (position 0 is the top)."""
+    gearsmith = _template_by_name("Gearsmith")
+    _copy_card(db, gearsmith)
+    _copy_ability(db, AG_GEARSMITH_PICK)
+    add_card(db, 0x3f01, owner, gearsmith, loc="warzone")
+    deck = []
+    for index, name in enumerate(deck_names):
+        tpl = _template_by_name(name)
+        _copy_card(db, tpl)
+        uid = 0x5001 + index * 0x100
+        add_card(db, uid, owner, tpl, loc="deck")
+        db.execute("UPDATE game_cards SET position=? WHERE card_uid=?",
+                   (index, uid))
+        deck.append(uid)
+    db.execute("UPDATE game_cards SET card_type=(SELECT card_type FROM "
+               "card_templates ct WHERE ct.guid=game_cards.template_guid)")
+    db.commit()
+    return deck
+
+
+def _gearsmith_deploy(db, owner, handler=None):
+    from rules_port.resolution import resolve_port_trigger
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = handler or HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "stack": [], "_rules_port_attached": True}
+    result = resolve_port_trigger(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        {"kind": "trigger", "ability_guid": AG_GEARSMITH_DEPLOY,
+         "source_uid": 0x3f01, "target_uid": 0x3f01,
+         "trigger_target_uid": 0x3f01, "source_owner_uid": owner,
+         "instance_id": 3})
+    return result, game, bstate
+
+
+def _zones(db):
+    return {uid: loc for uid, loc in db.execute(
+        "SELECT card_uid, location FROM game_cards")}
+
+
+def _deck_order(db):
+    return [uid for (uid,) in db.execute(
+        "SELECT card_uid FROM game_cards WHERE location='deck' "
+        "ORDER BY position")]
+
+
+def test_gearsmith_takes_the_revealed_artifact_and_stays_in_play(db):
+    """Gearsmith: "look at the top three cards of your deck, put up to one
+    artifact into your hand, it gets cost -1, put the remaining cards into
+    your deck".  The remaining-cards target excluded every revealed card, so
+    the move fell back to the source and Gearsmith went into the deck, and
+    the revealed cards stayed face-up on top.  The reveal also ran once per
+    revealed card."""
+    top, second, artifact, fourth, fifth = _gearsmith_board(
+        db, 0, ["Ruby Shard", "Construct Foreman", "S.P.A.M. Bot",
+                "Ruby Shard", "Construct Foreman"])
+    result, game, _bstate = _gearsmith_deploy(db, 0)
+    assert str(result).endswith("COMPLETED"), result
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert zones[artifact] == "hand", zones
+    assert all(zones[uid] == "deck" for uid in (top, second, fourth, fifth))
+    order = _deck_order(db)
+    # The cards that were not revealed keep their order (no shuffle).
+    assert [uid for uid in order if uid in (fourth, fifth)] == [fourth, fifth]
+    reveals = [e for e in game.events
+               if isinstance(e, game_engine.CardsRevealedSessionEventArgs)]
+    assert len(reveals) == 1, len(reveals)
+    moves = {int(e.session_card_id.uid.uid64): e for e in game.events
+             if isinstance(e, game_engine.CardMovedSessionEventArgs)}
+    assert set(moves) == {top, second, artifact}, moves
+    for uid in (top, second):
+        assert moves[uid].location == game_engine.ECardLocations.Unknown
+    hidden = {int(e.session_card_id.uid.uid64) for e in game.events
+              if isinstance(e, game_engine.CardUpdatedSessionEventArgs)
+              and getattr(e, "nulling", False)}
+    assert {top, second} <= hidden, hidden
+
+
+def test_gearsmith_without_an_artifact_returns_all_three(db):
+    """No artifact revealed: nothing goes to hand and Gearsmith stays."""
+    deck = _gearsmith_board(
+        db, 0, ["Ruby Shard", "Construct Foreman", "Ruby Shard",
+                "S.P.A.M. Bot", "Construct Foreman"])
+    result, _game, _bstate = _gearsmith_deploy(db, 0)
+    assert str(result).endswith("COMPLETED"), result
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert all(zones[uid] == "deck" for uid in deck), zones
+
+
+def test_gearsmith_player_picks_the_artifact(db):
+    """The player is asked only for the artifact choice (the "remaining
+    cards" target is automatic); resuming with the pick finishes the move."""
+    from rules_port.resolution import resolve_port_ability
+    top, second, artifact, _fourth, _fifth = _gearsmith_board(
+        db, 5, ["Ruby Shard", "Construct Foreman", "S.P.A.M. Bot",
+                "Ruby Shard", "Construct Foreman"])
+    prompts = []
+    handler = HandlerStub(db)
+    handler._prompt_revealed_choice = (
+        lambda *args, **kwargs: prompts.append((args[8], kwargs)))
+    result, game, bstate = _gearsmith_deploy(db, 5, handler)
+    assert len(prompts) == 1, prompts
+    candidates, kwargs = prompts[0]
+    assert list(candidates) == [artifact], candidates
+    assert kwargs["optional"] is True           # "up to one" may be declined
+    assert _zones(db)[0x3f01] == "warzone"
+    continuation = kwargs["continuation"]
+    target_map = {int(k): v for k, v in continuation["target_map"].items()}
+    target_map[int(continuation["target_index"])] = artifact
+    bstate.pop("resolution_paused", None)
+    pl_t, ai_t = _pl_ai()
+    resolve_port_ability(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        continuation["ability_guid"], continuation["source_uid"],
+        continuation["owner_id"], target_map=target_map,
+        variables=continuation["variables"],
+        resume_from_order=continuation["resume_effect_order"],
+        instance_id=continuation["ability_instance_id"])
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert zones[artifact] == "hand", zones
+    assert zones[top] == zones[second] == "deck", zones
+
+
 def _main():
     tests = (test_construction_plans_count_the_exhausted_troops,
+             test_gearsmith_takes_the_revealed_artifact_and_stays_in_play,
+             test_gearsmith_without_an_artifact_returns_all_three,
+             test_gearsmith_player_picks_the_artifact,
              test_dictionary_with_struct_keys_decodes,
              test_two_troop_exhaust_activation_keeps_both_troops,
              test_pterobot_costs_less_for_each_dwarf_and_robot_you_control,
