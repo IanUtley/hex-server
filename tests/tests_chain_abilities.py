@@ -2659,10 +2659,35 @@ def test_two_troop_exhaust_activation_keeps_both_troops(db):
     assert dict(ability.activation.target_map) == {}, ability.activation.target_map
 
 
+def test_pterobot_costs_less_for_each_dwarf_and_robot_you_control(db):
+    """"This has cost -1 in all your zones for each Dwarf and/or Robot you
+    control."  Only in-play cards were scanned as static sources, and the
+    count's "you control" filter got no player, so it always cost 7."""
+    from rules_port.static_rules import effective_cost
+    ptero, bot, dwarf = "bef4c375-71cd-4cd7-a8b6-8f7ef6cf6bad", "02ed9695-207a-4c23-a3f8-13c7b001203d", "0260fed3-fceb-40e1-af24-677dcb25fa97"
+    db.execute("DELETE FROM game_cards")
+    for tpl in (ptero, bot, dwarf):
+        _copy_card(db, tpl)
+    add_card(db, 0x101, 5, ptero, loc="hand")
+    db.execute("UPDATE game_cards SET card_abilities=(SELECT abilities_json "
+               "FROM card_templates WHERE guid=?) WHERE card_uid=?", (ptero, 0x101))
+    db.commit()
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3, "stack": []}
+    assert effective_cost(db, 1, bstate, 0x101) == 7
+    add_card(db, 0x201, 5, bot, loc="warzone")
+    add_card(db, 0x301, 5, dwarf, loc="warzone")
+    db.commit()
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+    add_card(db, 0x401, 0, bot, loc="warzone")     # the opponent's Robot
+    db.commit()
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+
+
 def _main():
     tests = (test_construction_plans_count_the_exhausted_troops,
              test_dictionary_with_struct_keys_decodes,
              test_two_troop_exhaust_activation_keeps_both_troops,
+             test_pterobot_costs_less_for_each_dwarf_and_robot_you_control,
              test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
