@@ -419,6 +419,15 @@ class NativeTriggerBackend:
                 if (event_name == "TurnStartedEvent" and
                         key[1] == TUNNELING_ABILITY_GUID):
                     continue
+                if event_name == "CardCreatedEvent":
+                    from .static_rules import is_continuous_self_static
+                    if is_continuous_self_static(graph):
+                        # The static projection recalculates this modifier
+                        # in every zone (Pterobot's "cost -1 for each Dwarf
+                        # and/or Robot you control").  Resolving it here too
+                        # baked a creation-time snapshot into the card and
+                        # applied the discount twice.
+                        continue
                 location = "champions" if source_uid in {
                     int(value) for value in (battle_state.get("champ_map") or {}).values()
                 } else db_card_location(session.session_id, source_uid, conn=db)

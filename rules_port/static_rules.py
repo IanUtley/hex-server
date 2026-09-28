@@ -1245,6 +1245,37 @@ def _owner_projects_card_properties(db, session_id, owner, cache):
     return cached
 
 
+def is_continuous_self_static(graph):
+    """Whether a CardCreated ability is a continuous self modifier.
+
+    Such abilities ("This has cost -1 in all your zones for each Dwarf and/or
+    Robot you control") are projected by this module in every zone, so they
+    must not also resolve once at card creation.
+    """
+    from .metadata import modifier_metadata
+    if graph is None or "CardCreatedEvent" not in str(
+            graph.trigger_event_type or ""):
+        return False
+    zones = {value.lower() for value in
+             str(graph.trigger_collection_flags or "").split("|") if value}
+    if not {"deck", "hand", "warzone", "discard"} <= zones:
+        return False
+    if not graph.targets or not all(
+            target.target_kind == "AbilitySourceCardTargetTemplate"
+            for target in graph.targets):
+        return False
+    if not graph.effects:
+        return False
+    for effect in graph.effects:
+        if (effect.concrete_type != "CardModifierAbilityEffectTemplate" or
+                str(effect.duration).lower() != "permanent"):
+            return False
+        prop = str((modifier_metadata(effect.guid) or {}).get("property") or "")
+        if prop not in {"attack", "defense", "cardcost", "attribute"}:
+            return False
+    return True
+
+
 def _self_static_abilities(db, session_id, card_uid, location, cache):
     """A card's own continuous abilities that apply to itself where it is.
 

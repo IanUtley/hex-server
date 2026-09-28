@@ -2681,6 +2681,69 @@ def test_pterobot_costs_less_for_each_dwarf_and_robot_you_control(db):
     add_card(db, 0x401, 0, bot, loc="warzone")     # the opponent's Robot
     db.commit()
     assert effective_cost(db, 1, bstate, 0x101) == 5
+    # Card creation must not also bake a snapshot of the same modifier
+    # into the card (Pterobot cost 4 with only a Robot and a Dwarf in play).
+    from rules_port.triggers import dispatch_native_trigger
+    pl_t, ai_t = _pl_ai()
+    dispatch_native_trigger(
+        db=db, handler=HandlerStub(db), game=game_engine.Game(1, pl_t, ai_t),
+        session=SessionStub(), player_uid=pl_t, ai_uid=ai_t,
+        battle_state={"stack": [], "ability_lists": {},
+                      "_rules_port_attached": True},
+        event_type="CardCreatedEvent", source_card_id=0x101,
+        source_player_id=5, data={"zones": ()})
+    assert db.execute("SELECT card_cost_mod FROM game_cards WHERE card_uid=?",
+                      (0x101,)).fetchone()[0] in (0, None)
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+
+
+def test_hand_card_shows_its_current_cost(db):
+    """The client shows the cost the server last pushed for a hand card;
+    board-dependent static costs (Pterobot) must be re-pushed."""
+    import hconnect_server as hcs
+    live = hcs._db
+    session_id = 97531
+    ptero, bot = "bef4c375-71cd-4cd7-a8b6-8f7ef6cf6bad", "02ed9695-207a-4c23-a3f8-13c7b001203d"
+    live.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+    def put(uid, tpl, loc, owner=5):
+        live.execute(
+            "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+            "card_template_id, location, position, card_state, card_abilities, "
+            "card_type, card_attributes, card_attack_mod, card_defense_mod, "
+            "card_cost_mod, card_damage, permanent_buffs, temporary_buffs, "
+            "card_uses, original_template_guid) VALUES "
+            "(?,?,?,?,?,?,0,0,(SELECT abilities_json FROM card_templates WHERE guid=?),"
+            "'Troop',0,0,0,0,0,'{}','{}','{}',?)",
+            (session_id, owner, uid, tpl, tpl, loc, tpl, tpl))
+        live.commit()
+    put(0x101, ptero, "hand")
+    pushed = []
+
+    class Game:
+        card_defs = {}
+        def push_card_updated(self, scid, owner, collection, ctype, **kw):
+            pushed.append((int(scid.uid.uid64), kw.get("cost")))
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler.user_profile = {"id": 5}
+    handler._card_full_data = lambda game, scid, tpl, instance_id=None: (
+        tpl, "Troop", "Pterobot", 7, 3, 5, 0)
+    session = type("S", (), {"session_id": session_id})()
+    pl_t, _ai_t = _pl_ai()
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [], pushed                    # printed cost, nothing new
+    put(0x201, bot, "warzone")
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [(0x101, 6)], pushed
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [(0x101, 6)], pushed          # unchanged: not re-sent
+    live.execute("DELETE FROM game_cards WHERE session_id=? AND card_uid=?",
+                 (session_id, 0x201))
+    live.commit()
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed[-1] == (0x101, 7), pushed
+    live.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+    live.commit()
 
 
 def _main():
@@ -2688,6 +2751,7 @@ def _main():
              test_dictionary_with_struct_keys_decodes,
              test_two_troop_exhaust_activation_keeps_both_troops,
              test_pterobot_costs_less_for_each_dwarf_and_robot_you_control,
+             test_hand_card_shows_its_current_cost,
              test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,

@@ -9366,6 +9366,51 @@ class HCPHandler(ProfileStreamMixin):
             game.push_card_updated(scid, owner, game_engine.ECardCollections.Warzone, ct,
                                    template_id=tpl_guid, attributes=attrs,
                                    state=int(cstate or 0), related_cards=related)
+        self._push_hand_cost_updates(game, session, pl_t, bstate)
+
+    def _push_hand_cost_updates(self, game, session, pl_t, bstate):
+        """Show the current effective cost of the player's hand cards.
+
+        Static cost changes that depend on the board (Pterobot: "cost -1 for
+        each Dwarf and/or Robot you control") were charged correctly but the
+        card in hand kept showing its printed cost.  Push a hand card whenever
+        its effective cost differs from the cost the client last saw.
+        """
+        if not self.user_profile:
+            return
+        from pvp_db import db_hand_cards_with_templates
+        from rules_port.static_rules import effective_cost
+        sent = getattr(self, "_hand_cost_sent", None)
+        if sent is None or sent.get("_session") != session.session_id:
+            sent = self._hand_cost_sent = {"_session": session.session_id}
+        rows = db_hand_cards_with_templates(
+            session.session_id, self.user_profile["id"])
+        in_hand = set()
+        for card_uid, base_cost, ct, _thresh, _abilities in rows:
+            card_uid = int(card_uid)
+            in_hand.add(card_uid)
+            try:
+                cost = int(effective_cost(_db, session.session_id, bstate,
+                                          card_uid))
+            except Exception:
+                continue
+            if cost == sent.get(card_uid, int(base_cost or 0)):
+                continue
+            basic = db_card_basic(session.session_id, card_uid)
+            if not basic or not basic[0]:
+                continue
+            tpl_guid = basic[0]
+            scid = game_engine.SessionCardId(game_engine.UID(card_uid))
+            _tpl, ctype, _n, _c, attack, defense, gems = self._card_full_data(
+                game, scid, tpl_guid)
+            game.push_card_updated(
+                scid, pl_t, game_engine.ECardCollections.Hand, ctype,
+                template_id=tpl_guid, cost=cost, attack=attack,
+                defense=defense, gems=gems)
+            sent[card_uid] = cost
+        for card_uid in [uid for uid in sent if uid != "_session"
+                         and uid not in in_hand]:
+            sent.pop(card_uid, None)
 
     def _apply_rules_port_prep(self, session, projection_game, bstate):
         """Project the native Prep lifecycle for the active controller."""
