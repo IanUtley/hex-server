@@ -97,6 +97,7 @@ def _normalize_activation_data(value):
         "muid64": "uid64",
         "msessioncardids": "session_card_ids",
         "cardstosacrifice": "cards_to_sacrifice",
+        "cardstoexhaust": "cards_to_exhaust",
         "mplayerids": "player_ids",
         "resourcexcost": "resource_x_cost",
         "chargepointsxcost": "charge_points_x_cost",
@@ -127,8 +128,13 @@ def _normalize_activation_data(value):
     }
     result = {}
     for key, item in value.items():
-        norm = aliases.get(str(key).replace("_", "").lower(), key)
-        result[norm] = _normalize_activation_data(item)
+        compact = str(key).replace("_", "").lower()
+        # C# private members keep their ``m_`` prefix on the wire
+        # (``m_CardsToExhaust``, ``m_ResourceXCost``).
+        norm = aliases.get(compact)
+        if norm is None and str(key).startswith("m_"):
+            norm = aliases.get(str(key)[2:].replace("_", "").lower())
+        result[norm or key] = _normalize_activation_data(item)
     if "x_cost" not in result and isinstance(result.get("x_cost_data"), Mapping):
         nested = result["x_cost_data"]
         for key in ("resource_x_cost", "x_cost", "value", "amount"):
@@ -170,6 +176,20 @@ def _normalize_activation_data(value):
     sacrifice = result.get("cards_to_sacrifice")
     if sacrifice is None and isinstance(result.get("x_cost_data"), Mapping):
         sacrifice = result["x_cost_data"].get("cards_to_sacrifice")
+    # Exhaust costs ("Exhaust one or more Dwarves and/or Robots you control")
+    # arrive as XCostData.CardsToExhaust, a Dictionary keyed by the cost's
+    # target template with a list of the exhausted cards.  Without it the
+    # raw fallback kept a single card, so exhausting two troops exhausted
+    # one and added one construction counter.
+    if sacrifice is None:
+        exhaust = result.get("cards_to_exhaust")
+        if exhaust is None and isinstance(result.get("x_cost_data"), Mapping):
+            exhaust = result["x_cost_data"].get("cards_to_exhaust")
+        if isinstance(exhaust, Mapping):
+            exhaust = [card for selected in exhaust.values()
+                       for card in (selected if isinstance(
+                           selected, (list, tuple)) else (selected,))]
+        sacrifice = exhaust
     if sacrifice is not None and "cost_target_map" not in result:
         if not isinstance(sacrifice, (list, tuple, set)):
             sacrifice = (sacrifice,)
