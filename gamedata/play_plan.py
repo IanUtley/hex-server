@@ -390,7 +390,7 @@ class AbilityInstance:
                 errors.append(f"option group {index} has invalid selection {selected}")
         for index, selected in self.activation.cost_target_map.items():
             if (self.graph is None or index < 0 or
-                    index >= len(self.costs.target_costs)):
+                    index >= len(self.graph.additional_cost_targets or ())):
                 errors.append(f"unknown additional-cost index {index}")
                 continue
             spec = self._cost_target_spec(index)
@@ -436,6 +436,7 @@ class CardPlayCost:
     variable_minimum: int
     life: int
     threshold: Any
+    variable_multiplier: int = 1
     additional_cost_targets: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
@@ -478,7 +479,11 @@ class PlayPlan:
             for graph in graphs)
         cost = CardPlayCost(
             resource=_int(_field(card, "m_ResourceCost")),
-            variable=bool(_int(_field(card, "m_VariableCost"))),
+            variable=bool(_int(_field(card, "m_VariableCost")) or
+                          _int(_field(card, "m_VariableCostDouble"))),
+            variable_multiplier=(
+                2 if _int(_field(card, "m_VariableCostDouble")) else
+                1 if _int(_field(card, "m_VariableCost")) else 0),
             variable_minimum=_int(_field(card, "m_VariableCostMinimum")),
             life=_int(_field(card, "m_LifeCost")),
             threshold=_field(card, "m_Threshold"),
@@ -670,9 +675,10 @@ class PlayPlan:
         errors: list[str] = []
         chosen_cost = self.cost.resource
         if self.cost.variable:
-            chosen_cost = variable_cost if variable_cost is not None else (
-                self.cost.variable_minimum)
-            if chosen_cost < self.cost.variable_minimum:
+            chosen_x = (variable_cost if variable_cost is not None else
+                        self.cost.variable_minimum)
+            chosen_cost += chosen_x * self.cost.variable_multiplier
+            if chosen_x < self.cost.variable_minimum:
                 errors.append("variable card cost is below its minimum")
         if not free and resources_available is not None and resources_available < chosen_cost:
             errors.append(f"card costs {chosen_cost} resources; only {resources_available} available")

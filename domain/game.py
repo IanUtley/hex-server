@@ -1066,6 +1066,12 @@ class Game:
                     and _uid64(player_value) == _uid64(
                         getattr(event, "_hand_reveal_viewer_uid")))
         }
+        chain_revealed_uids = {
+            int(event.session_card_id.uid.uid64)
+            for event in self.events
+            if (isinstance(event, CardUpdatedSessionEventArgs)
+                and getattr(event, "_chain_reveal", False))
+        }
         for event in self.events:
             reveal_viewer = getattr(event, "_hand_reveal_viewer_uid", None)
             if (reveal_viewer is not None and
@@ -1084,6 +1090,17 @@ class Game:
                 filtered = copy.copy(event)
                 filtered.ser = Serializer()
                 filtered.nulling = True
+            if (isinstance(event, CardUpdatedSessionEventArgs) and
+                    event.collection in (ECardCollections.Hand,
+                                         ECardCollections.Deck,
+                                         ECardCollections.Choosing) and
+                    event.nulling and
+                    int(event.session_card_id.uid.uid64) in chain_revealed_uids):
+                # A hidden-zone trigger is publicly identified by its chain
+                # ability. Do not let the ordinary hidden-zone refresh that
+                # follows it immediately face the same source card down again
+                # before UIBattle can render the chain copy.
+                continue
             if (isinstance(event, CardUpdatedSessionEventArgs) and
                     event.collection == ECardCollections.Hand and
                     int(player_value or 0) != int(getattr(

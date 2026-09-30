@@ -80,6 +80,58 @@ def consume_one_shot_trigger(handler, session, game, db, player_uid, ai_uid,
     return True
 
 
+def _claim_trigger_uses(db, session, battle_state, graph, source_uid) -> bool:
+    """Claim authored per-game/per-turn trigger uses before queueing it.
+
+    Triggered abilities bypass manual activation validation, so without this
+    claim a ``UsesPerTurn`` trigger can be queued again by events raised while
+    its first copy resolves. Persist the claim on the card instance just as a
+    manual card ability does.
+    """
+    costs = getattr(graph, "costs", None)
+    game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
+    turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
+    if game_limit <= 0 and turn_limit <= 0:
+        return True
+
+    from pvp_db import (db_card_ability_use_counts, db_card_basic,
+                        db_record_card_ability_use)
+    guid = str(getattr(graph, "guid", "") or "").lower()
+    turn_number = int((battle_state or {}).get("turn_number", 1) or 1)
+    source_uid = int(source_uid)
+    if db_card_basic(session.session_id, source_uid, conn=db):
+        game_uses, turn_uses = db_card_ability_use_counts(
+            session.session_id, source_uid, guid, turn_number, conn=db)
+        if ((game_limit > 0 and game_uses >= game_limit) or
+                (turn_limit > 0 and turn_uses >= turn_limit)):
+            return False
+        db_record_card_ability_use(
+            session.session_id, source_uid, guid, turn_number, conn=db,
+            uses_per_game=game_limit > 0,
+            uses_per_turn=turn_limit > 0)
+        db.commit()
+        return True
+
+    # Synthetic champions have no game_cards row. Keep their trigger budget
+    # in the shared checkpoint so it survives the next event/chain transition.
+    key = f"{source_uid}:{guid}"
+    uses = (battle_state or {}).setdefault("trigger_ability_uses", {})
+    entry = dict(uses.get(key) or {})
+    game_uses = int(entry.get("game_uses", 0) or 0)
+    entry_turn = int(entry.get("turn_number", -1) or -1)
+    turn_uses = (int(entry.get("turn_uses", 0) or 0)
+                 if entry_turn == turn_number else 0)
+    if ((game_limit > 0 and game_uses >= game_limit) or
+            (turn_limit > 0 and turn_uses >= turn_limit)):
+        return False
+    uses[key] = {
+        "game_uses": game_uses + (1 if game_limit > 0 else 0),
+        "turn_number": turn_number,
+        "turn_uses": turn_uses + (1 if turn_limit > 0 else 0),
+    }
+    return True
+
+
 class RecordsTriggerBackend:
     """Execute Records trigger metadata behind the RulesPort boundary."""
 
@@ -273,8 +325,7 @@ class NativeTriggerBackend:
             # re-published Corinth as an empty warzone card.  Champions are
             # already represented through PlayerUpdated.ChampionId, so never
             # project them as a collection card.
-            if not location or str(location).lower() in {
-                    "hand", "deck", "void", "choosing", "champion"}:
+            if not location or str(location).lower() == "champion":
                 return
             try:
                 import game_engine
@@ -303,7 +354,15 @@ class NativeTriggerBackend:
                     if prior.__class__.__name__ != "CardUpdatedSessionEventArgs":
                         break
                     if int(getattr(prior, "collection", -1)) == int(collection):
-                        return
+                        # A hidden hand/deck projection is deliberately sent
+                        # first.  A trigger sourced from that card is a
+                        # public chain object, however, so its complete card
+                        # representation must follow the face-down refresh.
+                        # Visible updates are already authoritative and do not
+                        # need another copy.
+                        if not getattr(prior, "nulling", False):
+                            return
+                        break
                     break
                 tpl, ctype, _name, cost, attack, defense, gems = \
                     handler._card_full_data(game, scid, template_guid)
@@ -314,6 +373,11 @@ class NativeTriggerBackend:
                     defense=defense, gems=gems,
                     state=int(db_card_state_value(
                         session.session_id, int(uid), conn=db) or 0))
+                if str(location).lower() in {"hand", "deck", "choosing"}:
+                    # Game.make_network_packet uses this marker to retain the
+                    # public chain reveal when the normal hidden-hand/deck
+                    # projection is appended later in the same packet.
+                    game.events[-1]._chain_reveal = True
             except Exception:
                 pass
 
@@ -393,6 +457,13 @@ class NativeTriggerBackend:
                 if (str(graph.trigger_event_type or "").rsplit(".", 1)[-1]
                         != event_name and not static_grant and
                         not continuous_card_aura):
+                    continue
+                # Card.CanTrigger: an opposing champion's
+                # OpposingDeathcriesCantTrigger blocks this card's Deathcry.
+                if (event_name == "CardEnteredZoneEvent" and
+                        _ability_has_deathcry(graph) and
+                        _opponents_block_deathcries(
+                            battle_state, source_owner)):
                     continue
                 trigger_location = (
                     "warzone" if str(location or "").lower() == "mod"
@@ -492,15 +563,21 @@ class NativeTriggerBackend:
                         source_uid, both_players=True,
                         champions=(getattr(handler, "_champion_targets", lambda: [])() or []),
                         battle_state=battle_state)
-                    if source_card_owner != 0 and hasattr(handler, "_prompt_trigger_targets"):
-                        handler._prompt_trigger_targets(
-                            game, player_uid, ai_uid, session, battle_state,
-                            source_uid, key[1],
-                            tuple(graph.targets[index].guid for index in explicit),
-                            candidates, owner_id=source_card_owner,
-                            trigger_target_uid=event.target_card_id)
-                        logs.append(f"{event_name} {key[1][:8]} -> awaiting target")
-                        continue
+                    if source_card_owner != 0:
+                        prompt = (getattr(handler, "_prompt_optional_trigger", None)
+                                  if graph.optional else
+                                  getattr(handler, "_prompt_trigger_targets", None))
+                        if callable(prompt):
+                            prompt(
+                                game, player_uid, ai_uid, session, battle_state,
+                                source_uid, key[1],
+                                tuple(graph.targets[index].guid for index in explicit),
+                                candidates, owner_id=source_card_owner,
+                                trigger_target_uid=event.target_card_id)
+                            logs.append(
+                                f"{event_name} {key[1][:8]} -> awaiting "
+                                f"{'optional choice' if graph.optional else 'target'}")
+                            continue
                     target = candidates[0] if candidates else None
                     if target is None:
                         continue
@@ -509,6 +586,18 @@ class NativeTriggerBackend:
                     target = ai_trigger_target(
                         db, session, key[1], source_uid, source_card_owner,
                         battle_state, getattr(handler, "_champion_targets", lambda: [])() or [])
+                elif (graph.optional and source_card_owner != 0 and
+                      callable(getattr(handler, "_prompt_optional_trigger", None))):
+                    handler._prompt_optional_trigger(
+                        game, player_uid, ai_uid, session, battle_state,
+                        source_uid, key[1], (), [], owner_id=source_card_owner,
+                        trigger_target_uid=event.target_card_id)
+                    logs.append(f"{event_name} {key[1][:8]} -> awaiting optional choice")
+                    continue
+
+                if not _claim_trigger_uses(
+                        db, session, battle_state, graph, source_uid):
+                    continue
 
                 instance_id = int(battle_state.get("_next_instance_id", 1))
                 battle_state["_next_instance_id"] = instance_id + 1
@@ -753,6 +842,39 @@ def dispatch_card_activated(*, db, handler, game, session, player_uid, ai_uid,
                 battle_state.pop(key, None)
             else:
                 battle_state[key] = value
+
+
+def _ability_has_deathcry(graph):
+    """Whether one authored ability carries the Deathcry TAC keyword."""
+    try:
+        from .tac import _tac_attr_hash, decode_tac
+        data = str(getattr(graph, "serialized_tac", "") or "")
+        return bool(data and _tac_attr_hash("Deathcry") in decode_tac(data))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def opponents_have_int_attr(battle_state, owner, attribute) -> bool:
+    """Session.CheckOpponentsForIntAttr for one named champion IntAttr."""
+    from .static_rules import _champion_int_attrs
+    wanted = str(attribute or "").lower()
+    for participant in (battle_state.get("champ_map") or {}):
+        try:
+            opponent = int(participant)
+        except (TypeError, ValueError):
+            continue
+        if opponent == int(owner or 0):
+            continue
+        for name, value in _champion_int_attrs(battle_state, opponent).items():
+            if str(name).lower() == wanted and int(value or 0) > 0:
+                return True
+    return False
+
+
+def _opponents_block_deathcries(battle_state, owner):
+    """Session.CheckOpponentsForIntAttr(OpposingDeathcriesCantTrigger)."""
+    return opponents_have_int_attr(
+        battle_state, owner, "OpposingDeathcriesCantTrigger")
 
 
 def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,

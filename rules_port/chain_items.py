@@ -32,6 +32,10 @@ source_uid, owner_id, **event_data) -> None``
     Optional permanent bookkeeping (arrival stamp / resolve counter).
 ``chain_push_empty(port, state, item, pending) -> bool``
     Whether this item's completion empties the client chain.
+``chain_state_based(session, state, game, player_uid, ai_uid) -> bool``
+    Apply state-based actions before this item can return priority.  The hook
+    receives the same packet buffer as the item so lethal cleanup and any
+    resulting Deathcry events are published in order.
 ``chain_finalize(session, state, game, item, pending, player_uid, ai_uid)``
     Optional in-packet priority projection before the buffer is sent.
 ``chain_after_item(session, state, game, item, player_uid, ai_uid)``
@@ -68,6 +72,36 @@ def pending_input(state) -> bool:
     return any(state.get(key) for key in PENDING_INPUT_KEYS)
 
 
+def _move_prompt_events_last(game, pending):
+    """Leave a triggered-ability picker as the final UI transition.
+
+    Trigger prompts are discovered while the current chain item is applying
+    an effect.  The prompt events are therefore initially appended before the
+    item's resolved/removed events.  Unity processes one packet in order; if
+    the prompt comes first, the later chain events immediately pop the dialog
+    again.  Keep the authoritative gameplay events in their existing order,
+    but send the interactive prompt after them so it owns the client's UI.
+    """
+    if not pending:
+        return
+    prompt_names = {
+        "PlayerOptionListSessionEventArgs",
+        "TriggeredAbilityActivationDataRequiredSessionEventArgs",
+        "AbilityActivationDataRequiredSessionEventArgs",
+        "GreenLightSessionEventArgs",
+    }
+    prompt_events = [
+        event for event in game.events
+        if event.__class__.__name__ in prompt_names
+    ]
+    if not prompt_events:
+        return
+    game.events = [
+        event for event in game.events
+        if event.__class__.__name__ not in prompt_names
+    ] + prompt_events
+
+
 def _hook(host, name):
     hook = getattr(host, name, None)
     return hook if callable(hook) else None
@@ -87,9 +121,27 @@ def dispatch(host, session, game, state, player_uid, ai_uid, event_type,
     if hook is not None:
         return hook(session, game, state, player_uid, ai_uid, event_type,
                     source_uid, owner_id, **event_data)
-    return host._dispatch_game_trigger(
-        game, session, player_uid, ai_uid, state, event_type, source_uid,
-        owner_id, **event_data)
+    legacy = _hook(host, "_dispatch_game_trigger")
+    if legacy is not None:
+        return legacy(
+            game, session, player_uid, ai_uid, state, event_type, source_uid,
+            owner_id, **event_data)
+    # Small AI/test hosts do not need to duplicate HCPHandler's private
+    # forwarding method.  Keep this shared boundary usable for them by
+    # dispatching directly through the native trigger backend instead of
+    # requiring an otherwise unrelated host adapter method.
+    from .triggers import dispatch_native_trigger
+    connection = getattr(host, "_db", None)
+    if connection is None:
+        import db as db_layer
+        connection = db_layer._db
+    target_card_id = event_data.pop("target_card_id", None)
+    return dispatch_native_trigger(
+        db=connection, handler=host, game=game, session=session,
+        player_uid=player_uid, ai_uid=ai_uid, battle_state=state,
+        event_type=event_type, source_card_id=source_uid,
+        source_player_id=owner_id, target_card_id=target_card_id,
+        data=event_data)
 
 
 def dispatch_card_cast(host, session, game, state, player_uid, ai_uid,
@@ -110,6 +162,71 @@ def dispatch_card_cast(host, session, game, state, player_uid, ai_uid,
             target_card_id=int(card_uid))
     finally:
         state.pop("card_cast_copy_target", None)
+    # HandleGameRulesTriggers: after the authored listeners, a resource cast
+    # activates the built-in Momentum ability on the caster's warzone troops.
+    return _activate_momentum(host, session, game, state, player_uid, ai_uid,
+                              card_uid, owner_id)
+
+
+def _activate_momentum(host, session, game, state, player_uid, ai_uid,
+                       card_uid, owner_id):
+    """Session.HandleGameRulesTriggers' Momentum pass for one cast."""
+    import json
+
+    import game_engine
+    from pvp_db import (db_card_mutation_field, db_card_source_info,
+                        db_set_card_mutation_field,
+                        db_warzone_blocker_uids)
+    from .effect_lifetimes import record_temporary_stat
+    from .runtime_helpers import owner_uid
+    from .static_rules import card_has_int_attr
+
+    session_id = session.session_id
+    import db as db_layer
+    conn = getattr(db_layer, "_db", None)
+    info = db_card_source_info(session_id, int(card_uid), conn=conn)
+    if not info or "Resource" not in str(info[1] or ""):
+        return []
+    granted = []
+    for (uid,) in db_warzone_blocker_uids(
+            session_id, int(owner_id or 0), 0, conn=conn):
+        uid = int(uid)
+        if not card_has_int_attr(conn, session_id, uid, "Momentum"):
+            continue
+        try:
+            buffs = json.loads(db_card_mutation_field(
+                session_id, uid, "permanent_buffs", conn=conn) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            buffs = {}
+        if not isinstance(buffs, dict):
+            buffs = {}
+        buffs["atk"] = int(buffs.get("atk", 0) or 0) + 1
+        buffs["def"] = int(buffs.get("def", 0) or 0) + 1
+        db_set_card_mutation_field(
+            session_id, uid, "permanent_buffs",
+            json.dumps(buffs, separators=(",", ":"), sort_keys=True),
+            conn=conn)
+        record_temporary_stat(
+            state, uid, 1, 1, duration="BeginningOfOwnersTurn",
+            owner_id=owner_id, source_uid=card_uid)
+        granted.append(uid)
+    if not granted:
+        return []
+    conn.commit()
+    row_owner = int(info[3] or 0)
+    for uid in granted:
+        scid = game_engine.SessionCardId(game_engine.UID(uid))
+        row = db_card_source_info(session_id, uid, conn=conn)
+        if not row:
+            continue
+        _tpl, card_type, _name, cost, attack, defense, gems = \
+            host._card_full_data(game, scid, row[0])
+        game.push_card_updated(
+            scid, owner_uid(row_owner, player_uid, ai_uid, state),
+            game_engine.ECardCollections.Warzone, card_type,
+            template_id=row[0], cost=cost, attack=attack, defense=defense,
+            gems=gems)
+    return granted
 
 
 def dispatch_card_zone_transition(host, session, game, state, player_uid,
@@ -191,6 +308,13 @@ def resolve_chain_item(host, port, session, db, ability, player_uid, ai_uid):
         host.chain_save(session, state)
         host.chain_send(session, game, player_uid, ai_uid)
         return AbilityResolutionState.WAITING_FOR_INPUT
+    # C# performs state-based actions after a resolution and before the next
+    # player can receive priority.  Keep this before chain removal/finalization
+    # so a lethal troop cannot survive the priority packet, and so a Deathcry
+    # can add a real native chain item before ChainEmpty is projected.
+    state_based = _hook(host, "chain_state_based")
+    if state_based is not None:
+        state_based(session, state, game, player_uid, ai_uid)
     pending = pending_input(state)
     if not bool(getattr(ability, "ignores_chain", False)):
         # Ability resolution itself removes the native chain item, but the
@@ -207,6 +331,7 @@ def resolve_chain_item(host, port, session, db, ability, player_uid, ai_uid):
             # Nerissa's two troop summons followed by the champion ability).
             # Only tell Unity the chain is empty for the final native item.
             game.push_chain_empty()
+    _move_prompt_events_last(game, pending)
     finalize = _hook(host, "chain_finalize")
     if finalize is not None:
         finalize(session, state, game, descriptor, pending,
@@ -242,10 +367,14 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
     if kind == "troop":
         if loc != "CastSpells":
             return
+        entering_state = game_engine.ECardStates.CameOutThisTurn
+        from .static_rules import opposing_enters_play_exhausted
+        if opposing_enters_play_exhausted(state, owner_id, row[0]):
+            entering_state |= game_engine.ECardStates.Tapped
         db_set_card_location(
             session.session_id, source_uid, "warzone",
             extra_set="position=?, card_state=(card_state | ?)",
-            extra_params=[0, game_engine.ECardStates.CameOutThisTurn],
+            extra_params=[0, entering_state],
             conn=db)
         mark_entry = _hook(host, "chain_mark_warzone_entry")
         if mark_entry is not None:
@@ -274,7 +403,7 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
             event_destination_collection="warzone")
         return
 
-    if loc != "CastSpells":
+    if loc != "CastSpells" and not bom_completed:
         return
     if not bom_completed:
         game.push_spell_card_played(scid, owner_sid)
@@ -294,14 +423,17 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
         resolve_port_played_spell(
             game, session, db, host, player_uid, ai_uid, state,
             item.get("ability_guids", ()),
-            activations=item.get("activations"))
+            activations=item.get("activations"),
+            played_from_hand=bool(item.get("played_from_hand")))
         if state.get("resolution_paused"):
             return
     state.pop("player_spell_target", None)
     state.pop("resolving_source_uid", None)
     state.pop("resolving_owner_id", None)
     state.pop("x_cost", None)
-    if db_card_location(session.session_id, source_uid, conn=db) != "deck":
+    current_location = str(db_card_location(
+        session.session_id, source_uid, conn=db) or "").lower()
+    if current_location == "castspells":
         db_card_discard_spell(session.session_id, source_uid, conn=db)
         dispatch(
             host,
@@ -316,6 +448,7 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
         game.push_card_updated(
             scid, owner_sid, game_engine.ECardCollections.Discard,
             game_engine.card_type_from_db(row[1]), template_id=row[0])
+    state.pop("_spell_played_from_hand", None)
 
 
 def resolve_trigger_item(host, session, db, game, state, item, player_uid,

@@ -2140,8 +2140,11 @@ def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
     if not candidates:
         return "transform random: no candidates"
     new_tpl = random.choice(candidates)
+    # The client transforms the same card in its current collection. This is
+    # observable for effects that first move the target to hand, such as
+    # Morphology: the random action must remain in hand after the transform.
     transform_card(handler, game, session, pl_t, ai_t, int(target), new_tpl,
-                   bstate=bstate)
+                   keep_zone=True, bstate=bstate)
     return f"transformed {hex(int(target))} -> random {new_tpl[:8]}"
 
 @effect("TransformCardAtRandomAbilityEffectTemplate")
@@ -2704,7 +2707,10 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                                             threshold_flags.append((flag, amount))
                         if not charge_grant:
                             charge_grant = 1
-                        bstate[charge_key] = int(bstate.get(charge_key, 0)) + charge_grant
+                        old_charge = int(bstate.get(charge_key, 0) or 0)
+                        bstate[charge_key] = old_charge + charge_grant
+                        charge_delta = max(
+                            0, int(bstate[charge_key]) - old_charge)
                         threshold = bstate.setdefault(threshold_key, {})
                         scid = game_engine.SessionCardId(game_engine.UID(selected_uid))
                         card_owner = owner_uid(owner_id, pl_t, ai_t, bstate)
@@ -2757,16 +2763,17 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                             game.player_threshold = dict(threshold)
                         else:
                             game.ai_threshold = dict(threshold)
-                        ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
-                        ev_chg.player_id = card_owner
-                        ev_chg.operation = 1
-                        ev_chg.delta = 1
-                        ev_chg.new_value = bstate[charge_key]
-                        game._push(ev_chg)
-                        from .triggers import resolve_gain_charge_triggers
-                        resolve_gain_charge_triggers(
-                            db, handler, game, session, pl_t, ai_t, bstate,
-                            owner_id)
+                        if charge_delta:
+                            ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
+                            ev_chg.player_id = card_owner
+                            ev_chg.operation = 1
+                            ev_chg.delta = charge_delta
+                            ev_chg.new_value = bstate[charge_key]
+                            game._push(ev_chg)
+                            from .triggers import resolve_gain_charge_triggers
+                            resolve_gain_charge_triggers(
+                                db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id, amount=charge_delta)
                         from .resources import (
                             resolve_granted_resource_abilities)
                         resource_logs = resolve_granted_resource_abilities(

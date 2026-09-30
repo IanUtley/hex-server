@@ -13,6 +13,19 @@ import db as _db_layer
 
 RECKONING_FLAG_ARENA_TIER1_PERFECT = "ARENA_TIER1_PERFECT"
 
+WELCOME_MAIL_SUBJECT = "Welcome to Hex"
+WELCOME_MAIL_BODY = (
+    "Welcome to Hex!\n\n"
+    "These public chat commands are available without the developer console:\n"
+    "!help — show this command list\n"
+    "!version — show the server version\n"
+    "!arena-cleanup — clear your Frost Ring Arena run\n"
+    "!account-cleanup — reset your account while keeping PvE and alt-art cards\n"
+    "!issue <title> — open a GitHub issue prefilled with diagnostics\n\n"
+    "Type a command in any chat room. The other developer commands remain\n"
+    "restricted to accounts with the developer-console permission."
+)
+
 def _profile_connection(conn=None):
     return conn if conn is not None else _db_layer._db
 
@@ -107,6 +120,8 @@ def db_get_or_create_user(name, steam_id=None, conn=None):
         new_player.grant_new_player(connection, uid)
     except Exception as exc:
         _db_layer.log(f"    WARN: new-player grant failed: {exc}")
+    db_send_email(uid, WELCOME_MAIL_SUBJECT, WELCOME_MAIL_BODY,
+                  sender="SYSTEM", conn=connection)
     if conn is None:
         connection.commit()
     return {"id": uid, "name": name, "gold": new_player.STARTING_GOLD,
@@ -115,7 +130,14 @@ def db_get_or_create_user(name, steam_id=None, conn=None):
 
 
 def db_reset_account(user_id, conn=None):
-    """Reset mutable account/game state and apply fresh-player grants."""
+    """Reset mutable account/game state and apply fresh-player grants.
+
+    The physical collection is only partially cleared: PvE printings and
+    extended-art (alternate art) PvP copies are permanent account rewards, so
+    the reset removes just the plain PvP copies.  The matching ``collections``
+    counts are decremented by the removed instance count so the deck-building
+    view stays consistent with the client's card-instance list.
+    """
     import new_player
     connection = _profile_connection(conn)
     uid = int(user_id)
@@ -125,8 +147,32 @@ def db_reset_account(user_id, conn=None):
         (str(uid), f"%{uid}%", uid, uid))
     connection.execute(
         "DELETE FROM game_cards WHERE user_id=? OR owner_user_id=?", (uid, uid))
-    for table in ("arena_state", "campaigns", "card_instances", "champions",
-                  "collections", "decks", "emails", "fra_challengers",
+    # Plain PvP copies are removed; PvE and extended-art instances survive.
+    # The EXISTS join keeps cards whose template row is missing.
+    removed = connection.execute(
+        "SELECT ci.template_guid, COUNT(*) FROM card_instances ci "
+        "WHERE ci.user_id=? AND COALESCE(ci.is_extended_art, 0)=0 "
+        "AND EXISTS (SELECT 1 FROM card_templates ct "
+        "            WHERE ct.guid=ci.template_guid AND ct.is_pve=0) "
+        "GROUP BY ci.template_guid", (uid,)).fetchall()
+    connection.execute(
+        "DELETE FROM card_instances WHERE user_id=? "
+        "AND COALESCE(is_extended_art, 0)=0 "
+        "AND EXISTS (SELECT 1 FROM card_templates ct "
+        "            WHERE ct.guid=card_instances.template_guid "
+        "            AND ct.is_pve=0)", (uid,))
+    for template_guid, removed_count in removed:
+        connection.execute(
+            "UPDATE collections SET quantity=MAX(quantity-?, 0) "
+            "WHERE user_id=? AND card_template_id=?",
+            (int(removed_count), uid, template_guid))
+    connection.execute(
+        "DELETE FROM collections WHERE user_id=? AND quantity<=0 "
+        "AND EXISTS (SELECT 1 FROM card_templates ct "
+        "            WHERE ct.guid=collections.card_template_id "
+        "            AND ct.is_pve=0)", (uid,))
+    for table in ("arena_state", "campaigns", "champions",
+                  "decks", "emails", "fra_challengers",
                   "reckoning_flags",
                   "friend_requests", "friends", "ignored_players",
                   "player_inventory", "stardust", "store_purchases",

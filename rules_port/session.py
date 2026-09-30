@@ -15,6 +15,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Callable, Deque, Dict, Mapping, Optional
 
 import game_engine
@@ -260,8 +261,17 @@ class RulesTransaction:
     @classmethod
     def resolve_triggered_continuation(cls, player_id, activation_data) -> "RulesTransaction":
         """Resume a metadata trigger target without a transient ability id."""
+        if isinstance(activation_data, Mapping):
+            normalized = dict(activation_data)
+        elif isinstance(activation_data, (list, tuple)):
+            # AbilityActivationData can be serialized as a one-element
+            # collection for triggered abilities. Preserve that shape so an
+            # optional opt-in is not discarded before the host sees it.
+            normalized = tuple(activation_data)
+        else:
+            normalized = {}
         return cls(player_id, "resolve_triggered_continuation", None,
-                   payload={"activation_data": dict(activation_data or {})})
+                   payload={"activation_data": normalized})
 
     @classmethod
     def resolve_discard_continuation(cls, player_id, activation_data) -> "RulesTransaction":
@@ -709,6 +719,7 @@ class AuthoritativeSession:
         self._transaction_handlers: Dict[str, Callable[[RulesTransaction], bool]] = {}
         self._trigger_handler: Optional[Callable[[object], None]] = None
         self._state_based_handler: Optional[Callable[[], bool]] = None
+        self._state_based_lock = RLock()
         # C# Session.cardsReadyToPlay: cards a host/effect chose to play
         # without an ordinary client transaction, finalized on the next tick.
         self._cards_ready_to_play: list[dict[str, Any]] = []
@@ -925,6 +936,20 @@ class AuthoritativeSession:
 
     def set_state_based_handler(self, handler: Callable[[], bool]) -> None:
         self._state_based_handler = handler
+
+    def run_state_based_checks(self) -> bool:
+        """Run state-based actions at a priority handoff.
+
+        The callback is host-owned because lethal cleanup needs the live
+        SQLite card state and packet projection.  The session owns the
+        boundary and serialization so a re-entrant projection cannot run the
+        same check concurrently while a Deathcry is adding chain work.
+        """
+        handler = self._state_based_handler
+        if handler is None:
+            return False
+        with self._state_based_lock:
+            return bool(handler())
 
     def set_ability_resolver(self, resolver: Callable[[object], AbilityResolutionState]) -> None:
         self._ability_resolver = resolver
@@ -2019,6 +2044,14 @@ class AuthoritativeSession:
         state = self._ability_resolver(ability)
         if state is AbilityResolutionState.COMPLETED:
             popped = self.chain.pop_ability(ability_instance_id)
+            if popped is None:
+                # The resolver discovered and queued a new chain item before
+                # it returned (a troop's Deploy trigger, for example), so the
+                # resolved id is no longer the chain top.  C# defers that push
+                # behind the resolve action and still pops the top; here the
+                # push already happened, so detach the resolved id by identity
+                # or it stays as a ghost that blocks the chain forever.
+                popped = self.chain.detach_ability(ability_instance_id)
             # ``Session.RemoveFromTopOfChain`` removes the manager entry once
             # resolution is over, except for an ability with ongoing effects.
             if popped is not None and not getattr(popped, "has_ongoing_effects", False):
@@ -2151,6 +2184,14 @@ class AuthoritativeSession:
             new_state = self.phase_states.get(phase_name(next_phase))
             if new_state is not None:
                 new_state.on_entry(self)
+            # TurnPhaseState.on_entry materializes the priority action before
+            # the phase update is published.  State-based actions belong
+            # between those two operations, so a player never receives a
+            # priority packet containing an already-lethal troop.
+            top = self.action_stack.peek()
+            if (isinstance(top, PriorityWindowAction) and
+                    top.priority_player_id is not None):
+                self.run_state_based_checks()
             self.send_turn_phase_update()
             # Phase transitions are authoritative scheduler mutations too.
             # Save after the client-visible update so reconnect resumes here.
@@ -2476,12 +2517,38 @@ class AuthoritativeSession:
         """Perform one C#-ordered scheduler step; never await a UI callback."""
         if self.terminated or phase_name(self.current_turn_phase) == "NotPlaying":
             return False
-        if self._state_based_handler is not None and self._state_based_handler():
+        # A triggered-ability/deck/choice prompt is the native equivalent of
+        # WaitForTriggeredAbilitiesAction.  It must be allowed to consume the
+        # client's answer, but no automatic phase/AI work may run while the
+        # prompt owns the UI.  In particular, a pending trigger can be left
+        # after its source chain item completes, with no action on the stack;
+        # advancing that empty stack here made optional dialogs flash and then
+        # let the AI continue through combat in the same request.
+        from .chain_items import pending_input
+        state = getattr(getattr(self, "runtime_facts", None),
+                        "battle_state", None)
+        if not isinstance(state, dict):
+            game_session = getattr(self.snapshot_store, "game_session", None)
+            if game_session is not None:
+                from .persistence import load_state
+                state = load_state(game_session)
+        if isinstance(state, dict) and (
+                pending_input(state) or state.get("resolution_paused")):
+            if self.handle_transaction():
+                return True
+            return False
+        # Normally the phase/chain/pass boundaries invoke this directly.  The
+        # scheduler check is a reconnect/rehydration safety net for a live
+        # PriorityWindowAction that was restored without replaying its entry.
+        from .kernel import PriorityWindowAction
+        top = self.action_stack.peek()
+        if (isinstance(top, PriorityWindowAction) and
+                top.priority_player_id is not None and
+                self.run_state_based_checks()):
             return True
         # C# InternalTick2 drains the trigger queue and finishes queued plays
         # only when the phase permits chain resolution and no chain action owns
         # the top of the stack.
-        from .kernel import PriorityWindowAction
         if (self.chain_can_resolve() and
                 (self.action_stack.count == 0 or
                  isinstance(self.action_stack.peek(), PriorityWindowAction))):

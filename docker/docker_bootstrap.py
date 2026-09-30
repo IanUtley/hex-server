@@ -150,9 +150,9 @@ def _ensure_database_schema(connection: sqlite3.Connection) -> None:
     """Apply the current DDL and idempotent static seeds to *connection*."""
     # Keep Docker databases consistent with the runtime database connection.
     # WAL permits readers (including replay) to continue while HConnect or the
-    # tournament scheduler is writing, while the busy timeout lets short
-    # writer collisions resolve instead of failing.
-    connection.execute("PRAGMA busy_timeout=30000")
+    # tournament scheduler is writing, while the five-second busy timeout lets
+    # short writer collisions resolve instead of failing.
+    connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA journal_mode=WAL")
     import static
 
@@ -169,7 +169,7 @@ def create_database(path: Path) -> None:
     temporary = Path(temporary_name)
     connection = None
     try:
-        connection = sqlite3.connect(str(temporary), timeout=30.0)
+        connection = sqlite3.connect(str(temporary), timeout=5.0)
         _ensure_database_schema(connection)
         connection.close()
         connection = None
@@ -189,7 +189,7 @@ def upgrade_database(path: Path) -> None:
     changes game data brings the persistent database with it instead of
     requiring a fresh database.
     """
-    connection = sqlite3.connect(str(path), timeout=30.0)
+    connection = sqlite3.connect(str(path), timeout=5.0)
     try:
         _ensure_database_schema(connection)
     finally:
@@ -198,7 +198,7 @@ def upgrade_database(path: Path) -> None:
 
 def validate_static_data(path: Path) -> None:
     """Fail startup if fresh database reference data is missing or empty."""
-    connection = sqlite3.connect(str(path), timeout=30.0)
+    connection = sqlite3.connect(str(path), timeout=5.0)
     try:
         missing = []
         for table in REQUIRED_STATIC_TABLES:

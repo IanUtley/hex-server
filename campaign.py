@@ -6560,6 +6560,61 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     return result
 
 
+def prepare_fra_battle_gameend(handler, db, session, won):
+    """Persist and clean up a non-campaign FRA/PvE battle result.
+
+    The client leaves the battle as soon as it receives ``GameEnded`` and
+    immediately joins the Arena lobby again.  Callers that publish that event
+    themselves must therefore run this step first, otherwise the join can read
+    the previous ``challenger_index`` and show the same opponent again.
+
+    ``None`` means the session belongs to the separate campaign/tournament
+    path.  A dict means this was the FRA/PvE path, including a failed attempt
+    whose error is already logged and represented by ``handled=False``.
+    """
+    try:
+        session_name = session.session_name or ""
+        if (session_name.startswith("camp_") or
+                session_name.startswith("tourney-")):
+            return None
+        profile = getattr(handler, "user_profile", None)
+        if not profile:
+            return None
+        from pve_db import db_record_arena_fight
+        from pvp_db import db_delete_game_session
+        result = db_record_arena_fight(
+            profile["id"], won, return_details=True,
+            session_id=session.session_id)
+        db_delete_game_session(session.session_id)
+        return {"handled": True, "result": result}
+    except Exception as exc:
+        getattr(handler, "_log_req", print)(
+            f"    FRA result preparation failed: {exc}")
+        return {"handled": False, "result": None}
+
+
+def publish_fra_battle_gameend(handler, prepared, service_mail_uid):
+    """Publish deferred FRA flags and reward conversations after GameEnded."""
+    if not prepared or not prepared.get("handled"):
+        return False
+    result = prepared.get("result") or {}
+    reward_guid = result.get("reward_conversation_guid", "")
+    if result.get("tier_one_perfect_flag_awarded"):
+        try:
+            handler.push_reckoning_flags_updated()
+        except Exception as exc:
+            getattr(handler, "_log_req", print)(
+                "    Could not publish ARENA_TIER1_PERFECT: "
+                f"{exc}")
+    if result.get("recorded") and reward_guid:
+        try:
+            _push_fra_buff_conversation(handler, reward_guid, service_mail_uid)
+        except Exception as exc:
+            getattr(handler, "_log_req", print)(
+                f"    Could not send FRA reward conversation: {exc}")
+    return True
+
+
 def handle_battle_gameend(handler, db, session, won, service_mail_uid,
                           service_campaign_uid_type=253):
     """Apply a finished PvE/FRA battle and clean up its game session.
@@ -6571,33 +6626,14 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
     """
     try:
         session_name = session.session_name or ""
-        from pve_db import db_record_arena_fight
-        from pvp_db import db_delete_game_session
         if not session_name.startswith("camp_"):
-            profile = getattr(handler, "user_profile", None)
-            if not session_name.startswith("tourney-") and profile:
-                result = db_record_arena_fight(
-                    profile["id"], won, return_details=True,
-                    session_id=session.session_id)
-                db_delete_game_session(session.session_id)
-                reward_guid = result.get("reward_conversation_guid", "")
-                if result.get("tier_one_perfect_flag_awarded"):
-                    try:
-                        handler.push_reckoning_flags_updated()
-                    except Exception as exc:
-                        getattr(handler, "_log_req", print)(
-                            "    Could not publish ARENA_TIER1_PERFECT: "
-                            f"{exc}")
-                if result.get("recorded") and reward_guid:
-                    try:
-                        _push_fra_buff_conversation(
-                            handler, reward_guid, service_mail_uid)
-                    except Exception as exc:
-                        getattr(handler, "_log_req", print)(
-                            f"    Could not send FRA reward conversation: {exc}")
+            prepared = prepare_fra_battle_gameend(handler, db, session, won)
+            if prepared is not None:
+                publish_fra_battle_gameend(
+                    handler, prepared, service_mail_uid)
                 getattr(handler, "_log_req", print)(
                     f"    FRA result recorded (won={won}); session cleaned")
-                return True
+                return bool(prepared.get("handled"))
             return False
         camp_id = int(session_name[5:])
         reward_result = _apply_encounter_end_rewards(
@@ -6932,7 +6968,8 @@ def resolve_opening_hand_config(db, session, player_id, race_name, cls_name,
     mods = pregame_modifiers(db, session, player_id, guids)
     return {
         "starting_hand_size": max(0, base_hand + int(mods["starting_hand"])),
-        "maximum_hand_size": max(0, 7 + int(mods["maximum_hand"])),
+        # Player.MaximumHandSize: PvE and PvE Arena use ten, PvP seven.
+        "maximum_hand_size": max(0, 10 + int(mods["maximum_hand"])),
         "starting_hand_effects": list(mods["starting_hand_effects"]),
     }
 

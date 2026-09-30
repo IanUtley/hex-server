@@ -34,7 +34,7 @@ class Personality:
         "Legendary": 3.0, "Epic": 1.4, "PvE": 1.4, "Promo": 1.4,
     }
 
-    def __init__(self, deck_personality=None, attitude="Aggressive"):
+    def __init__(self, deck_personality=None, attitude="Comfortable"):
         v = self.values = {}
         v["Attack"] = 1.0
         v["Defense"] = 0.75
@@ -61,7 +61,7 @@ class Personality:
         self.deck_personality = deck_personality
         self.attitude = attitude if attitude in {
             "Aggressive", "Comfortable", "Defensive"
-        } else "Aggressive"
+        } else "Comfortable"
         self._apply_deck_personality(deck_personality)
         # AttributesMatrix (AIPersonality.cs): keyword -> per-attack/def value.
         self.attributes_value = {
@@ -88,7 +88,8 @@ class Personality:
     @property
     def minimum_x_value(self):
         """AIPersonality.MinimumXValue: Aggressive=3, Comfortable=4,
-        Defensive=5 — the minimum combat value before committing a troop."""
+        Defensive=5 — the resource reserve for X-cost card play and preferred
+        X spending. This is not a combat attack threshold."""
         return {"Aggressive": 3, "Comfortable": 4, "Defensive": 5}.get(
             self.attitude, 4)
 
@@ -163,13 +164,18 @@ class CardInfo:
 
     def __init__(self, row):
         # row: game_cards joined card_templates (see _load_ai_hand)
+        # Accept pre-double-X snapshots used by in-process callers that
+        # construct the older tuple shape directly.
+        if len(row) in (21, 23):
+            row = tuple(row[:14]) + (0,) + tuple(row[14:])
         (self.card_uid, self.template_guid, self.location, self.card_type,
          self.name, self.rarity, self.cost, self.attack_base,
          self.defense_base, self.threshold_json, self.abilities_json,
          self.attributes, self.subtype, self.variable_cost,
+         self.variable_cost_double,
          self.current_resources_granted, self.max_resources_granted,
          self.card_state, self.card_damage, self.permanent_buffs,
-         self.temporary_buffs, self.temporary_attributes) = row[:21]
+         self.temporary_buffs, self.temporary_attributes) = row[:22]
         self.card_uid = int(self.card_uid)
         self.cost = int(self.cost or 0)
         self.attack_base = int(self.attack_base or 0)
@@ -178,6 +184,12 @@ class CardInfo:
         self.card_attack_mod = 0
         self.card_defense_mod = 0
         self.variable_cost = int(self.variable_cost or 0)
+        self.variable_cost_double = int(self.variable_cost_double or 0)
+        self.has_variable_cost = bool(
+            self.variable_cost or self.variable_cost_double)
+        self.variable_cost_multiplier = (
+            2 if self.variable_cost_double else
+            1 if self.variable_cost else 0)
         self.max_resources_granted = int(self.max_resources_granted or 0)
         self.current_resources_granted = int(
             self.current_resources_granted or 0)
@@ -448,7 +460,7 @@ class Hints:
             if self.removal is None:
                 self.removal = RemovalParams()
             self.removal.threshold = dmg
-        elif card.variable_cost and not card.is_troop():
+        elif card.has_variable_cost and not card.is_troop():
             # Variable-X damage spells (Burn to the Ground): threshold is
             # decided at play time; mark the removal so the AI casts it.
             if dmg == 0 and any(
@@ -472,7 +484,8 @@ class Hints:
 
     def _find_conscript(self, ag):
         from pvp_db import db_ability_trigger_metadata
-        ability_meta = db_ability_trigger_metadata(ag, conn=_db)
+        ability_meta = db_ability_trigger_metadata(
+            ag, conn=self.evaluator._connection())
         if (not ability_meta or bool(ability_meta[0])
                 or bool(ability_meta[1])):
             return
@@ -518,21 +531,20 @@ class CardEvaluator:
         self.resources = int(battle_state.get("ai_resources", 0))
         self.total_resources = int(battle_state.get("ai_total_resources", 0))
         self.threshold = battle_state.get("ai_threshold", {}) or {}
+        # An absent deck strategy means EDeckPersonality.Default: apply no
+        # deck-specific overrides. FRA setup infers a strategy from its deck
+        # when no explicit encounter value is authored.
         deck_p = getattr(handler, "_ai_deck_personality", None)
-        # An unconfigured handler retains the historical Aggressive fallback;
-        # battle setup explicitly writes None for an authored Default deck
-        # personality, allowing the campaign attitude to drive the evaluator.
-        if not hasattr(handler, "_ai_deck_personality"):
-            deck_p = "Aggressive"
         attitude = (getattr(handler, "_ai_campaign_personality", None)
                     or getattr(handler, "_ai_personality", None)
-                    or "Aggressive")
+                    or "Comfortable")
         self.personality = Personality(deck_p, attitude=attitude)
         self.ai_health = int(battle_state.get("ai_health", 20))
         self.player_health = int(battle_state.get("player_health", 20))
         self._effects_cache = {}
         self._effect_metadata_cache = {}
         self._random_transform_intent_cache = {}
+        self._summon_effect_cache = {}
         self._template_value_cache = {}
         self.hand = self._load_hand()
         self.ai_warzone = self._load_warzone(self.ai_owner_id)
@@ -540,28 +552,66 @@ class CardEvaluator:
         self.player_hand_count = self._hand_count(self.player_db_id)
         self._hints = {}
 
+    def _connection(self):
+        """Return the connection belonging to this evaluator's host.
+
+        Test harnesses and dual-seat simulations intentionally replace the
+        handler connection per match.  Capturing the process-global ``db._db``
+        at module import time can therefore point at a closed or unrelated
+        SQLite connection.  Prefer the host's connection, while retaining the
+        module alias for lightweight evaluator doubles that have no handler
+        database attribute.
+        """
+        connection = getattr(self, "_db", None)
+        if connection is None:
+            connection = getattr(getattr(self, "handler", None), "_db", None)
+        return connection if connection is not None else _db
+
     # -- DB loads ----------------------------------------------------------
     def _load_hand(self):
         from pvp_db import db_ai_evaluator_card_rows
         rows = db_ai_evaluator_card_rows(
-            self.session.session_id, self.ai_owner_id, "hand", conn=_db)
+            self.session.session_id, self.ai_owner_id, "hand",
+            conn=self._connection())
         return [CardInfo(r) for r in rows]
 
     def _load_warzone(self, user_id):
         from pvp_db import db_ai_evaluator_card_rows
         rows = db_ai_evaluator_card_rows(
-            self.session.session_id, user_id, "warzone", conn=_db)
+            self.session.session_id, user_id, "warzone",
+            conn=self._connection())
         cards = []
         for r in rows:
             c = CardInfo(r)
-            c.card_attack_mod = int(r[21] or 0)
-            c.card_defense_mod = int(r[22] or 0)
+            c.card_attack_mod = int(r[22] or 0)
+            c.card_defense_mod = int(r[23] or 0)
             cards.append(c)
         return cards
 
+    def _source_card_for_ability(self, source_uid):
+        """Load the card that authored a triggered/nested ability.
+
+        A Runic ability may resolve after its source has moved to discard or
+        CastSpells, so it is not necessarily present in the evaluator's hand
+        or Warzone snapshots.  Keep the lookup metadata-only and leave target
+        candidates to the live Warzone snapshots above.
+        """
+        try:
+            source_uid = int(source_uid)
+        except (TypeError, ValueError):
+            return None
+        for card in self.hand + self.ai_warzone + self.player_warzone:
+            if card.card_uid == source_uid:
+                return card
+        from pvp_db import db_ai_evaluator_card_row
+        row = db_ai_evaluator_card_row(
+            self.session.session_id, source_uid, conn=self._connection())
+        return CardInfo(row) if row is not None else None
+
     def _hand_count(self, user_id):
         from pvp_db import db_hand_count
-        return db_hand_count(self.session.session_id, user_id, conn=_db)
+        return db_hand_count(
+            self.session.session_id, user_id, conn=self._connection())
 
     # -- ability effect cache ----------------------------------------------
     def effects_for(self, ability_guid):
@@ -569,7 +619,8 @@ class CardEvaluator:
             return self._effects_cache[ability_guid]
         out = []
         from pvp_db import db_ability_effect_type_params
-        for e in db_ability_effect_type_params(ability_guid, conn=_db):
+        for e in db_ability_effect_type_params(
+                ability_guid, conn=self._connection()):
             try:
                 pm = json.loads(e[1]) if e[1] else {}
             except Exception:
@@ -577,6 +628,78 @@ class CardEvaluator:
             out.append((e[0], pm if isinstance(pm, dict) else {}))
         self._effects_cache[ability_guid] = out
         return out
+
+    def troop_summon_effects(self, card):
+        """Return metadata for effects that summon troops into the Warzone.
+
+        This intentionally classifies by the authored effect template and
+        destination. Card names and display text are not part of the decision.
+        """
+        key = (str(card.template_guid).lower(),
+               tuple(str(guid).lower() for guid in card.ability_guids))
+        if key in self._summon_effect_cache:
+            return list(self._summon_effect_cache[key])
+
+        effects = []
+        summon_types = {
+            "SummonTokenTroopAbilityEffectTemplate",
+            "SummonXTokenTroopsAbilityEffectTemplate",
+        }
+        for ability_guid in card.ability_guids:
+            for effect_type, params in self.effects_for(ability_guid):
+                if effect_type not in summon_types:
+                    continue
+                collection = str(
+                    params.get("collection")
+                    or params.get("card_collection") or "")
+                if collection.casefold() != "warzone":
+                    continue
+                amount_variable = (params.get("amount_variable")
+                                   or params.get("amount_field"))
+                if not amount_variable:
+                    try:
+                        if int(params.get("amount", 0) or 0) <= 0:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                template_guid = str(
+                    params.get("token_guid")
+                    or params.get("card_template_id") or "").strip().lower()
+                if not template_guid:
+                    continue
+                attributes = 0
+                try:
+                    from pvp_db import db_card_template_field
+                    card_type = str(db_card_template_field(
+                        template_guid, "card_type",
+                        conn=self._connection()) or "")
+                    if card_type.casefold() != "troop":
+                        continue
+                    attributes = int(db_card_template_field(
+                        template_guid, "attributes",
+                        conn=self._connection()) or 0)
+                except (TypeError, ValueError):
+                    attributes = 0
+
+                def authored_bool(value):
+                    if isinstance(value, str):
+                        return value.strip().casefold() in (
+                            "1", "true", "yes")
+                    return bool(value)
+
+                effects.append({
+                    "ability_guid": str(ability_guid).lower(),
+                    "effect_type": effect_type,
+                    "template_guid": template_guid or None,
+                    "attributes": attributes,
+                    "enters_play_exhausted": authored_bool(
+                        params.get("enters_play_exhausted",
+                                   params.get("exhausted", False))),
+                    "enters_play_attacking": authored_bool(
+                        params.get("enters_play_attacking", False)),
+                })
+        self._summon_effect_cache[key] = tuple(effects)
+        return list(effects)
 
     def random_transform_target_intent(self, ability_guid):
         """Return the C# AI's side preference from authored ability metadata."""
@@ -586,7 +709,8 @@ class CardEvaluator:
         intent = "opponent"
         try:
             from pvp_db import db_ability_activation_metadata
-            row = db_ability_activation_metadata(ability_guid, conn=_db)
+            row = db_ability_activation_metadata(
+                ability_guid, conn=self._connection())
             raw = row[5] if row and len(row) > 5 else None
             metadata = json.loads(raw) if raw else {}
             if not isinstance(metadata, dict):
@@ -604,7 +728,8 @@ class CardEvaluator:
         ability_guid = str(ability_guid).lower()
         if ability_guid not in self._effect_metadata_cache:
             from pvp_db import db_ability_effect_metadata_rows
-            rows = db_ability_effect_metadata_rows(ability_guid, conn=_db)
+            rows = db_ability_effect_metadata_rows(
+                ability_guid, conn=self._connection())
             self._effect_metadata_cache[ability_guid] = [
                 (str(effect_guid).lower(), effect_type)
                 for effect_guid, effect_type in rows]
@@ -620,7 +745,7 @@ class CardEvaluator:
         template_card = CardInfo((
             -1, template_guid, "template", row[2], row[1], row[8],
             row[3], row[4], row[5], row[10], "[]", row[6], row[7],
-            0, 0, 0, 0, 0, None, None, 0))
+            0, 0, 0, 0, 0, 0, None, None, 0))
         value = self.calculate_template_value(template_card)
         self._template_value_cache[template_guid] = value
         return value
@@ -658,7 +783,7 @@ class CardEvaluator:
             # inputs from whichever ability happened to resolve previously.
             state.pop("ability_variables", None)
             filter_context = SimpleNamespace(
-                db=_db, session=self.session, bstate=state)
+                db=self._connection(), session=self.session, bstate=state)
             candidates = set(_matching_template_candidates(
                 filter_context, card_filter,
                 _authored_banned_guids(filter_context),
@@ -668,13 +793,15 @@ class CardEvaluator:
 
             values = [
                 self._template_value_from_catalog_row(row)
-                for row in db_template_catalog_for_filter(conn=_db)
+                for row in db_template_catalog_for_filter(
+                    conn=self._connection())
                 if str(row[0]).lower() in candidates]
             if not values:
                 return 0.0
 
             amount = int(effect_field(
-                _db, state, effect_guid, "m_Amount", default=1) or 0)
+                self._connection(), state, effect_guid, "m_Amount",
+                default=1) or 0)
             faction = template.get("m_Faction", "")
             if isinstance(faction, dict):
                 faction = (faction.get("value__") or faction.get("name") or
@@ -683,7 +810,7 @@ class CardEvaluator:
                 try:
                     from rules_port.static_rules import player_int_attributes
                     amount += int(player_int_attributes(
-                        _db, self.session.session_id, state,
+                        self._connection(), self.session.session_id, state,
                         self.ai_owner_id).get(
                             "ConscriptUnderworldBonus", 0) or 0)
                 except (ImportError, TypeError, ValueError):
@@ -866,9 +993,11 @@ class CardEvaluator:
         return True
 
     # -- playability (AICardEvaluator.IsPlayable) --------------------------
-    def can_pay(self, cost, variable=False):
+    def can_pay(self, cost, variable=False, variable_multiplier=1):
         if variable:
-            cost += 1  # 1X cost means X+1 (client m_VariableCostDouble=0)
+            # Require enough to choose at least one X for the AI's useful
+            # playability checks. Double-X metadata doubles payment per X.
+            cost += max(1, int(variable_multiplier or 1))
         return self.resources + self._on_board_resources() >= cost
 
     def _on_board_resources(self):
@@ -887,8 +1016,8 @@ class CardEvaluator:
         if card is None:
             return "False"
         cost = card.cost
-        if card.variable_cost and not card.is_troop():
-            cost += 1
+        if card.has_variable_cost and not card.is_troop():
+            cost += max(1, card.variable_cost_multiplier)
         if not self.handler._thresholds_met(card.threshold_json,
                                             self.threshold):
             return "False"
@@ -902,6 +1031,14 @@ class CardEvaluator:
         if self.resources + self._on_board_resources() >= cost:
             return "True"
         return "NeedsResources"
+
+    def preferred_x_cost(self, card):
+        """Return the AI's preferred affordable X value for a card play."""
+        if not card.has_variable_cost:
+            return 0
+        multiplier = max(1, card.variable_cost_multiplier)
+        affordable = max(0, self.resources - card.cost) // multiplier
+        return max(0, min(int(self.personality.minimum_x_value), affordable))
 
     def get_theoretical_distance(self, card):
         """GetTheoriticalDistance: how far (resources + thresholds) this card
@@ -917,8 +1054,8 @@ class CardEvaluator:
                     extra[flag] = extra.get(flag, 0) + count
         dist = 0.0
         cost = card.cost
-        if card.variable_cost and not card.is_troop():
-            cost += 1
+        if card.has_variable_cost and not card.is_troop():
+            cost += max(1, card.variable_cost_multiplier)
         if total < cost:
             dist += cost - total
         try:
@@ -1029,15 +1166,17 @@ class CardEvaluator:
             return True
         hints = self.hints_for(card)
         if card.is_action() and hints.conscript:
-            if card.variable_cost and not self.can_pay(
-                    card.cost, variable=True):
+            if card.has_variable_cost and not self.can_pay(
+                    card.cost, variable=True,
+                    variable_multiplier=card.variable_cost_multiplier):
                 return False
             return True
         if card.is_basic_action():
             # Non-quick actions: removal, lifegain and buffs are worth playing
             # if they have a legal target (or are targetless).
-            if card.variable_cost and not self.can_pay(
-                    card.cost, variable=True):
+            if card.has_variable_cost and not self.can_pay(
+                    card.cost, variable=True,
+                    variable_multiplier=card.variable_cost_multiplier):
                 return False
             if card.is_quick_action():
                 return False
@@ -1091,8 +1230,8 @@ class CardEvaluator:
                     rest, new_res, has_resource, True, depth + 1)
             else:
                 cost = card.cost
-                if card.variable_cost and not card.is_troop():
-                    cost += 1
+                if card.has_variable_cost and not card.is_troop():
+                    cost += max(1, card.variable_cost_multiplier)
                 if cost > resources:
                     continue
                 order, val = self._best_stack(
@@ -1294,9 +1433,11 @@ class CardEvaluator:
                     return card, 0, target_uid
                 threshold = h.removal.threshold
                 x_cost = 0
-                if card.variable_cost and not card.is_troop():
+                if card.has_variable_cost and not card.is_troop():
                     # Burn-to-the-ground style: X = defense to kill.
-                    if self.resources - card.cost - 1 >= target.effective_defense(
+                    affordable_x = max(0, self.resources - card.cost) // max(
+                        1, card.variable_cost_multiplier)
+                    if affordable_x >= target.effective_defense(
                             in_play=True):
                         x_cost = target.effective_defense(in_play=True)
                         threshold = x_cost
@@ -1346,8 +1487,9 @@ class CardEvaluator:
             h = self.hints_for(card)
             if h.removal is None or h.removal.debuff or h.removal.sweeper:
                 continue
-            if card.variable_cost and not card.is_troop():
-                affordable = self.resources - card.cost - 1
+            if card.has_variable_cost and not card.is_troop():
+                affordable = max(0, self.resources - card.cost) // max(
+                    1, card.variable_cost_multiplier)
                 if affordable >= health:
                     return card
             elif h.removal.threshold >= health:
@@ -1421,8 +1563,9 @@ class CardEvaluator:
             loss = 0.0
             threshold = h.removal.threshold
             x_cost = 0
-            if card.variable_cost and not card.is_troop():
-                x_cost = max(0, self.resources - card.cost - 1)
+            if card.has_variable_cost and not card.is_troop():
+                x_cost = max(0, self.resources - card.cost) // max(
+                    1, card.variable_cost_multiplier)
                 threshold = x_cost
             if threshold <= 0:
                 continue
@@ -1461,15 +1604,17 @@ class CardEvaluator:
                 self.personality.attitude = "Comfortable"
 
     # -- targeting help ----------------------------------------------------
-    def _metadata_action_targets(self, card, ag):
-        """Return legal player-selected targets from authored metadata.
+    def _metadata_action_target_slots(self, card, ag):
+        """Return legal choices and authored bounds for each explicit slot.
 
-        An empty list means complete target metadata exists but has no legal
-        manual choice (for example, an auto-targeted trigger). None means the
-        metadata is absent or incomplete and legacy effect inference may apply.
+        ``None`` means the ability has no complete target metadata. An empty
+        list means complete metadata exists but has no player-selected slot.
+        Each slot keeps its original target-template index because effects
+        refer to targets by that index.
         """
         from pvp_db import db_ability_target_template_ids, db_target_template_row
-        payload = db_ability_target_template_ids(ag, conn=_db)
+        connection = self._connection()
+        payload = db_ability_target_template_ids(ag, conn=connection)
         if not payload:
             return None
         try:
@@ -1478,7 +1623,7 @@ class CardEvaluator:
             return None
         if not template_ids:
             return None
-        target_rows = [db_target_template_row(str(template_id), conn=_db)
+        target_rows = [db_target_template_row(str(template_id), conn=connection)
                        for template_id in template_ids]
         if any(target is None for target in target_rows):
             return None
@@ -1496,26 +1641,50 @@ class CardEvaluator:
         if self.player_champ_uid is not None:
             champions.append((int(self.player_champ_uid), self.player_db_id,
                               "Player", self.player_health))
-        for template_id, target in zip(template_ids, target_rows):
+        slots = []
+        for target_index, (template_id, target) in enumerate(
+                zip(template_ids, target_rows)):
             kind = (target[11] if target else "") or ""
             auto = int(target[2] or 0) if target else 0
             explicit = int(target[5] or 0) if target else 0
+            random_target = int(target[3] or 0) if target else 0
             if (auto or not explicit or kind in (
                     "PlayerTargetTemplate", "AbilitySourceCardTargetTemplate",
-                    "AbilityCreatedTargetTemplate")):
+                    "AbilityCreatedTargetTemplate") or random_target):
                 continue
             # ``legal_targets`` takes the database owner id, while the AI
             # turn APIs pass its wire UID (UID(type=3, instance=1000)).
             # Passing that wrapper through makes the filter tree fail when it
             # compares IsControlledBy/IsNotControlledBy ownership.
             candidates = legal_targets(
-                _db, self.session.session_id, self.ai_owner_id,
+                connection, self.session.session_id, self.ai_owner_id,
                 str(template_id),
                 card.card_uid,
-                both_players=target_uses_both_players(_db, str(template_id)),
+                both_players=target_uses_both_players(
+                    connection, str(template_id)),
                 champions=champions, battle_state=self.bstate)
-            if candidates:
-                return [int(uid) for uid in candidates]
+            slots.append({
+                "index": target_index,
+                "template_id": str(template_id),
+                "candidates": [int(uid) for uid in candidates],
+                "minimum": max(0, int(target[8] or 0)),
+                "maximum": max(0, int(target[9] or 0)),
+            })
+        return slots
+
+    def _metadata_action_targets(self, card, ag):
+        """Return legal player-selected targets from authored metadata.
+
+        An empty list means complete target metadata exists but has no legal
+        manual choice. None means metadata is absent or incomplete and legacy
+        effect inference may apply.
+        """
+        slots = self._metadata_action_target_slots(card, ag)
+        if slots is None:
+            return None
+        for slot in slots:
+            if slot["candidates"]:
+                return list(slot["candidates"])
         # Complete authored metadata is authoritative even when every target
         # is automatic or implicit. Do not infer a single-card choice from an
         # effect such as damage-to-each-opposing-champion.
@@ -1530,13 +1699,15 @@ class CardEvaluator:
         """
         from pvp_db import db_ability_target_template_ids, db_target_template_row
 
+        connection = self._connection()
         for ability_guid in card.ability_guids:
-            payload = db_ability_target_template_ids(ability_guid, conn=_db)
+            payload = db_ability_target_template_ids(
+                ability_guid, conn=connection)
             try:
                 template_ids = json.loads(payload or "[]")
             except (TypeError, ValueError, json.JSONDecodeError):
                 template_ids = []
-            rows = [db_target_template_row(str(template_id), conn=_db)
+            rows = [db_target_template_row(str(template_id), conn=connection)
                     for template_id in template_ids or []]
             if rows and all(row is not None for row in rows):
                 for row in rows:
@@ -1638,10 +1809,210 @@ class CardEvaluator:
             c.is_troop(), self.get_card_value(c), c.effective_attack(),
             c.effective_defense(), c.card_uid))
 
+    def choose_ability_target_map(self, source_uid, ability_guid,
+                                  preferred_target=None):
+        """Choose fresh explicit targets for a triggered ability instance.
+
+        This is the native equivalent of the C# ``GetActivationFor`` pass:
+        enumerate the current legal target pool and apply the same evaluator
+        ordering, even when the source card is no longer in hand/Warzone.
+        """
+        card = self._source_card_for_ability(source_uid)
+        if card is None:
+            return None
+        # Random explicit targets are resolved by the native session RNG, not
+        # by the deterministic card-value ordering used for player pickers.
+        # Returning ``None`` keeps that resolver path intact.
+        from pvp_db import db_ability_target_template_ids, db_target_template_row
+        connection = self._connection()
+        try:
+            payload = db_ability_target_template_ids(
+                str(ability_guid).lower(), conn=connection)
+            template_ids = json.loads(payload or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        manual_target = False
+        for template_id in template_ids or []:
+            target = db_target_template_row(
+                str(template_id), conn=connection)
+            if target is None:
+                return None
+            kind = str(target[11] or "")
+            if (int(target[2] or 0) == 0 and
+                    int(target[3] or 0) == 0 and
+                    int(target[5] or 0) != 0 and kind not in (
+                        "PlayerTargetTemplate",
+                        "AbilitySourceCardTargetTemplate",
+                        "AbilityCreatedTargetTemplate")):
+                manual_target = True
+        if not manual_target:
+            return None
+        return self.choose_action_target_map(
+            card, preferred_target=preferred_target,
+            ability_guids=(str(ability_guid).lower(),))
+
+    def choose_action_target_map(self, card, preferred_target=None,
+                                 ability_guids=None):
+        """Choose explicit targets by authored slot and target-count bounds.
+
+        ``None`` means no complete metadata was available. An empty mapping
+        means the metadata is complete and no manual target is needed or
+        currently legal.
+        """
+        friendly_uids, opposing_uids = self._target_side_uids()
+        preferred = []
+        if preferred_target is not None:
+            raw = (preferred_target if isinstance(
+                preferred_target, (list, tuple, set)) else [preferred_target])
+            for value in raw:
+                try:
+                    preferred.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+        saw_authoritative_targets = False
+        cards = {c.card_uid: c for c in
+                 self.ai_warzone + self.player_warzone}
+        if ability_guids is None:
+            ability_ids = card.ability_guids
+        elif isinstance(ability_guids, str):
+            ability_ids = (ability_guids,)
+        else:
+            ability_ids = tuple(ability_guids)
+        for ag in ability_ids:
+            slots = self._metadata_action_target_slots(card, ag)
+            if slots is None:
+                continue
+            saw_authoritative_targets = True
+            if not slots:
+                continue
+            intent = self._action_target_intent(card, ag)
+            selected_map = {}
+            for slot in slots:
+                candidates = list(slot["candidates"])
+                if not candidates:
+                    if slot["minimum"] > 0:
+                        return {}
+                    continue
+                side_ids = (opposing_uids if intent == "opponent" else
+                            friendly_uids if intent == "friendly" else None)
+                preferred_candidates = ([uid for uid in candidates
+                                         if uid in side_ids]
+                                        if side_ids is not None else candidates)
+                # Target-filter metadata is authoritative. An effect heuristic
+                # must not reject its only legal targets when the authored
+                # filter permits the opposite side.
+                if preferred_candidates:
+                    candidates = preferred_candidates
+                available = [cards[uid] for uid in candidates if uid in cards]
+                ordered = [item.card_uid for item in sorted(
+                    available,
+                    key=lambda item: (item.is_troop(),
+                                      self.get_card_value(item),
+                                      item.effective_attack(),
+                                      item.effective_defense(), item.card_uid),
+                    reverse=True)]
+                ordered.extend(uid for uid in candidates if uid not in cards)
+                for uid in reversed(preferred):
+                    if uid in ordered:
+                        ordered.remove(uid)
+                        ordered.insert(0, uid)
+                maximum = int(slot["maximum"] or 0)
+                count = (len(ordered) if maximum <= 0 else
+                         min(len(ordered), maximum))
+                chosen = ordered[:count]
+                if len(chosen) < int(slot["minimum"] or 0):
+                    return {}
+                if chosen:
+                    selected_map[int(slot["index"])] = tuple(chosen)
+            if selected_map:
+                return selected_map
+        return {} if saw_authoritative_targets else None
+
+    def choose_action_targets(self, card, preferred_target=None):
+        """Return selected card IDs in authored target-slot order."""
+        target_map = self.choose_action_target_map(
+            card, preferred_target=preferred_target)
+        if target_map is not None:
+            return [int(uid) for values in target_map.values()
+                    for uid in values]
+        target = self.choose_action_target(card, preferred_target)
+        return [] if target is None else [int(target)]
+
+    def choose_precombat_block_restriction(self):
+        """Choose an action adding CantBlock to legal opposing troops.
+
+        The effect attribute, operation, target index, legal candidates, and
+        target maximum all come from authored ability/target metadata.
+        """
+        opposing = {card.card_uid: card for card in self.player_warzone}
+        cant_block = int(ECardAttributes.CantBlock)
+        for card in self.hand:
+            if not card.is_action() or self.is_playable(card) != "True":
+                continue
+            for ag in card.ability_guids:
+                slots = self._metadata_action_target_slots(card, ag)
+                if slots is None:
+                    continue
+                for effect_type, params in self.effects_for(ag):
+                    if effect_type != "CardModifierAbilityEffectTemplate":
+                        continue
+                    if (str(params.get("property") or "").lower()
+                            != "attribute"
+                            or str(params.get("operation") or "").lower()
+                            != "add"):
+                        continue
+                    raw_flags = params.get("attribute_flags") or ""
+                    if isinstance(raw_flags, (list, tuple, set)):
+                        names = {str(value).replace("_", "").lower()
+                                 for value in raw_flags}
+                    else:
+                        names = {
+                            part.strip().replace("_", "").lower()
+                            for part in str(raw_flags).replace(",", "|")
+                            .split("|") if part.strip()
+                        }
+                    matches = "cantblock" in names
+                    if not matches:
+                        try:
+                            matches = bool(int(raw_flags) & cant_block)
+                        except (TypeError, ValueError):
+                            pass
+                    if not matches:
+                        continue
+                    try:
+                        target_index = int(params.get("target_index", 0) or 0)
+                    except (TypeError, ValueError):
+                        target_index = 0
+                    slot = next((value for value in slots
+                                 if int(value["index"]) == target_index), None)
+                    if slot is None:
+                        continue
+                    candidates = [opposing[uid] for uid in slot["candidates"]
+                                  if uid in opposing and opposing[uid].is_troop()
+                                  and not opposing[uid].has_attribute(
+                                      ECardAttributes.CantBlock)]
+                    if not candidates:
+                        continue
+                    candidates.sort(key=lambda item: (
+                        self.get_card_value(item), item.effective_attack(),
+                        item.effective_defense(), item.card_uid), reverse=True)
+                    maximum = int(slot["maximum"] or 0)
+                    chosen = candidates if maximum <= 0 else candidates[:maximum]
+                    if len(chosen) < int(slot["minimum"] or 0):
+                        continue
+                    return card, {target_index: tuple(
+                        int(item.card_uid) for item in chosen)}
+        return None
+
     def choose_action_target(self, card, preferred_target=None):
         """Pick a target for a hand action using gamedata effect params:
         enforce effect-side preference after metadata legality, and retain an
         explicitly selected legal target.  None = no target needed."""
+        target_map = self.choose_action_target_map(
+            card, preferred_target=preferred_target)
+        if target_map is not None:
+            return next((int(uid) for values in target_map.values()
+                         for uid in values), None)
         friendly_uids, opposing_uids = self._target_side_uids()
         saw_authoritative_targets = False
         for ag in card.ability_guids:

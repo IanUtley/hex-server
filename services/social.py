@@ -37,9 +37,16 @@ from objfmt_builder import ObjFmtBuilder
 
 
 def _active_clients():
-    """Return the _active_clients dict from hconnect_server without circular import."""
+    """Return a thread-safe snapshot of _active_clients from hconnect_server."""
     server = sys.modules.get("hconnect_server") or sys.modules.get("__main__")
-    return getattr(server, "_active_clients", {}) if server is not None else {}
+    if server is None:
+        return {}
+    lock = getattr(server, "_active_clients_lock", None)
+    raw = getattr(server, "_active_clients", {})
+    if lock:
+        with lock:
+            return {uid: list(entries) for uid, entries in raw.items()}
+    return dict(raw) if hasattr(raw, "items") else {}
 
 
 def _extract_keepname(inner_bytes):

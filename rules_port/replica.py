@@ -16,6 +16,51 @@ import threading
 _REPLICA_LOCK = threading.RLock()
 
 
+def replica_projection(db, session_id, uid):
+    """Return ``(card_type_bits, subtype)`` from the persisted replica row.
+
+    Callers use this after :func:`apply_replica_mods` so the client's
+    ``CardUpdated`` renders the Replica type/subtype instead of the base
+    template.
+    """
+    import game_engine
+    from pvp_db import (db_card_mutation_field, db_card_source_info)
+    info = db_card_source_info(session_id, int(uid), conn=db)
+    if not info:
+        return None, ""
+    card_type = game_engine.card_type_from_db(info[1])
+    try:
+        buffs = json.loads(db_card_mutation_field(
+            session_id, int(uid), "permanent_buffs", conn=db) or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        buffs = {}
+    subtype = str(buffs.get("subtype") or "") if isinstance(buffs, dict) else ""
+    return card_type, subtype
+
+
+def project_replica(context, uid):
+    """Push the post-replica type/subtype ``CardUpdated`` for one card."""
+    import game_engine
+    from pvp_db import db_card_source_info
+    from .runtime_helpers import card_collection_for_location, owner_uid
+    info = db_card_source_info(
+        context.session.session_id, int(uid), conn=context.db)
+    if not info:
+        return False
+    card_type, subtype = replica_projection(
+        context.db, context.session.session_id, int(uid))
+    scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
+    _tpl, _rendered, _name, cost, attack, defense, gems = \
+        context.handler._card_full_data(context.game, scid, info[0])
+    recipient = owner_uid(info[3], context.player_uid, context.ai_uid,
+                          context.bstate)
+    context.game.push_card_updated(
+        scid, recipient, card_collection_for_location(info[2]), card_type,
+        template_id=info[0], cost=cost, attack=attack, defense=defense,
+        gems=gems, sub_type=subtype)
+    return True
+
+
 def apply_replica_mods(context, uid, template_guid=None):
     """Project ``Card.HandleReplicaMods`` onto one session card."""
     from pvp_db import (db_apply_replica_mods, db_card_mutation_field,

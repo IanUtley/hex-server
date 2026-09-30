@@ -83,8 +83,8 @@ Frost Ring Arena implementation details are in
 - [x] Reconnect and state republishing for active sessions.
 - [ ] Full client-equivalent draw-first hand reorder flow.
 - [ ] Deck-exhaustion loss behavior on every draw path.
-- [ ] Campaign hand-size rules everywhere; campaign uses 10 while PvP uses 7,
-  and remaining paths need auditing.
+- [x] Hand-size rules follow the client: ten in PvE/PvE Arena, seven in PvP,
+  with campaign `MaximumHandSizeModifiers` and `UnlimitedHandSize` applied.
 - [ ] A reliable automated two-real-client PvP harness for all setup and combat
   flows.
 
@@ -150,9 +150,9 @@ Frost Ring Arena implementation details are in
 - [x] Frost Ring Arena run totals: non-boss wins add gold pouches, boss wins
   add treasure chests, and the totals are shown in the arena lobby.
 - [x] Session-event replay capture.
-- [ ] Complete Frost Ring Arena cash-out loot delivery; the current cash-out
-  response returns accumulated gold but does not yet populate `AllLoot` or
-  convert the chest total into inventory chests.
+- [x] Frost Ring Arena cash-out gold delivery: each stored gold bag is paid as
+  100 account gold and returned in `AllLoot`; the completed roster is revealed
+  before the client performs final arena cleanup.
 - [ ] Complete Frost Ring Arena start-to-finish parity, including all rewards,
   encounter effects, challenges, buyouts, and client-equivalent challenger
   match lifecycle.

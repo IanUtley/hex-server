@@ -101,7 +101,13 @@ def _broadcast_room_event(handler, room, action):
     server = sys.modules.get("hconnect_server")
     if server is None or not hasattr(server, "_active_clients"):
         server = sys.modules.get("__main__")
-    active_clients = getattr(server, "_active_clients", {})
+    lock = getattr(server, "_active_clients_lock", None) if server else None
+    raw_clients = getattr(server, "_active_clients", {}) if server else {}
+    if lock:
+        with lock:
+            active_clients = {uid: list(entries) for uid, entries in raw_clients.items()}
+    else:
+        active_clients = dict(raw_clients) if hasattr(raw_clients, "items") else {}
     profile = getattr(handler, "user_profile", None) or {}
     username = display_name_from_identity(profile.get("name", "Unknown"))
     flags = ""
@@ -156,15 +162,24 @@ def _handle_rchat(handler, room, chat_data):
     if msg_text.startswith("/") or msg_text.startswith("!"):
         resp = handler._handle_chat_command(msg_text[1:], room, username)
         if resp:
-            cmd_echo = json.dumps({
-                "action": "rchat", "room": room, "rflg": "",
-                "user": f"Server [{time.strftime('[%H:%M]')}]",
-                "msg": resp, "flags": "", "icon": "",
-            })
-            handler.scnt += 1
-            handler.send({
-                "issuer": "Session", "target": "chat", "sid": handler.sid,
-            }, body=cmd_echo.encode("utf-8"))
+            # Command responses are private to the issuing handler. Do not
+            # route them through the ordinary room broadcast below.
+            # The client strips literal newlines in ChatManager.FilterMarkup
+            # before passing chat text to the NGUI label.  Send multiline
+            # command output as separate chat messages so each logical line
+            # remains visible; <br>/<nl> are not supported chat markup.
+            for line in resp.splitlines():
+                if not line:
+                    continue
+                cmd_echo = json.dumps({
+                    "action": "rchat", "room": room, "rflg": "",
+                    "user": f"Server [{time.strftime('[%H:%M]')}]",
+                    "msg": line, "flags": "", "icon": "",
+                })
+                handler.scnt += 1
+                handler.send({
+                    "issuer": "Session", "target": "chat", "sid": handler.sid,
+                }, body=cmd_echo.encode("utf-8"))
     else:
         if user_id:
             db_store_chat(user_id, display_name, room, msg_text, icon, flags)
@@ -191,7 +206,13 @@ def _handle_rchat(handler, room, chat_data):
         server.touch_session(handler)
         server.cleanup_stale_sessions()
 
-        active_clients = server._active_clients
+        lock = getattr(server, "_active_clients_lock", None)
+        raw_clients = getattr(server, "_active_clients", {})
+        if lock:
+            with lock:
+                active_clients = {uid: list(entries) for uid, entries in raw_clients.items()}
+        else:
+            active_clients = dict(raw_clients) if hasattr(raw_clients, "items") else {}
         broadcast_count = 0
         for uid, handlers_list in active_clients.items():
             for h, t in handlers_list:

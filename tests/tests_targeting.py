@@ -7,6 +7,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -387,6 +388,40 @@ def test_trigger_target_prompt_uses_explicit_controller(db):
     assert target.target_index == 1
 
 
+def test_optional_trigger_prompt_has_opt_in_without_fake_target(db):
+    """Optional triggers use class 39 without inventing a target choice."""
+    import hconnect_server as hcs
+
+    class Checkpoint:
+        def save_state(self, _session, _state):
+            pass
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler._checkpoint_engine = lambda _session: Checkpoint()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"resolving_owner_id": 5}
+    hcs.HCPHandler._prompt_optional_trigger(
+        handler, game, pl_t, ai_t, SessionStub(), bstate, 0x101,
+        EXILE_DEPLOY, (), [], owner_id=5, trigger_target_uid=0x101)
+
+    assert bstate["pending_trigger"]["optional"] is True
+    option = game.events[0].options[0].instances[0]
+    assert option.target_instances == []
+    assert option.min_target_counts == []
+    assert game.events[1].CLASS_ID == 39
+    game.push_top_of_chain_resolved(7)
+    game.push_removed_top_of_chain(7)
+    from rules_port.chain_items import _move_prompt_events_last
+    _move_prompt_events_last(game, True)
+    assert [event.__class__.__name__ for event in game.events[-3:]] == [
+        "PlayerOptionListSessionEventArgs",
+        "TriggeredAbilityActivationDataRequiredSessionEventArgs",
+        "GreenLightSessionEventArgs",
+    ]
+
+
 def test_pending_trigger_target_queues_reconnectable_chain(db):
     """A class-39 answer must survive the next RulesPort reattach."""
     import hconnect_server as hcs
@@ -397,6 +432,11 @@ def test_pending_trigger_target_queues_reconnectable_chain(db):
     port = AuthoritativeSession(1, (pl_t, ai_t), seed_z=1, seed_w=2)
     port.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
     port.active_player_id = pl_t
+    # A live RulesPort owns the follow-up projection.  Keep this focused test
+    # from emitting a second packet, but assert that the continuation hands
+    # priority back through that scheduler rather than sending a human
+    # GreenLight while the native queue still belongs to the active side.
+    port.event_sink = object()
     state = {
         "pending_trigger": {
             "ability_guid": EXILE_DEPLOY,
@@ -428,9 +468,13 @@ def test_pending_trigger_target_queues_reconnectable_chain(db):
         projected.append(game_engine.Game(1, pl_t, ai_t)) or projected[-1])
     handler._send_battle_events = lambda *_args: None
     handler._push_transaction_ack = lambda *_args: None
+    resumed = []
+    handler._advance_rules_port_to_priority = lambda *args: resumed.append(args)
+    session = Session()
 
     assert handler._resolve_pending_trigger_target(
-        Session(), pl_t, ai_t, b"", ability_guid=EXILE_DEPLOY)
+        session, pl_t, ai_t, b"", ability_guid=EXILE_DEPLOY)
+    assert resumed == [(session, pl_t, ai_t, state)]
     chain_events = [event for event in projected[0].events
                     if isinstance(
                         event, game_engine.AbilityPushedOnChainSessionEventArgs)]
@@ -517,6 +561,22 @@ def test_pending_trigger_prompt_survives_priority_projection(db):
         session, pl_t, ai_t, bstate) is False
 
 
+def test_pending_trigger_stops_native_scheduler(_db):
+    """A trigger prompt must not advance an empty native action stack."""
+    from rules_port.session import AuthoritativeSession
+
+    player = game_engine.UID.make(244, 5)
+    ai = game_engine.UID.make(3, 1000)
+    port = AuthoritativeSession(1, (player, ai), seed_z=1, seed_w=2)
+    port.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    port.runtime_facts = SimpleNamespace(battle_state={
+        "pending_trigger": {"ability_guid": EXILE_DEPLOY},
+    })
+
+    assert port.drive_until_input(max_steps=4) == 1
+    assert port.current_turn_phase is game_engine.ETurnPhases.FirstMainPhase
+
+
 if __name__ == "__main__":
     run("legal targets exclude the ability source", test_legal_targets)
     run("card filter Not(IsAbilitySource)", test_filter_eval)
@@ -529,9 +589,13 @@ if __name__ == "__main__":
     run("human deploy triggers class-39 prompt", test_deploy_prompt_human)
     run("trigger target prompt preserves controller",
         test_trigger_target_prompt_uses_explicit_controller)
+    run("optional trigger prompt requests opt-in",
+        test_optional_trigger_prompt_has_opt_in_without_fake_target)
     run("trigger target continuation survives reconnect",
         test_pending_trigger_target_queues_reconnectable_chain)
     run("AI deploy auto-picks + chains", test_deploy_auto_ai)
     run("class-39 event serializes", test_class39_wire)
     run("pending trigger prompt survives the priority projection",
         test_pending_trigger_prompt_survives_priority_projection)
+    run("pending trigger stops the native scheduler",
+        test_pending_trigger_stops_native_scheduler)

@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from domain.enums import ECardTypes, ETurnPhases
 from gamemodes.arena import TIER_ONE_BOSS_RANK
 from profile_db import (RECKONING_FLAG_ARENA_TIER1_PERFECT,
+                        db_adjust_user_currency,
                         db_get_reckoning_flags,
                         db_set_reckoning_flag)
 
@@ -30,6 +31,7 @@ _FRA_CHALLENGE_KEYS = (
     "objective_text", "modifications_json", "metadata_json",
 )
 _FRA_TRANSACTION_LOCK = threading.RLock()
+FRA_GOLD_PER_SACK = 100
 
 
 def _fra_challenge_from_row(row):
@@ -214,6 +216,85 @@ def db_clear_arena_run(user_id, conn=None):
         connection.commit()
 
 
+def _fra_gold_rewards(history, sack_count, arena_instance=1):
+    """Build one client loot entry for each earned FRA gold sack."""
+    rewards = []
+    remaining = max(0, int(sack_count or 0))
+    completed_fight_id = 1
+    for index, fight in enumerate(history or []):
+        if str(fight.get("result", "") or "").upper() != "WIN":
+            continue
+        completed_fight_id = int(fight.get("fight_id", index + 1) or index + 1)
+        tier = max(1, int(fight.get("fight_tier", index // 5 + 1) or
+                          index // 5 + 1))
+        for _ in range(min(tier, remaining)):
+            rewards.append({
+                "arena_instance": int(arena_instance),
+                "fight_instance": completed_fight_id,
+                "type": "GOLD",
+                "rarity": "",
+                "gold": FRA_GOLD_PER_SACK,
+                "reason": "GOLD",
+                "template_id": "00000000-0000-0000-0000-000000000000",
+            })
+            remaining -= 1
+        if not remaining:
+            break
+
+    # Preserve every already-tracked sack if an older save has incomplete
+    # fight-history metadata. These fallback entries remain tied to the last
+    # completed fight, but are still worth the same authored 100 gold.
+    while remaining:
+        rewards.append({
+            "arena_instance": int(arena_instance),
+            "fight_instance": completed_fight_id,
+            "type": "GOLD",
+            "rarity": "",
+            "gold": FRA_GOLD_PER_SACK,
+            "reason": "GOLD",
+            "template_id": "00000000-0000-0000-0000-000000000000",
+        })
+        remaining -= 1
+    return rewards
+
+
+def db_claim_arena_rewards(user_id, conn=None):
+    """Atomically pay out and close one active FRA run.
+
+    ``gold_earned`` is the lobby's number of gold sacks, not the account gold
+    amount. Convert each sack to the authored 100 gold and retain the full
+    roster in the return value so the campaign service can reveal it before
+    clearing the client's cache.
+    """
+    with _fra_transaction(conn) as connection:
+        arena = db_get_arena_state(user_id, conn=connection)
+        challengers = db_get_fra_challengers(user_id, conn=connection)
+        history = db_get_arena_fight_history(user_id, conn=connection)
+        sack_count = max(0, int(arena.get("gold_earned", 0) or 0))
+        if not int(arena.get("deck_id", 0) or 0) or not sack_count:
+            return {
+                "success": False, "error": 2,
+                "error_message": "There are no FRA rewards to claim.",
+                "gold": 0, "loot": [], "challengers": challengers,
+                "new_gold": None,
+            }
+
+        loot = _fra_gold_rewards(history, sack_count)
+        gold = sum(int(item.get("gold", 0) or 0) for item in loot)
+        new_gold, _new_platinum = db_adjust_user_currency(
+            user_id, gold_delta=gold, conn=connection)
+        db_update_arena_state(
+            user_id, conn=connection, deck_id=0, wins=0, losses=0,
+            challenger_index=0, fight_history="[]", gold_earned=0,
+            chests_earned=0, sacks_earned=0)
+        db_clear_fra_challengers(user_id, conn=connection)
+        return {
+            "success": True, "error": 0, "error_message": "",
+            "gold": gold, "loot": loot, "challengers": challengers,
+            "new_gold": new_gold,
+        }
+
+
 def db_buyout_fra_tier_one(user_id, conn=None):
     """Skip the first FRA tier for an eligible player, without rewards."""
     with _fra_transaction(conn) as connection:
@@ -281,13 +362,14 @@ def db_get_fra_challengers(user_id, conn=None):
     """Return the saved FRA opponent roster for one player."""
     rows = _connection(conn).execute(
         "SELECT c.challenger_index, c.name, c.champion_guid, "
-        "c.encounter_deck_guid, c.is_boss, COALESCE(e.is_elite, 0) "
+        "c.encounter_deck_guid, c.is_boss, COALESCE(e.is_elite, 0), "
+        "COALESCE(NULLIF(TRIM(c.ai_deck_personality), ''), 'Default') "
         "FROM fra_challengers AS c LEFT JOIN fra_encounters AS e "
         "ON e.deck_guid=c.encounter_deck_guid WHERE c.user_id=? "
         "ORDER BY c.challenger_index", (user_id,)).fetchall()
     return [{"id": row[0] + 1, "name": row[1], "champion_guid": row[2],
              "deck": row[3], "boss": "True" if row[4] else "False",
-             "is_elite": bool(row[5])}
+             "is_elite": bool(row[5]), "ai_deck_personality": row[6]}
             for row in rows]
 
 
@@ -304,20 +386,25 @@ def db_create_fra_challengers(user_id, rng=None, conn=None):
     rows = _connection(conn).execute(
         "SELECT deck_guid, name, champion_guid, COALESCE(is_boss, 0), "
         "COALESCE(is_elite, 0), base_deck_name, COALESCE(min_rank, 6), "
-        "COALESCE(max_rank, 19) FROM fra_encounters").fetchall()
+        "COALESCE(max_rank, 19), "
+        "COALESCE(NULLIF(TRIM(ai_deck_personality), ''), 'Default') "
+        "FROM fra_encounters").fetchall()
     encounters = [{"deck": row[0], "name": row[1], "champion": row[2],
                    "is_boss": bool(row[3]), "is_elite": bool(row[4]),
-                   "base": row[5], "min_rank": row[6], "max_rank": row[7]}
+                   "base": row[5], "min_rank": row[6], "max_rank": row[7],
+                   "ai_deck_personality": row[8]}
                   for row in rows]
     from gamemodes.arena import is_boss_encounter, select_fra_roster
     selected = [(user_id, rank - 1, chosen["name"], chosen["champion"],
-                 chosen["deck"], int(is_boss_encounter(chosen)))
+                 chosen["deck"], int(is_boss_encounter(chosen)),
+                 chosen["ai_deck_personality"])
                 for rank, chosen in select_fra_roster(encounters, rng=rng)]
     connection = _connection(conn)
     connection.execute("DELETE FROM fra_challengers WHERE user_id=?", (user_id,))
     connection.executemany(
         "INSERT INTO fra_challengers (user_id, challenger_index, name, "
-        "champion_guid, encounter_deck_guid, is_boss) VALUES (?, ?, ?, ?, ?, ?)",
+        "champion_guid, encounter_deck_guid, is_boss, ai_deck_personality) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         selected)
     if conn is None:
         connection.commit()
@@ -374,9 +461,10 @@ def _db_prepare_fra_fight_challenge(user_id, fight_index=None, rng=None,
 
     selected = None
     challenger = challengers[fight_index]
-    if challenger.get("is_elite"):
+    is_boss = str(challenger.get("boss", "False")).lower() == "true"
+    if challenger.get("is_elite") and not is_boss:
         selected = db_select_fra_challenge("standard", rng=rng, conn=conn)
-    elif fight_index > 5:
+    elif not is_boss and fight_index > 5:
         candidate = db_select_fra_challenge("standard", rng=rng, conn=conn)
         if candidate:
             probability = max(0, min(
@@ -405,6 +493,97 @@ def _challenge_for_history_fight(fight, conn=None):
         guids = fight.get("active_challenges", [])
         guid = str(guids[0]) if guids else ""
     return db_get_fra_challenge(conversation_guid=guid, conn=conn) if guid else None
+
+
+def _consume_fra_boss_reward_challenges(fight, conn=None):
+    """Remove earned boss notifications after a failed boss attempt.
+
+    Elite reward conversations attach one or more ``*_boss_notification``
+    challenges to the tier boss. The reward is for that boss match, so a loss
+    consumes those modifiers even though the player remains on the boss.
+    Ordinary challenges on the boss are retained for the retry.
+    """
+    active = list(fight.get("active_challenges", []) or [])
+    if not active:
+        return []
+    consumed = set()
+    for guid in active:
+        challenge = db_get_fra_challenge(
+            conversation_guid=guid, conn=conn)
+        if not challenge:
+            continue
+        key = str(challenge.get("challenge_key", "") or "").lower()
+        try:
+            metadata = json.loads(
+                challenge.get("metadata_json", "{}") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        if (key.endswith("_boss_notification") or
+                metadata.get("trigger") == "notification"):
+            consumed.add(str(guid))
+    if not consumed:
+        return []
+
+    fight["active_challenges"] = [
+        str(guid) for guid in active if str(guid) not in consumed]
+    round_challenge = str(fight.get("round_challenge", "") or "")
+    if round_challenge in consumed:
+        remaining = fight["active_challenges"]
+        fight["round_challenge"] = remaining[0] if remaining else ""
+        # The previous response belonged to the consumed notification; do not
+        # carry that answer onto a different challenge on the retry.
+        fight["challenge_response"] = "NONE"
+    resolved = fight.get("resolved_modifications", {})
+    if isinstance(resolved, dict):
+        fight["resolved_modifications"] = {
+            guid: value for guid, value in resolved.items()
+            if str(guid) not in consumed
+        }
+    return sorted(consumed)
+
+
+def _fra_has_challenge_prompt(fight, conn=None):
+    """Return whether this fight has an authored MC challenge prompt.
+
+    The client cannot decline an MC challenge, so a fight carrying a prompt
+    is always played as an accepted challenge.
+    """
+    guids = list(fight.get("active_challenges", []) or [])
+    if not guids and fight.get("round_challenge"):
+        guids = [fight["round_challenge"]]
+    for guid in guids:
+        challenge = db_get_fra_challenge(
+            conversation_guid=guid, conn=conn)
+        if not challenge:
+            continue
+        try:
+            metadata = json.loads(challenge.get("metadata_json", "{}") or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if metadata.get("trigger") == "challenge":
+            return True
+    return False
+
+
+def _fra_perfected_tier(history, fight_index):
+    """Return whether the just-finished fight completed a lossless tier."""
+    fight_index = int(fight_index)
+    if fight_index < 0 or fight_index % 5 != 4:
+        return False
+    tier_start = fight_index - 4
+    return all(
+        str(fight.get("result", "") or "").upper() == "WIN"
+        and not int(fight.get("boss_loss_count", 0) or 0)
+        for fight in history[tier_start:fight_index + 1]
+    )
+
+
+def _fra_tier_boss_index(fight_index, challengers):
+    """Return the fixed boss slot for the current fight's tier."""
+    tier_boss_index = ((int(fight_index) // 5) + 1) * 5 - 1
+    if tier_boss_index >= len(challengers) or tier_boss_index <= int(fight_index):
+        return None
+    return tier_boss_index
 
 
 def db_store_fra_challenge_resolution(user_id, fight_index, challenge_guid,
@@ -458,19 +637,34 @@ def _db_record_arena_fight(user_id, won, conn=None, return_details=False,
     recorded = False
     reward_guid = ""
     tier_one_perfect_flag_awarded = False
-    if history[index]["result"] not in ("WIN", "LOSE"):
+    losses = int(arena.get("losses", 0) or 0)
+    challenger = challengers[index]
+    is_boss = str(challenger.get("boss", "False")).lower() == "true"
+    previous_result = str(
+        history[index].get("result", "") or "").upper()
+    # Ordinary fights are one attempt: a loss records the slot and advances
+    # to the next challenger.  A boss loss costs a life but leaves the run on
+    # that boss, so the same slot may be recorded again on a later attempt.
+    retrying_boss = is_boss and previous_result == "LOSE"
+    if previous_result not in ("WIN", "LOSE") or retrying_boss:
         recorded = True
-        challenger = challengers[index]
+        boss_loss_count = int(history[index].get("boss_loss_count", 0) or 0)
+        if is_boss and not won:
+            boss_loss_count += 1
         history[index].update({
             "result": result, "challenger_instance": challenger["id"],
             "fight_id": challenger["id"], "fight_tier": index // 5 + 1,
-            "fight_order": index + 1, "is_boss": challenger["boss"] == "True",
+            "fight_order": index + 1, "is_boss": is_boss,
         })
+        if boss_loss_count:
+            history[index]["boss_loss_count"] = boss_loss_count
+        if is_boss and not won:
+            _consume_fra_boss_reward_challenges(
+                history[index], conn=connection)
         if session_key:
             history[index]["session_id"] = session_key
         if (won and index + 1 == TIER_ONE_BOSS_RANK
-                and all(fight.get("result") == "WIN"
-                        for fight in history[:TIER_ONE_BOSS_RANK])):
+                and _fra_perfected_tier(history, index)):
             tier_one_perfect_flag_awarded = db_set_reckoning_flag(
                 user_id, RECKONING_FLAG_ARENA_TIER1_PERFECT,
                 progress=1, maximum=1, completed=True, conn=connection)
@@ -480,10 +674,29 @@ def _db_record_arena_fight(user_id, won, conn=None, return_details=False,
             # Fight tiers are five opponents each.  The lobby's GoldPacks
             # counter is the number of awarded bags, including boss wins.
             gold += index // 5 + 1
-            if challenger["boss"] == "True":
+            if is_boss:
                 chests += 1
 
-            if challenger.get("is_elite"):
+            # A lossless tier can restore one prior strike, but only when the
+            # run was below the three-loss cap.  This is the higher-priority
+            # tier reward and must be chosen before an elite's other reward.
+            reward = None
+            if losses > 0 and _fra_perfected_tier(history, index):
+                reward = db_get_fra_challenge(
+                    challenge_key="perfected_tier_strike_removal", conn=conn)
+            if not reward and losses > 0 and _fra_has_challenge_prompt(
+                    history[index], conn=conn):
+                reward = db_get_fra_challenge(
+                    challenge_key="challenge_win_strike_removal", conn=conn)
+
+            if reward:
+                reward_guid = reward["conversation_guid"]
+                history[index]["reward_conversation_guid"] = reward_guid
+                losses = max(0, losses - 1)
+            elif (losses == 0 and challenger.get("is_elite")
+                  and str(challenger.get("boss", "False")).lower() != "true"):
+                # An elite win queues its authored reward and the paired
+                # *_boss_notification for the tier boss.
                 reward = db_select_fra_challenge("reward", rng=rng, conn=conn)
                 if reward:
                     reward_guid = reward["conversation_guid"]
@@ -495,32 +708,35 @@ def _db_record_arena_fight(user_id, won, conn=None, return_details=False,
                         metadata = {}
                     notification_guid = str(
                         metadata.get("notification_conversation_guid", "") or "")
-                    # Save the paired notification on the first later boss.
-                    # ``active_challenges`` is a list so separate elite wins
-                    # before one boss can stack their authored rewards.
-                    for boss_index in range(index + 1, len(challengers)):
-                        if challengers[boss_index]["boss"] != "True":
-                            continue
+                    # Save the paired notification on this tier's fixed boss.
+                    # Tiers three and four have two elite slots, so the boss
+                    # challenge list must retain both notifications.
+                    boss_index = _fra_tier_boss_index(index, challengers)
+                    if boss_index is not None and str(
+                            challengers[boss_index].get("boss", "False")
+                    ).lower() == "true":
                         notification = db_get_fra_challenge(
                             conversation_guid=notification_guid, conn=conn)
                         if notification:
                             boss_fight = history[boss_index]
                             active = list(boss_fight.get("active_challenges", []))
-                            active.append(notification_guid)
+                            if notification_guid not in active:
+                                active.append(notification_guid)
                             boss_fight["active_challenges"] = active
                             if not boss_fight.get("round_challenge"):
                                 boss_fight["round_challenge"] = notification_guid
-                        break
+        next_index = index if is_boss and not won else index + 1
         db_update_arena_state(
             user_id, conn=connection,
             wins=int(arena.get("wins", 0) or 0) + int(bool(won)),
-            losses=int(arena.get("losses", 0) or 0) + int(not won),
-            challenger_index=index + 1, fight_history=json.dumps(history),
+            losses=losses + int(not won), challenger_index=next_index,
+            fight_history=json.dumps(history),
             gold_earned=gold, chests_earned=chests)
         # Persist the paired notification and next challenge in the same
-        # transaction as the result, so retries cannot reroll either one.
+        # transaction as the result. A boss loss prepares the same slot for
+        # its retry; completed ordinary fights prepare the next slot.
         db_prepare_fra_fight_challenge(
-            user_id, fight_index=index + 1, rng=rng, conn=connection)
+            user_id, fight_index=next_index, rng=rng, conn=connection)
     if return_details:
         return {"recorded": recorded,
                 "reward_conversation_guid": reward_guid,

@@ -460,6 +460,7 @@ def encode_objfmt_response(type_names, fields):
         threshold_data = []
         fight_data = []
         mod_data = []
+        reward_data = []
         uid_val = 0
         sub_fields = []
         raw_bytes = b""
@@ -521,6 +522,10 @@ def encode_objfmt_response(type_names, fields):
             tname = val[0]
             ecount = val[1]
             mod_data = val[2] if len(val) > 2 else []
+        elif tcode == "arenarewardlist":
+            tname = val[0]
+            ecount = val[1]
+            reward_data = val[2] if len(val) > 2 else []
         elif tcode == "uid":
             tname = "Game.Shared.UID"
             uid_val = val
@@ -757,6 +762,32 @@ def encode_objfmt_response(type_names, fields):
                 fields = base_fields + specific_fields
                 w(str(find_type(mod_type))); sep(); w(str(len(fields))); sep()
                 for name, stcode, sval in fields:
+                    encode_field(name, stcode, sval)
+                sizes[-1] = buf.tell() - se
+        elif tcode == "arenarewardlist":
+            w(str(ecount))
+            sep()
+            for i, reward in enumerate(reward_data):
+                se = buf.tell(); sizes.append(0)
+                w(str(i)); sep(); w(str(len(sizes) - 1)); sep()
+                w(str(find_type("Reckoning.Campaign.Messages.Arena.ArenaReward")))
+                sep(); w("7"); sep()
+                for name, stcode, sval in (
+                    ("ArenaInstance", "ulong", int(
+                        reward.get("arena_instance", 1) or 1)),
+                    ("FightInstance", "ulong", int(
+                        reward.get("fight_instance", i + 1) or i + 1)),
+                    ("Type", "string", str(reward.get("type", "") or "")),
+                    ("Rarity", "string", str(
+                        reward.get("rarity", "") or "")),
+                    ("Gold", "int", int(reward.get("gold", 0) or 0)),
+                    ("Reason", "string", str(
+                        reward.get("reason", "") or "")),
+                    ("TemplateID", "struct", ("Game.Shared.ResourceId", [
+                        ("m_Guid", "guid", _wire_guid(
+                            reward.get("template_id")))
+                    ])),
+                ):
                     encode_field(name, stcode, sval)
                 sizes[-1] = buf.tell() - se
         elif tcode == "struct":

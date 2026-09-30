@@ -21,6 +21,7 @@ share/
 *.dll
 *.zip
 *.swp
+*:Zone.Identifier
 .mimocode/
 .env
 .env.*

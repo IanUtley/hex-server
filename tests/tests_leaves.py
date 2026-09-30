@@ -325,6 +325,36 @@ def test_revert_mods(db):
     assert '"atk": 0' in row[3] and '"def": 0' in row[3], row[3]
 
 
+def test_card_cost_replace_assigns_effective_cost(db):
+    """A CardCostModifier with ReplaceExistingValue sets the cost.
+
+    Raucous Revelry ("your cards with Rowdy in all zones become cost 1")
+    authors ``m_ReplaceExistingValue``; the stored delta must make the
+    effective cost equal the authored value, not add to it.
+    """
+    add_card(db, 100, 5)
+    db.execute("UPDATE game_cards SET card_cost_mod=2 WHERE card_uid=100")
+    db.commit()
+    pl_t, ai_t, game, bstate = new_game(db)
+    bstate["player_spell_target"] = 100
+    _native_dispatch(
+        "CardModifierAbilityEffectTemplate", game, SessionStub(), db,
+        HandlerStub(), pl_t, ai_t, bstate,
+        '{"property": "cardcost", "amount": 1, "duration": "Permanent", '
+        '"replaceexistingvalue": 1}')
+    from rules_port.static_rules import effective_cost
+    assert effective_cost(db, 1, bstate, 100) == 1, db.execute(
+        "SELECT card_cost_mod FROM game_cards WHERE card_uid=100").fetchone()
+    # A replace modifier can legitimately assign 0 ("... cost [(0)]").
+    _native_dispatch(
+        "CardModifierAbilityEffectTemplate", game, SessionStub(), db,
+        HandlerStub(), pl_t, ai_t, bstate,
+        '{"property": "cardcost", "amount": 0, "duration": "Permanent", '
+        '"replaceexistingvalue": 1}')
+    assert effective_cost(db, 1, bstate, 100) == 0, db.execute(
+        "SELECT card_cost_mod FROM game_cards WHERE card_uid=100").fetchone()
+
+
 def test_battle_damage(db):
     add_card(db, 100, 5, state=game_engine.ECardStates.StartedATurnOnYourSide)
     add_card(db, 200, 0, state=game_engine.ECardStates.StartedATurnOnYourSide)
@@ -503,6 +533,8 @@ if __name__ == "__main__":
     run("MoveCardToZone hand destination", test_move_to_hand)
     run("MoveCardToZone clears Dead on warzone entry", test_move_to_warzone_clears_dead)
     run("RevertPermanentModifications resets mods", test_revert_mods)
+    run("CardCostModifier replace assigns effective cost",
+        test_card_cost_replace_assigns_effective_cost)
     run("Battle2Cards deals damage", test_battle_damage)
     run("SacrificeCard kills target", test_sacrifice)
     run("StoreName remembers name", test_store_name)

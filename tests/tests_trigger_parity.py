@@ -188,6 +188,60 @@ def _int_attribute_gained_is_a_zero_to_positive_edge(db):
         assert len(events) == 1, events
 
 
+def _int_attr_modifier_matches_client_operations(db):
+    """C# IntAttrModifier: Double first, Remove deletes, others no-op."""
+    from rules_port.context import EffectContext
+
+    uid = 302
+    add_card(db, uid, 5, TPL_GLADIATOR)
+    player_uid = game_engine.UID.make(244, 5)
+    ai_uid = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, player_uid, ai_uid)
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, HandlerStub(db), player_uid, ai_uid,
+        {"resolving_owner_id": 5}, "int-attribute")
+    context.target_owner = lambda _target, default=None: 5
+    context._push_modifier_card = lambda *_args, **_kwargs: None
+    context._emit_trigger = lambda *args, **kwargs: "published"
+
+    def stored():
+        row = db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()
+        return (json.loads(row[0] or "{}").get("int_attrs") or {}).get(
+            "Gladiator")
+
+    assert _int_attribute(context, uid, {
+        "attribute": "Gladiator", "amount": 1, "operation": "set"}) is not None
+    assert stored() == 1
+    assert _int_attribute(context, uid, {
+        "attribute": "Gladiator", "amount": 0, "operation": "unknown",
+        "double": True}) is not None
+    assert stored() == 2, stored()
+    assert _int_attribute(context, uid, {
+        "attribute": "Gladiator", "operation": "remove"}) is not None
+    assert stored() is None, stored()
+    before = stored()
+    assert _int_attribute(context, uid, {
+        "attribute": "Gladiator", "amount": 5, "operation": "unknown"})
+    assert stored() == before
+
+
+def _deploy_keyword_matches_as_enters_play_abilities():
+    from gamedata import DEFAULT_RECORD_STORE
+    from rules_port.trigger_discovery import ability_matches_keyword
+
+    enters_play = other = None
+    for ability in DEFAULT_RECORD_STORE.load("AbilityTemplate"):
+        trigger = str(ability.field("m_TriggerEventType") or "")
+        if "AsEntersPlayEvent" in trigger and enters_play is None:
+            enters_play = ability.guid
+        elif trigger and "AsEntersPlayEvent" not in trigger and other is None:
+            other = ability.guid
+    assert enters_play and ability_matches_keyword(enters_play, "Deploy")
+    assert other and not ability_matches_keyword(other, "Deploy")
+
+
 def _phase_exit_hook_is_owned_by_native_phase_states():
     player = game_engine.UID.make(244, 11)
     session = AuthoritativeSession(11, (player,), seed_z=1, seed_w=2)
@@ -290,10 +344,14 @@ if __name__ == "__main__":
         print("PASS Conscript filters, repeat selection, thresholds and events in PVE/PVP")
         _int_attribute_gained_is_a_zero_to_positive_edge(db)
         print("PASS CardGainedIntAttrEvent mutation edge in PVE/PVP")
+        _int_attr_modifier_matches_client_operations(db)
+        print("PASS IntAttrModifier double/remove/unknown operations")
     finally:
         db.close()
     _phase_exit_hook_is_owned_by_native_phase_states()
     print("PASS native phase exit trigger hook")
+    _deploy_keyword_matches_as_enters_play_abilities()
+    print("PASS Deploy keyword matches AsEntersPlay abilities")
     _records_trigger_inventory_is_45_authored_event_types()
     print("PASS 45 authored trigger event types inventory")
     _db = make_db()

@@ -88,6 +88,7 @@ DB_PATH = os.environ.get(
     "HEX_DB_PATH",
     os.path.join(os.path.dirname(__file__), "hconnect.db"),
 )
+_NO_PERSISTED_GEM = object()
 
 
 def _rules_port_timing(label, started, **fields):
@@ -175,7 +176,7 @@ def _target_count_from_text(game_text):
 def _talent_ability_guid(talent_guid: str) -> str | None:
     """Resolve a champion talent GUID to its actual ability GUID via DB."""
     return db_talent_data_ability_guid(talent_guid, conn=_db)
-from db import _db, log, log_req, hexdump
+from db import _db, log, log_req, hexdump, set_log_context
 from debug_runtime import enable_debugpy, trace_rules_port
 from db import (player_id_from_name, player_id_from_steam, display_name_from_identity,
                 STARDUST_TEMPLATES, CHEST_TEMPLATE)
@@ -282,6 +283,7 @@ from pvp_db import (db_clear_session_cards, db_game_session_pids,
                     db_card_basic, db_card_with_template,
                     db_card_instance_full,
                     db_card_instance_dynamic_projection,
+                    db_card_instance_dynamic_projections,
                     db_card_ability_list,
                     db_template_by_guid,
                     db_champion_template_health, db_set_card_state_or,
@@ -299,7 +301,7 @@ from pve_db import (db_campaign_user_id, db_campaign_identity_state,
                     db_champion_template_data_exists,
                     db_extended_champion_health, db_champion_template_name,
                     db_champion_talents_for_deck,
-                    db_encounter_deck_personality, db_talent_ability_rows,
+                    db_talent_ability_rows,
                     db_encounter_deck_sleeve,
                     db_talent_data_ability_guid, db_campaign_runtime_row,
                     db_campaign_champion_race, db_campaign_state,
@@ -446,6 +448,13 @@ SERVICE_PLAYER_UID = make_uid(UID_TYPE["ServicePlayer"], 67890)
 
 # Connected client registry: {user_id: [(HCPHandler, last_active_time), ...]}
 _active_clients = {}
+_active_clients_lock = threading.Lock()
+
+
+def get_active_clients_snapshot():
+    """Return a thread-safe snapshot copy of active clients."""
+    with _active_clients_lock:
+        return {uid: list(entries) for uid, entries in _active_clients.items()}
 _pvp_ready = {}  # session_id → ready_count for tournament PvP
 _pvp_events_ready = {}  # session_id → ready_count for tournament PvP events (22029)
 _pending_tournament_starts = set()
@@ -465,10 +474,11 @@ SESSION_TIMEOUT = 900  # 15 minutes
 def cleanup_stale_sessions():
     """Remove sessions inactive for more than SESSION_TIMEOUT seconds."""
     now = time.time()
-    for uid in list(_active_clients.keys()):
-        _active_clients[uid] = [(h, t) for h, t in _active_clients[uid] if now - t < SESSION_TIMEOUT]
-        if not _active_clients[uid]:
-            del _active_clients[uid]
+    with _active_clients_lock:
+        for uid in list(_active_clients.keys()):
+            _active_clients[uid] = [(h, t) for h, t in _active_clients[uid] if now - t < SESSION_TIMEOUT]
+            if not _active_clients[uid]:
+                del _active_clients[uid]
     # Also clean up ended game sessions from DB
     try:
         db_cleanup_game_sessions(conn=_db)
@@ -478,11 +488,12 @@ def cleanup_stale_sessions():
 
 def touch_session(handler):
     """Update the last-active time for a handler."""
-    for uid, entries in _active_clients.items():
-        for i, (h, t) in enumerate(entries):
-            if h is handler:
-                entries[i] = (h, time.time())
-                return
+    with _active_clients_lock:
+        for uid, entries in list(_active_clients.items()):
+            for i, (h, t) in enumerate(entries):
+                if h is handler:
+                    entries[i] = (h, time.time())
+                    return
 
 
 # Starter deck cards loaded from gamedata
@@ -695,10 +706,59 @@ def _open_client_chests(handler, chest_uids):
     return summary
 
 
+def _fra_arena_setup_values(encounter_data):
+    """Normalize the encounter identity needed by the FRA client session."""
+    if not isinstance(encounter_data, dict):
+        return None
+    raw_flags = encounter_data.get("SessionFlags", 0)
+    if isinstance(raw_flags, dict):
+        raw_flags = raw_flags.get("value__", 0)
+    try:
+        flags = int(raw_flags or 0)
+    except (TypeError, ValueError):
+        return None
+    arena_flag = int(game_engine.ESessionFlags.IsPvEArena)
+    if not flags & arena_flag:
+        return None
+
+    def _as_uint64(field):
+        value = encounter_data.get(field, 0)
+        if isinstance(value, dict):
+            value = value.get("value__", value.get("m_UID64", 0))
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "flags": (flags | int(game_engine.ESessionFlags.IsPvE) | arena_flag),
+        "arena_instance": _as_uint64("ArenaInstance"),
+        "arena_owner": _as_uint64("ArenaOwner"),
+    }
+
+
+def _fra_arena_session_state_data(values, flags=None):
+    """Build the FRA EncounterData object used in client setup responses.
+
+    ``flags`` overrides the saved setup flags so the transient StartEncounter
+    session can carry the arena identity without advertising IsPvE/IsPvEArena.
+    """
+    return ("struct", ("Game.Shared.SessionStateEncounterData", [
+        ("SceneTemplateId", "struct", ("Game.Shared.ResourceId", [
+            ("m_Guid", "guid", "00000000-0000-0000-0000-000000000000")])),
+        ("SessionFlags", "enum1", (
+            "Game.Shared.ESessionFlags",
+            values["flags"] if flags is None else int(flags))),
+        ("ArenaInstance", "ulong", values["arena_instance"]),
+        ("ArenaOwner", "ulong", values["arena_owner"]),
+    ]))
+
+
 class HCPHandler(ProfileStreamMixin):
     def __init__(self, conn, addr):
         self.conn = conn
         self.addr = addr
+        self._send_lock = threading.Lock()
         self.buf = b""
         self.sid = None
         self.scnt = 0
@@ -717,8 +777,61 @@ class HCPHandler(ProfileStreamMixin):
         self.user_profile: dict[str, Any] = {}
         self._inventory_pending = False
         self._tutorial_game = None
+        self._log_session_id = None
+        self._log_player_id = None
+        self._log_session_players = ()
+        self._active_game_session = None
         self._application = ApplicationCommandDispatcher(
             event_publisher=self._publish_application_events)
+
+    def _log_participant_tokens(self, session):
+        """Return filename-safe game player IDs for a session log."""
+        tokens = []
+        for participant, _position in getattr(session, "players", ()) or ():
+            try:
+                value = int(participant)
+            except (TypeError, ValueError):
+                continue
+            # GameSession stores typed ServicePlayer UIDs.  The lower 8 bits
+            # are the type; filenames use the client-visible player ID so a
+            # later !issue can find the file from its handler identity.
+            if (value & 0xff) == UID_TYPE["ServicePlayer"]:
+                value >>= 8
+            tokens.append(value)
+        if not tokens and self.client_reck_id:
+            try:
+                tokens.append(int(self.client_reck_id))
+            except (TypeError, ValueError):
+                pass
+        return tuple(tokens)
+
+    def _bind_log_session(self, session):
+        """Route output to this player and, when present, their game."""
+        session_id = getattr(session, "session_id", None) if session else None
+        player_id = ((self.user_profile or {}).get("id")
+                     if self.user_profile else None)
+        participant_ids = self._log_participant_tokens(session) if session else ()
+        self._log_session_id = session_id
+        self._log_player_id = player_id
+        self._log_session_players = participant_ids
+        self._active_game_session = session
+        set_log_context(player_id=player_id, session_id=session_id,
+                        participant_ids=participant_ids)
+        return session_id
+
+    def _refresh_log_session_context(self):
+        """Bind the caller's current persisted game session before dispatch."""
+        if not self.user_profile or not self.client_reck_id:
+            self._bind_log_session(None)
+            return None
+        try:
+            player_uid = make_uid(
+                UID_TYPE["ServicePlayer"], int(self.client_reck_id))
+            session = game_session.find_session_by_player(player_uid)
+        except Exception:
+            session = None
+        self._bind_log_session(session)
+        return session
 
     def _checkpoint_engine(self, session):
         """Select the checkpoint adapter for this session.
@@ -728,6 +841,7 @@ class HCPHandler(ProfileStreamMixin):
         the legacy battle engine.  Keeping the selection here makes the
         boundary explicit while preserving the rollback path for old sessions.
         """
+        self._bind_log_session(session)
         if getattr(session, "_rules_port_session", None) is not None:
             from rules_port import lifecycle
             return lifecycle
@@ -738,6 +852,7 @@ class HCPHandler(ProfileStreamMixin):
         """Attach the authoritative Python rules host for a live session."""
         if session is None:
             return None
+        self._bind_log_session(session)
         # The attached port callbacks close over this value.  Preserve the
         # validated session type across those nested callbacks as well as in
         # the enclosing method.
@@ -819,6 +934,42 @@ class HCPHandler(ProfileStreamMixin):
             event_sink = getattr(port, "event_sink", None)
             if event_sink is not None:
                 event_sink.game = game
+            def native_state_based(_port=port, _game=game,
+                                   _session=session, _state=battle_state):
+                """Run lethal state checks before native priority is shown."""
+                from rules_port.context import EffectContext
+                from rules_port.death_effects import state_based_deaths
+                from rules_port.persistence import load_state, save_state
+                current_state = load_state(
+                    _session, default=lambda: dict(_state))
+                projection = (getattr(getattr(_port, "event_sink", None),
+                                      "game", None) or _game)
+                player_uid = getattr(projection, "player_uid", None)
+                ai_uid = getattr(projection, "ai_uid", None)
+                if player_uid is None or ai_uid is None:
+                    return False
+                current_state["_rules_port_attached"] = True
+                previous = getattr(self, "_current_bstate", None)
+                self._current_bstate = current_state
+                try:
+                    dead = state_based_deaths(EffectContext.from_rules_port(
+                        projection, _session, _db, self, player_uid, ai_uid,
+                        current_state, "state_based_death", ability=None))
+                finally:
+                    if previous is None:
+                        try:
+                            del self._current_bstate
+                        except AttributeError:
+                            pass
+                    else:
+                        self._current_bstate = previous
+                # ``state_based_deaths`` consumes lethal marks even when no
+                # troop dies; persist that transition at the same boundary.
+                save_state(_session, current_state)
+                if dead:
+                    _session._rules_port_mutation_emitted = True
+                return bool(dead)
+            port.set_state_based_handler(native_state_based)
             def native_phase_priority(_port=port, _game=game,
                                       _session=session, _state=battle_state):
                 """Translate Practice/PvE stop preferences into native queues."""
@@ -1245,12 +1396,17 @@ class HCPHandler(ProfileStreamMixin):
                 health = int(battle_state.get(health_key, 25) or 0)
                 spell_uses = battle_state.get(f"{prefix}_sp_uses", {}) or {}
                 from rules_port.costs import plan_ability_cost
+                from rules_port.static_rules import \
+                    charge_point_cost_modifier
                 cost_plan = plan_ability_cost(
                     costs, getattr(ability, "activation", None),
                     current_resource=current, charges=charges,
                     spell_points=spell_points, health=health,
                     spell_uses=spell_uses,
-                    ability_key=getattr(ability, "ability_template_id", ""))
+                    ability_key=getattr(ability, "ability_template_id", ""),
+                    charge_modifier=charge_point_cost_modifier(
+                        _db, session.session_id, battle_state, owner_id,
+                        source_uid))
                 if cost_plan is None:
                     log_req(f"    RulesPort cost rejected: ability={getattr(ability, 'ability_template_id', '')} "
                             f"need={amount}r/{charge_amount}c/{spell_amount}sp/{life_amount}life "
@@ -1270,7 +1426,10 @@ class HCPHandler(ProfileStreamMixin):
                 graph = getattr(getattr(ability, "metadata", None), "graph", None)
                 activation_data = getattr(ability, "activation", None)
                 if graph is not None and activation_data is not None:
-                    from rules_port.costs import ability_cost_targets
+                    from rules_port.costs import (
+                        ability_cost_targets,
+                        validate_cost_target_selection,
+                    )
                     cost_map = getattr(activation_data, "cost_target_map", {}) or {}
                     for cost in ability_cost_targets(
                             graph, _db, session.session_id, owner_id,
@@ -1282,26 +1441,22 @@ class HCPHandler(ProfileStreamMixin):
                         if cost.is_source_auto_target and not selected:
                             source = getattr(ability, "source_uid", None)
                             selected = (() if source is None else (int(source),))
-                        selected = tuple(int(value) for value in (selected or ()))
-                        minimum = cost.minimum
-                        maximum = cost.maximum
-                        if (len(selected) < minimum or
-                                (maximum > 0 and len(selected) > maximum)):
+                        selected = validate_cost_target_selection(
+                            _db, session.session_id, owner_id,
+                            getattr(ability, "source_uid", None), cost,
+                            selected, champions=self._champion_targets(),
+                            battle_state=battle_state)
+                        if selected is None:
                             log_req(
-                                f"    RulesPort cost rejected: missing {cost.kind} target "
-                                f"index={cost.index}")
-                            return False
-                        if not cost.is_source_auto_target and any(
-                                value not in set(cost.candidates)
-                                for value in selected):
-                            log_req(
-                                f"    RulesPort cost rejected: illegal {cost.kind} "
-                                f"target(s)={selected}")
+                                f"    RulesPort cost rejected: invalid {cost.kind} "
+                                f"target(s)={selected} index={cost.index}")
                             return False
                         if selected:
                             additional_selections.append((
-                                {"kind": cost.kind, "minimum": minimum,
-                                 "maximum": maximum, "auto": False},
+                                {"kind": cost.kind,
+                                 "minimum": cost.minimum,
+                                 "maximum": cost.maximum,
+                                 "auto": cost.is_source_auto_target},
                                 selected))
                 if not self._card_costs_valid(
                         session, additional_selections, owner_id):
@@ -1605,7 +1760,6 @@ class HCPHandler(ProfileStreamMixin):
                     from services.tournament_game import pvp_concede
                     handled = bool(pvp_concede(self, session))
                 else:
-                    import commands as _cmd
                     # The persisted practice player IDs are integers, but
                     # GameEnded's wire event requires domain UID objects.
                     # _fresh_game() may be built from persisted IDs, so do not
@@ -1613,12 +1767,9 @@ class HCPHandler(ProfileStreamMixin):
                     player_wire_uid = game_engine.UID.make(
                         244, int(self.client_reck_id))
                     ai_wire_uid = game_engine.UID.make(3, 1000)
-                    _cmd.push_battle_game_end(
-                        handler=self, session=session,
+                    self._finish_battle_gameend(
+                        session, False,
                         winners=[ai_wire_uid], losers=[player_wire_uid])
-                    campaign.handle_battle_gameend(
-                        self, _db, session, False, SERVICE_MAIL_UID,
-                        UID_TYPE["ServiceCampaign"])
                     handled = True
                 if handled:
                     session._rules_port_mutation_emitted = True
@@ -1733,7 +1884,8 @@ class HCPHandler(ProfileStreamMixin):
                                 f"phase_window={phase_window} "
                                 f"practice={practice_window} "
                                 f"responding_to="
-                                f"{getattr(action, 'ability_responding_to', None)!r}")
+                                f"{getattr(action, 'ability_responding_to', None)!r}",
+                                level="DEBUG")
                         # Practice/PvE has one client and one server-driven
                         # participant. The AI must pass through the same
                         # native action both for ordinary ALL-player phase
@@ -1742,14 +1894,70 @@ class HCPHandler(ProfileStreamMixin):
                         # remains on the chain after the human's pass, with
                         # the card still in Hand and no resolver checkpoint.
                         if phase_window:
-                            # Ordinary Practice phase windows have no AI
-                            # decision to make here: the phase driver already
-                            # made its action decision before handing the
-                            # native window to the human.
                             client_id = transaction.player_id
+                            ai_id = game_engine.UID.make(3, 1000)
+                            response_phases = {
+                                game_engine.ETurnPhases.DeclareAttackPriorityWindow,
+                                game_engine.ETurnPhases.DeclareDefensePriorityWindow,
+                                game_engine.ETurnPhases.FirstStrikePriorityWindow,
+                                game_engine.ETurnPhases.EndPhase,
+                            }
+                            phase = port.current_turn_phase
                             while (next_player is not None and
                                    not _same_uid(next_player, client_id)):
+                                # The phase driver already made decisions on
+                                # the AI's own turn. When the human is active,
+                                # let the Practice AI use the same metadata-
+                                # based quick response path before passing a
+                                # combat window or EndPhase.
+                                if (practice_window and phase in response_phases
+                                        and not _same_uid(
+                                            port.active_player_id, ai_id)
+                                        and _same_uid(next_player, ai_id)):
+                                    ai_acted = False
+                                    try:
+                                        from ai import ai_respond_to_priority
+                                        from rules_port.persistence import (
+                                            load_state as _load_response_state)
+                                        response_state = _load_response_state(
+                                            session)
+                                        # ``game`` is the event builder for the
+                                        # pass transaction already being
+                                        # handled.  _fresh_game() reattaches
+                                        # RulesPort and syncs the checkpoint;
+                                        # that rebuilds an ALL-player queue
+                                        # from the AI's priority and puts the
+                                        # already-passed human back in it.
+                                        # Reuse this builder so the AI decision
+                                        # cannot reopen the same phase window.
+                                        response_game = game
+                                        ai_acted = bool(ai_respond_to_priority(
+                                            self, response_game, session,
+                                            ai_id, game.player_uid,
+                                            response_state))
+                                        if ai_acted:
+                                            event_sink = getattr(
+                                                port, "event_sink", None)
+                                            if event_sink is not None:
+                                                event_sink.game = response_game
+                                            self._send_battle_events(
+                                                session, response_game,
+                                                game.player_uid)
+                                            port.persist()
+                                            next_player = (
+                                                port.action_stack
+                                                .priority_player_id)
+                                            break
+                                    except Exception as exc:
+                                        log_req(
+                                            "    RulesPort phase AI response "
+                                            f"failed; using pass fallback: {exc!r}")
                                 if not port.pass_player_priority(next_player):
+                                    log_req(
+                                        "    RulesPort phase AI pass DEBUG: "
+                                        f"pass_player_priority({next_player!r}) "
+                                        "returned False; priority="
+                                        f"{port.action_stack.priority_player_id!r}")
                                     break
                                 next_player = port.action_stack.priority_player_id
                         elif practice_window:
@@ -1763,7 +1971,8 @@ class HCPHandler(ProfileStreamMixin):
                             client_id = transaction.player_id
                             log_req("    RulesPort AI response loop DEBUG: "
                                     f"client={client_id!r} "
-                                    f"next={next_player!r}")
+                                    f"next={next_player!r}",
+                                    level="DEBUG")
                             while (next_player is not None and
                                    not _same_uid(next_player, client_id)):
                                 ai_acted = False
@@ -1772,10 +1981,12 @@ class HCPHandler(ProfileStreamMixin):
                                     from rules_port.persistence import (
                                         load_state as _load_response_state)
                                     response_state = _load_response_state(session)
-                                    response_game = self._fresh_game(
-                                        session, game.player_uid,
-                                        game_engine.UID.make(3, 1000),
-                                        response_state)
+                                    # Reuse the current transaction's Game.
+                                    # Constructing a fresh one re-syncs the
+                                    # native checkpoint and can repopulate
+                                    # participants who already passed this
+                                    # response window.
+                                    response_game = game
                                     ai_acted = bool(ai_respond_to_priority(
                                         self, response_game, session,
                                         game_engine.UID.make(3, 1000),
@@ -1803,11 +2014,13 @@ class HCPHandler(ProfileStreamMixin):
                                     log_req("    RulesPort AI pass DEBUG: "
                                             f"pass_player_priority({next_player!r}) "
                                             "returned False; priority="
-                                            f"{port.action_stack.priority_player_id!r}")
+                                            f"{port.action_stack.priority_player_id!r}",
+                                            level="DEBUG")
                                     break
                                 next_player = port.action_stack.priority_player_id
                                 log_req("    RulesPort AI pass DEBUG: "
-                                        f"next now {next_player!r}")
+                                        f"next now {next_player!r}",
+                                        level="DEBUG")
                         # A first pass only hands APNAP priority to the next
                         # player. Do not tick an as-yet-unentered action: its
                         # on_enter() may rebuild the queue, undoing that pass.
@@ -1830,16 +2043,24 @@ class HCPHandler(ProfileStreamMixin):
                             # and immediately expose the server actor's
                             # follow-up priority in the same scheduler tick.
                             # Practice has no second client transaction for
-                            # that actor; consume the native pass and continue
-                            # to the next real input boundary.
-                            follow_up = port.action_stack.peek()
-                            follow_priority = getattr(
-                                follow_up, "priority_player_id", None)
-                            if _is_practice_chain_follow_up(
-                                    follow_up, transaction.player_id,
-                                    practice_window):
-                                if port.pass_player_priority(follow_priority):
-                                    port.drive_until_input(max_steps=64)
+                            # that actor; consume the native passes and
+                            # continue to the next real input boundary.  A
+                            # resolver may queue several server-owned
+                            # responses in a row (a troop's Deploy trigger
+                            # after its cast trigger), so keep draining until
+                            # the client owns the window or the chain ends.
+                            for _follow_up in range(8):
+                                follow_up = port.action_stack.peek()
+                                follow_priority = getattr(
+                                    follow_up, "priority_player_id", None)
+                                if not _is_practice_chain_follow_up(
+                                        follow_up, transaction.player_id,
+                                        practice_window):
+                                    break
+                                if not port.pass_player_priority(
+                                        follow_priority):
+                                    break
+                                port.drive_until_input(max_steps=64)
                         next_action = port.action_stack.peek()
                         # The compatibility host used to invoke the AI from
                         # its own pass handler. Native phase actions bypass
@@ -1860,6 +2081,20 @@ class HCPHandler(ProfileStreamMixin):
                             f"priority={getattr(next_action, 'priority_player_id', None)!r} "
                             f"players={port.player_ids!r} "
                             f"state_turn={native_state.get('turn_player')!r}")
+                        if any(native_state.get(key) for key in (
+                                "pending_choice", "pending_trigger",
+                                "pending_deck_search", "pending_conversation",
+                                "pending_discard_ability",
+                                "resolution_paused")):
+                            # The resolver has already sent the prompt packet.
+                            # Do not let this pass boundary immediately call
+                            # the AI driver or rebuild ordinary phase options;
+                            # either would replace the class-39/choice UI
+                            # before the client can answer it.
+                            log_req(
+                                "    RulesPort post-pass held for pending "
+                                "client input")
+                            return True
                         if (isinstance(next_action, PriorityWindowAction) and
                                 _same_uid(next_action.priority_player_id, ai_id) and
                                 getattr(next_action, "ability_responding_to", None)
@@ -1965,7 +2200,8 @@ class HCPHandler(ProfileStreamMixin):
             # compatibility dispatcher appears to have handled it.
             port.assert_projection_wiring()
             setattr(session, "_rules_port_session", port)
-            log_req(f"    RulesPort attached session={session.session_id}")
+            log_req(f"    RulesPort attached session={session.session_id}",
+                    level="DEBUG")
             return port
         except Exception as exc:
             log_req(f"    RulesPort attach failed session={getattr(session, 'session_id', '?')}: {exc}")
@@ -2493,7 +2729,9 @@ class HCPHandler(ProfileStreamMixin):
                 port.persist()
             except Exception as exc:
                 log_req(f"    RulesPort post-tick persistence failed: {exc}")
-        log_req(f"    RulesPort handled={handled} transaction={command.__class__.__name__}")
+        log_req(
+            f"    RulesPort handled={handled} transaction={command.__class__.__name__}",
+            level="DEBUG")
         if handled:
             game = getattr(getattr(port, "event_sink", None), "game", None)
             emitted = bool(getattr(session, "_rules_port_mutation_emitted", False))
@@ -2663,15 +2901,18 @@ class HCPHandler(ProfileStreamMixin):
         return True
 
     def send(self, headers: dict, body: bytes = b""):
-        h = dict(headers)
-        if self.sid:
-            h.setdefault("sid", self.sid)
-        h.setdefault("scnt", self.scnt)
-        h.setdefault("ccnt", self.ccnt)
-        pkt = make_packet(h, body)
-        if h.get('target') != 'pong':
-            log(f"SEND {h.get('target','')}/{h.get('instance','')}: body={len(body)}b")
-        self.conn.sendall(pkt)
+        with self._send_lock:
+            h = dict(headers)
+            if self.sid:
+                h.setdefault("sid", self.sid)
+            h.setdefault("scnt", self.scnt)
+            h.setdefault("ccnt", self.ccnt)
+            pkt = make_packet(h, body)
+            if h.get('target') != 'pong':
+                log(
+                    f"SEND {h.get('target','')}/{h.get('instance','')}: body={len(body)}b",
+                    level="DEBUG")
+            self.conn.sendall(pkt)
 
     def send_and_cache(self, headers, body, data_type, reqid, target, instance):
         self.send(headers, body)
@@ -2752,7 +2993,8 @@ class HCPHandler(ProfileStreamMixin):
         announcement_events = game.events[event_start:]
         del game.events[event_start:]
         game.events[0:0] = announcement_events
-        log_req("    Re-announced champion board cards (client in battle)")
+        log_req("    Re-announced champion board cards (client in battle)",
+                level="DEBUG")
         return True
 
     def _send_battle_events(self, session, game, pl_t):
@@ -3245,7 +3487,10 @@ class HCPHandler(ProfileStreamMixin):
     def _card_play_cost_selections(self, session, play_plan, source_uid,
                                    selected_uids):
         """Bind a card-play TargetMap to its authored CostInstances."""
-        from rules_port.costs import card_cost_targets, cost_type_for_kind
+        from rules_port.costs import (
+            card_cost_targets, cost_type_for_kind,
+            validate_cost_target_selection,
+        )
         selected_uids = [int(uid) for uid in (selected_uids or [])]
         used = set()
         selections = []
@@ -3288,6 +3533,14 @@ class HCPHandler(ProfileStreamMixin):
                 if len(available) < minimum:
                     return None
             chosen = tuple(available[:maximum])
+            chosen = validate_cost_target_selection(
+                _db, session.session_id,
+                self.user_profile["id"] if self.user_profile else 0,
+                source_uid, cost, chosen,
+                champions=self._champion_targets(),
+                battle_state=getattr(self, "_current_bstate", None))
+            if chosen is None:
+                return None
             used.update(chosen)
             selections.append((spec, chosen))
         return selections, used
@@ -3513,7 +3766,7 @@ class HCPHandler(ProfileStreamMixin):
         """
         from gamedata import DEFAULT_RECORD_STORE
         card = DEFAULT_RECORD_STORE.get("CardTemplate", str(tpl_guid).lower())
-        return bool(card and card.variable_cost)
+        return bool(card and card.has_variable_cost)
 
     def _resolve_gem_abilities(self, active_gems):
         """Bake a deck's socketed gems into per-instance ability lists at DECK
@@ -3540,7 +3793,8 @@ class HCPHandler(ProfileStreamMixin):
                     out[str(inst)] = [str(a).lower() for a in abilities]
         return out
 
-    def _card_gem_type(self, game, scid, instance_id=None):
+    def _card_gem_type(self, game, scid, instance_id=None,
+                       persisted_gem=_NO_PERSISTED_GEM):
         """Resolve the authoritative socketed gem for one card instance.
 
         The deck stores FRA instance ids, while mirrored/AI cards retain the
@@ -3556,7 +3810,11 @@ class HCPHandler(ProfileStreamMixin):
                     instance_id = int(card_details[1])
                 except (TypeError, ValueError):
                     pass
-        gem_type = 0
+        has_persisted_gem = persisted_gem is not _NO_PERSISTED_GEM
+        try:
+            gem_type = int(persisted_gem or 0) if has_persisted_gem else 0
+        except (TypeError, ValueError):
+            gem_type = 0
         if instance_id is not None:
             try:
                 # This is a display lookup.  Do not initialize arena_state
@@ -3581,7 +3839,7 @@ class HCPHandler(ProfileStreamMixin):
                 # card's persisted game_cards gem (the fallback below) rather
                 # than aborting the entire turn transition.
                 gem_type = 0
-        if not gem_type and scid is not None:
+        if (not gem_type and not has_persisted_gem and scid is not None):
             try:
                 persisted_gem = db_card_gem_type(
                     game.session_id.uid64, scid.uid.uid64, conn=_db)
@@ -3767,6 +4025,17 @@ class HCPHandler(ProfileStreamMixin):
         log_req(f"    Shards of Fate (AI): gained {color} threshold")
         return f"shards of fate: AI gained {color} threshold"
 
+    def _mobilize_discount(self, session, card_uid):
+        """Session.CheckMobilize's affordable reduction for one hand card."""
+        from rules_port.static_rules import mobilize_discount
+        owner = int(self.user_profile.get("id", 0) or 0) \
+            if isinstance(self.user_profile, dict) else 0
+        try:
+            return mobilize_discount(
+                _db, session.session_id, owner, int(card_uid))
+        except Exception:
+            return 0
+
     def _hand_card_playable(self, session, card_uid, ct, cost, thresh_json,
                             ability_guids, resources, threshold, resource_played,
                             friendly_count, enemy_count):
@@ -3780,9 +4049,23 @@ class HCPHandler(ProfileStreamMixin):
         if ct == 'Resource':
             return not resource_played
         if cost is not None and cost > resources:
-            return False
+            if cost - self._mobilize_discount(session, card_uid) > resources:
+                return False
         if not self._thresholds_met(thresh_json, threshold):
-            return False
+            from rules_port.static_rules import champion_int_attribute
+            battle_state = getattr(self, "_current_bstate", None)
+            if not battle_state:
+                try:
+                    from rules_port import lifecycle as _lifecycle
+                    battle_state = _lifecycle.load_state(session)
+                except Exception:
+                    battle_state = {}
+            owner = (int(self.user_profile.get("id", 0) or 0)
+                     if isinstance(self.user_profile, dict) else 0)
+            if champion_int_attribute(
+                    battle_state, owner,
+                    "CanIgnoreCardsThresholds") <= 0:
+                return False
         card_details = db_card_zone_details(
             session.session_id, card_uid, conn=_db)
         play_plan = self._card_play_plan(
@@ -3866,7 +4149,12 @@ class HCPHandler(ProfileStreamMixin):
             port.action_stack.priority_player_id = pl_t
         resources = bstate.get("player_resources", 0)
         threshold = bstate.get("player_threshold", {})
-        resource_played = bstate.get("player_resource_played_this_turn", False)
+        from rules_port.resources import can_play_resource, resource_play_limit
+        resource_limit = resource_play_limit(
+            _db, session.session_id, bstate,
+            int(self.user_profile.get("id", 0)))
+        resource_played = not can_play_resource(
+            bstate, "player", limit=resource_limit)
         friendly_count = self._warzone_troop_count(session, self.user_profile["id"])
         enemy_count = self._warzone_troop_count(session, 0)
         from pvp_db import (db_hand_cards_with_templates,
@@ -3949,7 +4237,8 @@ class HCPHandler(ProfileStreamMixin):
                     self._filter_affordable_abilities(abilities, bstate,
                                                       _be.current_phase(bstate),
                                                       target_data=champ_targets,
-                                                      cost_data=champ_costs),
+                                                      cost_data=champ_costs,
+                                                      session=session),
                     self._discard_costs_for(session, abilities),
                     champ_targets, champ_costs)
         # Warzone-troop manual abilities (e.g. Shift): light up as Activate.
@@ -4015,7 +4304,12 @@ class HCPHandler(ProfileStreamMixin):
                 resource_choice_ability = printed_resource_choice_ability(
                     ability_guids)
         bstate = _be.load_state(session)
-        if bstate.get("player_resource_played_this_turn"):
+        from rules_port.resources import can_play_resource, resource_play_limit
+        resource_limit = resource_play_limit(
+            _db, session.session_id, bstate,
+            int(self.user_profile.get("id", 0)))
+        if not can_play_resource(
+                bstate, "player", limit=resource_limit):
             return False
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
         ai_t = game_engine.UID.make(3, 1000)
@@ -4046,7 +4340,12 @@ class HCPHandler(ProfileStreamMixin):
                 change = apply_resource_change(
                     bstate, "player", "threshold", amount, color=flag)
                 threshold_changes.append((flag, amount, change))
-        play_resource(bstate, "player", current_grant, max_grant)
+        resource_play = play_resource(
+            bstate, "player", current_grant, max_grant,
+            additional_plays=max(0, resource_limit - 1))
+        charge_delta = max(
+            0, int(resource_play.charge.new_value) -
+            int(resource_play.charge.old_value))
         _be.save_state(session, bstate)
         game = self._fresh_game(session, pl_t, ai_t, bstate)
         from rules_port import chain_items as _chain_items
@@ -4101,17 +4400,20 @@ class HCPHandler(ProfileStreamMixin):
                         bstate.pop("gain_threshold_color", None)
                     else:
                         bstate["gain_threshold_color"] = old_threshold_color
-        charge = game_engine.ChampionChargePointsChangedSessionEventArgs()
-        charge.player_id = pl_t; charge.operation = 1; charge.delta = 1
-        charge.new_value = bstate["player_charges"]
-        game._push(charge)
-        from rules_port.triggers import dispatch_native_trigger
-        dispatch_native_trigger(
-            db=_db, handler=self, game=game, session=session,
-            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
-            event_type="GainChargeEvent",
-            source_card_id=int(self._player_champ_scid.uid.uid64),
-            source_player_id=int(self.user_profile.get("id", 0)))
+        if charge_delta:
+            charge = game_engine.ChampionChargePointsChangedSessionEventArgs()
+            charge.player_id = pl_t; charge.operation = 1
+            charge.delta = charge_delta
+            charge.new_value = bstate["player_charges"]
+            game._push(charge)
+            from rules_port.triggers import dispatch_native_trigger
+            for _ in range(charge_delta):
+                dispatch_native_trigger(
+                    db=_db, handler=self, game=game, session=session,
+                    player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+                    event_type="GainChargeEvent",
+                    source_card_id=int(self._player_champ_scid.uid.uid64),
+                    source_player_id=int(self.user_profile.get("id", 0)))
         from rules_port.resources import (
             resolve_granted_resource_abilities,
         )
@@ -4261,7 +4563,38 @@ class HCPHandler(ProfileStreamMixin):
         elif x_cost:
             return False
         playing_for_free = bool(payload.get("playing_for_free", False))
-        payment = 0 if playing_for_free else cost + x_cost
+        x_payment = x_cost * play_plan.cost.variable_multiplier
+        payment = 0 if playing_for_free else cost + x_payment
+        mobilized = []
+        for activation in ability_data:
+            if not isinstance(activation, dict):
+                continue
+            selected = activation.get("cards_to_mobilize")
+            if selected is None and isinstance(
+                    activation.get("x_cost_data"), dict):
+                selected = activation["x_cost_data"].get("cards_to_mobilize")
+            if selected is None:
+                continue
+            if not isinstance(selected, (list, tuple, set)):
+                selected = (selected,)
+            for value in selected:
+                try:
+                    uid = int(getattr(value, "uid64", value))
+                except (TypeError, ValueError):
+                    continue
+                if uid not in mobilized:
+                    mobilized.append(uid)
+        if mobilized and not playing_for_free:
+            # Session.CheckMobilize: each mobilized card is a ready troop the
+            # player controls, at most the card's Mobilize value, and each one
+            # tapped this way reduces the resource cost by two.
+            from rules_port.static_rules import mobilize_payment
+            reduced = mobilize_payment(
+                _db, session.session_id, owner_id, card_uid, payment,
+                mobilized)
+            if reduced is None:
+                return False
+            payment = reduced
         if payment > int(bstate.get("player_resources", 0) or 0):
             return False
         activations, _cost_target_map = play_plan.activation_bundle(
@@ -4278,6 +4611,13 @@ class HCPHandler(ProfileStreamMixin):
         if not self._card_costs_valid(
                 session, cost_selections, owner_id):
             return False
+        if mobilized:
+            from pvp_db import db_update_card_state
+            for uid in mobilized:
+                db_update_card_state(
+                    session.session_id, int(uid),
+                    set_bits=game_engine.ECardStates.Tapped, conn=_db)
+            _db.commit()
         from rules_port.card_transactions import apply_card_play
         from pvp_db import db_card_state_value
         previous_state = int(db_card_state_value(
@@ -4309,6 +4649,19 @@ class HCPHandler(ProfileStreamMixin):
             template_id=row[0], cost=cost, attack=attack, defense=defense,
             gems=gem)
         game.push_troop_card_played(scid, pl_t)
+        for uid in mobilized:
+            from pvp_db import db_card_zone_details
+            mugid = int(uid)
+            mscid = game_engine.SessionCardId(game_engine.UID(mugid))
+            details = db_card_zone_details(
+                session.session_id, mugid, conn=_db)
+            mtpl, mct, _mname, mcost, matk, mdef, mgem = \
+                self._card_full_data(
+                    game, mscid, details[0] if details else None)
+            game.push_card_updated(
+                mscid, pl_t, game_engine.ECardCollections.Warzone, mct,
+                template_id=mtpl, cost=mcost, attack=matk, defense=mdef,
+                gems=mgem, state=int(game_engine.ECardStates.Tapped))
         perm = card_type & (game_engine.ECardTypes.Troop |
                             game_engine.ECardTypes.Artifact |
                             game_engine.ECardTypes.Constant)
@@ -4323,21 +4676,29 @@ class HCPHandler(ProfileStreamMixin):
                 "kind": "troop", "source_uid": card_uid,
                 "ability_guids": [], "target_uid": None,
                 "instance_id": inst_id, "x_cost": 0,
+                "card_cast_event_dispatched": True,
             }
             _be.stack_push(bstate, chain_descriptor)
         else:
             effect_targets = [uid for uid in targets if uid not in cost_uids]
+            from rules_port.card_transactions import \
+                automatic_instance_ability_guids
+            ability_guids = automatic_instance_ability_guids(
+                _db, session.session_id, card_uid,
+                [ability.ability_guid
+                 for ability in play_plan.cast_abilities])
             chain_descriptor = {
                 "kind": "spell", "source_uid": card_uid,
-                "ability_guids": [ability.ability_guid
-                                   for ability in play_plan.cast_abilities],
+                "ability_guids": ability_guids,
                 "target_uid": (effect_targets[-1]
                                 if effect_targets else None),
                 "instance_id": inst_id, "x_cost": x_cost,
+                "played_from_hand": source_location == "hand",
                 "activations": {
                     guid: activation.as_dict()
                     for guid, activation in activations.items()
                 },
+                "card_cast_event_dispatched": True,
             }
             _be.stack_push(bstate, chain_descriptor)
         native_port = getattr(session, "_rules_port_session", None)
@@ -4711,18 +5072,36 @@ class HCPHandler(ProfileStreamMixin):
                         child.target_instances.append(child_target)
                         opt.instances.append(child)
 
+    def _prompt_optional_trigger(self, game, pl_t, ai_t, session, bstate,
+                                 source_uid, ability_guid, target_template_ids,
+                                 candidates, owner_id=None,
+                                 trigger_target_uid=None):
+        """Prompt a human controller for an authored optional trigger.
+
+        Optional triggers use the same class-39 continuation as triggered
+        target choices.  Keeping the packet construction in one path is
+        important: an optional trigger may also have an explicit target, in
+        which case the client first asks whether to opt in and then opens the
+        authored target picker.
+        """
+        return self._prompt_trigger_targets(
+            game, pl_t, ai_t, session, bstate, source_uid, ability_guid,
+            target_template_ids, candidates, owner_id=owner_id,
+            trigger_target_uid=trigger_target_uid, optional=True)
+
     def _prompt_trigger_targets(self, game, pl_t, ai_t, session, bstate,
                                 source_uid, ability_guid, target_template_ids,
                                 candidates, owner_id=None,
-                                trigger_target_uid=None):
-        """Ask the player to choose targets for a triggered ability with
-        explicit targets (e.g. Solitary Exile's Deploy "Void another target
-        card").  Mirrors the client's WaitForTriggeredAbilitiesAction: a
-        PlayerOptionList carrying the legal candidates (filtered through the
-        gamedata target template) plus the class-39
+                                trigger_target_uid=None, optional=False):
+        """Prompt for an optional trigger and/or its explicit targets.
+
+        Mirrors the client's WaitForTriggeredAbilitiesAction: a
+        PlayerOptionList carrying the legal candidates (when authored target
+        input exists) plus the class-39
         TriggeredAbilityActivationDataRequired event.  The follow-up
-        SetAbilityActivationDataTransaction resolves the trigger with the
-        chosen target."""
+        SetAbilityActivationDataTransaction resolves the trigger, or cancels
+        it when an optional ability is declined.
+        """
         _be = self._checkpoint_engine(session)
         inst_id = int(bstate.get("_next_instance_id", 1))
         bstate["_next_instance_id"] = inst_id + 1
@@ -4755,6 +5134,7 @@ class HCPHandler(ProfileStreamMixin):
             "target_template_id": (target_template_ids or [None])[0],
             "trigger_target_uid": (None if trigger_target_uid is None
                                    else int(trigger_target_uid)),
+            "optional": bool(optional),
         }
         # PvP: the trigger choice lives in the PvP state (not the battle
         # state), and the prompt goes only to the choosing player via the
@@ -4801,18 +5181,21 @@ class HCPHandler(ProfileStreamMixin):
                 opt.state = game_engine.ECardUsage.Activate
                 opt_inst = g2._make_event(game_engine.OptionInstanceSessionEventArgs)
                 opt_inst.opt_id = game_engine.ResourceId.from_str(ability_guid)
-                opt_inst.target_ids.append(
-                    game_engine.ResourceId.from_str(target_template_ids[0]))
-                tgt = g2._make_event(game_engine.TargetInstanceSessionEventArgs)
-                # Preserve the authored index. ConfigureAbility uses it when
-                # it serializes this choice into the activation TargetMap.
-                tgt.target_index = target_index
-                tgt.target_id = game_engine.ResourceId.from_str(target_template_ids[0])
-                tgt.targets = [game_engine.SessionCardId(game_engine.UID(int(u)))
-                               for u in (candidates or [])]
-                opt_inst.target_instances.append(tgt)
-                opt_inst.min_target_counts = [1]
-                opt_inst.max_target_counts = [1]
+                if target_template_ids:
+                    opt_inst.target_ids.append(
+                        game_engine.ResourceId.from_str(target_template_ids[0]))
+                    tgt = g2._make_event(
+                        game_engine.TargetInstanceSessionEventArgs)
+                    # Preserve the authored index. ConfigureAbility uses it
+                    # when it serializes this choice into TargetMap.
+                    tgt.target_index = target_index
+                    tgt.target_id = game_engine.ResourceId.from_str(
+                        target_template_ids[0])
+                    tgt.targets = [game_engine.SessionCardId(
+                        game_engine.UID(int(u))) for u in (candidates or [])]
+                    opt_inst.target_instances.append(tgt)
+                    opt_inst.min_target_counts = [1]
+                    opt_inst.max_target_counts = [1]
                 opt.instances.append(opt_inst)
                 ev.options.append(opt)
                 g2._push(ev)
@@ -4842,16 +5225,19 @@ class HCPHandler(ProfileStreamMixin):
         inst.opt_id = game_engine.ResourceId.from_str(ability_guid)
         # ConfigureAbility matches TargetInstances through this parallel list.
         # PvP otherwise receives candidates but cannot open the target picker.
-        inst.target_ids.append(game_engine.ResourceId.from_str(target_template_ids[0]))
-        tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
-        # The explicit target may follow auto targets such as "this".
-        tgt.target_index = target_index
-        tgt.target_id = game_engine.ResourceId.from_str(target_template_ids[0])
-        tgt.targets = [game_engine.SessionCardId(game_engine.UID(int(u)))
-                       for u in (candidates or [])]
-        inst.target_instances.append(tgt)
-        inst.min_target_counts = [1]
-        inst.max_target_counts = [1]
+        if target_template_ids:
+            inst.target_ids.append(
+                game_engine.ResourceId.from_str(target_template_ids[0]))
+            tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
+            # The explicit target may follow auto targets such as "this".
+            tgt.target_index = target_index
+            tgt.target_id = game_engine.ResourceId.from_str(
+                target_template_ids[0])
+            tgt.targets = [game_engine.SessionCardId(game_engine.UID(int(u)))
+                           for u in (candidates or [])]
+            inst.target_instances.append(tgt)
+            inst.min_target_counts = [1]
+            inst.max_target_counts = [1]
         opt.instances.append(inst)
         ev.options.append(opt)
         game._push(ev)
@@ -4942,16 +5328,377 @@ class HCPHandler(ProfileStreamMixin):
                 f"ability={ability_guid[:8]} owner={answer_owner_id}")
         return f"conversation: awaiting {str(conversation_id).lower()}"
 
+    def _apply_fra_battle_modifications(self, game, session, pl_t, ai_t,
+                                        bstate, modifications,
+                                        player_deck_cards, ai_deck_cards,
+                                        drain_setup_stack):
+        """Apply round-zero FRA mods through the same live card/rules state.
+
+        Arena's campaign service owns selection and persistence. This method
+        projects its typed result into the authoritative PvE session before
+        the initial PreGame packet is sent.
+        """
+        from pvp_db import db_insert_game_card, db_game_cards_at_location_scalar
+        from rules_port.resources import apply_resource_change
+
+        owners = {
+            0: ("ai", 0, ai_t, ai_deck_cards),
+            2: ("player", int(self.user_profile["id"]), pl_t,
+                player_deck_cards),
+        }
+        new_decks = {0: False, 2: False}
+        template_cache = {}
+        collection_values = {
+            "deck": game_engine.ECardCollections.Deck,
+            "hand": game_engine.ECardCollections.Hand,
+            "warzone": game_engine.ECardCollections.Warzone,
+            "castspells": game_engine.ECardCollections.CastSpells,
+            "playedresources": game_engine.ECardCollections.PlayedResources,
+            "underground": game_engine.ECardCollections.Underground,
+            "discard": game_engine.ECardCollections.Discard,
+            "crypt": game_engine.ECardCollections.Discard,
+            "void": game_engine.ECardCollections.Void,
+        }
+
+        def _owner_targets(target):
+            target = int(target or 0)
+            return (tuple(owners) if target == 1 else
+                    (target,) if target in owners else ())
+
+        def _push_player_state():
+            game.player_resources = int(bstate.get("player_resources", 0) or 0)
+            game.player_total_resources = int(
+                bstate.get("player_total_resources", 0) or 0)
+            game.player_charges = int(bstate.get("player_charges", 0) or 0)
+            game.player_threshold = {
+                game_engine.ECardShards(int(color)): int(value or 0)
+                for color, value in (bstate.get("player_threshold") or {}).items()
+                if int(value or 0) > 0
+            }
+            game.ai_resources = int(bstate.get("ai_resources", 0) or 0)
+            game.ai_total_resources = int(
+                bstate.get("ai_total_resources", 0) or 0)
+            game.ai_charges = int(bstate.get("ai_charges", 0) or 0)
+            game.ai_threshold = {
+                game_engine.ECardShards(int(color)): int(value or 0)
+                for color, value in (bstate.get("ai_threshold") or {}).items()
+                if int(value or 0) > 0
+            }
+
+        shared_grant_cache = {}
+
+        def _shared_all_player_grant(ability_guids):
+            """Whether one source grants the same permanent aura to both sides.
+
+            EncounterModAddCard targets All by creating one copy per owner.
+            For an authored permanent GrantAbility whose auto target spans
+            MultiplePlayers, that duplicates the same grant on every target.
+            Project a single source for that metadata shape; keep per-owner
+            copies for every other card ability.
+            """
+            key = tuple(dict.fromkeys(
+                str(value).lower() for value in (ability_guids or ()) if value))
+            if key in shared_grant_cache:
+                return shared_grant_cache[key]
+            if not key:
+                shared_grant_cache[key] = False
+                return False
+            from gamedata import DEFAULT_RECORD_STORE, ability_graph
+            result = True
+            for ability_guid in key:
+                graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
+                if graph is None or not graph.effects:
+                    result = False
+                    break
+                for effect in graph.effects:
+                    try:
+                        target_index = int(effect.target_index)
+                    except (TypeError, ValueError):
+                        result = False
+                        break
+                    if (effect.concrete_type != "GrantAbilityEffectTemplate" or
+                            str(effect.duration or "").lower() != "permanent" or
+                            target_index < 0 or target_index >= len(graph.targets)):
+                        result = False
+                        break
+                    target = graph.targets[target_index]
+                    if (not target.is_auto or
+                            str(target.player_filter or "").lower() !=
+                            "multipleplayers"):
+                        result = False
+                        break
+                if not result:
+                    break
+            shared_grant_cache[key] = result
+            return result
+
+        for modification in modifications or ():
+            if int(modification.get("round_to_apply", 0) or 0) != 0:
+                continue
+            wire_type = str(modification.get("wire_type") or "")
+            target_owners = _owner_targets(modification.get("target_player"))
+            if not target_owners:
+                continue
+
+            if wire_type.endswith("EncounterModAddChampionHealth"):
+                amount = int(modification.get("amount", 0) or 0)
+                absolute = bool(modification.get("absolute", False))
+                for target in target_owners:
+                    side = owners[target][0]
+                    key = f"{side}_health"
+                    old = int(bstate.get(key, getattr(
+                        game, f"{side}_health", 20)) or 0)
+                    bstate[key] = max(1, amount if absolute else old + amount)
+                continue
+
+            if wire_type.endswith("EncounterModAddResource"):
+                absolute = bool(modification.get("absolute", False))
+                for target in target_owners:
+                    side = owners[target][0]
+                    total_key = f"{side}_total_resources"
+                    current_key = f"{side}_resources"
+                    charge_key = f"{side}_charges"
+                    total_old = int(bstate.get(total_key, 0) or 0)
+                    resource_amount = int(
+                        modification.get("max_resource_value", 0) or 0)
+                    resource_delta = (resource_amount - total_old
+                                      if absolute else resource_amount)
+                    apply_resource_change(
+                        bstate, side, "totalresource", resource_delta)
+                    apply_resource_change(
+                        bstate, side, "currentresource", resource_delta)
+                    charge_amount = int(
+                        modification.get("charge_value", 0) or 0)
+                    charge_delta = (charge_amount - int(
+                        bstate.get(charge_key, 0) or 0)
+                        if absolute else charge_amount)
+                    apply_resource_change(
+                        bstate, side, "chargepoints", charge_delta)
+                    thresholds = modification.get("threshold_values", ())
+                    for threshold in thresholds if isinstance(
+                            thresholds, (list, tuple)) else ():
+                        color = int(threshold.get("color_flags", 0) or 0)
+                        desired = int(threshold.get("threshold", 0) or 0)
+                        old = int((bstate.get(f"{side}_threshold") or {}).get(
+                            color, (bstate.get(f"{side}_threshold") or {}).get(
+                                str(color), 0)) or 0)
+                        apply_resource_change(
+                            bstate, side, "threshold",
+                            desired - old if absolute else desired,
+                            color=color)
+                _push_player_state()
+                continue
+
+            if not wire_type.endswith("EncounterModAddCard"):
+                # EncounterModDrawCards is applied after the opening hand is
+                # dealt; all other unsupported round-zero mod classes remain
+                # visible in the shared setup result and log for follow-up.
+                if wire_type.endswith("EncounterModDrawCards"):
+                    bstate["fra_refill_hands_after_draw"] = True
+                else:
+                    log_req(f"    FRA encounter mod skipped: {wire_type}")
+                continue
+
+            template_guid = str(modification.get("card_guid") or "").lower()
+            if not template_guid or not db_template_exists(
+                    template_guid, conn=_db):
+                log_req(f"    FRA card mod skipped: invalid template {template_guid}")
+                continue
+            amount = max(0, int(modification.get("amount", 1) or 0))
+            collection = str(modification.get("collection", "Deck") or "Deck")
+            collection_key = collection.lower()
+            location_by_collection = {
+                "deck": "deck", "hand": "hand", "warzone": "warzone",
+                "castspells": "CastSpells", "playedresources": "PlayedResources",
+                "underground": "underground", "discard": "discard",
+                "crypt": "discard", "void": "void",
+            }
+            location = location_by_collection.get(collection_key)
+            if location is None:
+                log_req(f"    FRA card mod skipped: unsupported collection {collection}")
+                continue
+            row = db_template_card_info(template_guid, conn=_db)
+            if not row:
+                log_req(f"    FRA card mod skipped: template row missing {template_guid}")
+                continue
+            setup_data = self._battle_setup_template_data(
+                template_guid, template_cache)
+            if setup_data:
+                abilities_json, attributes, ability_guids, _threshold = setup_data
+            else:
+                abilities_json, attributes, ability_guids = "[]", 0, []
+            if isinstance(abilities_json, str):
+                try:
+                    ability_guids = json.loads(abilities_json)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    ability_guids = []
+            ability_guids = [str(value).lower() for value in
+                             (ability_guids or []) if value]
+            card_target_owners = target_owners
+            if (len(target_owners) > 1 and
+                    _shared_all_player_grant(ability_guids)):
+                card_target_owners = (target_owners[0],)
+                log_req("    FRA shared all-player grant projected once: "
+                        f"card={template_guid[:8]} copies={len(target_owners)}")
+            card_type_name = str(row[0] or "Unknown")
+            card_type = game_engine.card_type_from_db(card_type_name)
+
+            for owner_key in card_target_owners:
+                _side, owner_id, owner_uid, deck_cards = owners[owner_key]
+                for _ in range(amount):
+                    scid = game._new_card_id()
+                    card_uid = int(scid.uid.uid64)
+                    position = db_zone_card_count(
+                        session.session_id, owner_id, location, conn=_db)
+                    db_insert_game_card(
+                        session.session_id, owner_id, card_uid, template_guid,
+                        location, card_type=card_type_name, position=position,
+                        abilities_json=json.dumps(ability_guids),
+                        attributes=int(attributes or 0), conn=_db)
+                    _tpl, _ctype, _name, _cost, _attack, _defense, _gems = \
+                        self._card_full_data(game, scid, template_guid)
+                    collection_value = collection_values[collection_key]
+                    game.push_card_updated(
+                        scid, owner_uid, collection_value,
+                        card_type, template_id=template_guid,
+                        nulling=(location == "deck" or
+                                 (location == "underground" and owner_id == 0)))
+
+                    self._dispatch_game_trigger(
+                        game, session, pl_t, ai_t, bstate,
+                        "CardCreatedEvent", card_uid, owner_id)
+                    drain_setup_stack(bstate)
+
+                    if location == "CastSpells":
+                        from rules_port.chain_items import (
+                            dispatch_card_cast, resolve_card_item)
+                        dispatch_card_cast(
+                            self, session, game, bstate, pl_t, ai_t,
+                            card_uid, owner_id)
+                        resolve_card_item(
+                            self, session, _db, game, bstate,
+                            {"kind": "spell", "source_uid": card_uid,
+                             "ability_guids": ability_guids}, pl_t, ai_t)
+                        drain_setup_stack(bstate)
+                    elif location == "warzone":
+                        game.push_card_moved(
+                            scid, owner_uid, game_engine.ECardCollections.Warzone,
+                            game_engine.ECardLocations.Top, position)
+                        if card_type & game_engine.ECardTypes.Artifact:
+                            game.push_artifact_card_played(scid, owner_uid)
+                        elif card_type & game_engine.ECardTypes.Troop:
+                            game.push_troop_card_played(scid, owner_uid)
+                        self._dispatch_game_trigger(
+                            game, session, pl_t, ai_t, bstate,
+                            "CardEnteredZoneEvent", card_uid, owner_id,
+                            event_source_collection="Deck",
+                            event_destination_collection="warzone")
+                        drain_setup_stack(bstate)
+                    elif location == "deck":
+                        game.push_card_updated(
+                            scid, owner_uid, game_engine.ECardCollections.Deck,
+                            card_type, nulling=True)
+                        deck_cards.append(scid)
+                        new_decks[owner_key] = True
+                    elif location == "hand":
+                        game.push_card_moved(
+                            scid, owner_uid, game_engine.ECardCollections.Hand,
+                            game_engine.ECardLocations.Top, position)
+                    elif location == "underground":
+                        game.push_card_moved(
+                            scid, owner_uid,
+                            game_engine.ECardCollections.Underground,
+                            game_engine.ECardLocations.Top, position)
+
+            if bool(modification.get("shuffle")) and collection_key == "deck":
+                import random as _fra_random
+                for owner_key in target_owners:
+                    _side, owner_id, _owner_uid, deck_cards = owners[owner_key]
+                    ordered = db_game_cards_at_location_scalar(
+                        session.session_id, "deck", user_id=owner_id, conn=_db)
+                    _fra_random.shuffle(ordered)
+                    _db.executemany(
+                        "UPDATE game_cards SET position=? WHERE session_id=? "
+                        "AND card_uid=?",
+                        [(index, session.session_id, int(uid))
+                         for index, uid in enumerate(ordered)])
+
+            _db.commit()
+
+        # Keep the final authoritative deck list/count in the same setup
+        # packet after any challenge-injected cards were appended.
+        for owner_key, changed in new_decks.items():
+            if not changed:
+                continue
+            _side, _owner_id, owner_uid, deck_cards = owners[owner_key]
+            sleeve = (getattr(self, "_ai_deck_sleeve_guid", "")
+                      if owner_key == 0 else
+                      getattr(self, "_player_deck_sleeve_guid", ""))
+            game.push_deck_created_with_cards(
+                owner_uid, deck_cards, sleeve_guid=sleeve)
+
+        _push_player_state()
+        for key, uid, template_guid in (
+                ("player_health", self._player_champ_scid,
+                 getattr(self, "_player_champ_guid", "")),
+                ("ai_health", self._ai_champ_scid,
+                 getattr(self, "_ai_champ_guid", ""))):
+            health = int(bstate.get(key, 20) or 20)
+            if key == "player_health":
+                game.player_health = health
+            else:
+                game.ai_health = health
+            card_def = game.card_defs.get(uid)
+            if card_def is not None:
+                card_def.defense = health
+            owner_uid = pl_t if key == "player_health" else ai_t
+            game.push_card_updated(
+                uid, owner_uid, game_engine.ECardCollections.None_,
+                game_engine.ECardTypes.Champion, defense=health,
+                template_id=template_guid)
+        game.push_player_updated(
+            pl_t, champ_id=getattr(self, "_player_champ_scid", None))
+        game.push_player_updated(
+            ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
+
+        # The following Mulligan keep transaction builds a fresh state. Save
+        # the mod-adjusted start values there so setup bonuses survive it.
+        encounter_data = dict(session.encounter_data or {})
+        encounter_data["_fra_starting_battle_state"] = {
+            key: bstate.get(key) for key in (
+                "player_health", "ai_health", "player_resources",
+                "player_total_resources", "ai_resources",
+                "ai_total_resources", "player_charges", "ai_charges",
+                "player_threshold", "ai_threshold")}
+        session.encounter_data = encounter_data
+        persist = getattr(session, "_persist", None)
+        if callable(persist):
+            persist()
+
     def _resolve_pending_conversation(self, session, transaction):
         """Resume a BOM after the client closes class-55 conversation UI."""
         _be = self._checkpoint_engine(session)
         pending_state = _be.load_state(session)
         pending = pending_state.get("pending_conversation")
-        if not pending:
-            self._push_transaction_ack(session)
-            return True
         conversation_id = extract_resource_guid(
             transaction.inner_bytes, "ConversationId")
+        if not pending:
+            # FRA challenge conversations are queued directly by battle
+            # setup, rather than by a BOM ability continuation.  The stock
+            # client only sends the conversation GUID when its authored
+            # answer (the row's answer_text) is clicked, so record that as
+            # accepting the current challenge before acknowledging the
+            # class-55 transaction.
+            if conversation_id:
+                from services.arena import (
+                    record_fra_challenge_conversation_answer)
+                if record_fra_challenge_conversation_answer(
+                        self.user_profile["id"], conversation_id):
+                    log_req(
+                        "    FRA challenge answer accepted: "
+                        f"{conversation_id[:8]}")
+            self._push_transaction_ack(session)
+            return True
         if (conversation_id and conversation_id != str(
                 pending.get("conversation_id", "")).lower()):
             log_req(f"    Conversation answer rejected: got {conversation_id}, "
@@ -5154,7 +5901,8 @@ class HCPHandler(ProfileStreamMixin):
                 f"parent={pending.get('parent', {}).get('ability_guid')} "
                 f"parent_resume="
                 f"{pending.get('parent', {}).get('resume_effect_order')} "
-                f"child={pending.get('continuation', {}).get('ability_guid')}")
+                f"child={pending.get('continuation', {}).get('ability_guid')}",
+                level="DEBUG")
 
         def build_prompt(target_game, player_uid):
             ev = target_game._make_event(
@@ -5352,6 +6100,7 @@ class HCPHandler(ProfileStreamMixin):
                 if completed:
                     bstate["completed_chain_instance_id"] = completed
             _be.save_state(session, bstate)
+            projected = False
             if bstate.get("pending_choice"):
                 self._send_battle_events(session, g, pl_t)
             else:
@@ -5361,8 +6110,16 @@ class HCPHandler(ProfileStreamMixin):
                     # Publish the selected card's effects before the finish
                     # pass removes the waiting chain item.
                     self._send_battle_events(session, g, pl_t)
-                    self._resume_completed_rules_port_chain(
+                    finished_chain = self._resume_completed_rules_port_chain(
                         session, bstate, completed_chain)
+                    if (finished_chain and
+                            not bstate.get("resolution_paused")):
+                        # Completing the item can expose the next native
+                        # chain item (a trigger the chosen card raised) or end
+                        # the paused phase; re-project that priority window
+                        # instead of leaving the client on a stale pass button.
+                        projected = self._advance_rules_port_to_priority(
+                            session, pl_t, ai_t, bstate)
                 else:
                     # Non-chain choice effects still need the legacy empty
                     # chain/priority projection. A paused RulesPort chain item
@@ -5372,11 +6129,13 @@ class HCPHandler(ProfileStreamMixin):
                     g.push_green_light(
                         pl_t, game_engine.EPriorityContext.Normal)
                     self._send_battle_events(session, g, pl_t)
-                if _be.current_phase(bstate) in (
-                        game_engine.ETurnPhases.FirstMainPhase,
-                        game_engine.ETurnPhases.SecondMainPhase):
-                    self._push_main_phase_options(session, pl_t, ai_t)
-            self._push_transaction_ack(session)
+                if not projected:
+                    if _be.current_phase(bstate) in (
+                            game_engine.ETurnPhases.FirstMainPhase,
+                            game_engine.ETurnPhases.SecondMainPhase):
+                        self._push_main_phase_options(session, pl_t, ai_t)
+            if not projected:
+                self._push_transaction_ack(session)
             log_req(f"    Choice selected: {hex(int(chosen_uid))} "
                     f"for {child_guid[:8]} target")
             return True
@@ -5689,8 +6448,13 @@ class HCPHandler(ProfileStreamMixin):
         if port is not None:
             owner_id = int(pend.get("owner_id", 0) or 0)
             target_index = int(pend.get("target_index", 0) or 0)
-            target_map = ({} if chosen_uid is None else
-                          {str(target_index): [int(chosen_uid)]})
+            activation_data = pend.get("activation_data")
+            activation_data = (dict(activation_data)
+                               if isinstance(activation_data, Mapping) else {})
+            target_map = dict(activation_data.get("target_map") or {})
+            if chosen_uid is not None:
+                target_map[str(target_index)] = [int(chosen_uid)]
+            activation_data["target_map"] = target_map
             descriptor = {
                 "kind": "trigger",
                 "ability_guid": ag,
@@ -5699,7 +6463,7 @@ class HCPHandler(ProfileStreamMixin):
                 "target_uid": (None if chosen_uid is None
                                else int(chosen_uid)),
                 "trigger_target_uid": pend.get("trigger_target_uid"),
-                "activation_data": {"target_map": target_map},
+                "activation_data": activation_data,
                 "instance_id": inst_id,
             }
             queue_chain = getattr(port, "queue_projected_chain", None)
@@ -5722,8 +6486,19 @@ class HCPHandler(ProfileStreamMixin):
                 ability_instance_id=inst_id,
                 target_card_ids=target_cards,
                 ignores_chain=bool(graph and graph.ignores_chain))
-            g.push_green_light(pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
-            self._send_battle_events(session, g, pl_t)
+            event_sink = getattr(port, "event_sink", None)
+            if event_sink is not None:
+                # ``queue_projected_chain`` starts APNAP priority with the
+                # active player, which is commonly the Practice AI here.  Do
+                # not project a human GreenLight until that server-owned
+                # response has gone through the same native pass/drive path
+                # used by ordinary chain continuations.
+                self._advance_rules_port_to_priority(
+                    session, pl_t, ai_t, bstate)
+            else:
+                g.push_green_light(
+                    pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
+                self._send_battle_events(session, g, pl_t)
             self._push_transaction_ack(session)
             log_req(f"    RulesPort trigger target chosen: {ag[:8]} "
                     f"target={hex(chosen_uid) if chosen_uid else 'none'}")
@@ -5769,6 +6544,92 @@ class HCPHandler(ProfileStreamMixin):
                     session._rules_port_mutation_emitted = True
                 return handled
             return False
+
+        def activation_record(value):
+            """Select this prompt's AbilityActivationData record."""
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            first = None
+            wanted_instance = int(pending.get("instance_id", 0) or 0)
+            wanted_guid = str(pending.get("ability_guid") or "").lower()
+            for candidate in values:
+                if not isinstance(candidate, Mapping):
+                    continue
+                if first is None:
+                    first = candidate
+                try:
+                    instance = int(candidate.get(
+                        "ability_instance_id", candidate.get("instance_id", 0)) or 0)
+                except (TypeError, ValueError):
+                    instance = 0
+                guid = str(candidate.get("ability_template_id",
+                                        candidate.get("ability_guid", "")) or "").lower()
+                if ((wanted_instance and instance == wanted_instance) or
+                        (wanted_guid and guid == wanted_guid)):
+                    return dict(candidate)
+            return dict(first or {})
+
+        def flag(value, default=False):
+            if value is None:
+                return default
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+
+        activation = activation_record(payload)
+        if pending.get("optional"):
+            # The client sets either OptedIn=false or Disable=true when the
+            # optional trigger is declined. Missing fields are accepted for
+            # older clients that submit the target envelope without the opt-in
+            # members; an explicit false is the only decline signal.
+            declined = (flag(activation.get("disable")) or
+                        ("opted" in activation and
+                         not flag(activation.get("opted"))))
+            pending["activation_data"] = activation
+            if declined:
+                owner_id = int(pending.get("owner_id", 0) or 0)
+                instance_id = int(pending.get("instance_id", 1) or 1)
+                state.pop("pending_trigger", None)
+                _be.save_state(session, state)
+                pl_t = game_engine.UID.make(244, int(self.client_reck_id))
+                ai_t = game_engine.UID.make(3, 1000)
+                game = self._fresh_game(session, pl_t, ai_t, state)
+                game.push_ability_cancelled(
+                    instance_id, game_engine.UID.make(244, owner_id))
+                port = getattr(session, "_rules_port_session", None)
+                event_sink = getattr(port, "event_sink", None)
+                native_scheduler = port is not None and event_sink is not None
+                if native_scheduler:
+                    # The trigger prompt temporarily owns the client UI, but
+                    # its answer must return through the native scheduler.
+                    # In Practice the active AI is first in the response
+                    # queue; let it pass before projecting the next human
+                    # window instead of sending a GreenLight for a player
+                    # that does not yet own native priority.
+                    self._advance_rules_port_to_priority(
+                        session, pl_t, ai_t, state)
+                else:
+                    if _be.stack_empty(state):
+                        game.push_chain_empty()
+                        phase = _be.current_phase(state)
+                        game.push_green_light(
+                            pl_t, self._priority_context_for(phase, state))
+                    else:
+                        game.push_green_light(
+                            pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
+                    self._send_battle_events(session, game, pl_t)
+                self._push_transaction_ack(session)
+                if (not native_scheduler and _be.stack_empty(state) and
+                        _be.current_phase(state) in (
+                            game_engine.ETurnPhases.FirstMainPhase,
+                            game_engine.ETurnPhases.SecondMainPhase)):
+                    self._push_main_phase_options(session, pl_t, ai_t)
+                log_req(f"    Optional trigger declined: "
+                        f"{pending.get('ability_guid', '')[:8]}")
+                session._rules_port_mutation_emitted = True
+                return True
+            pending.pop("optional", None)
+            _be.save_state(session, state)
+
         found = []
         def walk(value):
             if isinstance(value, Mapping):
@@ -5791,14 +6652,14 @@ class HCPHandler(ProfileStreamMixin):
         # slot so unrelated activation values cannot be mistaken for the
         # selected card.
         target_index = int(pending.get("target_index", 0) or 0)
-        target_map = (payload.get("target_map", {})
-                      if isinstance(payload, Mapping) else {})
+        target_map = (activation.get("target_map", {})
+                      if isinstance(activation, Mapping) else {})
         if isinstance(target_map, Mapping):
             selected = target_map.get(
                 target_index, target_map.get(str(target_index)))
             walk(selected)
         if not found:
-            walk(payload)
+            walk(activation if activation else payload)
         if found:
             pending["selected_uid"] = found[-1]
             _be.save_state(session, state)
@@ -5942,10 +6803,10 @@ class HCPHandler(ProfileStreamMixin):
                 game.push_green_light(
                     pl_t, game_engine.EPriorityContext.Normal)
             self._send_battle_events(session, game, pl_t)
+            finished_chain = False
             if completed_chain is not None:
-                self._resume_completed_rules_port_chain(
+                finished_chain = self._resume_completed_rules_port_chain(
                     session, state, completed_chain)
-            self._push_transaction_ack(session)
             session._rules_port_mutation_emitted = True
             log_req(f"    RulesPort discard continuation: {chosen_uid} -> {result}")
             # The Deathcry that opened this picker fired during the AI's turn
@@ -5955,11 +6816,23 @@ class HCPHandler(ProfileStreamMixin):
             # deck-search prompt.
             ai_idx = state.get("ai_turn_phase_idx")
             if ai_idx is not None and not state.get("resolution_paused"):
+                self._push_transaction_ack(session)
                 state.pop("ai_turn_phase_idx", None)
                 _be.save_state(session, state)
                 log_req(f"    Discard answered — resuming AI turn at idx {ai_idx}")
                 self._run_ai_turn(session, pl_t, ai_t, state,
                                   start_idx=int(ai_idx))
+                return True
+            # A picker continuation that finishes its chain item can expose
+            # the next native chain item (a trigger the draw/discard raised,
+            # e.g. Mysterious Rune's "when a resource enters your hand") or
+            # end the paused phase.  Re-project the native priority window;
+            # an empty acknowledgement left the client on a Normal pass
+            # button while the trigger stayed on the chain.
+            if not (finished_chain and not state.get("resolution_paused") and
+                    self._advance_rules_port_to_priority(
+                        session, pl_t, ai_t, state)):
+                self._push_transaction_ack(session)
             return True
         if not state.get("pending_discard_ability"):
             return False
@@ -6233,8 +7106,8 @@ class HCPHandler(ProfileStreamMixin):
                     instance_id=int(native_continuation.get(
                         "ability_instance_id", pend.get("instance_id", 1))))
                 parent = native_continuation.get("parent") or {}
-                if parent.get("ability_guid") and not bstate.get(
-                        "resolution_paused"):
+                while (parent.get("ability_guid") and not bstate.get(
+                        "resolution_paused")):
                     resolve_port_ability(
                         self, g, session, _db, pl_t, ai_t, bstate,
                         str(parent.get("ability_guid") or "").lower(),
@@ -6245,7 +7118,10 @@ class HCPHandler(ProfileStreamMixin):
                         variables=parent.get("variables") or {},
                         resume_from_order=int(parent.get(
                             "resume_effect_order", 0)),
-                        instance_id=int(parent.get("ability_instance_id", 1)))
+                        instance_id=int(parent.get(
+                            "ability_instance_id",
+                            parent.get("instance_id", 1))))
+                    parent = parent.get("parent") or {}
                 # The continuation resolved the child plus its enclosing
                 # activation, so the chain item only needs its finishing
                 # projection on the next pass.
@@ -6256,8 +7132,19 @@ class HCPHandler(ProfileStreamMixin):
                         bstate["completed_chain_instance_id"] = completed
                 _be.save_state(session, bstate)
                 self._send_battle_events(session, g, pl_t)
-                self._resume_completed_rules_port_chain(session, bstate)
-                self._push_transaction_ack(session)
+                completed = self._resume_completed_rules_port_chain(
+                    session, bstate)
+                if completed:
+                    # Finishing the chain item can end the paused phase: a
+                    # trigger resolved during Draw advances to First Main.
+                    # Re-project the native priority window, or the client
+                    # keeps the stale ResolveTopOfChain button and its next
+                    # click passes the phase the player never saw.
+                    if not self._advance_rules_port_to_priority(
+                            session, pl_t, ai_t, bstate):
+                        self._push_transaction_ack(session)
+                else:
+                    self._push_transaction_ack(session)
                 return True
             destination = str(pend.get("move_destination") or "hand").lower()
             location = str(pend.get("move_location") or "").lower()
@@ -6496,7 +7383,8 @@ class HCPHandler(ProfileStreamMixin):
         return None
 
     def _filter_affordable_abilities(self, abilities, bstate, phase=None, *,
-                                     target_data=None, cost_data=None):
+                                     target_data=None, cost_data=None,
+                                     session=None):
         """Filter champion abilities to only those activatable in the current phase
         and affordable (charges/SP >= cost). Pass `phase` (an ETurnPhases value) to
         also gate on activatable_phases (a bitmask where bit N = 1<<N).
@@ -6520,6 +7408,19 @@ class HCPHandler(ProfileStreamMixin):
         sp = bstate.get("player_spell_points", 0)
         phase_bit = (1 << phase) if phase is not None else 0
         chain_pending = bool(bstate.get("stack"))
+        # Session.CanActivateChargeAbilitiesAsQuick: a warzone card with this
+        # flag lets the player treat charge powers as QuickActions.
+        quick_charges = False
+        if session is not None:
+            try:
+                from rules_port.static_rules import owner_has_card_int_attr
+                owner = (int(self.user_profile.get("id", 0) or 0)
+                         if isinstance(self.user_profile, dict) else 0)
+                quick_charges = owner_has_card_int_attr(
+                    _db, session.session_id, owner,
+                    "YouCanActivateYourChargePowersAsThoughTheyWereQuick")
+            except Exception:
+                quick_charges = False
         # Spell-power escalation: each use permanently bumps that spell's SP cost
         # by +1 (mirrors Session.cs:1154 IncrementSpellPointCostModifier).
         # Only spell powers (spell_cost > 0) escalate; charge powers don't.
@@ -6560,20 +7461,21 @@ class HCPHandler(ProfileStreamMixin):
             if row:
                 cc, sc, aphases, casting = row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0
                 if casting != 64:
-                    # BasicAction abilities cannot be activated while a chain
-                    # item is resolving. The source champion still appears on
-                    # the chain, but its BasicAction button must not remain
-                    # clickable from the previous option list.
-                    if chain_pending:
-                        continue
-                    # BasicAction etc.: only on the PLAYER's own main phases.
-                    # During the opponent's turn there is no player main phase,
-                    # so a BasicAction charge power must not be offered even if
-                    # the AI happens to be in FirstMain.
-                    if bstate.get("turn_player") != _be.PLAYER:
-                        continue
-                    if phase is not None and not (aphases & phase_bit):
-                        continue  # not activatable this phase (QuickAction exempt)
+                    if not (cc > 0 and quick_charges):
+                        # BasicAction abilities cannot be activated while a
+                        # chain item is resolving. The source champion still
+                        # appears on the chain, but its BasicAction button must
+                        # not remain clickable from the previous option list.
+                        if chain_pending:
+                            continue
+                        # BasicAction etc.: only on the PLAYER's own main
+                        # phases. During the opponent's turn there is no player
+                        # main phase, so a BasicAction charge power must not be
+                        # offered even if the AI happens to be in FirstMain.
+                        if bstate.get("turn_player") != _be.PLAYER:
+                            continue
+                        if phase is not None and not (aphases & phase_bit):
+                            continue  # not activatable (QuickAction exempt)
                 eff_sc = sc + (int(sp_uses.get(str(aid.guid), 0)) if sc > 0 else 0)
                 if (charges >= cc and sp >= eff_sc
                         and payable
@@ -6655,16 +7557,16 @@ class HCPHandler(ProfileStreamMixin):
     def _discard_prompt_data(self, ability_guid, *, bstate=None):
         """Return ``(ability_guid, hand_target_template)`` for a discard.
 
-        Most abilities expose a dedicated discard BOM leaf.  An ability-level
-        discard payment is represented by the same typed target contract and
-        is returned directly when no discard leaf exists.
+        Only a dedicated discard BOM leaf opens the class-23 follow-up prompt.
+        An ability-level discard payment is a normal typed CostInstance and is
+        paid with the other authored activation costs.
         """
-        from rules_port.metadata import ability_effect_prompt, ability_cost_prompt
+        from rules_port.metadata import ability_effect_prompt
         prompt = ability_effect_prompt(
             ability_guid, "DiscardCardAbilityEffectTemplate")
         if prompt and prompt[1]:
             return prompt
-        return ability_cost_prompt(ability_guid, "discard")
+        return None
 
     def _ability_requires_discard(self, ability_guid):
         """Return whether activation requires the controller to discard.
@@ -6786,7 +7688,8 @@ class HCPHandler(ProfileStreamMixin):
         before the chain item is created.
         """
         from rules_port.costs import (ability_cost_targets,
-                                      cost_type_for_kind)
+                                      cost_type_for_kind,
+                                      validate_cost_target_selection)
         from rules_port.targeting import legal_targets_for
         graph = _records_ability_graph(self, ability_guid)
         if graph is None:
@@ -6814,6 +7717,12 @@ class HCPHandler(ProfileStreamMixin):
                 return None
             limit = len(available) if maximum < 0 else maximum
             chosen = available[:limit]
+            chosen = validate_cost_target_selection(
+                _db, session.session_id, self.user_profile["id"],
+                int(champ_uid), cost, chosen,
+                champions=self._champion_targets(), battle_state=bstate)
+            if chosen is None:
+                return None
             used.update(chosen)
             if int(cost_type) == 2:
                 sacrifices.extend(chosen)
@@ -6941,7 +7850,8 @@ class HCPHandler(ProfileStreamMixin):
                     session, abilities, champ_uid)
                 affordable_champ = self._filter_affordable_abilities(
                     abilities, bstate, _be.current_phase(bstate),
-                    target_data=champ_targets, cost_data=champ_costs)
+                    target_data=champ_targets, cost_data=champ_costs,
+                    session=session)
                 game.add_champion_to_options(
                     pl_t, player_champ_cid, affordable_champ,
                     self._discard_costs_for(session, abilities),
@@ -7238,13 +8148,35 @@ class HCPHandler(ProfileStreamMixin):
                              int(row[0]))
                    for row in rows for attacker_uid in attackers)
 
+    def _finish_battle_gameend(self, session, won, winners, losers):
+        """Persist FRA progress before publishing the terminal event.
+
+        ArenaClient immediately joins the Arena lobby after it receives
+        ``GameEnded``.  The FRA result therefore has to advance the persisted
+        challenger index before that event is sent.  Campaign and tournament
+        sessions retain their existing post-event result handling.
+        """
+        import commands as _cmd
+        prepared = campaign.prepare_fra_battle_gameend(
+            self, _db, session, won)
+        _cmd.push_battle_game_end(
+            handler=self, session=session,
+            winners=winners, losers=losers)
+        if prepared is not None:
+            campaign.publish_fra_battle_gameend(
+                self, prepared, SERVICE_MAIL_UID)
+        else:
+            campaign.handle_battle_gameend(
+                self, _db, session, won, SERVICE_MAIL_UID,
+                UID_TYPE["ServiceCampaign"])
+        return prepared
+
     def _check_champion_health(self, session, pl_t, ai_t, bstate):
         """End the game immediately when a champion's health is 0 or less.
         State checks run at EVERY phase (and after chain resolutions), not
         only when combat damage happens — e.g. the AI killing itself with its
         own Fang of the Mountain God must not leave a 0-health champion alive
         until the player's next combat."""
-        import commands as _cmd
         ph = int(bstate.get("player_health", 20))
         ah = int(bstate.get("ai_health", 20))
         # Give metadata-defined survival abilities their client-equivalent
@@ -7285,15 +8217,13 @@ class HCPHandler(ProfileStreamMixin):
                 self._send_battle_events(session, loss_game, pl_t)
             ah = int(bstate.get("ai_health", 20))
         if ph <= 0:
-            _cmd.push_battle_game_end(handler=self, session=session,
-                                      winners=[ai_t], losers=[pl_t])
-            campaign.handle_battle_gameend(self, _db, session, False, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
+            self._finish_battle_gameend(
+                session, False, winners=[ai_t], losers=[pl_t])
             log_req(f"    Game over: player health {ph} <= 0 (AI wins)")
             return True
         if ah <= 0:
-            _cmd.push_battle_game_end(handler=self, session=session,
-                                      winners=[pl_t], losers=[ai_t])
-            campaign.handle_battle_gameend(self, _db, session, True, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
+            self._finish_battle_gameend(
+                session, True, winners=[pl_t], losers=[ai_t])
             log_req(f"    Game over: AI health {ah} <= 0 (player wins)")
             return True
         return False
@@ -7890,6 +8820,26 @@ class HCPHandler(ProfileStreamMixin):
             game, session, player_uid, ai_uid, state, event_type, source_uid,
             owner_id, **event_data)
 
+    def chain_state_based(self, session, state, game, player_uid, ai_uid):
+        """Apply lethal state-based actions before chain priority returns."""
+        from rules_port.context import EffectContext
+        from rules_port.death_effects import state_based_deaths
+        state["_rules_port_attached"] = True
+        previous = getattr(self, "_current_bstate", None)
+        self._current_bstate = state
+        try:
+            return bool(state_based_deaths(EffectContext.from_rules_port(
+                game, session, _db, self, player_uid, ai_uid, state,
+                "state_based_death", ability=None)))
+        finally:
+            if previous is None:
+                try:
+                    del self._current_bstate
+                except AttributeError:
+                    pass
+            else:
+                self._current_bstate = previous
+
     def chain_mark_warzone_entry(self, session, source_uid):
         """Permanent bookkeeping for a troop/artifact reaching the warzone."""
         db_card_set_warzone_arrival(session.session_id, source_uid)
@@ -7999,15 +8949,14 @@ class HCPHandler(ProfileStreamMixin):
                         "CardEnteredZoneEvent", uid, owner_id,
                         event_source_collection="CastSpells",
                         event_destination_collection="warzone")
-                    # CardCastEvent is emitted for every non-resource card,
-                    # including permanents.  This is distinct from the
-                    # enters-play event above: cards such as Jadiim react to
-                    # the act of playing a troop and use that card's cost.
-                    bstate["card_cast_copy_target"] = uid
-                    self._dispatch_game_trigger(
-                        game, session, pl_t, ai_t, bstate,
-                        "CardCastEvent", uid, owner_id)
-                    bstate.pop("card_cast_copy_target", None)
+                    # Normal plays publish CardCastEvent when they enter the
+                    # chain. Keep a fallback for legacy/effect-created chain
+                    # items, using the same champion-source/card-target shape.
+                    if not item.get("card_cast_event_dispatched"):
+                        from rules_port.chain_items import dispatch_card_cast
+                        dispatch_card_cast(
+                            self, session, game, bstate, pl_t, ai_t, uid,
+                            owner_id)
         elif kind == "trigger":
             from rules_port.resolution import resolve_port_trigger
             resolve_port_trigger(self, game, session, _db, pl_t, ai_t,
@@ -8046,7 +8995,8 @@ class HCPHandler(ProfileStreamMixin):
             resolve_port_played_spell(
                 game, session, _db, self, pl_t, ai_t, bstate,
                 item.get("ability_guids", []),
-                activations=item.get("activations"))
+                activations=item.get("activations"),
+                played_from_hand=bool(item.get("played_from_hand")))
             # A reveal/deck-search or revealed-card selection is a real client
             # continuation.  Do not move the spell to the graveyard or emit
             # ChainEmpty until that continuation has supplied its target; the
@@ -8057,17 +9007,16 @@ class HCPHandler(ProfileStreamMixin):
                 return game
             # "When you play an action/... " triggers (e.g. Chimes of the
             # Zodiac's "copy it") fire against the played spell.
-            if item.get("source_uid"):
-                bstate["card_cast_copy_target"] = item.get("source_uid")
-                # The event owner is the card's controller.  Using the human
-                # profile here misattributes AI casts (and causes controller-
-                # scoped triggers such as Jadiim to be skipped or to buff the
-                # wrong side).
+            if (item.get("source_uid") and
+                    not item.get("card_cast_event_dispatched")):
+                # Keep the event source/target identities consistent for AI
+                # and player casts. Champion triggers such as Rowdy inspect
+                # the cast card through TriggerTarget.
+                from rules_port.chain_items import dispatch_card_cast
                 cast_owner_id = int(loc_details[0] or 0) if loc_details else 0
-                self._dispatch_game_trigger(
-                    game, session, pl_t, ai_t, bstate, "CardCastEvent",
-                    item.get("source_uid"), cast_owner_id)
-                bstate.pop("card_cast_copy_target", None)
+                dispatch_card_cast(
+                    self, session, game, bstate, pl_t, ai_t,
+                    int(item["source_uid"]), cast_owner_id)
             bstate.pop("player_spell_target", None)
             bstate.pop("resolving_source_uid", None)
             bstate.pop("x_cost", None)
@@ -8254,13 +9203,18 @@ class HCPHandler(ProfileStreamMixin):
         return game
 
     def _max_hand_size(self, session):
-        """Return the effective maximum hand size for the active battle."""
+        """Return the effective maximum hand size for the active battle.
+
+        Client ``Player.MaximumHandSize``: ten in PvE/PvE Arena, seven in PvP
+        (tournament) sessions.  Campaign class/talent metadata can raise or
+        lower the PvE value through ``MaximumHandSizeModifiers``.
+        """
         try:
-            if (session.session_name or "").startswith("camp_"):
-                return int(getattr(self, "_campaign_max_hand_size", 7))
+            if (session.session_name or "").startswith("tourney-"):
+                return 7
         except Exception:
             pass
-        return 7
+        return int(getattr(self, "_campaign_max_hand_size", 10))
 
     def _starting_hand_size(self, session):
         """Return the effective opening-hand count for the active battle."""
@@ -8395,11 +9349,15 @@ class HCPHandler(ProfileStreamMixin):
                          for i in ((bstate or {}).get("stack") or [])
                          if i.get("source_uid")}
         rows = db_warzone_display_rows(session.session_id, conn=_db)
+        projections = db_card_instance_dynamic_projections(
+            session.session_id, [row[0] for row in rows], conn=_db)
         for card_uid, tpl_guid, user_id, cstate, _card_type in rows:
             if int(card_uid) in chain_sources:
                 continue
             scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
-            _tpl, ct, _n, _c, _a, _d, _g = self._card_full_data(game, scid, tpl_guid)
+            _tpl, ct, _n, _c, _a, _d, _g = self._card_full_data(
+                game, scid, tpl_guid,
+                instance_projection=projections.get(int(card_uid)))
             cdef = game.card_defs.get(scid)
             attrs = cdef.attributes if cdef else 0
             owner = owner_uid(user_id, pl_t, ai_t, bstate)
@@ -8413,7 +9371,7 @@ class HCPHandler(ProfileStreamMixin):
         """Project the native Prep lifecycle for the active controller."""
         from rules_port.lifecycle import (build_turn_phases,
                                           clear_expired_temporary_attributes,
-                                          ready_cards_for_turn)
+                                          ready_cards_for_turn, reset_armor)
         from rules_port.resources import project_resource_change
 
         pl_t, ai_t = projection_game.player_uid, projection_game.ai_uid
@@ -8432,6 +9390,7 @@ class HCPHandler(ProfileStreamMixin):
         clear_expired_temporary_attributes(
             _db, session.session_id, owner_id, "start_turn",
             clear_stat_buffs=True, battle_state=bstate, handler=self)
+        reset_armor(_db, session.session_id, bstate)
         changes = ready_cards_for_turn(_db, session.session_id, owner_id)
         recipient = pl_t if is_player else ai_t
         for uid, template_guid, card_owner, previous_state, new_state in changes:
@@ -8547,6 +9506,10 @@ class HCPHandler(ProfileStreamMixin):
         # Stealth" check still sees the counter that is being removed.
         from rules_port.stealth import advance as stealth_advance
         stealth_changes = stealth_advance(context, active_owner)
+        from rules_port.zone_effects import lifebound as lifebound_returns
+        lifebound_changes = lifebound_returns(context, active_owner)
+        replenished = self._replenish_other_resources(
+            game, session, bstate, pl_t, ai_t, active_owner)
         surfaces = queue_surfaces(context, active_owner)
         if _previous_phase is None:
             bstate.pop("phase", None)
@@ -8555,7 +9518,61 @@ class HCPHandler(ProfileStreamMixin):
         if emit_events:
             self._send_battle_events(session, game, pl_t)
         return {"tunneling": changes, "surfaces": surfaces,
-                "stealth": stealth_changes}
+                "stealth": stealth_changes,
+                "lifebound": lifebound_changes,
+                "replenished": replenished}
+
+    def _replenish_other_resources(self, game, session, bstate, pl_t, ai_t,
+                                   active_owner):
+        """Session.ResetActiveResourcePool: ReplenishResourcesEachTurn.
+
+        The active player's pool refills at Prep; a non-active champion with
+        this flag also refills at the start of the opposing turn.
+        """
+        from rules_port.static_rules import champion_int_attribute
+        changed = []
+        for participant in (bstate.get("champ_map") or {}):
+            try:
+                owner = int(participant)
+            except (TypeError, ValueError):
+                continue
+            if owner == int(active_owner or 0):
+                continue
+            if champion_int_attribute(
+                    bstate, owner, "ReplenishResourcesEachTurn") <= 0:
+                continue
+            if champion_int_attribute(
+                    bstate, owner, "CantReplenishResources") > 0:
+                continue
+            if bstate.get("pvp"):
+                key, total_key = f"res_{owner}", f"res_total_{owner}"
+                old = int(bstate.get(key, 0) or 0)
+                total = int(bstate.get(total_key, 0) or 0)
+                if total <= old:
+                    continue
+                bstate[key] = total
+                from rules_port.persistence import save_state
+                from rules_port.runtime_helpers import owner_uid
+                save_state(session, bstate)
+                event = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
+                event.player_id = owner_uid(owner, pl_t, ai_t, bstate)
+                event.operation = 1
+                event.delta = total - old
+                event.new_value = total
+                game._push(event)
+                changed.append((owner, total))
+            else:
+                side = "player" if owner else "ai"
+                total = int(bstate.get(f"{side}_total_resources", 0) or 0)
+                old = int(bstate.get(f"{side}_resources", 0) or 0)
+                if total <= old:
+                    continue
+                from rules_port.resources import project_resource_change
+                change = project_resource_change(
+                    game, session, bstate, pl_t, ai_t, side,
+                    "currentresource", total - old)
+                changed.append((owner, change.new_value))
+        return changed
 
     def _reset_active_cards_for_turn(self, game, session, pl_t, ai_t,
                                      bstate, active_owner_id):
@@ -8802,8 +9819,8 @@ class HCPHandler(ProfileStreamMixin):
                     bstate["ai_passed"] = False
                     bstate["phase_idx"] = 0
                     bstate["turn_phases"] = _be.BASE_TURN_PHASES
-                    if next_player == _be.AI:
-                        bstate["ai_resource_played_this_turn"] = False
+                    bstate[f"{next_player}_resource_played_this_turn"] = False
+                    bstate[f"{next_player}_resource_plays_this_turn"] = 0
                 # F10 auto-pass is "to the end of MY turn" — clear it now so the
                 # AI's own turn isn't auto-advanced.
                 bstate.pop("player_autopass", None)
@@ -8953,7 +9970,9 @@ class HCPHandler(ProfileStreamMixin):
                 # state in game_cards.card_state (DB) so a reconnect and the
                 # combat-phase decision can reconstruct it.
                 if native_prep:
-                    from rules_port.lifecycle import ready_cards_for_turn
+                    from rules_port.lifecycle import (ready_cards_for_turn,
+                                                      reset_armor)
+                    reset_armor(_db, session.session_id, bstate)
                     ready_changes = ready_cards_for_turn(
                         _db, session.session_id, self.user_profile["id"])
                     for uid, tpl_guid, owner_id, previous_state, pstate in ready_changes:
@@ -9263,6 +10282,19 @@ class HCPHandler(ProfileStreamMixin):
             # and the following phase transitions remain RulesPort-owned.
             port.materialize_current_phase()
         port.drive_until_input(max_steps=64)
+        # A resolver can queue server-owned chain responses (a troop's Deploy
+        # trigger) while it finishes.  Give the AI the same follow-up passes
+        # the transaction pass handler would, or the client is left staring at
+        # a window that belongs to the server actor.
+        if not (session.session_name or "").startswith("tourney-"):
+            for _ in range(8):
+                action = port.action_stack.peek()
+                if not _is_practice_chain_follow_up(action, pl_t, True):
+                    break
+                if not port.pass_player_priority(
+                        action.priority_player_id):
+                    break
+                port.drive_until_input(max_steps=64)
         trace_rules_port(log_req, "drive-after", port, bstate)
         return self._project_rules_port_priority(
             session, pl_t, ai_t, bstate)
@@ -9321,7 +10353,8 @@ class HCPHandler(ProfileStreamMixin):
         return None, None, None, 0, 0, 0
 
     def _card_full_data(self, game, scid: game_engine.SessionCardId,
-                        template_guid, instance_id=None):
+                        template_guid, instance_id=None,
+                        instance_projection=None):
         """Resolve full card data for a session card and prepare it for display.
 
         Fills game.card_defs[scid] (thresholds, abilities) so a subsequent
@@ -9342,8 +10375,9 @@ class HCPHandler(ProfileStreamMixin):
         joined = None
         irow = None
         if scid is not None:
-            joined = db_card_instance_dynamic_projection(
-                game.session_id.uid64, scid.uid.uid64, conn=_db)
+            joined = (instance_projection if instance_projection is not None
+                      else db_card_instance_dynamic_projection(
+                          game.session_id.uid64, scid.uid.uid64, conn=_db))
             irow = joined
         t = None
         records_template = None
@@ -9397,6 +10431,8 @@ class HCPHandler(ProfileStreamMixin):
         orig_tpl = None
         card_location = None
         card_owner_id = None
+        card_instance_ref = None
+        persisted_gem = _NO_PERSISTED_GEM
         if scid is not None:
             if irow:
                 inst_abilities_json = irow[0]
@@ -9435,6 +10471,10 @@ class HCPHandler(ProfileStreamMixin):
                     pass
             card_owner_id = irow[11] if irow else None
             card_location = irow[12] if irow else None
+            if irow and len(irow) > 14:
+                card_instance_ref = irow[14]
+            if irow and len(irow) > 15:
+                persisted_gem = irow[15]
         native_bstate = getattr(self, "_current_bstate", None)
         native_cost = None
         if (scid is not None and isinstance(native_bstate, dict) and
@@ -9531,7 +10571,10 @@ class HCPHandler(ProfileStreamMixin):
         # Call through the production class explicitly: focused test stubs
         # intentionally provide only the older helper surface, while the
         # live handler still receives the same method implementation.
-        gem_type = HCPHandler._card_gem_type(self, game, scid, instance_id)
+        gem_instance_id = (instance_id if instance_id is not None
+                           else card_instance_ref)
+        gem_type = HCPHandler._card_gem_type(
+            self, game, scid, gem_instance_id, persisted_gem=persisted_gem)
         if gem_type:
             try:
                 gem_abilities_json = db_gem_abilities(gem_type, conn=_db)
@@ -10290,6 +11333,9 @@ class HCPHandler(ProfileStreamMixin):
         # a stale transaction cannot exhaust a troop that became tapped after
         # the option list was sent.
         from rules_port.builder import AbilityBuilder
+        from rules_port.costs import (
+            AbilityCostTarget, validate_cost_target_selection,
+        )
         builder = AbilityBuilder.from_graph(
             graph, store=getattr(self, "_play_plan_store", None))
         cost_selections = []
@@ -10315,11 +11361,26 @@ class HCPHandler(ProfileStreamMixin):
                          [int(uid) for uid in selected_uids
                           if int(uid) in candidate_set and
                           int(uid) not in used_cost_uids])
-            if len(available) < minimum:
+            cost_target = AbilityCostTarget(
+                index=cost_ref.index, kind=cost_ref.kind,
+                guid=cost_ref.guid, minimum=minimum, maximum=maximum,
+                is_source_auto_target=auto_source,
+                candidates=tuple(candidates),
+                allow_best_effort_minimum=cost_ref.allow_best_effort_minimum)
+            if (len(available) < minimum and
+                    not cost_target.allow_best_effort_minimum):
                 log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
                         f"missing/illegal payment target for {cost_ref.guid}")
                 return
             chosen = available if maximum < 0 else available[:maximum]
+            chosen = validate_cost_target_selection(
+                _db, session.session_id, self.user_profile["id"],
+                int(source_uid), cost_target, chosen,
+                champions=self._champion_targets(), battle_state=bstate)
+            if chosen is None:
+                log_req(f"    REJECTED troop ability {ability_guid[:8]}: "
+                        f"invalid metadata payment target {cost_ref.guid}")
+                return
             used_cost_uids.update(chosen)
             cost_target_uids.extend(chosen)
             cost_selections.append(({"kind": cost_ref.kind}, tuple(chosen)))
@@ -10573,10 +11634,8 @@ class HCPHandler(ProfileStreamMixin):
                 log_req(f"    PvP debug draw: pid {owner_id} deck empty")
                 return False
             # Deck-out: a player who must draw with an empty deck loses.
-            import commands as _cmd
-            _cmd.push_battle_game_end(handler=self, session=session,
-                                      winners=[ai_t], losers=[pl_t])
-            campaign.handle_battle_gameend(self, _db, session, False, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
+            self._finish_battle_gameend(
+                session, False, winners=[ai_t], losers=[pl_t])
             log_req("    Game over: player deck empty on draw (AI wins)")
             return True
         repl_zone = self._dispatch_game_trigger(
@@ -10651,16 +11710,12 @@ class HCPHandler(ProfileStreamMixin):
                     _pvp_end_game(session, battle_state, winner, loser,
                                   reason="deck-out")
             return True
-        import commands as _cmd
         if owner_id:
-            _cmd.push_battle_game_end(
-                handler=self, session=session,
-                winners=[ai_t], losers=[pl_t])
-            campaign.handle_battle_gameend(
-                self, _db, session, False, SERVICE_MAIL_UID,
-                UID_TYPE["ServiceCampaign"])
+            self._finish_battle_gameend(
+                session, False, winners=[ai_t], losers=[pl_t])
             log_req("    Game over: player deck empty on native draw")
         else:
+            import commands as _cmd
             _cmd.push_battle_game_end(
                 handler=self, session=session,
                 winners=[pl_t], losers=[ai_t])
@@ -10716,14 +11771,12 @@ class HCPHandler(ProfileStreamMixin):
         except Exception as e:
             import traceback
             log(f"Error {self.addr}: {e}\n{traceback.format_exc()}")
-            # A handler can fail after a legacy helper has opened a write
-            # transaction on the shared connection (for example, when a
-            # game-card sync exhausts its SQLite lock retries).  Leaving that
-            # transaction open blocks every other process using the database,
-            # including the auth proxy.  Roll it back before closing this
-            # client connection so a failed request cannot poison the server.
+            # If a legacy helper left an uncommitted write transaction open on
+            # the shared connection, roll it back to avoid pinning the database lock.
             try:
-                _db.rollback()
+                if getattr(_db, "in_transaction", False):
+                    log(f"Handler error left transaction active on shared DB; rolling back: {self.addr}")
+                    _db.rollback()
             except Exception as rollback_error:
                 log(f"Rollback after handler error failed: {rollback_error}")
         finally:
@@ -10768,12 +11821,13 @@ class HCPHandler(ProfileStreamMixin):
 
         # Remove this handler before the social offline broadcast so remaining
         # sessions are evaluated accurately.
-        for uid in list(_active_clients.keys()):
-            _active_clients[uid] = [
-                (h, t) for h, t in _active_clients[uid] if h is not self
-            ]
-            if not _active_clients[uid]:
-                del _active_clients[uid]
+        with _active_clients_lock:
+            for uid in list(_active_clients.keys()):
+                _active_clients[uid] = [
+                    (h, t) for h, t in _active_clients[uid] if h is not self
+                ]
+                if not _active_clients[uid]:
+                    del _active_clients[uid]
         if getattr(self, "user_profile", None):
             try:
                 from services.social import broadcast_friend_offline
@@ -10782,6 +11836,13 @@ class HCPHandler(ProfileStreamMixin):
                 pass
 
     def handle_message(self, headers: dict, body: bytes):
+        # Restore the handler's session context for every inbound packet.
+        # ContextVar state is local to the worker thread, while the handler
+        # may have returned from a service callback since the last packet.
+        set_log_context(
+            player_id=getattr(self, "_log_player_id", None),
+            session_id=getattr(self, "_log_session_id", None),
+            participant_ids=getattr(self, "_log_session_players", ()))
         target = headers.get("target", "")
         issuer = headers.get("issuer", "")
         instance = headers.get("instance", "")
@@ -10794,15 +11855,23 @@ class HCPHandler(ProfileStreamMixin):
             self.ccnt = client_ccnt
 
         if instance != "ping":
-            log_req(f"=== RECV === target={target} instance={instance} reqid={reqid} conh={conh} ccnt={client_ccnt} scnt={client_scnt}")
-            log_req(f"  issuer={issuer} body_len={len(body)} hdrs={ {k:str(v)[:80] for k,v in headers.items()} }")
+            log_req(
+                f"=== RECV === target={target} instance={instance} reqid={reqid} "
+                f"conh={conh} ccnt={client_ccnt} scnt={client_scnt}",
+                level="DEBUG")
+            header_summary = {
+                k: str(v)[:80] for k, v in headers.items()}
+            log_req(
+                f"  issuer={issuer} body_len={len(body)} "
+                f"hdrs={header_summary}",
+                level="DEBUG")
 
         # Try to dump body content
         if body:
             if instance == "auth:req":
                 log_req(f"  body_json={body.decode('utf-8', errors='replace')}")
             else:
-                log_req(f"  body_hex={hexdump(body)}")
+                log_req(f"  body_hex={hexdump(body)}", level="DEBUG")
 
         # Session creation
         if target == "newsession":
@@ -10834,6 +11903,9 @@ class HCPHandler(ProfileStreamMixin):
             # be stable across sessions, so fold the hash down to 48 bits and
             # keep them distinct (auth=+0, reck=+1 offsets).
             self._set_client_identity_from_profile(profile)
+            # Bind the stable profile log before profile-stream responses so
+            # authentication-time errors after this point are player-scoped.
+            self._bind_log_session(None)
 
             # Read permission flags set by the auth proxy (Admin/Mod/Founder).
             flags = profile.get("flags", "{}")
@@ -10863,9 +11935,10 @@ class HCPHandler(ProfileStreamMixin):
             self.client_uid = make_uid(UID_TYPE["ServicePlayer"], int(self.client_reck_id))
             # Register in active clients for chat broadcasting
             uid = profile["id"]
-            if uid not in _active_clients:
-                _active_clients[uid] = []
-            _active_clients[uid].append((self, time.time()))
+            with _active_clients_lock:
+                if uid not in _active_clients:
+                    _active_clients[uid] = []
+                _active_clients[uid].append((self, time.time()))
             self.scnt += 1
             self.send(
                 {"issuer": "Session", "target": "auth:res", "sid": self.sid},
@@ -10893,11 +11966,13 @@ class HCPHandler(ProfileStreamMixin):
 
         elif target == "Session" and (instance == "chat" or instance == "battle"):
             from services.chat import handle_chat_message
+            self._refresh_log_session_context()
             handle_chat_message(self, body)
 
         # === ROUTED SERVICE MESSAGES ===
         elif instance and instance != "ping":
-            log_req(f">>> Routed msg target={target} instance={instance}")
+            log_req(f">>> Routed msg target={target} instance={instance}",
+                    level="DEBUG")
 
             # On first routed message after login, push inventory and existing cards
             if self._inventory_pending:
@@ -10925,7 +12000,7 @@ class HCPHandler(ProfileStreamMixin):
             # On first routed message, push social data (friend list etc.)
             if getattr(self, '_social_pending', False) and self.user_profile:
                 self._social_pending = False
-                log_req(f"    Social push triggered: _active_clients={list(_active_clients.keys())}")
+                log_req(f"    Social push triggered: _active_clients={list(get_active_clients_snapshot().keys())}")
                 try:
                     from services.social import push_all_social_data
                     push_all_social_data(self, SERVICE_PROFILE_UID)
@@ -10940,7 +12015,10 @@ class HCPHandler(ProfileStreamMixin):
             dw = None
             try:
                 dw = parse_datawrapper(body, preserve_complex=True)
-                log_req(f"    DW: dt={dw.get('DataType')} comp={dw.get('Comp')} sess={dw.get('RequestHandlerSessionId')}")
+                log_req(
+                    f"    DW: dt={dw.get('DataType')} comp={dw.get('Comp')} "
+                    f"sess={dw.get('RequestHandlerSessionId')}",
+                    level="DEBUG")
             except Exception as e:
                 import traceback
                 log_req(f"    Failed to parse DataWrapper: {e}")
@@ -10960,7 +12038,9 @@ class HCPHandler(ProfileStreamMixin):
             if comp == 1 and raw_bytes:
                 try:
                     inner_bytes = decompress_gzip(raw_bytes)
-                    log_req(f"    Decompressed: {len(raw_bytes)}b -> {len(inner_bytes)}b")
+                    log_req(
+                        f"    Decompressed: {len(raw_bytes)}b -> {len(inner_bytes)}b",
+                        level="DEBUG")
                 except Exception as e:
                     log_req(f"    Decompress failed: {e}")
                     log_req(f"    raw[:60]={hexdump(raw_bytes[:60])}")
@@ -10986,8 +12066,15 @@ class HCPHandler(ProfileStreamMixin):
                     if isinstance(inner_obj, dict):
                         inner_obj.setdefault("__raw__", inner_bytes)
                     inner_type = inner_obj.get("__type__", "?")
-                    log_req(f"    Inner: type={inner_type} fields={ {k: str(v)[:80] for k, v in inner_obj.items() if k != '__type__'} }")
-                    log_req(f"    Inner raw: {hexdump(inner_bytes)}")
+                    inner_fields = {
+                        k: str(v)[:80]
+                        for k, v in inner_obj.items()
+                        if k != "__type__"}
+                    log_req(
+                        f"    Inner: type={inner_type} fields={inner_fields}",
+                        level="DEBUG")
+                    log_req(f"    Inner raw: {hexdump(inner_bytes)}",
+                            level="DEBUG")
             except Exception as e:
                 log_req(f"    Inner parse: {e}")
                 log_req(f"    Inner hex: {hexdump(inner_bytes, 120)}")
@@ -11003,6 +12090,7 @@ class HCPHandler(ProfileStreamMixin):
     def handle_service_request(self, target, instance, data_type, reqid,
                                 comp, session_id, conh, inner_obj, inner_bytes):
         """Decode the protocol request into an application command envelope."""
+        self._refresh_log_session_context()
         command = ServiceRequestCommand(
             target=target,
             instance=instance,
@@ -11308,6 +12396,15 @@ class HCPHandler(ProfileStreamMixin):
                             f"({opening_hand_size})")
 
                 # Push hand + Mulligan to each player.
+                hands = {
+                    int(apid): db_game_get_hand(session.session_id, apid)
+                    for apid in pids
+                }
+                hand_uids = [int(card_uid)
+                             for hand in hands.values()
+                             for card_uid, _template_guid in hand]
+                hand_projections = db_card_instance_dynamic_projections(
+                    session.session_id, hand_uids, conn=_db)
                 for apid in pids:
                     h = player_handlers.get(apid)
                     if not h: continue
@@ -11315,21 +12412,25 @@ class HCPHandler(ProfileStreamMixin):
                     pl = game_engine.UID.make(244, apid)
                     op = game_engine.UID.make(244, aopp)
                     g = game_engine.Game(int(session.session_id), pl, op)
-                    for idx, (cu, tg) in enumerate(db_game_get_hand(session.session_id, apid)):
+                    for idx, (cu, tg) in enumerate(hands[int(apid)]):
                         scid = game_engine.SessionCardId(game_engine.UID(int(cu)))
                         # Populate the CardDef (cost/atk/def/thresholds/
                         # abilities/gems) so the client renders the hand
                         # and the Mulligan keep/redraw dialog correctly.
                         _tpl_g, ct, _nm, _c, _a, _d, gem_type = \
-                            self._card_full_data(g, scid, tg)
+                            self._card_full_data(
+                                g, scid, tg,
+                                instance_projection=hand_projections.get(int(cu)))
                         g.push_card_moved(scid, pl, game_engine.ECardCollections.Hand,
                                           game_engine.ECardLocations.Top, idx)
                         g.push_card_updated(scid, pl, game_engine.ECardCollections.Hand,
                                             ct, template_id=tg, gems=gem_type)
-                    for idx, (cu, tg) in enumerate(db_game_get_hand(session.session_id, aopp)):
+                    for idx, (cu, tg) in enumerate(hands[int(aopp)]):
                         scid = game_engine.SessionCardId(game_engine.UID(int(cu)))
                         _tpl_g, ct, _nm, _c, _a, _d, gem_type = \
-                            self._card_full_data(g, scid, tg)
+                            self._card_full_data(
+                                g, scid, tg,
+                                instance_projection=hand_projections.get(int(cu)))
                         g.push_card_moved(scid, op, game_engine.ECardCollections.Hand,
                                           game_engine.ECardLocations.Top, idx)
                         g.push_card_updated(scid, op, game_engine.ECardCollections.Hand, ct,
@@ -11440,11 +12541,18 @@ class HCPHandler(ProfileStreamMixin):
             player_hand = db_game_get_hand(session.session_id,
                                            self.user_profile["id"])
             ai_hand = db_game_get_hand(session.session_id, 0)
+            opening_hand_projections = db_card_instance_dynamic_projections(
+                session.session_id,
+                [int(card_uid) for hand in (player_hand, ai_hand)
+                 for card_uid, _template_guid in hand],
+                conn=_db)
             for idx, (cu, tg) in enumerate(player_hand):
                 scid = game_engine.SessionCardId(
                     game_engine.UID(int(cu)))
                 _tpl_g, ct, _nm, _c, _a, _d, gem_type = \
-                    self._card_full_data(game, scid, tg)
+                    self._card_full_data(
+                        game, scid, tg,
+                        instance_projection=opening_hand_projections.get(int(cu)))
                 game.push_card_moved(
                     scid, pl_t, game_engine.ECardCollections.Hand,
                     game_engine.ECardLocations.Top, idx)
@@ -11455,7 +12563,9 @@ class HCPHandler(ProfileStreamMixin):
                 scid = game_engine.SessionCardId(
                     game_engine.UID(int(cu)))
                 _tpl_g, ct, _nm, _c, _a, _d, gem_type = \
-                    self._card_full_data(game, scid, tg)
+                    self._card_full_data(
+                        game, scid, tg,
+                        instance_projection=opening_hand_projections.get(int(cu)))
                 game.push_card_moved(
                     scid, ai_t, game_engine.ECardCollections.Hand,
                     game_engine.ECardLocations.Top, idx)
@@ -11625,14 +12735,36 @@ class HCPHandler(ProfileStreamMixin):
             from rules_port import lifecycle as _be
             bstate = _be.default_state(
                 turn_player=_be.PLAYER if play_first_is_player else _be.AI)
-            bstate["player_resources"] = 0
-            bstate["player_total_resources"] = 0
+            setup_encounter = session.encounter_data or {}
+            fra_start_state = (setup_encounter.get(
+                "_fra_starting_battle_state", {})
+                if isinstance(setup_encounter, dict) else {})
+            bstate["player_resources"] = int(
+                fra_start_state.get("player_resources", 0) or 0)
+            bstate["player_total_resources"] = int(
+                fra_start_state.get("player_total_resources", 0) or 0)
+            bstate["ai_resources"] = int(
+                fra_start_state.get("ai_resources", 0) or 0)
+            bstate["ai_total_resources"] = int(
+                fra_start_state.get("ai_total_resources", 0) or 0)
+            for side in ("player", "ai"):
+                thresholds = fra_start_state.get(f"{side}_threshold", {})
+                bstate[f"{side}_threshold"] = {
+                    int(color): int(value or 0)
+                    for color, value in (thresholds or {}).items()
+                }
             bstate["ai_resource_played_this_turn"] = False
-            bstate["player_charges"] = getattr(self, "_player_starting_charges", 0)
-            bstate["ai_charges"] = getattr(self, "_ai_starting_charges", 0)
+            bstate["ai_resource_plays_this_turn"] = 0
+            bstate["player_resource_plays_this_turn"] = 0
+            bstate["player_charges"] = int(fra_start_state.get(
+                "player_charges", getattr(self, "_player_starting_charges", 0)) or 0)
+            bstate["ai_charges"] = int(fra_start_state.get(
+                "ai_charges", getattr(self, "_ai_starting_charges", 0)) or 0)
             # Champion starting health (persisted for combat + reconnect).
-            bstate["player_health"] = getattr(self, "_player_starting_health", 20)
-            bstate["ai_health"] = getattr(self, "_ai_starting_health", 10)
+            bstate["player_health"] = int(fra_start_state.get(
+                "player_health", getattr(self, "_player_starting_health", 20)) or 20)
+            bstate["ai_health"] = int(fra_start_state.get(
+                "ai_health", getattr(self, "_ai_starting_health", 10)) or 10)
             # Attach before opening GameStarted triggers.  Otherwise the first
             # gameplay event would be resolved by the compatibility scanner,
             # leaving the session with a mixed native/legacy lifecycle from
@@ -11642,8 +12774,27 @@ class HCPHandler(ProfileStreamMixin):
             # checkpoint created during setup, before PreGame modifiers ran.
             # That snapshot has no charge count, so re-apply the PreGame seed
             # (e.g. Fury's +2 charges) here or the starting charges are lost.
-            bstate["player_charges"] = getattr(self, "_player_starting_charges", 0)
-            bstate["ai_charges"] = getattr(self, "_ai_starting_charges", 0)
+            bstate["player_charges"] = int(fra_start_state.get(
+                "player_charges", getattr(self, "_player_starting_charges", 0)) or 0)
+            bstate["ai_charges"] = int(fra_start_state.get(
+                "ai_charges", getattr(self, "_ai_starting_charges", 0)) or 0)
+            # Reapplying the challenge snapshot after RulesPort attachment
+            # mirrors the charge restoration above and keeps the saved
+            # round-zero resource/health mods from being overwritten by the
+            # setup checkpoint created before they were applied.
+            for key in ("player_resources", "player_total_resources",
+                        "ai_resources", "ai_total_resources",
+                        "player_health", "ai_health"):
+                if key in fra_start_state:
+                    bstate[key] = int(fra_start_state.get(key, 0) or 0)
+            for side in ("player", "ai"):
+                key = f"{side}_threshold"
+                if key in fra_start_state:
+                    bstate[key] = {
+                        int(color): int(value or 0)
+                        for color, value in
+                        (fra_start_state.get(key) or {}).items()
+                    }
             native_port = getattr(session, "_rules_port_session", None)
             if native_port is not None:
                 # The setup packet contains the client's non-interactive
@@ -12098,6 +13249,23 @@ class HCPHandler(ProfileStreamMixin):
                     max_grant = int(crow[5] or 0)
                     if crow[1] == 'Resource':
                         is_resource_play = True
+                        # Validate the authored per-turn allowance before the
+                        # compatibility projection moves the card out of the
+                        # hand. This keeps an extra-resource card in hand
+                        # when a stale client submits a now-illegal play.
+                        import battle_engine as _resource_be
+                        _resource_state = _resource_be.load_state(session)
+                        from rules_port.resources import (
+                            can_play_resource, resource_play_limit)
+                        _resource_limit = resource_play_limit(
+                            _db, session.session_id, _resource_state,
+                            int(self.user_profile.get("id", 0)))
+                        if not can_play_resource(
+                                _resource_state, "player",
+                                limit=_resource_limit):
+                            log_req(
+                                "    Rejected resource play: per-turn allowance used")
+                            return True
                         shard_color = crow[2].split()[0]
                         # Shards of Fate ("Choose a Standard resource in
                         # your deck. Gain the thresholds it provides.")
@@ -12137,7 +13305,12 @@ class HCPHandler(ProfileStreamMixin):
             self._current_bstate = bstate
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
             ai_t = game_engine.UID.make(3, 1000)
-            if is_resource_play and not bstate.get("player_resource_played_this_turn"):
+            charge_delta = 0
+            if is_resource_play:
+                from rules_port.resources import resource_play_count
+                old_charge = int(bstate.get("player_charges", 0) or 0)
+                bstate["player_resource_plays_this_turn"] = (
+                    resource_play_count(bstate, "player") + 1)
                 bstate["player_resource_played_this_turn"] = True
                 if shard_tpl:
                     # Shards of Fate: grants max/current resources from
@@ -12183,6 +13356,8 @@ class HCPHandler(ProfileStreamMixin):
                         if color is not None:
                             th = bstate.setdefault("player_threshold", {})
                             th[color] = th.get(color, 0) + 1
+                charge_delta = max(
+                    0, int(bstate.get("player_charges", 0) or 0) - old_charge)
                 _be.save_state(session, bstate)
                 log_req(f"    Resource: tot={bstate.get('player_total_resources',0)} th={dict(bstate.get('player_threshold',{}))} chg={bstate.get('player_charges',0)}")
 
@@ -12225,14 +13400,17 @@ class HCPHandler(ProfileStreamMixin):
                             color=shard_val)
                 # Playing any resource, including Shards of Fate, grants a
                 # champion charge point.
-                ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
-                ev_chg.player_id = pl_t; ev_chg.operation = 1; ev_chg.delta = 1
-                ev_chg.new_value = bstate.get("player_charges", 0)
-                g3._push(ev_chg)
-                from abilities.framework.triggers import resolve_gain_charge_triggers
-                resolve_gain_charge_triggers(
-                    _db, self, g3, session, pl_t, ai_t, bstate,
-                    self.user_profile["id"] if self.user_profile else 0)
+                if charge_delta:
+                    ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
+                    ev_chg.player_id = pl_t; ev_chg.operation = 1
+                    ev_chg.delta = charge_delta
+                    ev_chg.new_value = bstate.get("player_charges", 0)
+                    g3._push(ev_chg)
+                    from abilities.framework.triggers import resolve_gain_charge_triggers
+                    resolve_gain_charge_triggers(
+                        _db, self, g3, session, pl_t, ai_t, bstate,
+                        self.user_profile["id"] if self.user_profile else 0,
+                        amount=charge_delta)
                 # A resource can carry an instance-only, non-triggered
                 # ability granted while it was in the deck (for example
                 # Fruitful Foresight's Gain [L1][R1]).  Resolve those
@@ -12327,12 +13505,13 @@ class HCPHandler(ProfileStreamMixin):
                     self._push_transaction_ack(session)
                     handled = True
                     return True
-                if cost + x_cost > bstate.get("player_resources", 0):
+                x_payment = x_cost * play_plan.cost.variable_multiplier
+                if cost + x_payment > bstate.get("player_resources", 0):
                     # Defense-in-depth: the client's playability is the
                     # normal gate, but a drag shouldn't be able to play
                     # an unaffordable card (e.g. an undiscounted Fury of
                     # the Mountain God) and push resources negative.
-                    log_req(f"    REJECTED play {crow[2]}: cost {cost}+{x_cost} > "
+                    log_req(f"    REJECTED play {crow[2]}: cost {cost}+{x_payment} > "
                             f"resources {bstate.get('player_resources', 0)}")
                     g3 = game_engine.Game(session.session_id, pl_t, ai_t)
                     g3.push_player_updated(pl_t, champ_id=getattr(
@@ -12373,7 +13552,7 @@ class HCPHandler(ProfileStreamMixin):
                     handled = True
                     return True
                 bstate["player_resources"] = (
-                    bstate.get("player_resources", 0) - cost - x_cost)
+                    bstate.get("player_resources", 0) - cost - x_payment)
                 # Move from hand to CastSpells in DB
                 from pvp_db import db_set_card_played_to_zone
                 db_set_card_played_to_zone(session.session_id, tid, 'CastSpells')
@@ -12462,7 +13641,7 @@ class HCPHandler(ProfileStreamMixin):
                 _be.save_state(session, bstate)
                 g3.player_resources = bstate["player_resources"]
                 ec = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
-                ec.player_id = pl_t; ec.operation = 2; ec.delta = cost + x_cost
+                ec.player_id = pl_t; ec.operation = 2; ec.delta = cost + x_payment
                 ec.new_value = bstate["player_resources"]
                 g3._push(ec)
                 g3.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
@@ -12512,6 +13691,12 @@ class HCPHandler(ProfileStreamMixin):
             ec3 = self._warzone_troop_count(session, 0)
             playable3 = []
             from rules_port.static_rules import effective_cost
+            from rules_port.resources import can_play_resource, resource_play_limit
+            resource_limit = resource_play_limit(
+                _db, session.session_id, bstate,
+                int(self.user_profile.get("id", 0)))
+            resource_slots_used = not can_play_resource(
+                bstate, "player", limit=resource_limit)
             for s, c, ct, thresh_json, ab_guids in hand3:
                 # Recompute instance-level cost when rebuilding options after
                 # a resource play; opening-hand discounts must remain active.
@@ -12524,7 +13709,7 @@ class HCPHandler(ProfileStreamMixin):
                                             thresh_json, ab_guids,
                                             bstate.get("player_resources", 0),
                                             bstate.get("player_threshold", {}),
-                                            bstate.get("player_resource_played_this_turn", False),
+                                            resource_slots_used,
                                             fc3, ec3):
                     playable3.append(s)
             if (not bstate.get("pending_choice") and
@@ -12618,15 +13803,11 @@ class HCPHandler(ProfileStreamMixin):
                 log_req(f"    Pushed resource-play events (choice pending) ({len(dw3)}b)")
         elif not handled:
             log_req(f"    === PlayerTransaction — ending game ===")
-            import commands as _cmd
-            _cmd.push_battle_game_end(
-                self, session,
+            self._finish_battle_gameend(
+                session, False,
                 [game_engine.UID.make(3, 1000)],   # AI wins
                 [game_engine.UID(player_uid)])     # player loses
             log_req(f"    Pushed GameEnded (3055) — marked as loss")
-            # Campaign gameendnotify — updates campaign state after the
-            # battle so the client doesn't re-queue the encounter.
-            campaign.handle_battle_gameend(self, _db, session, False, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
         return True
 
     def _handle_debug_cheat_transaction(self, session, transaction):
@@ -13298,8 +14479,11 @@ class HCPHandler(ProfileStreamMixin):
         if combats:
             game.push_combat_listing(pl_t, combats)
         self._send_battle_events(session, game, pl_t)
+        block_summary = ", ".join(
+            hex(int(k)) + "->" + (hex(int(v[0])) if v else "none")
+            for k, v in blockers_map.items())
         log_req(f"    CommitDefense: {len(attackers)} attacker(s), "
-                f"blocks={{ {', '.join(hex(int(k)) + '->' + (hex(int(v[0])) if v else 'none') for k, v in blockers_map.items())} }}")
+                f"blocks={block_summary}")
         if authoritative_port is not None:
             # The native defense transaction already staged the blockers and
             # consumed the defender's DeclareDefense priority before this
@@ -13594,10 +14778,8 @@ class HCPHandler(ProfileStreamMixin):
             # If the AI's champion is dead, end the game (player wins).
             if bstate.get("ai_health", 10) <= 0:
                 log_req(f"    AI defeated! ai_health={bstate['ai_health']}")
-                import commands as _cmd
-                _cmd.push_battle_game_end(handler=self, session=session,
-                                          winners=[pl_t], losers=[ai_t])
-                campaign.handle_battle_gameend(self, _db, session, True, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
+                self._finish_battle_gameend(
+                    session, True, winners=[pl_t], losers=[ai_t])
                 handled = True
                 self._push_transaction_ack(session)
                 return True
@@ -13908,8 +15090,8 @@ class HCPHandler(ProfileStreamMixin):
                     bstate["ai_passed"] = False
                     bstate["phase_idx"] = 0
                     bstate["turn_phases"] = _be.BASE_TURN_PHASES
-                    if next_player == _be.AI:
-                        bstate["ai_resource_played_this_turn"] = False
+                    bstate[f"{next_player}_resource_played_this_turn"] = False
+                    bstate[f"{next_player}_resource_plays_this_turn"] = 0
                 _be.save_state(session, bstate)
                 if next_player == _be.PLAYER:
                     self._advance_to_priority(session, pl_t, ai_t, bstate)
@@ -14037,10 +15219,8 @@ class HCPHandler(ProfileStreamMixin):
                         _be.save_state(session, bstate)
                         if bstate.get("ai_health", 10) <= 0:
                             log_req(f"    AI defeated via pass at AssignDamage! ai_health={bstate['ai_health']}")
-                            import commands as _cmd
-                            _cmd.push_battle_game_end(handler=self, session=session,
-                                                      winners=[pl_t], losers=[ai_t])
-                            campaign.handle_battle_gameend(self, _db, session, True, SERVICE_MAIL_UID, UID_TYPE["ServiceCampaign"])
+                            self._finish_battle_gameend(
+                                session, True, winners=[pl_t], losers=[ai_t])
                             self._push_transaction_ack(session)
                             return True
                         if bstate.get("pending_deck_search"):
@@ -14730,6 +15910,7 @@ class HCPHandler(ProfileStreamMixin):
             # that makes UIBattle fall back to an invalid (zero) EncounterDeck
             # and can leave the scene on the starfield.
             response_encounter_data = ("class", "Game.Shared.SessionStateEncounterData")
+            fra_setup = _fra_arena_setup_values(encounter_data_raw)
             if str(session_name).startswith("camp_"):
                 scene_guid = campaign._last_encounter_scene.get(str(session_name))
                 if scene_guid:
@@ -14743,6 +15924,21 @@ class HCPHandler(ProfileStreamMixin):
                                 game_engine.ESessionFlags.IsEncounter |
                                 game_engine.ESessionFlags.IsPvE)),
                         ]))
+            elif fra_setup is not None:
+                # The client replaces its arena battle context with this
+                # StartEncounter response. Preserve the arena IDs for the
+                # client-side challenge UI and reconnect path; live battle
+                # mods are loaded internally by the authoritative setup below.
+                # Do NOT advertise IsPvE/IsPvEArena on this transient session:
+                # GameClient.OnStartEncounter and GameClient.OnReadyForGameSetup
+                # each call UIBattle.OnSessionCreated, which appends its
+                # challenge-event handler on every PvE session. The
+                # ReadyForGameSetup session below carries the live flags and
+                # registers that handler once; adding them here registered it
+                # twice, so one conversation objective event produced two
+                # identical rows in the battle challenge panel.
+                response_encounter_data = _fra_arena_session_state_data(
+                    fra_setup, flags=0)
 
             resp_inner = encode_objfmt_response(
                 ["Game.Shared.Network.LoadBalancer.StartEncounterResponseArgs",
@@ -14751,7 +15947,7 @@ class HCPHandler(ProfileStreamMixin):
                  "System.Int32", "System.Int32",
                      "Game.Shared.SessionStateEncounterData", "System.Boolean",
                      "Game.Shared.ResourceId", "System.Guid", "Game.Shared.ESessionFlags", "System.Int32",
-                 "Game.Shared.UID"],
+                 "Game.Shared.UID", "System.UInt64"],
                 [("RoutingPlayerId", "uid", player_uid),
                  ("Success", "bool", True),
                  ("SessionState", "struct", ("Game.Shared.SessionState", [
@@ -14892,6 +16088,11 @@ class HCPHandler(ProfileStreamMixin):
                 state="setup",
             )).value
             if session:
+                fra_setup = _fra_arena_setup_values(session.encounter_data)
+                setup_encounter_data = (
+                    _fra_arena_session_state_data(fra_setup)
+                    if fra_setup is not None else
+                    ("class", "Game.Shared.SessionStateEncounterData"))
                 resp_inner = encode_objfmt_response(
                     ["Game.Client.Network.LoadBalancer.ReadyForGameSetupResponse",
                      "Game.Shared.SessionState", "Game.Shared.UID",
@@ -14906,7 +16107,7 @@ class HCPHandler(ProfileStreamMixin):
                          ("SessionName", "string", session.session_name),
                          ("MinimumPlayerCount", "int", 1),
                          ("MaximumPlayerCount", "int", 2),
-                         ("EncounterData", "class", "Game.Shared.SessionStateEncounterData"),
+                         ("EncounterData", setup_encounter_data[0], setup_encounter_data[1]),
                          ("JoinInsteadOfReconnect", "bool", False)])),
                      ("DeckId", "uid", player_uid),
                      ("DeckTemplateId", "struct", ("Game.Shared.ResourceId", [
@@ -15131,14 +16332,57 @@ class HCPHandler(ProfileStreamMixin):
             rfg_sz[fps_idx] = rfg_buf.tell()-fps
             rfg_sz[foi_idx] = rfg_buf.tell()-foi
             
+            rfg_fra_setup = _fra_arena_setup_values(session.encounter_data)
+            if rfg_fra_setup is not None:
+                log_req("    ReadyForGameSetup FRA data: "
+                        f"flags={rfg_fra_setup['flags']} "
+                        f"arena={rfg_fra_setup['arena_instance']} "
+                        f"owner={rfg_fra_setup['arena_owner']}")
+
             # SessionState
             fss = rfg_buf.tell(); rfg_sz.append(0); fss_idx = len(rfg_sz)-1
             rfg_w("SessionState"); rfg_sp(); rfg_w(str(fss_idx)); rfg_sp()
             rfg_w(str(rfg_ft("Game.Shared.SessionState"))); rfg_sp(); rfg_w("6"); rfg_sp()
-            # EncounterData (class),
-            rfg_w("EncounterData"); rfg_sp(); rfg_w(str(len(rfg_sz))); rfg_sp()
-            rfg_w(str(rfg_ft("Game.Shared.SessionStateEncounterData"))); rfg_sp(); rfg_w("0"); rfg_sp()
-            rfg_sz.append(0)
+            # The client rebuilds SessionClient from this setup response.
+            # Preserve FRA identity for challenge UI and reconnect handling.
+            if rfg_fra_setup is None:
+                f_ed = rfg_buf.tell(); rfg_sz.append(0); ed_idx = len(rfg_sz)-1
+                rfg_w("EncounterData"); rfg_sp(); rfg_w(str(ed_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("Game.Shared.SessionStateEncounterData"))); rfg_sp(); rfg_w("0"); rfg_sp()
+                rfg_sz[ed_idx] = rfg_buf.tell() - f_ed
+            else:
+                f_ed = rfg_buf.tell(); rfg_sz.append(0); ed_idx = len(rfg_sz)-1
+                rfg_w("EncounterData"); rfg_sp(); rfg_w(str(ed_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("Game.Shared.SessionStateEncounterData"))); rfg_sp(); rfg_w("4"); rfg_sp()
+
+                f_scene = rfg_buf.tell(); rfg_sz.append(0); scene_idx = len(rfg_sz)-1
+                rfg_w("SceneTemplateId"); rfg_sp(); rfg_w(str(scene_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("Game.Shared.ResourceId"))); rfg_sp(); rfg_w("1"); rfg_sp()
+                f_scene_guid = rfg_buf.tell(); rfg_sz.append(0); scene_guid_idx = len(rfg_sz)-1
+                rfg_w("m_Guid"); rfg_sp(); rfg_w(str(scene_guid_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("System.Guid"))); rfg_sp(); rfg_w("0"); rfg_sp()
+                rfg_w("36"); rfg_sp(); rfg_buf.write(b"00000000-0000-0000-0000-000000000000")
+                rfg_sz[scene_guid_idx] = rfg_buf.tell() - f_scene_guid
+                rfg_sz[scene_idx] = rfg_buf.tell() - f_scene
+
+                f_flags = rfg_buf.tell(); rfg_sz.append(0); flags_idx = len(rfg_sz)-1
+                rfg_w("SessionFlags"); rfg_sp(); rfg_w(str(flags_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("Game.Shared.ESessionFlags"))); rfg_sp(); rfg_w("1"); rfg_sp()
+                f_flags_value = rfg_buf.tell(); rfg_sz.append(0); flags_value_idx = len(rfg_sz)-1
+                rfg_w("value__"); rfg_sp(); rfg_w(str(flags_value_idx)); rfg_sp()
+                rfg_w(str(rfg_ft("System.Int32"))); rfg_sp(); rfg_w("0"); rfg_sp()
+                rfg_w(hexlify(struct.pack("<i", rfg_fra_setup["flags"])).decode("ascii")); rfg_sp()
+                rfg_sz[flags_value_idx] = rfg_buf.tell() - f_flags_value
+                rfg_sz[flags_idx] = rfg_buf.tell() - f_flags
+
+                for field_name, value in (("ArenaInstance", rfg_fra_setup["arena_instance"]),
+                                          ("ArenaOwner", rfg_fra_setup["arena_owner"])):
+                    f_arena = rfg_buf.tell(); rfg_sz.append(0); arena_idx = len(rfg_sz)-1
+                    rfg_w(field_name); rfg_sp(); rfg_w(str(arena_idx)); rfg_sp()
+                    rfg_w(str(rfg_ft("System.UInt64"))); rfg_sp(); rfg_w("0"); rfg_sp()
+                    rfg_w(hexlify(struct.pack("<Q", value)).decode("ascii")); rfg_sp()
+                    rfg_sz[arena_idx] = rfg_buf.tell() - f_arena
+                rfg_sz[ed_idx] = rfg_buf.tell() - f_ed
             # JoinInsteadOfReconnect
             rfg_w("JoinInsteadOfReconnect"); rfg_sp(); rfg_w(str(len(rfg_sz))); rfg_sp()
             rfg_w(str(rfg_ft("System.Boolean"))); rfg_sp(); rfg_w("0"); rfg_sp()
@@ -15282,6 +16526,15 @@ class HCPHandler(ProfileStreamMixin):
             mode_name = ("CAMPAIGN" if is_campaign else
                          "PRACTICE" if is_practice else "FRA")
             log_req(f"    Game mode: {mode_name} (session={session.session_name})")
+            fra_mod_setup = None
+            if not is_campaign and not is_practice:
+                from services.arena import get_battle_modifications
+                fra_mod_setup = get_battle_modifications(
+                    int(self.user_profile["id"]))
+                log_req(
+                    "    FRA encounter setup: "
+                    f"challenge={(fra_mod_setup.get('challenge') or {}).get('challenge_name', 'none')}, "
+                    f"mods={len(fra_mod_setup.get('modifications') or [])}")
 
             if is_campaign:
                 camp_id = int((session.session_name or "camp_0").split("_")[-1] or 0)
@@ -15344,6 +16597,7 @@ class HCPHandler(ProfileStreamMixin):
                     ai_name = (_mirror_name if _mirror_name
                                else "AI Opponent")
                     ai_deck_guid = None
+                    ai_deck_personality = "Default"
                 else:
                     # Get AI champion from the current FRA challenger.
                     challengers = db_get_fra_challengers(self.user_profile["id"])
@@ -15352,20 +16606,19 @@ class HCPHandler(ProfileStreamMixin):
                         ai_champ_guid = challengers[cidx]["champion_guid"]
                         ai_name = challengers[cidx]["name"]
                         ai_deck_guid = challengers[cidx]["deck"]
+                        ai_deck_personality = (
+                            challengers[cidx].get("ai_deck_personality")
+                            or "Default")
                     else:
                         ai_champ_guid = "f8f86969-2e47-4901-8c9e-7fbf8d859e22"
                         ai_name = "Angel of Dawn"
                         ai_deck_guid = None
+                        ai_deck_personality = "Default"
                 ai_charge_power = db_get_charge_power(ai_champ_guid)
 
-                # FRA encounters currently have no authored campaign
-                # attitude. An encounter scene may still provide a deck
-                # strategy for the challenger's deck.
+                # FRA encounters have no authored combat attitude. Their
+                # static deck strategy is copied onto the saved challenger.
                 ai_personality = None
-                ai_deck_personality = None
-                if ai_deck_guid:
-                    ai_deck_personality = db_encounter_deck_personality(
-                        ai_deck_guid, conn=_db)
 
             # Configure the client-style attitude and deck strategy once at
             # the battle boundary. Campaign attitude is the fallback when an
@@ -15376,6 +16629,10 @@ class HCPHandler(ProfileStreamMixin):
                 db_deck_sleeve(deck_db_id, self.user_profile["id"], conn=_db)
                 if deck_db_id else None)
             import ai as _ai
+            if ai_deck_guid:
+                log_req(
+                    f"    AI deck strategy: deck={ai_deck_guid} "
+                    f"profile={ai_deck_personality or 'Default'}")
             _ai.configure_personality(
                 self,
                 deck_personality=ai_deck_personality,
@@ -15420,7 +16677,7 @@ class HCPHandler(ProfileStreamMixin):
             # modifiers are resolved from the extracted talent ability/BOM
             # metadata so dungeon-only effects do not leak into campaigns.
             self._campaign_starting_hand_size = 7
-            self._campaign_max_hand_size = 7
+            self._campaign_max_hand_size = 10
             self._campaign_starting_hand_effects = []
             if is_campaign:
                 hand_cfg = campaign.resolve_opening_hand_config(
@@ -16096,6 +17353,12 @@ class HCPHandler(ProfileStreamMixin):
                 game.push_deck_created_with_cards(
                     ai_uid_t, ai_deck_cards,
                     sleeve_guid=ai_deck_sleeve_guid)
+            if fra_mod_setup:
+                self._apply_fra_battle_modifications(
+                    game, session, pl_uid_t, ai_uid_t, setup_bstate,
+                    fra_mod_setup.get("modifications") or [],
+                    player_deck_cards, ai_deck_cards,
+                    _drain_setup_stack)
             _db.commit()
             # C# writes StartingDeckSize to each champion card's
             # PlayerGameStats before it runs CardCreated/PreGame abilities.
@@ -16229,6 +17492,36 @@ class HCPHandler(ProfileStreamMixin):
             self._ai_starting_health = game.ai_health
             log_req(f"    PreGame: player health {game.player_health}, AI health {game.ai_health}")
             game.push_turn_phase(game_engine.ETurnPhases.PreGame)
+            if fra_mod_setup:
+                # A challenge can carry dialogue without one of the supported
+                # round-zero mod classes.  Queue the saved challenge
+                # conversations themselves as well as any mod-level ids, so
+                # starting a fresh encounter always presents its assigned
+                # challenge.
+                conversation_candidates = [
+                    (fra_mod_setup.get("challenge") or {}).get(
+                        "conversation_guid")]
+                conversation_candidates.extend(
+                    item.get("conversation_guid")
+                    for item in fra_mod_setup.get("active_challenges") or ()
+                    if isinstance(item, dict))
+                conversation_candidates.extend(
+                    item.get("conversation_id")
+                    for item in fra_mod_setup.get("modifications") or ()
+                    if isinstance(item, dict))
+                conversation_ids = list(dict.fromkeys(
+                    str(value).lower() for value in conversation_candidates
+                    if value))
+                for conversation_id in conversation_ids:
+                    event = game._make_event(
+                        game_engine.EncounterModDialogSessionEventArgs)
+                    event.player_id = pl_uid_t
+                    event.conversation_template_id = (
+                        game_engine.ResourceId.from_str(conversation_id))
+                    game._push(event)
+                if conversation_ids:
+                    log_req("    FRA challenge conversation queued internally: "
+                            + ",".join(value[:8] for value in conversation_ids))
             pkt = game.make_network_packet(pl_uid_t)
             evt_bytes = compress_gzip(encode_sync_event(pkt))
             evt_dw = encode_datawrapper(0, 3055, evt_bytes, 1, "00000000-0000-0000-0000-000000000000")

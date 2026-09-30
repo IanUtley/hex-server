@@ -51,19 +51,19 @@ Reload-only modules can be refreshed without restarting HConnect:
 kill -USR1 "$(pgrep -f '[h]connect_server.py' | head -n1)"
 ```
 
-During development, Supervisor can own all four long-running processes after
-installing the dependencies from `requirements.txt`:
+Supervisor owns all four long-running processes by default after installing
+the dependencies from `requirements.txt`:
 
 ```bash
-HEX_USE_SUPERVISOR=1 bash restart.sh
+bash restart.sh
 supervisorctl -c supervisord.conf status
 ```
 
 The Docker entrypoint runs the same `supervisord.conf` in the foreground after
 database bootstrap. Supervisor restarts a failed service and writes the
 service logs under `/tmp`; use `supervisorctl` for targeted stop, start, or
-restart operations. `restart.sh` retains its direct-process mode when
-`HEX_USE_SUPERVISOR` is unset.
+restart operations. Set `HEX_USE_SUPERVISOR=0` when a direct-process restart is
+needed for local troubleshooting.
 
 Use a full restart after changing `hconnect_server.py`, startup wiring,
 encoders, schema initialization, or process configuration. Do not run tests in
@@ -99,6 +99,17 @@ client unless `HEX_DEBUGPY_WAIT=1` is set. Snapshots are written to
 `/tmp/hconnect_log.txt` at RulesPort attachment, scheduler drives, projection,
 and AI-turn boundaries; ordinary restarts do not enable either feature.
 
+Authenticated logger output is copied to a player-wide
+`/tmp/hconnect_sessions/player-<profile-id>.log`, including requests outside a
+game. Game-associated output is also copied to
+`session-<session-id>-p<player1>-p<player2>.log`; the participant tokens are
+the client-visible game player IDs. Set `HEX_SESSION_LOG_DIR` or
+`HEX_PLAYER_LOG_DIR` to move these files. The process-wide
+`/tmp/hconnect_log.txt` and `/tmp/hconnect_requests.log` remain available for
+startup and pre-auth failures. `!issue <title>` includes the player's recent
+log and the newest matching game log, plus a compact active-session snapshot
+when one exists.
+
 `hex_mcp.py` answers champion, encounter, card, and ability questions over the
 MCP stdio transport. It is read-only and reads the same Records-derived
 snapshot the server seeds from (`AssetExtraction/gamedata_seed.py` for the
@@ -115,6 +126,14 @@ args = ["/home/ianutley/Hex/hex_mcp.py"]
 ```
 
 ## 4. Module ownership
+
+Hand QuickActions that summon troops are recognized from their authored
+summon-effect and Warzone-destination metadata. The shared AI chooser can use
+them at the opponent's EndPhase or after attacker declaration when its current
+blockers cannot cover the attacks; the live AI and FRA simulator must use the
+same chooser. The C# CreateCard ability case covers manual troop-summoning
+abilities, while its EndPhase handler passes and its combat QuickAction fallback
+does not select troop-summoning hand cards.
 
 | Module | Owns |
 |---|---|
@@ -242,6 +261,28 @@ Deathcry, Giant Corpse Fly's Deploy) is the class-23 discard prompt. The
 card could occupy and must never choose a prompt. A paused discard resumes at
 the same effect order with the chosen card bound as the resolved target: the
 first pass stopped before its mutation, so resuming after it discards nothing.
+A picker continuation that finishes its chain item must re-project the native
+priority window (`_advance_rules_port_to_priority`), because completing the
+item can end the paused phase (a trigger that resolved during Draw advances to
+First Main) or expose a chain item queued behind it (a resource drawn into hand
+fires Mysterious Rune's revert-and-play). Acknowledging without that
+projection leaves the client on the stale ResolveTopOfChain button, and its
+next click passes the phase the player never saw.
+A resolver can queue a new chain item while it runs (a troop entering play
+fires its Deploy trigger). C# defers that push behind the resolve action and
+still pops the resolved item; this port pushes immediately, so
+`resolve_top_of_chain` must detach the resolved id by identity
+(`Chain.detach_ability`) or it stays as a ghost item that never pops. The
+newly queued item's response window is server-owned on the AI's turn, so both
+the transaction pass handler and `_advance_rules_port_to_priority` drain
+consecutive AI-owned chain windows (`_is_practice_chain_follow_up`) before
+projecting the human; otherwise the game waits on the server actor forever.
+
+A `CardModifier` with `m_ReplaceExistingValue` (Raucous Revelry, "become cost
+1", and Giant Army Ants, "become cost 0") *assigns* the card cost, including
+0; the port stores the equivalent additive delta so playability and payment
+agree. Only an additive modifier falls back to the game-text operand when the
+extracted amount is 0.
 
 Resource and cost transitions are likewise RulesPort-owned. Use the typed
 resource transitions for current/total pools, thresholds, charges, spell
@@ -313,7 +354,12 @@ Store unsigned client UIDs as text where SQLite signed integers are unsafe.
 
 Practice sessions (`Session-*`) do not write replay event or transaction
 capture rows. Tournament cleanup removes stale tournament `game_sessions` and
-`game_cards` after replay generation is safe. The replay worker retains the
+`game_cards` after replay generation is safe. A separate scheduled sweep
+(`pvp_db.db_cleanup_stale_sessions`, `STALE_SESSION_AGE_DAYS`) removes abandoned
+non-tournament Practice/FRA/PvE sessions and their `game_cards` (and any event
+or transaction rows) after that retention window; sessions referenced by
+`tournaments`/`tournament_matches` or holding a replay awaiting indexing are
+left to the tournament/replay path. The replay worker retains the
 generated artifact for its configured retention period, then removes its
 `game_replays`, `session_events`, and `session_transactions` rows and the
 expired artifact file.

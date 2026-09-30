@@ -14,7 +14,8 @@ from gamedata.records import reference_guid
 # the Records field name, except for ``attribute_flags``: every RulesPort
 # attribute reader (and the legacy BOM merge it mirrors) uses that underscored
 # key, so map it explicitly instead of emitting ``attributeflags``.
-_PARAM_NAMES = {"m_AttributeFlags": "attribute_flags"}
+_PARAM_NAMES = {"m_AttributeFlags": "attribute_flags",
+                "m_LoseHalfHealth": "lose_half_health"}
 
 
 def modifier_metadata(effect_guid=None, *, template=None):
@@ -50,12 +51,12 @@ def modifier_metadata(effect_guid=None, *, template=None):
     }
     result = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
-                "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_Value", "m_Double", "m_ThresholdColor", "m_Shard", "m_Subtype",
                 "m_Tag",
                 "m_CardFilter", "m_SetThresholds", "m_RemoveAllCounters",
                 "m_ReplaceExistingValue", "m_IsCombatDamage", "m_CombatDamageOnly",
                 "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely",
-                "m_RandomLowestThreshold", "m_Random"):
+                "m_RandomLowestThreshold", "m_Random", "m_LoseHalfHealth"):
         if key in modifier:
             result[_PARAM_NAMES.get(key, key[2:].lower())] = modifier[key]
     counter = modifier.get("m_CardCounterTemplateId")

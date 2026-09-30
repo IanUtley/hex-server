@@ -245,6 +245,21 @@ class Chain:
         self._instance_ids.remove(instance_id)
         return self.ability_manager.remove(instance_id)
 
+    def detach_ability(self, instance_id: int):
+        """Remove one already-resolved id from the chain, not only its top.
+
+        C# defers triggers discovered during a resolution behind a
+        ``PushOntoChainAction``, so ``RemoveFromTopOfChain`` still sees the
+        resolved item on top.  This port pushes the discovered item onto the
+        chain immediately, so the resolved id can sit below the new trigger
+        and a top-only pop would leave a ghost item that never resolves.
+        """
+        instance_id = int(instance_id)
+        if instance_id not in self._instance_ids:
+            return None
+        self._instance_ids.remove(instance_id)
+        return self.ability_manager.get(instance_id)
+
 
 class GameActionStack:
     """LIFO action scheduler matching ``GameActionStack.Update`` ordering."""
@@ -394,7 +409,14 @@ class PriorityWindowAction(GameAction):
             return False
         self._priority_queue.popleft()
         self._require_action_stack().priority_player_id = self.priority_player_id
-        self._require_session().send_turn_phase_update()
+        session = self._require_session()
+        # Passing can expose another responder immediately.  Run state-based
+        # actions before publishing that new priority, including for a chain
+        # response window rather than only ordinary turn phases.
+        run_state_based = getattr(session, "run_state_based_checks", None)
+        if callable(run_state_based):
+            run_state_based()
+        session.send_turn_phase_update()
         return True
 
     def reset_priority_window(self, start_with_active_player: bool) -> None:

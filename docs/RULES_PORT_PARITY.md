@@ -11,15 +11,15 @@ C# paths below are relative to
 
 | System | C# entry points | Server owners | Authored input | Evidence / remaining acceptance |
 | --- | --- | --- | --- | --- |
-| Turns, stops, priority, reconnect | `Mechanics/TurnPhaseState.cs`, `Mechanics/GameActions/PriorityWindowAction.cs`, `Mechanics/EndTurnState.cs` | `session.py`, `phases.py`, `turn_states.py`, `lifecycle.py`, `pvp_lifecycle.py`, `adapter.py` in `rules_port` | Phase stops and saved action/chain descriptors | Existing implementation; complete reconnect and two-client priority traces still required. Champion shield expiry covered in both checkpoint formats. |
-| Timing, resource plays, costs, thresholds | `Mechanics/Transactions/PlayTroopTransaction.cs`, `PlayResourceTransaction.cs`, `ActivateAbilityTransaction.cs` | `rules_port/transactions.py`, `card_transactions.py`, `resources.py`, `costs.py` | Ability costs, casting behavior, thresholds, target maps | Existing validation; exhaustive invalid-intent and multi-part payment rollback parity not certified here. |
+| Turns, stops, priority, reconnect | `Mechanics/TurnPhaseState.cs`, `Mechanics/GameActions/PriorityWindowAction.cs`, `Mechanics/EndTurnState.cs` | `session.py`, `phases.py`, `turn_states.py`, `lifecycle.py`, `pvp_lifecycle.py`, `adapter.py` in `rules_port` | Phase stops and saved action/chain descriptors | Existing implementation; complete reconnect and two-client priority traces still required. Champion shield expiry covered in both checkpoint formats. `ReadyState` armor reset and the `CantReady`/`CantReadyNormally`/`CantReadyNormallyHidden` IntAttr gates apply in `ready_cards_for_turn`. |
+| Timing, resource plays, costs, thresholds | `Mechanics/Transactions/PlayTroopTransaction.cs`, `PlayResourceTransaction.cs`, `ActivateAbilityTransaction.cs` | `rules_port/transactions.py`, `card_transactions.py`, `resources.py`, `costs.py`, `static_rules.py` | Ability costs, casting behavior, thresholds, target maps | Existing validation; exhaustive invalid-intent and multi-part payment rollback parity not certified here. Free plays require `OwnerCanPlayForFree` or the controller's champion `CanPlayCardsForFree` and project a zero effective cost. `Mobilize` reduces the payment by two per ready troop tapped (capped by the card's value, validated against the client's `CardsToMobilize`), and `CanIgnoreCardsThresholds` bypasses threshold checks; `ChargePointCostModifier` remains open. |
 | Chain and choices | `Mechanics/GameActions/PriorityWindowAction.cs`, `ResolveTopOfChainAction.cs`, `WaitForTriggeredAbilitiesAction.cs` | `rules_port/kernel.py`, `chain.py`, `resolution.py`, `async_bridge.py` | Effect group/instance order, continuation and chain identity | Existing continuation machinery; nested choices and reconnect through every checkpoint need acceptance traces. |
-| Combat declarations and assignment | `Mechanics/Combat.cs`, `CombatResolver.cs`, `Card.cs:CalculateTotalCombatDamageToDeal` | `rules_port/combat.py`, `combat_rules.py`, `combat_damage.py` | Keywords, blocker order, multiplier rules | Shared damage callback now reports absorption including prevention; minimum-to-kill is applied after shields. Full keyword/simultaneous parity remains open. |
-| Damage and prevention | `Session.cs:DamageCard`, `DamageChampion`, `Mechanics/DamageShield.cs` | `rules_port/damage_effects.py`, `context.py` | DamageShield, DamageMultiplier, DamageImmunity modifier fields | Focused ordering/accounting tests below. Armor, chance prevention, received-damage modifiers and threshold-based prevention remain absent from this damage interpreter. |
+| Combat declarations and assignment | `Mechanics/Combat.cs`, `CombatResolver.cs`, `Card.cs:CalculateTotalCombatDamageToDeal`, `Card.cs:CurrentAttackValue` | `rules_port/combat.py`, `combat_rules.py`, `combat_damage.py`, `static_rules.py` | Keywords, blocker order, multiplier rules, Gladiator role bonus | Shared damage callback now reports absorption including prevention; minimum-to-kill is applied after shields. `Gladiator` projects to attack while the controller is active and to defense while defending, with `GladiatorBoth` applying both. Moving a troop to the warzone applies an opposing champion's `OpposingTroopsEnterPlayExhausted`/`OpposingNonArdentTroopsEnterPlayExhausted` flags through the shared played/token/effect entry paths. Full keyword/simultaneous parity remains open. |
+| Damage and prevention | `Session.cs:DamageCard`, `DamageChampion`, `Mechanics/DamageShield.cs`, `Card.cs:ResetArmor` | `rules_port/damage_effects.py`, `context.py`, `lifecycle.py` | DamageShield, DamageMultiplier, DamageImmunity modifier fields, Armor/ArmorUsed, additive received modifiers | Focused ordering/accounting tests below. Armor consumption is ordered after shields, `ArmorUsed` persists in the permanent store and resets for every card at Ready. Additive `DamageReceivedModifier`/`*ReceivedModifier`, source `PreventMy*` and noncombat `DamageChampionMultiplier` follow `Session.DamageCard`/`DamageChampion`. Additive `PreventDamageFromCardsThatHaveOwnersThreshold`, the champion `NonCombatDamageReduction`/`OpposingNonCombatDamageReduction` adjustments and the `ChanceToPreventCombatDamage`/`ChanceToPreventNonCombatDamage` roll (same RNG consumption point, including a stored zero) also follow `Session.DamageCard`. |
 | Statics and targeting | `Mechanics/Modifiers/DamageMultiplierModifier.cs`, `DamageImmunityModifier.cs` | `rules_port/static_rules.py`, `targeting.py`, `filters.py` | Target templates, conditions, typed modifier operands | Continuous rule modifiers now check their authored target filter. Numeric multipliers preserve multiplication, replacement, separate speed scopes, and zero. Synthetic champion continuous-rule projection remains incomplete. |
-| Counters, deaths, zones | `Mechanics/Card.cs`, `Session.cs`, `Mechanics/AbilityManager.cs` | `rules_port/death_effects.py`, `context.py`, `runtime_helpers.py`; `pvp_db.py` projection | Counters, durations, zone collections, Deathcry triggers | End-of-turn, end-of-next-turn, owner/opponent turn and after-ready duration boundaries follow C#; noncombat death timing and damage-bound teardown still need parity work. |
-| Trigger discovery | `Mechanics/AbilityManager.cs`, `Mechanics/Triggers/Conditions/` | `rules_port/triggers.py`, `trigger_discovery.py`, `conditions.py` | Event source/target, conditions, collections | Damage now publishes prevention and target-damaged events with payloads. Entering play publishes `CardEnteredZoneEvent` -> `AsEntersPlayEvent` -> `CardInspiredEvent` (self enters-play abilities and Inspire), and `None` collection flags are unrestricted like C#. Focused fixtures cover the enters-play chain; not every downstream authored trigger has an acceptance scenario. |
-| Ability interpreter and champion powers | `Mechanics/Abilities/`, `Mechanics/Transactions/ActivateAbilityTransaction.cs` | `rules_port/resolution.py`, `context.py`, `abilities.py`, `card_transactions.py`, `ability_usage.py` | Variables, effect groups, costs, uses, cooldowns | Repeating children, current Records variable subclasses, use limits, cooldowns and key duration boundaries have focused coverage; full option, statistic and champion-modifier parity remains uncertified. |
+| Counters, deaths, zones | `Mechanics/Card.cs`, `Session.cs`, `Mechanics/AbilityManager.cs` | `rules_port/death_effects.py`, `context.py`, `runtime_helpers.py`, `lifecycle.py`, `triggers.py`; `pvp_db.py` projection | Counters, durations, zone collections, Deathcry gates, `Session.GetBuryBonusForPlayer`, end-of-turn damage reset | End-of-turn, end-of-next-turn, owner/opponent turn and after-ready duration boundaries follow C#; burying adds other champions' `BuryBonus`; an opponent's `OpposingDeathcriesCantTrigger` blocks Deathcry and `CantHealAtEndOfTurn` cards keep damage through the reset. `Session.Lifebound` returns the active player's marked discard cards at StartTurn. Noncombat death timing and damage-bound teardown still need parity work. |
+| Trigger discovery | `Mechanics/AbilityManager.cs`, `Mechanics/Triggers/Conditions/` | `rules_port/triggers.py`, `trigger_discovery.py`, `conditions.py` | Event source/target, conditions, collections | Damage now publishes prevention and target-damaged events with payloads. Entering play publishes `CardEnteredZoneEvent` -> `AsEntersPlayEvent` -> `CardInspiredEvent` (self enters-play abilities and Inspire), and `None` collection flags are unrestricted like C#. `HandleGameRulesTriggers` equivalents run after authored listeners: Rage on attack and Momentum for the caster's warzone troops on a resource cast (+1/+1 until the owner's next StartTurn). Focused fixtures cover the enters-play chain; not every downstream authored trigger has an acceptance scenario. |
+| Ability interpreter and champion powers | `Mechanics/Abilities/`, `Mechanics/Transactions/ActivateAbilityTransaction.cs` | `rules_port/resolution.py`, `context.py`, `abilities.py`, `card_transactions.py`, `ability_usage.py` | Variables, effect groups, costs, uses, cooldowns | Repeating children (including the deprecated loop-count fallback), current Records variable subclasses, use limits, cooldowns and key duration boundaries have focused coverage. Verdict builds the authored good/bad choice tokens and activates the built-in choose/play ability. Full option, statistic and champion-modifier parity remains uncertified. |
 | Client projection | `Session.cs`; `HexClient/Assembly-CSharp/UIBattle.cs:OnChampionHealthChanged`, `OnCardUpdated` | `game_engine.py`, `rules_port/adapter.py`, HConnect and mode adapters | Valid SessionCardIds, event order, visible legal options | Existing wire events retained. No new real-client or live PvP acceptance performed. |
 
 ## Target filter and selection coverage
@@ -295,11 +295,13 @@ these behaviors.
 The scope of the complete original-client port is not complete. In addition to
 the uncertified rows above, the inspected damage path still needs:
 
-- Armor consumption/reset, probabilistic prevention, threshold immunity,
-  received-damage and champion-specific adjustments from `Session.cs`.
-- Complete synthetic champion multiplier/immunity instance and continuous
-  projection, plus total ordering when shields span permanent and temporary
-  stores (the current persistence splits those lists).
+- Champion-targeted continuous `CardModifier` leaves that are not IntAttrs
+  (champion auras granting `DamageMultiplier`/`DamageImmunity`/stat rules)
+  are not folded into a synthetic champion context; only champion runtime
+  IntAttrs and the four champion flag IntAttrs are projected. No current
+  Records card exercises the missing shapes.
+- Total ordering when shields span permanent and temporary stores (the
+  current persistence splits those lists; C# keeps one add-ordered list).
 - Full replacement pause/resume and UntilDamaged duration removal. The fixture
   validates replacement dispatch ordering, not the entire continuation graph.
 - Consistent state-based death timing across effect groups and simultaneous
@@ -309,10 +311,6 @@ Effect-field audit follow-ups (`AssetExtraction/audit_effect_leaves.py`
 reports no meaningful unread effect-template fields for the current snapshot;
 these are the remaining projection limits):
 
-- Replica modification is authoritative server-side (Artifact type, Robot and
-  Replica subtypes, cleared thresholds, IsReplica permanent data,
-  `rules_port/replica.py`), but the pushed `CardUpdated` still renders the base
-  template, so the client does not display the replica subtype/type change.
 - Current Records contain no `GrantAbility.m_AllSocketedPowersOfMyMaster = 1`
   and no `CreateTokenCopy.m_CopyGems = 1` instances. The master equipment link
   is not represented in the session, so those unused field variants are not
@@ -321,6 +319,19 @@ these are the remaining projection limits):
   this value to `AuthoritativeSessionBase.CopyCardAndPutOnChain`, whose current
   implementation does not branch on it. The server therefore has no distinct
   action to mirror for this flag in the inspected client build.
+
+`card_audit.py` reports zero unconsumed intattrs for the current Records
+snapshot: every C# `Game/**` runtime IntAttr read now has a Python consumer,
+including the champion permissions (`CantActivateAbilities`,
+`CantUseChargePowers`, `OpposingCryptPowersCantBeUsed`,
+`YouCanActivateYourChargePowersAsThoughTheyWereQuick`), charge and draw
+adjustments (`ChargePointBonus`, `ChargePointCostModifier`,
+`MaxCardsDrawablePerTurn`, `CantDrawCards`), `Prevent*`/`*DamageReduction`
+damage adjustments, `CantRevert`, `RabidNotOneShot`, `Lifebound`,
+`ReplenishResourcesEachTurn`, `VerdictChoice`/`VerdictAncient` and the
+`CanSee*` visibility permissions. The only remaining audit entry is
+`m_SendPlayAction`, whose C# consumer (`CopyCardAndPutOnChain`) does not
+branch on it, so the no-op port is exact.
 
 Use `docs/PRIVATE_SERVER_FEATURES.md` for the other known setup, draw, hand-limit,
 metadata-interpreter and client acceptance gaps. A clean class inventory must

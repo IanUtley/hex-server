@@ -42,6 +42,28 @@ _LOCATION_BY_COLLECTION = {
 }
 
 
+def _ability_has_tac(graph, name):
+    """Whether one authored ability graph carries the named TAC keyword."""
+    try:
+        from .tac import _tac_attr_hash, decode_tac
+        data = str(getattr(graph, "serialized_tac", "") or "")
+        return bool(data and _tac_attr_hash(name) in decode_tac(data))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _champion_owner_for_uid(battle_state, source_id):
+    """The owner whose champion maps to ``source_id`` (or None)."""
+    for participant, uid in (battle_state.get("champ_map") or {}).items():
+        try:
+            value = getattr(uid, "uid", uid)
+            if int(getattr(value, "uid64", value)) == int(source_id):
+                return int(participant)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _raw_player_id(value) -> int:
     value = int(getattr(value, "uid64", value))
     # HConnect uses typed ServicePlayer UIDs; game_cards stores the raw owner.
@@ -314,8 +336,24 @@ class PvpRuntimeFacts:
             if not top or int(top[1]) != int(card.session_card_id):
                 return False
         if not self._has_thresholds(card, player):
-            return False
-        return bool(playing_for_free or player.current_resource_pool >= card.casting_cost)
+            from .static_rules import champion_int_attribute
+            if champion_int_attribute(
+                    self.battle_state, owner_id,
+                    "CanIgnoreCardsThresholds") <= 0:
+                return False
+        if playing_for_free:
+            # C# PlayTroop/Spell/ArtifactTransaction only accept a free play
+            # when the card has OwnerCanPlayForFree or the controller's
+            # champion has CanPlayCardsForFree.
+            from .static_rules import _card_play_for_free
+            db = getattr(getattr(self._pvp, "_db_layer", None), "_db", None)
+            if db is None:
+                import db as db_layer
+                db = db_layer._db
+            return bool(_card_play_for_free(
+                db, self.session_id, self.battle_state,
+                int(card.session_card_id)))
+        return bool(player.current_resource_pool >= card.casting_cost)
 
     def can_activate_ability(self, card: RuntimeCard, player_id, ability_template_id) -> bool:
         # ``game_cards.owner_user_id`` is the profile/reckoning id, while the
@@ -348,6 +386,7 @@ class PvpRuntimeFacts:
         if flags and str(card.location or "").lower() not in {
                 zone.strip().lower() for zone in flags.split("|") if zone.strip()}:
             return False
+        from .static_rules import card_has_int_attr, champion_int_attribute
         if graph is not None:
             from pvp_db import db_card_ability_use_counts, db_card_cooldown_counts
             game_uses, turn_uses = db_card_ability_use_counts(
@@ -356,12 +395,47 @@ class PvpRuntimeFacts:
             costs = getattr(graph, "costs", None)
             game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
             turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
-            if ((game_limit > 0 and game_uses >= game_limit) or
+            # Card.PayPerGameCosts: a RabidNotOneShot champion leaves a Rabid
+            # one-shot's per-game use uncounted.
+            rabid = (champion_int_attribute(
+                self.battle_state, owner_id, "RabidNotOneShot") > 0
+                and _ability_has_tac(graph, "Rabid"))
+            if ((game_limit > 0 and not rabid and game_uses >= game_limit) or
                     (turn_limit > 0 and turn_uses >= turn_limit) or
                     int(db_card_cooldown_counts(
                         self.session_id, card.session_card_id).get(
                             str(graph.guid).lower(), 0) or 0) > 0):
                 return False
+        # Card.CanActivateAbility's typed capability gates.
+        db = getattr(getattr(self._pvp, "_db_layer", None), "_db", None)
+        if db is None:
+            import db as db_layer
+            db = db_layer._db
+        if card_has_int_attr(
+                db, self.session_id, card.session_card_id,
+                "CantActivateAbilities"):
+            return False
+        if champion_int_attribute(
+                self.battle_state, owner_id, "CantActivateAbilities") > 0:
+            return False
+        if str(getattr(card, "location", "") or "").lower() == "discard":
+            for participant in (self.battle_state.get("champ_map") or {}):
+                try:
+                    opponent = int(participant)
+                except (TypeError, ValueError):
+                    continue
+                if opponent == int(owner_id):
+                    continue
+                if champion_int_attribute(
+                        self.battle_state, opponent,
+                        "OpposingCryptPowersCantBeUsed") > 0:
+                    return False
+        costs = getattr(graph, "costs", None)
+        if (costs is not None and getattr(costs, "is_charge_power", False)
+                and champion_int_attribute(
+                    self.battle_state, owner_id,
+                    "CantUseChargePowers") > 0):
+            return False
         validator = getattr(self, "ability_validator", None)
         return (bool(validator(card, player_id, ability_template_id))
                 if callable(validator) else True)
@@ -414,10 +488,83 @@ class PvpRuntimeFacts:
                 attached = getattr(self, "ai_champion_ability_guids", None)
             if attached is not None and guid not in {
                     str(value).lower() for value in attached}:
+                # A projected CardDef can omit champion powers when the
+                # champion is a generated PvP card.  The checkpoint retains
+                # the champion GUID, so validate the signature catalog from
+                # its authored database rows before rejecting the activation.
+                source_owner = None
+                for owner, champion in (
+                        (getattr(self, "battle_state", {}) or {}).get(
+                            "champ_map", {}).items()):
+                    try:
+                        champion = getattr(champion, "uid", champion)
+                        if int(getattr(champion, "uid64", champion)) == source_id:
+                            source_owner = int(owner)
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                champion_guid = str((
+                    (getattr(self, "battle_state", {}) or {}).get(
+                        "champ_guid_map", {}) or {}).get(
+                            str(source_owner), "") or "").lower()
+                try:
+                    from pvp_db import db_get_champion_ability_guids
+                    authored = {str(value).lower()
+                                for value in db_get_champion_ability_guids(
+                                    champion_guid)} if champion_guid else set()
+                except Exception:
+                    authored = set()
+                if guid not in authored:
+                    return False
+            graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+            champion_owner = _champion_owner_for_uid(self.battle_state,
+                                                     source_id)
+            from .static_rules import champion_int_attribute
+            rabid = (champion_int_attribute(
+                self.battle_state, champion_owner, "RabidNotOneShot") > 0
+                and _ability_has_tac(graph, "Rabid"))
+            if (self.champion_ability_uses_exhausted(source_id, graph)
+                    and not rabid):
                 return False
-            if self.champion_ability_uses_exhausted(
-                    source_id, ability_graph(DEFAULT_RECORD_STORE, guid)):
+            if champion_int_attribute(
+                    self.battle_state, champion_owner,
+                    "CantActivateAbilities") > 0:
                 return False
+            costs = getattr(graph, "costs", None)
+            if (costs is not None and getattr(costs, "is_charge_power", False)
+                    and champion_int_attribute(
+                        self.battle_state, champion_owner,
+                        "CantUseChargePowers") > 0):
+                return False
+            # CanActivateAbilityBase rejects a manual activation when the
+            # authored m_AbilityCondition fails (the threshold requirement on
+            # signature powers such as Mesa Caretaker's [DIAMOND][SAPPHIRE]
+            # [WILD] Conscript, or Phenteo's [BLOOD][BLOOD]).  Evaluate the
+            # typed Records condition against the champion owner; a condition
+            # family the port cannot evaluate leaves the payment decision to
+            # the option projection rather than blocking a legal power.
+            condition = getattr(graph, "ability_condition", None)
+            if condition is not None:
+                try:
+                    from .condition_context import ConditionContext
+                    from .conditions import evaluate_condition
+                    import types as _types
+                    db = getattr(getattr(self._pvp, "_db_layer", None),
+                                 "_db", None)
+                    if db is None:
+                        import db as db_layer
+                        db = db_layer._db
+                    context = ConditionContext(
+                        db, _types.SimpleNamespace(session_id=self.session_id),
+                        self.battle_state,
+                        event_type="AbilityActivationEvent",
+                        ability_source_uid=source_id,
+                        ability_source_owner_id=champion_owner,
+                        pl_t=self.player_uid, ai_t=self.ai_uid)
+                    if not evaluate_condition(condition, context):
+                        return False
+                except (RuntimeError, TypeError, ValueError, KeyError):
+                    pass
             from pvp_db import db_champion_ability_costs, db_charge_ability_cost
             return (db_champion_ability_costs(guid) is not None or
                     db_charge_ability_cost(guid) is not None)
@@ -547,10 +694,17 @@ class PvpRuntimeFacts:
         if costs is None:
             return True
         owner = getattr(metadata, "owner_id", None)
+        source_uid = getattr(metadata, "source_uid", None)
         if not owner:
-            source_uid = getattr(metadata, "source_uid", None)
             source = self.get_card(source_uid) if source_uid is not None else None
             owner = getattr(source, "owner_id", None)
+        from .static_rules import charge_point_cost_modifier
+        db = getattr(getattr(self._pvp, "_db_layer", None), "_db", None)
+        if db is None:
+            import db as db_layer
+            db = db_layer._db
+        charge_mod = charge_point_cost_modifier(
+            db, self.session_id, self.battle_state, owner, source_uid)
         if self.battle_state.get("pvp") and owner is not None:
             # PvP has two human participants and no stable player/AI side.
             # The ability metadata carries the raw participant id, so never
@@ -566,6 +720,7 @@ class PvpRuntimeFacts:
                 health=int(self.battle_state.get(f"hp_{owner}", 25) or 0),
                 spell_uses=self.battle_state.get(f"sp_uses_{owner}", {}) or {},
                 ability_key=str(getattr(metadata, "ability_template_id", "")),
+                charge_modifier=charge_mod,
             )
             return plan is not None
         player_owner = getattr(self, "player_owner_id", None)
@@ -582,6 +737,7 @@ class PvpRuntimeFacts:
             health=int(self.battle_state.get(f"{prefix}_health", 25) or 0),
             spell_uses=self.battle_state.get(f"{prefix}_sp_uses", {}) or {},
             ability_key=str(getattr(metadata, "ability_template_id", "")),
+            charge_modifier=charge_mod,
         )
         return plan is not None
 

@@ -45,6 +45,22 @@ Encounter data is persisted in `fra_encounters`, and the selected run is
 persisted in `fra_challengers`. The challenger response exposes the boss state
 as the client-facing `IsBoss` field.
 
+Deck strategies are inferred from typed Records by
+[`AssetExtraction/evaluate_fra_deck_personalities.py`](../AssetExtraction/evaluate_fra_deck_personalities.py).
+The result is stored on `fra_encounters`, copied to `fra_challengers`, and
+applied to matching `encounter_scenes.ai_deck_personality` rows. Decks without
+a clear strategy use `Default`: the top score must reach 3/10 and lead the
+runner-up by at least 1/10. An average troop cost from 3 through 5 is neutral
+for `BigThreats`; ramp cards add weight there. `Reanimation` gets weight from
+its graveyard setup and recovery package, with large troops as supporting
+signals. Direct damage actions that can target a champion contribute to
+`Burn`. `HandAdvantage` counts draw effects only; QuickActions without draw do
+not contribute. Authored threshold colors add up to 2/10 as an archetype bias:
+Sapphire for `HandAdvantage`, Wild for `BigThreats`, Blood or Diamond for
+`Reanimation`, Ruby for `Burn`, Wild/Diamond/Ruby for `BuildArmy`, and
+Ruby/Wild/Diamond for `Aggressive`. Run the evaluator after changing strategy
+rules or the Records snapshot; it prints each category's score out of 10.
+
 ## Arena state
 
 The `arena_state` table in [`static.py`](../static.py) contains:
@@ -60,16 +76,22 @@ The `arena_state` table in [`static.py`](../static.py) contains:
 | `sacks_earned` | Reserved for other reward types; currently unused |
 
 `db_record_arena_fight()` in [`pve_db.py`](../pve_db.py) records the result and
-advances the challenger index:
+updates the challenger index:
 
 - every opponent: `gold_earned += fight_tier` (five opponents per tier);
 - boss: `chests_earned += 1` in addition to the tier's gold bags;
-- loss: neither counter changes.
+- ordinary loss: the player loses one life and advances to the next opponent;
+- boss loss: the player loses one life but stays on the same boss to retry it;
+- a boss win advances to the next tier, while a successful boss retry still
+  retains the recorded boss-loss marker and is not treated as a lossless tier.
 
-The update occurs only when the fight-history slot is unfinished, so repeated
-game-end handling cannot award the same fight twice. `GoldPacks` projects the
-accumulated gold-bag count in the arena lobby, and cash-out returns that count
-as `GoldWin`.
+The update is idempotent per game-session ID. Ordinary fight slots are only
+recorded once; a boss slot may record each distinct loss attempt and then its
+eventual win without awarding the boss twice. `GoldPacks` projects the
+accumulated gold-bag count in the arena lobby. At cash-out, each bag becomes
+one `ArenaReward` worth 100 gold; `GoldWin` is the resulting account-gold
+amount, not the bag count. The full selected roster is sent to the client
+before the cash-out response so the summary can reveal completed opponents.
 
 ## FRA challenges
 
@@ -79,17 +101,32 @@ ordinary challenge. After a win against an elite, the server sends its authored
 `... Reward` conversation at game end and stores the paired `... Boss
 Notification` challenge for the next boss fight. The notification's authored
 encounter modification is included in that boss's `GetArenaBattleMods` reply.
+If the player loses that boss fight, the attached boss-notification challenge
+and its modification are consumed; a retry remains on the boss but does not
+receive that earned boss reward again.
 
 For non-elite encounters after the first six opponents (zero-based challenger
 index greater than 5), the server selects an ordinary challenge and applies it
-only when its `probability_percent` roll succeeds. Reward and notification
-conversations are excluded from this selection. Selected challenge IDs and
-runtime card choices are persisted with fight history so lobby refreshes do
-not reroll them.
+only when its `probability_percent` roll succeeds; boss encounters are excluded
+from both ordinary-challenge paths. Reward and notification conversations are
+excluded from this selection. Selected challenge IDs and runtime card choices
+are persisted with fight history so lobby refreshes do not reroll them.
 
 `Starting Health 15` is a separate run-start challenge. The server rolls it
 when assigning the arena deck, stores it in fight-history slot 0, and applies
 its health modifier only for challenger index 0.
+
+For every new FRA game session, preserve `IsPvEArena`, `ArenaInstance`, and
+`ArenaOwner` in the `ReadyForGameSetup` session state for client challenge UI
+and reconnect handling. The fixed local client does not request
+`GetArenaBattleMods` during normal setup. The authoritative HConnect setup path
+calls the same saved-challenge lookup directly, applies its round-zero mods,
+and pushes each authored conversation before PreGame. The conversation's
+authored answer event displays its objective panel; the reconnect-only
+`GetArenaMCChallenge` response supplies the objective text directly. The fixed
+client has no reachable decline action for an MC challenge, so the server
+never models a declined challenge: an attached challenge is always accepted
+and its mods and rewards apply.
 
 ## Game-session result flow
 
@@ -135,15 +172,13 @@ lobby display.
 ## Cash-out and remaining work
 
 The client supports richer end-of-run `ArenaReward` entries, including gold,
-cards, equipment, and sleeves. The current server cash-out path in
-`services/arena.py` returns the accumulated gold value but still sends an
-empty `AllLoot` list. It also resets the run counters and clears the saved
-challenger roster.
+cards, equipment, and sleeves. The server cash-out path converts each stored
+gold bag into a 100-gold `ArenaReward`, credits the account atomically, and
+returns the full selected roster before the client requests final cleanup.
 
-Consequently, the current implementation tracks and displays FRA gold-bag
-and treasure-chest totals during a run, but does not yet convert those totals
-into inventory items or populated cash-out loot entries. That should be added
-separately from the run-counter logic.
+The cash-out path credits the converted gold atomically, returns the gold loot
+entries, and leaves final roster cleanup to the client's subsequent
+`DestroyArenaData` request.
 
 ## Validation notes
 

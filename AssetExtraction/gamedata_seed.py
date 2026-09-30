@@ -264,10 +264,16 @@ def _card_helpers():
     }
 
 
-def _target_count(value: Any) -> int:
-    if isinstance(value, dict):
-        return int_value(value, 1) or 1
-    return 1
+def _target_count(value: Any, default: int) -> int:
+    """Read an authored target bound without turning zero into one.
+
+    Zero is meaningful for both sides of a target range (for example,
+    "up to three" has a minimum of zero).  Missing fields use the caller's
+    bound-specific default; they must not overwrite an explicit zero.
+    """
+    if value is None:
+        return int(default)
+    return int_value(value, int(default))
 
 
 def _talent_condition(raw: str) -> str:
@@ -324,6 +330,9 @@ def _extract_cards(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ..
         if sacrifice_match and sacrifice_match.group(1).lower() != ZERO_GUID:
             sacrifice = sacrifice_match.group(1).lower()
         subtype = helpers["str_field"](raw, "m_CardSubtype")
+        variable_cost = helpers["int_field"](raw, "m_VariableCost")
+        variable_cost_double = helpers["int_field"](
+            raw, "m_VariableCostDouble")
         row = (
             card_guid,
             helpers["guid"](raw, "m_SetId") or "",
@@ -341,7 +350,8 @@ def _extract_cards(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ..
             helpers["abilities_to_json"](raw),
             helpers["attributes_to_int"](helpers["str_field"](raw, "m_AttributeFlags")),
             sacrifice,
-            helpers["int_field"](raw, "m_VariableCost"),
+            variable_cost,
+            variable_cost_double,
             helpers["int_field"](raw, "m_VariableCostMinimum"),
             rage,
             subtype,
@@ -385,8 +395,8 @@ def _extract_targets(data: str) -> list[tuple[Any, ...]]:
             int_value(record.get("m_Explicit")),
             record.get("m_PlayerFilter") or "",
             record.get("m_CollectionFlags") or "",
-            _target_count(record.get("m_MinTargetCount")),
-            _target_count(record.get("m_MaxTargetCount")),
+            _target_count(record.get("m_MinTargetCount"), 0),
+            _target_count(record.get("m_MaxTargetCount"), 1),
             json_text(record.get("m_CardFilter"), {}),
             str(record.get("_t") or "").split(".")[-1],
         )
@@ -1225,11 +1235,13 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
+_EXTRACT_CACHE_VERSION = 3
 
 
 def _extract_cache_file(cache_key: str) -> str:
     import hashlib
-    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:20]
+    versioned_key = f"{_EXTRACT_CACHE_VERSION}:{cache_key}"
+    digest = hashlib.sha256(versioned_key.encode("utf-8")).hexdigest()[:20]
     return os.path.join("/tmp", f"hex_records_seed_{digest}.pkl")
 
 
@@ -1342,7 +1354,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
 
 
 TABLE_COLUMNS = {
-    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "equipment_modified", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_minimum", "rage_value", "subtype", "lethal"),
+    "card_templates": ("guid", "set_guid", "name", "rarity", "cost", "attack", "defense", "card_type", "socket_count", "no_pvp", "is_pve", "equipment_modified", "threshold_json", "abilities_json", "attributes", "sacrifice_target", "variable_cost", "variable_cost_double", "variable_cost_minimum", "rage_value", "subtype", "lethal"),
     "card_abilities_meta": ("ability_guid", "casting_behavior", "is_manual", "activation_cost", "uses_per_game", "uses_per_turn", "cooldown", "exhausts_on_use", "is_triggered", "target_template_ids", "trigger_event_type", "game_text", "raw_json"),
     "ability_effects": (
         "ability_guid", "effect_guid", "effect_order", "effect_type", "param",

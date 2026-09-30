@@ -2038,6 +2038,119 @@ def test_lethal_blocker_native_kills_high_defense_attacker(db):
     assert blocker == ("warzone", 1), blocker
 
 
+def test_kog_tepetl_thirst_kills_zero_defense_blocker_before_priority(db):
+    """A permanent -1 DEF spell kills a 1/1 blocker before combat resumes.
+
+    The blocker is already declared, so leaving a 4/0 troop in combat lets it
+    deal damage during the later combat step.  C# state-based actions remove it
+    immediately after Thirst resolves; the attacker remains blocked and does
+    not take return damage or hit the champion merely because its blocker left.
+    """
+    from types import SimpleNamespace
+
+    from tests.tests_cards_fixes import _copy_card
+    from rules_port import chain_items
+    from rules_port.actions import AbilityResolutionState
+    from rules_port.context import EffectContext
+    from rules_port.death_effects import state_based_deaths
+
+    kog_tpl = "3becf35a-b67f-49cd-b3b0-40bd9cb3c7f7"
+    mosquito_tpl = "80ef4aab-7242-4b11-b494-bd65f3524493"
+    attacker_tpl = "ffffffff-0000-0000-0000-00000000d001"
+    thirst_ability = "2c7ddd48-4965-63b3-7b57-83992fa63379"
+
+    _copy_card(db, kog_tpl)
+    _copy_card(db, mosquito_tpl)
+    db.execute(
+        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "defense, attributes, abilities_json, threshold_json, subtype, "
+        "variable_cost, variable_cost_minimum, rage_value) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (attacker_tpl, "Rage Trooper", "Troop", 2, 2, 1, 0, "[]", "[]",
+         "Orc Warrior", 0, 0, 1))
+    add_card(db, 101, 0, attacker_tpl)
+    add_card(db, 301, 5, mosquito_tpl)
+    add_card(db, 4901, 0, kog_tpl, loc="CastSpells")
+    db.execute("UPDATE game_cards SET card_type='QuickAction' "
+               "WHERE card_uid=4901")
+    db.commit()
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    bstate = {
+        "player_health": 20, "ai_health": 20, "turn_number": 1,
+        "stack": [], "_rules_port_attached": True,
+        "ai_attackers": {"101": str(int(pl_t.uid64))},
+        "ai_blockers": {"101": ["301"]},
+    }
+    session = SessionStub()
+    handler = HandlerStub(db)
+    game = handler._fresh_game(session, pl_t, ai_t, bstate)
+
+    class Host(HandlerStub):
+        def chain_load(self, _session):
+            return bstate
+
+        def chain_save(self, _session, value):
+            # ``chain_load`` returns the authoritative mutable checkpoint;
+            # the production persistence hook saves it in place.
+            assert value is bstate
+
+        def chain_new_game(self, _session, _state, _player_uid, _ai_uid):
+            return game
+
+        def chain_send(self, *_args):
+            return None
+
+        def chain_card_data(self, current_game, scid, template_guid):
+            return self._card_full_data(current_game, scid, template_guid)
+
+        def chain_dispatch(self, *_args, **_kwargs):
+            return None
+
+        def chain_push_empty(self, _port, state, _item, pending):
+            return not pending and not state.get("stack")
+
+        def chain_state_based(self, current_session, state, current_game,
+                              player_uid, ai_uid):
+            context = EffectContext.from_rules_port(
+                current_game, current_session, db, self, player_uid, ai_uid,
+                state, "state_based_death", ability=None)
+            return bool(state_based_deaths(context))
+
+    host = Host(db)
+    descriptor = {
+        "kind": "spell", "source_uid": 4901, "source_owner_uid": 0,
+        "target_uid": 301, "ability_guids": [thirst_ability],
+        "instance_id": 1,
+    }
+    bstate["stack"] = [dict(descriptor)]
+    ability = SimpleNamespace(descriptor=descriptor, instance_id=1,
+                              ignores_chain=False)
+    result = chain_items.resolve_chain_item(
+        host, None, session, db, ability, pl_t, ai_t)
+    assert result is AbilityResolutionState.COMPLETED, result
+
+    blocker = db.execute(
+        "SELECT location, card_state FROM game_cards WHERE card_uid=301"
+    ).fetchone()
+    attacker = db.execute(
+        "SELECT location, card_damage FROM game_cards WHERE card_uid=101"
+    ).fetchone()
+    assert blocker[0] == "discard", blocker
+    assert blocker[1] & game_engine.ECardStates.Dead, blocker
+    assert attacker == ("warzone", 0), attacker
+    assert bstate["blocked_attackers"] == {"101": True}, bstate
+
+    # The declaration remains blocked after the lethal blocker leaves play.
+    resolve_native_combat(handler, session, pl_t, ai_t, bstate,
+                          {101: int(pl_t.uid64)}, {101: []})
+    assert db.execute(
+        "SELECT location, card_damage FROM game_cards WHERE card_uid=101"
+    ).fetchone() == ("warzone", 0)
+    assert bstate["player_health"] == 20, bstate
+
+
 def test_ai_attacks_zero_attack_rage_troop_when_unblocked(db):
     """A ready 0-attack troop with printed Rage must still attack into an
     empty opposing warzone so its Rage trigger can apply."""
@@ -2260,6 +2373,8 @@ def main():
          test_lethal_attacker_native_kills_high_defense_blocker),
         ("Lethal blocker kills high-defense attacker (native)",
          test_lethal_blocker_native_kills_high_defense_attacker),
+        ("Thirst kills zero-defense blocker before priority",
+         test_kog_tepetl_thirst_kills_zero_defense_blocker_before_priority),
     ]
     failed = 0
     for name, fn in tests:

@@ -421,6 +421,8 @@ def _card_ability_bom(data, ability_guids):
             amount = _int_field(rec, "m_Amount") or 1
             collection = _str_field(rec, "m_CardCollection") or "Warzone"
             location = _str_field(rec, "m_CardLocation") or "Unknown"
+            exhausted = _int_field(rec, "m_EntersPlayExhausted")
+            attacking = _int_field(rec, "m_EntersPlayAttacking")
             # m_AmountField: variable name controlling the real count (e.g. "Two")
             amt_var = ""
             am = re.search(r'"m_AmountField"\s*:\s*\{[^}]*"m_InputVariableName"\s*:\s*"([^"]+)"', rec)
@@ -429,6 +431,8 @@ def _card_ability_bom(data, ability_guids):
             values = {"token_guid": token_guid, "amount": amount,
                       "collection": collection, "location": location,
                       "amount_variable": amt_var}
+            values["exhausted"] = exhausted
+            values["enters_play_attacking"] = attacking
             card_filter = _object_field(rec, "m_CardFilter")
             if card_filter:
                 values["card_filter"] = card_filter
@@ -664,6 +668,7 @@ def main():
         # the Ground "1X" = 1 base + X extra); m_VariableCostMinimum is the
         # smallest X the player may choose.
         variable_cost = _int_field(rec, "m_VariableCost")
+        variable_cost_double = _int_field(rec, "m_VariableCostDouble")
         variable_cost_minimum = _int_field(rec, "m_VariableCostMinimum")
         # Some legacy templates carry a stale m_RageValue even though the
         # card text has no Rage keyword.  Only materialize Rage when the
@@ -680,7 +685,8 @@ def main():
         card_rows.append((guid, set_guid, name, rarity, cost, attack, defense,
                           card_type, socket_count, no_pvp, is_pve,
                           threshold_json, abilities_json, attributes,
-                          sacrifice_target, variable_cost, variable_cost_minimum,
+                          sacrifice_target, variable_cost, variable_cost_double,
+                          variable_cost_minimum,
                           rage_value, _card_template_has_lethal(rec)))
         for g in re.findall(
                 r'"m_CardAbilityId"\s*:\s*\{\s*"m_Guid"\s*:\s*"([0-9a-fA-F-]+)"',
@@ -703,17 +709,19 @@ def main():
                  "AssetExtraction/extract_cards.py — do not edit by hand.")
     lines.append("# CARD_TEMPLATES rows: (guid, set_guid, name, rarity, cost, attack, defense, "
                  "card_type, socket_count, no_pvp, is_pve, threshold_json, abilities_json, "
-                 "attributes, sacrifice_target, variable_cost, variable_cost_minimum, rage_value, lethal)")
+                 "attributes, sacrifice_target, variable_cost, variable_cost_double, variable_cost_minimum, rage_value, lethal)")
     lines.append("CARD_TEMPLATES = [")
     for (guid, set_guid, name, rarity, cost, attack, defense, card_type,
          socket_count, no_pvp, is_pve, threshold_json, abilities_json, attributes,
-         sacrifice_target, variable_cost, variable_cost_minimum,
+         sacrifice_target, variable_cost, variable_cost_double,
+         variable_cost_minimum,
          rage_value, lethal) in card_rows:
         lines.append(
             f"    ({guid!r}, {set_guid!r}, {name!r}, {rarity!r}, {cost}, {attack}, {defense}, "
             f"{card_type!r}, {socket_count}, {no_pvp}, {is_pve}, {threshold_json!r}, "
             f"{abilities_json!r}, {attributes}, {sacrifice_target!r}, "
-            f"{variable_cost}, {variable_cost_minimum}, {rage_value}, {lethal}),")
+            f"{variable_cost}, {variable_cost_double}, {variable_cost_minimum}, "
+            f"{rage_value}, {lethal}),")
     lines.append("]")
     lines.append("")
     lines.append("# card ability BOM rows: (ability_guid, effect_guid, effect_order, effect_type, param, effect_group_id, condition_id, target_index, effect_instance_id, contingent_effect_instance_id, secondary_target_index, recalculate_targets, is_optional, effect_duration, output_variables)")

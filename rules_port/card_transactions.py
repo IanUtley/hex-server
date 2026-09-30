@@ -8,6 +8,7 @@ malformed typed payloads from reaching a legacy fallback implicitly.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -19,6 +20,51 @@ CARD_TRANSACTION_KINDS = frozenset({
     "play_resource", "play_troop", "play_artifact", "play_spell",
     "play_champion", "activate_ability",
 })
+
+
+def automatic_instance_ability_guids(db, session_id, card_uid,
+                                     ability_guids=()):
+    """Include automatic abilities currently granted to this card instance.
+
+    The static Records card graph does not contain runtime-granted keywords
+    such as Runic. C# ``CastSpell`` calls ``CreateAutomaticAbilities`` on the
+    live card, so the cast graph must also read the card instance's serialized
+    ability list and retain only abilities that C# classifies as automatic.
+    """
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    from pvp_db import db_card_ability_payload
+
+    result = [str(guid).lower() for guid in (ability_guids or ()) if guid]
+    seen = set(result)
+    try:
+        payload = db_card_ability_payload(
+            int(session_id), int(card_uid), conn=db)
+        values = json.loads(payload or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return result
+    if not isinstance(values, list):
+        return result
+
+    for value in values:
+        if isinstance(value, Mapping):
+            value = (value.get("guid") or value.get("m_Guid") or
+                     value.get("ability_guid"))
+        if not isinstance(value, str):
+            continue
+        guid = value.lower()
+        if not guid or guid in seen:
+            continue
+        graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+        if graph is None:
+            continue
+        # Mirrors AbilityTemplate.IsAutomatic: !Manual, no trigger, and no
+        # explicit ability index.
+        if (graph.manual or graph.trigger_event_type or
+                graph.trigger_condition or int(graph.ability_index) >= 0):
+            continue
+        result.append(guid)
+        seen.add(guid)
+    return result
 
 
 @dataclass(frozen=True)

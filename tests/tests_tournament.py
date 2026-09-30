@@ -122,6 +122,17 @@ def test_tournament_session_pids_ignore_non_player_card_owners():
         test_db.close()
 
 
+def test_projected_chain_owner_normalizes_typed_service_player_uid():
+    raw_player_id = 2408558011085730
+    typed_player_id = game_engine.UID.make(244, raw_player_id)
+
+    assert tournament_game._raw_player_id(raw_player_id) == raw_player_id
+    assert tournament_game._raw_player_id(typed_player_id) == raw_player_id
+    assert game_engine.UID.make(
+        244, tournament_game._raw_player_id(typed_player_id)).uid64 == (
+            typed_player_id.uid64)
+
+
 def test_orphaned_started_tournaments_are_closed_but_live_and_waiting_remain():
     previous_db = db._db
     test_db = sqlite3.connect(":memory:")
@@ -202,6 +213,91 @@ def test_old_tournaments_close_and_remove_only_their_game_state():
         assert test_db.execute(
             "SELECT session_id FROM game_cards ORDER BY session_id"
         ).fetchall() == [("new-session",)]
+    finally:
+        db._db = previous_db
+        test_db.close()
+
+
+def test_stale_session_sweep_removes_only_unowned_old_sessions():
+    """Abandoned Practice/PvE sessions are swept; tournament/replay state is not.
+
+    Practice/FRA/PvE sessions never write replays, so nothing else removes
+    their game_sessions row and full deck copy of game_cards.  The sweep must
+    stay away from sessions referenced by a tournament or tournament match,
+    and from a session whose replay is still awaiting indexing.
+    """
+    import pvp_db
+
+    previous_db = db._db
+    test_db = sqlite3.connect(":memory:")
+    try:
+        test_db.executescript(
+            """
+            CREATE TABLE game_sessions (
+                session_id TEXT PRIMARY KEY, state TEXT, created_at TEXT
+            );
+            CREATE TABLE game_cards (session_id TEXT, card_uid INTEGER);
+            CREATE TABLE session_events (session_id TEXT);
+            CREATE TABLE session_transactions (session_id TEXT);
+            CREATE TABLE game_replays (session_id TEXT, status TEXT);
+            CREATE TABLE tournaments (id INTEGER PRIMARY KEY, session_id TEXT);
+            CREATE TABLE tournament_matches (
+                id INTEGER PRIMARY KEY, session_id TEXT
+            );
+            INSERT INTO tournaments VALUES (1, 'tourney-linked');
+            INSERT INTO tournament_matches VALUES (1, 'corinth-match');
+            INSERT INTO game_sessions VALUES
+                ('Session-old', 'joined', datetime('now', '-30 days')),
+                ('Session-new', 'joined', datetime('now')),
+                ('tourney-linked', 'setup', datetime('now', '-30 days')),
+                ('corinth-match', 'setup', datetime('now', '-30 days')),
+                ('replay-pending', 'setup', datetime('now', '-30 days')),
+                ('replay-ready', 'setup', datetime('now', '-30 days'));
+            INSERT INTO game_cards VALUES
+                ('Session-old', 1), ('Session-old', 2), ('Session-new', 3),
+                ('tourney-linked', 4), ('corinth-match', 5),
+                ('replay-pending', 6), ('replay-ready', 7);
+            INSERT INTO session_events VALUES
+                ('Session-old'), ('replay-ready'), ('replay-pending'),
+                ('lost-session'), ('ghost-replay');
+            INSERT INTO session_transactions VALUES
+                ('Session-old'), ('replay-ready'), ('replay-pending'),
+                ('lost-txn');
+            INSERT INTO game_replays VALUES
+                ('replay-pending', 'pending'), ('replay-ready', 'ready'),
+                ('ghost-replay', 'ready');
+            """
+        )
+        db._db = test_db
+
+        assert pvp_db.db_cleanup_stale_sessions(7) == {
+            "sessions_removed": 2,
+            "cards_removed": 3,
+            "events_removed": 3,
+            "transactions_removed": 3,
+        }
+        assert test_db.execute(
+            "SELECT session_id FROM game_sessions ORDER BY session_id"
+        ).fetchall() == [
+            ("Session-new",), ("corinth-match",), ("replay-pending",),
+            ("tourney-linked",),
+        ]
+        # Source rows survive while a session or replay record can read them;
+        # a session-less event with no replay is unreachable and reclaimed.
+        assert test_db.execute(
+            "SELECT session_id FROM session_events ORDER BY session_id"
+        ).fetchall() == [("ghost-replay",), ("replay-pending",)]
+        assert test_db.execute(
+            "SELECT session_id FROM session_transactions ORDER BY session_id"
+        ).fetchall() == [("replay-pending",)]
+        # The ready replay keeps its index row (the replay worker owns the
+        # artifact retention); only its source session is released.
+        assert test_db.execute(
+            "SELECT session_id, status FROM game_replays ORDER BY session_id"
+        ).fetchall() == [
+            ("ghost-replay", "ready"), ("replay-pending", "pending"),
+            ("replay-ready", "ready"),
+        ]
     finally:
         db._db = previous_db
         test_db.close()
@@ -765,6 +861,7 @@ if __name__ == "__main__":
     test_pvp_concede_ends_for_both_players()
     test_tournament_session_pids_ignore_non_player_card_owners()
     test_old_tournaments_close_and_remove_only_their_game_state()
+    test_stale_session_sweep_removes_only_unowned_old_sessions()
     test_pvp_champion_damage_uses_target_player_health()
     test_completed_match_is_visible_in_tournament_lobby()
     test_forfeit_completes_active_bo1_match()

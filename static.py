@@ -18,6 +18,21 @@ import sqlite3
 CLIENT_SEED_META_TABLE = "client_seed_meta"
 
 
+def _ensure_column(db, table: str, column: str, declaration: str) -> None:
+    """Add a migration column once, tolerating concurrent service startup."""
+    present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column in present:
+        return
+    try:
+        db.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    except sqlite3.OperationalError as exc:
+        # HConnect, tournament, and replay workers may initialize the shared
+        # file at the same time. Another initializer can win this exact ALTER.
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 def _seed_conflict_columns(db, table, columns):
     """Primary-key columns shared by the database table and the seed row.
 
@@ -244,6 +259,7 @@ DDL = [
         attributes INTEGER DEFAULT 0,
         sacrifice_target TEXT DEFAULT '',
         variable_cost INTEGER DEFAULT 0,
+        variable_cost_double INTEGER DEFAULT 0,
         variable_cost_minimum INTEGER DEFAULT 0,
         rage_value INTEGER DEFAULT 0,
         subtype TEXT DEFAULT '',
@@ -932,6 +948,7 @@ DDL = [
         name TEXT NOT NULL,
         champion_guid TEXT NOT NULL,
         encounter_deck_guid TEXT NOT NULL,
+        ai_deck_personality TEXT DEFAULT NULL,
         is_boss INTEGER NOT NULL DEFAULT 0,
         UNIQUE(user_id, challenger_index)
     )
@@ -950,6 +967,7 @@ DDL = [
         tier INTEGER DEFAULT NULL,
         min_rank INTEGER DEFAULT NULL,
         max_rank INTEGER DEFAULT NULL,
+        ai_deck_personality TEXT DEFAULT NULL,
         is_elite INTEGER NOT NULL DEFAULT 0,
         base_deck_name TEXT NOT NULL,
         set_guid TEXT NOT NULL DEFAULT '',
@@ -1540,6 +1558,15 @@ def ensure_schema(db):
     """
     for stmt in DDL:
         db.execute(stmt)
+    template_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(card_templates)")}
+    added_variable_cost_double = "variable_cost_double" not in template_columns
+    _ensure_column(db, "card_templates", "variable_cost_double",
+                   "INTEGER DEFAULT 0")
+    _ensure_column(db, "fra_challengers", "ai_deck_personality",
+                   "TEXT DEFAULT NULL")
+    _ensure_column(db, "fra_encounters", "ai_deck_personality",
+                   "TEXT DEFAULT NULL")
     tournament_columns = {row[1] for row in db.execute(
         "PRAGMA table_info(tournaments)")}
     if "expires_at" not in tournament_columns:
@@ -1902,7 +1929,8 @@ def ensure_schema(db):
         # field was normalized into card_templates. Backfill from the same
         # Records/gamedata extractor used for fresh databases, keyed by GUID;
         # never infer this keyword from display text or card names.
-        if added_lethal or added_equipment_modified:
+        if (added_lethal or added_equipment_modified or
+                added_variable_cost_double):
             from AssetExtraction.gamedata_seed import extract
             card_rows = extract()["tables"].get("card_templates", [])
             if added_lethal:
@@ -1916,6 +1944,13 @@ def ensure_schema(db):
                     "UPDATE card_templates SET equipment_modified=? WHERE guid=?",
                     [(int(row[11] or 0), row[0]) for row in card_rows
                      if len(row) >= 21],
+                )
+            if added_variable_cost_double:
+                db.executemany(
+                    "UPDATE card_templates SET variable_cost_double=? "
+                    "WHERE guid=?",
+                    [(int(row[17] or 0), row[0]) for row in card_rows
+                     if len(row) >= 22],
                 )
             db.commit()
     except Exception:
@@ -1973,13 +2008,13 @@ def ensure_schema(db):
             if isinstance(objective, dict) and objective.get("encounter"):
                 tamed_scene_guids.add(str(objective["encounter"]).lower())
 
-        ecols = {r[1] for r in db.execute("PRAGMA table_info(encounter_scenes)")}
-        if "ai_champion_guid" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN ai_champion_guid TEXT")
-        if "ai_deck_personality" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN ai_deck_personality TEXT DEFAULT NULL")
-        if "mods_json" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN mods_json TEXT DEFAULT '[]'")
+        _ensure_column(db, "encounter_scenes", "ai_champion_guid", "TEXT")
+        _ensure_column(db, "encounter_scenes", "ai_deck_personality",
+                       "TEXT DEFAULT NULL")
+        _ensure_column(db, "encounter_scenes", "mods_json",
+                       "TEXT DEFAULT '[]'")
+        ecols = {r[1] for r in db.execute(
+            "PRAGMA table_info(encounter_scenes)")}
         if "rewards_json" not in ecols:
             db.execute("ALTER TABLE encounter_scenes ADD COLUMN rewards_json TEXT DEFAULT '{}'")
             db.commit()
@@ -2107,6 +2142,19 @@ def ensure_schema(db):
         db.commit()
     except Exception as exc:
         print(f"Encounter seed repair skipped: {exc}")
+
+    # Deck strategy is static metadata: calculate missing profiles when the
+    # deck catalogue is seeded. The standalone evaluator can force a full
+    # refresh after strategy rules or Records metadata change.
+    try:
+        from AssetExtraction.evaluate_fra_deck_personalities import (
+            update_fra_deck_personalities,
+        )
+        evaluated = update_fra_deck_personalities(db)
+        if evaluated:
+            print(f"Updated AI deck personalities for {evaluated} deck(s)")
+    except Exception as exc:
+        print(f"FRA deck personality seed skipped: {exc}")
 
     # Migration: raw ability record JSON on card_abilities_meta if missing
     try:

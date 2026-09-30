@@ -7,12 +7,73 @@ second database file.
 
 import db as _db_layer
 import json
+import sqlite3
 import threading
+from collections import OrderedDict
 from domain.constants import DEFAULT_STARTING_HEALTH, PLAYED_CARD_POSITION
 from domain.enums import ECardStates, ECardTypes, ETurnPhases
 
 _CARD_COOLDOWN_LOCK = threading.RLock()
 _CARD_COOLDOWNS_KEY = "__cooldown_counts__"
+
+# Card/template, ability, and target-template rows are seeded from the
+# extracted client data and are not mutated during a game.  The runtime still
+# keeps mutable instance state in SQLite, but repeatedly crossing the SQLite
+# boundary for the same authored metadata is unnecessary.  Cache only the
+# process-wide application connection: focused tests commonly swap in a
+# temporary connection and must continue to observe their fixture mutations.
+_STATIC_METADATA_LOCK = threading.RLock()
+_STATIC_METADATA_DB = None
+_STATIC_METADATA_CACHE = OrderedDict()
+_STATIC_METADATA_CACHE_LIMIT = 16384
+_STATIC_CACHE_MISS = object()
+
+# The client uses the format bit even when a socketable card has no gems in
+# its sockets. A persisted zero is interpreted as the old gem format, so the
+# client will not expose the card's empty sockets.
+EMPTY_SOCKET_GEMS = 1 << 62
+
+
+def _cached_static_value(connection, key, loader):
+    """Read one immutable metadata value, caching only the shared DB view."""
+    global _STATIC_METADATA_DB
+    if connection is not _db_layer._db:
+        return loader()
+    with _STATIC_METADATA_LOCK:
+        if connection is not _STATIC_METADATA_DB:
+            _STATIC_METADATA_DB = connection
+            _STATIC_METADATA_CACHE.clear()
+        cached = _STATIC_METADATA_CACHE.get(key, _STATIC_CACHE_MISS)
+        if cached is not _STATIC_CACHE_MISS:
+            _STATIC_METADATA_CACHE.move_to_end(key)
+            return cached
+    value = loader()
+    with _STATIC_METADATA_LOCK:
+        # A test or reload may have replaced db._db while the query was in
+        # flight. Never attach a result from the old connection to the new
+        # process-wide cache.
+        if connection is _db_layer._db:
+            if connection is not _STATIC_METADATA_DB:
+                _STATIC_METADATA_DB = connection
+                _STATIC_METADATA_CACHE.clear()
+            _STATIC_METADATA_CACHE[key] = value
+            _STATIC_METADATA_CACHE.move_to_end(key)
+            while len(_STATIC_METADATA_CACHE) > _STATIC_METADATA_CACHE_LIMIT:
+                _STATIC_METADATA_CACHE.popitem(last=False)
+    return value
+
+
+def _cached_static_row(connection, key, sql, params):
+    return _cached_static_value(
+        connection, key,
+        lambda: connection.execute(sql, params).fetchone())
+
+
+def _cached_static_rows(connection, key, sql, params):
+    value = _cached_static_value(
+        connection, key,
+        lambda: tuple(connection.execute(sql, params).fetchall()))
+    return value if connection is _db_layer._db else list(value)
 
 def db_next_session_instance(conn=None):
     """Atomically allocate the next persisted game-session instance."""
@@ -71,6 +132,138 @@ def db_cleanup_ended_sessions(conn=None):
     """Remove game sessions that reached the terminal state."""
     (conn or _db_layer._db).execute(
         "DELETE FROM game_sessions WHERE state='ended'")
+
+
+_STALE_SESSION_ZERO = {
+    "sessions_removed": 0,
+    "cards_removed": 0,
+    "events_removed": 0,
+    "transactions_removed": 0,
+}
+
+
+def db_cleanup_stale_sessions(age_days=7):
+    """Remove abandoned non-tournament game sessions and their card rows.
+
+    Practice/FRA/PvE sessions are not owned by the tournament replay pipeline,
+    so nothing else removes them once their client is gone: the
+    ``game_sessions`` row and a full deck copy of ``game_cards`` would live
+    forever.  A session is eligible only when it is older than ``age_days``,
+    is not referenced by ``tournaments`` or ``tournament_matches``, and has no
+    replay awaiting indexing (a ready replay is retained and lets the session
+    go).  Tournament state keeps its own replay gate in
+    ``db.db_tournament_cleanup_old``.
+
+    Runs in its own short-lived write transaction, like the tournament
+    cleanup, so a handler's open transaction cannot be inherited or blocked.
+    """
+    try:
+        days = max(1, int(age_days))
+    except (TypeError, ValueError):
+        days = 7
+    cutoff = f"-{days} days"
+    owns_connection = True
+    # Keep an in-memory/shared test connection usable; production always uses
+    # a short-lived connection instead of the process-wide RetryingConnection.
+    if isinstance(_db_layer._db, sqlite3.Connection) and not isinstance(
+            _db_layer._db, _db_layer.RetryingConnection):
+        connection = _db_layer._db
+        owns_connection = False
+    else:
+        connection = sqlite3.connect(_db_layer.DB_PATH, timeout=0.5)
+    try:
+        connection.execute("PRAGMA busy_timeout=500")
+        connection.execute("BEGIN IMMEDIATE")
+
+        def _has(table):
+            return bool(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone())
+
+        optional = {
+            name for name in ("tournaments", "tournament_matches",
+                              "session_events", "session_transactions",
+                              "game_replays")
+            if _has(name)
+        }
+        clauses = []
+        if "tournaments" in optional:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM tournaments t WHERE "
+                "CAST(t.session_id AS TEXT)=CAST(gs.session_id AS TEXT))")
+        if "tournament_matches" in optional:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM tournament_matches tm WHERE "
+                "CAST(tm.session_id AS TEXT)=CAST(gs.session_id AS TEXT))")
+        if "game_replays" in optional:
+            clauses.append(
+                "(NOT EXISTS (SELECT 1 FROM game_replays gr WHERE "
+                "CAST(gr.session_id AS TEXT)=CAST(gs.session_id AS TEXT)) "
+                "OR EXISTS (SELECT 1 FROM game_replays gr WHERE "
+                "CAST(gr.session_id AS TEXT)=CAST(gs.session_id AS TEXT) "
+                "AND gr.status='ready'))")
+
+        query = ("SELECT gs.session_id FROM game_sessions gs "
+                 "WHERE gs.created_at IS NOT NULL "
+                 "AND datetime(gs.created_at) <= datetime('now', ?)")
+        if clauses:
+            query += " AND " + " AND ".join(clauses)
+        stale = [str(row[0]) for row in connection.execute(
+            query, (cutoff,)).fetchall() if row[0] is not None]
+
+        result = dict(_STALE_SESSION_ZERO)
+        for session_id in stale:
+            if "session_events" in optional:
+                result["events_removed"] += int(connection.execute(
+                    "DELETE FROM session_events "
+                    "WHERE CAST(session_id AS TEXT)=?",
+                    (session_id,)).rowcount or 0)
+            if "session_transactions" in optional:
+                result["transactions_removed"] += int(connection.execute(
+                    "DELETE FROM session_transactions "
+                    "WHERE CAST(session_id AS TEXT)=?",
+                    (session_id,)).rowcount or 0)
+            result["cards_removed"] += int(connection.execute(
+                "DELETE FROM game_cards WHERE CAST(session_id AS TEXT)=?",
+                (session_id,)).rowcount or 0)
+            result["sessions_removed"] += int(connection.execute(
+                "DELETE FROM game_sessions WHERE CAST(session_id AS TEXT)=?",
+                (session_id,)).rowcount or 0)
+        # Source rows whose session and replay are both gone can never be read
+        # again (the replay worker expires rows that still have a game_replays
+        # record).  Reclaim them in the same pass.
+        def _orphan_sql(table):
+            guard = ""
+            if "game_replays" in optional:
+                guard = (" AND NOT EXISTS (SELECT 1 FROM game_replays gr "
+                         f"WHERE CAST(gr.session_id AS TEXT)="
+                         f"CAST({table}.session_id AS TEXT))")
+            return ("DELETE FROM " + table + " WHERE NOT EXISTS ("
+                    "SELECT 1 FROM game_sessions gs WHERE "
+                    f"CAST(gs.session_id AS TEXT)="
+                    f"CAST({table}.session_id AS TEXT))" + guard)
+
+        if "session_events" in optional:
+            result["events_removed"] += int(connection.execute(
+                _orphan_sql("session_events")).rowcount or 0)
+        if "session_transactions" in optional:
+            result["transactions_removed"] += int(connection.execute(
+                _orphan_sql("session_transactions")).rowcount or 0)
+        connection.commit()
+        return result
+    except sqlite3.OperationalError as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        # A busy database is a normal scheduler condition; leave this pass for
+        # the next interval instead of killing the scheduler thread.
+        if _db_layer._is_sqlite_lock_error(exc):
+            return dict(_STALE_SESSION_ZERO)
+        raise
+    finally:
+        if owns_connection:
+            connection.close()
 
 
 def db_insert_game_card(session_id, user_id, card_uid, template_guid, location,
@@ -262,11 +455,13 @@ def db_target_template_text(template_id, conn=None):
 
 def db_ability_meta_targets(ability_guid, conn=None):
     """Return targeting and activation metadata for an ability."""
-    return (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    return _cached_static_row(
+        connection, ("ability_meta_targets", str(ability_guid).lower()),
         "SELECT target_template_ids, trigger_event_type, game_text, "
         "casting_behavior, is_manual, activation_cost, uses_per_game, "
         "uses_per_turn FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid),)).fetchone()
+        (str(ability_guid).lower(),))
 
 
 def db_champion_template_health_by_class(race_name, cls_name, conn=None):
@@ -579,9 +774,11 @@ def db_game_card_type(template_guid, conn=None):
     """Return a template's stored card type, defaulting legacy rows to Troop."""
     if not template_guid:
         return "Troop"
-    row = (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    row = _cached_static_row(
+        connection, ("card_type", str(template_guid).lower()),
         "SELECT card_type FROM card_templates WHERE guid=?",
-        (template_guid,)).fetchone()
+        (template_guid,))
     return row[0] if row else "Troop"
 
 
@@ -831,16 +1028,80 @@ def db_card_instance_dynamic_projection(session_id, card_uid, conn=None):
     The first eleven fields intentionally retain ``db_card_instance_full``'s
     order. Printed template fields are resolved from the process-wide Records
     cache by the caller, avoiding a repeated SQLite join on this hot path.
+    The final two fields are the persisted instance reference and socketed gem;
+    they let card encoding avoid two more point lookups.
     """
-    return (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    sql = (
         "SELECT gc.card_abilities, gc.card_attack_mod, gc.card_defense_mod, "
         "gc.card_damage, gc.original_template_guid, gc.permanent_buffs, "
         "gc.temporary_buffs, gc.card_cost_mod, gc.cost_mod_json, "
         "gc.card_attributes, gc.temporary_attributes, "
-        "gc.user_id, gc.location, gc.template_guid "
+        "gc.user_id, gc.location, gc.template_guid, "
+        "gc.card_template_id, gc.gems "
         "FROM game_cards gc "
-        "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+        "WHERE gc.session_id=? AND gc.card_uid=?"
+    )
+    try:
+        return connection.execute(sql, (session_id, int(card_uid))).fetchone()
+    except sqlite3.OperationalError as exc:
+        # Keep older focused fixtures usable when the optional socket columns
+        # have not been migrated yet. The normal production schema has both.
+        if "no such column" not in str(exc).lower():
+            raise
+        return connection.execute(
+            sql.replace(", gc.card_template_id, gc.gems ", " "),
+            (session_id, int(card_uid))).fetchone()
+
+
+def db_card_instance_dynamic_projections(session_id, card_uids, conn=None):
+    """Return dynamic card projections for many UIDs using one ``IN`` read.
+
+    The mapping values have the same field order as
+    :func:`db_card_instance_dynamic_projection`, so callers can feed a
+    prefetched row directly into the card encoder.  This is intentionally a
+    read-only batch helper: location, buffs, and abilities remain authoritative
+    mutable SQLite state and are never put in a process-wide cache.
+    """
+    ids = []
+    seen = set()
+    for raw_uid in card_uids or ():
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        if uid not in seen:
+            seen.add(uid)
+            ids.append(uid)
+    if not ids:
+        return {}
+    connection = conn or _db_layer._db
+    result = {}
+    # SQLite's default host parameter limit is commonly 999. Keep the helper
+    # correct for a large revealed/deck batch as well as the normal small HUD
+    # batches.
+    for start in range(0, len(ids), 900):
+        chunk = ids[start:start + 900]
+        marks = ",".join("?" for _ in chunk)
+        sql = (
+            "SELECT gc.card_uid, gc.card_abilities, gc.card_attack_mod, "
+            "gc.card_defense_mod, gc.card_damage, gc.original_template_guid, "
+            "gc.permanent_buffs, gc.temporary_buffs, gc.card_cost_mod, "
+            "gc.cost_mod_json, gc.card_attributes, gc.temporary_attributes, "
+            "gc.user_id, gc.location, gc.template_guid, "
+            "gc.card_template_id, gc.gems FROM game_cards gc "
+            "WHERE gc.session_id=? AND gc.card_uid IN (" + marks + ")")
+        try:
+            rows = connection.execute(sql, [session_id, *chunk]).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).lower():
+                raise
+            old_sql = sql.replace(", gc.card_template_id, gc.gems ", " ")
+            rows = connection.execute(
+                old_sql, [session_id, *chunk]).fetchall()
+        for row in rows:
+            result[int(row[0])] = tuple(row[1:])
+    return result
 
 
 def db_is_champion_template(template_guid, conn=None):
@@ -1127,6 +1388,7 @@ def db_condition_card_row(session_id, card_uid, conn=None):
         "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
         "gc.card_attributes, ct.attributes, gc.card_attack_mod, "
         "gc.card_defense_mod, COALESCE(gc.permanent_buffs,'{}') "
+        ", COALESCE(gc.card_abilities, '[]') "
         "FROM game_cards gc LEFT JOIN card_templates ct "
         "ON ct.guid = gc.template_guid "
         "WHERE gc.session_id=? AND gc.card_uid=?",
@@ -1207,10 +1469,15 @@ def db_template_ability_payload(template_guid, conn=None):
 
 
 def db_template_ability_data(template_guid, conn=None):
-    """Return authored abilities and variable-cost flag for a template."""
+    """Return authored abilities and variable-cost flags for a template."""
     connection = conn or _db_layer._db
+    columns = {row[1] for row in connection.execute(
+        "PRAGMA table_info(card_templates)")}
+    variable_cost_double = (
+        "variable_cost_double" if "variable_cost_double" in columns else "0")
     return connection.execute(
-        "SELECT abilities_json, variable_cost FROM card_templates WHERE guid=?",
+        "SELECT abilities_json, variable_cost, " + variable_cost_double + " "
+        "FROM card_templates WHERE guid=?",
         (template_guid,)).fetchone()
 
 
@@ -1717,10 +1984,12 @@ def db_template_by_guid(template_guid, conn=None):
 
 def db_card_template_lethal(template_guid, conn=None):
     """Return the optional printed Lethal flag for a template."""
+    connection = conn or _db_layer._db
     try:
-        row = (conn or _db_layer._db).execute(
+        row = _cached_static_row(
+            connection, ("card_lethal", str(template_guid).lower()),
             "SELECT lethal FROM card_templates WHERE guid=?",
-            (template_guid,)).fetchone()
+            (template_guid,))
     except Exception:
         return 0
     return int(row[0] or 0) if row else 0
@@ -1933,6 +2202,28 @@ def db_template_exists(template_guid, conn=None):
     ).fetchone())
 
 
+def db_empty_socket_gems(template_guid, conn=None):
+    """Return the client value for an unfilled socketable card.
+
+    Generated cards do not inherit a gem unless their authored effect says
+    to copy one. Socketable cards still need the new gem-format marker so
+    the client renders their empty sockets and permits socketing. Keep the
+    lookup tolerant of older focused test schemas that predate
+    ``card_templates.socket_count``.
+    """
+    connection = conn or _db_layer._db
+    try:
+        row = _cached_static_row(
+            connection, ("card_socket_count", str(template_guid).lower()),
+            "SELECT socket_count FROM card_templates WHERE guid=?",
+            (str(template_guid).lower(),))
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
+        return 0
+    return (EMPTY_SOCKET_GEMS if row and int(row[0] or 0) > 0 else 0)
+
+
 def db_first_template_guid(conn=None):
     """Return a deterministic catalog fallback template, if available."""
     connection = conn or _db_layer._db
@@ -1989,27 +2280,34 @@ def db_ability_metadata(ability_guid, conn=None):
 def db_ability_raw_json(ability_guid, conn=None):
     """Return the raw authored metadata for one ability."""
     connection = conn or _db_layer._db
-    row = connection.execute(
+    row = _cached_static_row(
+        connection, ("ability_raw", str(ability_guid).lower()),
         "SELECT raw_json FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid).lower(),)).fetchone()
+        (str(ability_guid).lower(),))
     return row[0] if row else None
 
 
 def db_any_ability_raw_json(ability_guid, conn=None):
     """Return raw metadata for a card or champion ability."""
-    try:
-        value = db_ability_raw_json(ability_guid, conn=conn)
-    except Exception:
-        value = None
-    if value:
-        return value
-    try:
-        row = (conn or _db_layer._db).execute(
-            "SELECT raw_json FROM champion_abilities WHERE ability_guid=? LIMIT 1",
-            (str(ability_guid).lower(),)).fetchone()
-    except Exception:
-        row = None
-    return row[0] if row else None
+    connection = conn or _db_layer._db
+    guid = str(ability_guid).lower()
+
+    def load():
+        try:
+            value = db_ability_raw_json(guid, conn=connection)
+        except Exception:
+            value = None
+        if value:
+            return value
+        try:
+            row = connection.execute(
+                "SELECT raw_json FROM champion_abilities "
+                "WHERE ability_guid=? LIMIT 1", (guid,)).fetchone()
+        except Exception:
+            row = None
+        return row[0] if row else None
+
+    return _cached_static_value(connection, ("any_ability_raw", guid), load)
 
 
 def db_ability_trigger_metadata(ability_guid, conn=None):
@@ -2033,19 +2331,21 @@ def db_ability_activation_metadata(ability_guid, conn=None):
 def db_ability_effect_rows(ability_guid, conn=None):
     """Return BOM effect IDs, types, and parameters for an ability."""
     connection = conn or _db_layer._db
-    return connection.execute(
+    return _cached_static_rows(
+        connection, ("ability_effect_rows", str(ability_guid).lower()),
         "SELECT effect_guid, effect_type, param FROM ability_effects "
         "WHERE ability_guid=?", (str(ability_guid).lower(),)
-    ).fetchall()
+    )
 
 
 def db_ability_effect_type_params(ability_guid, conn=None):
     """Return ordered effect types and serialized parameters."""
     connection = conn or _db_layer._db
-    return connection.execute(
+    return _cached_static_rows(
+        connection, ("ability_effect_type_params", str(ability_guid).lower()),
         "SELECT effect_type, param FROM ability_effects "
         "WHERE ability_guid=? ORDER BY effect_order",
-        (str(ability_guid).lower(),)).fetchall()
+        (str(ability_guid).lower(),))
 
 
 def db_effect_parent_ability(effect_guid, conn=None):
@@ -2084,10 +2384,11 @@ def db_ability_metadata_exists(ability_guid, conn=None):
 def db_ability_target_template_ids(ability_guid, conn=None):
     """Return the serialized target-template IDs for an ability."""
     connection = conn or _db_layer._db
-    row = connection.execute(
+    row = _cached_static_row(
+        connection, ("ability_target_ids", str(ability_guid).lower()),
         "SELECT target_template_ids FROM card_abilities_meta "
         "WHERE ability_guid=?", (str(ability_guid).lower(),)
-    ).fetchone()
+    )
     return row[0] if row else None
 
 
@@ -2104,18 +2405,19 @@ def db_champion_ability_target_template_ids(ability_guid, conn=None):
 def db_target_template_filter(template_id, conn=None):
     """Return one target template's serialized filter."""
     connection = conn or _db_layer._db
-    row = connection.execute(
+    row = _cached_static_row(
+        connection, ("target_filter", str(template_id)),
         "SELECT filter_json FROM target_templates WHERE template_id=?",
-        (template_id,)).fetchone()
+        (template_id,))
     return row[0] if row else None
 
 
 def db_template_subtype(template_guid, conn=None):
     """Return a card template's authored subtype."""
     connection = conn or _db_layer._db
-    row = connection.execute(
-        "SELECT subtype FROM card_templates WHERE guid=?", (template_guid,)
-    ).fetchone()
+    row = _cached_static_row(
+        connection, ("card_subtype", str(template_guid).lower()),
+        "SELECT subtype FROM card_templates WHERE guid=?", (template_guid,))
     return row[0] if row else None
 
 
@@ -2309,6 +2611,18 @@ def db_clear_warzone_damage(session_id, conn=None):
         "WHERE session_id=? AND location='warzone'", (session_id,))
 
 
+def db_clear_warzone_damage_except(session_id, exempt_uids, conn=None):
+    """Clear warzone damage except cards that cannot heal at end of turn."""
+    uids = [int(uid) for uid in exempt_uids or ()]
+    if not uids:
+        return db_clear_warzone_damage(session_id, conn=conn)
+    marks = ",".join("?" for _ in uids)
+    return (conn or _db_layer._db).execute(
+        "UPDATE game_cards SET card_damage=0 "
+        "WHERE session_id=? AND location='warzone' "
+        "AND card_uid NOT IN (" + marks + ")", (session_id, *uids))
+
+
 def db_temporary_attribute_rows(session_id, conn=None):
     """Return cards carrying temporary attributes or temporary buffs."""
     return (conn or _db_layer._db).execute(
@@ -2421,25 +2735,30 @@ def db_card_list_stat_row(session_id, card_uid, conn=None):
 
 def db_static_target_template(template_id, conn=None):
     """Return target fields used by continuous static evaluation."""
-    return (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    return _cached_static_row(
+        connection, ("static_target", str(template_id)),
         "SELECT collection_flags, player_filter, filter_json, game_text "
-        "FROM target_templates WHERE template_id=?", (template_id,)).fetchone()
+        "FROM target_templates WHERE template_id=?", (template_id,))
 
 
 def db_ability_static_metadata(ability_guid, conn=None):
     """Return trigger/manual/raw metadata for static ability filtering."""
-    return (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    return _cached_static_row(
+        connection, ("ability_static", str(ability_guid).lower()),
         "SELECT trigger_event_type, is_manual, raw_json "
         "FROM card_abilities_meta WHERE ability_guid=?",
-        (str(ability_guid).lower(),)).fetchone()
+        (str(ability_guid).lower(),))
 
 
 def db_gem_abilities(gem_type, conn=None):
     """Return the serialized ability list for a gem type."""
     connection = conn or _db_layer._db
-    row = connection.execute(
+    row = _cached_static_row(
+        connection, ("gem_abilities", int(gem_type or 0)),
         "SELECT abilities_json FROM gem_templates WHERE gem_type=?",
-        (gem_type,)).fetchone()
+        (gem_type,))
     return row[0] if row else None
 
 
@@ -2582,7 +2901,7 @@ def db_ai_deck_top_card(session_id, conn=None):
     ).fetchone()
 
 
-def db_ai_hand_tunneling_cards(session_id, conn=None):
+def db_ai_hand_tunneling_cards(session_id, conn=None, owner_id=0):
     """Return non-resource AI hand cards and their tunneling metadata."""
     connection = conn or _db_layer._db
     return connection.execute(
@@ -2590,9 +2909,10 @@ def db_ai_hand_tunneling_cards(session_id, conn=None):
         "gc.permanent_buffs, COALESCE(ct.cost, 0), ct.threshold_json, "
         "gc.card_abilities FROM game_cards gc "
         "JOIN card_templates ct ON ct.guid=gc.template_guid "
-        "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='hand' "
+        "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='hand' "
         "AND ct.card_type NOT LIKE '%Resource%' "
-        "ORDER BY gc.position, gc.card_uid", (session_id,)).fetchall()
+        "ORDER BY gc.position, gc.card_uid",
+        (session_id, int(owner_id))).fetchall()
 
 
 def db_target_template_info(template_id, conn=None):
@@ -2723,12 +3043,41 @@ def db_ai_evaluator_card_rows(session_id, user_id, zone, conn=None):
         "SELECT gc.card_uid, gc.template_guid, gc.location, ct.card_type, "
         "ct.name, ct.rarity, ct.cost, ct.attack, ct.defense, "
         "ct.threshold_json, ct.abilities_json, ct.attributes, ct.subtype, "
-        "ct.variable_cost, " + current + ", " + maximum + ", gc.card_state, "
+        "ct.variable_cost, ct.variable_cost_double, " + current + ", " +
+        maximum + ", gc.card_state, "
         "gc.card_damage, gc.permanent_buffs, gc.temporary_buffs, "
         "gc.temporary_attributes" + extra + " FROM game_cards gc "
         "JOIN card_templates ct ON ct.guid=gc.template_guid "
         "WHERE gc.session_id=? AND gc.user_id=? AND gc.location=? "
         "ORDER BY gc.position", (session_id, int(user_id), zone)).fetchall()
+
+
+def db_ai_evaluator_card_row(session_id, card_uid, conn=None):
+    """Return one joined card snapshot for an ability source in any zone.
+
+    Triggered and nested abilities can resolve after their source card has
+    left the hand or Warzone.  The AI still needs that source's authored
+    ability metadata to choose a fresh explicit target, so this deliberately
+    does not restrict the card location or controller.
+    """
+    connection = conn or _db_layer._db
+    ct_cols = {row[1] for row in connection.execute(
+        "PRAGMA table_info(card_templates)").fetchall()}
+    current = ("ct.current_resources_granted" if
+               "current_resources_granted" in ct_cols else "0")
+    maximum = ("ct.max_resources_granted" if
+               "max_resources_granted" in ct_cols else "0")
+    return connection.execute(
+        "SELECT gc.card_uid, gc.template_guid, gc.location, ct.card_type, "
+        "ct.name, ct.rarity, ct.cost, ct.attack, ct.defense, "
+        "ct.threshold_json, ct.abilities_json, ct.attributes, ct.subtype, "
+        "ct.variable_cost, ct.variable_cost_double, " + current + ", " +
+        maximum + ", gc.card_state, "
+        "gc.card_damage, gc.permanent_buffs, gc.temporary_buffs, "
+        "gc.temporary_attributes FROM game_cards gc "
+        "JOIN card_templates ct ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.card_uid=? LIMIT 1",
+        (session_id, int(card_uid))).fetchone()
 
 
 def db_target_template_targeting_info(template_id, conn=None):
@@ -3071,6 +3420,10 @@ def db_insert_generated_card(session_id, owner_id, card_uid, template_guid,
               template_guid, template_guid, location, int(position),
               int(card_state), abilities_json or "[]", card_type,
               int(attributes or 0)]
+    existing = {row[1] for row in connection.execute(
+        "PRAGMA table_info(game_cards)").fetchall()}
+    if "gems" in existing and gems is None:
+        gems = db_empty_socket_gems(template_guid, conn=connection)
     optional = {
         "owner_user_id": owner_id if owner_user_id is None else owner_user_id,
         "original_template_guid": (template_guid if original_template_guid is None
@@ -3078,8 +3431,6 @@ def db_insert_generated_card(session_id, owner_id, card_uid, template_guid,
         "gems": gems,
         "permanent_buffs": permanent_buffs,
     }
-    existing = {row[1] for row in connection.execute(
-        "PRAGMA table_info(game_cards)").fetchall()}
     for column, value in optional.items():
         if column in existing and value is not None:
             columns.append(column)
@@ -3392,15 +3743,17 @@ def db_card_is_battleboard(session_id, card_uid, conn=None):
         (session_id, int(card_uid))).fetchone()
 
 
-def db_warzone_ability_cards(session_id, include_non_troops=False, conn=None):
+def db_warzone_ability_cards(session_id, include_non_troops=False, conn=None,
+                            owner_id=0):
     """Return AI-eligible warzone cards and their authored ability payload."""
     sql = ("SELECT gc.card_uid, gc.template_guid, gc.card_state, ct.attributes, "
            "gc.card_attributes, gc.card_abilities FROM game_cards gc "
            "JOIN card_templates ct ON ct.guid=gc.template_guid "
-           "WHERE gc.session_id=? AND gc.user_id=0 AND gc.location='warzone'")
+           "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='warzone'")
     if not include_non_troops:
         sql += " AND gc.card_type LIKE '%Troop%'"
-    return (conn or _db_layer._db).execute(sql, (session_id,)).fetchall()
+    return (conn or _db_layer._db).execute(
+        sql, (session_id, int(owner_id))).fetchall()
 
 
 def db_warzone_troop_stats(session_id, user_id, conn=None):

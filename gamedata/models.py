@@ -583,6 +583,20 @@ class CardTemplate(RecordObject):
         return bool(_int(self.field("m_VariableCost")))
 
     @property
+    def variable_cost_double(self) -> bool:
+        return bool(_int(self.field("m_VariableCostDouble")))
+
+    @property
+    def has_variable_cost(self) -> bool:
+        return self.variable_cost or self.variable_cost_double
+
+    @property
+    def variable_cost_multiplier(self) -> int:
+        if self.variable_cost_double:
+            return 2
+        return 1 if self.variable_cost else 0
+
+    @property
     def variable_cost_minimum(self) -> int:
         return _int(self.field("m_VariableCostMinimum"))
 

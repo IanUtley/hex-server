@@ -828,15 +828,37 @@ def test_context_authored_events_use_typed_event_names():
     assert emit.call_args.args[:3] == ("FateweavedEvent", 123, 5)
 
 
-def test_context_verdict_emits_shared_authored_event():
+def test_native_transform_uses_typed_stored_target_copy():
+    """UseStoredTarget copies the resolved target's template to the stored card."""
     context = EffectContext.from_rules_port(
-        object(), _Session(), _DB(), object(), "player", "ai",
-        {"resolving_source_uid": 123, "resolving_owner_id": 5},
-        "verdict-effect", "")
+        _Game(), _Session(), _DB(), object(), "player", "ai",
+        {"resolving_ability": "copy-ability",
+         "resolving_source_uid": 100,
+         "stored_targets": {"copy-ability": [100]}},
+        "copy-effect", effect_targets=(200,))
+    typed = {
+        "m_Portal": False,
+        "m_CardTemplateId": "0" * 36,
+        "m_SerializedTAC": {"data": "AgCct9UYAQAAAAAAAAA="},
+    }
     with mock.patch.object(
-            context, "_emit_trigger", return_value="triggered") as emit:
-        assert context.verdict() == "fired VerdictEvent: triggered"
-    assert emit.call_args.args[:3] == ("VerdictEvent", 123, 5)
+            context, "template_value",
+            side_effect=lambda name, default=None: typed.get(name, default)), \
+            mock.patch("pvp_db.db_card_source_info",
+                       return_value=("target-template", "Troop", "warzone", 5)), \
+            mock.patch("rules_port.transform_effects.transform_instance",
+                       return_value=100) as transform:
+        result = context.transform_card()
+
+    assert result == "transformed 1 stored card(s) -> target-t"
+    transform.assert_called_once_with(
+        context, 100, "target-template", keep_zone=True)
+
+
+# The Verdict effect builds its typed choice tokens and activates the
+# authored choose/play ability; its focused fixture lives in
+# tests/tests_rules_port_kernel.py (test_verdict_creates_pool_tokens...).
+# The VerdictEvent itself is published by the sibling FireEvent effect.
 
 
 def test_context_draw_effect_uses_typed_or_fixture_count():
@@ -1383,7 +1405,7 @@ if __name__ == "__main__":
     test_all_registered_effects_use_the_context_adapter()
     test_context_draw_preserves_owner_and_handler_boundary()
     test_context_authored_events_use_typed_event_names()
-    test_context_verdict_emits_shared_authored_event()
+    test_native_transform_uses_typed_stored_target_copy()
     test_context_draw_effect_uses_typed_or_fixture_count()
     test_native_draw_routes_empty_deck_to_explicit_result_projection()
     test_context_randomize_variable_uses_typed_bounds()

@@ -313,6 +313,8 @@ def default_state(turn_player=PLAYER):
         "ai_threshold": {},
         "player_resource_played_this_turn": False,
         "ai_resource_played_this_turn": False,
+        "player_resource_plays_this_turn": 0,
+        "ai_resource_plays_this_turn": 0,
         "player_charges": 0,
         "ai_charges": 0,
         "player_spell_points": 0,

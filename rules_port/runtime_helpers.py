@@ -35,6 +35,38 @@ def owner_uid(owner_id, player_uid, ai_uid, battle_state=None):
     return player_uid if int(owner_id or 0) else ai_uid
 
 
+def game_health_projection_attr(game, battle_state, owner_id):
+    """Return the player/AI health field for a PvP owner in this Game view."""
+    state = battle_state or {}
+    if not state.get("pvp"):
+        return None
+    try:
+        owner = int(owner_id or 0)
+    except (TypeError, ValueError):
+        return None
+    health_map = state.get("pvp_health_map") or {}
+    mapped = health_map.get(owner, health_map.get(str(owner)))
+    if mapped in ("player_health", "ai_health"):
+        return mapped
+    for attribute in ("player_uid", "ai_uid"):
+        participant = getattr(game, attribute, None)
+        try:
+            packed = raw_uid(participant)
+        except (TypeError, ValueError):
+            continue
+        if (packed & 0xFF) == 244 and (packed >> 8) == owner:
+            return "player_health" if attribute == "player_uid" else "ai_health"
+    return None
+
+
+def set_game_champion_health(game, battle_state, owner_id, health_key, value):
+    """Update both the checkpoint key and its client-facing Game health field."""
+    setattr(game, str(health_key), int(value))
+    projected = game_health_projection_attr(game, battle_state, owner_id)
+    if projected:
+        setattr(game, projected, int(value))
+
+
 def raw_uid(value):
     """Return the raw identity of a UID/SessionCardId/int.
 

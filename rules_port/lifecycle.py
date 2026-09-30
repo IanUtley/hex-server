@@ -99,6 +99,8 @@ def default_state(turn_player=PLAYER):
         "ai_threshold": {},
         "player_resource_played_this_turn": False,
         "ai_resource_played_this_turn": False,
+        "player_resource_plays_this_turn": 0,
+        "ai_resource_plays_this_turn": 0,
         "player_charges": 0,
         "ai_charges": 0,
         "player_spell_points": 0,
@@ -164,6 +166,7 @@ def complete_turn(state):
     state.pop("blocked_attackers", None)
     state.pop("player_damage_order", None)
     state[f"{next_player}_resource_played_this_turn"] = False
+    state[f"{next_player}_resource_plays_this_turn"] = 0
     return next_player
 
 
@@ -368,6 +371,50 @@ def prime_cards_for_turn(db, session_id, active_owner_id):
     return changed
 
 
+def reset_armor(db, session_id, battle_state=None):
+    """Card.ResetArmor for every card in the Ready-state cache.
+
+    C# ReadyState.OnEntry runs the reset against the whole ResourceCache, so
+    both players' cards and synthetic champion IntAttrs clear ArmorUsed at
+    every Ready step, not only the active player's.
+    """
+    for column in ("permanent_buffs", "temporary_buffs"):
+        db.execute(
+            "UPDATE game_cards SET " + column + " = json_remove(" + column +
+            ", '$.int_attrs.ArmorUsed') WHERE session_id = ? AND " + column +
+            " IS NOT NULL AND json_valid(" + column + ") AND "
+            "json_extract(" + column + ", '$.int_attrs.ArmorUsed') "
+            "IS NOT NULL", (session_id,))
+    if isinstance(battle_state, dict):
+        for attrs in (battle_state.get("champion_int_attrs") or {}).values():
+            if isinstance(attrs, dict):
+                attrs.pop("ArmorUsed", None)
+    db.commit()
+
+
+_READY_BLOCKING_INTATTRS = frozenset((
+    "cantready", "cantreadynormally", "cantreadynormallyhidden"))
+
+
+def card_ready_blocked(db, session_id, card_uid):
+    """Card.CanReadyAtStartOfTurn's IntAttr gates beyond the enum bit."""
+    from pvp_db import db_card_mutation_field
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            data = json.loads(db_card_mutation_field(
+                session_id, int(card_uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attrs = data.get("int_attrs") if isinstance(data, dict) else None
+        if not isinstance(attrs, dict):
+            continue
+        for name, value in attrs.items():
+            if (str(name).lower() in _READY_BLOCKING_INTATTRS
+                    and int(value or 0) > 0):
+                return True
+    return False
+
+
 def ready_cards_for_turn(db, session_id, owner_id):
     """Apply the port-owned Prep readiness transition for one controller."""
     from pvp_db import (db_warzone_cards_with_state,
@@ -388,7 +435,10 @@ def ready_cards_for_turn(db, session_id, owner_id):
             session_id, int(card_uid), conn=db)
         attrs = attrs_row[1] if attrs_row else 0
         mask = clear_mask
-        if attrs and int(attrs) & game_engine.ECardAttributes.CantReadyAutomatically:
+        blocked = bool(
+            attrs and int(attrs) &
+            game_engine.ECardAttributes.CantReadyAutomatically)
+        if blocked or card_ready_blocked(db, session_id, card_uid):
             mask &= ~game_engine.ECardStates.Tapped
         db_reset_warzone_troop(session_id, int(card_uid), mask, conn=db)
         new_state = previous & ~mask
@@ -418,8 +468,23 @@ def decrement_ability_cooldowns(db, session_id, owner_id, battle_state=None):
 
 
 def clear_combat_damage(db, session_id):
-    from pvp_db import db_clear_warzone_damage
-    db_clear_warzone_damage(session_id, conn=db)
+    from pvp_db import (db_clear_warzone_damage_except,
+                        db_warzone_troop_state_rows)
+    exempt = []
+    for row in db_warzone_troop_state_rows(session_id, conn=db):
+        for raw in (row[5], row[6]):
+            try:
+                buffs = json.loads(raw or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            attrs = buffs.get("int_attrs") if isinstance(buffs, dict) else None
+            if isinstance(attrs, dict) and any(
+                    str(name).lower() == "canthealatendofturn"
+                    and int(value or 0) > 0
+                    for name, value in attrs.items()):
+                exempt.append(int(row[0]))
+                break
+    db_clear_warzone_damage_except(session_id, exempt, conn=db)
     db.commit()
 
 
@@ -429,16 +494,21 @@ def clear_expired_temporary_attributes(db, session_id, owner_id, boundary,
     """Expire temporary attributes and stat grants at an authored boundary."""
     from pvp_db import (db_temporary_attribute_rows,
                         db_set_temporary_card_state)
+    stat_changes = []
     if isinstance(battle_state, dict):
         from .effect_lifetimes import (expire_grants,
-                                       expire_temporary_intattrs)
+                                       expire_temporary_intattrs,
+                                       expire_temporary_stats)
         expire_temporary_intattrs(
             db, session_id, battle_state, boundary=boundary,
             boundary_owner=owner_id)
         expire_grants(
             db, session_id, battle_state, boundary=boundary,
             boundary_owner=owner_id, handler=handler)
-    changed = []
+        stat_changes = list(expire_temporary_stats(
+            db, session_id, battle_state, boundary=boundary,
+            boundary_owner=owner_id))
+    changed = list(stat_changes)
     for card_uid, target_owner, attrs, raw_buffs in db_temporary_attribute_rows(
             session_id, conn=db):
         try:

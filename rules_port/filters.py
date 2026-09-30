@@ -442,6 +442,19 @@ def _gem_abilities_for_card(card):
     return tuple(abilities)
 
 
+def _printed_abilities_for_card(card):
+    """Return the current instance's authored card abilities, if present."""
+    values = _v(card, "card_abilities", "abilities", default=()) or ()
+    if isinstance(values, str):
+        try:
+            values = json.loads(values)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            values = ()
+    if not isinstance(values, (list, tuple, set)):
+        return ()
+    return tuple(str(value).lower() for value in values if value)
+
+
 def _tac_path_value(tree, parts):
     if not isinstance(tree, dict) or not parts:
         return None
@@ -1742,6 +1755,32 @@ class IntAttrFilter:
         elif prefix == "abilitytac":
             target = effect
             parts = parts[1:]
+            # RulesPort effect conditions receive the originating TAC as
+            # ``ConditionContext.event_tac``.  Preserve AbilityTAC filters
+            # when they arrive through a wrapped Records CardFilter (for
+            # example RequiresSourcePassesFilterCondition ->
+            # IntAttrFilter(AbilityTAC>PlayedFromHand)).  Without this, the
+            # filter falls through to the ConditionContext object, which has
+            # no serialized IntAttrs, and incorrectly evaluates every event
+            # attribute as zero.
+            event_tac = getattr(effect, "event_tac", None)
+            if event_tac is None:
+                event_state = getattr(effect, "bstate", {}) or {}
+                event_tac = event_state.get("event_tac")
+            if isinstance(event_tac, dict) and parts:
+                from .tac import _tac_attr_hash
+                attribute_hash = _tac_attr_hash(parts[0])
+                value = event_tac.get(attribute_hash)
+                if value is None:
+                    value = event_tac.get(str(attribute_hash))
+                if value is not None:
+                    try:
+                        rhs = (int(_v(card, "resource_cost", "cost", default=0)
+                                    or 0) if self.compare_to_cost else
+                               int(self.value))
+                        return _cmp(int(value or 0), self.comparison, rhs)
+                    except (TypeError, ValueError):
+                        return False
         if any(part.lower() == "rabid" for part in parts):
             return self._matches_rabid(card, parts)
         path = ">".join(parts) if parts else attr
@@ -1767,7 +1806,9 @@ class IntAttrFilter:
         if self.compare_to_cost:
             return False
         from .tac import decode_tac_tree
-        for ability_guid in _gem_abilities_for_card(card):
+        ability_guids = list(_printed_abilities_for_card(card))
+        ability_guids.extend(_gem_abilities_for_card(card))
+        for ability_guid in dict.fromkeys(ability_guids):
             template = None
             try:
                 from gamedata import DEFAULT_RECORD_STORE

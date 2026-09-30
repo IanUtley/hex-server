@@ -109,9 +109,10 @@ rollback mode.
 - The opening hand is normally seven cards. Each redraw decreases the hand
   size by one (`7 -> 6 -> ... -> 0`); zero cards forces a keep. A player is not
   considered ready until both sides have kept.
-- The intended campaign hand-size limit is ten and the FRA/PVP limit is seven.
-  The server still has paths that use seven universally; these are a known
-  parity gap and must not be silently described as complete.
+- The maximum hand size follows `Player.MaximumHandSize`: ten in PvE/PvE Arena
+  (including campaign and FRA) and seven in PvP. Campaign class/talent
+  metadata may add `MaximumHandSizeModifiers`, and a champion with
+  `UnlimitedHandSize` removes the limit.
 - The draw-first player-order notification and all client-equivalent hand
   reordering remain partial where the feature checklist says so.
 
@@ -128,7 +129,14 @@ rollback mode.
   color indexes and must be converted before encoding.
 - Charge powers use their metadata-defined uses per turn. Spell-power costs
   use the card's current modifier; repeated use may permanently increase that
-  modifier when the metadata says so.
+  modifier when the metadata says so. A free play is only legal when the card
+  has `OwnerCanPlayForFree` or its controller's champion has
+  `CanPlayCardsForFree`; while either holds the card's effective cost is zero.
+  A `Mobilize` card may tap up to its authored number of ready troops as it is
+  played; each tapped troop reduces the resource cost by two. A champion with
+  `CanIgnoreCardsThresholds` lets its controller play cards whose thresholds
+  are not met. An ability's charge-point cost adds its source card's
+  `ChargePointCostModifier`.
 - Every resource, threshold, current-pool, total-pool, and player update must
   be emitted from the post-mutation state so the client HUD does not revert to
   default values.
@@ -145,10 +153,20 @@ and `discard`. A card move updates the authoritative DB and ordered position,
 then sends the destination `CardUpdated` before `CardMoved`. A draw needs both a
 zone/card representation update and the draw animation event. Permanent cards
 normally enter the warzone; actions resolve through the cast-spell path and
-then leave for the appropriate destination.
+then leave for the appropriate destination. A card with the `CantReady`,
+`CantReadyNormally`, or `CantReadyNormallyHidden` IntAttr is not readied at its
+controller's Ready step. When a player buries cards, every other player's
+champion `BuryBonus` adds to the number buried. Cards with
+`CantHealAtEndOfTurn` keep their marked damage through the end-of-turn heal.
+At StartTurn, if the active player has a warzone card with the `Lifebound`
+IntAttr, that player's discard cards carrying the same marker return to the
+warzone.
 
 Do not expose hidden card identities to the opponent. Reconnect reconstructs
-the same filtered projection from the DB rather than trusting client state.
+the same filtered projection from the DB rather than trusting client state. A
+champion with `CanSeeOpponentsTopOfDeck` or `CanSeeUndergroundTroops` receives
+those opponent cards' real representations for its viewer only, and
+`MaxCardsDrawablePerTurn`/`CantDrawCards` cap draws without a deck-out loss.
 
 The client stores one `ECardUsage` value per card in its option cache. Manual
 abilities authored for the card's current collection (including Hand for
@@ -171,6 +189,14 @@ offer its Play-or-Tunnel choice. A card with only the manual route receives
   champion. Lifelink/SpiritDrain grants life for damage dealt. Flight,
   Skyguard, unblockable, Swiftstrike, Steadfast, rage, gems, and other keywords
   are legal only when represented by metadata or a documented adapter.
+- Gladiator adds to a troop's attack while its controller is the active player
+  and to defense while that controller is defending; a champion's
+  GladiatorBoth applies both halves at once. A troop entering the warzone is
+  tapped when an opposing champion has `OpposingTroopsEnterPlayExhausted`, or
+  `OpposingNonArdentTroopsEnterPlayExhausted` for a non-Aria troop.
+- Casting a resource activates Momentum: each of the caster's warzone troops
+  with the Momentum IntAttr gets +1[ATK]/+1[DEF] until its controller's next
+  StartTurn. Rage triggers the same way on attack.
 - Lethal troops move to the graveyard, retain the death state needed by death
   triggers, and fire Deathcry through the ability resolver. State-based deaths
   occur after resolution/combat when the chain is empty.
@@ -195,8 +221,16 @@ replacement checks receive the remaining damage. Minimum-to-kill assignment
 follows prevention; shielded damage consumes the attacker's remaining damage
 budget. SpiritDrain heals damage actually dealt, for effects as well as combat.
 Champion shields persist in the session checkpoint and temporary shields expire
-at either player's end of turn. See `docs/RULES_PORT_PARITY.md` for C# evidence,
-focused acceptance scenarios and the remaining damage-system gaps.
+at either player's end of turn. Armor (`IntAttrs.Armor` minus `ArmorUsed`) is
+consumed after shields, persists in permanent data, and resets for every card
+when a Ready step is entered. Additive received-damage modifiers and the
+source's `PreventMy*` attributes apply before shields; noncombat damage to a
+champion also scales by `DamageChampionMultiplier`. A target with
+`PreventDamageFromCardsThatHaveOwnersThreshold` ignores damage from a source
+whose shard the target's controller already has, and opposing champions'
+`NonCombatDamageReduction` reduces noncombat damage. See
+`docs/RULES_PORT_PARITY.md` for C# evidence, focused acceptance scenarios and
+the remaining damage-system gaps.
 
 ## Abilities and triggers
 
@@ -217,6 +251,15 @@ known extraction/client gap and must be documented in `abilities/ABILITIES.md`.
 its target. Existing listeners can inspect the played card's type and cost,
 but a card does not observe its own cast when that cast first activates its
 Warzone trigger.
+
+`IntAttrModifier` follows the client: `m_Double` doubles the stored value
+before `m_Operation` is considered, `Remove` deletes the attribute, and an
+unknown operation is a no-op. `ActivateTriggered`'s `m_Keyword` resolves
+Deathcry, Momentum and Deploy (the target's `AsEntersPlayEvent` abilities). A
+Deathcry does not trigger while any opponent's champion has
+`OpposingDeathcriesCantTrigger`. Verdict builds the authored good/bad choice
+cards into the target player's choice zone and activates the built-in
+choose/play ability; `VerdictChoice` gives the caster the choice instead.
 
 The Records ability interpreter has shared paths for the shipped effect
 leaves, target and condition metadata, output variables, duration boundaries,
@@ -239,6 +282,10 @@ AI decisions are server-side. The AI must take legal actions, publish the same
 authoritative state/events as a player, and respect waits that require a human
 transaction. Campaign encounter metadata may select Aggressive, Comfortable,
 or Defensive behavior; it must not be replaced by a card-name guess.
+Attack selection should consider a favorable damage race as a group: when
+eligible attackers' combined unblocked damage exceeds the opponent's legal
+ready-troop attack power, prefer attacking with the positive-power group. The
+client's `MinimumXValue` applies to X-cost card play, not troop attack power.
 
 Tournament registration, matching, results, forfeit, and participant-scoped
 history are separate domain operations. Auction remains an unimplemented API

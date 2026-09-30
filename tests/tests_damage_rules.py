@@ -32,6 +32,7 @@ class DamageRules(unittest.TestCase):
         self.events = []
         self.health = {769: 20, 1025: 20, 1281: 20}
         self.attrs = {769: int(game_engine.ECardAttributes.SpiritDrain)}
+        self.flags = {}
         self.handler = SimpleNamespace(user_profile={'id': 5},
             _player_champ_scid=SimpleNamespace(uid=257),
             _ai_champ_scid=SimpleNamespace(uid=513))
@@ -51,6 +52,8 @@ class DamageRules(unittest.TestCase):
             _emit_trigger=self.trigger,
             update_card_state=lambda uid, **kw: self.events.append(('update', uid)),
             _push_champion_intattrs=lambda owner, uid: None,
+            _push_modifier_card=lambda uid, **kw: None,
+            _champion_owner=lambda uid: None,
             gain_health=lambda owner, amount: self.events.append(('heal', owner, amount)),
             destroy=lambda uid: self.events.append(('destroy', uid)))
         self.stack = ExitStack()
@@ -62,7 +65,7 @@ class DamageRules(unittest.TestCase):
     def stats(self, db, session, state, uid):
         row = db.execute('SELECT card_damage FROM game_cards WHERE card_uid=?', (uid,)).fetchone()
         return (5, self.health.get(uid, 20) - (row[0] if row else 0),
-                self.attrs.get(uid, 0), set(), 0)
+                self.attrs.get(uid, 0), set(self.flags.get(uid, ())), 0)
 
     def trigger(self, name, source, owner=None, **kw):
         self.events.append((name, source, kw))
@@ -188,6 +191,83 @@ class DamageRules(unittest.TestCase):
         self.assertEqual(wire[0], 'begin-combat')
         self.assertEqual(wire[1], 'combat-phase')
         self.assertEqual(wire[-1], 'end-combat')
+
+    def test_armor_absorbs_before_replacement_and_resets_at_ready(self):
+        from rules_port.lifecycle import reset_armor
+        self.buffs(1025, {'int_attrs': {'Armor': 3}})
+        outcome = DamageOutcome()
+        deal_damage(self.ctx, 1025, 5, outcome=outcome)
+        self.assertEqual((outcome.dealt, outcome.absorbed), (2, 5))
+        self.assertEqual(self.db.execute(
+            'SELECT card_damage FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0], 2)
+        stored = json.loads(self.db.execute(
+            'SELECT permanent_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        self.assertEqual(stored['int_attrs']['ArmorUsed'], 3)
+        self.assertEqual([
+            event[2]['event_tac']['DamagePrevented'] for event in self.events
+            if event[0] == 'DamagePreventedEvent'], [3])
+        # Spent armor no longer prevents damage for the rest of the turn.
+        outcome = DamageOutcome()
+        deal_damage(self.ctx, 1025, 1, outcome=outcome)
+        self.assertEqual(outcome.dealt, 1)
+        # The Ready-state reset restores the full pool for the next hit.
+        reset_armor(self.db, 1, self.state)
+        stored = json.loads(self.db.execute(
+            'SELECT permanent_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        self.assertNotIn('ArmorUsed', stored.get('int_attrs', {}))
+        outcome = DamageOutcome()
+        deal_damage(self.ctx, 1025, 2, outcome=outcome)
+        self.assertEqual((outcome.dealt, outcome.absorbed), (0, 2))
+        self.assertEqual(self.db.execute(
+            'SELECT card_damage FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0], 3)
+
+    def test_chance_prevention_rolls_when_the_attr_is_present(self):
+        class Rng:
+            def __init__(self, value):
+                self.value = value
+                self.calls = 0
+
+            def next(self, low, high):
+                self.calls += 1
+                return self.value
+
+        self.buffs(1025, {'int_attrs': {
+            'ChanceToPreventNonCombatDamage': 50}})
+        rng = Rng(10)
+        self.state['_rules_rng'] = rng
+        outcome = DamageOutcome()
+        self.assertEqual(deal_damage(self.ctx, 1025, 4, outcome=outcome),
+                         'damage: chance prevented')
+        self.assertEqual(outcome.absorbed, 4)
+        self.assertEqual(outcome.dealt, 0)
+        self.assertEqual(rng.calls, 1)
+        self.assertEqual([
+            event[2]['event_tac']['DamagePrevented'] for event in self.events
+            if event[0] == 'DamagePreventedEvent'], [4])
+        rng.value = 90
+        self.events.clear()
+        self.assertEqual(deal_damage(self.ctx, 1025, 4), 'survives')
+        self.assertEqual(rng.calls, 2)
+        # A stored zero still consumes the roll (C# reads >= 0).
+        self.buffs(1025, {'int_attrs': {
+            'ChanceToPreventNonCombatDamage': 0}})
+        rng.value = 0
+        self.assertEqual(deal_damage(self.ctx, 1025, 4), 'survives')
+        self.assertEqual(rng.calls, 3)
+
+    def test_additive_received_modifier_and_source_prevention(self):
+        self.buffs(1025, {'int_attrs': {'DamageReceivedModifier': -1}})
+        outcome = DamageOutcome()
+        deal_damage(self.ctx, 1025, 3, outcome=outcome)
+        self.assertEqual(outcome.dealt, 2)
+        self.flags[769] = {'prevent_my_noncombat_damage'}
+        self.assertEqual(deal_damage(self.ctx, 1025, 3),
+                         'damage: source prevention')
+        self.flags.clear()
 
     def test_continuous_rules_respect_authored_targets(self):
         rule = {'property': 'damagemultiplier', 'amount': 3}

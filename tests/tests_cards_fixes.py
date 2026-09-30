@@ -712,6 +712,166 @@ def test_oakhenge_reveal_opens_one_selectable_picker(db):
     assert bstate.pop("completed_chain_instance_id", None) == 6, bstate
 
 
+def test_revealed_choice_completion_reprojects_native_priority(db):
+    """A finished reveal picker must re-project the native priority window.
+
+    Oakhenge's picker can finish a chain item that paused during Draw.  The
+    native scheduler then advances to First Main, but returning without a host
+    projection left the client on the stale ResolveTopOfChain button, and its
+    next click passed the unseen First Main straight into Second Main.
+    """
+    import battle_engine
+    import hconnect_server as hcs
+    import types
+    from rules_port import resolution as resolution_mod
+
+    handler = HandlerStub(db)
+    handler._checkpoint_engine = lambda session: battle_engine
+    handler._hide_candidates_to_deck = lambda *args, **kwargs: None
+    handler._send_battle_events = lambda *args, **kwargs: True
+    acks = []
+    handler._push_transaction_ack = lambda *args, **kwargs: acks.append(1)
+    handler._resolve_pending_revealed_choice = types.MethodType(
+        hcs.HCPHandler._resolve_pending_revealed_choice, handler)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    session = SessionStub()
+
+    def pending():
+        return {
+            "kind": "revealed_troop",
+            "ability_guid": "d8203b7a-0080-f7e0-e2bf-dfac6429785e",
+            "source_uid": 361,
+            "owner_id": 5,
+            "instance_id": 6,
+            "candidates": [362],
+            "revealed_cards": [362],
+            "continuation": {
+                "ability_guid": "d8203b7a-0080-f7e0-e2bf-dfac6429785e",
+                "source_uid": 361,
+                "owner_id": 5,
+                "target_index": 0,
+                "target_map": {},
+            },
+        }
+
+    calls = []
+    state = lambda: {"player_health": 20, "ai_health": 20}
+    with mock.patch.object(resolution_mod, "resolve_port_ability",
+                           lambda *args, **kwargs: "ok"):
+        # A completed chain item hands control back through the native
+        # scheduler (phase/priority projection), not the raw empty ack.
+        handler._resume_completed_rules_port_chain = (
+            lambda *args, **kwargs: True)
+        handler._advance_rules_port_to_priority = (
+            lambda *args, **kwargs: calls.append(args) or True)
+        handler._resolve_pending_revealed_choice(
+            session, pl_t, ai_t, state(), pending(), 362)
+        assert len(calls) == 1, calls
+        assert acks == [], "a projected window must not send an empty ack"
+
+        # A still-paused item keeps the old acknowledgement-only behavior.
+        acks.clear()
+        calls.clear()
+        handler._resume_completed_rules_port_chain = (
+            lambda *args, **kwargs: False)
+        handler._resolve_pending_revealed_choice(
+            session, pl_t, ai_t, state(), pending(), 362)
+        assert calls == [], calls
+        assert acks == [1], acks
+
+
+def test_discard_continuation_reprojects_native_chain_window(db):
+    """A finished discard picker must re-project the next native chain item.
+
+    Stargazer's "draw a card, then discard a card" can draw a resource while a
+    Mysterious Rune is in play; the rune's "when a resource enters your hand"
+    trigger queues behind the paused ability chain item. Finishing the discard
+    completed that item but returned only an empty acknowledgement, so the
+    client stayed on a Normal pass button while the trigger waited on the
+    chain and never resolved into its revert-and-play.
+    """
+    import battle_engine
+    import hconnect_server as hcs
+    import db as dbmod
+    import types
+    from rules_port import resolution as resolution_mod
+
+    discard_child = "06570445-27e3-fc87-2e17-a7b5e1de693d"  # "Discard a card"
+    hand_card = 513
+    add_card(db, hand_card, 5, TPL_GLADIATOR, loc="hand")
+    db.commit()
+
+    handler = HandlerStub(db)
+    handler._checkpoint_engine = lambda session: battle_engine
+    handler._send_battle_events = lambda *args, **kwargs: True
+    acks = []
+    handler._push_transaction_ack = lambda *args, **kwargs: acks.append(1)
+    handler._resolve_rules_port_discard_continuation = types.MethodType(
+        hcs.HCPHandler._resolve_rules_port_discard_continuation, handler)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    session = SessionStub()
+    session.session_name = ""
+
+    def state():
+        return {
+            "turn_player": "player",
+            "pending_discard_continuation": {
+                "ability_guid": discard_child,
+                "source_uid": 5121,
+                "owner_id": 5,
+                "instance_id": 1,
+                "resume_effect_order": 0,
+                "target_map": {},
+            },
+            "pending_discard_target_template":
+                "84e4acf1-1f2e-abac-069d-8c6eb18b2b12",
+        }
+
+    transaction = types.SimpleNamespace(payload={
+        "activation_data": {"target_map": {0: (hand_card,)}}})
+
+    old_db = dbmod._db
+    old_hcs_db = hcs._db
+    dbmod._db = db
+    hcs._db = db
+    try:
+        calls = []
+        with mock.patch.object(resolution_mod, "resolve_port_ability",
+                               lambda *args, **kwargs: "ok"), \
+                mock.patch.object(
+                    resolution_mod, "resume_ability_continuation_parents",
+                    lambda *args, **kwargs: "ok"):
+            # A completed chain item hands control back through the native
+            # scheduler (phase/priority projection), not the raw empty ack.
+            handler._completed_rules_port_chain = (
+                lambda *args, **kwargs: ("port", 1))
+            handler._resume_completed_rules_port_chain = (
+                lambda *args, **kwargs: True)
+            handler._advance_rules_port_to_priority = (
+                lambda *args, **kwargs: calls.append(args) or True)
+            session.turn_order = state()
+            handler._resolve_rules_port_discard_continuation(
+                session, transaction)
+            assert len(calls) == 1, calls
+            assert acks == [], "a projected window must not send an empty ack"
+
+            # A continuation that did not finish a chain item keeps the ack.
+            acks.clear()
+            calls.clear()
+            handler._completed_rules_port_chain = (
+                lambda *args, **kwargs: None)
+            session.turn_order = state()
+            handler._resolve_rules_port_discard_continuation(
+                session, transaction)
+            assert calls == [], calls
+            assert acks == [1], acks
+    finally:
+        dbmod._db = old_db
+        hcs._db = old_hcs_db
+
+
 def test_cosmic_transmogrifier_preserves_type_and_cost(db):
     """Cosmic's random transform uses each target as the filter source.
 
@@ -2111,7 +2271,7 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
                         effective_attack=lambda: 3,
                         effective_defense=lambda: 3),
     ]
-    selector.handler = SimpleNamespace(_ai_champ_scid=None)
+    selector.handler = SimpleNamespace(_ai_champ_scid=None, _db=db)
     selector.player_champ_uid = None
     selector.get_card_value = lambda card: card.value
     legal_uids = [101, 102, 201, 202]
@@ -2155,6 +2315,7 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
 
     guard_evaluator = object.__new__(ai_eval.CardEvaluator)
     guard_evaluator.choose_action_target = lambda _card: None
+    guard_evaluator.choose_action_targets = lambda _card: []
     old_ai_db, old_eval_db = ai._db, ai_eval._db
     ai._db = ai_eval._db = db
     try:
@@ -2233,7 +2394,7 @@ def test_concubunny_exhausts_selected_ready_shinhare(db):
     try:
         # UID 102 is 0x6601 on the wire (little-endian uint64).
         inner = b"m_UID64;;;;0166000000000000;"
-        with mock.patch("ability.resolve_effect", return_value=lambda *args: ""):
+        with mock.patch("abilities.resolve_effect", return_value=lambda *args: ""):
             handler._activate_troop_ability(
                 session, pl_t, ai_t, bstate, source_uid, ability_guid, inner)
 
@@ -2302,6 +2463,10 @@ def main():
          test_oakhenge_moves_revealed_troop_to_hand_with_its_template),
         ("Oakhenge reveal opens one selectable picker",
          test_oakhenge_reveal_opens_one_selectable_picker),
+        ("Revealed choice completion re-projects priority",
+         test_revealed_choice_completion_reprojects_native_priority),
+        ("Discard continuation re-projects native chain window",
+         test_discard_continuation_reprojects_native_chain_window),
         ("Cosmic Transmogrifier preserves type and cost",
          test_cosmic_transmogrifier_preserves_type_and_cost),
         ("Crown of the Primals buffs its target troop",

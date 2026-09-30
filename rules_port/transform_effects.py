@@ -192,6 +192,28 @@ def transform_card_at_random(context):
     candidates = []
     cant_same = bool(context.template_value("m_CantBeSameCard", False))
     owner = source_card.get("user_id", 0)
+    # Apply the source card's category only for the authored
+    # Artifact|Constant|Troop union used by same-cost permanent transforms.
+    # Other effects can intentionally transform between card types (e.g.
+    # Morphology turns a troop into a BasicAction or QuickAction).
+    type_union = None
+    if str(filter_spec.get("_t", "")).rsplit(".", 1)[-1] == "AndCardFilter":
+        for child in filter_spec.get("m_TargetFilters", []):
+            if str(child.get("_t", "")).rsplit(".", 1)[-1] != "OrCardFilter":
+                continue
+            categories = set()
+            for branch in child.get("m_TargetFilters", []):
+                branch_type = str(branch.get("_t", "")).rsplit(".", 1)[-1]
+                if branch_type == "IsArtifact":
+                    categories.add("Artifact")
+                elif branch_type == "IsTroop":
+                    categories.add("Troop")
+                elif (branch_type == "IsType" and
+                      str(branch.get("m_CardType") or "") == "Constant"):
+                    categories.add("Constant")
+            if categories == {"Artifact", "Constant", "Troop"}:
+                type_union = categories
+                break
     for row in rows:
         candidate = {
             "card_uid": 0, "template_guid": row[0], "name": row[1] or "",
@@ -204,18 +226,16 @@ def transform_card_at_random(context):
             continue
         candidate_types = {part.strip() for part in candidate["card_type"].split("|")
                            if part.strip()}
-        # This preserves the authored category-union behavior for transforms
-        # whose filter is Artifact|Constant|Troop.
-        if target_types and target_types.intersection({"Artifact", "Constant", "Troop"}):
-            authored_types = {part for part in target_types
-                              if part in {"Artifact", "Constant", "Troop"}}
-            if authored_types and not candidate_types.intersection(authored_types):
-                continue
+        if type_union and target_types and not target_types.intersection(
+                candidate_types):
+            continue
         if records_filter_matches(candidate, filter_spec,
                                   source=source_card, context=context):
             candidates.append(row[0])
     if not candidates:
         return "transform random: no candidates"
     new_template = random.choice(candidates)
-    transform_instance(context, int(target), new_template)
+    # TransformCard mutates the current card in place. In particular,
+    # "put into hand, then transform" must leave the generated action in hand.
+    transform_instance(context, int(target), new_template, keep_zone=True)
     return f"transformed {hex(int(target))} -> random {new_template[:8]}"

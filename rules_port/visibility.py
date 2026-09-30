@@ -142,13 +142,10 @@ def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
     else:
         profile = getattr(handler, "user_profile", None) or {}
         owners.update((int(profile.get("id", 0) or 0), 0))
-    for owner in owners:
-        attrs = player_int_attributes(db, session.session_id, state, owner)
-        if int(attrs.get("CanSeeTopOfDeck", 0) or 0) <= 0:
-            continue
-        top = db_deck_top_card_details(session.session_id, owner, conn=db)
+    def reveal(viewer, target):
+        top = db_deck_top_card_details(session.session_id, target, conn=db)
         if not top:
-            continue
+            return
         _row_id, uid, _instance_template, template_guid = top
         if any(
                 isinstance(event, game_engine.CardUpdatedSessionEventArgs) and
@@ -156,14 +153,14 @@ def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
                 event.collection == game_engine.ECardCollections.Deck and
                 not bool(getattr(event, "nulling", False))
                 for event in game.events):
-            continue
+            return
         scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
         try:
             _tpl, card_type, _name, cost, attack, defense, gems = \
                 handler._card_full_data(game, scid, template_guid)
         except Exception:
-            continue
-        recipient = _owner_uid(game, owner, state)
+            return
+        recipient = _owner_uid(game, viewer, state)
         game.push_card_updated(
             scid, recipient, game_engine.ECardCollections.Deck, card_type,
             template_id=template_guid, cost=cost, attack=attack,
@@ -171,6 +168,70 @@ def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
         # Reuse the packet's viewer-only filtering rule; the visible card is
         # not sent to the other participant's client.
         game.events[-1]._hand_reveal_viewer_uid = recipient
+
+    for owner in owners:
+        attrs = player_int_attributes(db, session.session_id, state, owner)
+        if int(attrs.get("CanSeeTopOfDeck", 0) or 0) > 0:
+            reveal(owner, owner)
+        if int(attrs.get("CanSeeOpponentsTopOfDeck", 0) or 0) > 0:
+            opponent = _opponent_owner(state, owner, handler)
+            if opponent is not None:
+                reveal(owner, opponent)
+
+
+def project_visible_underground(db, session, handler, game, pl_t, ai_t,
+                                state):
+    """Card.IsVisibleTo: reveal opponent underground cards to a viewer.
+
+    ``CanSeeUndergroundTroops`` is a champion intattr; the default client
+    projection keeps those cards face down, so the permission sends the real
+    representation to that viewer only.
+    """
+    from pvp_db import db_underground_card_rows
+    from .static_rules import player_int_attributes
+    owners = set()
+    if state.get("pvp"):
+        owners.update(int(pid) for pid in state.get("pids", ()) or ())
+    else:
+        profile = getattr(handler, "user_profile", None) or {}
+        owners.update((int(profile.get("id", 0) or 0), 0))
+    projected = getattr(game, "_visible_underground_uids", None)
+    if projected is None:
+        projected = {}
+        game._visible_underground_uids = projected
+    active = set()
+    for viewer in owners:
+        attrs = player_int_attributes(db, session.session_id, state, viewer)
+        if int(attrs.get("CanSeeUndergroundTroops", 0) or 0) <= 0:
+            continue
+        opponent = _opponent_owner(state, viewer, handler)
+        if opponent is None:
+            continue
+        rows = db_underground_card_rows(session.session_id, opponent, conn=db)
+        current = {int(uid) for uid, _template in rows}
+        key = str(viewer)
+        previous = projected.get(key)
+        if previous is not None and not (current - set(previous)):
+            continue
+        recipient = _owner_uid(game, viewer, state)
+        for uid, template_guid in rows:
+            scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
+            try:
+                _tpl, card_type, _name, cost, attack, defense, gems = \
+                    handler._card_full_data(game, scid, template_guid)
+            except Exception:
+                continue
+            game.push_card_updated(
+                scid, recipient, game_engine.ECardCollections.Underground,
+                card_type, template_id=template_guid, cost=cost,
+                attack=attack, defense=defense, gems=gems, nulling=False)
+            game.events[-1]._hand_reveal_viewer_uid = recipient
+        projected[key] = sorted(current)
+        active.add(key)
+    for key in list(projected):
+        if key not in active:
+            projected.pop(key, None)
+    return projected
 
 
 def _apply_player_flags(game, state):
@@ -230,6 +291,7 @@ def refresh_player_visibility(db, session, handler, game, pl_t, ai_t, state):
         _push_hand(db, session, handler, game, pl_t, ai_t, state,
                    int(owner), visible)
     project_visible_hands(db, session, handler, game, pl_t, ai_t, state)
+    project_visible_underground(db, session, handler, game, pl_t, ai_t, state)
     for owner in set(old) | set(new):
         owner_uid_value = _owner_uid(game, int(owner), state)
         champion = (game.player_champion_card_id

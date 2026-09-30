@@ -11,6 +11,7 @@ import game_engine
 from rules_port.filters import (records_filter_from_metadata,
                                 records_filter_matches)
 from rules_port.targeting import legal_targets, validate_target_selection
+from rules_port.costs import AbilityCostTarget, validate_cost_target_selection
 from tests.tests_targeting import (
     EXILE_TPL, PLAIN_TPL, SRC, add_card, make_db,
 )
@@ -216,7 +217,49 @@ def _shared_name_uses_custom_card_validation(db):
         db, 1, 51, SHARED_NAME_TARGET, 999,
         [301, 302, 303, 304],
         battle_state={"_rules_port_suppress_card_properties": True}) == [
-            301, 302, 303, 304]
+        301, 302, 303, 304]
+
+
+def _shared_name_cost_rejects_mixed_groups(db):
+    source_db = __import__("sqlite3").connect(
+        __import__("tests.tests_targeting", fromlist=["SRC"]).SRC)
+    try:
+        row = source_db.execute(
+            "SELECT * FROM target_templates WHERE template_id=?",
+            (SHARED_NAME_TARGET,)).fetchone()
+    finally:
+        source_db.close()
+    assert row is not None
+    db.execute("INSERT OR REPLACE INTO target_templates VALUES "
+               "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
+    other_tpl = "77777777-7777-7777-7777-777777777777"
+    db.execute(
+        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (other_tpl, "Other Troop", "Troop", 1, 1, 1, 0, "[]", "[]", ""))
+    for uid in range(401, 405):
+        add_card(db, uid, 51, PLAIN_TPL, "hand", position=uid - 401)
+    for uid in range(405, 409):
+        db.execute(
+            "INSERT INTO game_cards VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'{}','{}','{}')",
+            (1, 51, uid, other_tpl, other_tpl, "hand", uid - 401,
+             0, "[]", "Troop", 0))
+    db.commit()
+    candidates = legal_targets(
+        db, 1, 51, SHARED_NAME_TARGET, 999,
+        battle_state={"_rules_port_suppress_card_properties": True})
+    assert set(candidates) == set(range(401, 409)), candidates
+    cost = AbilityCostTarget(
+        index=0, kind="discard", guid=SHARED_NAME_TARGET,
+        minimum=4, maximum=4, is_source_auto_target=False,
+        candidates=tuple(candidates))
+    assert validate_cost_target_selection(
+        db, 1, 51, 999, cost, [401, 402, 403, 404],
+        battle_state={"_rules_port_suppress_card_properties": True}) == (
+            401, 402, 403, 404)
+    assert validate_cost_target_selection(
+        db, 1, 51, 999, cost, [401, 402, 403, 405],
+        battle_state={"_rules_port_suppress_card_properties": True}) is None
 
 
 def _records_target_catalog_compiles_all_filters_and_modes(db):
@@ -555,6 +598,8 @@ if __name__ == "__main__":
          _duplicate_is_collection_local)
     _run("SharedName direct target validation follows C# override",
          _shared_name_uses_custom_card_validation)
+    _run("SharedName additional costs reject mixed-name payment groups",
+         _shared_name_cost_rejects_mixed_groups)
     _run("all Records target filters and selection modes compile",
          _records_target_catalog_compiles_all_filters_and_modes)
     _run("nested filter edge cases agree for PVE and PVP owners",

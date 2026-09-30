@@ -327,6 +327,82 @@ def expire_temporary_intattrs(db, session_id, state, *, boundary=None,
     return tuple(key for key, _item in results)
 
 
+def record_temporary_stat(state, uid, attack, defense, *, duration,
+                          owner_id=0, source_uid=None):
+    """Record a reversible duration-bound stat grant.
+
+    Used by the game-rules triggers whose built-in effects are stat modifiers
+    rather than IntAttrs (Momentum's +1/+1 until the owner's next turn).
+    """
+    item = {"uid": int(uid), "attack": int(attack or 0),
+            "defense": int(defense or 0), "duration": str(duration),
+            "owner_id": int(owner_id or 0),
+            "turn_number": int(state.get("turn_number", 1) or 1),
+            "source_uid": (int(source_uid)
+                           if source_uid is not None else None)}
+    with _LIFETIME_LOCK:
+        state.setdefault("temporary_card_stats", []).append(item)
+
+
+def _stat_expired(item, *, boundary=None, boundary_owner=None):
+    duration = str(item.get("duration") or "")
+    owner = int(item.get("owner_id", 0) or 0)
+    boundary_owner = int(boundary_owner or 0)
+    if boundary == "start_turn" and duration == "BeginningOfOwnersTurn":
+        return owner == boundary_owner
+    if boundary == "end_turn" and duration == "EndOfTurn":
+        return owner == boundary_owner
+    return False
+
+
+def expire_temporary_stats(db, session_id, state, *, boundary=None,
+                           boundary_owner=None):
+    """Remove stat grants whose authored duration boundary has arrived."""
+    with _LIFETIME_LOCK:
+        values = list(state.get("temporary_card_stats") or ())
+        expired = [item for item in values
+                   if isinstance(item, dict) and
+                   _stat_expired(item, boundary=boundary,
+                                 boundary_owner=boundary_owner)]
+        if expired:
+            state["temporary_card_stats"] = [
+                item for item in values if item not in expired]
+            if not state["temporary_card_stats"]:
+                state.pop("temporary_card_stats", None)
+    changed = []
+    from pvp_db import db_card_mutation_field, db_set_card_mutation_field
+    for item in reversed(expired):
+        uid = int(item.get("uid", -1))
+        if uid < 0:
+            continue
+        try:
+            buffs = json.loads(db_card_mutation_field(
+                session_id, uid, "permanent_buffs", conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(buffs, dict):
+            continue
+        attack = int(item.get("attack", 0) or 0)
+        defense = int(item.get("defense", 0) or 0)
+        new_atk = int(buffs.get("atk", 0) or 0) - attack
+        new_def = int(buffs.get("def", 0) or 0) - defense
+        if new_atk:
+            buffs["atk"] = new_atk
+        else:
+            buffs.pop("atk", None)
+        if new_def:
+            buffs["def"] = new_def
+        else:
+            buffs.pop("def", None)
+        db_set_card_mutation_field(
+            session_id, uid, "permanent_buffs",
+            json.dumps(buffs, separators=(",", ":"), sort_keys=True), conn=db)
+        changed.append(uid)
+    if changed:
+        db.commit()
+    return changed
+
+
 def _intattr_expired(item, db, session_id, state, *, boundary=None,
                      boundary_owner=None, damaged_uid=None):
     duration = str(item.get("duration") or "")

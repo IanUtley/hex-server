@@ -734,3 +734,41 @@ class ProfileStreamMixin:
             db_set_inventory_client_uid(
                 self.user_profile["id"], template_guid, item_id, conn=_db)
             _db.commit()
+
+    def push_currency_to_client(self, gold_delta=0, platinum_delta=0):
+        """Push an atomic profile currency delta through the generic stream."""
+        if not self.user_profile or (not gold_delta and not platinum_delta):
+            return
+        batch_bytes = encode_objfmt_response(
+            ["Game.Shared.ProfileGenericBatchUpdate",
+             "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+             "Game.Shared.Domain.inventory_bits", "System.UInt64",
+             "Game.Shared.ResourceId", "System.Guid", "System.Boolean",
+             "System.Int32", "System.DateTime", "System.String"],
+            [("Items", "coll", (
+                "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+                0, [])),
+             ("GoldDelta", "int", int(gold_delta or 0)),
+             ("PlatDelta", "int", int(platinum_delta or 0))]
+        )
+        args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileGenericUpdateEventArgs",
+             "Game.Shared.ProfileGenericMessage", "System.Byte[]"],
+            [("Message", "struct", ("Game.Shared.ProfileGenericMessage", [
+                ("Data", "bytes", batch_bytes)]))]
+        )
+        compressed = compress_gzip(args)
+        dw = encode_datawrapper(
+            0, 2211, compressed, 1,
+            "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer."
+            f"{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(
+            f">>> PUSH currency delta (dt=2211) gold={int(gold_delta or 0)} "
+            f"platinum={int(platinum_delta or 0)}, dw_sz={len(dw)}")

@@ -19,7 +19,7 @@ import game_engine
 
 def _empty_deltas():
     return {"atk": 0, "def": 0, "cost_mod": 0, "attrs": 0,
-            "flags": set(), "rage": 0, "rules": [],
+            "flags": set(), "rage": 0, "gladiator": 0, "rules": [],
             "card_properties": {}}
 
 
@@ -1352,6 +1352,14 @@ def _scan_static_deltas(db, session_id, battle_state, card_uid, cache):
                             "prevent_combat_damage" if attribute ==
                             "preventcombatdamage" else
                             "prevent_noncombat_damage")
+                    elif attribute in {"preventmycombatdamage",
+                                       "preventmynoncombatdamage"}:
+                        total["flags"].add(
+                            "prevent_my_combat_damage" if attribute ==
+                            "preventmycombatdamage" else
+                            "prevent_my_noncombat_damage")
+                    elif attribute == "gladiator":
+                        total["gladiator"] += value
                     elif attribute in {"cantgainhealth", "cantlosehealth",
                                        "cantplaycards", "unlimitedhandsize"}:
                         total["flags"].add(_CHAMPION_INTATTR_FLAGS[attribute])
@@ -1466,7 +1474,7 @@ def _has_continuous_static(db, session_id, card_uid):
 
 
 def _instance_buffs(row):
-    attack = defense = rage = 0
+    attack = defense = rage = gladiator = 0
     attrs = int(row[3] or 0) | int(row[6] or 0) | int(row[9] or 0)
     flags = set()
     for raw in (row[7], row[8]):
@@ -1487,6 +1495,19 @@ def _instance_buffs(row):
                 flags.add("lethal")
             if int(int_attrs.get("Crush", int_attrs.get("crush", 0)) or 0) > 0:
                 flags.add("crush")
+            prevention = {
+                "preventcombatdamage": "prevent_combat_damage",
+                "preventnoncombatdamage": "prevent_noncombat_damage",
+                "preventmycombatdamage": "prevent_my_combat_damage",
+                "preventmynoncombatdamage": "prevent_my_noncombat_damage",
+            }
+            for name, value in int_attrs.items():
+                lowered = str(name).lower()
+                flag = prevention.get(lowered)
+                if flag and int(value or 0) > 0:
+                    flags.add(flag)
+                elif lowered == "gladiator":
+                    gladiator += int(value or 0)
         for rule in buffs.get("rule_modifiers", []) or []:
             if not isinstance(rule, dict) or rule.get("property") != "damagemultiplier":
                 continue
@@ -1498,7 +1519,7 @@ def _instance_buffs(row):
                 flags.add("double_noncombat_damage")
             else:
                 flags.add("double_damage")
-    return attack, defense, attrs, flags, rage
+    return attack, defense, attrs, flags, rage, gladiator
 
 
 def effective_stats(db, session_id, battle_state, card_uid):
@@ -1508,10 +1529,78 @@ def effective_stats(db, session_id, battle_state, card_uid):
     if unsupported:
         raise RuntimeError(
             f"RulesPort static stats have no native handler for card {card_uid}")
-    return _stats_from_deltas(db, session_id, card_uid, static)
+    return _stats_from_deltas(db, session_id, card_uid, static, battle_state)
 
 
-def _stats_from_deltas(db, session_id, card_uid, static):
+def _is_active_owner(owner, battle_state):
+    """Whether ``owner`` is the active player, or None when unknown."""
+    if owner is None or not battle_state:
+        return None
+    if battle_state.get("pvp"):
+        pid = battle_state.get("turn_pid")
+        if pid is None:
+            return None
+        return int(owner) == int(pid)
+    turn_player = battle_state.get("turn_player")
+    if turn_player not in ("player", "ai"):
+        return None
+    return (turn_player == "player") == bool(int(owner or 0))
+
+
+def _champion_int_attrs(battle_state, owner):
+    """Runtime intattrs of the controller's synthetic champion card."""
+    if owner is None or not battle_state:
+        return {}
+    champion_uid = None
+    for participant, uid in (battle_state.get("champ_map") or {}).items():
+        if str(participant) == str(owner):
+            champion_uid = str(uid)
+            break
+    if champion_uid is None:
+        return {}
+    attrs = (battle_state.get("champion_int_attrs") or {}).get(champion_uid)
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _champion_has_gladiator_both(battle_state, owner):
+    """Read GladiatorBoth from the controller's champion intattr state."""
+    for name, value in _champion_int_attrs(battle_state, owner).items():
+        if str(name).lower() == "gladiatorboth" and int(value or 0) > 0:
+            return True
+    return False
+
+
+def _card_play_for_free(db, session_id, battle_state, card_uid):
+    """Card.OwnerCanPlayForFree or the controller's CanPlayCardsForFree.
+
+    ``PlayTroopTransaction.Resolve`` (and the spell/artifact equivalents)
+    reject a free play unless one of these is set, so a client-projected play
+    option must treat the card as zero cost while either holds.
+    """
+    if not isinstance(battle_state, dict) or not battle_state:
+        return False
+    from pvp_db import db_card_mutation_field, db_card_owner_id
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            data = json.loads(db_card_mutation_field(
+                session_id, int(card_uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            data = {}
+        attrs = data.get("int_attrs") if isinstance(data, dict) else None
+        if isinstance(attrs, dict):
+            for name, value in attrs.items():
+                if (str(name).lower() == "ownercanplayforfree"
+                        and int(value or 0) > 0):
+                    return True
+    owner = db_card_owner_id(session_id, int(card_uid), conn=db)
+    for name, value in _champion_int_attrs(battle_state, owner).items():
+        if (str(name).lower() == "canplaycardsforfree"
+                and int(value or 0) > 0):
+            return True
+    return False
+
+
+def _stats_from_deltas(db, session_id, card_uid, static, battle_state=None):
     """Project combat stats from an already-computed native delta view."""
     from pvp_db import db_card_static_row, db_card_combat_state
     try:
@@ -1524,7 +1613,7 @@ def _stats_from_deltas(db, session_id, card_uid, static):
             row = tuple(row) + (0, 0)
     if not row:
         return 0, 0, 0, set(), 0
-    atk, defense, attrs, flags, rage = _instance_buffs(row)
+    atk, defense, attrs, flags, rage, gladiator = _instance_buffs(row)
     atk += int(row[0] or 0) + int(row[4] or 0)
     defense += int(row[1] or 0) + int(row[5] or 0) - int(row[2] or 0)
     attrs |= int(row[3] or 0) | int(row[6] or 0)
@@ -1536,6 +1625,20 @@ def _stats_from_deltas(db, session_id, card_uid, static):
     rage += int(row[10] or 0)
     if row[11]:
         flags.add("lethal")
+    gladiator += int(static.get("gladiator", 0) or 0)
+    if gladiator and battle_state is not None:
+        from pvp_db import db_card_owner_id
+        owner = db_card_owner_id(session_id, int(card_uid), conn=db)
+        active = _is_active_owner(owner, battle_state)
+        if active is not None:
+            both = _champion_has_gladiator_both(battle_state, owner)
+            # C# Card.CurrentAttackValue adds Gladiator for the active
+            # controller and CurrentDefenseValue adds it while defending;
+            # GladiatorBoth applies both halves at once.
+            if active or both:
+                atk += gladiator
+            if not active or both:
+                defense += gladiator
     return atk, max(0, defense), attrs, flags, rage
 
 
@@ -1552,36 +1655,175 @@ def effective_deltas(db, session_id, battle_state, card_uid):
     return native
 
 
+def card_has_int_attr(db, session_id, card_uid, name):
+    """Whether one card's runtime intattrs carry a positive named value."""
+    from pvp_db import db_card_mutation_field
+    wanted = str(name).lower()
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            data = json.loads(db_card_mutation_field(
+                session_id, int(card_uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attrs = data.get("int_attrs") if isinstance(data, dict) else None
+        if isinstance(attrs, dict) and any(
+                str(key).lower() == wanted and int(value or 0) > 0
+                for key, value in attrs.items()):
+            return True
+    return False
+
+
+def owner_has_card_int_attr(db, session_id, owner, name):
+    """Whether any of ``owner``'s in-play cards carries the runtime intattr."""
+    wanted = str(name).lower()
+    rows = db.execute(
+        "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
+        "AND location IN ('warzone', 'underground')",
+        (session_id, int(owner))).fetchall()
+    for (uid,) in rows:
+        if card_has_int_attr(db, session_id, int(uid), wanted):
+            return True
+    return False
+
+
+def champion_int_attribute(battle_state, owner, name):
+    """One named runtime intattr from the controller's champion context."""
+    value = champion_int_attr_optional(battle_state, owner, name)
+    return 0 if value is None else value
+
+
+def champion_int_attr_optional(battle_state, owner, name):
+    """Like :func:`champion_int_attribute`, but None when the attr is absent."""
+    for key, value in _champion_int_attrs(battle_state, owner).items():
+        if str(key).lower() == str(name).lower():
+            return int(value or 0)
+    return None
+
+
+def charge_point_cost_modifier(db, session_id, battle_state, owner,
+                               source_uid):
+    """Card.GetChargePointCostModifier for one ability activation.
+
+    The modifier lives on the ability's source card; champion powers source
+    from the champion, whose runtime intattrs carry modifiers granted by
+    other cards.
+    """
+    from .combat_rules import card_int_attr
+    total = 0
+    if source_uid is not None:
+        total += int(card_int_attr(
+            db, session_id, int(source_uid),
+            "ChargePointCostModifier") or 0)
+    champion = None
+    for participant, uid in (battle_state.get("champ_map") or {}).items():
+        if str(participant) == str(owner):
+            champion = int(uid)
+            break
+    if champion is not None and champion != int(source_uid or 0):
+        total += champion_int_attribute(
+            battle_state, owner, "ChargePointCostModifier")
+    return total
+
+
+def opposing_enters_play_exhausted(battle_state, controller_owner,
+                                   template_guid):
+    """Session.MoveCard: an opponent's champion flag taps entering troops.
+
+    ``OpposingTroopsEnterPlayExhausted`` and
+    ``OpposingNonArdentTroopsEnterPlayExhausted`` (non-Aria troops only) are
+    read from every champion that opposes the entering troop's controller.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    card = DEFAULT_RECORD_STORE.get("CardTemplate", str(template_guid or "").lower())
+    if card is None or "Troop" not in str(card.field("m_CardType", "") or ""):
+        return False
+    faction = str(card.field("m_Faction", "") or "").lower()
+    for participant in (battle_state.get("champ_map") or {}):
+        try:
+            opponent = int(participant)
+        except (TypeError, ValueError):
+            continue
+        if opponent == int(controller_owner or 0):
+            continue
+        for name, value in _champion_int_attrs(battle_state, opponent).items():
+            if int(value or 0) <= 0:
+                continue
+            lowered = str(name).lower()
+            if lowered == "opposingtroopsenterplayexhausted":
+                return True
+            if (lowered == "opposingnonardenttroopsenterplayexhausted"
+                    and "aria" not in faction):
+                return True
+    return False
+
+
+def mobilize_discount(db, session_id, owner_id, card_uid):
+    """Session.CheckMobilize's affordable reduction for one card."""
+    from pvp_db import db_warzone_blocker_uids
+    from .combat_rules import card_int_attr
+    limit = int(card_int_attr(db, session_id, int(card_uid), "Mobilize") or 0)
+    if limit <= 0:
+        return 0
+    from domain.enums import ECardStates
+    ready = db_warzone_blocker_uids(
+        session_id, int(owner_id), int(ECardStates.Tapped), conn=db)
+    return 2 * min(limit, len(ready))
+
+
+def mobilize_payment(db, session_id, owner_id, card_uid, payment, mobilized):
+    """Apply selected ``CardsToMobilize`` to a play payment.
+
+    Returns the reduced payment, or ``None`` when the client's selection is
+    not legal: more cards than the card's Mobilize value, or a card that is
+    not one of the player's ready warzone troops.
+    """
+    if not mobilized:
+        return max(0, int(payment or 0))
+    from pvp_db import db_warzone_blocker_uids
+    from .combat_rules import card_int_attr
+    limit = int(card_int_attr(db, session_id, int(card_uid), "Mobilize") or 0)
+    if limit <= 0 or len(mobilized) > limit:
+        return None
+    from domain.enums import ECardStates
+    ready = {int(uid) for (uid,) in db_warzone_blocker_uids(
+        session_id, int(owner_id), int(ECardStates.Tapped), conn=db)}
+    if any(int(uid) not in ready for uid in mobilized):
+        return None
+    return max(0, int(payment or 0) - 2 * len(mobilized))
+
+
 def effective_cost(db, session_id, battle_state, card_uid):
     native, unsupported = _native_static_deltas(
         db, session_id, battle_state or {}, int(card_uid))
     if unsupported:
         raise RuntimeError(
             f"RulesPort static cost has no native handler for card {card_uid}")
+    if _card_play_for_free(db, session_id, battle_state, card_uid):
+        return 0
     return _cost_from_deltas(db, session_id, card_uid, native)
 
 
 def player_int_attributes(db, session_id, battle_state, owner_id):
-    """Evaluate PlayerTarget IntAttr effects sourced by the active deck top.
+    """Project active Records IntAttr modifiers onto each player's context.
 
-    ``AbilityEffectInstance`` disables WhileCardOnTopOfDeck mappings unless
-    their source card is exactly the top card.  Player permissions such as
-    CanSeeTopOfDeck and CanPlayTopOfDeck are therefore derived from authored
-    mappings each time options or visibility are projected.
+    Player permissions can come from active deck-top effects or continuous
+    abilities on cards in play.  Keep the source zone, duration, target's
+    player filter, and effect condition tied to Records metadata so player
+    rules such as additional resource plays are available to both AI and
+    transaction validation.
     """
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
-    from pvp_db import db_deck_top_card_details, db_card_ability_list
+    from pvp_db import (db_deck_top_card_details, db_card_ability_list,
+                        db_cards_in_zones_with_abilities,
+                        db_warzone_owner_ids,
+                        db_get_champion_ability_guids)
     from .metadata import modifier_metadata
     owner = int(owner_id or 0)
     result = {}
-    top = db_deck_top_card_details(session_id, owner, conn=db)
-    sources = []
-    if top:
-        sources.append((int(top[1]), db_card_ability_list(
-            session_id, int(top[1]), conn=db)))
+    state = battle_state if isinstance(battle_state, dict) else {}
+
     # Synthetic champion instance IntAttrs are persisted in the shared
     # checkpoint because champion cards have no game_cards row.
-    state = battle_state if isinstance(battle_state, dict) else {}
     champion_map = state.get("champ_map") or {}
     champion_uid = champion_map.get(owner, champion_map.get(str(owner)))
     try:
@@ -1595,14 +1837,70 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
                 result[str(name)] = int(value or 0)
             except (TypeError, ValueError):
                 continue
-    for source_uid, abilities in sources:
-        for ability_guid in abilities:
+
+    # Each source tuple records which authored duration can currently apply.
+    # The top-of-deck source has its own lifetime; ordinary static player
+    # modifiers require a source card to remain in the Warzone.  A champion's
+    # own passive abilities are always available while that champion is in
+    # the session.
+    sources = []
+    top = db_deck_top_card_details(session_id, owner, conn=db)
+    if top:
+        top_uid = int(top[1])
+        sources.append((owner, top_uid, db_card_ability_list(
+            session_id, top_uid, conn=db), {"WhileCardOnTopOfDeck"}))
+
+    source_owners = {owner}
+    for row in db_warzone_owner_ids(session_id, conn=db):
+        try:
+            source_owners.add(int(row[0]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    for key in champion_map:
+        try:
+            source_owners.add(int(key))
+        except (TypeError, ValueError):
+            continue
+    champion_guids = state.get("champ_guid_map") or {}
+    for source_owner in sorted(source_owners):
+        for source_uid, abilities in db_cards_in_zones_with_abilities(
+                session_id, source_owner, ("warzone",), conn=db):
+            sources.append((source_owner, int(source_uid), abilities,
+                            {"WhileCardInPlay"}))
+        champion_guid = champion_guids.get(
+            source_owner, champion_guids.get(str(source_owner)))
+        source_champion_uid = champion_map.get(
+            source_owner, champion_map.get(str(source_owner)))
+        if champion_guid and source_champion_uid is not None:
+            sources.append((source_owner, int(source_champion_uid),
+                            db_get_champion_ability_guids(
+                                champion_guid, conn=db),
+                            {"WhileCardInPlay", "Permanent"}))
+
+    def targets_player(player_filter, source_owner):
+        target_filter = str(player_filter or "Self").rsplit(".", 1)[-1].lower()
+        if target_filter in {"self", "you", "controller", "activeplayer"}:
+            return int(source_owner) == owner
+        if target_filter in {
+                "opposing", "opponents", "multipleopponents"}:
+            return int(source_owner) != owner
+        if target_filter in {"multipleplayers", "allplayers"}:
+            return True
+        return False
+
+    for source_owner, source_uid, abilities, active_durations in sources:
+        if isinstance(abilities, str):
+            try:
+                abilities = json.loads(abilities or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                abilities = ()
+        for ability_guid in abilities or ():
             graph = ability_graph(
                 DEFAULT_RECORD_STORE, str(ability_guid).lower())
             if graph is None:
                 continue
             for effect in graph.effects:
-                if (effect.duration != "WhileCardOnTopOfDeck" or
+                if (effect.duration not in active_durations or
                         effect.concrete_type != "CardModifierAbilityEffectTemplate" or
                         effect.target_index < 0 or
                         effect.target_index >= len(graph.targets)):
@@ -1610,10 +1908,7 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
                 target = graph.targets[effect.target_index]
                 if target.target_kind != "PlayerTargetTemplate":
                     continue
-                player_filter = str(
-                    target.player_filter or "Self").lower()
-                if player_filter not in {
-                        "self", "you", "controller", "activeplayer"}:
+                if not targets_player(target.player_filter, source_owner):
                     continue
                 metadata = modifier_metadata(effect.guid)
                 if str(metadata.get("property") or "").lower() != "intattr":
@@ -1621,18 +1916,25 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
                 attribute = str(metadata.get("attribute") or "")
                 if not attribute:
                     continue
+                param = dict(metadata)
+                param["condition_id"] = effect.condition_guid
+                raw_ability = None
                 try:
-                    value = int(metadata.get(
-                        "value", metadata.get("input_value", 1)) or 0)
-                except (TypeError, ValueError):
+                    from pvp_db import db_ability_raw_json
+                    raw_ability = db_ability_raw_json(
+                        ability_guid, conn=db) or ""
+                    resolved = _native_leaf_value(
+                        db, session_id, state, source_uid, source_owner,
+                        param, raw_ability)
+                    if resolved is None or resolved[0] != "intattr":
+                        continue
+                    value = int(resolved[1])
+                except (TypeError, ValueError, RuntimeError):
                     continue
                 if effect.condition_guid and effect.condition_guid != "0" * 36:
                     try:
                         from .condition_context import ConditionContext
                         from .conditions import evaluate_effect_condition
-                        from pvp_db import db_card_owner_id
-                        source_owner = int(db_card_owner_id(
-                            session_id, source_uid, conn=db) or owner)
                         if not evaluate_effect_condition(
                                 db, effect.condition_guid, ConditionContext(
                                     db, _StaticSession(session_id), state,
@@ -1645,9 +1947,13 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
                 operation = str(
                     metadata.get("operation") or "Set").lower()
                 previous = int(result.get(attribute, 0) or 0)
-                if operation in {"add", "increment"}:
+                if metadata.get("double"):
+                    result[attribute] = previous * 2
+                elif operation in {"add", "increment"}:
                     result[attribute] = previous + value
-                elif operation in {"remove", "subtract"}:
+                elif operation == "remove":
+                    result.pop(attribute, None)
+                elif operation == "subtract":
                     result[attribute] = previous - value
                 else:
                     result[attribute] = value
@@ -1700,7 +2006,10 @@ def effective_option_projection(db, session_id, battle_state, card_uid):
         raise RuntimeError(
             "RulesPort static projection has no native handler for card "
             f"{card_uid}")
-    attributes = _stats_from_deltas(db, session_id, card_uid, native)[2]
+    attributes = _stats_from_deltas(
+        db, session_id, card_uid, native, battle_state)[2]
+    if _card_play_for_free(db, session_id, battle_state, card_uid):
+        return attributes, 0
     return attributes, _cost_from_deltas(db, session_id, card_uid, native)
 
 

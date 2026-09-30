@@ -37,6 +37,54 @@ class AbilityCostTarget:
     allow_best_effort_minimum: bool = False
 
 
+def validate_cost_target_selection(db, session_id: int, controller_uid: int,
+                                   source_uid: int | None,
+                                   cost: AbilityCostTarget, selected,
+                                   *, champions=None, battle_state=None,
+                                   variables=None):
+    """Validate one submitted additional-cost selection against its template.
+
+    Candidate enumeration is not sufficient for specialized target classes.
+    ``SharedNameTargetTemplate`` deliberately enumerates every card from a
+    qualifying same-name group, so a caller must still validate that the
+    submitted selection belongs to one group.  Keep this check beside the
+    authored cost projection so PvE, PvP, and card-play adapters cannot each
+    grow a slightly different interpretation of the cost.
+    """
+    values = selected if isinstance(selected, (list, tuple, set)) else (
+        () if selected is None else (selected,))
+    try:
+        values = tuple(int(getattr(value, "uid64", value))
+                      for value in values)
+    except (TypeError, ValueError):
+        return None
+
+    if cost.is_source_auto_target:
+        if source_uid is None:
+            return values if not values else None
+        expected = (int(source_uid),)
+        return expected if not values or values == expected else None
+
+    minimum = int(cost.minimum or 0)
+    maximum = int(cost.maximum or -1)
+    if (len(values) < minimum and
+            not cost.allow_best_effort_minimum) or \
+            (maximum > 0 and len(values) > maximum):
+        return None
+    if any(value not in {int(candidate) for candidate in cost.candidates}
+           for value in values):
+        return None
+
+    from .targeting import validate_target_selection
+    validated = validate_target_selection(
+        db, session_id, int(controller_uid), cost.guid, source_uid, values,
+        both_players=False, champions=champions, battle_state=battle_state,
+        variables=variables)
+    if tuple(validated) != values:
+        return None
+    return values
+
+
 def cost_type_for_kind(kind: str) -> int:
     """Return the client wire value for an authored card-cost kind."""
     return {
@@ -84,7 +132,8 @@ def ability_cost_targets(graph, db, session_id: int, owner_id: int,
         maximum = int(target.maximum or 0)
         result.append(AbilityCostTarget(
             index, str(kind), str(guid), max(0, int(target.minimum or 0)),
-            maximum if maximum > 0 else -1, is_source_auto, candidates))
+            maximum if maximum > 0 else -1, is_source_auto, candidates,
+            bool(getattr(target, "allow_best_effort_minimum", False))))
     return tuple(result)
 
 
@@ -154,18 +203,22 @@ def apply_ability_cost_plan(state, side: str, plan: AbilityCostPlan) -> dict:
 def plan_ability_cost(costs, activation, *, current_resource: int,
                       charges: int, spell_points: int, health: int,
                       spell_uses: Mapping[str, int] | None = None,
-                      ability_key: str = "") -> AbilityCostPlan | None:
+                      ability_key: str = "",
+                      charge_modifier: int = 0) -> AbilityCostPlan | None:
     """Return an affordable payment plan, or ``None`` if it is unaffordable.
 
     ``activation`` carries the typed X value selected by the client.  The
     caller remains responsible for resolving ownership and non-numeric card
-    selections; those are separate typed cost requirements.
+    selections; those are separate typed cost requirements.  ``charge_modifier``
+    is the source card's ``ChargePointCostModifier`` (C#
+    ``Card.GetChargePointCostModifier``).
     """
     activation_cost = int(getattr(costs, "activation", 0) or 0)
     variable = int(getattr(costs, "variable_activation", 0) or 0)
     x_cost = int(getattr(activation, "x_cost", 0) or 0)
     resource = activation_cost + (x_cost if variable else 0)
-    charge = int(getattr(costs, "charge_points", 0) or 0)
+    charge = max(0, int(getattr(costs, "charge_points", 0) or 0)
+                 + int(charge_modifier or 0))
     spell = int(getattr(costs, "spell_points", 0) or 0)
     life = int(getattr(costs, "life", 0) or 0)
     uses = spell_uses or {}

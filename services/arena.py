@@ -11,6 +11,7 @@ import uuid
 
 from pve_db import (db_buyout_fra_tier_one, db_clear_fra_challengers,
                 db_create_fra_challengers,
+                db_claim_arena_rewards,
                 db_get_arena_fight_history, db_get_arena_state,
                 db_get_active_fra_challenges, db_get_fra_challenge,
                 db_get_fra_challengers,
@@ -18,7 +19,8 @@ from pve_db import (db_buyout_fra_tier_one, db_clear_fra_challengers,
                 db_champion_template_health,
                 db_prepare_fra_fight_challenge,
                 db_roll_fra_start_challenge,
-                db_store_fra_challenge_resolution, db_update_arena_state)
+                db_store_fra_challenge_resolution, db_update_arena_state,
+                _fra_transaction)
 from profile_db import db_card_instance_template, db_user_owns_deck
 from pvp_db import db_deck_cards_json
 from db import log_req as _log_req
@@ -106,11 +108,13 @@ def _mask_unfought_challenger(challenger, next_index):
 
 
 def _send_challenger_list(handler, target, instance, reqid, comp, session_id,
-                          conh, service_uid, log_prefix=""):
+                          conh, service_uid, log_prefix="", *,
+                          challengers=None, reveal_all=False):
     """Send the current roster projection to refresh ArenaClient's cache."""
     user_id = handler.user_profile["id"]
     arena = db_get_arena_state(user_id)
-    challengers = db_get_fra_challengers(user_id)
+    if challengers is None:
+        challengers = db_get_fra_challengers(user_id)
     if not challengers and arena["deck_id"]:
         challengers = db_create_fra_challengers(user_id)
     prefix = f"{log_prefix} " if log_prefix else ""
@@ -119,7 +123,8 @@ def _send_challenger_list(handler, target, instance, reqid, comp, session_id,
     next_index = int(arena.get("challenger_index", 0) or 0)
     public_challengers = []
     for item in challengers[:20]:
-        public = _mask_unfought_challenger(item, next_index)
+        public = dict(item) if reveal_all else _mask_unfought_challenger(
+            item, next_index)
         public_challengers.append({
             "id": public["id"], "deck": public["deck"],
             "name": public["name"], "boss": public["boss"],
@@ -143,6 +148,14 @@ def _arena_mc_challenge_fields(challenge):
         ("Body", "string", str(challenge.get(
             "dialogue_text", "") or challenge.get("objective_text", ""))),
     ]
+
+
+def _arena_objective_fields(challenge):
+    """Encode the challenge fields expected by UIBattle's objective panel."""
+    fields = _arena_mc_challenge_fields(challenge)
+    fields[-1] = ("Body", "string", str(
+        (challenge or {}).get("objective_text", "") or ""))
+    return fields
 
 
 def _arena_info_fields(arena):
@@ -188,11 +201,103 @@ def _arena_payload(user_id):
     return arena, challengers, current, current_fight, history
 
 
-def _challenge_for_fight(fight):
+def _challenge_for_fight(fight, conn=None):
     guid = str(fight.get("round_challenge", _ZERO_GUID) or _ZERO_GUID)
     if guid == _ZERO_GUID:
         return None
-    return db_get_fra_challenge(conversation_guid=guid)
+    return db_get_fra_challenge(conversation_guid=guid, conn=conn)
+
+
+def _fra_challenge_metadata(challenge):
+    """Decode the authored metadata used to distinguish challenge prompts."""
+    if not isinstance(challenge, dict):
+        return {}
+    try:
+        metadata = json.loads(challenge.get("metadata_json", "{}") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _is_fra_challenge_prompt(challenge):
+    """Whether *challenge* is a player-decidable FRA challenge prompt."""
+    return _fra_challenge_metadata(challenge).get("trigger") == "challenge"
+
+
+def _resolve_fra_challenge_response(challenge, *values):
+    """Normalize a wire ``ACCEPT`` or an authored answer into a response.
+
+    The client has no way to decline an MC challenge.  It sends ``ACCEPT``
+    when the player accepts; some clients and test tools expose the selected
+    conversation text instead, so only an exact, case-insensitive match to
+    the row's authored ``answer_text`` is accepted as well, and arbitrary
+    text cannot opt a player into a challenge.
+    """
+    answer_text = str((challenge or {}).get("answer_text", "") or "").strip()
+    for value in values:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value).strip()
+        if text.upper() == "ACCEPT":
+            return "ACCEPT"
+        if answer_text and text.casefold() == answer_text.casefold():
+            return "ACCEPT"
+    return ""
+
+
+def _record_fra_challenge_update(user_id, values):
+    """Resolve and persist one MC update while holding the FRA transaction."""
+    with _fra_transaction() as connection:
+        arena = db_get_arena_state(user_id, conn=connection)
+        index = int(arena.get("challenger_index", 0) or 0)
+        history = db_get_arena_fight_history(user_id, conn=connection)
+        if not 0 <= index < len(history):
+            return ""
+        fight = history[index]
+        challenge = _challenge_for_fight(fight, conn=connection)
+        if not _is_fra_challenge_prompt(challenge):
+            return ""
+        response = _resolve_fra_challenge_response(challenge, *values)
+        if not response:
+            return ""
+        current = str(fight.get("challenge_response", "NONE") or "NONE").upper()
+        if current != response:
+            fight["challenge_response"] = response
+            db_update_arena_state(
+                user_id, conn=connection, fight_history=json.dumps(history))
+        return response
+
+
+def record_fra_challenge_conversation_answer(user_id, conversation_guid):
+    """Treat completion of the authored answer as accepting its challenge.
+
+    The fixed client submits only ``ConversationId`` when the conversation
+    closes, so the server cannot receive the answer label itself.  Restrict
+    this path to the current row's authored challenge conversation; reward
+    and boss-notification conversations never become challenge acceptances.
+    """
+    challenge_guid = str(conversation_guid or "").strip()
+    if not challenge_guid:
+        return False
+    with _fra_transaction() as connection:
+        arena = db_get_arena_state(user_id, conn=connection)
+        index = int(arena.get("challenger_index", 0) or 0)
+        history = db_get_arena_fight_history(user_id, conn=connection)
+        if not 0 <= index < len(history):
+            return False
+        fight = history[index]
+        challenge = _challenge_for_fight(fight, conn=connection)
+        if (not _is_fra_challenge_prompt(challenge) or
+                not str(challenge.get("answer_text", "") or "").strip() or
+                str(challenge.get("conversation_guid", "")).casefold() !=
+                challenge_guid.casefold()):
+            return False
+        current = str(fight.get("challenge_response", "NONE") or "NONE").upper()
+        if current != "ACCEPT":
+            fight["challenge_response"] = "ACCEPT"
+            db_update_arena_state(
+                user_id, conn=connection, fight_history=json.dumps(history))
+        return True
 
 
 def _fallback_challenger(current_fight):
@@ -339,35 +444,66 @@ def _assign_deck(handler, target, instance, reqid, comp, session_id, conh,
 def _cash_out(handler, target, instance, reqid, comp, session_id, conh,
               service_uid):
     user_id = handler.user_profile["id"]
-    arena = db_get_arena_state(user_id)
-    gold = arena["gold_earned"]
+    result = db_claim_arena_rewards(user_id)
+    gold = int(result.get("gold", 0) or 0)
     _log_req(f">>> DoArenaCashOut (dt=10011): gold={gold}, "
-              f"chests={arena['chests_earned']}, sacks={arena['sacks_earned']}")
-    db_update_arena_state(
-        user_id, deck_id=0, wins=0, losses=0, challenger_index=0,
-        fight_history="[]",
-        gold_earned=0, chests_earned=0, sacks_earned=0)
-    db_clear_fra_challengers(user_id)
+             f"loot={len(result.get('loot', []))}, "
+             f"roster={len(result.get('challengers', []))}")
+    if not result.get("success"):
+        resp_inner = encode_objfmt_response(
+            ["Game.Client.Network.Campaign.DoArenaCashOutResponse",
+             "System.Boolean", "System.Int32", "System.String",
+             "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
+             "Reckoning.Campaign.Messages.Arena.ArenaReward", "System.UInt64",
+             "Game.Shared.ResourceId", "System.Guid",
+             "Game.Shared.Network.Campaign.EDoArenaCashOutError",
+             "System.Int32"],
+            [("Success", "bool", False), ("GoldWin", "int", 0),
+             ("AllLoot", "arenarewardlist", (
+                 "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
+                 0, [])),
+             ("Error", "enum1", (
+                 "Game.Shared.Network.Campaign.EDoArenaCashOutError",
+                 int(result.get("error", 2) or 2))),
+             ("ErrorMessage", "string", str(
+                 result.get("error_message", "Cash-out failed.") or
+                 "Cash-out failed."))])
+        size = _send_response(handler, 10011, resp_inner, comp, session_id,
+                              reqid, target, instance, conh, service_uid)
+        _log_req(f"    Sent DoArenaCashOut failure response ({size}b)")
+        return
+
+    # The summary window resolves every completed fight through ArenaClient's
+    # cached master list. Reveal the actual deck/name/boss values before the
+    # cash-out response invokes the summary callback; DestroyArenaData clears
+    # this transient cache only after the loot window has been shown.
+    _send_challenger_list(
+        handler, target, instance, 0, comp, session_id, conh, service_uid,
+        log_prefix="reveal", challengers=result.get("challengers", []),
+        reveal_all=True)
+    if gold and hasattr(handler, "push_currency_to_client"):
+        handler.push_currency_to_client(gold_delta=gold)
+        if isinstance(handler.user_profile, dict):
+            handler.user_profile["gold"] = int(
+                result.get("new_gold", handler.user_profile.get("gold", 0))
+                or 0)
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.DoArenaCashOutResponse",
          "System.Boolean", "System.Int32", "System.String",
          "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
          "Reckoning.Campaign.Messages.Arena.ArenaReward", "System.UInt64",
-         "System.String", "Game.Shared.Network.Campaign.EDoArenaCashOutError",
-         "System.Int32"],
+         "Game.Shared.ResourceId", "System.Guid",
+         "Game.Shared.Network.Campaign.EDoArenaCashOutError", "System.Int32"],
         [("Success", "bool", True), ("GoldWin", "int", gold),
-         ("AllLoot", "coll", (
+         ("AllLoot", "arenarewardlist", (
              "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
-             0, [])), ("Error", "int", 0), ("ErrorMessage", "string", "")])
+             len(result.get("loot", [])), result.get("loot", []))),
+         ("Error", "enum1", (
+             "Game.Shared.Network.Campaign.EDoArenaCashOutError", 0)),
+         ("ErrorMessage", "string", "")])
     size = _send_response(handler, 10011, resp_inner, comp, session_id,
                           reqid, target, instance, conh, service_uid)
     _log_req(f"    Sent DoArenaCashOut response ({size}b)")
-    # ArenaClient intentionally keeps m_AllFighters between lobby visits and
-    # only requests this list when it is empty.  Send an empty authoritative
-    # list after cash-out so the old run's portraits cannot be reused by the
-    # next run.
-    _send_challenger_list(handler, target, instance, 0, comp, session_id,
-                          conh, service_uid, log_prefix="clear")
 
 
 def _destroy_arena(handler, target, instance, reqid, comp, session_id, conh,
@@ -488,8 +624,20 @@ def _challenger_list(handler, target, instance, reqid, comp, session_id, conh,
 
 def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
                       conh, service_uid):
-    fight = _arena_payload(handler.user_profile["id"])[3]
+    user_id = int(handler.user_profile["id"])
+    fight = _arena_payload(user_id)[3]
     challenge = _challenge_for_fight(fight)
+    # During an Arena battle, the conversation sent with the game setup also
+    # raises UIEventShowObjectivePanel. UIBattle appends that event to its
+    # challenge list, and its reconnect path appends this response separately.
+    # Return an invalid challenge for that in-game lookup so the conversation
+    # remains the single source for both dialogue and objective text.
+    if (_has_active_fra_session(handler) and challenge and
+            _wire_guid(challenge.get("conversation_guid")) != _ZERO_GUID):
+        _log_req(
+            "    FRA challenge objective omitted from reconnect lookup; "
+            f"conversation supplies it ({challenge.get('challenge_name', 'unknown')})")
+        challenge = None
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.GetArenaMCChallengeResponse",
          "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge", "System.UInt64",
@@ -497,7 +645,7 @@ def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
          "Game.Shared.Network.Campaign.EGetArenaMCChallengeError", "System.Int32"],
         [("MCChallenge", "struct", (
             "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge",
-            _arena_mc_challenge_fields(challenge))),
+            _arena_objective_fields(challenge))),
          ("Error", "enum1", (
              "Game.Shared.Network.Campaign.EGetArenaMCChallengeError", 0)),
          ("ErrorMessage", "string", "")])
@@ -505,22 +653,60 @@ def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
                    target, instance, conh, service_uid)
 
 
-def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
-                     conh, service_uid):
-    user_id = handler.user_profile["id"]
+def _has_active_fra_session(handler):
+    """Whether a reconnect challenge lookup belongs to a live FRA battle."""
+    profile = getattr(handler, "user_profile", {}) or {}
+    player_ids = (
+        getattr(handler, "client_reck_id", None),
+        profile.get("id") if isinstance(profile, dict) else None,
+        getattr(handler, "client_uid", None),
+    )
+    try:
+        from game_session import find_session_by_player
+        from game_engine import ESessionFlags
+        seen = set()
+        for player_id in player_ids:
+            if player_id is None:
+                continue
+            try:
+                player_id = int(player_id)
+            except (TypeError, ValueError):
+                continue
+            if not player_id or player_id in seen:
+                continue
+            seen.add(player_id)
+            session = find_session_by_player(player_id)
+            if session is None or str(session.state or "").lower() == "ended":
+                continue
+            encounter_data = session.encounter_data or {}
+            raw_flags = encounter_data.get("SessionFlags", 0)
+            if isinstance(raw_flags, dict):
+                raw_flags = raw_flags.get("value__", 0)
+            if int(raw_flags or 0) & int(ESessionFlags.IsPvEArena):
+                return True
+        return False
+    except Exception as exc:
+        _log_req(f"    FRA reconnect challenge lookup session check failed: {exc}")
+        return False
+
+
+def get_battle_modifications(user_id):
+    """Return the saved FRA challenge and round-zero mods for battle setup.
+
+    The fixed client only requests GetArenaBattleMods when reconnecting. Live
+    encounters therefore call this shared lookup from authoritative setup;
+    the network handler below only serializes the same result for compatible
+    clients.
+    """
     arena, _challengers, challenger, fight, history = _arena_payload(user_id)
     challenger_index = int(arena.get("challenger_index", 0) or 0)
     active_challenges = db_get_active_fra_challenges(
         user_id, fight_index=challenger_index)
     modifications = []
-    declined = str(fight.get("challenge_response", "NONE")).upper() == "DECLINE"
     for challenge in active_challenges:
-        try:
-            metadata = json.loads(challenge.get("metadata_json", "{}") or "{}")
-        except (TypeError, ValueError):
-            metadata = {}
+        metadata = _fra_challenge_metadata(challenge)
         if metadata.get("opponent_scope") == "TierOne":
-            if (declined or challenger_index != 0
+            if (challenger_index != 0
                     or challenge.get("challenge_key") != "starting_health_15"):
                 continue
             adjustment = int(metadata.get("health_adjustment", 0) or 0)
@@ -536,17 +722,30 @@ def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
                 "target_player": 0,
             })
             continue
-        # A paired boss notification is the already-earned elite reward. It
-        # announces the boss modification, but declining an ordinary round
-        # challenge must not void that reward.
-        if declined and metadata.get("trigger") != "notification":
-            continue
         for descriptor in _fra_challenge_mod_descriptors(
                 user_id, arena, fight, history, challenge):
             modification = _encode_fra_challenge_mod(
                 descriptor, challenge["conversation_guid"])
             if modification:
                 modifications.append(modification)
+    challenge = _challenge_for_fight(fight)
+    return {
+        "arena": arena,
+        "challenger": challenger,
+        "fight": fight,
+        "history": history,
+        "challenge": challenge,
+        "active_challenges": active_challenges,
+        "modifications": modifications,
+    }
+
+
+def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
+                     conh, service_uid):
+    user_id = handler.user_profile["id"]
+    setup = get_battle_modifications(user_id)
+    active_challenges = setup["active_challenges"]
+    modifications = setup["modifications"]
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.GetArenaBattleModsResponse",
          "System.Collections.Generic.List`1#Reckoning.Game.EncounterModBase",
@@ -683,26 +882,26 @@ def _encode_fra_challenge_mod(descriptor, conversation_guid):
 
 def _update_mc_challenge(handler, target, instance, reqid, comp, session_id,
                          conh, inner_obj, service_uid):
-    """Persist the player's ACCEPT/DECLINE decision for the current fight."""
+    """Persist the fire-and-forget ACCEPT decision for this fight.
+
+    The fixed client's CampaignService does not register an inbound handler
+    for response type 10019, so replying with that type is rejected as an
+    unknown command.
+    """
     user_id = handler.user_profile["id"]
-    response = inner_obj.get("EncounterData", {}) if isinstance(inner_obj, dict) else {}
-    response = response.get("ChallengeResponse", "") if isinstance(response, dict) else ""
-    response = str(response or "").upper()
-    if response in {"ACCEPT", "DECLINE"}:
-        arena = db_get_arena_state(user_id)
-        index = int(arena.get("challenger_index", 0) or 0)
-        history = db_get_arena_fight_history(user_id)
-        if index < len(history) and _challenge_for_fight(history[index]):
-            history[index]["challenge_response"] = response
-            db_update_arena_state(user_id, fight_history=json.dumps(history))
-    resp_inner = encode_objfmt_response(
-        ["Game.Client.Network.Campaign.UpdateMCChallengeResponse",
-         "Game.Shared.Network.Campaign.EUpdateMCChallengeError", "System.Int32"],
-        [("Error", "enum1", (
-            "Game.Shared.Network.Campaign.EUpdateMCChallengeError", 0)),
-         ("ErrorMessage", "string", "")])
-    _send_response(handler, 10019, resp_inner, comp, session_id, reqid,
-                   target, instance, conh, service_uid)
+    encounter = inner_obj.get("EncounterData", {}) if isinstance(inner_obj, dict) else {}
+    values = []
+    if isinstance(encounter, dict):
+        values.extend(encounter.get(key) for key in (
+            "ChallengeResponse", "AnswerText", "answer_text",
+            "SelectedAnswer", "Choice", "SelectedChoice"))
+    if isinstance(inner_obj, dict):
+        values.extend(inner_obj.get(key) for key in (
+            "ChallengeResponse", "AnswerText", "answer_text",
+            "SelectedAnswer", "Choice", "SelectedChoice"))
+    response = _record_fra_challenge_update(user_id, values)
+    _log_req(f">>> UpdateMCChallenge (dt=10019): "
+             f"decision={response or 'unchanged'}")
 
 
 def _buyout(handler, target, instance, reqid, comp, session_id, conh,

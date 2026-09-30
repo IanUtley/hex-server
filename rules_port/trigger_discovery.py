@@ -33,6 +33,11 @@ def ability_matches_keyword(ability_guid, keyword):
         return False
     if key == "momentum":
         return "CardInspiredEvent" in str(graph.trigger_event_type or "")
+    if key == "deploy":
+        # ActivateTriggered's m_Keyword "Deploy" manually triggers the card's
+        # authored AsEntersPlay abilities (Daybloom, "Trigger the Deploy of
+        # that troop").
+        return "AsEntersPlayEvent" in str(graph.trigger_event_type or "")
     if key != "deathcry":
         return False
     try:

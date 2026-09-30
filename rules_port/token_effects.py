@@ -24,65 +24,6 @@ def _publish_created_card(context, card_uid, owner_id, card_type):
         context, "CardCreatedEvent", int(card_uid), int(owner_id or 0))
 
 
-def _random_socket_gems(template_guid, connection):
-    """Build the client's positional gem bitfield for a generated card.
-
-    CardTemplate.m_SocketCount is only the total.  The authoritative minor /
-    major split is the authored ``SOCKETABLE MINOR/MAJOR`` text, which the
-    client turns into GetMinorSocketCount/GetMajorSocketCount.  Major slots
-    accept either gem class; minor slots accept only minor gems.
-    """
-    from gamedata import DEFAULT_RECORD_STORE
-
-    card = DEFAULT_RECORD_STORE.get("CardTemplate", str(template_guid))
-    game_text = str(card.field("m_GameText", "") or "").lower() \
-        if card is not None else ""
-    major_count = game_text.count("socketable major")
-    minor_count = game_text.count("socketable minor")
-    columns = {row[1] for row in connection.execute(
-        "PRAGMA table_info(card_templates)").fetchall()}
-    socket_expr = "socket_count" if "socket_count" in columns else "0"
-    row = connection.execute(
-        "SELECT " + socket_expr + " FROM card_templates WHERE guid=?",
-        (str(template_guid).lower(),)).fetchone()
-    socket_count = int(row[0] or 0) if row else 0
-    if socket_count <= 0:
-        return 0
-    # A few old/equipment records have only the total count. Treat those as
-    # minor-only, which is the safe compatibility direction.
-    if major_count + minor_count == 0:
-        minor_count = socket_count
-    total = min(socket_count, major_count + minor_count)
-    gem_rows = connection.execute(
-        "SELECT gem_type, gem_type_name FROM gem_templates WHERE gem_type > 0"
-    ).fetchall()
-    major = [int(r[0]) for r in gem_rows
-             if "_major" in str(r[1] or "").lower()]
-    minor = [int(r[0]) for r in gem_rows
-             if "_minor" in str(r[1] or "").lower()]
-    if not major or not minor:
-        return 0
-    packed = 1 << 62  # EGemTypesNew.Unknown / GemFormatBit
-    position = 0
-    # Fill major positions first, but choose from both pools.  This allows a
-    # minor gem in a major slot while preserving the client's positional
-    # layout; only the subsequent minor-only positions are restricted.
-    available = major + minor
-    for gem_type in random.sample(available, min(major_count, len(available))):
-        packed |= int(gem_type) << (position * 10)
-        position += 1
-        available.remove(gem_type)
-    remaining_minor = [gem_type for gem_type in minor
-                       if gem_type in available]
-    for gem_type in random.sample(remaining_minor,
-                                  min(minor_count, len(remaining_minor))):
-        if position >= total:
-            break
-        packed |= int(gem_type) << (position * 10)
-        position += 1
-    return packed
-
-
 def _tac_flag(context, name):
     """Return a boolean Template Attribute Collection flag on the effect."""
     raw = context.template_value("m_SerializedTAC", None)
@@ -135,8 +76,9 @@ def create_matching_target(context, target, count, collection,
             source_uid=int(target), player=responsible)
     if not pool:
         return 0
-    location = {"hand": "hand", "deck": "deck", "underground": "underground",
-                "void": "void", "warzone": "warzone"}.get(
+    location = {"hand": "hand", "deck": "deck", "discard": "discard",
+                "underground": "underground", "void": "void",
+                "warzone": "warzone"}.get(
                     str(collection or "warzone").lower(), "warzone")
     from .runtime_helpers import (card_collection_for_location,
                                   next_game_card_uid, owner_uid)
@@ -161,7 +103,7 @@ def create_matching_target(context, target, count, collection,
                 db_next_game_card_row_id(
                     context.session.session_id, conn=context.db),
                 conn=context.db, owner_user_id=owner_id,
-                original_template_guid=template_guid, gems=0)
+                original_template_guid=template_guid)
             made.append((int(uid), template_guid, payload[0]))
     # C# MoveCardWithDispatch -> FinishMovingCard places a card moved into the
     # deck at ``RNG.Next(deck_count + 1)`` when its location is Unknown: the
@@ -620,8 +562,8 @@ def summon_token(context, payload=None):
         "m_CardCollection", payload.get("collection", "Warzone")) or
         "Warzone").rsplit(".", 1)[-1].lower()
     location = {"deck": "deck", "hand": "hand", "choosing": "choosing",
-                "underground": "underground", "void": "void"}.get(
-                    collection, "warzone")
+                "discard": "discard", "underground": "underground",
+                "void": "void"}.get(collection, "warzone")
     deck_location = str(context.template_value(
         "m_CardLocation", "") or "").rsplit(".", 1)[-1].lower()
     card_filter = payload.get("card_filter")
@@ -721,6 +663,27 @@ def summon_token(context, payload=None):
         source_uid = context.bstate.get("resolving_source_uid")
         if source_uid is not None:
             conscript_thresholds = context._card_thresholds(int(source_uid))
+    copy_gems = context.template_value("m_CopyGems", False)
+    try:
+        copy_gems = bool(int(copy_gems or 0))
+    except (TypeError, ValueError):
+        copy_gems = False
+    copied_gems = None
+    if copy_gems:
+        source_uid = context.bstate.get("resolving_source_uid")
+        if source_uid is not None:
+            from pvp_db import db_card_gem_type
+            source_gems = db_card_gem_type(
+                context.session.session_id, int(source_uid), conn=context.db)
+            try:
+                source_gems = int(source_gems or 0)
+            except (TypeError, ValueError):
+                source_gems = 0
+            # A copied zero is still an unfilled socket when the destination
+            # is socketable; let db_insert_generated_card supply the format
+            # marker rather than persisting legacy-format zero.
+            if source_gems:
+                copied_gems = source_gems
     made = []
     if selected_guids is None:
         # An explicit template amount gets its creation bonus once, exactly
@@ -744,7 +707,6 @@ def summon_token(context, payload=None):
         if not create_template:
             continue
         uid = next_game_card_uid(context.db, context.session.session_id)
-        gem_type = _random_socket_gems(create_guid, context.db)
         if location == "deck":
             if deck_location in ("bottom",):
                 position = __import__("pvp_db").db_deck_next_position(
@@ -758,12 +720,19 @@ def summon_token(context, payload=None):
                 position = 9999
         else:
             position = 0
+        token_state = 0
+        if location == "warzone":
+            from .static_rules import opposing_enters_play_exhausted
+            if opposing_enters_play_exhausted(
+                    context.bstate, owner, create_guid):
+                token_state = int(game_engine.ECardStates.Tapped)
         db_insert_generated_card(
             context.session.session_id, owner, uid, create_guid, location,
             create_template[0], create_template[1], create_template[2],
             db_next_game_card_row_id(context.session.session_id, conn=context.db),
             conn=context.db, position=position, owner_user_id=owner,
-            original_template_guid=create_guid, gems=gem_type)
+            original_template_guid=create_guid, gems=copied_gems,
+            card_state=token_state)
         if conscript_thresholds is not None:
             # ConscriptModifierAbility is a client built-in CardThreshold
             # effect with CopySourceCard=true. Persist its eventual result in
@@ -894,7 +863,13 @@ def create_token_copy(context):
             "RulesPort CreateTokenCopy effect is missing typed destination metadata")
     if context.bstate.get("choice_copy_to_hand"):
         destination = "hand"
-    location = "hand" if destination == "hand" else "warzone"
+    # C# CreateTokenCopies creates the copy directly into m_CardCollection.
+    # Mapping only hand->hand silently put deck copies ("copies into their
+    # deck": Myrym/Jovial Pippit/Monk of the Six Strikes) and crypt copies
+    # into the warzone.
+    location = {"hand": "hand", "deck": "deck", "discard": "discard",
+                "void": "void", "underground": "underground",
+                "choosing": "choosing"}.get(destination, "warzone")
     payload = db_copy_template_payload(row[0], conn=context.db)
     if not payload:
         return "copy: target template payload missing"
@@ -910,8 +885,14 @@ def create_token_copy(context):
     created = []
     is_replica = bool(context.template_value("m_IsReplica", False))
     from pvp_db import db_card_gem_type
-    source_gem = int(db_card_gem_type(
-        context.session.session_id, int(target), conn=context.db) or 0)
+    source_gem = db_card_gem_type(
+        context.session.session_id, int(target), conn=context.db)
+    try:
+        source_gem = int(source_gem or 0)
+    except (TypeError, ValueError):
+        source_gem = 0
+    if not source_gem:
+        source_gem = None
     for _ in range(count):
         uid = next_game_card_uid(context.db, context.session.session_id)
         db_insert_generated_card(
@@ -919,20 +900,25 @@ def create_token_copy(context):
             payload[0], payload[1], payload[2],
             db_next_game_card_row_id(context.session.session_id, conn=context.db),
             conn=context.db, gems=source_gem)
+        replica_type = None
+        replica_subtype = ""
         if is_replica:
-            from .replica import apply_replica_mods
+            from .replica import apply_replica_mods, replica_projection
             apply_replica_mods(context, uid, row[0])
+            replica_type, replica_subtype = replica_projection(
+                context.db, context.session.session_id, uid)
         scid = game_engine.SessionCardId(game_engine.UID(uid))
         _tpl, card_type, _name, cost, attack, defense, _gems = \
             context.handler._card_full_data(context.game, scid, row[0])
-        collection = (game_engine.ECardCollections.Hand if location == "hand"
-                      else game_engine.ECardCollections.Warzone)
+        from .runtime_helpers import card_collection_for_location
+        collection = card_collection_for_location(location)
         context.game.push_card_moved(scid, recipient, collection,
                                      game_engine.ECardLocations.Top, 1)
         context.game.push_card_updated(
-            scid, recipient, collection, card_type, template_id=row[0],
-            cost=cost, attack=attack, defense=defense, gems=source_gem,
-            nulling=False)
+            scid, recipient, collection, replica_type or card_type,
+            template_id=row[0], cost=cost, attack=attack, defense=defense,
+            gems=_gems, nulling=False,
+            **({"sub_type": replica_subtype} if replica_subtype else {}))
         created.append(uid)
     context.db.commit()
     for uid in created:
@@ -940,4 +926,4 @@ def create_token_copy(context):
         from .triggers import dispatch_trigger
         dispatch_trigger(context, "CardEnteredZoneEvent", uid, owner_id,
                          data={"event_destination_collection": location})
-    return f"copied {len(created)}x {row[0][:8]} {'to hand' if location == 'hand' else 'to warzone'}"
+    return f"copied {len(created)}x {row[0][:8]} to {location}"

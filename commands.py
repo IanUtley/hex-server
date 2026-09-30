@@ -4,8 +4,11 @@ All commands receive the handler instance (self) for DB access, event sending, e
 """
 import struct as _struct
 import json as _json
+import os as _os
+import re as _re
 import sys as _sys
 from pathlib import Path as _Path
+from urllib.parse import urlencode as _urlencode
 
 import game_engine
 import game_session
@@ -13,6 +16,8 @@ import hconnect_server
 import encoder
 import campaign
 from encoder import encode_datawrapper, compress_gzip, encode_sync_event
+from db import (get_log_level, latest_session_log_path_for_players,
+                player_log_path, session_log_path)
 
 
 def reload_runtime_modules():
@@ -157,11 +162,369 @@ def _account_cleanup_command(handler):
     handler.user_profile.update({
         "gold": 10000, "platinum": 10000, "experience": 0,
         "level": 1, "flags": "{}"})
-    return "Account reset to new-player state"
+    return "Account reset (PvE and alt-art cards kept)"
+
+
+_ERROR_LOG_PATHS = (
+    _Path("/tmp/hconnect_log.txt"),
+    _Path("/tmp/hconnect_requests.log"),
+)
+_ERROR_LINE_RE = _re.compile(
+    r"(?:\b(?:error|exception|traceback|failed|failure)\b|"
+    r"[A-Za-z]+(?:Error|Exception))",
+    _re.IGNORECASE,
+)
+_LOG_TIME_RE = _re.compile(r"^\[(?P<time>\d{2}:\d{2}:\d{2})\]\s*(?P<msg>.*)$")
+_ERROR_LOG_TAIL_BYTES = 256 * 1024
+_ERROR_MESSAGE_LIMIT = 900
+# The issue body can carry the complete bounded report; keep enough context to
+# diagnose a multi-step failure without attaching the whole session log.
+_SESSION_LOG_TAIL_LINES = 32
+_SESSION_LOG_LINE_LIMIT = 360
+_SESSION_PENDING_KEYS = (
+    "pending_choice", "pending_trigger", "pending_deck_search",
+    "pending_conversation", "pending_discard_ability",
+    "pending_discard_continuation", "resolution_paused",
+)
+
+
+def _read_log_tail(path):
+    """Read the end of a server log without loading an unbounded file."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, _os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - _ERROR_LOG_TAIL_BYTES)
+            stream.seek(start)
+            data = stream.read()
+    except OSError:
+        return []
+
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    # A tail that starts in the middle of a line cannot be trusted as a
+    # complete log entry.  Drop that partial line, but retain all lines when
+    # the whole file fit in the bounded read.
+    if start:
+        lines = lines[1:]
+    return lines
+
+
+def _log_entries(lines):
+    """Group timestamped log lines with their continuation lines."""
+    entries = []
+    current = None
+    for line in lines:
+        match = _LOG_TIME_RE.match(line)
+        if match:
+            if current is not None:
+                entries.append(current)
+            current = [match.group("time"), [match.group("msg").strip()]]
+        elif current is not None:
+            # ``log_req`` can receive a traceback, so its continuation lines
+            # have no timestamp of their own. Keep them attached to the
+            # timestamped entry for a useful issue report.
+            continuation = line.strip()
+            if continuation:
+                current[1].append(continuation)
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
+def _latest_error_from_lines(lines):
+    """Return ``(timestamp, message)`` for the newest error in *lines*."""
+    for timestamp, message_lines in reversed(_log_entries(lines)):
+        message = " ".join(line for line in message_lines if line)
+        if message and _ERROR_LINE_RE.search(message):
+            return timestamp, message
+    return None
+
+
+def _last_error_from_logs():
+    """Return ``(timestamp, message)`` for the newest logged error.
+
+    ``hconnect_log.txt`` contains normal server stdout/stderr, while
+    ``hconnect_requests.log`` is the structured request log used by
+    ``log_req``.  The former is preferred because it also contains errors
+    written through the plain ``log`` helper; the latter keeps the command
+    useful if stdout logging was redirected or rotated independently.
+    """
+    for path in _ERROR_LOG_PATHS:
+        error = _latest_error_from_lines(_read_log_tail(path))
+        if error is not None:
+            return error
+    return None
+
+
+def _chat_safe_error_message(message):
+    """Flatten and neutralize log markup before sending it through chat."""
+    message = " ".join(str(message).split())
+    # ChatManager interprets square brackets as client markup.  An exception
+    # should be copy/pasteable text, not a malformed link or formatting tag.
+    message = message.replace("[", "(").replace("]", ")")
+    if len(message) > _ERROR_MESSAGE_LIMIT:
+        message = message[:_ERROR_MESSAGE_LIMIT - 3].rstrip() + "..."
+    return message
+
+
+def _issue_player_tokens(handler):
+    """Return stable and protocol player tokens used in session filenames."""
+    profile = getattr(handler, "user_profile", None) or {}
+    values = [profile.get("id"), getattr(handler, "client_reck_id", None)]
+    values.extend(getattr(handler, "_log_session_players", ()) or ())
+    tokens = []
+    for value in values:
+        if value is None:
+            continue
+        token = str(value).strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _session_log_path_for_issue(session_id=None, player_tokens=()):
+    """Find the newest session log for a player, optionally by session ID."""
+    if player_tokens:
+        path = latest_session_log_path_for_players(
+            player_tokens, session_id=session_id)
+        if path is not None:
+            return path
+        # If the active session has not emitted a file yet, still provide the
+        # last completed game rather than dropping the game-history section.
+        if session_id is not None:
+            path = latest_session_log_path_for_players(player_tokens)
+            if path is not None:
+                return path
+    return session_log_path(session_id) if session_id is not None else None
+
+
+def _player_log_tail(handler):
+    """Return the bounded tail of the caller's cross-session log."""
+    profile = getattr(handler, "user_profile", None) or {}
+    path = player_log_path(profile.get("id"))
+    if path is None:
+        return []
+    return _read_log_tail(path)[-_SESSION_LOG_TAIL_LINES:]
+
+
+def _session_log_tail(session_id=None, player_tokens=()):
+    """Return a bounded tail for the newest matching game-session log."""
+    path = _session_log_path_for_issue(session_id, player_tokens)
+    if path is None:
+        return []
+    return _read_log_tail(path)[-_SESSION_LOG_TAIL_LINES:]
+
+
+def _session_log_display_name(path):
+    """Show a session log name without exposing participant IDs in a report."""
+    if not path:
+        return "selected session log"
+    name = _os.path.basename(path)
+    if name.startswith("session-"):
+        session_token = name[len("session-"):].split("-p", 1)[0]
+        return f"session-{session_token}.log"
+    return "selected session log"
+
+
+def _handler_game_session(handler):
+    """Find the caller's active session, preferring the persisted DB view."""
+    active = getattr(handler, "_active_game_session", None)
+    try:
+        reck_id = getattr(handler, "client_reck_id", None)
+        if reck_id is not None:
+            player_uid = encoder.make_uid(
+                hconnect_server.UID_TYPE["ServicePlayer"], int(reck_id))
+            session = game_session.find_session_by_player(player_uid)
+            if session is not None:
+                return session
+    except Exception:
+        pass
+    return active
+
+
+def _display_diagnostic_value(value):
+    """Make enum-like state values compact and safe for chat output."""
+    if value is None:
+        return "-"
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    return str(value).replace("ETurnPhases.", "")
+
+
+def _session_diagnostic_lines(handler, session):
+    """Build a small state snapshot useful for diagnosing a remote game."""
+    state = getattr(session, "turn_order", {})
+    engine = None
+    try:
+        checkpoint_engine = getattr(handler, "_checkpoint_engine", None)
+        if callable(checkpoint_engine):
+            engine = checkpoint_engine(session)
+            state = engine.load_state(session)
+    except Exception:
+        # The log tail is still useful when the checkpoint itself is damaged.
+        state = getattr(session, "turn_order", {})
+    if not isinstance(state, dict):
+        state = {}
+
+    phase = state.get("phase")
+    if phase is None and engine is not None:
+        try:
+            phase = engine.current_phase(state)
+        except Exception:
+            phase = None
+
+    priority = state.get("priority_pid", state.get("priority_player_id"))
+    chain_count = len(state.get("stack") or [])
+    top_description = "-"
+    port = getattr(session, "_rules_port_session", None)
+    action_stack = getattr(port, "action_stack", None)
+    if action_stack is not None:
+        try:
+            chain_count = int(action_stack.count)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        priority = getattr(action_stack, "priority_player_id", priority)
+        try:
+            action = action_stack.peek()
+            if action is not None:
+                top_description = type(action).__name__
+        except Exception:
+            pass
+    if top_description == "-" and state.get("stack"):
+        top = state["stack"][-1]
+        if isinstance(top, dict):
+            top_description = (str(top.get("kind") or "item") + ":" +
+                               str(top.get("ability_guid") or
+                                   top.get("source_uid") or "?"))
+        else:
+            top_description = type(top).__name__
+
+    pending = [key for key in _SESSION_PENDING_KEYS if state.get(key)]
+    if getattr(port, "pending_activation", None):
+        pending.append("native_activation")
+    engine_name = type(engine).__name__ if engine is not None else "unknown"
+    return [
+        f"Server: version={_version_command()} log_level={get_log_level()}",
+        "Session diagnostics: "
+        f"id={getattr(session, 'session_id', '-')} "
+        f"name={getattr(session, 'session_name', '-') or '-'} "
+        f"state={getattr(session, 'state', '-') or '-'}",
+        "Game state: "
+        f"engine={engine_name} phase={_display_diagnostic_value(phase)} "
+        f"phase_idx={state.get('phase_idx', '-')} "
+        f"turn={state.get('turn_number', state.get('turn', '-'))} "
+        f"turn_player={_display_diagnostic_value(state.get('turn_player', state.get('turn_pid')))} "
+        f"priority={_display_diagnostic_value(priority)} "
+        f"chain={chain_count} top={top_description} "
+        f"pending={','.join(pending) if pending else '-'} "
+        f"seed={getattr(session, 'seed_z', '-')}:{getattr(session, 'seed_w', '-')}",
+    ]
+
+
+def _error_report(handler):
+    """Return player and latest-game diagnostics for an issue report."""
+    session = _handler_game_session(handler)
+    player_tokens = _issue_player_tokens(handler)
+    session_id = getattr(session, "session_id", None) if session else None
+    player_lines = _player_log_tail(handler)
+    session_lines = _session_log_tail(session_id, player_tokens)
+    if player_lines or session_lines:
+        if session is not None:
+            report = _session_diagnostic_lines(handler, session)
+        else:
+            report = [
+                f"Server: version={_version_command()} log_level={get_log_level()}",
+                "Player diagnostics: authenticated profile",
+            ]
+        if player_lines:
+            report.append("Recent player log:")
+            report.extend(player_lines)
+        if session_lines:
+            session_path = _session_log_path_for_issue(
+                session_id, player_tokens)
+            report.append(
+                "Recent game log: "
+                f"{_session_log_display_name(session_path)}")
+            report.extend(session_lines)
+        safe_lines = []
+        for line in report:
+            safe = _chat_safe_error_message(line)
+            if len(safe) > _SESSION_LOG_LINE_LIMIT:
+                safe = safe[:_SESSION_LOG_LINE_LIMIT - 3].rstrip() + "..."
+            safe_lines.append(safe)
+        return "\n".join(safe_lines)
+
+    error = _last_error_from_logs()
+    if error is None:
+        return "No server error found in the log"
+
+    timestamp, message = error
+    session_suffix = (f" session={session.session_id}"
+                      if session is not None else "")
+    return (f"Last server error{session_suffix} {timestamp}: "
+            f"{_chat_safe_error_message(message)}")
+
+
+_GITHUB_ISSUE_URL = "HTTPS://github.com/IanUtley/hex-server/issues/new"
+# Keep the generated link below common browser/proxy request-line limits. The
+# report is still bounded by _error_report; this only truncates unusually long
+# tails after the complete URL has been assembled and measured.
+_GITHUB_ISSUE_URL_LIMIT = 7500
+_GITHUB_ISSUE_TITLE_LIMIT = 256
+
+
+def _github_issue_url(title, report):
+    """Build a prefilled GitHub issue URL with a bounded diagnostics body."""
+    body_prefix = "Session diagnostics collected by the Hex server:\n\n```text\n"
+    body_suffix = "\n```"
+    truncation_note = "\n\n[diagnostics truncated to fit the issue link]"
+
+    def build(report_text):
+        # A log line can contain Markdown fences. Neutralize them so the
+        # submitted issue keeps the whole report inside its diagnostics block.
+        safe_report = str(report_text).replace("```", "``\u200b`")
+        body = body_prefix + safe_report + body_suffix
+        query = _urlencode({"title": title, "body": body})
+        return f"{_GITHUB_ISSUE_URL}?{query}"
+
+    issue_url = build(report)
+    if len(issue_url) <= _GITHUB_ISSUE_URL_LIMIT:
+        return issue_url
+
+    # Find the largest report prefix that still produces a usable link. This
+    # measures the encoded URL, rather than guessing from raw character count.
+    low, high = 0, len(str(report))
+    report_text = str(report)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = build(report_text[:midpoint].rstrip() + truncation_note)
+        if len(candidate) <= _GITHUB_ISSUE_URL_LIMIT:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return build(report_text[:low].rstrip() + truncation_note)
+
+
+def _issue_command(handler, title):
+    """Open a prefilled GitHub issue form for the caller's session."""
+    title = str(title or "").strip()
+    if not title:
+        return "Usage: !issue <title>"
+    title = f"[{_version_command()}] {title}"
+    if len(title) > _GITHUB_ISSUE_TITLE_LIMIT:
+        title = title[:_GITHUB_ISSUE_TITLE_LIMIT - 3].rstrip() + "..."
+
+    issue_url = _github_issue_url(title, _error_report(handler))
+    # The fixed label avoids putting user-controlled markup in the chat link.
+    return ("Click the link below to open the prefilled GitHub issue; "
+            "review the title and diagnostics before submitting: "
+            f"[url={issue_url}]Open GitHub issue[/url]")
 
 
 def _public_help_command():
-    return "Available commands: !help, !version, !arena-cleanup, !account-cleanup"
+    return ("Available commands: !help, !commands, !version, !arena-cleanup, "
+            "!account-cleanup, !issue <title>")
 
 
 def _full_help_lines():
@@ -170,8 +533,14 @@ def _full_help_lines():
         "=== Commands ===",
         "!version — show the server version",
         "!arena-cleanup — clear your Frost Ring Arena run",
+        "!account-cleanup — reset your account, keeping PvE and alt-art cards",
+        "!issue <title> — open a prefilled GitHub issue with session diagnostics",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
+        "!encounter <name> — start a named campaign encounter",
+        "!challenge [opponent] — create a duel challenge",
+        "!reload — reload runtime modules",
         "!hand — list cards in hand (name [id])",
+        "!aihand — reveal the AI hand",
         "!playable [id|name ...] — set golden outlines (no args = all)",
         "!gencard <name> — generate a copy of a card template to your hand",
         "!addcard <name|id> — draw the next copy of that card from your deck",
@@ -183,13 +552,14 @@ def _full_help_lines():
         "!pass — advance turn phase",
         "!phase <Name> — jump to phase",
         "!draw N — draw N cards",
+        "!discard — discard a random card from your hand",
         "!top <id|name> — put a card from your hand on top of your deck",
         "!zones — list cards by zone",
         "!move <id> <zone> — move card to zone",
         "!state <id> <flags> — set card state (Tapped|Attacking|...)",
-        "!attr <id> <flags> — set card attributes (Flight|Speed|...)",
+        "!attr/!attributes <id> <flags> — set card attributes (Flight|Speed|...)",
         "!update <id> — resend CardUpdated for a card",
-        "!help — this list",
+        "!help / !commands — this list",
     ]
 
 
@@ -208,13 +578,17 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
             return _account_cleanup_command(handler)
         except Exception as exc:
             return f"Error: {exc}"
-    if action == "help" and "allowcon" not in getattr(
+    if action == "issue":
+        raw_command = cmd.strip()
+        title = raw_command[len(parts[0]):].strip() if parts else ""
+        return _issue_command(handler, title)
+    if action in ("help", "commands") and "allowcon" not in getattr(
             hconnect_server, "PROFILE_FEATURE_FLAGS", ()):
         return _public_help_command()
     # Help is informational and must remain available from chat while the
     # client is on the panorama.  It should not fall through to the active
     # game/session gate used by state-mutating debug commands.
-    if action == "help":
+    if action in ("help", "commands"):
         return "\n".join(_full_help_lines())
     # The profile flag controls both the client's console UI and the server
     # endpoint.  Do not rely on the client hiding the backtick console: a
@@ -224,7 +598,7 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if not parts:
         return ("Commands: !version !arena-cleanup !help !game_end !encounter !hand !zones !playable !gencard "
                 "!update !threshold !resource !pass !phase !draw !discard "
-                "!addcard !top")
+                "!addcard !top !issue <title>")
 
     # Accept both the historical ``!command`` spelling and the slash spelling
     # used by the in-client developer console.  Keep the canonical command
@@ -386,24 +760,40 @@ def _cmd_game_end(handler, args):
     session = game_session.find_session_by_player(player_uid)
     if session:
         try:
-            _push_battle_game_end(handler, session, won)
-            out.append(f"GameEnded pushed to session {session.session_id} ({result})")
-
-            # Campaign battles need the complete result path: it applies
-            # authored rewards, advances quest state, sends gameendnotify,
-            # and removes the finished session/cards.  Sending only the
-            # lightweight campaign notification leaves an encounter's
-            # autostart state active, so the client immediately launches it
-            # again after returning to the map.
-            if str(session.session_name or "").startswith("camp_"):
-                campaign_handled = True
-                handled = campaign.handle_battle_gameend(
-                    handler, db, session, won,
-                    hconnect_server.SERVICE_MAIL_UID,
-                    hconnect_server.UID_TYPE["ServiceCampaign"])
+            # ArenaClient immediately joins the lobby after GameEnded.  Commit
+            # the FRA result first so that JoinCampaignArena cannot observe the
+            # pre-result challenger index and return the same fight.  Reward
+            # conversations remain deferred until after GameEnded so the
+            # Arena UI is subscribed when it receives them.
+            prepared = campaign.prepare_fra_battle_gameend(
+                handler, db, session, won)
+            if prepared is not None:
+                fra_handled = bool(prepared.get("handled"))
+                _push_battle_game_end(handler, session, won)
                 out.append(
-                    "Campaign battle result applied"
-                    if handled else "Campaign battle result was not applied")
+                    f"GameEnded pushed to session {session.session_id} ({result})")
+                campaign.publish_fra_battle_gameend(
+                    handler, prepared, hconnect_server.SERVICE_MAIL_UID)
+                out.append(
+                    "FRA battle result applied"
+                    if fra_handled else "FRA battle result was not applied")
+            else:
+                _push_battle_game_end(handler, session, won)
+                out.append(
+                    f"GameEnded pushed to session {session.session_id} ({result})")
+
+                # Non-FRA campaign battles need the complete result path: it
+                # applies authored rewards, advances quest state, sends
+                # gameendnotify, and removes the finished session/cards.
+                if str(session.session_name or "").startswith("camp_"):
+                    campaign_handled = True
+                    handled = campaign.handle_battle_gameend(
+                        handler, db, session, won,
+                        hconnect_server.SERVICE_MAIL_UID,
+                        hconnect_server.UID_TYPE["ServiceCampaign"])
+                    out.append(
+                        "Campaign battle result applied"
+                        if handled else "Campaign battle result was not applied")
         except Exception as e:
             out.append(f"GameEnded error: {e}")
     else:

@@ -72,7 +72,13 @@ def notify_new_mail(user_id):
     server = _server_module()
     if server is None:
         return
-    for handler, _last_active in list(server._active_clients.get(int(user_id), [])):
+    lock = getattr(server, "_active_clients_lock", None)
+    if lock:
+        with lock:
+            entries = list(server._active_clients.get(int(user_id), []))
+    else:
+        entries = list(getattr(server, "_active_clients", {}).get(int(user_id), []))
+    for handler, _last_active in entries:
         push_unread_notification(handler, count=1)
 
 

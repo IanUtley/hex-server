@@ -52,6 +52,8 @@ TID_BUNJITSU_VOID = "becbfb96-fea8-e8ec-234b-b066d1f7184c"
 TID_LIGHTNING = "fb84ad94-e6ed-f04b-353d-eda325e0ae43"
 TPL_TOMB_LORD = "dc748c9a-9b04-4279-93d6-19b06cbde108"
 TPL_INFILTRATOR = "cad6307e-bafc-492f-84f6-3b914071d5d3"
+TPL_RUNEWEB_INFILTRATOR = "e50468fe-6e6f-4319-80e9-c138748e18b4"
+AG_RUNEWEB_INFILTRATOR_DAMAGE = "2b4d0103-4513-a194-8dfa-f48c0587ab49"
 TPL_INCANT_FEAR = "f8103511-772f-40ea-8599-04d520508bac"
 AG_INCANT_FEAR = "1026a613-0814-a633-0869-3d35aaa8dd72"
 TPL_STRENGTH_REDWOOD = "27e20321-3e24-4802-8ffe-b4579616ff5c"
@@ -230,6 +232,52 @@ def test_brood_creeper_does_not_fire_on_own_champion(db):
                      "CardDealtDamageEvent", 101, 0,
                      extra_target=ai_champ_uid)
     assert not (bstate.get("stack") or []), "own-champion hit must not fire"
+
+
+def test_runeweb_infiltrator_puts_two_spiderling_eggs_in_opponent_deck(db):
+    """Runeweb Infiltrator's native damage trigger creates two eggs for the
+    opposing champion's deck, using the authored ``Two`` variable and target
+    controller rather than the trigger source's owner."""
+    from rules_port.resolution import resolve_port_trigger
+    from rules_port.triggers import dispatch_native_trigger
+
+    _copy_card(db, TPL_RUNEWEB_INFILTRATOR)
+    _copy_card(db, TPL_SPIDERLING_EGG)
+    add_card(db, 101, 0, TPL_RUNEWEB_INFILTRATOR, loc="warzone")
+    db.execute(
+        "UPDATE game_cards SET card_abilities=? WHERE card_uid=101",
+        (json.dumps([AG_RUNEWEB_INFILTRATOR_DAMAGE]),))
+    # Existing cards make the destination an ordinary populated deck, not an
+    # empty-deck special case.
+    add_card(db, 201, 5, TPL_GLADIATOR, loc="deck")
+    add_card(db, 202, 0, TPL_GLADIATOR, loc="deck")
+    db.commit()
+
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "stack": [], "_rules_port_attached": True}
+    handler._current_bstate = bstate
+    player_champ_uid = int(handler._player_champ_scid.uid.uid64)
+    result = dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=SessionStub(),
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="CardDealtDamageEvent", source_card_id=101,
+        source_player_id=0, target_card_id=player_champ_uid)
+    assert AG_RUNEWEB_INFILTRATOR_DAMAGE[:8] in result, result
+
+    item = next(item for item in (bstate.get("stack") or [])
+                if item.get("ability_guid") == AG_RUNEWEB_INFILTRATOR_DAMAGE)
+    bstate["stack"].remove(item)
+    resolve_port_trigger(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate, item)
+
+    eggs = db.execute(
+        "SELECT user_id, location, COUNT(*) FROM game_cards "
+        "WHERE template_guid=? GROUP BY user_id, location",
+        (TPL_SPIDERLING_EGG,)).fetchall()
+    assert eggs == [(5, "deck", 2)], (result, eggs, bstate)
 
 
 def test_queued_trigger_source_projection_preserves_combat_state(db):
@@ -2480,6 +2528,7 @@ def _main():
              test_card_battled_dispatch_is_directional,
              test_lose_life_modifier_is_not_damage,
              test_brood_creeper_does_not_fire_on_own_champion,
+             test_runeweb_infiltrator_puts_two_spiderling_eggs_in_opponent_deck,
              test_queued_trigger_source_projection_preserves_combat_state,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,

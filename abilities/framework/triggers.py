@@ -1447,7 +1447,7 @@ def resolve_turn_ended_triggers(db, handler, game, session, pl_t, ai_t,
 
 
 def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
-                                 bstate, owner_id):
+                                 bstate, owner_id, *, amount=1):
     """Dispatch the data-defined event for a newly gained champion charge.
 
     Charge-point UI updates are not gameplay events by themselves.  Use the
@@ -1464,9 +1464,16 @@ def resolve_gain_charge_triggers(db, handler, game, session, pl_t, ai_t,
              getattr(handler, "_player_champ_scid", None))
     if champ is None:
         return ""
-    return resolve_triggers(
-        db, handler, game, session, pl_t, ai_t, bstate,
-        "GainChargeEvent", int(champ.uid.uid64), owner_id)
+    try:
+        amount = max(0, int(amount or 0))
+    except (TypeError, ValueError):
+        amount = 0
+    result = ""
+    for _ in range(amount):
+        result = resolve_triggers(
+            db, handler, game, session, pl_t, ai_t, bstate,
+            "GainChargeEvent", int(champ.uid.uid64), owner_id)
+    return result
 
 
 def resolve_gain_threshold_triggers(db, handler, game, session, pl_t, ai_t,

@@ -527,9 +527,16 @@ def _animation_trigger(context):
 def _repeating(context, effect):
     """Apply C#'s nested ``RepeatingEffect`` on the shared target instance."""
     try:
-        loops = int(context.value("m_LoopCount", 1) or 1)
+        loops = int(context.value("m_LoopCount", 0) or 0)
     except (TypeError, ValueError):
-        loops = 1
+        loops = 0
+    if not loops:
+        # RepeatingAbilityEffectTemplate.Initialize folds the deprecated
+        # ability-variable form into m_LoopCount; older records only carry it.
+        try:
+            loops = int(context.value("m_LoopCount_DEPRECATED", 1) or 1)
+        except (TypeError, ValueError):
+            loops = 1
     child = context.template_value("m_RepeatingEffect", None)
     if child is None:
         return "repeat: no nested effect"
@@ -631,6 +638,12 @@ def _resource_modifier(context, effect):
         context.game, context.session, context.bstate,
         context.player_uid, context.ai_uid, side, property_name, amount,
         color=color)
+    if property_name == "chargepoints":
+        # Session.AddChargePoints queues one singular GainChargeEvent for
+        # every actual point gained, including ChargePointBonus. The counter
+        # projection above remains one aggregate UI event.
+        context.emit_gain_charge_triggers(
+            int(change.new_value) - int(change.old_value), owner_id=owner)
     # The C# resource modifiers keep per-effect-instance accounting alongside
     # the player pool mutation. These values back shipped IntAttr operands such
     # as ResourcesDepleted and ChargePointsDrained.
@@ -806,7 +819,10 @@ def _card_cost(context, target, param):
     amount = int(param.get("amount") or 0)
     if not amount:
         amount = context.modifier_value(param, param, "cardcost")
-    if not amount:
+    replace = bool(param.get("replaceexistingvalue"))
+    # A replace modifier can legitimately assign 0 ("... become cost [(0)]"),
+    # so only an additive modifier falls back to the game-text operand.
+    if not amount and not replace:
         # Extracted CardModifier rows can carry amount 0 with the operand only
         # in the localized game text (e.g. "cost -[(1)]") or in an ability
         # variable whose raw record is unavailable.  Recover the signed delta
@@ -817,8 +833,22 @@ def _card_cost(context, target, param):
         if match:
             value = int(match.group(2))
             amount = -value if match.group(1) == "-" else value
-    if not amount:
+    if not amount and not replace:
         return "cardcost: no change"
+    assigned_cost = int(amount)
+    if replace:
+        # C# ``CardCostModifier.Apply`` assigns ``card.ResourceCost = value``
+        # when ReplaceExistingValue is set (Raucous Revelry: "your cards with
+        # Rowdy in all zones become cost 1").  This port stores additive
+        # deltas, so convert the assignment into the delta that makes the
+        # card's current effective cost equal the authored value.
+        from rules_port.static_rules import effective_cost
+        current = int(effective_cost(
+            context.db, context.session.session_id, context.bstate,
+            int(target)) or 0)
+        amount = assigned_cost - current
+        if not amount:
+            return f"cost already {assigned_cost} on {hex(int(target))}"
     duration = str(param.get("duration") or context.effect_duration)
     if duration == "UntilItLeavesYourHand":
         try:
@@ -845,6 +875,8 @@ def _card_cost(context, target, param):
         context.session.session_id, int(target), conn=context.db)
     if row:
         context._push_modifier_card(int(target))
+    if replace:
+        return f"cost -> {assigned_cost} on {hex(int(target))}"
     return f"cost {amount:+} on {hex(int(target))}"
 
 
@@ -858,7 +890,24 @@ def _int_attribute(context, target, param):
     if not amount:
         amount = context.modifier_value(param, param, "intattr")
     operation = str(param.get("operation") or "set").lower()
+    double = bool(param.get("double") or param.get("doubled") or False)
     duration = str(param.get("duration") or context.effect_duration)
+
+    def apply_operation(old):
+        # C# IntAttrModifier.Apply checks m_Double before m_Operation, then
+        # Add/Remove/Set; Remove deletes the attribute regardless of value and
+        # any other operation logs an error and does nothing.
+        if double:
+            return old + old
+        if operation in ("add", "increment"):
+            return old + amount
+        if operation in ("remove", "removeall", "clear"):
+            return 0
+        if operation == "subtract":
+            return old - amount
+        if operation == "set":
+            return amount
+        return None
     temporary_durations = {
         "EndOfTurn", "EndOfNextTurn", "BeginningOfOwnersTurn",
         "BeginningOfOpponentsTurn", "AfterCardsReadyOnPlayersTurn",
@@ -888,12 +937,9 @@ def _int_attribute(context, target, param):
         all_attrs = context.bstate.setdefault("champion_int_attrs", {})
         attrs = all_attrs.setdefault(uid_key, {})
         previous = attrs.get(attr)
-        if operation in ("add", "increment"):
-            value = int(previous or 0) + amount
-        elif operation in ("remove", "subtract"):
-            value = int(previous or 0) - amount
-        else:
-            value = amount
+        value = apply_operation(int(previous or 0))
+        if value is None:
+            return f"intattr: unsupported operation {operation} on {attr}"
         if value:
             attrs[attr] = value
         else:
@@ -926,12 +972,9 @@ def _int_attribute(context, target, param):
         buffs = {}
     attrs = buffs.setdefault("int_attrs", {})
     old = int(attrs.get(attr, 0) or 0)
-    if operation in ("add", "increment"):
-        value = old + amount
-    elif operation in ("remove", "subtract"):
-        value = old - amount
-    else:
-        value = amount
+    value = apply_operation(old)
+    if value is None:
+        return f"intattr: unsupported operation {operation} on {attr}"
     if value:
         attrs[attr] = value
     else:

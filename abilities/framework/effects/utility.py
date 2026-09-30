@@ -211,7 +211,7 @@ def _create_matching_target(game, session, db, handler, pl_t, ai_t, bstate,
         db_insert_generated_card(
             session.session_id, owner_id, uid, tpl_guid, loc, tpl[0], tpl[1],
             tpl[2], next_id, conn=db, owner_user_id=owner_id,
-            original_template_guid=tpl_guid, gems=0)
+            original_template_guid=tpl_guid)
         created.append(int(uid))
     # Deck copies follow the client's Unknown-location rule: a random slot,
     # with the untouched cards keeping their existing relative order.

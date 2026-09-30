@@ -288,6 +288,49 @@ def test_secondary_target_ignores_missing_source_uid(db):
             ability, None, 5)
 
 
+def test_match_secondary_target_uses_effect_instance_reference(db):
+    """MatchSecondary uses m_SecondaryTargetIndex as an effect id.
+
+    Herofall stores its selected troop in target slot 0 on effect instance 1;
+    resolving the field as target slot 1 silently produced no same-name cards.
+    """
+    from rules_port.resolution import _match_secondary_values
+
+    target_guid = _ag("match-secondary-target")
+    record = SimpleNamespace(
+        field=lambda name, default=None: {
+            "m_SameName": 1,
+            "m_SameCost": 0,
+            "m_SameOwner": 0,
+            "m_SharesRace": 0,
+            "m_DoesntShareRace": 0,
+            "m_CantBePreviousTarget": 0,
+        }.get(name, default))
+    ability = SimpleNamespace(
+        responsible_player_id=5,
+        source_uid=900,
+        ordered_effects=(SimpleNamespace(
+            effect_instance_id=1, target_index=0),),
+        activation=SimpleNamespace(target_map={0: (100,)}),
+    )
+    effect = SimpleNamespace(secondary_target_index=1)
+    target_spec = SimpleNamespace(guid=target_guid)
+    views = {
+        uid: {"card_uid": uid, "name": "Pack Raptor", "user_id": 5,
+              "cost": 1, "subtype": "Dinosaur"}
+        for uid in (100, 101, 102)
+    }
+    with mock.patch("gamedata.DEFAULT_RECORD_STORE.get", return_value=record), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=(101, 102)), \
+            mock.patch("rules_port.resolution._current_match_card",
+                       side_effect=lambda *_args: views.get(_args[2])):
+        matched = _match_secondary_values(
+            db, 1, ability, effect, target_spec, {},
+            resolved_by_instance={1: (100,)})
+    assert matched == (101, 102), matched
+
+
 def test_deck_search_detection_uses_filter_not_collection_flags(db):
     """A broad visibility mask must not turn a hand target into a deck search.
 
@@ -712,6 +755,50 @@ def test_native_deck_target_ai_auto_selects_without_a_picker(db):
                      "target_map": {0: (101,)}}, calls
 
 
+def test_native_ai_triggered_target_reselects_with_current_evaluator(db):
+    """An empty Runic child map gets a fresh AI target, not first legal."""
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
+
+    ability_guid = _ag("runic-reselect")
+    target_guid = _ag("runic-reselect-target")
+    effect_guid = _ag("runic-reselect-effect")
+    with synthetic_records() as rec:
+        rec.target(
+            target_guid, "AbilityTargetTemplate", is_auto=0, explicit=1,
+            player_filter="MultiplePlayers", collection_flags="Warzone",
+            minimum=1, maximum=1)
+        effect = rec.effect(
+            effect_guid, "CardModifierAbilityEffectTemplate",
+            text="mark target")
+        rec.ability(
+            ability_guid, effects=[rec.mapping(effect, target_index=0)],
+            targets=[target_guid])
+
+        chooser = mock.Mock(return_value={0: (102,)})
+        evaluator = SimpleNamespace(choose_ability_target_map=chooser)
+        seen = []
+
+        def native_effect(_kind, context, _effect):
+            seen.append(context.resolved_target())
+            return "resolved"
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        with mock.patch("ai_eval.build_evaluator", return_value=evaluator), \
+                mock.patch("rules_port.targeting.legal_targets",
+                           side_effect=AssertionError(
+                               "resolver used first-legal fallback")):
+            resolve_port_ability(
+                HandlerStub(db), game_engine.Game(1, pl_t, ai_t),
+                SessionStub(), db, pl_t, ai_t,
+                {"player_health": 20, "ai_health": 20}, ability_guid,
+                900, 0, native_effect=native_effect)
+
+    chooser.assert_called_once_with(900, ability_guid)
+    assert seen == [102], seen
+
+
 def test_choice_ability_transforms_real_parent(db):
     """Playing a Choice token applies its automatic ability to its parent."""
     from rules_port.choice_effects import (
@@ -814,6 +901,8 @@ def main():
          test_empty_revealed_troop_target_does_not_move_stale_card),
         ("Source-less secondary target is empty",
          test_secondary_target_ignores_missing_source_uid),
+        ("MatchSecondary follows effect-instance references",
+         test_match_secondary_target_uses_effect_instance_reference),
         ("Deck search detection uses the zone filter",
          test_deck_search_detection_uses_filter_not_collection_flags),
         ("Empty sacrifice target does not sacrifice source",
@@ -832,6 +921,8 @@ def main():
          test_native_deck_target_opens_the_deck_search_picker),
         ("Native deck target AI auto-selects",
          test_native_deck_target_ai_auto_selects_without_a_picker),
+        ("Native AI triggered target reselects",
+         test_native_ai_triggered_target_reselects_with_current_evaluator),
         ("Choice transforms its real parent",
          test_choice_ability_transforms_real_parent),
         ("Records choice filter preserves typed target data",
