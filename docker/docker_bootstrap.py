@@ -10,6 +10,10 @@ An existing database is upgraded in place through ``static.ensure_schema``,
 which also re-syncs its client-derived projection (card, ability, champion and
 encounter rows) from the mounted gamedata or ``Records/`` source whenever that
 snapshot has moved on — player progress is never part of that projection.
+
+The Frost Ring Arena encounter and challenge catalogues are maintained by
+standalone extractors, so this bootstrap also fills them when they are absent
+or incomplete.  Existing usable FRA data is left untouched.
 """
 
 from __future__ import annotations
@@ -52,6 +56,8 @@ REQUIRED_STATIC_TABLES = (
     "champion_class_data",
     "encounter_scenes",
     "encounter_deck_cards",
+    "fra_encounters",
+    "fra_challenges",
     "campaign_node_conversations",
     "quest_templates",
     "quest_conversations",
@@ -62,6 +68,16 @@ REQUIRED_STATIC_TABLES = (
     "chest_probabilities",
     "redeem_codes",
     "conversation_rewards",
+)
+
+
+FRA_ENCOUNTER_RECORD_FILES = (
+    "DeckTemplate.jsonl",
+    "ChampionTemplate.jsonl",
+)
+FRA_CHALLENGE_RECORD_FILES = (
+    "ConversationTemplate.jsonl",
+    "CardTemplate.jsonl",
 )
 
 
@@ -196,8 +212,118 @@ def upgrade_database(path: Path) -> None:
         connection.close()
 
 
+def _scalar_count(connection: sqlite3.Connection, query: str) -> int | None:
+    """Return a count, treating a missing table/column as unavailable."""
+    try:
+        row = connection.execute(query).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0] or 0) if row else 0
+
+
+def _fra_catalog_needs_population(path: Path) -> tuple[bool, bool]:
+    """Return ``(encounters_needed, challenges_needed)`` for *path*.
+
+    A non-empty encounter table is not sufficient: roster selection starts at
+    rank one and every selected deck must have card rows.  Likewise, disabled
+    challenge rows cannot satisfy the Arena challenge lookup.
+    """
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        encounter_count = _scalar_count(
+            connection, "SELECT COUNT(*) FROM fra_encounters")
+        rank_one_count = _scalar_count(
+            connection,
+            "SELECT COUNT(*) FROM fra_encounters "
+            "WHERE COALESCE(min_rank, 6) <= 1 "
+            "AND COALESCE(max_rank, 19) >= 1 "
+            "AND COALESCE(is_elite, 0) = 0",
+        )
+        encounters_without_cards = _scalar_count(
+            connection,
+            "SELECT COUNT(*) FROM fra_encounters AS e "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM encounter_deck_cards AS c "
+            "WHERE c.deck_guid=e.deck_guid)",
+        )
+        challenge_count = _scalar_count(
+            connection,
+            "SELECT COUNT(*) FROM fra_challenges WHERE enabled=1",
+        )
+    finally:
+        connection.close()
+
+    encounters_needed = (
+        encounter_count is None
+        or encounter_count == 0
+        or rank_one_count is None
+        or rank_one_count == 0
+        or encounters_without_cards is None
+        or encounters_without_cards > 0
+    )
+    challenges_needed = challenge_count is None or challenge_count == 0
+    return encounters_needed, challenges_needed
+
+
+def _require_records_files(records: Path, files: tuple[str, ...], catalog: str) -> None:
+    missing = [name for name in files if not (records / name).is_file()]
+    if not missing:
+        return
+    joined = ", ".join(missing)
+    raise RuntimeError(
+        f"FRA {catalog} data is missing ({joined}) under {records}. "
+        "Mount a complete Records/ directory or set HEX_GAMEDATA so the "
+        "bootstrap can regenerate it."
+    )
+
+
+def populate_missing_fra_data(path: Path, records: Path) -> None:
+    """Populate standalone FRA catalogues without replacing usable data."""
+    encounters_needed, challenges_needed = _fra_catalog_needs_population(path)
+    if not encounters_needed and not challenges_needed:
+        print("[docker] FRA catalogues already populated", flush=True)
+        return
+
+    if encounters_needed:
+        _require_records_files(records, FRA_ENCOUNTER_RECORD_FILES, "encounter")
+        from AssetExtraction.populate_fra_encounters import (
+            apply_rows,
+            extract_rows,
+        )
+
+        print("[docker] populating FRA encounters", flush=True)
+        encounter_rows, card_rows, unresolved = extract_rows(records, {})
+        if not encounter_rows or not card_rows:
+            raise RuntimeError(
+                "FRA encounter extraction produced no encounter or deck-card "
+                f"rows from {records}"
+            )
+        encounter_count, card_count = apply_rows(
+            path, encounter_rows, card_rows)
+        print(
+            f"[docker] populated FRA encounters: encounters={encounter_count} "
+            f"deck_cards={card_count} unresolved={len(unresolved)}",
+            flush=True,
+        )
+
+    if challenges_needed:
+        _require_records_files(records, FRA_CHALLENGE_RECORD_FILES, "challenge")
+        from AssetExtraction.populate_fra_challenges import apply
+
+        print("[docker] populating FRA challenges", flush=True)
+        challenge_count = apply(path, records, dry_run=False)
+        if not challenge_count:
+            raise RuntimeError(
+                f"FRA challenge extraction produced no rows from {records}"
+            )
+        print(
+            f"[docker] populated FRA challenges: rows={challenge_count}",
+            flush=True,
+        )
+
+
 def validate_static_data(path: Path) -> None:
-    """Fail startup if fresh database reference data is missing or empty."""
+    """Fail startup if required database reference data is missing or empty."""
     connection = sqlite3.connect(str(path), timeout=5.0)
     try:
         missing = []
@@ -213,8 +339,19 @@ def validate_static_data(path: Path) -> None:
                 missing.append(f"{table}=empty")
         if missing:
             raise RuntimeError(
-                "fresh database static data validation failed: "
+                "database static data validation failed: "
                 + ", ".join(missing)
+            )
+        encounters_needed, challenges_needed = _fra_catalog_needs_population(path)
+        if encounters_needed:
+            raise RuntimeError(
+                "database static data validation failed: "
+                "fra_encounters=incomplete"
+            )
+        if challenges_needed:
+            raise RuntimeError(
+                "database static data validation failed: "
+                "fra_challenges=empty"
             )
         print(
             "[docker] static data validated: "
@@ -292,6 +429,7 @@ def main() -> int:
         os.environ["HEX_DB_PATH"] = str(path)
         print(f"[docker] applying current schema and seeds to {path}", flush=True)
         upgrade_database(path)
+        populate_missing_fra_data(path, configured_records)
         validate_static_data(path)
         return 0
 
@@ -304,6 +442,7 @@ def main() -> int:
     os.environ["HEX_DB_PATH"] = str(path)
     create_database(path)
     print(f"[docker] database created at {path}", flush=True)
+    populate_missing_fra_data(path, configured_records)
     validate_static_data(path)
     run_tests(path)
     return 0
