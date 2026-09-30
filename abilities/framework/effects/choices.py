@@ -15,7 +15,7 @@ import struct
 import game_engine
 
 from .._shared import next_game_card_uid, owner_uid
-from ..builder import AbilityContinuation
+from rules_port.builder import AbilityContinuation
 from ..fields import effect_field, effect_template, effect_template_value
 from .registry import effect
 
@@ -318,19 +318,21 @@ def resolve_choice_card_abilities(game, session, db, handler, pl_t, ai_t,
     if not ability_guids:
         return []
 
-    if resolver is None:
+    resolve = resolver
+    if resolve is None:
         from ..resolution import resolve_ability
+        resolve = resolve_ability
     logs = []
     for ability_guid in ability_guids:
         meta = db_ability_activation_metadata(ability_guid, conn=db)
         if meta and int(meta[4] or 0):
             continue
         if resolver is None:
-            logs.append(resolve_ability(
+            logs.append(resolve(
                 handler, game, session, db, pl_t, ai_t, bstate,
                 ability_guid, source_uid, owner_id, target_map={}))
         else:
-            logs.append(resolver(
+            logs.append(resolve(
                 handler, game, session, db, pl_t, ai_t, bstate,
                 ability_guid, source_uid, owner_id, target_map={},
                 variables={}))

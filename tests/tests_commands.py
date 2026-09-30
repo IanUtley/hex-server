@@ -3,6 +3,9 @@
 import sqlite3
 import os
 import sys
+import io
+import tempfile
+from urllib.parse import parse_qs, urlparse
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -12,6 +15,7 @@ from tests.test_db import fresh_database
 fresh_database()   # bind this process's database before ``db`` is imported
 
 import commands
+import db as db_module
 import game_engine
 import battle_engine
 
@@ -57,8 +61,130 @@ def test_help_lists_only_public_commands_without_debug_console():
     old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
     commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
     try:
-        assert commands.handle_command(HandlerStub(), "!help", "", "") == (
-            "Available commands: !help, !version, !arena-cleanup")
+        expected = (
+            "Available commands: !help, !commands, !version, !arena-cleanup, "
+            "!account-cleanup, !issue <title>")
+        assert commands.handle_command(HandlerStub(), "!help", "", "") == expected
+        assert commands.handle_command(HandlerStub(), "!commands", "", "") == expected
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
+
+
+def test_issue_command_is_available_without_debug_console():
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
+    try:
+        with mock.patch.object(
+                commands, "_ERROR_LOG_PATHS", ("/tmp/hex-issue-test.log",)), \
+                mock.patch.object(commands, "player_log_path", return_value=None), \
+                mock.patch.object(
+                    commands, "_read_log_tail",
+                    return_value=[
+                        "[12:00:00] normal diagnostic",
+                        "[12:01:02] RulesPort trigger error: test failure",
+                    ]):
+                result = commands.handle_command(
+                    HandlerStub(), "!issue Client crash", "", "")
+        assert result.startswith("Click the link below to open")
+        assert "[url=HTTPS://github.com/IanUtley/hex-server/issues/new?" in result
+        issue_url = result.split("[url=", 1)[1].split("]", 1)[0]
+        query = parse_qs(urlparse(issue_url).query)
+        assert query["title"] == [
+            f"[{commands._version_command()}] Client crash"]
+        assert "RulesPort trigger error: test failure" in query["body"][0]
+    finally:
+        commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
+
+
+def test_session_logger_writes_bound_session_file():
+    old_dir = db_module.SESSION_LOG_DIR
+    old_player_dir = db_module.PLAYER_LOG_DIR
+    old_log_file = db_module._log_req_file
+    with tempfile.TemporaryDirectory() as temp_dir:
+        capture = io.StringIO()
+        db_module.SESSION_LOG_DIR = temp_dir
+        db_module.PLAYER_LOG_DIR = temp_dir
+        db_module._log_req_file = capture
+        try:
+            with db_module.log_session_context(
+                    77, player_id=5, participant_ids=(5, 6)):
+                assert db_module.log_req("session diagnostic") is True
+            session_path = os.path.join(temp_dir, "session-77-p5-p6.log")
+            player_path = os.path.join(temp_dir, "player-5.log")
+            with open(session_path,
+                      encoding="utf-8") as session_log:
+                contents = session_log.read()
+            with open(player_path, encoding="utf-8") as player_log:
+                player_contents = player_log.read()
+            assert "session diagnostic" in contents
+            assert "session diagnostic" in player_contents
+            assert db_module.latest_session_log_path_for_players((5,)) == session_path
+        finally:
+            db_module.SESSION_LOG_DIR = old_dir
+            db_module.PLAYER_LOG_DIR = old_player_dir
+            db_module._log_req_file = old_log_file
+
+
+def test_issue_report_combines_player_and_latest_game_logs():
+    old_session_dir = db_module.SESSION_LOG_DIR
+    old_player_dir = db_module.PLAYER_LOG_DIR
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_module.SESSION_LOG_DIR = temp_dir
+        db_module.PLAYER_LOG_DIR = temp_dir
+        old_session_path = db_module.session_log_path(76, (5, 6))
+        latest_session_path = db_module.session_log_path(77, (5, 6))
+        with open(old_session_path, "w", encoding="utf-8") as stream:
+            stream.write("[12:00:00] old game\n")
+        with open(latest_session_path, "w", encoding="utf-8") as stream:
+            stream.write("[12:01:00] latest game\n")
+        old_mtime = os.stat(old_session_path).st_mtime
+        os.utime(latest_session_path, (old_mtime + 2, old_mtime + 2))
+        with open(db_module.player_log_path(5), "w", encoding="utf-8") as stream:
+            stream.write("[12:02:00] profile/chat failure\n")
+        handler = HandlerStub()
+        try:
+            with mock.patch.object(commands, "_handler_game_session",
+                                   return_value=None):
+                report = commands._error_report(handler)
+            assert "Recent player log:" in report
+            assert "profile/chat failure" in report
+            assert "Recent game log: session-77.log" in report
+            assert "latest game" in report
+            assert "old game" not in report
+        finally:
+            db_module.SESSION_LOG_DIR = old_session_dir
+            db_module.PLAYER_LOG_DIR = old_player_dir
+
+
+def test_issue_command_reports_session_state_and_tail():
+    session = SessionStub()
+    session.turn_order = battle_engine.default_state()
+    session.turn_order["phase_idx"] = 1
+    tail = [
+        "[12:02:00] entering FirstMainPhase",
+        "[12:02:01] Error resolving trigger: test failure",
+    ]
+    handler = HandlerStub()
+    handler._checkpoint_engine = lambda _session: battle_engine
+    expected_phase = getattr(
+        battle_engine.current_phase(session.turn_order), "name",
+        str(battle_engine.current_phase(session.turn_order)))
+    old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
+    commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
+    try:
+        with mock.patch.object(commands, "_handler_game_session",
+                               return_value=session), \
+                mock.patch.object(commands, "player_log_path", return_value=None), \
+                mock.patch.object(commands, "_session_log_tail",
+                                  return_value=tail):
+                result = commands.handle_command(
+                    handler, "!issue Remote issue", "", "")
+        issue_url = result.split("[url=", 1)[1].split("]", 1)[0]
+        report = parse_qs(urlparse(issue_url).query)["body"][0]
+        assert "Session diagnostics: id=7" in report
+        assert f"phase={expected_phase}" in report
+        assert "Error resolving trigger" in report
+        assert report.count("Error resolving trigger") == 1
     finally:
         commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
 
@@ -177,6 +303,10 @@ def test_threshold_command_reports_delta_from_previous_value():
 
 
 if __name__ == "__main__":
+    test_issue_command_is_available_without_debug_console()
+    test_session_logger_writes_bound_session_file()
+    test_issue_report_combines_player_and_latest_game_logs()
+    test_issue_command_reports_session_state_and_tail()
     test_top_moves_named_hand_card_to_deck_position_zero()
     test_resource_command_persists_authoritative_pools()
     test_threshold_command_reports_delta_from_previous_value()

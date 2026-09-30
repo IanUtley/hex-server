@@ -1,6 +1,7 @@
 """Regression tests for persisted chat history retention."""
 
 from datetime import datetime, timedelta, timezone
+import json
 import os
 import sqlite3
 import sys
@@ -12,6 +13,7 @@ from tests.test_db import fresh_database
 fresh_database()   # bind this process's database before ``db`` is imported
 
 import db
+from services import chat
 
 
 def test_chat_history_is_limited_to_last_24_hours():
@@ -47,6 +49,55 @@ def test_chat_history_is_limited_to_last_24_hours():
     assert [message["msg"] for message in history] == ["inside"]
 
 
+def test_multiline_command_response_is_sent_as_separate_chat_messages():
+    sent = []
+    peer_sent = []
+
+    class Handler:
+        user_profile = {"name": "Tester", "id": 1}
+        sid = "test-session"
+        scnt = 0
+
+        def _handle_chat_command(self, _command, _room, _username):
+            return "=== Commands ===\n!one\n!two"
+
+        def send(self, _headers, body=b""):
+            sent.append(json.loads(body.decode("utf-8")))
+
+    class Peer:
+        authenticated = True
+        _chat_rooms = {"global"}
+        sid = "peer-session"
+        scnt = 0
+
+        def send(self, _headers, body=b""):
+            peer_sent.append(json.loads(body.decode("utf-8")))
+
+    handler = Handler()
+    peer = Peer()
+    fake_server = type("FakeServer", (), {
+        "_active_clients": {1: [(handler, 0)], 2: [(peer, 0)]},
+    })
+    previous_server = sys.modules.get("hconnect_server")
+    sys.modules["hconnect_server"] = fake_server
+    try:
+        chat._handle_rchat(handler, "global", {"msg": "!commands"})
+    finally:
+        if previous_server is None:
+            sys.modules.pop("hconnect_server", None)
+        else:
+            sys.modules["hconnect_server"] = previous_server
+
+    assert [message["msg"] for message in sent] == [
+        "=== Commands ===", "!one", "!two"
+    ]
+    # The command branch sends only to the requesting handler; it must not
+    # enter the ordinary room broadcast path.
+    assert len(sent) == 3
+    assert peer_sent == []
+
+
 if __name__ == "__main__":
     test_chat_history_is_limited_to_last_24_hours()
+    test_multiline_command_response_is_sent_as_separate_chat_messages()
     print("chat tests passed")

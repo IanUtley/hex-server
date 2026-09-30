@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import random
+import game_engine
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 
 @dataclass(frozen=True)
@@ -79,13 +80,62 @@ def consume_one_shot_trigger(handler, session, game, db, player_uid, ai_uid,
     return True
 
 
+def _claim_trigger_uses(db, session, battle_state, graph, source_uid) -> bool:
+    """Claim authored per-game/per-turn trigger uses before queueing it.
+
+    Triggered abilities bypass manual activation validation, so without this
+    claim a ``UsesPerTurn`` trigger can be queued again by events raised while
+    its first copy resolves. Persist the claim on the card instance just as a
+    manual card ability does.
+    """
+    costs = getattr(graph, "costs", None)
+    game_limit = int(getattr(costs, "uses_per_game", 0) or 0)
+    turn_limit = int(getattr(costs, "uses_per_turn", 0) or 0)
+    if game_limit <= 0 and turn_limit <= 0:
+        return True
+
+    from pvp_db import (db_card_ability_use_counts, db_card_basic,
+                        db_record_card_ability_use)
+    guid = str(getattr(graph, "guid", "") or "").lower()
+    turn_number = int((battle_state or {}).get("turn_number", 1) or 1)
+    source_uid = int(source_uid)
+    if db_card_basic(session.session_id, source_uid, conn=db):
+        game_uses, turn_uses = db_card_ability_use_counts(
+            session.session_id, source_uid, guid, turn_number, conn=db)
+        if ((game_limit > 0 and game_uses >= game_limit) or
+                (turn_limit > 0 and turn_uses >= turn_limit)):
+            return False
+        db_record_card_ability_use(
+            session.session_id, source_uid, guid, turn_number, conn=db,
+            uses_per_game=game_limit > 0,
+            uses_per_turn=turn_limit > 0)
+        db.commit()
+        return True
+
+    # Synthetic champions have no game_cards row. Keep their trigger budget
+    # in the shared checkpoint so it survives the next event/chain transition.
+    key = f"{source_uid}:{guid}"
+    uses = (battle_state or {}).setdefault("trigger_ability_uses", {})
+    entry = dict(uses.get(key) or {})
+    game_uses = int(entry.get("game_uses", 0) or 0)
+    entry_turn = int(entry.get("turn_number", -1) or -1)
+    turn_uses = (int(entry.get("turn_uses", 0) or 0)
+                 if entry_turn == turn_number else 0)
+    if ((game_limit > 0 and game_uses >= game_limit) or
+            (turn_limit > 0 and turn_uses >= turn_limit)):
+        return False
+    uses[key] = {
+        "game_uses": game_uses + (1 if game_limit > 0 else 0),
+        "turn_number": turn_number,
+        "turn_uses": turn_uses + (1 if turn_limit > 0 else 0),
+    }
+    return True
+
+
 class RecordsTriggerBackend:
     """Execute Records trigger metadata behind the RulesPort boundary."""
 
     def __init__(self, resolver: Callable | None = None) -> None:
-        if resolver is None:
-            from abilities.framework.triggers import resolve_triggers
-            resolver = resolve_triggers
         self.resolver = resolver
 
     def __call__(self, *, db, handler, game, session, player_uid, ai_uid,
@@ -96,6 +146,9 @@ class RecordsTriggerBackend:
             raise RuntimeError(
                 "RecordsTriggerBackend cannot run in an attached live session; "
                 "use NativeTriggerBackend or explicitly enable rollback")
+        if self.resolver is None:
+            raise RuntimeError(
+                "RecordsTriggerBackend requires an explicit resolver")
         previous = battle_state.get("_rules_port_native_effect")
         battle_state["_rules_port_native_effect"] = True
         try:
@@ -127,7 +180,8 @@ class NativeTriggerBackend:
                  battle_state, event: TriggerEvent,
                  force_ignores_chain: bool = False):
         from gamedata import ability_graph, DEFAULT_RECORD_STORE
-        from pvp_db import db_card_basic, db_card_location, db_card_owner_id
+        from pvp_db import (db_card_basic, db_card_location,
+                            db_card_owner_id, db_card_state_value)
         from rules_port.counter_effects import TUNNELING_ABILITY_GUID
         from rules_port.conditions import ConditionContext, trigger_condition_met
         from rules_port.trigger_discovery import RecordsTriggerDiscovery
@@ -155,10 +209,34 @@ class NativeTriggerBackend:
                 event_name, event.source_card_id, event.source_player_id,
                 event.target_card_id, event.target_player_id,
                 dict(event.data or {}))
+        # AbilityTriggerCardTargetTemplate selects SourceCardId or
+        # TargetCardId exactly as carried by the C# TriggerEvent. Do not
+        # synthesize a target from the source for event classes that have no
+        # TargetCardId; their TriggerTarget picker is empty in the client.
+        trigger_target_uid = event.target_card_id
+
+        # A permanent entering play activates its authored creation-replacement
+        # markers (IntAttrModifiers such as ShinhareCreationBonus or
+        # CreateShinhareMilitiaInsteadOfBattleHopper).  The client reads them
+        # from the card context at creation time; the port persists them as
+        # permanent data on the entering card.
+        if (event_name == "CardEnteredZoneEvent" and
+                event.source_card_id is not None and
+                str(event.data.get("event_destination_collection")
+                    or "").lower() == "warzone"):
+            from .creation_effects import activate_creation_replacements
+            activate_creation_replacements(
+                db, session.session_id, int(event.source_card_id))
 
         # Keep event-local counters in the port state before condition
         # evaluation, matching the client's event ordering.
-        if event.event_type == "CardDiscardedEvent":
+        if event_name == "TurnStartedEvent":
+            # StartTurnState.UpdateStats clears every card's ThisTurnsData
+            # before TurnStartedEvent is processed. These maps are the port's
+            # authoritative equivalent for stored target lists at card scope.
+            battle_state.pop("stored_targets_by_card_this_turn", None)
+            battle_state.pop("stored_targets_this_turn", None)
+        elif event_name == "CardDiscardedEvent":
             owner = int(event.source_player_id or 0)
             key = (f"cards_discarded_this_turn_{owner}"
                    if battle_state.get("pvp") else
@@ -247,21 +325,59 @@ class NativeTriggerBackend:
             # re-published Corinth as an empty warzone card.  Champions are
             # already represented through PlayerUpdated.ChampionId, so never
             # project them as a collection card.
-            if not location or str(location).lower() in {
-                    "hand", "deck", "void", "choosing", "champion"}:
+            if not location or str(location).lower() == "champion":
                 return
             try:
                 import game_engine
                 scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
-                tpl, ctype, _name, cost, attack, defense, gems = \
-                    handler._card_full_data(game, scid, template_guid)
                 from .runtime_helpers import (card_collection_for_location,
                                               owner_uid)
+                collection = card_collection_for_location(location)
+                # Skip when this batch already published the card in the same
+                # collection (the death transition pushes its own discard
+                # CardUpdated); re-publishing duplicated the death update and
+                # made the client replay the move animation.
+                target_uid64 = int(scid.uid.uid64)
+                for prior in reversed(game.events):
+                    prior_scid = getattr(prior, "session_card_id", None)
+                    prior_uid = getattr(
+                        getattr(prior_scid, "uid", prior_scid), "uid64",
+                        prior_scid)
+                    if prior_uid is None:
+                        continue
+                    try:
+                        prior_uid64 = int(cast(Any, prior_uid))
+                    except (TypeError, ValueError):
+                        prior_uid64 = None
+                    if prior_uid64 != target_uid64:
+                        continue
+                    if prior.__class__.__name__ != "CardUpdatedSessionEventArgs":
+                        break
+                    if int(getattr(prior, "collection", -1)) == int(collection):
+                        # A hidden hand/deck projection is deliberately sent
+                        # first.  A trigger sourced from that card is a
+                        # public chain object, however, so its complete card
+                        # representation must follow the face-down refresh.
+                        # Visible updates are already authoritative and do not
+                        # need another copy.
+                        if not getattr(prior, "nulling", False):
+                            return
+                        break
+                    break
+                tpl, ctype, _name, cost, attack, defense, gems = \
+                    handler._card_full_data(game, scid, template_guid)
                 game.push_card_updated(
                     scid, owner_uid(owner, player_uid, ai_uid, battle_state),
-                    card_collection_for_location(location), ctype,
+                    collection, ctype,
                     template_id=tpl, cost=cost, attack=attack,
-                    defense=defense, gems=gems)
+                    defense=defense, gems=gems,
+                    state=int(db_card_state_value(
+                        session.session_id, int(uid), conn=db) or 0))
+                if str(location).lower() in {"hand", "deck", "choosing"}:
+                    # Game.make_network_packet uses this marker to retain the
+                    # public chain reveal when the normal hidden-hand/deck
+                    # projection is appended later in the same packet.
+                    game.events[-1]._chain_reveal = True
             except Exception:
                 pass
 
@@ -289,6 +405,10 @@ class NativeTriggerBackend:
                                    (getattr(handler,
                                             "_champion_granted_ability_guids",
                                             {}) or {})})
+                if event_name == "CardEnteredZoneEvent" and not dynamic_source:
+                    from .effect_lifetimes import champion_grants
+                    dynamic_source = bool(champion_grants(
+                        battle_state, source_uid))
                 if (event_name != "GameStartedEvent" and
                         str(trigger_type).rsplit(".", 1)[-1] != event_name and
                         not dynamic_source):
@@ -322,9 +442,13 @@ class NativeTriggerBackend:
                 # encounter setup affect troops deployed later as well.
                 dynamic = getattr(handler,
                                   "_champion_granted_ability_guids", {}) or {}
+                from .effect_lifetimes import champion_grants
+                dynamic_source = (source_uid in {int(uid) for uid in dynamic} or
+                                  bool(champion_grants(
+                                      battle_state, source_uid)))
                 continuous_card_aura = bool(
                     event_name == "CardEnteredZoneEvent" and
-                    source_uid in {int(uid) for uid in dynamic} and
+                    dynamic_source and
                     not graph.trigger_event_type and
                     any(effect.concrete_type == "CardModifierAbilityEffectTemplate" and
                         str(effect.duration).lower() == "permanent"
@@ -333,6 +457,13 @@ class NativeTriggerBackend:
                 if (str(graph.trigger_event_type or "").rsplit(".", 1)[-1]
                         != event_name and not static_grant and
                         not continuous_card_aura):
+                    continue
+                # Card.CanTrigger: an opposing champion's
+                # OpposingDeathcriesCantTrigger blocks this card's Deathcry.
+                if (event_name == "CardEnteredZoneEvent" and
+                        _ability_has_deathcry(graph) and
+                        _opponents_block_deathcries(
+                            battle_state, source_owner)):
                     continue
                 trigger_location = (
                     "warzone" if str(location or "").lower() == "mod"
@@ -349,8 +480,14 @@ class NativeTriggerBackend:
                         if graph.uses_previous_state and
                         event.data.get("event_source_collection") else
                         event.data.get("event_destination_collection"))
+                # C# treats an unset/None collection mask as unrestricted
+                # (``Card.PassesCollectionFlagRequirements`` and
+                # ``Session.cs`` skip the zone test for None); only a real
+                # mask restricts where the trigger can fire from.
                 allowed = {str(value).lower() for value in
-                            str(graph.trigger_collection_flags or "").split("|") if value}
+                           str(graph.trigger_collection_flags or "").split("|")
+                           if value}
+                allowed.discard("none")
                 if (trigger_location and allowed and
                         str(trigger_location).lower() not in allowed):
                     continue
@@ -374,6 +511,36 @@ class NativeTriggerBackend:
                         "event_previous_owner_id"))
                 if not trigger_condition_met(graph.source.to_dict(), context):
                     continue
+                entering_uid = event.source_card_id
+                entry_event = (event_name == "AsEntersPlayEvent" and
+                               entering_uid is not None)
+                if (entry_event and entering_uid is not None and
+                        not _ability_has_valid_entry_targets(
+                            db, session.session_id, source_card_owner,
+                            entering_uid, graph, battle_state, champions)):
+                    continue
+                inspiring = (entry_event and
+                             _card_has_inspire(
+                                 db, session.session_id, int(source_uid),
+                                 battle_state, handler, game))
+                if inspiring and entering_uid is not None:
+                    from .statistics import add_tac_stat
+                    add_tac_stat(
+                        battle_state, "cards", entering_uid,
+                        "CardStatsWithSpecificDuration", "InspireCount", 1)
+                    # C# emits CardInspiredEvent for each valid Inspire
+                    # ability before queuing that ability. Preserve the
+                    # source/entered-card identities, including self-inspire.
+                    inspired = dispatch_native_trigger(
+                        db=db, handler=handler, game=game, session=session,
+                        player_uid=player_uid, ai_uid=ai_uid,
+                        battle_state=battle_state,
+                        event_type="CardInspiredEvent",
+                        source_card_id=int(source_uid),
+                        source_player_id=source_card_owner,
+                        target_card_id=entering_uid, data={})
+                    if inspired:
+                        logs.append(inspired)
                 chance = chance_to_happen(graph)
                 if chance < 100 and random.randrange(100) >= chance:
                     logs.append(f"{event_name} {key[1][:8]} -> chance failed ({chance}%)")
@@ -396,14 +563,21 @@ class NativeTriggerBackend:
                         source_uid, both_players=True,
                         champions=(getattr(handler, "_champion_targets", lambda: [])() or []),
                         battle_state=battle_state)
-                    if source_card_owner != 0 and hasattr(handler, "_prompt_trigger_targets"):
-                        handler._prompt_trigger_targets(
-                            game, player_uid, ai_uid, session, battle_state,
-                            source_uid, key[1],
-                            tuple(graph.targets[index].guid for index in explicit),
-                            candidates)
-                        logs.append(f"{event_name} {key[1][:8]} -> awaiting target")
-                        continue
+                    if source_card_owner != 0:
+                        prompt = (getattr(handler, "_prompt_optional_trigger", None)
+                                  if graph.optional else
+                                  getattr(handler, "_prompt_trigger_targets", None))
+                        if callable(prompt):
+                            prompt(
+                                game, player_uid, ai_uid, session, battle_state,
+                                source_uid, key[1],
+                                tuple(graph.targets[index].guid for index in explicit),
+                                candidates, owner_id=source_card_owner,
+                                trigger_target_uid=event.target_card_id)
+                            logs.append(
+                                f"{event_name} {key[1][:8]} -> awaiting "
+                                f"{'optional choice' if graph.optional else 'target'}")
+                            continue
                     target = candidates[0] if candidates else None
                     if target is None:
                         continue
@@ -412,6 +586,18 @@ class NativeTriggerBackend:
                     target = ai_trigger_target(
                         db, session, key[1], source_uid, source_card_owner,
                         battle_state, getattr(handler, "_champion_targets", lambda: [])() or [])
+                elif (graph.optional and source_card_owner != 0 and
+                      callable(getattr(handler, "_prompt_optional_trigger", None))):
+                    handler._prompt_optional_trigger(
+                        game, player_uid, ai_uid, session, battle_state,
+                        source_uid, key[1], (), [], owner_id=source_card_owner,
+                        trigger_target_uid=event.target_card_id)
+                    logs.append(f"{event_name} {key[1][:8]} -> awaiting optional choice")
+                    continue
+
+                if not _claim_trigger_uses(
+                        db, session, battle_state, graph, source_uid):
+                    continue
 
                 instance_id = int(battle_state.get("_next_instance_id", 1))
                 battle_state["_next_instance_id"] = instance_id + 1
@@ -426,10 +612,21 @@ class NativeTriggerBackend:
                     old_owner = battle_state.get("resolving_owner_id")
                     old_trigger_target = battle_state.get(
                         "resolving_trigger_target_uid")
+                    old_trigger_source = battle_state.get(
+                        "resolving_trigger_source_uid")
+                    old_event_type = battle_state.get(
+                        "resolving_trigger_event_type")
+                    old_event_data = battle_state.get(
+                        "resolving_trigger_event_data")
                     battle_state["resolving_source_uid"] = source_uid
                     battle_state["resolving_owner_id"] = source_card_owner
                     battle_state["resolving_trigger_target_uid"] = \
+                        trigger_target_uid
+                    battle_state["resolving_trigger_source_uid"] = \
                         event.source_card_id
+                    battle_state["resolving_trigger_event_type"] = event_name
+                    battle_state["resolving_trigger_event_data"] = dict(
+                        event.data or {})
                     try:
                         result = resolve_port_ability(
                             handler, game, session, db, player_uid, ai_uid,
@@ -445,6 +642,18 @@ class NativeTriggerBackend:
                             battle_state.pop("resolving_trigger_target_uid", None)
                         else:
                             battle_state["resolving_trigger_target_uid"] = old_trigger_target
+                        if old_trigger_source is None:
+                            battle_state.pop("resolving_trigger_source_uid", None)
+                        else:
+                            battle_state["resolving_trigger_source_uid"] = old_trigger_source
+                        if old_event_type is None:
+                            battle_state.pop("resolving_trigger_event_type", None)
+                        else:
+                            battle_state["resolving_trigger_event_type"] = old_event_type
+                        if old_event_data is None:
+                            battle_state.pop("resolving_trigger_event_data", None)
+                        else:
+                            battle_state["resolving_trigger_event_data"] = old_event_data
                     logs.append(f"{event_name} {key[1][:8]} -> {result}")
                     if not battle_state.get("resolution_paused"):
                         consume_one_shot_trigger(
@@ -453,12 +662,28 @@ class NativeTriggerBackend:
                 else:
                     import game_engine
                     from . import chain
+                    activation_payload = {}
+                    if event_name == "CardActivatedEvent":
+                        activation_payload = {
+                            field: event.data[field]
+                            for field in (
+                                "activated_ability_guid",
+                                "activated_source_uid",
+                                "activated_target_uid",
+                                "activated_ability_instance_id",
+                                "activated_activation_data")
+                            if field in event.data
+                        }
                     chain.push(battle_state, {
                         "kind": "trigger", "ability_guid": key[1],
                         "source_uid": source_uid, "target_uid": target,
-                        "trigger_target_uid": event.source_card_id,
+                        "trigger_source_uid": event.source_card_id,
+                        "trigger_target_uid": trigger_target_uid,
+                        "trigger_event_type": event_name,
+                        "trigger_event_data": dict(event.data or {}),
                         "source_owner_uid": source_card_owner,
-                        "instance_id": instance_id})
+                        "instance_id": instance_id,
+                        **activation_payload})
                     push_source(source_uid, source_card_owner)
                     game.push_ability_on_chain(
                         game_engine.SessionCardId(game_engine.UID(source_uid)),
@@ -494,12 +719,34 @@ class NativeTriggerBackend:
                             "ability_guid": key[1],
                             "source_uid": source_uid,
                             "target_uid": target,
-                            "trigger_target_uid": event.source_card_id,
+                            "trigger_target_uid": trigger_target_uid,
+                            "trigger_event_type": event_name,
+                            "trigger_event_data": dict(event.data or {}),
                             "source_owner_uid": source_card_owner,
                             "instance_id": instance_id,
+                            **activation_payload,
                         }, source_card_owner, first_player_id=first_player)
                     logs.append(f"{event_name} {key[1][:8]} -> chain")
-        return "; ".join(logs)
+        logs_result = "; ".join(logs)
+        if (event_name == "CardEnteredZoneEvent" and
+                event.source_card_id is not None and
+                str(event.data.get("event_destination_collection")
+                    or "").lower() == "warzone"):
+            # C# raises AsEntersPlayEvent after the entering card's Deploy
+            # (CardEnteredZone) triggers.  It carries the entering card as
+            # source and event target so a card's own "as this enters play"
+            # triggers and every other card's Inspire conditions can resolve.
+            enters_logs = dispatch_native_trigger(
+                db=db, handler=handler, game=game, session=session,
+                player_uid=player_uid, ai_uid=ai_uid,
+                battle_state=battle_state, event_type="AsEntersPlayEvent",
+                source_card_id=int(event.source_card_id),
+                source_player_id=event.source_player_id,
+                target_card_id=int(event.source_card_id), data={})
+            if enters_logs:
+                logs_result = (f"{logs_result}; {enters_logs}"
+                               if logs_result else enters_logs)
+        return logs_result
 
 
 class PortTriggerDispatcher:
@@ -551,6 +798,85 @@ def dispatch_trigger(context, event_type, source_card_id, source_player_id=None,
         data=dict(data or {})))
 
 
+def dispatch_card_activated(*, db, handler, game, session, player_uid, ai_uid,
+                            battle_state, ability_guid, source_card_id,
+                            source_player_id, ability_instance_id,
+                            activation_data, dispatcher=None):
+    """Publish C# ActivateAbility's CardActivatedEvent with its instance."""
+    activation = dict(activation_data or {})
+    target_map = activation.get("target_map") or {}
+    target_uid = None
+    for selected in target_map.values() if isinstance(target_map, dict) else ():
+        values = selected if isinstance(selected, (tuple, list, set)) else (selected,)
+        for value in values:
+            try:
+                target_uid = int(getattr(value, "uid64", value))
+                break
+            except (TypeError, ValueError):
+                continue
+        if target_uid is not None:
+            break
+    event_data = {
+        "activated_ability_guid": str(ability_guid or "").lower(),
+        "activated_source_uid": int(source_card_id),
+        "activated_target_uid": target_uid,
+        "activated_ability_instance_id": int(ability_instance_id),
+        "activated_activation_data": activation,
+    }
+    missing = object()
+    previous = {key: battle_state.get(key, missing) for key in event_data}
+    battle_state.update(event_data)
+    try:
+        publish = dispatcher or dispatch_native_trigger
+        return publish(
+            db=db, handler=handler, game=game, session=session,
+            player_uid=player_uid, ai_uid=ai_uid,
+            battle_state=battle_state,
+            event_type="CardActivatedEvent",
+            source_card_id=int(source_card_id),
+            source_player_id=int(source_player_id or 0),
+            data=event_data)
+    finally:
+        for key, value in previous.items():
+            if value is missing:
+                battle_state.pop(key, None)
+            else:
+                battle_state[key] = value
+
+
+def _ability_has_deathcry(graph):
+    """Whether one authored ability carries the Deathcry TAC keyword."""
+    try:
+        from .tac import _tac_attr_hash, decode_tac
+        data = str(getattr(graph, "serialized_tac", "") or "")
+        return bool(data and _tac_attr_hash("Deathcry") in decode_tac(data))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def opponents_have_int_attr(battle_state, owner, attribute) -> bool:
+    """Session.CheckOpponentsForIntAttr for one named champion IntAttr."""
+    from .static_rules import _champion_int_attrs
+    wanted = str(attribute or "").lower()
+    for participant in (battle_state.get("champ_map") or {}):
+        try:
+            opponent = int(participant)
+        except (TypeError, ValueError):
+            continue
+        if opponent == int(owner or 0):
+            continue
+        for name, value in _champion_int_attrs(battle_state, opponent).items():
+            if str(name).lower() == wanted and int(value or 0) > 0:
+                return True
+    return False
+
+
+def _opponents_block_deathcries(battle_state, owner):
+    """Session.CheckOpponentsForIntAttr(OpposingDeathcriesCantTrigger)."""
+    return opponents_have_int_attr(
+        battle_state, owner, "OpposingDeathcriesCantTrigger")
+
+
 def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
                             battle_state, event_type, source_card_id,
                             source_player_id=None, target_card_id=None,
@@ -562,6 +888,38 @@ def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
     ability, which resolves without a priority window in that format.
     """
     event_name = str(event_type).rsplit(".", 1)[-1]
+    if event_name == "CardEnteredZoneEvent":
+        _record_typed_entry_statistics(
+            db, session, battle_state, source_card_id, source_player_id,
+            data or {})
+    # Duration belongs to each authored effect mapping.  Reconcile zone-bound
+    # grants before discovering this event's trigger candidates so a departed
+    # source cannot fire its just-expired ability from a stale instance list.
+    from .effect_lifetimes import expire_grants, expire_zone_bound_modifiers
+    expired = expire_grants(
+        db, session.session_id, battle_state, event_type=event_name,
+        event_source_uid=source_card_id,
+        handler=handler, game=game, player_uid=player_uid, ai_uid=ai_uid)
+    expired = list(dict.fromkeys(expired + expire_zone_bound_modifiers(
+        db, session.session_id, battle_state)))
+    for uid in expired:
+        from pvp_db import db_card_source_info
+        from .runtime_helpers import card_collection_for_location, owner_uid
+        row = db_card_source_info(session.session_id, int(uid), conn=db)
+        if not row:
+            continue
+        template_guid, card_type, location, owner = row
+        scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
+        try:
+            tpl, card_type, _name, cost, attack, defense, gems = \
+                handler._card_full_data(game, scid, template_guid)
+        except Exception:
+            continue
+        game.push_card_updated(
+            scid, owner_uid(owner or 0, player_uid, ai_uid, battle_state),
+            card_collection_for_location(location), card_type,
+            template_id=tpl, cost=cost, attack=attack, defense=defense,
+            gems=gems, nulling=str(location or "").lower() == "deck")
     previous_event_type = battle_state.get("event_type")
     battle_state["event_type"] = event_name
     try:
@@ -583,3 +941,127 @@ def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
             battle_state.pop("event_type", None)
         else:
             battle_state["event_type"] = previous_event_type
+
+
+def _record_typed_entry_statistics(db, session, state, card_uid, owner_id,
+                                   data):
+    """Apply C# entry counters whose authored variable type marks the card.
+
+    SourcePlayerBriarLegionVariable is the sole shipped authored type that
+    reads the Briar Legion entry counter. The client increments it for one
+    template, identified by its authored ability metadata. Resolve that marker
+    from Records rather than branching on the localized card name.
+    """
+    destination = str(data.get("event_destination_collection") or "").lower()
+    previous = str(data.get("event_source_collection") or "").lower()
+    if destination != "warzone" or previous == "warzone" or card_uid is None:
+        return
+    from .statistics import set_tac_stat
+    set_tac_stat(state, "cards", int(card_uid),
+                 "CardStatsWithSpecificDuration", "InspireCount", 0)
+    from pvp_db import db_card_ability_list, db_ability_raw_json
+    try:
+        ability_guids = db_card_ability_list(
+            session.session_id, int(card_uid), conn=db)
+    except (TypeError, ValueError):
+        ability_guids = ()
+    for guid in ability_guids or ():
+        try:
+            raw = json.loads(db_ability_raw_json(str(guid), conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        variables = raw.get("m_Variables") or []
+        if any(str(variable.get("_t", "")).rsplit(".", 1)[-1] ==
+               "SourcePlayerBriarLegionVariable" for variable in variables):
+            from .statistics import add_champion_card_stat
+            add_champion_card_stat(
+                state, int(owner_id or 0),
+                "BriarLegionsPlayedThisGame", 1)
+            return
+
+
+def _card_has_inspire(db, session_id, card_uid, state, handler, game):
+    """Mirror ``Card.HasInspire`` from authored card attributes/context."""
+    try:
+        attributes = int(__import__("rules_port.static_rules",
+                                    fromlist=["effective_attributes"])
+                        .effective_attributes(
+                            db, session_id, state, int(card_uid)))
+        if attributes & int(game_engine.ECardAttributes.Inspire):
+            return True
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        pass
+    try:
+        from gamedata import DEFAULT_RECORD_STORE
+        from pvp_db import db_card_zone_details
+        row = db_card_zone_details(session_id, int(card_uid), conn=db)
+        record = (DEFAULT_RECORD_STORE.get("CardTemplate", str(row[0]).lower())
+                  if row and row[0] else None)
+        serialized = record.field("m_SerializedTAC") if record else None
+        data = (serialized.field("data", "")
+                if serialized is not None and hasattr(serialized, "field") else
+                serialized.get("data", "")
+                if isinstance(serialized, dict) else "")
+        from .tac import _tac_attr_hash, decode_tac
+        if int(decode_tac(data).get(_tac_attr_hash("Inspire"), 0) or 0) > 0:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
+        card_def = getattr(game, "card_defs", {}).get(scid)
+        if card_def is None and hasattr(handler, "_card_full_data"):
+            from pvp_db import db_card_source_info
+            row = db_card_source_info(session_id, int(card_uid), conn=db)
+            if row and row[0]:
+                handler._card_full_data(game, scid, row[0])
+                card_def = getattr(game, "card_defs", {}).get(scid)
+        values = getattr(card_def, "int_attrs", {}) if card_def else {}
+        if int((values or {}).get("Inspire", 0) or 0) > 0:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        pass
+    from pvp_db import db_card_mutation_field
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            payload = json.loads(db_card_mutation_field(
+                session_id, int(card_uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        attrs = payload.get("int_attrs", {}) if isinstance(payload, dict) else {}
+        try:
+            if int(attrs.get("Inspire", 0) or 0) > 0:
+                return True
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return False
+
+
+def _ability_has_valid_entry_targets(db, session_id, owner_id, entering_uid,
+                                     graph, state, champions):
+    """Port the client's AbilityHasValidTargets check for AsEntersPlay."""
+    from .targeting import legal_targets, target_uses_both_players
+    targets = tuple(getattr(graph, "targets", ()) or ())
+    for effect in tuple(getattr(graph, "effects", ()) or ()):
+        try:
+            index = int(effect.target_index)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if index < 0 or index >= len(targets):
+            return False
+        target = targets[index]
+        # The client skips variable minima and best-effort minimum templates
+        # in AbilityHasValidTargets; the resolving activation handles them.
+        if target.min_variable or target.allow_best_effort_minimum:
+            continue
+        minimum = int(target.minimum or 0)
+        if minimum <= 0:
+            continue
+        candidates = legal_targets(
+            db, session_id, int(owner_id or 0), target.guid,
+            int(entering_uid),
+            both_players=target_uses_both_players(db, target.guid),
+            champions=champions, battle_state=state)
+        if len(candidates) < minimum:
+            return False
+    return True

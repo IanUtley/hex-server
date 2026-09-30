@@ -1,6 +1,6 @@
 """PvP combat parity: the tournament path must resolve through the SAME shared
-ai.resolve_combat as the FRA/AI path, with pid-based ownership, producing the
-identical outcome (who lives/dies, lifesteal heals) and objective events."""
+native RulesPort combat resolver as the FRA/AI path, with pid-based
+ownership, producing the identical outcome (who lives/dies, lifesteal heals) and objective events."""
 
 import os
 import json
@@ -31,12 +31,14 @@ def make_db(att_owner, blk_owner):
     os.close(fd)
     db = sqlite3.connect(path)
     db.execute("""CREATE TABLE game_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER, user_id INTEGER, card_uid INTEGER,
         template_guid TEXT, card_template_id TEXT, location TEXT,
         position INTEGER, card_state INTEGER, card_abilities TEXT,
         card_type TEXT, card_attributes INTEGER, temporary_attributes INTEGER,
-        card_attack_mod INTEGER, card_defense_mod INTEGER, card_cost_mod INTEGER,
-        cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER,
+        card_attack_mod INTEGER DEFAULT 0, card_defense_mod INTEGER DEFAULT 0,
+        card_cost_mod INTEGER DEFAULT 0,
+        cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER DEFAULT 0,
         permanent_buffs TEXT DEFAULT '{}', temporary_buffs TEXT DEFAULT '{}',
         card_uses TEXT DEFAULT '{}', resolved_at INTEGER DEFAULT 0,
         original_template_guid TEXT DEFAULT '')""")
@@ -115,9 +117,30 @@ class HandlerStub:
         return None
 
 
+def resolve_native(handler, session, pl_t, ai_t, bstate, attackers, blockers,
+                   attacker_key="player_attackers", first_strike=False):
+    """Run the native RulesPort combat resolver with explicit declarations."""
+    from rules_port.combat_damage import resolve as resolve_native_fn
+    from rules_port.context import EffectContext
+    bstate["_rules_port_attached"] = True
+    if attackers:
+        bstate[attacker_key] = {str(k): str(v) for k, v in attackers.items()}
+    if blockers:
+        bstate["ai_blockers"] = {str(k): [str(b) for b in v]
+                                 for k, v in blockers.items()}
+    game = handler._fresh_game(session, pl_t, ai_t, bstate)
+    context = EffectContext.from_rules_port(
+        game, session, handler._db, handler, pl_t, ai_t, bstate,
+        "", ability=None)
+    resolve_native_fn(context, first_strike=first_strike,
+                      attacker_key=attacker_key, blocker_key="ai_blockers")
+    return game
+
+
 def resolve(owner_a, owner_d, pvp):
     db = make_db(owner_a, owner_d)
     ai._db = db
+    dbmod._db = db
     if pvp:
         pl_t = game_engine.UID.make(244, owner_a)
         ai_t = game_engine.UID.make(244, owner_d)
@@ -144,10 +167,10 @@ def resolve(owner_a, owner_d, pvp):
     def _capture(game, pl_t, ai_t, bstate):
         captured["game"] = game
 
-    ai.resolve_combat(
+    _capture(resolve_native(
         handler, SessionStub(), pl_t, ai_t, bstate, attackers, blockers,
-        pl_t, ai_t, "pvp_attackers" if pvp else "player_attackers",
-        send_events=_capture)
+        attacker_key="pvp_attackers" if pvp else "player_attackers"),
+        pl_t, ai_t, bstate)
     loc_a = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0]
     loc_b = db.execute(
@@ -204,14 +227,12 @@ def test_pvp_combat_trigger_stays_on_authoritative_stack():
         captured["game"] = game
 
     try:
-        ai.resolve_combat(
+        _capture(resolve_native(
             HandlerStub(db), SessionStub(),
             game_engine.UID.make(244, 1001),
             game_engine.UID.make(244, 1002),
-            bstate, {101: 9002}, {},
-            game_engine.UID.make(244, 1001),
-            game_engine.UID.make(244, 1002), "pvp_attackers",
-            send_events=_capture)
+            bstate, {101: 9002}, {}, attacker_key="pvp_attackers"),
+            None, None, bstate)
         assert len(bstate["stack"]) == 1, bstate
         assert not any(
             isinstance(event, game_engine.ChainEmptySessionEventArgs)
@@ -478,7 +499,8 @@ def test_pvp_champion_options_exclude_triggers_and_basic_on_chain():
         tournament_game._db = db
         dbmod._db = db
         tournament_game.ability_graph = lambda _store, guid: SimpleNamespace(
-            manual=str(guid).lower() == manual, targets=())
+            manual=str(guid).lower() == manual, targets=(),
+            costs=SimpleNamespace(uses_per_game=0, uses_per_turn=0))
 
         state = {
             "pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
@@ -571,7 +593,7 @@ def test_pvp_activation_summoning_sickness_only_applies_to_troops():
             casting_behavior="QuickAction", manual=True,
             costs=SimpleNamespace(
                 activation=0, uses_per_game=0, uses_per_turn=0,
-                exhausts_card_on_use=True),
+                exhausts_card_on_use=True, cooldown=0),
             targets=(), additional_cost_targets=(),
             source=SimpleNamespace(to_dict=lambda: {}))
 
@@ -976,6 +998,86 @@ def test_constant_is_not_offered_as_pvp_attacker():
     print("PASS PvP Constants are not attackers")
 
 
+def test_pvp_declare_attack_priority_resync_keeps_attack_options():
+    """A DeclareAttack priority resync must project the attack option list.
+
+    The client replaces its entire PlayerOptionList on every push, so
+    answering a client RequestPrioritySync with the generic quick-action
+    window would clear ECardUsage.Attack and leave every ready troop
+    unselectable in BattleStateDeclareAttackers.
+    """
+    db = make_db(1001, 1002)
+    db.execute(
+        "UPDATE game_cards SET card_state=? WHERE card_uid=101",
+        (int(game_engine.ECardStates.StartedATurnOnYourSide),))
+    db.commit()
+
+    class Session:
+        session_id = 1
+        server_id = 100
+
+    class Handler:
+        scnt = 0
+        sid = "test"
+
+        def send(self, *_args, **_kwargs):
+            pass
+
+    previous_db = tournament_game._db
+    previous_pids = tournament_game.db_game_session_pids
+    previous_handlers = tournament_game.player_handlers
+    previous_encode = (
+        tournament_game.encode_datawrapper,
+        tournament_game.encode_sync_event,
+        tournament_game.compress_gzip,
+        tournament_game.client_session_guid,
+    )
+    original_packet = game_engine.Game.make_network_packet
+    captured = {}
+    try:
+        tournament_game._db = db
+        tournament_game.db_game_session_pids = lambda _sid: [1001, 1002]
+        tournament_game.player_handlers = {1001: Handler()}
+        tournament_game.encode_datawrapper = lambda *_args: b""
+        tournament_game.encode_sync_event = lambda *_args: b""
+        tournament_game.compress_gzip = lambda value: value
+        tournament_game.client_session_guid = lambda _handler: ""
+
+        def capture_packet(game, _player):
+            captured["events"] = list(game.events)
+            return b""
+
+        game_engine.Game.make_network_packet = capture_packet
+        state = {
+            "pvp": True,
+            "pids": [1001, 1002],
+            "turn_pid": 1001,
+            "priority_pid": 1001,
+            "phase": int(game_engine.ETurnPhases.DeclareAttack),
+            "champ_map": {"1001": 9001, "1002": 9002},
+        }
+        # The priority-sync / phase-entry projection seam.
+        tournament_game.pvp_push_current_phase_options(Session(), state)
+    finally:
+        game_engine.Game.make_network_packet = original_packet
+        tournament_game._db = previous_db
+        tournament_game.db_game_session_pids = previous_pids
+        tournament_game.player_handlers = previous_handlers
+        (tournament_game.encode_datawrapper,
+         tournament_game.encode_sync_event,
+         tournament_game.compress_gzip,
+         tournament_game.client_session_guid) = previous_encode
+        db.close()
+
+    option_lists = [ev for ev in captured["events"]
+                    if isinstance(ev, game_engine.PlayerOptionListSessionEventArgs)]
+    assert option_lists, captured["events"]
+    offered = {(int(opt.card.uid.uid64), int(opt.state))
+               for opt in option_lists[0].options}
+    assert offered == {(101, int(game_engine.ECardUsage.Attack))}, offered
+    print("PASS PvP DeclareAttack resync keeps attack options")
+
+
 def test_pvp_steadfast_attacker_stays_untapped():
     """The PvP commit handler must preserve Steadfast on an attacker."""
     db = make_db(1001, 1002)
@@ -1230,6 +1332,44 @@ def test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty():
     print("PASS PvP choice reads native payload when raw envelope is empty")
 
 
+def test_pvp_play_transactions_use_the_client_envelope():
+    """A PvP play must be submitted as the client's typed Play transaction.
+
+    The smoke harness used to submit a generic ``PlayCardTransaction``
+    envelope, which is not a client transaction class: every play fell outside
+    the typed RulesPort ingress and was executed by the legacy PvP dispatcher
+    instead.  Guard both halves of that contract — the envelope the harness
+    builds must normalize to a port play intent, and the generic envelope must
+    stay unclassified so the boundary refuses it.
+    """
+    from application.player_transactions import (
+        classify_player_transaction, typed_payload_from_decoded)
+    from rules_port.wire import normalize_player_transaction
+    import pvp_autoplay
+
+    for card_type, kind in (("Resource", "play_resource"),
+                            ("Troop", "play_troop"),
+                            ("BasicAction", "play_spell")):
+        raw = pvp_autoplay._card_play_bytes(257, card_type)
+        command = classify_player_transaction(raw)
+        assert getattr(command, f"is_{kind}"), (card_type, raw)
+        payload = typed_payload_from_decoded(command, {"__raw__": raw})
+        assert payload and payload["card_id"] == 257, (card_type, payload)
+        transaction = normalize_player_transaction(
+            command, 1001,
+            current_phase=game_engine.ETurnPhases.FirstMainPhase,
+            payload=payload)
+        assert transaction is not None and transaction.kind == kind, card_type
+        assert transaction.payload["card_id"] == 257, card_type
+
+    legacy_shape = b"PlayCardTransaction;m_SessionCardId;" + \
+        pvp_autoplay._mk_uid_bytes(257)
+    unclassified = classify_player_transaction(legacy_shape)
+    assert not any(getattr(unclassified, name) for name in dir(unclassified)
+                   if name.startswith("is_")), legacy_shape
+    print("PASS PvP play transactions use the typed client envelope")
+
+
 if __name__ == "__main__":
     test_parity()
     test_pvp_combat_trigger_stays_on_authoritative_stack()
@@ -1245,6 +1385,8 @@ if __name__ == "__main__":
     test_mulligan_completion_reenables_both_clients()
     test_phase_start_resolves_defender_before_turn_phase_triggers()
     test_pvp_quick_action_handoff_updates_both_clients()
+    test_pvp_declare_attack_priority_resync_keeps_attack_options()
     test_pvp_steadfast_attacker_stays_untapped()
     test_pvp_choice_zone_target_resolves_child_then_parent()
     test_pvp_choice_reads_native_payload_when_raw_envelope_is_empty()
+    test_pvp_play_transactions_use_the_client_envelope()

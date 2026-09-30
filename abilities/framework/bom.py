@@ -652,14 +652,15 @@ def _card_modifier_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             from .triggers import _apply_health_gain
             amount = _numeric("healhero")
             text = pm.get("text") or ""
-            # Escalation: "Gain ESC:4 health." — the amount scales with every
-            # escalation spell cast this game (data-driven from the text).
+            # Compatibility fallback for text-only ESC leaves. The client
+            # reads ESC from the source card's own EscalationCount.
             m_esc = _re.search(r'esc:(\d+)', text, _re.IGNORECASE)
             if m_esc:
                 base = int(m_esc.group(1))
-                uses = int((bstate or {}).get("player_escalation_uses", 0))
-                amount = base * (uses + 1)
-                (bstate or {})["player_escalation_uses"] = uses + 1
+                from rules_port.statistics import card_escalation_count
+                amount = base * card_escalation_count(
+                    db, session.session_id, bstate,
+                    (bstate or {}).get("resolving_source_uid"))
             if amount <= 0 and not has_dynamic_numeric:
                 m_gain = _re.search(r'gain\s+(\d+)\s+health', text.lower())
                 amount = int(m_gain.group(1)) if m_gain else 1
@@ -2139,8 +2140,11 @@ def _transform_card_at_random_legacy(game, session, db, handler, pl_t, ai_t,
     if not candidates:
         return "transform random: no candidates"
     new_tpl = random.choice(candidates)
+    # The client transforms the same card in its current collection. This is
+    # observable for effects that first move the target to hand, such as
+    # Morphology: the random action must remain in hand after the transform.
     transform_card(handler, game, session, pl_t, ai_t, int(target), new_tpl,
-                   bstate=bstate)
+                   keep_zone=True, bstate=bstate)
     return f"transformed {hex(int(target))} -> random {new_tpl[:8]}"
 
 @effect("TransformCardAtRandomAbilityEffectTemplate")
@@ -2703,7 +2707,10 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                                             threshold_flags.append((flag, amount))
                         if not charge_grant:
                             charge_grant = 1
-                        bstate[charge_key] = int(bstate.get(charge_key, 0)) + charge_grant
+                        old_charge = int(bstate.get(charge_key, 0) or 0)
+                        bstate[charge_key] = old_charge + charge_grant
+                        charge_delta = max(
+                            0, int(bstate[charge_key]) - old_charge)
                         threshold = bstate.setdefault(threshold_key, {})
                         scid = game_engine.SessionCardId(game_engine.UID(selected_uid))
                         card_owner = owner_uid(owner_id, pl_t, ai_t, bstate)
@@ -2756,16 +2763,17 @@ def _play_card_legacy(game, session, db, handler, pl_t, ai_t, bstate,
                             game.player_threshold = dict(threshold)
                         else:
                             game.ai_threshold = dict(threshold)
-                        ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
-                        ev_chg.player_id = card_owner
-                        ev_chg.operation = 1
-                        ev_chg.delta = 1
-                        ev_chg.new_value = bstate[charge_key]
-                        game._push(ev_chg)
-                        from .triggers import resolve_gain_charge_triggers
-                        resolve_gain_charge_triggers(
-                            db, handler, game, session, pl_t, ai_t, bstate,
-                            owner_id)
+                        if charge_delta:
+                            ev_chg = game_engine.ChampionChargePointsChangedSessionEventArgs()
+                            ev_chg.player_id = card_owner
+                            ev_chg.operation = 1
+                            ev_chg.delta = charge_delta
+                            ev_chg.new_value = bstate[charge_key]
+                            game._push(ev_chg)
+                            from .triggers import resolve_gain_charge_triggers
+                            resolve_gain_charge_triggers(
+                                db, handler, game, session, pl_t, ai_t,
+                                bstate, owner_id, amount=charge_delta)
                         from .resources import (
                             resolve_granted_resource_abilities)
                         resource_logs = resolve_granted_resource_abilities(
@@ -2833,32 +2841,11 @@ def _leaf_invoke(effect):
 
 def _tac_legacy(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
                 param):
-    from .tac import tac_function, tac_guid
-
-    if not param:
-        return "tac: no serialized data"
-    func = tac_function(param)
-    guid = tac_guid(param)
-    if func == "ShiftAbility" and guid:
-        return _shift_power(game, session, db, handler, pl_t, ai_t, bstate, guid)
-    if func == "Escalate":
-        # "Escalate your cards with the same name as this in all zones"
-        # (e.g. Chronic Madness): each copy's EscalationCount grows, so the
-        # next ESC-based amount doubles (4 -> 8 -> ...).  The caller's
-        # escalation re-render block (player_escalation_uses) pushes the new
-        # multiplier onto every copy the caster owns.
-        owner = int((bstate or {}).get("resolving_owner_id", 0))
-        side = "ai" if owner == 0 else "player"
-        key = f"{side}_escalation_uses"
-        if (bstate or {}).get("_esc_counted_this_resolution"):
-            # An ESC-based leaf earlier in this same resolution already
-            # advanced the counter (Ragefire's "Deal ESC:2 damage"): the
-            # Escalate operation is the same event, not a second one.
-            return "escalate (already counted by ESC leaf)"
-        (bstate or {})[key] = int((bstate or {}).get(key, 0)) + 1
-        (bstate or {})["_esc_counted_this_resolution"] = True
-        return f"escalate {side} (uses={bstate[key]})"
-    return f"tac: {func or '?'}"
+    """Route legacy leaf calls through the shared typed TAC operation."""
+    from rules_port.context import EffectContext
+    return EffectContext.from_legacy(
+        game, session, db, handler, pl_t, ai_t, bstate,
+        effect_guid, param).tac()
 
 
 @effect("TACAbilityEffectTemplate")
@@ -2923,7 +2910,7 @@ def bom_leaf_prompt_data(db, ability_guid, leaf_type):
     store = getattr(bom_leaf_prompt_data, "_record_store", None)
     if store is None:
         store = DEFAULT_RECORD_STORE
-        bom_leaf_prompt_data._record_store = store
+        setattr(bom_leaf_prompt_data, "_record_store", store)
     seen = set()
 
     def walk(guid):

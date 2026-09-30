@@ -9,6 +9,7 @@ coordinates are retained in the SVG tooltips but are not used for placement.
 from __future__ import annotations
 
 import argparse
+from typing import Any, cast
 import html
 import json
 import math
@@ -17,8 +18,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-import UnityPy
-from PIL import Image, ImageDraw, ImageFont
+import UnityPy  # pyright: ignore[reportMissingImports] -- optional asset extraction dependency
+from PIL import Image, ImageDraw, ImageFont  # pyright: ignore[reportMissingImports] -- optional asset extraction dependency
 
 
 DEFAULT_CLIENT_ROOT = Path(
@@ -175,7 +176,7 @@ def extract_terrain(env):
     if az_map is None:
         return []
     root_go = az_map.read()
-    root_transform = transform_of(root_go)
+    root_transform = cast(Any, transform_of(root_go))
     root_world = local_transform(root_transform)
     azm_transform = None
     for child_ptr in root_transform.m_Children:
@@ -271,6 +272,7 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
         return {}
     champion_map = champion_names(records_path)
     details = {}
+    db = None
     try:
         db = sqlite3.connect(str(database_path))
         scene_rows = db.execute(
@@ -293,10 +295,8 @@ def load_node_details(database_path: Path, records_path: Path) -> dict[str, Node
     except sqlite3.Error:
         return {}
     finally:
-        try:
+        if db is not None:
             db.close()
-        except UnboundLocalError:
-            pass
 
     accumulated = {}
     for scene_name, scene_title, champion_guid in scene_rows:
@@ -370,7 +370,7 @@ def extract(resources_path: Path, records_path: Path, env=None):
         raise RuntimeError(f"Could not find AZ1 nodes prefab path ID {PREFAB_PATH_ID}")
 
     root_go = prefab.read()
-    root_transform = transform_of(root_go)
+    root_transform = cast(Any, transform_of(root_go))
     root_world = local_transform(root_transform)
     labels = scene_labels(records_path)
     node_transforms = {}

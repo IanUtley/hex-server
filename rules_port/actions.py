@@ -28,11 +28,13 @@ class PushOntoChainAction(GameAction):
         # C# ``Session.CreateAbility`` registers this before prompt handling.
         # The standalone adapter has no separate factory call, so mirror it
         # here and make the waiting reply addressable by instance ID.
-        if self.session.ability_manager.get(self.ability.instance_id) is None:
-            self.session.ability_manager.add_chain(self.ability.instance_id,
-                                                   self.ability)
+        assert self.session is not None
+        manager = self.session.ability_manager
+        if manager.get(self.ability.instance_id) is None:
+            manager.add_chain(self.ability.instance_id, self.ability)
 
     def update(self) -> GameActionResult:
+        assert self.session is not None
         prompts = tuple(self.ability.needs_activation_data())
         if prompts:
             # The callback emits the existing client picker/option event and
@@ -46,6 +48,7 @@ class PushOntoChainAction(GameAction):
 
     def on_exit(self) -> None:
         if self._finish_ability:
+            assert self.session is not None
             self.session.finish_ability_on_chain(self.ability, free=self.free)
 
     def untargeted_trigger(self) -> bool:
@@ -60,6 +63,8 @@ class ResolveTopOfChainAction(GameAction):
         self.ability = ability
 
     def update(self) -> GameActionResult:
+        assert self.session is not None
+        assert self.action_stack is not None
         if self.session.chain.is_empty:
             return GameActionResult.COMPLETE
         state = self.session.resolve_top_of_chain(self.ability.instance_id)

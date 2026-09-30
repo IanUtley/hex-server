@@ -2,10 +2,155 @@
 
 Client-derived rows are loaded into fresh databases by
 ``AssetExtraction.gamedata_seed`` from ``HEX_GAMEDATA`` or the checked-in
-``Records/`` snapshot.  They deliberately do not live in this module.
+``Records/`` snapshot.  They deliberately do not live in this module; an
+existing database keeps whichever snapshot first seeded it, so
+``refresh_client_seed`` upserts the seed-owned columns when that snapshot
+moves on.
 """
 
 import json
+import hashlib
+import os
+import shutil
+import sqlite3
+
+
+CLIENT_SEED_META_TABLE = "client_seed_meta"
+
+
+def _ensure_column(db, table: str, column: str, declaration: str) -> None:
+    """Add a migration column once, tolerating concurrent service startup."""
+    present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column in present:
+        return
+    try:
+        db.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    except sqlite3.OperationalError as exc:
+        # HConnect, tournament, and replay workers may initialize the shared
+        # file at the same time. Another initializer can win this exact ALTER.
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
+def _seed_conflict_columns(db, table, columns):
+    """Primary-key columns shared by the database table and the seed row.
+
+    Returns ``None`` when the table has no usable key, in which case the
+    caller falls back to insert-if-missing for that table.
+    """
+    try:
+        info = list(db.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return None
+    keys = [row[1] for row in sorted(info, key=lambda row: row[5])
+            if row[5]]
+    if not keys or any(key not in columns for key in keys):
+        return None
+    return keys
+
+
+def _client_seed_fingerprint(seed) -> str:
+    """Stable digest of the client-derived rows in one extracted seed."""
+    payload = json.dumps(
+        {table: rows for table, rows in sorted(seed["tables"].items())
+         if table != "pack_set_map"},
+        sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _store_client_seed_fingerprint(db, fingerprint: str) -> None:
+    """Record which snapshot the client-derived projection was built from."""
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute(
+        f"INSERT INTO {CLIENT_SEED_META_TABLE} (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("records_fingerprint", fingerprint))
+    db.commit()
+
+
+def refresh_client_seed(db) -> int:
+    """Keep an existing database's client-derived projection in step.
+
+    ``seed_database`` is insert-if-missing and only runs for a fresh database,
+    so an existing database keeps whichever Records snapshot first seeded it.
+    When the checked-in snapshot later gains typed modifier fields, champion
+    abilities or effect chains, that staleness silently changes gameplay: the
+    ``Minor Ruby of Zeal`` gem kept a lossy ``ability_effects.param`` row, so
+    the Swiftstrike it grants when the controller has a Ruby threshold never
+    applied, and champion abilities added to the snapshot never reached the
+    engine at all.
+
+    Refresh only the columns the seed owns, keyed by the snapshot fingerprint
+    so an unchanged snapshot is a no-op. Rows are upserted, never deleted, and
+    columns written by other extractors or runtime code (for example
+    ``champion_templates.charge_power``, ``quest_conversations.enabled``,
+    ``encounter_scenes.ai_deck_personality``) are left intact.
+    """
+    from AssetExtraction.gamedata_seed import TABLE_COLUMNS, extract
+
+    seed = extract()
+    fingerprint = _client_seed_fingerprint(seed)
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    stored = db.execute(
+        f"SELECT value FROM {CLIENT_SEED_META_TABLE} WHERE key=?",
+        ("records_fingerprint",)).fetchone()
+    if stored and stored[0] == fingerprint:
+        return 0
+
+    # The projection is derived, but it is also the only copy of rows the
+    # running server reads; keep the pre-refresh file for a rollback.
+    try:
+        row = db.execute("PRAGMA database_list").fetchall()
+        path = next((value for _seq, name, value in row
+                     if name == "main" and value), None)
+        if path and os.path.isfile(path):
+            backup = path + ".preseed.bak"
+            if not os.path.exists(backup):
+                shutil.copy2(path, backup)
+    except Exception:
+        pass
+
+    refreshed: dict[str, int] = {}
+    for table, rows in sorted(seed["tables"].items()):
+        if table == "pack_set_map" or not rows:
+            continue
+        columns = list(TABLE_COLUMNS.get(table, ()))
+        if not columns or not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone():
+            continue
+        present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        columns = [column for column in columns if column in present]
+        keys = _seed_conflict_columns(db, table, set(columns))
+        before = db.total_changes
+        if keys:
+            assignments = ", ".join(
+                f"{column}=excluded.{column}" for column in columns
+                if column not in keys)
+            sql = (
+                f"INSERT INTO {table} ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in columns)}) "
+                f"ON CONFLICT({','.join(keys)}) DO UPDATE SET {assignments}")
+        else:
+            sql = (f"INSERT OR IGNORE INTO {table} ({','.join(columns)}) "
+                   f"VALUES ({','.join('?' for _ in columns)})")
+        db.executemany(sql, rows)
+        changed = db.total_changes - before
+        if changed:
+            refreshed[table] = changed
+    _store_client_seed_fingerprint(db, fingerprint)
+    print(
+        "Refreshed client-derived rows for {}: {}".format(
+            seed["source"],
+            ", ".join(f"{table}={count}"
+                      for table, count in sorted(refreshed.items()))
+            or "already current"))
+    return sum(refreshed.values())
 
 # ---------------------------------------------------------------------------
 # DDL — all tables the server expects to exist.
@@ -34,6 +179,16 @@ DDL = [
         password_hash TEXT DEFAULT NULL,
         email TEXT DEFAULT NULL,
         created_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reckoning_flags (
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        maximum INTEGER NOT NULL DEFAULT 0,
+        completed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, name)
     )
     """,
     """
@@ -104,6 +259,7 @@ DDL = [
         attributes INTEGER DEFAULT 0,
         sacrifice_target TEXT DEFAULT '',
         variable_cost INTEGER DEFAULT 0,
+        variable_cost_double INTEGER DEFAULT 0,
         variable_cost_minimum INTEGER DEFAULT 0,
         rage_value INTEGER DEFAULT 0,
         subtype TEXT DEFAULT '',
@@ -792,6 +948,7 @@ DDL = [
         name TEXT NOT NULL,
         champion_guid TEXT NOT NULL,
         encounter_deck_guid TEXT NOT NULL,
+        ai_deck_personality TEXT DEFAULT NULL,
         is_boss INTEGER NOT NULL DEFAULT 0,
         UNIQUE(user_id, challenger_index)
     )
@@ -810,6 +967,7 @@ DDL = [
         tier INTEGER DEFAULT NULL,
         min_rank INTEGER DEFAULT NULL,
         max_rank INTEGER DEFAULT NULL,
+        ai_deck_personality TEXT DEFAULT NULL,
         is_elite INTEGER NOT NULL DEFAULT 0,
         base_deck_name TEXT NOT NULL,
         set_guid TEXT NOT NULL DEFAULT '',
@@ -1400,6 +1558,15 @@ def ensure_schema(db):
     """
     for stmt in DDL:
         db.execute(stmt)
+    template_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(card_templates)")}
+    added_variable_cost_double = "variable_cost_double" not in template_columns
+    _ensure_column(db, "card_templates", "variable_cost_double",
+                   "INTEGER DEFAULT 0")
+    _ensure_column(db, "fra_challengers", "ai_deck_personality",
+                   "TEXT DEFAULT NULL")
+    _ensure_column(db, "fra_encounters", "ai_deck_personality",
+                   "TEXT DEFAULT NULL")
     tournament_columns = {row[1] for row in db.execute(
         "PRAGMA table_info(tournaments)")}
     if "expires_at" not in tournament_columns:
@@ -1762,7 +1929,8 @@ def ensure_schema(db):
         # field was normalized into card_templates. Backfill from the same
         # Records/gamedata extractor used for fresh databases, keyed by GUID;
         # never infer this keyword from display text or card names.
-        if added_lethal or added_equipment_modified:
+        if (added_lethal or added_equipment_modified or
+                added_variable_cost_double):
             from AssetExtraction.gamedata_seed import extract
             card_rows = extract()["tables"].get("card_templates", [])
             if added_lethal:
@@ -1777,6 +1945,13 @@ def ensure_schema(db):
                     [(int(row[11] or 0), row[0]) for row in card_rows
                      if len(row) >= 21],
                 )
+            if added_variable_cost_double:
+                db.executemany(
+                    "UPDATE card_templates SET variable_cost_double=? "
+                    "WHERE guid=?",
+                    [(int(row[17] or 0), row[0]) for row in card_rows
+                     if len(row) >= 22],
+                )
             db.commit()
     except Exception:
         pass
@@ -1789,12 +1964,26 @@ def ensure_schema(db):
 
         client_seed = extract()
         inserted = seed_database(db, client_seed)
+        # Record the snapshot the fresh projection was built from so the
+        # refresh below is a no-op on the next start.
+        _store_client_seed_fingerprint(
+            db, _client_seed_fingerprint(client_seed))
         print(
             "Seeded client data from {}: {}".format(
                 client_seed["source"],
                 ", ".join(f"{table}={count}" for table, count in sorted(inserted.items())),
             )
         )
+    else:
+        # The schema (and the client-derived projection it reads) is owned
+        # here, so the refresh of an existing database also belongs here
+        # rather than in each metadata consumer.
+        try:
+            refresh_client_seed(db)
+        except Exception as exc:
+            print(
+                f"Client-derived row refresh skipped ({exc}); keeping the "
+                "existing client data")
 
     # Existing databases predate the race-specific Crayburn encounter seed.
     # Add only the missing client-derived encounter rows; do not reseed or
@@ -1819,13 +2008,13 @@ def ensure_schema(db):
             if isinstance(objective, dict) and objective.get("encounter"):
                 tamed_scene_guids.add(str(objective["encounter"]).lower())
 
-        ecols = {r[1] for r in db.execute("PRAGMA table_info(encounter_scenes)")}
-        if "ai_champion_guid" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN ai_champion_guid TEXT")
-        if "ai_deck_personality" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN ai_deck_personality TEXT DEFAULT NULL")
-        if "mods_json" not in ecols:
-            db.execute("ALTER TABLE encounter_scenes ADD COLUMN mods_json TEXT DEFAULT '[]'")
+        _ensure_column(db, "encounter_scenes", "ai_champion_guid", "TEXT")
+        _ensure_column(db, "encounter_scenes", "ai_deck_personality",
+                       "TEXT DEFAULT NULL")
+        _ensure_column(db, "encounter_scenes", "mods_json",
+                       "TEXT DEFAULT '[]'")
+        ecols = {r[1] for r in db.execute(
+            "PRAGMA table_info(encounter_scenes)")}
         if "rewards_json" not in ecols:
             db.execute("ALTER TABLE encounter_scenes ADD COLUMN rewards_json TEXT DEFAULT '{}'")
             db.commit()
@@ -1953,6 +2142,19 @@ def ensure_schema(db):
         db.commit()
     except Exception as exc:
         print(f"Encounter seed repair skipped: {exc}")
+
+    # Deck strategy is static metadata: calculate missing profiles when the
+    # deck catalogue is seeded. The standalone evaluator can force a full
+    # refresh after strategy rules or Records metadata change.
+    try:
+        from AssetExtraction.evaluate_fra_deck_personalities import (
+            update_fra_deck_personalities,
+        )
+        evaluated = update_fra_deck_personalities(db)
+        if evaluated:
+            print(f"Updated AI deck personalities for {evaluated} deck(s)")
+    except Exception as exc:
+        print(f"FRA deck personality seed skipped: {exc}")
 
     # Migration: raw ability record JSON on card_abilities_meta if missing
     try:

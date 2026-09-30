@@ -23,6 +23,8 @@ is_optional / effect_duration / output_variables restored from the gamedata):
 
 import json
 import random
+from collections.abc import Mapping
+from typing import Any, cast
 
 import game_engine
 
@@ -33,7 +35,7 @@ from .fields import (ability_variables, effect_template,
 from .targeting import (legal_targets, evaluate_card_filter,
                          validate_target_selection)
 from ._shared import pvp_champion_uid, pvp_opponent_pid
-from .builder import AbilityBuilder, AbilityContinuation
+from rules_port.builder import AbilityBuilder, AbilityContinuation
 from .context import EffectContext
 from .trace import begin_effect, end_effect
 from gamedata import DEFAULT_RECORD_STORE, ability_graph, runtime_effects
@@ -90,6 +92,12 @@ def _parse_param(param):
         return d if isinstance(d, dict) else None
     except (ValueError, TypeError):
         return None
+
+
+def _param_dict(param) -> dict[str, Any]:
+    """Return a mapping view for effect parameters that use keyed fields."""
+    value = _parse_param(param)
+    return value if isinstance(value, dict) else {}
 
 
 def _effect_list(db, ability_guid):
@@ -201,7 +209,7 @@ def _champion_uids(handler, bstate):
     return pu, au
 
 
-def _champion_targets(handler, bstate):
+def _champion_targets(handler, bstate) -> list[tuple[int, int, str, int]]:
     """Return live champion cards for condition evaluation.
 
     Most PvE handlers expose ``_champion_targets`` directly.  PvP resolves
@@ -211,7 +219,7 @@ def _champion_targets(handler, bstate):
     provider = getattr(handler, "_champion_targets", None)
     if callable(provider) and not (bstate or {}).get("pvp"):
         try:
-            return provider() or []
+            return cast(list[tuple[int, int, str, int]], provider() or [])
         except Exception:
             pass
     if (bstate or {}).get("pvp"):
@@ -518,7 +526,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     groups = {}
     order = []
     for eff in ability_builder.effects:
-        gid = eff["effect_group_id"]
+        gid = (eff["effect_group_id"] if isinstance(eff, Mapping) else
+               eff.effect_group_id)
         if gid not in groups:
             groups[gid] = []
             order.append(gid)
@@ -818,7 +827,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
         # rather than allowing an unrelated activation target to redirect it.
         if (source_uid is not None and
                 eff.get("effect_type") == "MoveCardToZoneEffectTemplate"):
-            move_param = _parse_param(eff.get("param")) or {}
+            move_param = _param_dict(eff.get("param"))
             move_name = str(move_param.get("name", "")).lower()
             move_dest = str(move_param.get("destination", "")).lower()
             if move_name == "putthisintoyourdeck" or move_dest.endswith("deck"):
@@ -840,7 +849,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 and eff.get("effect_type") == "MoveCardToZoneEffectTemplate"):
             typed_dest = effect_template_value(
                 db, bstate, eff["effect_guid"], "m_DestinationCollection", "")
-            param = _parse_param(eff.get("param")) or {}
+            param = _param_dict(eff.get("param"))
             destination = str(typed_dest or param.get("destination") or "")
             if destination.rsplit(".", 1)[-1].lower() == "deck":
                 return [int(source_uid)], False
@@ -956,7 +965,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                                 not callable(getattr(
                                     handler, "_prompt_deck_search", None))):
             chosen = _choice(bstate, candidates)
-            target_map[int(eff["target_index"])] = int(chosen)
+            target_map[int(eff["target_index"])] = (int(chosen),)
             return f"matching target: selected {hex(int(chosen))}"
         if owner_id == 0:
             chosen = _choice(bstate, candidates)
@@ -965,9 +974,12 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 owner_id, bstate)
         prompt = getattr(handler, "_prompt_deck_search", None)
         if callable(prompt):
+            if owner_id is None:
+                return [], False
             prompt_args = (game, session, pl_t, ai_t, bstate,
-                           root_ability_guid, int(source_uid) if source_uid
-                           else 0, int(owner_id), candidates)
+                           root_ability_guid,
+                           int(source_uid) if source_uid is not None else 0,
+                           int(owner_id), candidates)
             if matching_target:
                 parent = dict((bstate or {}).get("_choice_parent") or {})
                 continuation = {
@@ -1024,7 +1036,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
             # RandomizeVariable leaf is group 1 and the conditioned branches
             # live in later groups.
             if etype == "RandomizeVariableEffectTemplate":
-                pm = _parse_param(eff["param"]) or {}
+                pm = _param_dict(eff["param"])
                 name = pm.get("variable") or "RandomNumber"
                 lo = int(pm.get("min", 1))
                 hi = int(pm.get("max", lo))
@@ -1039,7 +1051,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 # bstate cache for the current resolution and persist the
                 # value alongside the card's other per-instance data.
                 template = effect_template(eff["effect_guid"]) or {}
-                pm = _parse_param(eff["param"]) or {}
+                pm = _param_dict(eff["param"])
                 variable = (template.get("m_VariableName") or
                             pm.get("variable") or "")
                 operation = (template.get("m_Operation") or
@@ -1097,7 +1109,7 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                 # has no separate condition.  Carry the failed gate forward
                 # for that transform instead of transforming the first target
                 # card even though the threshold was not met.
-                pm = _parse_param(eff["param"])
+                pm = _param_dict(eff["param"])
                 if (eff["effect_type"] == "CardModifierAbilityEffectTemplate"
                         and pm and pm.get("property") == "counter"
                         and int(pm.get("amount") or 0) <= 0):

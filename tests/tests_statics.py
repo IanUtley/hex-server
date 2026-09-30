@@ -45,6 +45,8 @@ GORTEZUMA = "b24b07cf-3da5-0014-fa56-8936700c3f52"  # self Invincible if opponen
 GORTEZUMA_COND = "180773b3-b10b-5633-f60c-42eb3556fd9d"
 ELECTROID = "e0c9f434-86e1-20a8-47c0-2a1c5f27f5ff"
 ELECTROID_COND = "c96dccfd-f714-4508-a3a6-f21779918aae"
+FOREMAN = "155ecb0a-a471-42d6-b754-04961add4d67"           # champion passive
+FOREMAN_PASSIVE = "ccbd7f1a-0531-e6d9-7ca6-6a511ea61f85"   # no maximum hand size
 
 TPL_PLAIN = "11111111-1111-1111-1111-111111111111"
 TPL_SOUL = "22222222-2222-2222-2222-222222222222"
@@ -89,8 +91,20 @@ def make_db():
             player_filter TEXT, collection_flags TEXT, min_target_count INTEGER,
             max_target_count INTEGER, filter_json TEXT)""",
         "ALTER TABLE target_templates ADD COLUMN target_kind TEXT DEFAULT ''",
+        """CREATE TABLE champion_abilities (
+            champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
+            ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
+            threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
+            thresholds_json TEXT, target_template_ids TEXT)""",
     ):
         db.execute(ddl)
+
+    for row in src.execute(
+            "SELECT * FROM champion_abilities WHERE champion_guid=?",
+            (FOREMAN,)):
+        db.execute(
+            "INSERT INTO champion_abilities VALUES (%s)"
+            % ",".join("?" * len(row)), tuple(row))
 
     def copy_ability(ag):
         m = src.execute(
@@ -111,7 +125,7 @@ def make_db():
 
     for ag in (LIGHT, SOUL, TECH, ROCK, WALL, OZAWA, DANDELION, EMBER,
                TE_TALCA, HARVESTER, AIR_SUP, OATH, HIGH_TOMB, ENDBRINGER,
-               GORTEZUMA, ELECTROID):
+               GORTEZUMA, ELECTROID, FOREMAN_PASSIVE):
         copy_ability(ag)
     for cid in ("1b5793b0", "d4a01cea", "72c15be6", GORTEZUMA_COND,
                 ELECTROID_COND):
@@ -303,6 +317,65 @@ def test_ember_cant_gain_health(db):
     assert "cant_gain_health" in global_flags(db, 1, {})
 
 
+def test_champion_passive_lifts_max_hand_size(db):
+    """Construct Foreman's champion passive removes the hand limit.
+
+    "Champions have no maximum hand size." is a WhileCardInPlay
+    UnlimitedHandSize intattr authored on the champion itself.  A champion has
+    no ``game_cards`` row, so the continuous-static scan must read the
+    checkpoint's ``champ_guid_map``; without it the AI discarded down to 7
+    every end of turn.
+    """
+    from rules_port.static_rules import hand_size_unlimited
+    bstate = {"champ_map": {"5": 257, "0": 513},
+              "champ_guid_map": {"5": "00000000-0000-0000-0000-000000000001",
+                                 "0": FOREMAN}}
+    assert hand_size_unlimited(db, 1, bstate) is True
+    assert hand_size_unlimited(
+        db, 1, {"champ_map": {"5": 257, "0": 513}}) is False
+
+
+def test_ember_cant_gain_health_reaches_the_native_heal_path(db):
+    """The authored champion constraint must reach RulesPort's heal leaf.
+
+    Emberspire Witch's "Champions can't gain health." is a WhileCardInPlay
+    CantGainHealth intattr on an AllChampions target.  Champions are synthetic
+    SessionCardIds with no ``game_cards`` row, so the per-card static
+    projection never landed that leaf and Dragon Guard Stalwart's "Gain 1
+    health" charge power healed while she was in play.
+    """
+    from rules_port.context import EffectContext
+    from rules_port.effects import _heal_hero
+    from rules_port.static_rules import global_flags
+    from tests.tests_combat import HandlerStub, SessionStub
+
+    heal = {"property": "healhero", "amount": 1, "duration": "Instant"}
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    game.player_health = 12
+    bstate = {"player_health": 12, "resolving_owner_id": 5,
+              "resolving_source_uid": 101}
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, HandlerStub(db), pl_t, ai_t, bstate,
+        "19eb6023-c496-cfdf-abab-9a7e09e7fdae")
+
+    card(db, 101, 5, "11111111-1111-1111-1111-111111111116", "warzone",
+         json.dumps([EMBER]))
+    assert "cant_gain_health" in global_flags(db, 1, {})
+    result = _heal_hero(context, None, heal)
+    assert result.startswith("prevented"), result
+    assert bstate["player_health"] == 12, result
+    assert game.player_health == 12, result
+
+    # The same leaf still heals once the constraint has left play.
+    db.execute("DELETE FROM game_cards WHERE card_uid=101")
+    db.commit()
+    assert "cant_gain_health" not in global_flags(db, 1, {})
+    assert _heal_hero(context, None, heal) == "healed player 12->13"
+    assert bstate["player_health"] == 13
+
+
 def test_unblockable_except(db):
     card(db, 101, 5, "11111111-1111-1111-1111-111111111118", "warzone",
          json.dumps([HARVESTER]))
@@ -455,11 +528,7 @@ def test_count_list_attribute_uses_gamedata_list_name(db):
 
 
 def test_damage_esc_variable(db):
-    """'Deal ESC:2 damage' — ESC * 2 from the escalation counter.
-
-    Ragefire's escalation sequence is 2 -> 4 -> 6, so an escalation count of
-    three produces 6 damage.
-    """
+    """'Deal ESC:2 damage' reads the active source card's escalation count."""
     from abilities.framework.statics import _leaf_numeric_value
     src = sqlite3.connect(SRC)
     raw = src.execute(
@@ -467,10 +536,11 @@ def test_damage_esc_variable(db):
         ("36dc9fbf-c870-1796-a9e9-a3f84994d934",)).fetchone()[0]
     src.close()
     pm = {"property": "damage", "amount": 0, "text": "Deal ESC:2 damage"}
-    for uses, expected in ((0, 2), (1, 4), (2, 6)):
-        bstate = {"player_escalation_uses": uses}
-        amount = _leaf_numeric_value(db, 1, bstate, pm, raw, 5, 0, "damage")
-        assert amount == expected, (uses, amount)
+    for count, expected in ((1, 2), (2, 4), (3, 6)):
+        bstate = {"escalation_counts_by_card": {"820801": count}}
+        amount = _leaf_numeric_value(
+            db, 1, bstate, pm, raw, 5, 820801, "damage")
+        assert amount == expected, (count, amount)
 
 
 def test_champion_damage(db):
@@ -628,9 +698,10 @@ def test_end_of_turn_cleanup_clears_damage_before_buffs(db):
 
 
 def test_beginning_of_owners_turn_uses_source_controller(db):
-    """A source-owned duration survives the affected opponent's turn."""
-    from abilities.framework._shared import (
-        apply_attribute_grant, clear_expired_temporary_attributes)
+    """A native attribute effect expires on its source controller's turn."""
+    from rules_port.context import EffectContext
+    from rules_port.effects import _card_modifier
+    from rules_port.lifecycle import clear_expired_temporary_attributes
 
     class H:
         user_profile = {"id": 5}
@@ -643,18 +714,32 @@ def test_beginning_of_owners_turn_uses_source_controller(db):
 
     pl_t = game_engine.UID.make(244, 5)
     ai_t = game_engine.UID.make(3, 1000)
-    game = game_engine.Game(1, pl_t, ai_t)
+
+    class G:
+        def push_card_updated(self, *args, **kwargs):
+            pass
+
+    game = G()
     card(db, 101, 0, TPL_PLAIN, "warzone")
-    bstate = {"resolving_source_uid": 201, "resolving_owner_id": 5}
+    bstate = {"resolving_source_uid": 201, "resolving_owner_id": 5,
+              "resolving_target_uid": 101}
     card(db, 201, 5, TPL_PLAIN, "warzone")
-    apply_attribute_grant(
-        game, S(), db, H(), pl_t, ai_t, 101, "<b>Defensive</b>",
-        temporary=True, bstate=bstate,
-        duration="BeginningOfOwnersTurn", source_owner_id=5)
+    context = EffectContext.from_rules_port(
+        game, S(), db, H(), pl_t, ai_t, bstate,
+        "6ddc0f5f-9caa-96e8-a48d-f3d6cd212050")
+    result = _card_modifier(context, {"param": json.dumps({
+        "property": "attribute", "attribute_flags": "Defensive",
+        "duration": "BeginningOfOwnersTurn"})})
+    assert "attribute grant" in result, result
     defensive = int(game_engine.ECardAttributes.Defensive)
     assert db.execute(
         "SELECT temporary_attributes FROM game_cards WHERE card_uid=101"
     ).fetchone()[0] & defensive
+    buffs = json.loads(db.execute(
+        "SELECT temporary_buffs FROM game_cards WHERE card_uid=101"
+    ).fetchone()[0])
+    assert buffs["__attribute_expirations"][str(defensive)] == {
+        "owner": 5, "boundary": "start_turn"}
     clear_expired_temporary_attributes(db, 1, 0, "start_turn")
     assert db.execute(
         "SELECT temporary_attributes FROM game_cards WHERE card_uid=101"
@@ -755,6 +840,67 @@ def test_can_block_rejects_cantblock(db):
     assert can_block(db, 1, {}, 101, 102)
 
 
+def test_client_seed_refresh_repairs_the_typed_modifier_projection(db):
+    """An existing database is refreshed to the checked-in Records snapshot.
+
+    ``seed_database`` is insert-if-missing and only runs for a fresh database,
+    so a database seeded before the extractor emitted typed modifier fields
+    kept a lossy ``ability_effects.param`` row: Minor Ruby of Zeal's
+    Swiftstrike leaf read as an empty IntAttr, so a Hired Horn Hunter socketed
+    with it never gained Swiftstrike even while its controller held a Ruby
+    threshold.  The refresh upserts the seed-owned columns and is
+    fingerprint-gated, so a normal start is a no-op.
+    """
+    # This case needs the full snapshot-seeded database rather than the
+    # minimal fixture the harness passes in.
+    import os
+    import shutil
+    import static
+    from rules_port.static_rules import effective_attributes
+
+    gem = "45e3a0b2-7001-857c-66d5-256eca98b093"
+    hunter = "318ac376-9807-46f1-b8cb-6ddb965f2e53"
+    socket = "30560d1c-175a-0611-9a2e-92db365a0513"
+    first_strike = int(game_engine.ECardAttributes.FirstStrike)
+    ruby = int(game_engine.SHARD_TO_FLAG["ruby"])
+    stale_param = ('{"property": "intattr", "attribute": "", "operation": '
+                   '"Add", "amount": 0, "duration": "Permanent", '
+                   '"text": "<b>Swiftstrike</b>"}')
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    shutil.copy2(SRC, path)
+    db = sqlite3.connect(path)
+    try:
+        # Emulate a database seeded before the snapshot gained typed modifier
+        # fields and the snapshot fingerprint.
+        db.execute("DROP TABLE IF EXISTS client_seed_meta")
+        db.execute(
+            "UPDATE ability_effects SET param=?, condition_id='' "
+            "WHERE ability_guid=?", (stale_param, gem))
+        db.execute(
+            "INSERT INTO game_cards (session_id, user_id, card_uid, "
+            "template_guid, card_template_id, location, position, card_state, "
+            "card_abilities, card_type, card_attributes, card_attack_mod, "
+            "card_defense_mod, card_cost_mod, card_damage, permanent_buffs, "
+            "temporary_buffs, card_uses, resolved_at, original_template_guid) "
+            "VALUES (1,0,7001,?,?,'warzone',0,0,?,'Troop',0,0,0,0,0,'{}',"
+            "'{}','{}',0,?)",
+            (hunter, hunter, json.dumps([socket, gem]), hunter))
+        db.commit()
+        armed = {"ai_threshold": {ruby: 1}}
+        assert not effective_attributes(db, 1, armed, 7001) & first_strike
+        assert static.refresh_client_seed(db) > 0
+        assert effective_attributes(db, 1, armed, 7001) & first_strike
+        # The authored condition still gates the grant.
+        assert not effective_attributes(
+            db, 1, {"ai_threshold": {}}, 7001) & first_strike
+        # Fingerprint-gated: the repaired snapshot is a no-op on the next start.
+        assert static.refresh_client_seed(db) == 0
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     run("Lightning Armada scales with hand size", test_lightning_armada)
     run("Soul Armaments auras troops you control", test_soul_armaments_aura)
@@ -764,6 +910,10 @@ if __name__ == "__main__":
     run("Ozawa scales with champion health", test_ozawa_health)
     run("Dandelion Sprite needs WILD x3", test_dandelion_threshold_keywords)
     run("Emberspire Witch blocks health gain", test_ember_cant_gain_health)
+    run("Construct Foreman lifts the maximum hand size",
+        test_champion_passive_lifts_max_hand_size)
+    run("Emberspire Witch blocks the native heal path",
+        test_ember_cant_gain_health_reaches_the_native_heal_path)
     run("Harvester only blocked by artifact/blood", test_unblockable_except)
     run("Te'talca grants double damage flag", test_te_talca_double_damage_flag)
     run("Air Superiority buffs only Flyers", test_air_superiority_flight_aura)
@@ -792,3 +942,5 @@ if __name__ == "__main__":
         test_surfaced_speed_expires_at_end_of_turn_not_prep)
     run("Swiftstrike phases need FirstStrike/DualStrike", test_combat_has_swiftstrike)
     run("CantBlock troops cannot block", test_can_block_rejects_cantblock)
+    run("Client-seed refresh repairs typed modifier rows",
+        test_client_seed_refresh_repairs_the_typed_modifier_projection)

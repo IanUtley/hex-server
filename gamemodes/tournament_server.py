@@ -18,6 +18,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tournament_db as _tournament_db
+import pvp_db as _pvp_db
 from tournament_db import db_random_card_guids_for_set
 
 # Corinth is one persistent event, not a stream of generated rooms. Keep its
@@ -34,6 +35,10 @@ STALE_CLEANUP_INTERVAL = 60.0
 # old session/database state below.
 STALE_MATCH_AGE_SECONDS = 60 * 60
 STALE_TOURNAMENT_AGE_DAYS = 1
+# Abandoned Practice/FRA/PvE sessions keep a full deck copy of game_cards and
+# are not owned by the tournament replay pipeline, so the scheduler removes
+# them independently after this retention window.
+STALE_SESSION_AGE_DAYS = 7
 SEALED_PACK_COUNT = 6   # 6 packs for sealed
 DRAFT_PACK_COUNT = 3    # 3 packs for draft
 CARDS_PER_PACK = 15     # standard 15-card packs
@@ -276,7 +281,6 @@ def _cleanup_old_state(force=False):
     except Exception as exc:
         print(f"[tournament_server] Stale match recovery error: {exc}")
     result = _tournament_db.db_tournament_cleanup_old(STALE_TOURNAMENT_AGE_DAYS)
-    _last_stale_cleanup = now
     if any(result.values()):
         print(
             "[tournament_server] Old-state cleanup: "
@@ -284,6 +288,18 @@ def _cleanup_old_state(force=False):
             f"sessions={result['game_sessions_removed']} "
             f"cards={result['game_cards_removed']}"
         )
+    # Non-tournament (Practice/FRA/PvE) sessions are not tournament-owned, so
+    # the pass above deliberately skips them. Sweep the abandoned ones here.
+    stale = _pvp_db.db_cleanup_stale_sessions(STALE_SESSION_AGE_DAYS)
+    if any(stale.values()):
+        print(
+            "[tournament_server] Stale session cleanup: "
+            f"sessions={stale['sessions_removed']} "
+            f"cards={stale['cards_removed']} "
+            f"events={stale['events_removed']} "
+            f"transactions={stale['transactions_removed']}"
+        )
+    _last_stale_cleanup = now
 
 
 def _scheduler_loop():

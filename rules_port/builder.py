@@ -9,7 +9,7 @@ source or resolver.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from gamedata.play_plan import (AbilityInstance, ActivationData, CardPlayCost,
                                 PlayPlan)
@@ -367,7 +367,7 @@ class AbilityBuilder:
               effect: EffectRef | int | str | None = None,
               default: int = 0) -> int:
         """Evaluate one typed numeric field from the authoritative Records graph."""
-        from .fields import effect_field
+        from .bom_fields import effect_field
 
         return effect_field(
             db, bstate, self._effect_guid(effect), field_name, default)
@@ -376,7 +376,7 @@ class AbilityBuilder:
                        effect: EffectRef | int | str | None = None,
                        default: Any = None) -> Any:
         """Read one non-numeric typed field from an effect template."""
-        from .fields import effect_template_value
+        from .bom_fields import effect_template_value
 
         return effect_template_value(
             db, bstate, self._effect_guid(effect), field_name, default)
@@ -426,8 +426,8 @@ class AbilityBuilder:
         if graph is None:
             return ()
         result = []
-        for index, (kind, guid) in enumerate(
-                getattr(graph, "additional_cost_targets", ()) or ()):
+        for index, (kind, guid) in enumerate(cast(
+                Any, getattr(graph, "additional_cost_targets", ()) or ())):
             target = None
             for target_index, spec in enumerate(self.instance.targets):
                 if str(spec.guid).lower() == str(guid).lower():

@@ -17,7 +17,7 @@ def to_effect_view(state, player_id, opponent_id):
     """Return a side-oriented view while aliasing mutable stack state."""
     if not isinstance(state, dict):
         raise TypeError("PvP state must be a dict")
-    return {
+    view = {
         "pvp": True,
         "pids": list(state.get("pids") or []),
         "champ_map": state.get("champ_map") or {},
@@ -55,6 +55,19 @@ def to_effect_view(state, player_id, opponent_id):
         "stack_ai_passed": state.get("stack_ai_passed", False),
         "_next_instance_id": state.get("_next_instance_id", 1),
     }
+    # Records abilities read and update these shared TAC/list values while
+    # they resolve through the FRA-shaped PvP adapter. Keep the nested roots
+    # aliased so a paused continuation and its later resume see one instance.
+    for key in ("tac_statistics", "ability_runtime_state",
+                "ability_variable_cache", "ability_lists", "list_attrs",
+                "ability_variables", "card_integer_variables",
+                "stored_targets", "champion_int_attrs",
+                "stored_targets_by_card",
+                "stored_targets_by_card_this_turn",
+                "temporary_champion_int_attrs",
+                "talent_guids_by_owner", "escalation_counts_by_card"):
+        view[key] = state.setdefault(key, {})
+    return view
 
 
 def apply_effect_view(state, view, player_id, opponent_id):
@@ -88,7 +101,15 @@ def apply_effect_view(state, view, player_id, opponent_id):
             view.get("damaged_opponent_this_turn") or [])
     if "bonus_turn_pid" in view:
         state["bonus_turn_pid"] = int(view.get("bonus_turn_pid") or 0)
-    for key in ("champion_counters", "player_visibility"):
+    for key in ("champion_counters", "player_visibility",
+                "tac_statistics", "ability_runtime_state",
+                "ability_variable_cache", "ability_lists", "list_attrs",
+                "ability_variables", "card_integer_variables",
+                "stored_targets", "champion_int_attrs",
+                "stored_targets_by_card",
+                "stored_targets_by_card_this_turn",
+                "temporary_champion_int_attrs",
+                "talent_guids_by_owner", "escalation_counts_by_card"):
         if key in view:
             state[key] = dict(view.get(key) or {})
     if "stack" in view:
@@ -96,4 +117,3 @@ def apply_effect_view(state, view, player_id, opponent_id):
     if "_next_instance_id" in view:
         state["_next_instance_id"] = int(view["_next_instance_id"] or 1)
     return state
-

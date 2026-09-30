@@ -6,16 +6,23 @@ through :mod:`pve_db` and :mod:`profile_db`.
 """
 
 import json
+import random
 import uuid
 
-from pve_db import (db_clear_fra_challengers, db_create_fra_challengers,
+from pve_db import (db_buyout_fra_tier_one, db_clear_fra_challengers,
+                db_create_fra_challengers,
+                db_claim_arena_rewards,
                 db_get_arena_fight_history, db_get_arena_state,
                 db_get_active_fra_challenges, db_get_fra_challenge,
                 db_get_fra_challengers,
                 db_get_fra_public_base_encounter,
                 db_champion_template_health,
-                db_roll_fra_start_challenge, db_update_arena_state)
-from profile_db import db_user_owns_deck
+                db_prepare_fra_fight_challenge,
+                db_roll_fra_start_challenge,
+                db_store_fra_challenge_resolution, db_update_arena_state,
+                _fra_transaction)
+from profile_db import db_card_instance_template, db_user_owns_deck
+from pvp_db import db_deck_cards_json
 from db import log_req as _log_req
 from encoder import (compress_gzip, encode_datawrapper,
                      encode_get_challengers_response,
@@ -101,11 +108,13 @@ def _mask_unfought_challenger(challenger, next_index):
 
 
 def _send_challenger_list(handler, target, instance, reqid, comp, session_id,
-                          conh, service_uid, log_prefix=""):
+                          conh, service_uid, log_prefix="", *,
+                          challengers=None, reveal_all=False):
     """Send the current roster projection to refresh ArenaClient's cache."""
     user_id = handler.user_profile["id"]
     arena = db_get_arena_state(user_id)
-    challengers = db_get_fra_challengers(user_id)
+    if challengers is None:
+        challengers = db_get_fra_challengers(user_id)
     if not challengers and arena["deck_id"]:
         challengers = db_create_fra_challengers(user_id)
     prefix = f"{log_prefix} " if log_prefix else ""
@@ -114,7 +123,8 @@ def _send_challenger_list(handler, target, instance, reqid, comp, session_id,
     next_index = int(arena.get("challenger_index", 0) or 0)
     public_challengers = []
     for item in challengers[:20]:
-        public = _mask_unfought_challenger(item, next_index)
+        public = dict(item) if reveal_all else _mask_unfought_challenger(
+            item, next_index)
         public_challengers.append({
             "id": public["id"], "deck": public["deck"],
             "name": public["name"], "boss": public["boss"],
@@ -140,6 +150,14 @@ def _arena_mc_challenge_fields(challenge):
     ]
 
 
+def _arena_objective_fields(challenge):
+    """Encode the challenge fields expected by UIBattle's objective panel."""
+    fields = _arena_mc_challenge_fields(challenge)
+    fields[-1] = ("Body", "string", str(
+        (challenge or {}).get("objective_text", "") or ""))
+    return fields
+
+
 def _arena_info_fields(arena):
     return [
         ("ArenaID", "ulong", 1), ("PlayerID", "ulong", 1),
@@ -152,7 +170,7 @@ def _arena_info_fields(arena):
         ("GoldPacks", "int", int(arena.get("gold_earned", 0))),
         ("CardPacks", "int", 0),
         ("EquipmentPacks", "int", int(arena.get("chests_earned", 0))),
-        ("IsBuyout", "bool", False),
+        ("IsBuyout", "bool", bool(arena.get("is_buyout", False))),
         ("Buffs", "coll", (
             "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaBuff",
             0, [])),
@@ -161,11 +179,13 @@ def _arena_info_fields(arena):
 
 def _arena_payload(user_id):
     arena = db_get_arena_state(user_id)
+    index = int(arena.get("challenger_index", 0) or 0)
     challengers = db_get_fra_challengers(user_id)
     if not challengers and arena["deck_id"]:
         challengers = db_create_fra_challengers(user_id)
+    if challengers and arena.get("deck_id"):
+        db_prepare_fra_fight_challenge(user_id, fight_index=index)
     history = db_get_arena_fight_history(user_id)
-    index = int(arena.get("challenger_index", 0) or 0)
     current = challengers[index] if index < len(challengers) else None
     current_fight = history[index] if index < len(history) else {
         "fight_id": index + 1, "fight_tier": index // 5 + 1,
@@ -173,15 +193,111 @@ def _arena_payload(user_id):
         "result": "NONE",
     }
     arena = dict(arena)
+    arena["is_buyout"] = any(
+        item.get("result") == "SKIP" and
+        int(item.get("fight_tier", 1) or 1) == 1
+        for item in history[:5])
     arena["fight_id"] = current_fight["fight_id"]
     return arena, challengers, current, current_fight, history
 
 
-def _challenge_for_fight(fight):
+def _challenge_for_fight(fight, conn=None):
     guid = str(fight.get("round_challenge", _ZERO_GUID) or _ZERO_GUID)
     if guid == _ZERO_GUID:
         return None
-    return db_get_fra_challenge(conversation_guid=guid)
+    return db_get_fra_challenge(conversation_guid=guid, conn=conn)
+
+
+def _fra_challenge_metadata(challenge):
+    """Decode the authored metadata used to distinguish challenge prompts."""
+    if not isinstance(challenge, dict):
+        return {}
+    try:
+        metadata = json.loads(challenge.get("metadata_json", "{}") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _is_fra_challenge_prompt(challenge):
+    """Whether *challenge* is a player-decidable FRA challenge prompt."""
+    return _fra_challenge_metadata(challenge).get("trigger") == "challenge"
+
+
+def _resolve_fra_challenge_response(challenge, *values):
+    """Normalize a wire ``ACCEPT`` or an authored answer into a response.
+
+    The client has no way to decline an MC challenge.  It sends ``ACCEPT``
+    when the player accepts; some clients and test tools expose the selected
+    conversation text instead, so only an exact, case-insensitive match to
+    the row's authored ``answer_text`` is accepted as well, and arbitrary
+    text cannot opt a player into a challenge.
+    """
+    answer_text = str((challenge or {}).get("answer_text", "") or "").strip()
+    for value in values:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value).strip()
+        if text.upper() == "ACCEPT":
+            return "ACCEPT"
+        if answer_text and text.casefold() == answer_text.casefold():
+            return "ACCEPT"
+    return ""
+
+
+def _record_fra_challenge_update(user_id, values):
+    """Resolve and persist one MC update while holding the FRA transaction."""
+    with _fra_transaction() as connection:
+        arena = db_get_arena_state(user_id, conn=connection)
+        index = int(arena.get("challenger_index", 0) or 0)
+        history = db_get_arena_fight_history(user_id, conn=connection)
+        if not 0 <= index < len(history):
+            return ""
+        fight = history[index]
+        challenge = _challenge_for_fight(fight, conn=connection)
+        if not _is_fra_challenge_prompt(challenge):
+            return ""
+        response = _resolve_fra_challenge_response(challenge, *values)
+        if not response:
+            return ""
+        current = str(fight.get("challenge_response", "NONE") or "NONE").upper()
+        if current != response:
+            fight["challenge_response"] = response
+            db_update_arena_state(
+                user_id, conn=connection, fight_history=json.dumps(history))
+        return response
+
+
+def record_fra_challenge_conversation_answer(user_id, conversation_guid):
+    """Treat completion of the authored answer as accepting its challenge.
+
+    The fixed client submits only ``ConversationId`` when the conversation
+    closes, so the server cannot receive the answer label itself.  Restrict
+    this path to the current row's authored challenge conversation; reward
+    and boss-notification conversations never become challenge acceptances.
+    """
+    challenge_guid = str(conversation_guid or "").strip()
+    if not challenge_guid:
+        return False
+    with _fra_transaction() as connection:
+        arena = db_get_arena_state(user_id, conn=connection)
+        index = int(arena.get("challenger_index", 0) or 0)
+        history = db_get_arena_fight_history(user_id, conn=connection)
+        if not 0 <= index < len(history):
+            return False
+        fight = history[index]
+        challenge = _challenge_for_fight(fight, conn=connection)
+        if (not _is_fra_challenge_prompt(challenge) or
+                not str(challenge.get("answer_text", "") or "").strip() or
+                str(challenge.get("conversation_guid", "")).casefold() !=
+                challenge_guid.casefold()):
+            return False
+        current = str(fight.get("challenge_response", "NONE") or "NONE").upper()
+        if current != "ACCEPT":
+            fight["challenge_response"] = "ACCEPT"
+            db_update_arena_state(
+                user_id, conn=connection, fight_history=json.dumps(history))
+        return True
 
 
 def _fallback_challenger(current_fight):
@@ -269,8 +385,8 @@ def _assign_deck(handler, target, instance, reqid, comp, session_id, conh,
         user_id, deck_id=deck_id, wins=0, losses=0, challenger_index=0,
         fight_history="[]", gold_earned=0, chests_earned=0, sacks_earned=0)
     challengers = db_create_fra_challengers(user_id)
-    # A run starts before opponent #1.  There is no Tier 1 skip path in the
-    # extracted server, so this is also the explicit full-run boundary.
+    # A run starts before opponent #1. Eligible accounts can use BuyoutArena
+    # to skip the first five fights once this roster has been assigned.
     challenge = db_roll_fra_start_challenge(user_id)
     history = db_get_arena_fight_history(user_id)
     challenger = challengers[0] if challengers else {
@@ -328,35 +444,66 @@ def _assign_deck(handler, target, instance, reqid, comp, session_id, conh,
 def _cash_out(handler, target, instance, reqid, comp, session_id, conh,
               service_uid):
     user_id = handler.user_profile["id"]
-    arena = db_get_arena_state(user_id)
-    gold = arena["gold_earned"]
+    result = db_claim_arena_rewards(user_id)
+    gold = int(result.get("gold", 0) or 0)
     _log_req(f">>> DoArenaCashOut (dt=10011): gold={gold}, "
-              f"chests={arena['chests_earned']}, sacks={arena['sacks_earned']}")
-    db_update_arena_state(
-        user_id, deck_id=0, wins=0, losses=0, challenger_index=0,
-        fight_history="[]",
-        gold_earned=0, chests_earned=0, sacks_earned=0)
-    db_clear_fra_challengers(user_id)
+             f"loot={len(result.get('loot', []))}, "
+             f"roster={len(result.get('challengers', []))}")
+    if not result.get("success"):
+        resp_inner = encode_objfmt_response(
+            ["Game.Client.Network.Campaign.DoArenaCashOutResponse",
+             "System.Boolean", "System.Int32", "System.String",
+             "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
+             "Reckoning.Campaign.Messages.Arena.ArenaReward", "System.UInt64",
+             "Game.Shared.ResourceId", "System.Guid",
+             "Game.Shared.Network.Campaign.EDoArenaCashOutError",
+             "System.Int32"],
+            [("Success", "bool", False), ("GoldWin", "int", 0),
+             ("AllLoot", "arenarewardlist", (
+                 "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
+                 0, [])),
+             ("Error", "enum1", (
+                 "Game.Shared.Network.Campaign.EDoArenaCashOutError",
+                 int(result.get("error", 2) or 2))),
+             ("ErrorMessage", "string", str(
+                 result.get("error_message", "Cash-out failed.") or
+                 "Cash-out failed."))])
+        size = _send_response(handler, 10011, resp_inner, comp, session_id,
+                              reqid, target, instance, conh, service_uid)
+        _log_req(f"    Sent DoArenaCashOut failure response ({size}b)")
+        return
+
+    # The summary window resolves every completed fight through ArenaClient's
+    # cached master list. Reveal the actual deck/name/boss values before the
+    # cash-out response invokes the summary callback; DestroyArenaData clears
+    # this transient cache only after the loot window has been shown.
+    _send_challenger_list(
+        handler, target, instance, 0, comp, session_id, conh, service_uid,
+        log_prefix="reveal", challengers=result.get("challengers", []),
+        reveal_all=True)
+    if gold and hasattr(handler, "push_currency_to_client"):
+        handler.push_currency_to_client(gold_delta=gold)
+        if isinstance(handler.user_profile, dict):
+            handler.user_profile["gold"] = int(
+                result.get("new_gold", handler.user_profile.get("gold", 0))
+                or 0)
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.DoArenaCashOutResponse",
          "System.Boolean", "System.Int32", "System.String",
          "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
          "Reckoning.Campaign.Messages.Arena.ArenaReward", "System.UInt64",
-         "System.String", "Game.Shared.Network.Campaign.EDoArenaCashOutError",
-         "System.Int32"],
+         "Game.Shared.ResourceId", "System.Guid",
+         "Game.Shared.Network.Campaign.EDoArenaCashOutError", "System.Int32"],
         [("Success", "bool", True), ("GoldWin", "int", gold),
-         ("AllLoot", "coll", (
+         ("AllLoot", "arenarewardlist", (
              "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaReward",
-             0, [])), ("Error", "int", 0), ("ErrorMessage", "string", "")])
+             len(result.get("loot", [])), result.get("loot", []))),
+         ("Error", "enum1", (
+             "Game.Shared.Network.Campaign.EDoArenaCashOutError", 0)),
+         ("ErrorMessage", "string", "")])
     size = _send_response(handler, 10011, resp_inner, comp, session_id,
                           reqid, target, instance, conh, service_uid)
     _log_req(f"    Sent DoArenaCashOut response ({size}b)")
-    # ArenaClient intentionally keeps m_AllFighters between lobby visits and
-    # only requests this list when it is empty.  Send an empty authoritative
-    # list after cash-out so the old run's portraits cannot be reused by the
-    # next run.
-    _send_challenger_list(handler, target, instance, 0, comp, session_id,
-                          conh, service_uid, log_prefix="clear")
 
 
 def _destroy_arena(handler, target, instance, reqid, comp, session_id, conh,
@@ -477,8 +624,20 @@ def _challenger_list(handler, target, instance, reqid, comp, session_id, conh,
 
 def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
                       conh, service_uid):
-    fight = _arena_payload(handler.user_profile["id"])[3]
+    user_id = int(handler.user_profile["id"])
+    fight = _arena_payload(user_id)[3]
     challenge = _challenge_for_fight(fight)
+    # During an Arena battle, the conversation sent with the game setup also
+    # raises UIEventShowObjectivePanel. UIBattle appends that event to its
+    # challenge list, and its reconnect path appends this response separately.
+    # Return an invalid challenge for that in-game lookup so the conversation
+    # remains the single source for both dialogue and objective text.
+    if (_has_active_fra_session(handler) and challenge and
+            _wire_guid(challenge.get("conversation_guid")) != _ZERO_GUID):
+        _log_req(
+            "    FRA challenge objective omitted from reconnect lookup; "
+            f"conversation supplies it ({challenge.get('challenge_name', 'unknown')})")
+        challenge = None
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.GetArenaMCChallengeResponse",
          "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge", "System.UInt64",
@@ -486,7 +645,7 @@ def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
          "Game.Shared.Network.Campaign.EGetArenaMCChallengeError", "System.Int32"],
         [("MCChallenge", "struct", (
             "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge",
-            _arena_mc_challenge_fields(challenge))),
+            _arena_objective_fields(challenge))),
          ("Error", "enum1", (
              "Game.Shared.Network.Campaign.EGetArenaMCChallengeError", 0)),
          ("ErrorMessage", "string", "")])
@@ -494,43 +653,114 @@ def _get_mc_challenge(handler, target, instance, reqid, comp, session_id,
                    target, instance, conh, service_uid)
 
 
-def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
-                     conh, service_uid):
-    user_id = handler.user_profile["id"]
+def _has_active_fra_session(handler):
+    """Whether a reconnect challenge lookup belongs to a live FRA battle."""
+    profile = getattr(handler, "user_profile", {}) or {}
+    player_ids = (
+        getattr(handler, "client_reck_id", None),
+        profile.get("id") if isinstance(profile, dict) else None,
+        getattr(handler, "client_uid", None),
+    )
+    try:
+        from game_session import find_session_by_player
+        from game_engine import ESessionFlags
+        seen = set()
+        for player_id in player_ids:
+            if player_id is None:
+                continue
+            try:
+                player_id = int(player_id)
+            except (TypeError, ValueError):
+                continue
+            if not player_id or player_id in seen:
+                continue
+            seen.add(player_id)
+            session = find_session_by_player(player_id)
+            if session is None or str(session.state or "").lower() == "ended":
+                continue
+            encounter_data = session.encounter_data or {}
+            raw_flags = encounter_data.get("SessionFlags", 0)
+            if isinstance(raw_flags, dict):
+                raw_flags = raw_flags.get("value__", 0)
+            if int(raw_flags or 0) & int(ESessionFlags.IsPvEArena):
+                return True
+        return False
+    except Exception as exc:
+        _log_req(f"    FRA reconnect challenge lookup session check failed: {exc}")
+        return False
+
+
+def get_battle_modifications(user_id):
+    """Return the saved FRA challenge and round-zero mods for battle setup.
+
+    The fixed client only requests GetArenaBattleMods when reconnecting. Live
+    encounters therefore call this shared lookup from authoritative setup;
+    the network handler below only serializes the same result for compatible
+    clients.
+    """
     arena, _challengers, challenger, fight, history = _arena_payload(user_id)
     challenger_index = int(arena.get("challenger_index", 0) or 0)
-    active_challenges = db_get_active_fra_challenges(user_id)
+    active_challenges = db_get_active_fra_challenges(
+        user_id, fight_index=challenger_index)
     modifications = []
     for challenge in active_challenges:
-        try:
-            metadata = json.loads(challenge.get("metadata_json", "{}") or "{}")
-        except (TypeError, ValueError):
-            metadata = {}
-        if metadata.get("opponent_scope") != "TierOne" or challenger_index >= 5:
-            continue
-        if (challenge.get("challenge_key") == "starting_health_15"
-                and history
-                and str(history[0].get("challenge_response", "NONE")).upper() != "DECLINE"):
+        metadata = _fra_challenge_metadata(challenge)
+        if metadata.get("opponent_scope") == "TierOne":
+            if (challenger_index != 0
+                    or challenge.get("challenge_key") != "starting_health_15"):
+                continue
             adjustment = int(metadata.get("health_adjustment", 0) or 0)
             base_health = db_champion_template_health(
                 (challenger or {}).get("champion_guid"))
-            # EncounterModAddChampionHealth with Absolute=true is the client
-            # operation that can lower a champion's starting health safely.
             modifications.append({
+                "wire_type": "Reckoning.Game.EncounterModAddChampionHealth",
                 "amount": max(1, base_health + adjustment),
                 "absolute": True,
                 "is_applied": False,
                 "round_to_apply": 0,
                 "conversation_id": challenge["conversation_guid"],
-                "target_player": 0,  # EModTarget.AIPlayer
+                "target_player": 0,
             })
+            continue
+        for descriptor in _fra_challenge_mod_descriptors(
+                user_id, arena, fight, history, challenge):
+            modification = _encode_fra_challenge_mod(
+                descriptor, challenge["conversation_guid"])
+            if modification:
+                modifications.append(modification)
+    challenge = _challenge_for_fight(fight)
+    return {
+        "arena": arena,
+        "challenger": challenger,
+        "fight": fight,
+        "history": history,
+        "challenge": challenge,
+        "active_challenges": active_challenges,
+        "modifications": modifications,
+    }
+
+
+def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
+                     conh, service_uid):
+    user_id = handler.user_profile["id"]
+    setup = get_battle_modifications(user_id)
+    active_challenges = setup["active_challenges"]
+    modifications = setup["modifications"]
     resp_inner = encode_objfmt_response(
         ["Game.Client.Network.Campaign.GetArenaBattleModsResponse",
          "System.Collections.Generic.List`1#Reckoning.Game.EncounterModBase",
          "Reckoning.Game.EncounterModBase",
-         "Reckoning.Game.EncounterModAddChampionHealth", "System.Int32",
-         "System.Boolean", "Game.Shared.ResourceId", "System.Guid",
+         "Reckoning.Game.EncounterModAddChampionHealth",
+         "Reckoning.Game.EncounterModAddCard",
+         "Reckoning.Game.EncounterModAddResource",
+         "Reckoning.Game.EncounterModDrawCards",
+         "Reckoning.Game.CardThreshold", "System.Int32", "System.Boolean",
+         "Game.Shared.ResourceId", "System.Guid",
          "Game.Shared.Mechanics.EModTarget",
+         "Game.Shared.Mechanics.ECardCollections",
+         "Game.Shared.Mechanics.ECardLocations",
+         "Game.Shared.Mechanics.ECardShards",
+         "System.Collections.Generic.List`1#Reckoning.Game.CardThreshold",
          "Game.Shared.Network.Campaign.EGetArenaBattleModsError"],
         [("Modifications", "encountermodlist", (
             "System.Collections.Generic.List`1#Reckoning.Game.EncounterModBase",
@@ -545,28 +775,193 @@ def _get_battle_mods(handler, target, instance, reqid, comp, session_id,
                    target, instance, conh, service_uid)
 
 
+def _fra_challenge_mod_descriptors(user_id, arena, fight, history, challenge):
+    """Read a challenge's authored mods and persist runtime tunnel choices."""
+    guid = challenge["conversation_guid"]
+    resolved = fight.get("resolved_modifications", {})
+    if isinstance(resolved, dict) and guid in resolved:
+        return resolved[guid]
+    try:
+        descriptors = json.loads(
+            challenge.get("modifications_json", "[]") or "[]")
+    except (TypeError, ValueError):
+        descriptors = []
+    if not isinstance(descriptors, list):
+        return []
+
+    changed = False
+    for descriptor in descriptors:
+        selection = descriptor.get("selection", {})
+        if not (isinstance(selection, dict) and selection.get("tunnel")
+                and not descriptor.get("card_guid")):
+            continue
+        deck_json = db_deck_cards_json(
+            int(arena.get("deck_id", 0) or 0), user_id)
+        try:
+            deck_refs = json.loads(deck_json or "[]")
+        except (TypeError, ValueError):
+            deck_refs = []
+        templates = []
+        for reference in deck_refs if isinstance(deck_refs, list) else []:
+            try:
+                template_guid = str(uuid.UUID(str(reference)))
+            except (TypeError, ValueError, AttributeError):
+                try:
+                    template_guid = db_card_instance_template(
+                        user_id, int(reference)) or ""
+                except (TypeError, ValueError):
+                    template_guid = ""
+            if template_guid and template_guid != _ZERO_GUID:
+                templates.append(template_guid)
+        if templates:
+            descriptor["card_guid"] = random.SystemRandom().choice(templates)
+            changed = True
+        else:
+            # This challenge's card comes from the player's deck at runtime;
+            # without a valid deck reference there is no client-valid mod.
+            descriptor["_unresolved"] = True
+
+    descriptors = [item for item in descriptors if not item.get("_unresolved")]
+    if changed:
+        return db_store_fra_challenge_resolution(
+            user_id, int(arena.get("challenger_index", 0) or 0), guid,
+            descriptors)
+    return descriptors
+
+
+def _encode_fra_challenge_mod(descriptor, conversation_guid):
+    """Map extracted EncounterMod descriptors to client wire fields."""
+    mod_type = str(descriptor.get("type", ""))
+    if mod_type not in {
+            "EncounterModAddCard", "EncounterModAddChampionHealth",
+            "EncounterModAddResource", "EncounterModDrawCards"}:
+        return None
+    target_values = {"AIPlayer": 0, "All": 1, "UserPlayer": 2}
+    result = {
+        "wire_type": "Reckoning.Game." + mod_type,
+        "round_to_apply": int(descriptor.get("round_to_apply", 0) or 0),
+        "is_applied": bool(descriptor.get("is_applied", False)),
+        "conversation_id": str(descriptor.get("conversation_id")
+                                or conversation_guid),
+        "target_player": target_values.get(
+            str(descriptor.get("target_player", "AIPlayer")), 0),
+    }
+    if mod_type == "EncounterModAddChampionHealth":
+        result.update({
+            "amount": int(descriptor.get("amount", 0) or 0),
+            "absolute": bool(descriptor.get("absolute", False)),
+        })
+    elif mod_type == "EncounterModAddCard":
+        try:
+            result["card_guid"] = str(uuid.UUID(
+                str(descriptor.get("card_guid", ""))))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        result.update({
+            "amount": int(descriptor.get("amount", 1)
+                           if descriptor.get("amount") is not None else 1),
+            "collection": str(descriptor.get("collection", "Deck") or "Deck"),
+            "location": str(descriptor.get("location", "Unknown") or "Unknown"),
+            "shuffle": bool(descriptor.get("shuffle", False)),
+        })
+    elif mod_type == "EncounterModAddResource":
+        thresholds = descriptor.get("threshold_values", [])
+        result.update({
+            "max_resource_value": int(
+                descriptor.get("max_resource_value", 0) or 0),
+            "threshold_values": [
+                {"color_flags": int(item.get("color_flags", 0) or 0),
+                 "threshold": int(item.get("threshold", 0) or 0)}
+                for item in thresholds if isinstance(item, dict)
+            ] if isinstance(thresholds, list) else [],
+            "charge_value": int(descriptor.get("charge_value", 0) or 0),
+            "absolute": bool(descriptor.get("absolute", False)),
+        })
+    return result
+
+
 def _update_mc_challenge(handler, target, instance, reqid, comp, session_id,
                          conh, inner_obj, service_uid):
-    """Persist the player's ACCEPT/DECLINE decision for the current fight."""
+    """Persist the fire-and-forget ACCEPT decision for this fight.
+
+    The fixed client's CampaignService does not register an inbound handler
+    for response type 10019, so replying with that type is rejected as an
+    unknown command.
+    """
     user_id = handler.user_profile["id"]
-    response = inner_obj.get("EncounterData", {}) if isinstance(inner_obj, dict) else {}
-    response = response.get("ChallengeResponse", "") if isinstance(response, dict) else ""
-    response = str(response or "").upper()
-    if response in {"ACCEPT", "DECLINE"}:
-        arena = db_get_arena_state(user_id)
-        index = int(arena.get("challenger_index", 0) or 0)
-        history = db_get_arena_fight_history(user_id)
-        if index < len(history) and _challenge_for_fight(history[index]):
-            history[index]["challenge_response"] = response
-            db_update_arena_state(user_id, fight_history=json.dumps(history))
+    encounter = inner_obj.get("EncounterData", {}) if isinstance(inner_obj, dict) else {}
+    values = []
+    if isinstance(encounter, dict):
+        values.extend(encounter.get(key) for key in (
+            "ChallengeResponse", "AnswerText", "answer_text",
+            "SelectedAnswer", "Choice", "SelectedChoice"))
+    if isinstance(inner_obj, dict):
+        values.extend(inner_obj.get(key) for key in (
+            "ChallengeResponse", "AnswerText", "answer_text",
+            "SelectedAnswer", "Choice", "SelectedChoice"))
+    response = _record_fra_challenge_update(user_id, values)
+    _log_req(f">>> UpdateMCChallenge (dt=10019): "
+             f"decision={response or 'unchanged'}")
+
+
+def _buyout(handler, target, instance, reqid, comp, session_id, conh,
+            service_uid):
+    """Honor the account flag and skip the first FRA tier without rewards."""
+    user_id = handler.user_profile["id"]
+    arena_state = db_get_arena_state(user_id)
+    deck_id = int(arena_state.get("deck_id", 0) or 0)
+    if not deck_id or not db_user_owns_deck(deck_id, user_id):
+        result = {"success": False, "reason": "A valid arena deck is required"}
+    else:
+        result = db_buyout_fra_tier_one(user_id)
+
+    arena, _challengers, challenger, fight, history = _arena_payload(user_id)
+    index = int(arena.get("challenger_index", 0) or 0)
+    if challenger is None:
+        challenger = _fallback_challenger(fight)
+    else:
+        challenger = _mask_unfought_challenger(challenger, index)
+    challenge = _challenge_for_fight(fight)
+    succeeded = bool(result.get("success"))
+    error = 0 if succeeded else -1
+    error_message = "" if succeeded else str(
+        result.get("reason", "Buyout rejected"))
     resp_inner = encode_objfmt_response(
-        ["Game.Client.Network.Campaign.UpdateMCChallengeResponse",
-         "Game.Shared.Network.Campaign.EUpdateMCChallengeError", "System.Int32"],
-        [("Error", "enum1", (
-            "Game.Shared.Network.Campaign.EUpdateMCChallengeError", 0)),
-         ("ErrorMessage", "string", "")])
-    _send_response(handler, 10019, resp_inner, comp, session_id, reqid,
-                   target, instance, conh, service_uid)
+        ["Game.Client.Network.Campaign.BuyoutArenaResponse",
+         "Reckoning.Campaign.Messages.Arena.ArenaData", "System.UInt64",
+         "Game.Shared.Mechanics.ECampaignDifficulty", "System.Int32",
+         "System.Boolean", "System.String",
+         "System.Collections.Generic.List`1#Reckoning.Campaign.Messages.Arena.ArenaBuff",
+         "Reckoning.Campaign.Messages.Arena.ArenaChallenger",
+         "Game.Shared.ResourceId", "System.Guid",
+         "System.Collections.Generic.List`1#Game.Shared.ResourceId",
+         "Reckoning.Campaign.Messages.Arena.ArenaFight",
+         _ARENA_FIGHT_LIST_TYPE,
+         "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge",
+         "Game.Shared.Network.Campaign.EBuyoutArenaError", "System.Int32"],
+        [("Success", "bool", succeeded),
+         ("ArenaInfo", "struct", (
+             "Reckoning.Campaign.Messages.Arena.ArenaData",
+             _arena_info_fields(arena))),
+         ("EncounterData", "struct", (
+             "Reckoning.Campaign.Messages.Arena.ArenaFight",
+             _arena_fight_fields(fight))),
+         ("ChallengerData", "struct", (
+             "Reckoning.Campaign.Messages.Arena.ArenaChallenger",
+             _arena_challenger_fields(challenger))),
+         ("MCChallengeData", "struct", (
+             "Reckoning.Campaign.Messages.Arena.ArenaMCChallenge",
+             _arena_mc_challenge_fields(challenge))),
+         ("FightHistory", "arenafightlist",
+          (_ARENA_FIGHT_LIST_TYPE, len(history), history)),
+         ("Error", "enum1", (
+             "Game.Shared.Network.Campaign.EBuyoutArenaError", error)),
+         ("ErrorMessage", "string", error_message)])
+    size = _send_response(handler, 10017, resp_inner, comp, session_id,
+                          reqid, target, instance, conh, service_uid)
+    _log_req(f">>> BuyoutArena (dt=10017): success={succeeded}, "
+             f"challenger_index={index}, reason={error_message or 'ok'}")
+    _log_req(f"    Sent BuyoutArena response ({size}b)")
 
 
 def handle_request(handler, target, instance, reqid, comp, session_id, conh,
@@ -607,6 +1002,9 @@ def handle_request(handler, target, instance, reqid, comp, session_id, conh,
     elif data_type == 10013:
         _refresh_info(handler, target, instance, reqid, comp, session_id, conh,
                       SERVICE_MAIL_UID)
+    elif data_type == 10017:
+        _buyout(handler, target, instance, reqid, comp, session_id, conh,
+                SERVICE_MAIL_UID)
     elif data_type == 10019:
         _update_mc_challenge(handler, target, instance, reqid, comp, session_id,
                              conh, inner_obj, SERVICE_MAIL_UID)

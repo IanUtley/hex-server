@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, cast
 
 from .phases import phase_name
 
@@ -72,8 +72,8 @@ def _same_player_id(session, left, right) -> bool:
     if left == right:
         return True
     try:
-        return int(getattr(left, "uid64", left)) == int(
-            getattr(right, "uid64", right))
+        return int(cast(Any, getattr(left, "uid64", left))) == int(
+            cast(Any, getattr(right, "uid64", right)))
     except (TypeError, ValueError):
         return False
 
@@ -208,7 +208,8 @@ class CardCountRequirement:
         if not callable(checker):
             return False
         try:
-            return _compare(int(checker(self.player_id, self.collection)),
+            return _compare(int(cast(Any, checker(
+                self.player_id, self.collection))),
                             self.comparison, int(self.quantity))
         except (TypeError, ValueError):
             return False
@@ -633,6 +634,30 @@ class QuickActionCardRequirement:
             return bool(card_type & 64 or attributes & 268435456)
         except (TypeError, ValueError):
             return False
+
+
+@dataclass(frozen=True)
+class CardPlayTimingRequirement:
+    """Match the client's speed, active-player, phase, and chain checks.
+
+    Quick-speed cards may be cast whenever their controller has priority.
+    Other cards require the active player in a main-phase priority window
+    with an empty chain.
+    """
+    card_id: object
+
+    def is_valid(self, session, player_id) -> bool:
+        if QuickActionCardRequirement(self.card_id).is_valid(
+                session, player_id):
+            return True
+        chain = getattr(session, "chain", None)
+        return (
+            MainPhaseRequirement().is_valid(session, player_id)
+            and PlayerIsActiveRequirement(player_id).is_valid(
+                session, player_id)
+            and chain is not None
+            and bool(getattr(chain, "is_empty", False))
+        )
 
 
 class PriorityWindowRequirement:

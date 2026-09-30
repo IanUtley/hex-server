@@ -175,7 +175,7 @@ def db_record_session_transaction(session_id, player_uid, request_id,
              json.dumps(classification or {}, sort_keys=True, default=str),
              payload, str(pre_state_hash or "")))
         capture_db.commit()
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
     except BaseException:
         capture_db.rollback()
         raise

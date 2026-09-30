@@ -35,7 +35,7 @@ Adding a new card ability::
 
 from .framework.bom import (_LEAFS, _walk_bom, leaf_register, bom_has_leaf,
                             bom_has_discard, bom_leaf_prompt_data)
-from .framework.builder import (AbilityBuilder, AbilityContinuation, CostRef,
+from rules_port.builder import (AbilityBuilder, AbilityContinuation, CostRef,
                                 EffectRef, TargetRef)
 from .framework.context import EffectContext
 from .framework.effects.registry import effect
@@ -188,7 +188,7 @@ def resolve_played_spell(game, session, db, handler, pl_t, ai_t, bstate,
                 # target templates are resolved by the ability instance itself.
                 for index, target in enumerate(graph.targets):
                     if target.requires_input:
-                        target_map[index] = int(target_uid)
+                        target_map[index] = (int(target_uid),)
                         break
             out = resolve_ability(
                 handler, game, session, db, pl_t, ai_t, bstate, ag, src_uid,

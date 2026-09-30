@@ -85,13 +85,16 @@ class ConditionContext:
                     except (TypeError, ValueError):
                         continue
             counters, guids = self._counter_counts(uid)
+            int_attrs = dict((self.bstate.get("champion_int_attrs") or {}).get(
+                str(uid), {}) or {})
             return {"card_uid": uid, "card_type": "Champion",
                     "location": "champions", "user_id": owner,
                     "owner_id": owner, "controller_id": owner,
                     "attack": 0, "defense": int(health or 0),
                     "name": name or "Champion", "cost": 0,
                     "shards": [], "attributes": 0,
-                    "counters": counters, "counter_guids": guids}
+                    "counters": counters, "counter_guids": guids,
+                    "int_attrs": int_attrs}
         if uid in self._cards:
             return self._cards[uid]
         from pvp_db import db_condition_card_row
@@ -106,6 +109,15 @@ class ConditionContext:
         if not isinstance(buffs, dict):
             buffs = {}
         counters, guids = self._counter_counts(uid)
+        try:
+            card_abilities = json.loads(row[17] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            card_abilities = []
+        if not isinstance(card_abilities, list):
+            card_abilities = []
+        from pvp_db import db_game_card_effective_cost
+        effective_cost = db_game_card_effective_cost(
+            self.session.session_id, uid, self.bstate, conn=self.db)
         card = {"card_uid": int(row[0]), "card_type": row[1] or "",
                 "location": row[2] or "", "user_id": row[3],
                 "owner_id": row[3], "controller_id": row[3],
@@ -113,11 +125,14 @@ class ConditionContext:
                 "attack": int(row[5] or 0) + int(row[14] or 0),
                 "defense": int(row[6] or 0) + int(row[15] or 0),
                 "template_guid": row[7] or "", "name": row[8] or "",
-                "cost": int(row[9] or 0), "subtype": row[10] or "",
+                "cost": int(effective_cost or 0),
+                "subtype": row[10] or "",
                 "shards": _shards(row[11]),
                 "attributes": int(row[12] or 0) | int(row[13] or 0),
                 "int_attrs": buffs.get("int_attrs", {}),
+                "card_abilities": card_abilities,
                 "counters": counters, "counter_guids": guids,
+                "tags": buffs.get("tags", {}) or {},
                 "damaged_opponent_this_turn": list(
                     self.bstate.get("damaged_opponent_this_turn") or [])}
         self._cards[uid] = card

@@ -79,12 +79,21 @@ def news_feed(base_url):
                 "DetailTitleText": "Release Notes",
                 "DetailSubTitleText": "Hex TCG Private Server",
                 "DetailContentText": (
-                    "Frost Ring Arena now supports tiered encounters, elite decks, "
-                    "hidden boss information, unique opponents, and run rewards.\n\n"
+                    "Frost Ring Arena now supports twenty-fight tiered runs, "
+                    "unique opponent rosters, elite encounters, boss retries, "
+                    "challenge modifiers, treasure chests, and 100-gold rewards "
+                    "for each earned gold sack. Completed rosters are revealed "
+                    "when a run is cashed out.\n\n"
+                    "Campaign progress is now server-driven across maps, nodes, "
+                    "conversations, encounters, champion XP, and authored rewards, "
+                    "with progress persisted between sessions.\n\n"
+                    "Merry Melee Corinth is available as a persistent asynchronous "
+                    "event. Enter a run, build from the Corinth shard pool, and "
+                    "match against another entrant; finish with five wins or three "
+                    "losses to receive the run result.\n\n"
                     "Card abilities and AI behavior continue to move toward the "
                     "original gamedata definitions, with ongoing PvP and priority "
-                    "improvements.\n\n"
-                    "Mail, replay, tournament, Docker, and GHCR support are also "
+                    "improvements. Mail, replay, Docker, and GHCR support are also "
                     "available in the private server build."
                 ),
                 "ResizeContentFrame": True,
@@ -123,7 +132,7 @@ def _legacy_nonsteam_uid(user):
     return _player_id_from_name(f"{identity}#{disc}")
 
 
-def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=None,
+def db_set_user_flags(username, admin=None, mod=None, founder=None, steam_id=None,
                       password=None):
     """Create the user if needed and set their admin/moderator flags.
 
@@ -158,18 +167,21 @@ def db_set_user_flags(username, admin=False, mod=False, founder=False, steam_id=
     # Update password if provided (for register or password change on existing user).
     if password and uid:
         db_set_auth_password(uid, password, conn=db)
-    if admin:
-        flags["admin"] = "true"
-    else:
-        flags.pop("admin", None)
-    if mod:
-        flags["mod"] = "true"
-    else:
-        flags.pop("mod", None)
-    if founder:
-        flags["founder"] = "true"
-    else:
-        flags.pop("founder", None)
+    if admin is not None:
+        if admin:
+            flags["admin"] = "true"
+        else:
+            flags.pop("admin", None)
+    if mod is not None:
+        if mod:
+            flags["mod"] = "true"
+        else:
+            flags.pop("mod", None)
+    if founder is not None:
+        if founder:
+            flags["founder"] = "true"
+        else:
+            flags.pop("founder", None)
     db_set_auth_flags(uid, json.dumps(flags), conn=db)
     db.commit()
     db.close()
@@ -436,9 +448,19 @@ class HexAuthProxy(http.server.BaseHTTPRequestHandler):
                         steam_id.encode("utf-8")).hexdigest(), 16) % 10000).zfill(4)
                 username = f"{display}#{disc}"
 
-                admin = _flag(params.get("Admin"))
-                mod = _flag(params.get("Mod"))
-                founder = _flag(params.get("Founder"))
+                # Query-parameter privilege elevation is disabled unless explicitly
+                # enabled via HEX_ALLOW_QUERY_FLAGS or authorized via HEX_ADMIN_SECRET.
+                allow_elevation = (
+                    os.environ.get("HEX_ALLOW_QUERY_FLAGS", "").lower() in ("1", "true", "yes")
+                )
+                admin_secret = os.environ.get("HEX_ADMIN_SECRET", "").strip()
+                if admin_secret and _str(params.get("AdminSecret", [None])) == admin_secret:
+                    allow_elevation = True
+
+                admin = _flag(params.get("Admin")) if (allow_elevation and "Admin" in params) else None
+                mod = _flag(params.get("Mod")) if (allow_elevation and "Mod" in params) else None
+                founder = _flag(params.get("Founder")) if (allow_elevation and "Founder" in params) else None
+
                 flags = db_set_user_flags(username, admin=admin, mod=mod,
                                           founder=founder, steam_id=steam_id)
                 token = f"steam:{steam_id}" if steam_id else "test_token_abc123"

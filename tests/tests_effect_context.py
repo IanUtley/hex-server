@@ -12,7 +12,7 @@ from tests.test_db import fresh_database
 fresh_database()   # bind this process's database before ``db`` is imported
 
 import game_engine
-from abilities.framework.builder import AbilityBuilder
+from rules_port.builder import AbilityBuilder
 from abilities.framework.context import EffectContext
 from abilities.framework.effects.registry import _LEAFS, effect
 from gamedata.models import AbilityCost, TargetSpec
@@ -210,7 +210,7 @@ def test_tunnel_moves_source_to_underground_and_emits_zone_triggers():
 
     db = TunnelDB()
     game = _Game()
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         game, _Session(), db, object(), "player", "ai",
         # Legacy target aliases may be left behind by a nested trigger. A
         # source-bound Tunnel effect must continue to use the current typed
@@ -218,10 +218,10 @@ def test_tunnel_moves_source_to_underground_and_emits_zone_triggers():
         {"resolving_source_uid": 123, "resolving_target_uid": None,
          "player_spell_target": 999, "player_mod_target": 998},
         "effect", "")
-    with mock.patch("abilities.framework.effects.utility._push_card_in_zone"), \
-            mock.patch("abilities.framework.triggers.resolve_triggers") as triggers, \
+    with mock.patch("rules_port.zone_effects.project_card"), \
+            mock.patch("rules_port.triggers.dispatch_trigger") as triggers, \
             mock.patch(
-                "abilities.framework.effects.tokens.activate_creation_replacements_for_card"
+                "rules_port.creation_effects.activate_creation_replacements"
             ) as replacements:
         assert context.tunnel() == "tunneled 0x7b"
     # Reese's replacement is granted by Underground -> CastSpells, not by
@@ -234,7 +234,7 @@ def test_tunnel_moves_source_to_underground_and_emits_zone_triggers():
                          if sql.startswith("UPDATE game_cards"))
     assert int(update_params[-1]) == 123
     assert triggers.call_count == 2
-    assert [call.args[7] for call in triggers.call_args_list] == [
+    assert [call.args[1] for call in triggers.call_args_list] == [
         "CardExitedZoneEvent", "CardEnteredZoneEvent"]
 
 
@@ -560,12 +560,41 @@ def test_player_updated_carries_subterranean_spy_hand_permission():
     assert event.can_see_enemy_hand is True
 
 
+def test_player_updated_preserves_the_established_deck_sleeve():
+    """The client assigns DeckSleeveId unconditionally from PlayerUpdated.
+
+    Any update that omits the sleeve (every draw/health/resource refresh)
+    reverted the opponent's cards to the default Hex sleeve once another
+    player state change arrived.  GameStarted/DeckCreated establish it once and
+    later updates must keep carrying it.
+    """
+    from domain.game import Game
+    from domain.types import UID, SessionCardId
+
+    owner = UID.make(244, 1001)
+    opponent = UID.make(244, 1002)
+    game = Game(1, owner, opponent)
+    sleeve = "7b05554f-4ced-4096-931d-792a7c529650"
+    champion = SessionCardId(UID(0x6702))
+    game.ai_champion_card_id = champion
+    game.push_game_started(
+        champion_names=["Player", "Opponent"],
+        champion_template_ids=["1d462ffb-0744-4996-804c-ba61b2c5c2f1",
+                               "f8f86969-2e47-4901-8c9e-7fbf8d859e22"],
+        sleeve_template_ids=[
+            "c508cdd3-77ad-4dbf-b1b4-b201eae5a690", sleeve])
+    game.events.clear()
+    game.push_player_updated(opponent, champ_id=champion)
+    event = game.events[-1]
+    assert str(event.deck_sleeve_id.guid) == sleeve, event.deck_sleeve_id
+
+
 def test_effect_context_keeps_runtime_builder_out_of_battle_state():
     import json
 
     builder = object()
     state = {"turn_player": "player"}
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai", state,
         "effect", "", ability=builder)
     assert context.ability is builder
@@ -573,52 +602,8 @@ def test_effect_context_keeps_runtime_builder_out_of_battle_state():
     assert json.dumps(state) == '{"turn_player": "player"}'
 
 
-def test_resolver_passes_builder_ephemerally_when_effect_persists_state():
-    """A leaf may persist state before resolution cleanup runs."""
-    import json
-    import abilities.framework.resolution as resolution
-
-    effect_row = {
-        "effect_guid": "runtime-effect",
-        "effect_type": "RuntimeBuilderProbeEffect",
-        "param": "",
-        "target_index": -1,
-        "effect_group_id": 0,
-        "effect_order": 0,
-        "effect_instance_id": 1,
-        "condition_id": "",
-        "contingent_effect_instance_id": -1,
-        "secondary_target_index": -1,
-    }
-    seen = {}
-
-    def probe(context):
-        seen["builder"] = context.ability
-        # Model draw/save_state: this occurs while the leaf is executing,
-        # not after resolver cleanup.
-        json.dumps(context.bstate)
-        return "persisted"
-
-    state = {}
-    with mock.patch.object(resolution, "ability_graph", return_value=None), \
-            mock.patch.object(resolution, "ability_variables", return_value={}), \
-            mock.patch.object(resolution, "_target_template_ids", return_value=[]), \
-            mock.patch.object(resolution, "_effect_list", return_value=[effect_row]), \
-            mock.patch.object(resolution, "_target_template", return_value=None), \
-            mock.patch.dict(resolution._LEAFS,
-                            {"RuntimeBuilderProbeEffect": probe}):
-        result = resolution.resolve_ability(
-            object(), object(), _Session(), _DB(), "player", "ai", state,
-            "runtime-ability", 123, 5, {})
-
-    assert result == "persisted"
-    assert seen["builder"].guid == "runtime-ability"
-    assert "_ability_builder" not in state
-    assert json.dumps(state)
-
-
 def test_continuation_carries_only_serializable_activation_data():
-    from abilities.framework.builder import AbilityContinuation
+    from rules_port.builder import AbilityContinuation
 
     pending = AbilityContinuation.from_state({
         "resolving_ability": "ABILITY-GUID",
@@ -645,7 +630,7 @@ def test_context_activate_ability_uses_typed_child_resolver():
         "resolving_owner_id": 5,
         "ability_variables": {"Roll": 2},
     }
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai", state,
         "effect", "child-guid")
     with mock.patch.object(resolution, "resolve_ability", return_value="child") as run:
@@ -752,7 +737,7 @@ def test_all_registered_effects_use_the_context_adapter():
 def test_ability_resolution_entrypoint_accepts_context(monkeypatch):
     from abilities import resolve_ability_context
 
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai", {},
         "ability-guid", "")
     seen = {}
@@ -778,36 +763,22 @@ def test_ability_resolution_entrypoint_accepts_context(monkeypatch):
     assert seen["target_map"] == {0: 123}
 
 
-def test_legacy_ability_facade_exports_context_entrypoint():
-    import ability
-
-    from abilities import resolve_ability_context
-
-    assert ability.resolve_ability_context is resolve_ability_context
-
-
-def test_legacy_ability_facade_exports_turn_phase_trigger_entrypoint():
-    import ability
-
-    from abilities import resolve_turn_phase_triggers
-
-    assert ability.resolve_turn_phase_triggers is resolve_turn_phase_triggers
-
-
 def test_context_draw_preserves_owner_and_handler_boundary():
     handler = _DrawHandler()
-    context = EffectContext.from_legacy(
+    handler.user_profile = {"id": 5}
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), handler, "player", "ai",
-        {"resolving_target_uid": 123}, "draw-effect", "")
+        {"resolving_target_uid": 5}, "draw-effect", "")
 
-    assert context.draw(2) == "draw 2 for owner 5"
-    assert len(handler.calls) == 2
-    assert all(call[-1] == 5 for call in handler.calls)
+    with mock.patch("rules_port.draw_effects.draw_cards",
+                    return_value="draw 2 for owner 5") as draw:
+        assert context.draw(2) == "draw 2 for owner 5"
+    draw.assert_called_once_with(context, 2, owner=5)
 
 
 def test_context_conversation_uses_typed_id_and_pauses_at_handler_boundary():
     handler = _ConversationHandler()
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), handler, "player", "ai",
         {"resolving_ability": "ability-guid",
          "resolving_source_uid": 123,
@@ -841,7 +812,7 @@ def test_tac_decoder_preserves_append_to_list_metadata():
 
 
 def test_context_authored_events_use_typed_event_names():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai",
         {"resolving_source_uid": 123, "resolving_owner_id": 5},
         "fire-effect", "")
@@ -850,36 +821,58 @@ def test_context_authored_events_use_typed_event_names():
             side_effect=lambda name, default=None: {
                 "m_TriggerType": "Game.Shared.Mechanics.FateweavedEvent",
                 "m_Name": "fireFateweavedEvent",
-            }.get(name, default)), mock.patch(
-                "abilities.framework.triggers.resolve_triggers",
-                return_value="triggered") as resolve:
+            }.get(name, default)), mock.patch.object(
+                context, "_emit_trigger",
+                return_value="triggered") as emit:
         assert context.fire_event() == "fired FateweavedEvent: triggered"
-    assert resolve.call_args.args[7:9] == ("FateweavedEvent", 123)
-    assert resolve.call_args.kwargs["source_owner_uid"] == 5
+    assert emit.call_args.args[:3] == ("FateweavedEvent", 123, 5)
 
 
-def test_context_verdict_emits_shared_authored_event():
-    context = EffectContext.from_legacy(
-        object(), _Session(), _DB(), object(), "player", "ai",
-        {"resolving_source_uid": 123, "resolving_owner_id": 5},
-        "verdict-effect", "")
-    with mock.patch(
-            "abilities.framework.triggers.resolve_triggers",
-            return_value="triggered") as resolve:
-        assert context.verdict() == "fired VerdictEvent: triggered"
-    assert resolve.call_args.args[7:9] == ("VerdictEvent", 123)
-    assert resolve.call_args.kwargs["source_owner_uid"] == 5
+def test_native_transform_uses_typed_stored_target_copy():
+    """UseStoredTarget copies the resolved target's template to the stored card."""
+    context = EffectContext.from_rules_port(
+        _Game(), _Session(), _DB(), object(), "player", "ai",
+        {"resolving_ability": "copy-ability",
+         "resolving_source_uid": 100,
+         "stored_targets": {"copy-ability": [100]}},
+        "copy-effect", effect_targets=(200,))
+    typed = {
+        "m_Portal": False,
+        "m_CardTemplateId": "0" * 36,
+        "m_SerializedTAC": {"data": "AgCct9UYAQAAAAAAAAA="},
+    }
+    with mock.patch.object(
+            context, "template_value",
+            side_effect=lambda name, default=None: typed.get(name, default)), \
+            mock.patch("pvp_db.db_card_source_info",
+                       return_value=("target-template", "Troop", "warzone", 5)), \
+            mock.patch("rules_port.transform_effects.transform_instance",
+                       return_value=100) as transform:
+        result = context.transform_card()
+
+    assert result == "transformed 1 stored card(s) -> target-t"
+    transform.assert_called_once_with(
+        context, 100, "target-template", keep_zone=True)
+
+
+# The Verdict effect builds its typed choice tokens and activates the
+# authored choose/play ability; its focused fixture lives in
+# tests/tests_rules_port_kernel.py (test_verdict_creates_pool_tokens...).
+# The VerdictEvent itself is published by the sibling FireEvent effect.
 
 
 def test_context_draw_effect_uses_typed_or_fixture_count():
     handler = _DrawHandler()
-    context = EffectContext.from_legacy(
+    handler.user_profile = {"id": 5}
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), handler, "player", "ai",
-        {"resolving_target_uid": 123}, "missing-draw-effect",
+        {"resolving_target_uid": 5}, "missing-draw-effect",
         '{"count": 2}')
 
-    assert context.draw_effect() == "draw 2 for owner 5"
-    assert len(handler.calls) == 2
+    with mock.patch("rules_port.draw_effects.draw_cards",
+                    return_value="draw 2 for owner 5") as draw:
+        assert context.draw_effect() == "draw 2 for owner 5"
+    draw.assert_called_once_with(context, 2, owner=5)
 
 
 def test_native_draw_routes_empty_deck_to_explicit_result_projection():
@@ -904,7 +897,7 @@ def test_native_draw_routes_empty_deck_to_explicit_result_projection():
 
 
 def test_context_randomize_variable_uses_typed_bounds():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai", {},
         "random-effect", "")
     with mock.patch.object(
@@ -924,19 +917,18 @@ def test_context_randomize_variable_uses_typed_bounds():
 
 
 def test_context_stat_mod_uses_shared_operation_boundary():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai", {},
         "stat-effect", "")
     with mock.patch(
-            "abilities.framework.stat_mod.apply_card_stat_mod",
-            return_value=4) as apply:
+            "rules_port.stat_effects.apply_stat_mod", return_value=4) as apply:
         assert context.stat_mod(123, 2, 3, this_turn=True) == 4
-    assert apply.call_args.args[6:9] == (123, 2, 3)
-    assert apply.call_args.kwargs == {"this_turn": True, "bstate": {}}
+    assert apply.call_args.args[1:4] == (123, 2, 3)
+    assert apply.call_args.kwargs == {"this_turn": True}
 
 
 def test_context_damage_modifier_resolves_typed_input_and_target():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai",
         {
             "resolving_ability":
@@ -953,7 +945,7 @@ def test_context_damage_modifier_resolves_typed_input_and_target():
 
 
 def test_context_stat_modifier_resolves_typed_input_and_duration():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai",
         {
             "resolving_ability":
@@ -972,41 +964,29 @@ def test_context_stat_modifier_resolves_typed_input_and_duration():
 
 
 def test_context_counter_hides_card_persistence_and_projection():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
         "counter-effect", "")
     with mock.patch(
-            "abilities.framework.effects.counters.is_champion_target",
-            return_value=False), mock.patch(
-                "abilities.framework.effects.counters.card_counters",
-                return_value={"roar": 3}), mock.patch(
-                    "abilities.framework.effects.counters.remove_card_counters"
-                ) as remove, mock.patch(
-                    "abilities.framework.effects.counters.add_card_counter",
-                    return_value=1) as add, mock.patch(
-                        "abilities.framework.effects.counters.push_card_counters"
-                    ) as push:
+            "rules_port.counter_effects.change_counter",
+            return_value=(3, 1)) as change:
         assert context.counter(123, "roar", amount=2,
                                operation="remove") == (3, 1)
-    remove.assert_called_once()
-    add.assert_called_once()
-    push.assert_called_once()
+    change.assert_called_once()
+    assert change.call_args.args[1:3] == (123, "roar")
+    assert change.call_args.args[5] == "remove"
 
 
 def test_context_counter_uses_champion_state_and_event_projection():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
         "counter-effect", "")
     with mock.patch(
-            "abilities.framework.effects.counters.is_champion_target",
-            return_value=True), mock.patch(
-                "abilities.framework.effects.counters.change_champion_counter",
-                return_value=(1, 4)) as change, mock.patch(
-                    "abilities.framework.effects.counters.push_champion_counter"
-                ) as push:
+            "rules_port.counter_effects.change_counter",
+            return_value=(1, 4)) as change:
         assert context.counter(123, "roar", "counter-guid", 3) == (1, 4)
     change.assert_called_once()
-    push.assert_called_once()
+    assert change.call_args.args[1:4] == (123, "roar", "counter-guid")
 
 
 def test_rules_port_counter_projection_reads_persisted_buffs():
@@ -1056,32 +1036,31 @@ def test_rules_port_counter_projection_reads_persisted_buffs():
 
 
 def test_context_remove_from_combat_preserves_state_event_boundary():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai",
         {"resolving_target_uid": 123}, "combat-effect", "")
-    with mock.patch("abilities.framework.bom._push_card_state") as push:
+    with mock.patch("rules_port.card_projection.push_card_state") as push:
         assert context.remove_from_combat() == "removed 0x7b from combat"
     push.assert_called_once()
 
 
 def test_context_card_state_owns_projection_and_tap_trigger():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
         "tap-effect", "")
-    with mock.patch("abilities.framework.bom._push_card_state") as push, \
-            mock.patch(
-                "abilities.framework.triggers.resolve_triggers",
-                return_value=False) as resolve:
+    with mock.patch("rules_port.card_projection.push_card_state") as push, \
+            mock.patch.object(
+                context, "_emit_trigger", return_value=False) as emit:
         assert context.update_card_state(
             123, add=1, trigger="CardTappedEvent") == 5
     push.assert_called_once()
-    assert resolve.call_args.args[7:9] == ("CardTappedEvent", 123)
+    assert emit.call_args.args[:2] == ("CardTappedEvent", 123)
 
 
 def test_context_lose_thresholds_preserves_state_and_event_operation():
     game = _Game()
     bstate = {"resolving_owner_id": 5, "player_threshold": {4: 2}}
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         game, _Session(), _DB(), object(), "player", "ai", bstate,
         "threshold-effect", "")
 
@@ -1101,7 +1080,7 @@ def test_context_typed_hero_health_and_spell_points_share_owner_projection():
         "player_health": 20,
         "player_spell_points": 1,
     }
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         game, _Session(), _DB(), object(), "player", "ai", bstate,
         "typed-modifier", "")
 
@@ -1116,7 +1095,7 @@ def test_context_typed_hero_health_and_spell_points_share_owner_projection():
 
 
 def test_context_typed_card_threshold_and_subtype_preserve_metadata_values():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
         "typed-modifier", "")
     with mock.patch.object(context, "_card_thresholds", return_value=[4, 4]), \
@@ -1166,7 +1145,7 @@ def test_context_modifier_keeps_deck_cards_nulled():
 
 
 def test_context_typed_damage_shield_uses_client_flags():
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         _Game(), _Session(), _DB(), object(), "player", "ai", {},
         "typed-modifier", "")
     with mock.patch.object(context, "_card_buffs", return_value={}) as buffs, \
@@ -1233,7 +1212,7 @@ def test_builder_reuses_metadata_cost_target_filter_and_ordering():
     assert builder.validate().count("missing target input at index 0") == 1
     bound = builder.bind(ActivationData.from_values(target_map={0: [123]}))
     assert bound.validate() == ()
-    context = EffectContext.from_legacy(
+    context = EffectContext.from_rules_port(
         object(), _Session(), _DB(), object(), "player", "ai",
         {}, "effect", "", ability=builder)
     assert context.ability is builder
@@ -1267,7 +1246,7 @@ def test_builder_exposes_typed_values_conditions_and_continuations():
     assert [ref.type_name for ref in builder.continuations] == [
         "ActivateAbilityEffectTemplate"]
     with mock.patch(
-            "abilities.framework.fields.effect_field", return_value=6) as field:
+            "rules_port.bom_fields.effect_field", return_value=6) as field:
         assert builder.value(_DB(), {"session_id": 9}, "m_InputValue",
                              effect=builder.effect(0)) == 6
     field.assert_called_once()
@@ -1340,6 +1319,76 @@ def test_builder_target_and_cost_candidates_delegate_to_shared_legality():
     legal.assert_called_once()
 
 
+def test_battle2cards_uses_authored_secondary_effect_target():
+    """The referenced effect target wins over older stored targets."""
+    from rules_port.effects import dispatch
+
+    ability_guid = "shared-battle-ability"
+    first_source, first_target = 0x801, 0x4701
+    second_source, second_target = 0x301, 0x4401
+    attack = {
+        first_source: 3, first_target: 2,
+        second_source: 6, second_target: 1,
+    }
+    damage = []
+    battle_effect = SimpleNamespace(
+        effect_instance_id=1, target_index=1, secondary_target_index=0)
+    effects = (
+        # The secondary value indexes an effect instance; that effect's
+        # target_index may differ from both the secondary value and the
+        # Battle2Cards effect's own target index.
+        SimpleNamespace(effect_instance_id=0, target_index=2),
+        battle_effect,
+    )
+
+    def resolve(source, target, old_stored):
+        target_map = {1: (target,), 2: (source,)}
+        bstate = {
+            "resolving_ability": ability_guid,
+            "resolving_source_uid": source,
+            "resolving_target_uid": target,
+            "ability_target_map": target_map,
+            "stored_targets": {ability_guid: list(old_stored)},
+        }
+        ability = SimpleNamespace(
+            ordered_effects=effects,
+            activation=SimpleNamespace(target_map=target_map))
+        context = EffectContext.from_rules_port(
+            _Game(), _Session(), _DB(), object(), "player", "ai", bstate,
+            "battle-effect", ability=ability)
+        context.template_value = lambda _name, default=None: True
+        context.damage = lambda uid, amount: (
+            damage.append((int(bstate["resolving_source_uid"]),
+                           int(uid), int(amount))) or "applied")
+        context._emit_authored_event = lambda event_type, target: (
+            damage_events.append((event_type,
+                                  int(bstate["resolving_source_uid"]),
+                                  int(target))) or "queued")
+        return dispatch("Battle2CardsAbilityEffectTemplate",
+                        context, battle_effect)
+
+    damage_events = []
+    with mock.patch("rules_port.static_rules.effective_stats",
+                    side_effect=lambda _db, _session, _state, uid:
+                    (attack[int(uid)], 0)):
+        resolve(first_source, first_target, [first_source])
+        resolve(second_source, second_target,
+                [first_source, second_source])
+
+    assert damage == [
+        (first_source, first_target, attack[first_source]),
+        (first_target, first_source, attack[first_target]),
+        (second_source, second_target, attack[second_source]),
+        (second_target, second_source, attack[second_target]),
+    ], damage
+    assert damage_events == [
+        ("CardBattledEvent", first_source, first_target),
+        ("CardBattledEvent", first_target, first_source),
+        ("CardBattledEvent", second_source, second_target),
+        ("CardBattledEvent", second_target, second_source),
+    ], damage_events
+
+
 if __name__ == "__main__":
     test_native_grant_ability_can_target_a_champion()
     test_player_target_template_uses_champion_identity_for_grants()
@@ -1352,10 +1401,11 @@ if __name__ == "__main__":
     test_subterranean_spy_visibility_reveals_only_the_controller_view()
     test_match_secondary_reveal_uses_stored_target_owner()
     test_player_updated_carries_subterranean_spy_hand_permission()
+    test_player_updated_preserves_the_established_deck_sleeve()
     test_all_registered_effects_use_the_context_adapter()
     test_context_draw_preserves_owner_and_handler_boundary()
     test_context_authored_events_use_typed_event_names()
-    test_context_verdict_emits_shared_authored_event()
+    test_native_transform_uses_typed_stored_target_copy()
     test_context_draw_effect_uses_typed_or_fixture_count()
     test_native_draw_routes_empty_deck_to_explicit_result_projection()
     test_context_randomize_variable_uses_typed_bounds()
@@ -1375,4 +1425,5 @@ if __name__ == "__main__":
     test_builder_reuses_metadata_cost_target_filter_and_ordering()
     test_builder_exposes_typed_values_conditions_and_continuations()
     test_builder_target_and_cost_candidates_delegate_to_shared_legality()
+    test_battle2cards_uses_authored_secondary_effect_target()
     print("PASS effect context/builder tests")

@@ -5,6 +5,11 @@ deployment can point ``HEX_DB_PATH`` at persistent storage. If that file does
 not exist, this module creates it from the server schema and the mounted
 gamedata blob or a mounted ``Records/`` snapshot. Tests run only after a new
 database is created.
+
+An existing database is upgraded in place through ``static.ensure_schema``,
+which also re-syncs its client-derived projection (card, ability, champion and
+encounter rows) from the mounted gamedata or ``Records/`` source whenever that
+snapshot has moved on — player progress is never part of that projection.
 """
 
 from __future__ import annotations
@@ -145,9 +150,9 @@ def _ensure_database_schema(connection: sqlite3.Connection) -> None:
     """Apply the current DDL and idempotent static seeds to *connection*."""
     # Keep Docker databases consistent with the runtime database connection.
     # WAL permits readers (including replay) to continue while HConnect or the
-    # tournament scheduler is writing, while the busy timeout lets short
-    # writer collisions resolve instead of failing.
-    connection.execute("PRAGMA busy_timeout=30000")
+    # tournament scheduler is writing, while the five-second busy timeout lets
+    # short writer collisions resolve instead of failing.
+    connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA journal_mode=WAL")
     import static
 
@@ -164,7 +169,7 @@ def create_database(path: Path) -> None:
     temporary = Path(temporary_name)
     connection = None
     try:
-        connection = sqlite3.connect(str(temporary), timeout=30.0)
+        connection = sqlite3.connect(str(temporary), timeout=5.0)
         _ensure_database_schema(connection)
         connection.close()
         connection = None
@@ -177,8 +182,14 @@ def create_database(path: Path) -> None:
 
 
 def upgrade_database(path: Path) -> None:
-    """Apply current schema/data changes to an existing persistent database."""
-    connection = sqlite3.connect(str(path), timeout=30.0)
+    """Apply current schema/data changes to an existing persistent database.
+
+    This is the container's client-data refresh point: ``ensure_schema`` owns
+    both the schema and the Records-derived projection, so a release that
+    changes game data brings the persistent database with it instead of
+    requiring a fresh database.
+    """
+    connection = sqlite3.connect(str(path), timeout=5.0)
     try:
         _ensure_database_schema(connection)
     finally:
@@ -187,7 +198,7 @@ def upgrade_database(path: Path) -> None:
 
 def validate_static_data(path: Path) -> None:
     """Fail startup if fresh database reference data is missing or empty."""
-    connection = sqlite3.connect(str(path), timeout=30.0)
+    connection = sqlite3.connect(str(path), timeout=5.0)
     try:
         missing = []
         for table in REQUIRED_STATIC_TABLES:

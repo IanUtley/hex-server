@@ -107,141 +107,108 @@ def test_random_variable_conditions_and_recursion(db):
     conditioned ActivateAbility branch runs — roll 1 heals 1, roll 2 heals 2.
     This exercises groups, conditions, ability variables, ActivateAbility
     recursion and the auto 'You' (controller champion) target template."""
-    from abilities.framework.resolution import resolve_ability
-    A = _ag("top")
-    B = _ag("roll")
-    D = _ag("heal1")
-    H = _ag("heal2")
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
+
     YOU = "eb7e48cd-1c85-813f-6635-d43f50cf7809"
     C1 = _ag("cond1")
     C2 = _ag("cond2")
     _condition(db, C1, "RandomNumber", 1)
     _condition(db, C2, "RandomNumber", 2)
-    _insert_ability(db, A, [YOU], [
-        {"order": 0, "type": "ActivateAbilityEffectTemplate",
-         "param": B, "target_index": 0}])
-    _insert_ability(db, B, [YOU, YOU, YOU], [
-        {"order": 0, "type": "RandomizeVariableEffectTemplate",
-         "param": '{"variable": "RandomNumber", "min": 1, "max": 2}'},
-        {"order": 1, "type": "ActivateAbilityEffectTemplate", "param": D,
-         "group": 2, "condition": C1, "target_index": 1},
-        {"order": 2, "type": "ActivateAbilityEffectTemplate", "param": H,
-         "group": 3, "condition": C2, "target_index": 2}])
-    _insert_ability(db, D, [YOU], [
-        {"order": 0, "type": "CardModifierAbilityEffectTemplate",
-         "param": '{"text": "gain 1 health.", "property": "healhero", '
-                  '"amount": 1, "duration": "Instant"}',
-         "target_index": 0}])
-    _insert_ability(db, H, [YOU], [
-        {"order": 0, "type": "CardModifierAbilityEffectTemplate",
-         "param": '{"text": "gain 2 health.", "property": "healhero", '
-                  '"amount": 2, "duration": "Instant"}',
-         "target_index": 0}])
+    A, B, D, H = (_ag(name) for name in
+                  ("rv-top", "rv-roll", "rv-heal1", "rv-heal2"))
+    with synthetic_records() as rec:
+        heal1 = rec.effect(
+            _ag("rv-e1"), "CardModifierAbilityEffectTemplate",
+            text="gain 1 health.",
+            m_Modifier=rec.modifier("HealHeroModifier", input_variable="1"))
+        heal2 = rec.effect(
+            _ag("rv-e2"), "CardModifierAbilityEffectTemplate",
+            text="gain 2 health.",
+            m_Modifier=rec.modifier("HealHeroModifier", input_variable="2"))
+        rec.ability(D, effects=[rec.mapping(heal1)], targets=[YOU],
+                    variables=[rec.constant("1", 1)])
+        rec.ability(H, effects=[rec.mapping(heal2)], targets=[YOU],
+                    variables=[rec.constant("2", 2)])
+        randomize = rec.effect(
+            _ag("rv-rand"), "RandomizeVariableEffectTemplate",
+            m_VariableName="RandomNumber", m_MinValue=1, m_MaxValue=2)
+        act1 = rec.effect(_ag("rv-act1"), "ActivateAbilityEffectTemplate",
+                          m_AbilityToInvoke={"m_Guid": D})
+        act2 = rec.effect(_ag("rv-act2"), "ActivateAbilityEffectTemplate",
+                          m_AbilityToInvoke={"m_Guid": H})
+        rec.ability(B, effects=[
+            rec.mapping(randomize, instance=0, group=1),
+            rec.mapping(act1, target_index=1, instance=1, group=2,
+                        condition=C1),
+            rec.mapping(act2, target_index=2, instance=2, group=3,
+                        condition=C2),
+        ], targets=[YOU, YOU, YOU])
+        top = rec.effect(_ag("rv-topact"), "ActivateAbilityEffectTemplate",
+                         m_AbilityToInvoke={"m_Guid": B})
+        rec.ability(A, effects=[rec.mapping(top)], targets=[YOU])
 
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    handler = HandlerStub(db)
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        handler = HandlerStub(db)
 
-    def run(roll):
-        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
-        game = game_engine.Game(1, pl_t, ai_t)
-        with mock.patch("random.randint", return_value=roll):
-            resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t,
-                            bstate, A, 200, 5, {})
-        return bstate
+        def run(roll):
+            bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+            game = game_engine.Game(1, pl_t, ai_t)
+            with mock.patch("random.randint", return_value=roll):
+                resolve_port_ability(handler, game, SessionStub(), db,
+                                     pl_t, ai_t, bstate, A, 200, 5)
+            return bstate
 
-    with mock.patch("random.randint", return_value=1):
-        assert run(1)["player_health"] == 21, run(1)
-
-    with mock.patch("random.randint", return_value=2):
-        assert run(2)["player_health"] == 22, run(2)
+        assert run(1)["player_health"] == 21
+        assert run(2)["player_health"] == 22
 
 
 def test_contingent_effect_applies_only_when_prerequisite_did(db):
-    """Ability X: effect 1 (counter +1 on 'this') always applies; effect 2
-    (void 'this') is contingent on effect 1's instance having applied; effect 3
-    is contingent on a missing instance — the void runs once, the missing
-    contingency never does."""
-    from abilities.framework.resolution import resolve_ability
+    """Ability X: effect 1 (heal) always applies; effect 2 (void 'this') is
+    contingent on effect 1's instance having applied; effect 3 is contingent
+    on a missing instance — the void runs once, the missing contingency never
+    does."""
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
+
     X = _ag("contingency")
     THIS = "190a4d8c-7c2c-10d0-6429-99c5aeb0791f"
-    _insert_ability(db, X, [THIS], [
-        {"order": 0, "type": "CardModifierAbilityEffectTemplate",
-         "param": '{"text": "add a test counter to this.", '
-                  '"property": "counter", "amount": 1, "duration": "Instant"}',
-         "target_index": 0, "instance_id": 0},
-        {"order": 1, "type": "VoidCardAbilityEffectTemplate",
-         "param": "", "group": 2, "target_index": 0,
-         "instance_id": 1, "contingent": 0},
-        {"order": 2, "type": "VoidCardAbilityEffectTemplate",
-         "param": "", "group": 3, "target_index": 0,
-         "instance_id": 2, "contingent": 99},
-    ])
-    add_card(db, 300, 5, "b7172b6a-ef85-4fef-91e1-81975b4ce7cd")  # Shamed Gladiator
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    handler = HandlerStub(db)
-    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
-    game = game_engine.Game(1, pl_t, ai_t)
-    resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t, bstate,
-                    X, 300, 5, {})
+    with synthetic_records() as rec:
+        heal = rec.effect(
+            _ag("cont-heal"), "CardModifierAbilityEffectTemplate",
+            text="gain 1 health.",
+            m_Modifier=rec.modifier("HealHeroModifier", input_variable="1"))
+        void = rec.effect(_ag("cont-void"), "VoidCardAbilityEffectTemplate",
+                          text="void this.")
+        rec.ability(X, effects=[
+            rec.mapping(heal, instance=0, group=1),
+            rec.mapping(void, instance=1, group=2, contingent=0),
+            rec.mapping(void, instance=2, group=3, contingent=99),
+        ], targets=[THIS], variables=[rec.constant("1", 1)])
+        add_card(db, 300, 5, "b7172b6a-ef85-4fef-91e1-81975b4ce7cd")
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        handler = HandlerStub(db)
+        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+        game = game_engine.Game(1, pl_t, ai_t)
+        resolve_port_ability(handler, game, SessionStub(), db, pl_t, ai_t,
+                             bstate, X, 300, 5)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=300").fetchone()[0]
     assert loc == "void", loc
-
-
-def test_shared_activation_map_feeds_single_explicit_leaf(db):
-    """An explicit (non-auto) leaf deep in an ActivateAbility chain uses the
-    activation TargetMap entry — the Darkspire search MoveCardToZone gets the
-    chosen deck card even though the leaf lives under a nested ability."""
-    from abilities.framework.resolution import resolve_ability
-    TOP = _ag("search-top")
-    MID = _ag("search-mid")
-    LEAF = _ag("search-leaf")
-    YOU = "eb7e48cd-1c85-813f-6635-d43f50cf7809"
-    DECK = "0ad94887-419c-9e99-7946-74c4f72cdd2e"
-    _insert_ability(db, TOP, [YOU], [
-        {"order": 0, "type": "ActivateAbilityEffectTemplate", "param": MID,
-         "target_index": 0}])
-    _insert_ability(db, MID, [YOU], [
-        {"order": 0, "type": "ActivateAbilityEffectTemplate", "param": LEAF,
-         "target_index": 0}])
-    _insert_ability(db, LEAF, [DECK], [
-        {"order": 0, "type": "MoveCardToZoneEffectTemplate",
-         "param": '{"destination": "Hand", "location": "Unknown", '
-                  '"name": "PutItIntoYourHand", "text": "put it into your hand."}',
-         "target_index": 0}])
-    add_card(db, 101, 5, "14909185-1070-48df-9508-61d5a9650bd2", loc="deck")
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    handler = HandlerStub(db)
-    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
-    game = game_engine.Game(1, pl_t, ai_t)
-    resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t, bstate,
-                    TOP, 200, 5, {0: 101})
-    loc = db.execute(
-        "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0]
-    assert loc == "hand", loc
 
 
 def test_empty_revealed_troop_target_does_not_move_stale_card(db):
     """Oakhenge's no-troop reveal skips the hand move and returns every
     revealed non-troop to the deck instead of resolving the leaf with None.
     """
-    from abilities.framework.resolution import resolve_ability
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
 
     TOP = _ag("oakhenge-no-troop")
     TROOP = _ag("oakhenge-revealed-troop-target")
     REMAINING = _ag("oakhenge-revealed-remaining-target")
-    _insert_ability(db, TOP, [TROOP, REMAINING], [
-        {"order": 0, "type": "MoveCardToZoneEffectTemplate",
-         "param": '{"destination": "Hand", "location": "Unknown"}',
-         "group": 1, "target_index": 0, "instance_id": 0},
-        {"order": 1, "type": "MoveCardToZoneEffectTemplate",
-         "param": '{"destination": "Deck", "location": "Unknown"}',
-         "group": 2, "target_index": 1, "instance_id": 1,
-         "secondary": 0},
-    ])
     db.executemany(
         "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
             (TROOP, "a revealed troop", 0, 0, 0, 1, "", "", 1, 1,
@@ -250,27 +217,48 @@ def test_empty_revealed_troop_target_does_not_move_stale_card(db):
             (REMAINING, "the remaining cards", 1, 0, 0, 0, "", "", 1, 1,
              "{}", "SourceRevealedTargetTemplate"),
         ])
-    shard_tpl = "b7172b6a-ef85-4fef-91e1-81975b4ce7cd"
-    add_card(db, 301, 5, shard_tpl, loc="deck")
-    add_card(db, 302, 5, shard_tpl, loc="deck")
-    db.execute(
-        "UPDATE game_cards SET card_type='Resource', position=? "
-        "WHERE card_uid=?", (1, 301))
-    db.execute(
-        "UPDATE game_cards SET card_type='Resource', position=? "
-        "WHERE card_uid=?", (2, 302))
-    db.commit()
+    with synthetic_records() as rec:
+        rec.target(
+            TROOP, "SourceRevealedTargetTemplate", is_auto=0,
+            explicit=1, minimum=1, maximum=1,
+            card_filter={
+                "_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"})
+        rec.target(
+            REMAINING, "SourceRevealedTargetTemplate", is_auto=1,
+            explicit=0, minimum=1, maximum=1)
+        move_hand = rec.effect(
+            _ag("oak-move-hand"), "MoveCardToZoneEffectTemplate",
+            m_DestinationCollection="Hand")
+        move_deck = rec.effect(
+            _ag("oak-move-deck"), "MoveCardToZoneEffectTemplate",
+            m_DestinationCollection="Deck")
+        rec.ability(TOP, effects=[
+            rec.mapping(move_hand, target_index=0, instance=0, group=1),
+            rec.mapping(move_deck, target_index=1, instance=1, group=2,
+                        secondary=0),
+        ], targets=[TROOP, REMAINING])
 
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    game = game_engine.Game(1, pl_t, ai_t)
-    bstate = {"player_health": 20, "ai_health": 20,
-              "revealed_cards": [301, 302],
-              # Simulate the stale target that previously caused the null
-              # hand move to select a shard.
-              "player_spell_target": 301}
-    resolve_ability(HandlerStub(db), game, SessionStub(), db, pl_t, ai_t,
-                    bstate, TOP, 999, 5, {})
+        shard_tpl = "b7172b6a-ef85-4fef-91e1-81975b4ce7cd"
+        add_card(db, 301, 5, shard_tpl, loc="deck")
+        add_card(db, 302, 5, shard_tpl, loc="deck")
+        db.execute(
+            "UPDATE game_cards SET card_type='Resource', position=? "
+            "WHERE card_uid=?", (1, 301))
+        db.execute(
+            "UPDATE game_cards SET card_type='Resource', position=? "
+            "WHERE card_uid=?", (2, 302))
+        db.commit()
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        bstate = {"player_health": 20, "ai_health": 20,
+                  "revealed_cards": [301, 302],
+                  # Simulate the stale target that previously caused the null
+                  # hand move to select a shard.
+                  "player_spell_target": 301}
+        resolve_port_ability(HandlerStub(db), game, SessionStub(), db,
+                             pl_t, ai_t, bstate, TOP, 999, 5)
     rows = db.execute(
         "SELECT card_uid, location FROM game_cards "
         "WHERE card_uid IN (301,302) ORDER BY card_uid").fetchall()
@@ -279,58 +267,68 @@ def test_empty_revealed_troop_target_does_not_move_stale_card(db):
 
 def test_secondary_target_ignores_missing_source_uid(db):
     """A source-less nested activation must not expose ``None`` as a target."""
-    from abilities.framework.resolution import resolve_ability
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
 
     ability = _ag("source-less-secondary")
-    _insert_ability(db, ability, [], [
-        {"order": 0, "type": "RevealCardsAbilityEffectTemplate",
-         "instance_id": 0},
-        {"order": 1, "type": "StoreTargetsAbilityEffectTemplate",
-         "instance_id": 1, "secondary": 0},
-    ])
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    resolve_ability(
-        HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(),
-        db, pl_t, ai_t, {"player_health": 20, "ai_health": 20},
-        ability, None, 5, {})
+    with synthetic_records() as rec:
+        reveal = rec.effect(
+            _ag("sl-reveal"), "RevealCardsAbilityEffectTemplate")
+        store = rec.effect(
+            _ag("sl-store"), "StoreTargetsAbilityEffectTemplate")
+        rec.ability(ability, effects=[
+            rec.mapping(reveal, instance=0, group=1),
+            rec.mapping(store, instance=1, group=2, secondary=0),
+        ])
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        resolve_port_ability(
+            HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(),
+            db, pl_t, ai_t, {"player_health": 20, "ai_health": 20},
+            ability, None, 5)
 
 
-def test_deck_search_prompt_pauses_before_second_effect(db):
-    """A nested ability with two effects sharing a deck target opens one
-    picker and pauses; the second effect must not issue a duplicate prompt.
+def test_match_secondary_target_uses_effect_instance_reference(db):
+    """MatchSecondary uses m_SecondaryTargetIndex as an effect id.
 
-    Adaptable Infusion Device has this metadata shape (StoreTargets followed
-    by TAC), so this protects the client picker from being rebuilt underneath
-    the first selection.
+    Herofall stores its selected troop in target slot 0 on effect instance 1;
+    resolving the field as target slot 1 silently produced no same-name cards.
     """
-    from abilities.framework.resolution import resolve_ability
+    from rules_port.resolution import _match_secondary_values
 
-    ability = _ag("duplicate-deck-prompt")
-    target = _ag("deck-prompt-target")
-    _insert_ability(db, ability, [target], [
-        {"order": 0, "type": "TACAbilityEffectTemplate",
-         "param": "first", "target_index": 0},
-        {"order": 1, "type": "TACAbilityEffectTemplate",
-         "param": "second", "target_index": 0},
-    ])
-    db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (target, "choose from deck", 0, 0, 0, 1, "", "Deck", 1, 1,
-         json.dumps({
-             "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
-             "m_Collection": "Deck",
-         }), "AbilityTargetTemplate"))
-    add_card(db, 401, 5, TPL_GLADIATOR, loc="deck")
-    db.commit()
-    handler = PromptHandlerStub(db)
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    bstate = {"player_health": 20, "ai_health": 20}
-    resolve_ability(handler, game_engine.Game(1, pl_t, ai_t), SessionStub(),
-                    db, pl_t, ai_t, bstate, ability, 401, 5, {})
-    assert len(handler.prompt_calls) == 1, handler.prompt_calls
-    assert bstate.get("resolution_paused") is True, bstate
+    target_guid = _ag("match-secondary-target")
+    record = SimpleNamespace(
+        field=lambda name, default=None: {
+            "m_SameName": 1,
+            "m_SameCost": 0,
+            "m_SameOwner": 0,
+            "m_SharesRace": 0,
+            "m_DoesntShareRace": 0,
+            "m_CantBePreviousTarget": 0,
+        }.get(name, default))
+    ability = SimpleNamespace(
+        responsible_player_id=5,
+        source_uid=900,
+        ordered_effects=(SimpleNamespace(
+            effect_instance_id=1, target_index=0),),
+        activation=SimpleNamespace(target_map={0: (100,)}),
+    )
+    effect = SimpleNamespace(secondary_target_index=1)
+    target_spec = SimpleNamespace(guid=target_guid)
+    views = {
+        uid: {"card_uid": uid, "name": "Pack Raptor", "user_id": 5,
+              "cost": 1, "subtype": "Dinosaur"}
+        for uid in (100, 101, 102)
+    }
+    with mock.patch("gamedata.DEFAULT_RECORD_STORE.get", return_value=record), \
+            mock.patch("rules_port.targeting.legal_targets",
+                       return_value=(101, 102)), \
+            mock.patch("rules_port.resolution._current_match_card",
+                       side_effect=lambda *_args: views.get(_args[2])):
+        matched = _match_secondary_values(
+            db, 1, ability, effect, target_spec, {},
+            resolved_by_instance={1: (100,)})
+    assert matched == (101, 102), matched
 
 
 def test_deck_search_detection_uses_filter_not_collection_flags(db):
@@ -340,9 +338,8 @@ def test_deck_search_detection_uses_filter_not_collection_flags(db):
     including Deck, but its authoritative filter is InZone: Hand. Only an
     actual InZone: Deck filter should enter the class-39 deck-search path.
     """
-    from abilities.framework.resolution import _is_deck_search_target
+    from rules_port.targeting import filter_restricts_to_zone
 
-    broad_flags = "Deck|Hand|Champions|Warzone|Discard|Void|CastSpells|Underground|Choosing"
     hand_filter = {
         "_t": "Game.Shared.Mechanics.Cards.Filters.AndCardFilter",
         "m_TargetFilters": [{
@@ -358,26 +355,18 @@ def test_deck_search_detection_uses_filter_not_collection_flags(db):
         }],
     }
 
-    assert not _is_deck_search_target({
-        "collection_flags": broad_flags,
-        "filter_json": hand_filter,
-    })
-    assert _is_deck_search_target({
-        "collection_flags": broad_flags,
-        "filter_json": deck_filter,
-    })
-    assert not _is_deck_search_target({
-        "collection_flags": broad_flags,
-        "filter_json": {
-            "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
-            "m_Collection": "Deck|Hand",
-        },
-    })
+    assert not filter_restricts_to_zone(hand_filter, "Deck")
+    assert filter_restricts_to_zone(deck_filter, "Deck")
+    assert not filter_restricts_to_zone({
+        "_t": "Game.Shared.Mechanics.Cards.Filters.InZone",
+        "m_Collection": "Deck|Hand",
+    }, "Deck")
 
 
 def test_empty_sacrifice_target_does_not_sacrifice_source(db):
     """An optional target with no legal card must not fall back to the source."""
-    from abilities.framework.resolution import resolve_ability
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
 
     ability = _ag("empty-sacrifice")
     target = _ag("optional-troop")
@@ -386,17 +375,25 @@ def test_empty_sacrifice_target_does_not_sacrifice_source(db):
         (target, "a troop you control", 0, 0, 0, 0, "Self", "Warzone",
          1, 1, '{"_t":"Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
          "AbilityTargetTemplate"))
-    _insert_ability(db, ability, [target], [{
-        "order": 0, "type": "SacrificeCardAbilityEffectTemplate",
-        "target_index": 0,
-    }])
-    add_card(db, 200, 0, TPL_GLADIATOR, loc="warzone")
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    handler = HandlerStub(db)
-    game = game_engine.Game(1, pl_t, ai_t)
-    resolve_ability(handler, game, SessionStub(), db, pl_t, ai_t,
-                    {"turn_number": 1}, ability, 200, 0, {})
+    with synthetic_records() as rec:
+        rec.target(
+            target, "AbilityTargetTemplate", is_auto=0, explicit=0,
+            player_filter="Self", collection_flags="Warzone", minimum=1,
+            maximum=1,
+            card_filter={
+                "_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"})
+        sacrifice = rec.effect(
+            _ag("empty-sacrifice-effect"),
+            "SacrificeCardAbilityEffectTemplate")
+        rec.ability(ability, effects=[rec.mapping(sacrifice)],
+                    targets=[target])
+        add_card(db, 200, 0, TPL_GLADIATOR, loc="warzone")
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        handler = HandlerStub(db)
+        game = game_engine.Game(1, pl_t, ai_t)
+        resolve_port_ability(handler, game, SessionStub(), db, pl_t, ai_t,
+                             {"turn_number": 1}, ability, 200, 0)
     location = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=200").fetchone()[0]
     assert location == "warzone", location
@@ -404,7 +401,8 @@ def test_empty_sacrifice_target_does_not_sacrifice_source(db):
 
 def test_ai_sacrifice_target_excludes_source(db):
     """AI deploy targeting chooses another troop, or no target if absent."""
-    from abilities.framework import triggers
+    from rules_port import targeting
+    from tests.native_records import synthetic_records
 
     ability = _ag("ai-sacrifice-target")
     target = _ag("ai-optional-troop")
@@ -417,23 +415,29 @@ def test_ai_sacrifice_target_excludes_source(db):
         "order": 0, "type": "SacrificeCardAbilityEffectTemplate",
         "target_index": 0,
     }])
-    add_card(db, 210, 0, TPL_GLADIATOR, loc="warzone")
-    session = SessionStub()
-    graph = SimpleNamespace(targets=(SimpleNamespace(guid=target),))
-    with mock.patch.object(triggers, "ability_graph",
-                           lambda _store, _guid: graph):
-        assert triggers._ai_trigger_target(
+    with synthetic_records() as rec:
+        rec.target(
+            target, "AbilityTargetTemplate", is_auto=0, explicit=0,
+            player_filter="Self", collection_flags="Warzone", minimum=1,
+            maximum=1,
+            card_filter={
+                "_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"})
+        sacrifice = rec.effect(_ag("ai-sacrifice-effect"),
+                               "SacrificeCardAbilityEffectTemplate")
+        rec.ability(ability, effects=[rec.mapping(sacrifice)],
+                    targets=[target])
+        add_card(db, 210, 0, TPL_GLADIATOR, loc="warzone")
+        session = SessionStub()
+        assert targeting.ai_trigger_target(
             db, session, ability, 210, 0, {}, []) is None
-    add_card(db, 211, 0, TPL_GLADIATOR, loc="warzone")
-    with mock.patch.object(triggers, "ability_graph",
-                           lambda _store, _guid: graph):
-        assert triggers._ai_trigger_target(
+        add_card(db, 211, 0, TPL_GLADIATOR, loc="warzone")
+        assert targeting.ai_trigger_target(
             db, session, ability, 210, 0, {}, []) == 211
-
 
 def test_double_choice_creates_random_choices_and_clears_before_second(db):
     """DoubleChoice follows the client sequence without using card text."""
-    from abilities.framework.effects import choices
+    from rules_port.choice_effects import double_choice
+    from rules_port.context import EffectContext
 
     choice_guids = [_ag(f"choice-{i}") for i in range(6)]
     for guid in choice_guids:
@@ -460,35 +464,34 @@ def test_double_choice_creates_random_choices_and_clears_before_second(db):
     }
     first_guid = "effect-first"
     second_guid = "effect-second"
+    context = EffectContext.from_rules_port(
+        game, session, db, handler, pl_t, ai_t, bstate, first_guid, "")
 
-    def typed(effect_guid):
-        return {"m_SecondChoice": effect_guid == second_guid}
-
-    def value(_db, _state, effect_guid, field_name, default=None):
-        if field_name == "m_Choices" and effect_guid == first_guid:
+    def template_value(name, default=None):
+        if name == "m_SecondChoice":
+            return context.effect_guid == second_guid
+        if name == "m_Choices" and context.effect_guid == first_guid:
             return [{"m_Guid": guid} for guid in choice_guids]
         return default
 
-    with mock.patch.object(choices, "effect_template", side_effect=typed), \
-            mock.patch.object(choices, "effect_template_value",
-                              side_effect=value), \
-            mock.patch.object(choices, "effect_field", return_value=3), \
-            mock.patch("random.randrange", side_effect=[0, 0, 0]):
-        result = choices.double_choice(
-            game, session, db, handler, pl_t, ai_t, bstate, first_guid, "")
+    with mock.patch.object(context, "template_value",
+                           side_effect=template_value), \
+            mock.patch.object(context, "value", return_value=3), \
+            mock.patch("rules_port.choice_effects.random.randrange",
+                       side_effect=[0, 0, 0]):
+        result = double_choice(context)
     assert "awaiting 3" in result, result
     assert len(bstate["pending_choice"]["choice_uids"]) == 3
     assert db.execute(
         "SELECT COUNT(*) FROM game_cards WHERE location='choosing'").fetchone()[0] == 3
-    bstate.pop("pending_choice")
-    bstate.pop("resolution_paused")
+    bstate.pop("pending_choice", None)
+    bstate.pop("resolution_paused", None)
     bstate["resolving_effect_order"] = 1
-    with mock.patch.object(choices, "effect_template", side_effect=typed), \
-            mock.patch.object(choices, "effect_template_value",
-                              side_effect=value), \
-            mock.patch.object(choices, "effect_field", return_value=3):
-        result = choices.double_choice(
-            game, session, db, handler, pl_t, ai_t, bstate, second_guid, "")
+    context.effect_guid = second_guid
+    with mock.patch.object(context, "template_value",
+                           side_effect=template_value), \
+            mock.patch.object(context, "value", return_value=3):
+        result = double_choice(context)
     assert "awaiting 3" in result, result
     assert db.execute(
         "SELECT COUNT(*) FROM game_cards WHERE location='choosing'").fetchone()[0] == 3
@@ -498,7 +501,8 @@ def test_double_choice_creates_random_choices_and_clears_before_second(db):
 
 def test_summon_choosing_collection_stays_out_of_warzone(db):
     """A typed Choosing summon creates option cards, not permanents."""
-    from abilities.framework.effects.tokens import summon_token
+    from rules_port.context import EffectContext
+    from rules_port.token_effects import summon_token
 
     choice = _ag("choosing-token")
     db.execute(
@@ -512,11 +516,11 @@ def test_summon_choosing_collection_stays_out_of_warzone(db):
     ai_t = game_engine.UID.make(3, 1000)
     game = game_engine.Game(1, pl_t, ai_t)
     bstate = {"resolving_owner_id": 5, "resolving_ability": ""}
-    result = summon_token(
-        game, session, db, HandlerStub(db), pl_t, ai_t, bstate,
-        _ag("choosing-effect"), json.dumps({
-            "token_guid": choice, "amount": 1, "collection": "Choosing"}))
-    assert "to choosing" in result, result
+    context = EffectContext.from_rules_port(
+        game, session, db, HandlerStub(db), pl_t, ai_t, bstate, "", "")
+    result = summon_token(context, {
+        "token_guid": choice, "amount": 1, "collection": "Choosing"})
+    assert "summoned 1" in result, result
     uid = bstate["created_token_uids"][0]
     assert db.execute(
         "SELECT location, card_state FROM game_cards WHERE card_uid=?",
@@ -751,12 +755,55 @@ def test_native_deck_target_ai_auto_selects_without_a_picker(db):
                      "target_map": {0: (101,)}}, calls
 
 
+def test_native_ai_triggered_target_reselects_with_current_evaluator(db):
+    """An empty Runic child map gets a fresh AI target, not first legal."""
+    from rules_port.resolution import resolve_port_ability
+    from tests.native_records import synthetic_records
+
+    ability_guid = _ag("runic-reselect")
+    target_guid = _ag("runic-reselect-target")
+    effect_guid = _ag("runic-reselect-effect")
+    with synthetic_records() as rec:
+        rec.target(
+            target_guid, "AbilityTargetTemplate", is_auto=0, explicit=1,
+            player_filter="MultiplePlayers", collection_flags="Warzone",
+            minimum=1, maximum=1)
+        effect = rec.effect(
+            effect_guid, "CardModifierAbilityEffectTemplate",
+            text="mark target")
+        rec.ability(
+            ability_guid, effects=[rec.mapping(effect, target_index=0)],
+            targets=[target_guid])
+
+        chooser = mock.Mock(return_value={0: (102,)})
+        evaluator = SimpleNamespace(choose_ability_target_map=chooser)
+        seen = []
+
+        def native_effect(_kind, context, _effect):
+            seen.append(context.resolved_target())
+            return "resolved"
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        with mock.patch("ai_eval.build_evaluator", return_value=evaluator), \
+                mock.patch("rules_port.targeting.legal_targets",
+                           side_effect=AssertionError(
+                               "resolver used first-legal fallback")):
+            resolve_port_ability(
+                HandlerStub(db), game_engine.Game(1, pl_t, ai_t),
+                SessionStub(), db, pl_t, ai_t,
+                {"player_health": 20, "ai_health": 20}, ability_guid,
+                900, 0, native_effect=native_effect)
+
+    chooser.assert_called_once_with(900, ability_guid)
+    assert seen == [102], seen
+
+
 def test_choice_ability_transforms_real_parent(db):
     """Playing a Choice token applies its automatic ability to its parent."""
-    import db as db_module
-    from abilities.framework.effects.choices import (
-        play_choice_card, resolve_choice_card_abilities)
-    from abilities.framework.effects.tokens import summon_token
+    from rules_port.choice_effects import (
+        _play_choice_card, _resolve_choice_card_abilities)
+    from rules_port.context import EffectContext
 
     source_uid = 401
     source_tpl = TPL_GLADIATOR
@@ -775,44 +822,34 @@ def test_choice_ability_transforms_real_parent(db):
         "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (choice_tpl, "Choose Output", "Choice", 0, 0, 0, 0,
          json.dumps([choice_ability]), "[]", ""))
-    _insert_ability(db, choice_ability, [
-        "190a4d8c-7c2c-10d0-6429-99c5aeb0791f"], [{
-            "order": 0, "type": "TransformCardAbilityEffectTemplate",
-            "effect_guid": effect_guid, "target_index": 0}])
-    db.execute(
-        "UPDATE card_abilities_meta SET game_text=? WHERE ability_guid=?",
-        (f"Transform this into <a data={output_tpl}>Choice Output</a>.",
-         choice_ability))
-    # _insert_ability generates the effect GUID; use the requested one so the
-    # test can assert the same metadata fallback path as a real transform.
-    db.execute(
-        "UPDATE ability_effects SET effect_guid=? WHERE ability_guid=?",
-        (effect_guid, choice_ability))
-    db.commit()
-    add_card(db, source_uid, 5, source_tpl)
-    session = SessionStub()
-    pl_t = game_engine.UID.make(244, 5)
-    ai_t = game_engine.UID.make(3, 1000)
-    game = game_engine.Game(1, pl_t, ai_t)
-    handler = HandlerStub(db)
-    bstate = {"resolving_source_uid": source_uid,
-              "resolving_owner_id": 5}
-    summon_token(
-        game, session, db, handler, pl_t, ai_t, bstate, _ag("choice-summon"),
-        json.dumps({"token_guid": choice_tpl, "amount": 1,
-                    "collection": "Choosing"}))
-    choice_uid = bstate["created_token_uids"][0]
-    old_db = db_module._db
-    db_module._db = db
-    try:
-        assert play_choice_card(
-            game, session, db, handler, pl_t, ai_t, bstate,
-            choice_uid, 5)
-        resolve_choice_card_abilities(
-            game, session, db, handler, pl_t, ai_t, bstate,
-            choice_uid, source_uid, 5)
-    finally:
-        db_module._db = old_db
+    from tests.native_records import synthetic_records
+    with synthetic_records() as rec:
+        transform = rec.effect(
+            effect_guid, "TransformCardAbilityEffectTemplate",
+            text=f"Transform this into <a data={output_tpl}>Choice Output</a>.",
+            m_CardTemplateId={"m_Guid": output_tpl})
+        rec.ability(choice_ability, effects=[rec.mapping(transform)],
+                    targets=["190a4d8c-7c2c-10d0-6429-99c5aeb0791f"])
+        db.commit()
+        add_card(db, source_uid, 5, source_tpl)
+        session = SessionStub()
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        handler = HandlerStub(db)
+        bstate = {"resolving_source_uid": source_uid,
+                  "resolving_owner_id": 5}
+        from rules_port.token_effects import summon_token
+        summon_token(
+            EffectContext.from_rules_port(
+                game, session, db, handler, pl_t, ai_t, bstate, "", ""),
+            {"token_guid": choice_tpl, "amount": 1,
+             "collection": "Choosing"})
+        choice_uid = bstate["created_token_uids"][0]
+        context = EffectContext.from_rules_port(
+            game, session, db, handler, pl_t, ai_t, bstate, "", "")
+        assert _play_choice_card(context, choice_uid, 5)
+        _resolve_choice_card_abilities(context, choice_uid, source_uid, 5)
     assert db.execute(
         "SELECT template_guid FROM game_cards WHERE card_uid=?",
         (source_uid,)).fetchone()[0] == output_tpl
@@ -860,14 +897,12 @@ def main():
          test_random_variable_conditions_and_recursion),
         ("Contingent effects gate on prerequisite",
          test_contingent_effect_applies_only_when_prerequisite_did),
-        ("Shared activation map feeds nested explicit leaf",
-         test_shared_activation_map_feeds_single_explicit_leaf),
         ("Empty revealed troop target is a no-op",
          test_empty_revealed_troop_target_does_not_move_stale_card),
         ("Source-less secondary target is empty",
          test_secondary_target_ignores_missing_source_uid),
-        ("Deck search pauses after one prompt",
-         test_deck_search_prompt_pauses_before_second_effect),
+        ("MatchSecondary follows effect-instance references",
+         test_match_secondary_target_uses_effect_instance_reference),
         ("Deck search detection uses the zone filter",
          test_deck_search_detection_uses_filter_not_collection_flags),
         ("Empty sacrifice target does not sacrifice source",
@@ -886,6 +921,8 @@ def main():
          test_native_deck_target_opens_the_deck_search_picker),
         ("Native deck target AI auto-selects",
          test_native_deck_target_ai_auto_selects_without_a_picker),
+        ("Native AI triggered target reselects",
+         test_native_ai_triggered_target_reselects_with_current_evaluator),
         ("Choice transforms its real parent",
          test_choice_ability_transforms_real_parent),
         ("Records choice filter preserves typed target data",

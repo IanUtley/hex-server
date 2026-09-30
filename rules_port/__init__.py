@@ -119,11 +119,12 @@ from .filters import (AndCardFilter, CardFilter, InZone, IsControlledBy,
                       HasResourceCost, HasAttackValue, HasDefenseValue,
                       IsSocketable, IsSocketed,
                       IsToken, IsResource, IsQuick, IsTroop, IsArtifact,
-                      IsChampion, IsHero, IsDamaged, IsAttacking, IsBlocking,
+                      IsChampion, IsHero, IsAttacking, IsBlocking,
                       IsNotType, IsAlternateArt, IsExtendedArt, IsPromo,
                       IsNotControlledBy, IsPlayedThisTurn, IsDamagedThisTurn,
                       IsHealedThisTurn,
-                      filter_from_metadata)
+                      filter_from_metadata, filter_matches_template,
+                      filter_cost_value)
 
 __all__ = (
     "AbilityRegistry", "Chain", "GameAction", "GameActionResult", "GameActionStack",
@@ -221,9 +222,9 @@ __all__ = (
     "FILTER_COVERAGE", "validate_transaction_coverage", "validate_filter_coverage",
     "coverage_report", "validate_effect_coverage", "STRUCTURAL_EFFECTS",
     "STAGED_EFFECTS",
-    "IsTroop", "IsArtifact", "IsDamaged", "IsAttacking", "IsBlocking",
+    "IsTroop", "IsArtifact", "IsAttacking", "IsBlocking",
     "IsChampion", "IsHero",
     "IsNotType", "IsAlternateArt", "IsExtendedArt", "IsPromo",
     "IsNotControlledBy", "IsPlayedThisTurn", "IsDamagedThisTurn",
-    "IsHealedThisTurn",
+    "IsHealedThisTurn", "filter_matches_template", "filter_cost_value",
 )

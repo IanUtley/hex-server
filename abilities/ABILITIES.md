@@ -117,7 +117,7 @@ serializable copy) and its options into `QuickAbilityOptions` (§12).
 | `m_AbilityCondition` | `IAbilityCondition` (inline object) | If set, must be true for **any** portion of the ability to execute. Evaluated against the source card + session. |
 | `m_TriggerEventType` | `ConstrainedType<TriggerEvent>` (inline `{m_InternalType: "..."}`) | If set, the ability is a **triggered** ability that fires on this game event (e.g. `GameStartedEvent`, `PreGameEvent`, `CardEnteredZoneEvent`, `CardAttackedEvent`). `null` → not triggered. |
 | `m_TriggerCondition` | `ITriggerCondition` (inline object) | Additional gate specific to the trigger. Must be true for the ability to fire. |
-| `m_TriggerCollectionFlags` | `ECardCollections` (flags string) | The zones the ability's source card must be in for the trigger to be allowed to fire. Default `"Warzone"`. |
+| `m_TriggerCollectionFlags` | `ECardCollections` (flags string) | The zones the ability's source card must be in for the trigger to be allowed to fire. Default `"Warzone"` when the field is omitted. An explicit `"None"` is **not** a restriction: C# skips the zone test for None (`Card.PassesCollectionFlagRequirements`, `Session.cs`), so those triggers may fire from any collection. Only a real mask restricts. |
 | `m_UsesPreviousState` | bool | If true, trigger evaluation uses the card's *previous* collection/state (before the event that fired it). |
 | `m_AbilityFreeCondition` | `IAbilityCondition` | If set and true, the ability costs nothing to activate (free). |
 
@@ -723,6 +723,13 @@ post-resolution options use that updated pool.
 
 ## 14. Support matrix — what the Python framework currently implements
 
+RulesPort damage ordering, numeric multipliers, shield consumption, champion
+shield lifetime and SpiritDrain accounting are documented with C# references
+and focused acceptance scenarios in
+[`docs/RULES_PORT_PARITY.md`](../docs/RULES_PORT_PARITY.md). That matrix also
+records unsupported damage features; leaf registration alone is not proof of
+complete modifier semantics.
+
 The Python layer is a **work in progress**. This table shows what is genuinely
 data-driven today vs. what is inferred from game text vs. what is missing.
 
@@ -765,6 +772,58 @@ per-target leaf. Random target templates are likewise resolved from their
 metadata filter and count, even when the template is not marked as an
 auto-target in the extracted record.
 
+#### Typed-field audit
+
+`AssetExtraction/audit_effect_leaves.py` is the field-level counterpart to the
+registration inventory above. It reads the C# `m_*` field declarations, the
+Records field unions, and the Python leaf call closures, then reports every
+meaningful Records field a leaf never reads, leaves with no typed reads, and
+classes without a handler. A field may only be exempted through the tool's
+`ACCEPTED_FIELDS` list with a cited C# reason. Run it after touching a leaf so
+"registered" never stands in for "reads the authored fields".
+
+#### Card text vs implementation audit
+
+`AssetExtraction/audit_card_text.py` is the card-level counterpart. For every
+card template it reads each authored ability's printed text, extracts the
+unambiguous claims (draw/damage/stat numbers, summon counts, cost deltas,
+keyword grants), and compares them with the ability's typed Records graph —
+following `ActivateAbility`/`GrantAbility`/`DoubleChoice`/`Repeating` children,
+Choosing-summon choice cards, and creation-replacement markers. It reports
+only text claims with no implementing effect and printed numbers that
+contradict the typed value; deliberate out-of-battle exceptions live in
+`ACCEPTED_CARDS` with a reason. The current snapshot reports zero findings.
+
+#### Trigger dispatch order
+
+When a permanent enters play, the native dispatcher emits the client's event
+sequence: the entering card's `CardEnteredZoneEvent` (Deploy), then
+`AsEntersPlayEvent` for the entering card (its own "as this enters play"
+abilities plus every other card's Inspire conditions), then
+`CardInspiredEvent` once per inspirer that resolved.  The same entry activates
+the card's authored creation-replacement markers (`IntAttrModifier`s such as
+`ShinhareCreationBonus`, `Cost1CreationBonus`, `EggCreationBonus`, or
+`...InsteadOf...`), and summon/copy effects apply
+`GetCreationBonuses`/`replacement_substitute` from `rules_port/creation_effects.py`.
+
+Audited implementations that consume the full typed field set (not text):
+`CreateTokenMatchingTarget` (filter pool evaluated against the resolved target
+for the responsible player, TAC `SameName`/`SameOwner`), `RandomizeVariable`
+(`m_MaxValueField` dynamic bound and `m_SecondValue` roll),
+`PutTopOfDeckIntoHand` (`m_AbilityOwnerTakesControl`), `RevokeAbility`
+(`m_RevokedAbilityTemplateId`), `TransformCard` (`m_Portal` rarity portals),
+`TransformSelf` (`m_PlantGarden`, `m_IsReplica` copy transform),
+`CreateAndCastSpell` (`m_AmountField` copy count), `SummonTokenTroop`
+(`m_CombinedCost` exact-sum selection and `m_Terminus` fused-card pool),
+`ActivateAbility` (`m_RandomlyLuckyOrUnlucky` Lucky/Unlucky pools),
+`GrantAbility` (`m_AllPaymentPowersOf*`, `m_AllRememberedPowers`,
+`m_AllSocketedPowersOf*`, `m_RandomInspirePower`,
+`m_RandomChampionChargePower`), `MoveCardToZone`
+(`m_PreviousControllerTakesControl`), and `CreateTokenCopy`
+(`m_SameOwner`, `m_IsReplica`).  Replica modification (`Card.HandleReplicaMods`
+markers, Artifact/Robot/Replica subtypes, cleared thresholds, no Unique) is
+owned by `rules_port/replica.py`.
+
 `ConversationAbilityEffectTemplate` has an explicit continuation path. Its
 typed `ConversationId` is emitted as the client's class-55 conversation dialog
 event; the ability remains paused until the matching
@@ -773,12 +832,20 @@ campaign/UI conversations separate from ordinary card-state effects while
 allowing metadata-defined records to invoke them in both game modes.
 
 ### Triggered-ability handling (`abilities/framework/triggers.py`, `deathcry.py`)
-`resolve_triggers` fires abilities whose `card_abilities_meta.trigger_event_type`
-matches a supported event (`AsEntersPlayEvent` Inspire, `CardEnteredZoneEvent`
-Deploy/Deathcry, `CardAttackedEvent`, `CardBlockedEvent`, `CardInspiredEvent`).
-`resolve_deathcry` walks a dead card's BOM. These cover a subset of
-`TriggerEvent` types; other triggers (e.g. `CardCastEvent`, `SpellCastEvent`,
-`DamageEvent`, …) are not yet wired.
+Live battle resolution uses `rules_port.triggers.NativeTriggerBackend` and
+`RecordsTriggerDiscovery`; the legacy `resolve_triggers` entry point is retained
+for direct compatibility callers. The native dispatcher matches the authored
+`trigger_event_type`, source and target identities, collection flags, and
+trigger conditions before scheduling the ability through the normal resolver.
+Event publishers are shared across card movement, casts, combat, damage,
+resource/stat changes, and turn transitions. `FireEventEffectTemplate` also
+dispatches the event type read from Records. The Records snapshot contains 44
+distinct trigger event types. The implementation audit does not certify every
+publisher/condition combination in both game modes; see
+[`docs/RULES_PORT_PARITY.md`](../docs/RULES_PORT_PARITY.md) for the current
+acceptance boundary and remaining event-level coverage work. Do not describe
+an event as implemented solely because its trigger type is accepted by the
+dispatcher.
 
 ### Shared activation/play boundary
 

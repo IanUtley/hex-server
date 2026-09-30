@@ -296,14 +296,14 @@ def test_port_spends_a_one_shot_champion_power_once():
                  "ability_instance_id": 1},
         player_id=player)
 
+    from rules_port.cooldowns import champion_cooldown_key
+    use_key = champion_cooldown_key(champ_uid, GOOD_AT_HIDING_ABILITY)
     assert executor("activate_ability", transaction) is True
-    assert state["champion_ability_uses"] == {
-        GOOD_AT_HIDING_ABILITY: 1}
+    assert state["champion_ability_uses"] == {use_key: 1}
     assert len(port.queued) == 1
     # The ONE-SHOT is spent: the replay is refused and nothing is queued.
     assert executor("activate_ability", transaction) is False
-    assert state["champion_ability_uses"] == {
-        GOOD_AT_HIDING_ABILITY: 1}
+    assert state["champion_ability_uses"] == {use_key: 1}
     assert len(port.queued) == 1
 
 

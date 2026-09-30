@@ -220,13 +220,21 @@ def play_free_resource_card(host, game, session, db, player_uid, ai_uid,
         0, int(state.get(f"{side}_total_resources", 0) or 0) + total_grant)
     state[f"{side}_charges"] = int(
         state.get(f"{side}_charges", 0) or 0) + 1
-    record_card_cast(state, owner_id, resource=True)
-    color_map = {"ruby": 8, "sapphire": 16, "blood": 4,
-                 "diamond": 64, "wild": 32}
-    color = color_map.get(str(row[3] or "").split()[0].lower())
-    if color is not None:
-        thresholds = state.setdefault(f"{side}_threshold", {})
-        thresholds[color] = int(thresholds.get(color, 0) or 0) + 1
+    record_card_cast(state, owner_id, resource=True,
+                     card_uid=int(card_uid), card_type="Resource")
+    from .statistics import record_charge_gained
+    record_charge_gained(state, owner_id, 1)
+    try:
+        ability_guids = json.loads(row[5] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        ability_guids = []
+    from .resources import resource_threshold_grants
+    threshold_grants = resource_threshold_grants(
+        db, session.session_id, owner_id, ability_guids, state,
+        source_uid=card_uid)
+    thresholds = state.setdefault(f"{side}_threshold", {})
+    for flag, amount in threshold_grants:
+        thresholds[flag] = int(thresholds.get(flag, 0) or 0) + int(amount)
     db.commit()
     from .persistence import save_state
     save_state(session, state)
@@ -250,12 +258,12 @@ def play_free_resource_card(host, game, session, db, player_uid, ai_uid,
         event.delta = amount
         event.new_value = value
         game._push(event)
-    if color is not None:
+    for flag, amount in threshold_grants:
         event = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
         event.player_id = owner
-        event.color = color
+        event.color = flag
         event.operation = 1
-        event.delta = 1
-        event.new_value = state[f"{side}_threshold"][color]
+        event.delta = int(amount)
+        event.new_value = state[f"{side}_threshold"][flag]
         game._push(event)
     return f"played resource {int(card_uid)} for free"

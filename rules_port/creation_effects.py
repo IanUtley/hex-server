@@ -23,6 +23,23 @@ def replacement_filter(attribute):
     return _REPLACEMENT_FILTERS.get(str(attribute))
 
 
+def replacement_substitute(attribute, linked_templates, replaced_guid):
+    """Return the linked template an authored ``...InsteadOf...`` marker uses.
+
+    Cottontail Recruiter's ``CreateShinhareMilitiaInsteadOfBattleHopper``
+    names both the replaced card and the substitute in the ability's card
+    links; the substitute is the linked template that is not the replaced one.
+    """
+    if "insteadof" not in str(attribute).lower():
+        return None
+    replaced = str(replaced_guid or "").lower()
+    for guid in linked_templates or ():
+        candidate = str(guid).lower()
+        if candidate and candidate != replaced:
+            return candidate
+    return None
+
+
 # The replaced template is named by the client's ``<a data=GUID>`` card link
 # inside the ability's game text, so the reference is read from the graph's
 # strings rather than from a parsed dict field.
@@ -51,7 +68,10 @@ def replacement_abilities(db, ability_guids):
             template = effect.template.to_dict() if effect.template else {}
             modifier = template.get("m_Modifier") or {}
             attr = str(modifier.get("m_Attribute") or "")
-            if "create" not in attr.lower() or "instead" not in attr.lower():
+            # Both the substitute markers (...InsteadOf...) and the count
+            # bonuses (...CreationBonus) are authored creation-replacement
+            # state; collect either shape.
+            if "creat" not in attr.lower():
                 continue
             linked = []
             def walk(value):

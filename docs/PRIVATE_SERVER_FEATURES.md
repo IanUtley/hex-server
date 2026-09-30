@@ -83,8 +83,8 @@ Frost Ring Arena implementation details are in
 - [x] Reconnect and state republishing for active sessions.
 - [ ] Full client-equivalent draw-first hand reorder flow.
 - [ ] Deck-exhaustion loss behavior on every draw path.
-- [ ] Campaign hand-size rules everywhere; campaign uses 10 while PvP uses 7,
-  and remaining paths need auditing.
+- [x] Hand-size rules follow the client: ten in PvE/PvE Arena, seven in PvP,
+  with campaign `MaximumHandSizeModifiers` and `UnlimitedHandSize` applied.
 - [ ] A reliable automated two-real-client PvP harness for all setup and combat
   flows.
 
@@ -105,6 +105,8 @@ Frost Ring Arena implementation details are in
   contents.
 - [ ] Complete parity for all combat keywords, prevention/replacement effects,
   simultaneous damage, and every edge case in the original client.
+  See [RulesPort parity evidence](RULES_PORT_PARITY.md) for the damage-order,
+  shield, multiplier and lifedrain fixes and their validation boundaries.
 
 ## Gamedata-driven abilities and rules
 
@@ -120,13 +122,21 @@ Frost Ring Arena implementation details are in
   registry where the original data needs a server-side adapter.
 - [x] Set 1 sweep coverage: 425/425 abilities resolved cleanly in the focused
   server sweep at the time of the last validation.
-- [ ] Remaining ability leaves such as full discard/void, tap/untap,
-  grant/play/fire-event/reveal/revert/store-targets/verdict behavior.
-- [ ] Complete generic target filters and all target-selection modes.
-- [ ] Full condition trees, variables/output variables, option lists, effect
-  durations/teardown, uses/cooldowns, and every trigger type.
-- [ ] Eliminate the remaining game-text compatibility fallbacks where typed
-  gamedata fields are available.
+- [x] Shared executors for the current Records effect leaves, including
+  discard/void, tap/untap, grant/play/fire-event/reveal/revert/store-targets,
+  verdict, repeating effects, and typed variable/effect fields. See
+  [`abilities/ABILITIES.md`](../abilities/ABILITIES.md) and the field audit in
+  [`RULES_PORT_PARITY.md`](RULES_PORT_PARITY.md); leaf registration alone does
+  not establish client or trigger-event parity.
+- [ ] Complete parity for every target filter and selection mode, including
+  edge-case condition combinations and their PvP/PvE acceptance paths.
+- [ ] Complete end-to-end acceptance for all 45 authored trigger event types
+  in Practice/PvE and PvP. The C# producer-to-server publication map and the
+  shared ordered-resolution path are documented in
+  [`RULES_PORT_PARITY.md`](RULES_PORT_PARITY.md); client packet/UI completion
+  still needs fresh mode-specific traces.
+- [ ] Remove game-text compatibility fallbacks only after confirming the
+  corresponding Records field is present and authoritative.
 
 ## Campaign, tournaments, chat, and replay
 
@@ -140,9 +150,9 @@ Frost Ring Arena implementation details are in
 - [x] Frost Ring Arena run totals: non-boss wins add gold pouches, boss wins
   add treasure chests, and the totals are shown in the arena lobby.
 - [x] Session-event replay capture.
-- [ ] Complete Frost Ring Arena cash-out loot delivery; the current cash-out
-  response returns accumulated gold but does not yet populate `AllLoot` or
-  convert the chest total into inventory chests.
+- [x] Frost Ring Arena cash-out gold delivery: each stored gold bag is paid as
+  100 account gold and returned in `AllLoot`; the completed roster is revealed
+  before the client performs final arena cleanup.
 - [ ] Complete Frost Ring Arena start-to-finish parity, including all rewards,
   encounter effects, challenges, buyouts, and client-equivalent challenger
   match lifecycle.

@@ -325,9 +325,11 @@ def apply_attribute_grant(game, session, db, handler, pl_t, ai_t, target_uid,
     if bits & game_engine.ECardAttributes.Defensive:
         champion_uids = set()
         if (bstate or {}).get("pvp"):
+            champ_map = (bstate or {}).get("champ_map")
+            champion_values = (champ_map.values()
+                               if isinstance(champ_map, dict) else ())
             champion_uids.update(
-                int(uid) for uid in (bstate.get("champ_map") or {}).values()
-                if uid)
+                int(uid) for uid in champion_values if uid)
         for attr in ("_player_champ_scid", "_ai_champ_scid"):
             champ = getattr(handler, attr, None)
             if champ is not None:

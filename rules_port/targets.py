@@ -15,8 +15,7 @@ class TargetSelection:
 
     @classmethod
     def from_values(cls, template_id, card_ids: Iterable[int] | int | None):
-        values = () if card_ids is None else (
-            card_ids if isinstance(card_ids, (tuple, list, set)) else (card_ids,))
+        values = (card_ids,) if isinstance(card_ids, int) else (card_ids or ())
         return cls(str(template_id), tuple(int(value) for value in values))
 
 

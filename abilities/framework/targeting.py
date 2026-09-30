@@ -308,17 +308,78 @@ def _stored_uids(stored_names, ability_state):
         return set()
 
 
+_OWNERSHIP_FILTERS = {"IsControlledBy", "IsNotControlledBy", "DifferentOwners"}
+
+
+def _filter_type_names(node, acc):
+    if isinstance(node, dict):
+        name = str(node.get("_t", "")).rsplit(".", 1)[-1]
+        if name:
+            acc.add(name)
+        for child in node.get("m_TargetFilters") or ():
+            _filter_type_names(child, acc)
+        _filter_type_names(node.get("m_TargetFilter"), acc)
+    return acc
+
+
+def _ownership_context_is_incomplete(card, filter_json, source):
+    """Return True when only the legacy side fallback can resolve ownership."""
+    if not (_filter_type_names(filter_json, set()) & _OWNERSHIP_FILTERS):
+        return False
+    if isinstance(card, dict) and card.get("src_owner_id") is not None:
+        return False
+    if source is None:
+        return True
+    return not any(source.get(key) is not None for key in
+                   ("user_id", "owner_id", "controller_id", "player_id"))
+
+
+def _evaluate_card_filter_via_port(card, filter_json, source_uid,
+                                   stored_names, source_card, card_pool,
+                                   ability_state, db):
+    from rules_port.filters import records_filter_matches
+    source = source_card
+    if source is None and source_uid is not None:
+        source = {"card_uid": source_uid}
+    if _ownership_context_is_incomplete(card, filter_json, source):
+        raise ValueError("legacy ownership context is incomplete")
+    context = ability_state if isinstance(ability_state, dict) else {}
+    extra = {}
+    if stored_names is not None:
+        extra["stored_names"] = stored_names
+    if card_pool is not None:
+        extra["all_cards"] = tuple(card_pool)
+    if db is not None:
+        extra["db"] = db
+    if extra:
+        context = {**context, **extra}
+    player = None
+    if isinstance(card, dict):
+        player = card.get("src_owner_id", card.get("src_owner_side"))
+    return records_filter_matches(card, filter_json, source=source,
+                                  context=context, player=player)
+
+
 def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
                          source_card=None, card_pool=None, champion_pool=None,
                          ability_state=None, db=None):
     """Evaluate a gamedata CardFilter tree against one card.
 
     ``card`` is a dict with at least card_uid, card_type, location, user_id,
-    attack, defense.  Filters we cannot model (e.g. IsSubType without a
-    subtype column) default to True so they never wrongly exclude.
+    attack, defense.  The native RulesPort evaluator owns the semantics; the
+    legacy branches below remain only as a fallback when a compatibility
+    caller supplies a filter the port does not construct.
     """
     if not isinstance(filter_json, dict):
         return True
+    import os as _os
+    if _os.environ.get("HEX_LEGACY_FILTERS_PORT", "1") == "1":
+        try:
+            return _evaluate_card_filter_via_port(
+                card, filter_json, source_uid, stored_names, source_card,
+                card_pool, ability_state, db)
+        except Exception:
+            pass
     t = _last(filter_json.get("_t"))
     if t == "AndCardFilter":
         return all(evaluate_card_filter(
@@ -678,7 +739,8 @@ def evaluate_card_filter(card, filter_json, source_uid, stored_names=None,
             card.get("template_guid"))
     if t == "IsEquippedCardFilter":
         return template_equipment_match(
-            card.get("template_guid"), filter_json.get("m_EquipmentType"))
+            card.get("template_guid"),
+            str(filter_json.get("m_EquipmentType") or ""))
     if t == "InCollection":
         wanted = _filter_zones(filter_json.get("m_CardSource"))
         return not wanted or card.get("location") in wanted

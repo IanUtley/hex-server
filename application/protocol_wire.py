@@ -7,6 +7,7 @@ the existing compatibility path.
 
 import json
 import struct
+from typing import Any, cast
 
 
 IDENT = b"~HCP~"
@@ -50,7 +51,7 @@ def tournament_deck_card_ids(deck_value, field_name):
         if not isinstance(card, dict):
             continue
         try:
-            card_uid = int(card.get("Id"))
+            card_uid = int(cast(Any, card.get("Id")))
         except (TypeError, ValueError):
             continue
         template = card.get("TemplateID", {})

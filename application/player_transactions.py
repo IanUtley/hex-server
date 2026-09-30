@@ -104,6 +104,26 @@ def _normalize_activation_data(value):
         "counterxcost": "counter_x_cost",
         "spellpointsxcost": "spell_points_x_cost",
         "setvalues": "set_values",
+        # ``XCostData`` serializes its private members with their ``m_``
+        # prefix (AbilityActivationData's own fields do not), so the same
+        # members arrive as ``m_ResourceXCost`` / ``m_CardsToSacrifice`` /
+        # ... .  Without these aliases the chosen X was dropped and a
+        # variable-cost card resolved for 0.
+        "mresourcexcost": "resource_x_cost",
+        "mchargepointsxcost": "charge_points_x_cost",
+        "mlifexcost": "life_x_cost",
+        "mcounterxcost": "counter_x_cost",
+        "mspellpointsxcost": "spell_points_x_cost",
+        "msetvalues": "set_values",
+        "mcardstodiscard": "cards_to_discard",
+        "mcardstoexhaust": "cards_to_exhaust",
+        "mcardstoputintodeck": "cards_to_put_into_deck",
+        "mcardstoputintohand": "cards_to_put_into_hand",
+        "mcardstoreveal": "cards_to_reveal",
+        "mcardstosacrifice": "cards_to_sacrifice",
+        "mcardstoshuffleintodeck": "cards_to_shuffle_into_deck",
+        "mcardstovoid": "cards_to_void",
+        "mcardstomobilize": "cards_to_mobilize",
     }
     result = {}
     for key, item in value.items():
@@ -415,7 +435,7 @@ def typed_payload_from_decoded(command, decoded):
                     # their labelled card fields independently; using the
                     # last UID in the envelope makes Bunoshi buff the troop
                     # selected for sacrifice and then fail the cost check.
-                    def labelled_card(label):
+                    def labelled_activation_card(label):
                         pos = raw.find(label)
                         if pos < 0:
                             return None
@@ -423,8 +443,8 @@ def typed_payload_from_decoded(command, decoded):
                         if values:
                             return int(values[0])
                         return None
-                    effect_target = labelled_card(b"TargetMap")
-                    sacrifice_target = labelled_card(b"CardsToSacrifice")
+                    effect_target = labelled_activation_card(b"TargetMap")
+                    sacrifice_target = labelled_activation_card(b"CardsToSacrifice")
                     if effect_target is None:
                         effect_target = card_uids[-1]
                     raw_payload["activation_data"] = {
