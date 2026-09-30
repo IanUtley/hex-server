@@ -7,7 +7,11 @@ available even before a dedicated semantic property is added.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import struct
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, Mapping, cast
 
 from .records import RecordObject, reference_guid, register_type
@@ -487,6 +491,88 @@ class CardTemplate(RecordObject):
     @property
     def card_type(self) -> str:
         return str(self.field("m_CardType", ""))
+
+    @property
+    def base_attack(self) -> int:
+        return _int(self.field("m_BaseAttackValue"))
+
+    @property
+    def base_defense(self) -> int:
+        return _int(self.field("m_BaseDefenseValue"))
+
+    @property
+    def subtype(self) -> str:
+        return str(self.field("m_CardSubtype", "") or "")
+
+    @property
+    def attributes(self) -> int:
+        """Decode the client-authored printed attribute flags."""
+        value = self.field("m_AttributeFlags", "")
+        if isinstance(value, int):
+            return int(value)
+        from domain.enums import ECardAttributes
+        result = 0
+        for name in str(value or "").split("|"):
+            result |= int(getattr(ECardAttributes, name.strip(), 0) or 0)
+        return result
+
+    @cached_property
+    def threshold_shards(self) -> tuple[int, ...]:
+        """Return printed thresholds in the server's ECardShards values."""
+        shard_flags = {
+            "colorless": 0,
+            "blood": 4,
+            "ruby": 8,
+            "sapphire": 16,
+            "wild": 32,
+            "diamond": 64,
+        }
+        result: list[int] = []
+        for requirement in self.threshold or ():
+            if isinstance(requirement, RecordObject):
+                color = requirement.field("m_ColorFlags", "")
+                count = requirement.field("m_ThresholdColorRequirement", 1)
+            elif isinstance(requirement, Mapping):
+                color = requirement.get("m_ColorFlags", "")
+                count = requirement.get("m_ThresholdColorRequirement", 1)
+            else:
+                color, count = requirement, 1
+            try:
+                count = max(0, int(count or 1))
+            except (TypeError, ValueError):
+                count = 1
+            flag = shard_flags.get(str(color or "").lower(), 0)
+            result.extend([flag] * count)
+        return tuple(result)
+
+    @cached_property
+    def lethal(self) -> bool:
+        """Read the printed Lethal IntAttr from the serialized client TAC."""
+        serialized = self.field("m_SerializedTAC")
+        if isinstance(serialized, RecordObject):
+            encoded = serialized.field("data", "")
+        elif isinstance(serialized, Mapping):
+            encoded = serialized.get("data", "")
+        else:
+            encoded = ""
+        if not encoded:
+            return False
+        try:
+            payload = base64.b64decode(str(encoded), validate=True)
+        except (ValueError, TypeError):
+            return False
+        digest = bytearray(hashlib.md5(b"Lethal").digest()[:4])
+        if digest[0] == 0:
+            digest[0] = 1
+        if digest[3] == 0:
+            digest[3] = 1
+        offset = payload.find(bytes(reversed(digest)))
+        if offset < 0 or offset + 8 > len(payload):
+            return False
+        try:
+            return bool(struct.unpack_from("<i", payload, offset + 4)[0])
+        except struct.error:
+            return False
 
     @property
     def resource_cost(self) -> int:

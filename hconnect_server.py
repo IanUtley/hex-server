@@ -18,6 +18,7 @@ import sqlite3
 import os
 from collections import namedtuple
 from collections.abc import Mapping
+from functools import lru_cache
 import uuid
 import hashlib
 import signal
@@ -280,6 +281,7 @@ from pvp_db import (db_clear_session_cards, db_game_session_pids,
                     db_card_uses, db_bump_card_use,
                     db_card_basic, db_card_with_template,
                     db_card_instance_full,
+                    db_card_instance_dynamic_projection,
                     db_card_ability_list,
                     db_template_by_guid,
                     db_champion_template_health, db_set_card_state_or,
@@ -330,6 +332,39 @@ def _records_ability_graph(handler, ability_guid) -> "AbilityGraph | None":
         except AttributeError:
             pass
     return ability_graph(store, str(ability_guid).lower())
+
+
+@lru_cache(maxsize=8192)
+def _records_card_projection(template_guid):
+    """Return the immutable printed card projection from the Records cache.
+
+    ``card_templates`` is a normalized database projection of the same client
+    CardTemplate records.  CardUpdated is a hot path, so use the indexed,
+    process-wide Records snapshot for static fields and leave SQLite to answer
+    only the mutable game-card state.  A missing record is a normal fallback
+    for champions, generated cards, and older/incomplete Records snapshots.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+
+    guid = str(template_guid or "").lower()
+    if not guid:
+        return None
+    record = DEFAULT_RECORD_STORE.get("CardTemplate", guid)
+    if record is None:
+        return None
+    return (
+        str(record.guid or guid).lower(),
+        record.card_type,
+        record.name,
+        record.resource_cost,
+        record.base_attack,
+        record.base_defense,
+        record.threshold_shards,
+        tuple(record.ability_guids),
+        record.attributes,
+        record.subtype,
+        record.lethal,
+    )
 
 
 def _records_target_spec(handler, target_guid):
@@ -9299,7 +9334,34 @@ class HCPHandler(ProfileStreamMixin):
         +atk/+def), not the template's printed list — so a Prep re-push keeps a
         shifted Lifedrain / granted ability / buff instead of reverting it.
         """
-        t = self._template_by_guid(template_guid)
+        # This is the hot CardUpdated path. Keep the instance fields in the
+        # historical ``db_card_instance_full`` order, but fetch the owner,
+        # zone, and current template GUID in the same indexed lookup. Printed
+        # fields come from the process-wide Records cache; a missing record is
+        # expected for champion/generated/legacy rows and uses the DB fallback.
+        joined = None
+        irow = None
+        if scid is not None:
+            joined = db_card_instance_dynamic_projection(
+                game.session_id.uid64, scid.uid.uid64, conn=_db)
+            irow = joined
+        t = None
+        records_template = None
+        if joined:
+            joined_guid = str(joined[13] or "")
+            requested_guid = str(template_guid or "")
+            if (joined_guid and
+                    (not requested_guid or
+                     joined_guid.lower() == requested_guid.lower())):
+                records_template = _records_card_projection(joined_guid)
+                if records_template:
+                    t = records_template[:6]
+        if t is None:
+            records_template = _records_card_projection(template_guid)
+            if records_template:
+                t = records_template[:6]
+        if t is None:
+            t = self._template_by_guid(template_guid)
         if t:
             tpl_guid, ct_name, name, cost, atk, def_ = t
             ct = game_engine.card_type_from_db(ct_name)
@@ -9335,9 +9397,7 @@ class HCPHandler(ProfileStreamMixin):
         orig_tpl = None
         card_location = None
         card_owner_id = None
-        irow = None
         if scid is not None:
-            irow = db_card_instance_full(game.session_id.uid64, scid.uid.uid64)
             if irow:
                 inst_abilities_json = irow[0]
                 atk_mod = irow[1] or 0
@@ -9373,10 +9433,8 @@ class HCPHandler(ProfileStreamMixin):
                         tb.get("damage_shields"))
                 except Exception:
                     pass
-            lrow = db_card_owner_zone_state(
-                game.session_id.uid64, scid.uid.uid64, conn=_db)
-            card_owner_id = lrow[0] if lrow else None
-            card_location = lrow[1] if lrow else None
+            card_owner_id = irow[11] if irow else None
+            card_location = irow[12] if irow else None
         native_bstate = getattr(self, "_current_bstate", None)
         native_cost = None
         if (scid is not None and isinstance(native_bstate, dict) and
@@ -9406,8 +9464,17 @@ class HCPHandler(ProfileStreamMixin):
                 except Exception:
                     pass
         if tpl_guid != "00000000-0000-0000-0000-000000000000":
-            lethal = bool(db_card_template_lethal(tpl_guid))
-            srow = db_card_template_thresholds(tpl_guid)
+            records_template = (records_template if records_template and
+                                str(records_template[0]).lower() ==
+                                str(tpl_guid).lower() else None)
+            if records_template:
+                lethal = bool(records_template[10])
+                shards = list(records_template[6])
+                srow = (None, json.dumps(list(records_template[7])),
+                        records_template[8])
+            else:
+                lethal = bool(db_card_template_lethal(tpl_guid))
+                srow = db_card_template_thresholds(tpl_guid)
             if srow:
                 if srow[0]:
                     try:
@@ -9430,7 +9497,10 @@ class HCPHandler(ProfileStreamMixin):
         if threshold_override is not None:
             shards = list(threshold_override)
         try:
-            subtype = db_template_subtype(tpl_guid, conn=_db) or ""
+            if records_template:
+                subtype = records_template[9] or ""
+            else:
+                subtype = db_template_subtype(tpl_guid, conn=_db) or ""
         except Exception:
             subtype = ""
         if subtype_override is not None:
@@ -9507,7 +9577,7 @@ class HCPHandler(ProfileStreamMixin):
         # ever placing those grants on the chain.
         if scid is not None and card_location == "warzone":
             from abilities.framework.targeting import evaluate_card_filter
-            card_subtype = db_template_subtype(tpl_guid, conn=_db) or ""
+            card_subtype = subtype or ""
             # Scene target filters can inspect dynamic IntAttr markers (for
             # example, Taming Dire Toad only grants Untamed to non-Tamed
             # Dire Toads).  Reconstruct those markers from the card's current

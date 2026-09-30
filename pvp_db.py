@@ -825,6 +825,24 @@ def db_card_instance_full(session_id, card_uid, conn=None):
         (session_id, int(card_uid))).fetchone()
 
 
+def db_card_instance_dynamic_projection(session_id, card_uid, conn=None):
+    """Return mutable instance state and ownership in one indexed lookup.
+
+    The first eleven fields intentionally retain ``db_card_instance_full``'s
+    order. Printed template fields are resolved from the process-wide Records
+    cache by the caller, avoiding a repeated SQLite join on this hot path.
+    """
+    return (conn or _db_layer._db).execute(
+        "SELECT gc.card_abilities, gc.card_attack_mod, gc.card_defense_mod, "
+        "gc.card_damage, gc.original_template_guid, gc.permanent_buffs, "
+        "gc.temporary_buffs, gc.card_cost_mod, gc.cost_mod_json, "
+        "gc.card_attributes, gc.temporary_attributes, "
+        "gc.user_id, gc.location, gc.template_guid "
+        "FROM game_cards gc "
+        "WHERE gc.session_id=? AND gc.card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+
+
 def db_is_champion_template(template_guid, conn=None):
     """Whether a template is present in either champion catalog."""
     connection = conn or _db_layer._db
