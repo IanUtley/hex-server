@@ -2888,8 +2888,101 @@ def test_gearsmith_player_picks_the_artifact(db):
     assert zones[top] == zones[second] == "deck", zones
 
 
+AG_UNTAMED_AURA = "c49e0fa5-a778-24fc-5483-ac6abcba1754"
+AG_SPHERE_CHANCE = "5cd9dfa2-cb88-915a-3c06-8ef0bf6d8672"
+AG_SPHERE_TAME = "153271a7-9117-301f-e4bb-625d53064bfc"
+TID_UNTAMED_TROOP = "b71b0113-0f8f-9d9c-bf8a-1517143f3cab"
+TPL_DIRE_TOAD = "2a419ce5-5e32-0c2f-5019-e4773544c25f"
+TPL_TAMING_SPHERE = "7a8ab8b5-23c2-4359-b8cb-f560c359da27"
+
+
+def _tamed_board(db):
+    """Taming Sphere (player) and a Dire Toad under the AI's Untamed aura."""
+    from rules_port.triggers import dispatch_native_trigger
+    for tpl in (TPL_DIRE_TOAD, TPL_TAMING_SPHERE):
+        _copy_card(db, tpl)
+    for ability in (AG_UNTAMED_AURA, AG_SPHERE_CHANCE, AG_SPHERE_TAME):
+        _copy_ability(db, ability)
+    handler = HandlerStub(db)
+    handler._champion_granted_ability_guids = {
+        int(handler._ai_champ_scid.uid.uid64): [AG_UNTAMED_AURA]}
+    add_card(db, 0x901, 5, TPL_TAMING_SPHERE, loc="warzone")
+    add_card(db, 0x501, 0, TPL_DIRE_TOAD, loc="warzone")
+    db.execute("UPDATE game_cards SET card_abilities=(SELECT abilities_json "
+               "FROM card_templates WHERE guid=template_guid)")
+    db.commit()
+    pl_t, ai_t = _pl_ai()
+    bstate = {"stack": [], "ability_lists": {}, "_rules_port_attached": True}
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game_engine.Game(1, pl_t, ai_t),
+        session=SessionStub(), player_uid=pl_t, ai_uid=ai_t,
+        battle_state=bstate, event_type="CardEnteredZoneEvent",
+        source_card_id=0x501, source_player_id=0,
+        data={"event_source_collection": "CastSpells",
+              "event_destination_collection": "warzone"})
+    return handler, bstate
+
+
+def _toad(db):
+    location, buffs = db.execute(
+        "SELECT location, permanent_buffs FROM game_cards WHERE card_uid=?",
+        (0x501,)).fetchone()
+    return location, json.loads(buffs or "{}").get("int_attrs", {})
+
+
+def test_untamed_aura_makes_the_toad_a_taming_target(db):
+    """"Your non-Tamed Dire Toads are Untamed" is a constant IntAttrModifier
+    (Set Untamed = m_Value 1).  The native leaf read only "amount", so it set
+    Untamed to 0 and the Taming Sphere never had a legal target."""
+    from rules_port.targeting import legal_targets
+    _handler, bstate = _tamed_board(db)
+    assert _toad(db) == ("warzone", {"Untamed": 1}), _toad(db)
+    assert legal_targets(db, 1, 5, TID_UNTAMED_TROOP, 0x901,
+                         both_players=True, champions=[],
+                         battle_state=bstate) == [0x501]
+
+
+def test_taming_sphere_captures_the_toad(db):
+    """A successful tame marks the troop Tamed, clears Untamed and voids it;
+    the Tamed quest looks for a Tamed troop in the void."""
+    from rules_port.resolution import resolve_port_ability
+    handler, bstate = _tamed_board(db)
+    pl_t, ai_t = _pl_ai()
+    resolve_port_ability(
+        handler, game_engine.Game(1, pl_t, ai_t), SessionStub(), db, pl_t,
+        ai_t, bstate, AG_SPHERE_TAME, 0x901, 5, target_map={0: 0x501})
+    assert _toad(db) == ("void", {"Tamed": 1}), _toad(db)
+
+
+def test_taming_sphere_chance_either_captures_or_leaves_the_toad(db):
+    """The 2-cost ability is a 50% tame: every outcome is a clean capture or
+    an untouched Untamed toad, and both outcomes occur."""
+    from rules_port.resolution import resolve_port_ability
+    pl_t, ai_t = _pl_ai()
+    outcomes = set()
+    for _ in range(40):
+        db.execute("DELETE FROM game_cards")
+        db.commit()
+        handler, bstate = _tamed_board(db)
+        resolve_port_ability(
+            handler, game_engine.Game(1, pl_t, ai_t), SessionStub(), db,
+            pl_t, ai_t, bstate, AG_SPHERE_CHANCE, 0x901, 5,
+            target_map={1: 0x501})
+        location, attrs = _toad(db)
+        assert (location, attrs) in (("void", {"Tamed": 1}),
+                                     ("warzone", {"Untamed": 1})),             (location, attrs)
+        outcomes.add(location)
+        if outcomes == {"void", "warzone"}:
+            break
+    assert outcomes == {"void", "warzone"}, outcomes
+
+
+
 def _main():
-    tests = (test_construction_plans_count_the_exhausted_troops,
+    tests = (test_untamed_aura_makes_the_toad_a_taming_target,
+             test_taming_sphere_captures_the_toad,
+             test_taming_sphere_chance_either_captures_or_leaves_the_toad,
+             test_construction_plans_count_the_exhausted_troops,
              test_gearsmith_takes_the_revealed_artifact_and_stays_in_play,
              test_gearsmith_without_an_artifact_returns_all_three,
              test_gearsmith_player_picks_the_artifact,
