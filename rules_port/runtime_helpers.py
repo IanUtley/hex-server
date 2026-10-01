@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import threading
+
 import game_engine
+
+
+_CHAMPION_ABILITY_USES_LOCK = threading.RLock()
 
 
 def next_game_card_uid(db, session_id):
@@ -28,6 +33,38 @@ def owner_uid(owner_id, player_uid, ai_uid, battle_state=None):
     if (battle_state or {}).get("pvp"):
         return game_engine.UID.make(244, int(owner_id or 0))
     return player_uid if int(owner_id or 0) else ai_uid
+
+
+def game_health_projection_attr(game, battle_state, owner_id):
+    """Return the player/AI health field for a PvP owner in this Game view."""
+    state = battle_state or {}
+    if not state.get("pvp"):
+        return None
+    try:
+        owner = int(owner_id or 0)
+    except (TypeError, ValueError):
+        return None
+    health_map = state.get("pvp_health_map") or {}
+    mapped = health_map.get(owner, health_map.get(str(owner)))
+    if mapped in ("player_health", "ai_health"):
+        return mapped
+    for attribute in ("player_uid", "ai_uid"):
+        participant = getattr(game, attribute, None)
+        try:
+            packed = raw_uid(participant)
+        except (TypeError, ValueError):
+            continue
+        if (packed & 0xFF) == 244 and (packed >> 8) == owner:
+            return "player_health" if attribute == "player_uid" else "ai_health"
+    return None
+
+
+def set_game_champion_health(game, battle_state, owner_id, health_key, value):
+    """Update both the checkpoint key and its client-facing Game health field."""
+    setattr(game, str(health_key), int(value))
+    projected = game_health_projection_attr(game, battle_state, owner_id)
+    if projected:
+        setattr(game, projected, int(value))
 
 
 def raw_uid(value):
@@ -89,7 +126,7 @@ def champion_uid_for_owner(handler, battle_state, owner_id):
         owner = int(owner_id if owner_id is not None else 0)
     except (TypeError, ValueError):
         return None
-    if state.get("pvp"):
+    if state.get("pvp") or isinstance(state.get("champ_map"), dict):
         champions = state.get("champ_map") or {}
         value = champions.get(owner, champions.get(str(owner)))
         if value is None:
@@ -106,6 +143,61 @@ def champion_uid_for_owner(handler, battle_state, owner_id):
         return raw_uid(getattr(champion, "uid", champion))
     except (TypeError, ValueError):
         return None
+
+
+def champion_ability_use_key(source_uid, ability_guid):
+    """Return a stable per-champion, per-ability usage key."""
+    try:
+        source = raw_uid(source_uid)
+    except (TypeError, ValueError):
+        return None
+    guid = str(ability_guid or "").lower()
+    return f"{source}:{guid}" if guid else None
+
+
+def champion_ability_uses_this_turn(battle_state, key):
+    """Return this turn's use count for a synthetic champion ability."""
+    if not isinstance(battle_state, dict) or not key:
+        return 0
+    try:
+        turn = int(battle_state.get("turn_number", 1) or 1)
+    except (TypeError, ValueError):
+        turn = 1
+    with _CHAMPION_ABILITY_USES_LOCK:
+        usages = battle_state.get("champion_ability_uses_per_turn")
+        entry = usages.get(str(key)) if isinstance(usages, dict) else None
+        if not isinstance(entry, dict) or entry.get("turn_number") != turn:
+            return 0
+        try:
+            return int(entry.get("uses", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
+def record_champion_ability_use_this_turn(battle_state, key):
+    """Record one synthetic champion ability use for the current turn."""
+    if not isinstance(battle_state, dict) or not key:
+        return 0
+    try:
+        turn = int(battle_state.get("turn_number", 1) or 1)
+    except (TypeError, ValueError):
+        turn = 1
+    with _CHAMPION_ABILITY_USES_LOCK:
+        usages = battle_state.get("champion_ability_uses_per_turn")
+        if not isinstance(usages, dict):
+            usages = {}
+            battle_state["champion_ability_uses_per_turn"] = usages
+        previous = usages.get(str(key))
+        if isinstance(previous, dict) and previous.get("turn_number") == turn:
+            try:
+                count = int(previous.get("uses", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+        else:
+            count = 0
+        count += 1
+        usages[str(key)] = {"turn_number": turn, "uses": count}
+        return count
 
 
 def champion_uids_by_owner(adapter, battle_state):

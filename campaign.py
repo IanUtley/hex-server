@@ -1319,6 +1319,7 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
             },
         })
 
+    npc = None
     campaign_group = (((area_state.get("PublicState") or {}).get("Data") or {})
                        .get("CampaignGroup") or "AREA")
 
@@ -3721,9 +3722,10 @@ def _build_initial_gameplay_state(cid, champion_id, campaign_type, champion_race
             (rid for rid, name in _RACE_NAMES.items()
              if name.lower() == champion_race.lower()),
             None)
-    race_name = _RACE_NAMES.get(race_id, champion_race)
+    race_key = int(race_id) if isinstance(race_id, int) else 0
+    race_name = _RACE_NAMES.get(race_key, champion_race)
     if campaign_type == "PANORAMA":
-        cfg = _az0_config(race_id)
+        cfg = _az0_config(race_key)
         if cfg:
             return _build_starter_panorama_state(cid, champion_id, cfg)
 
@@ -3949,7 +3951,9 @@ def _az1_panorama_assets(panorama_node, champion_race=None):
     # Preserve compatibility with older panorama states that predate the node
     # marker. New authored AZ1 handoffs must be added above instead of relying
     # on the travelling champion's race.
-    return _RACE_BUNDLE_MAP.get(champion_race, ("", ""))
+    race_key = (int(champion_race)
+                if isinstance(champion_race, int) else -1)
+    return _RACE_BUNDLE_MAP.get(race_key, ("", ""))
 
 # When _launch_encounter pushes a gamestarted, the scene GUID is stored
 # here keyed by session_name so the battle session setup can resolve the
@@ -4198,6 +4202,29 @@ def _push_campaign_notify(handler, env_json, comp, session_id, target, instance,
     return f"    Sent Campaign notify {env_json.get('RequestType','?')} ({len(dw_bytes)}b)"
 
 
+def _push_fra_buff_conversation(handler, conversation_guid, service_mail_uid):
+    """Queue an authored FRA reward conversation in the Arena client."""
+    body = encode_objfmt_response(
+        ["Game.Shared.Network.Campaign.BuffConversationEventArgs",
+         "Game.Shared.ResourceId", "System.Guid"],
+        [("ConversationID", "struct", ("Game.Shared.ResourceId", [
+            ("m_Guid", "guid", str(conversation_guid)),
+        ]))],
+    )
+    body = compress_gzip(body)
+    data = encode_datawrapper(
+        0, 10047, body, 1, "00000000-0000-0000-0000-000000000000")
+    reqid = int(getattr(handler, "scnt", 0) or 0)
+    issuer = (f"0.0.0.0.ServiceCampaign.{service_mail_uid}."
+              f"ServicePlayer.{handler.client_uid}.{reqid}")
+    handler.scnt = reqid + 1
+    handler.send({
+        "issuer": issuer, "target": "ServiceCampaign", "instance": "Shared",
+        "reqid": 0, "c": 1, "conh": 0, "sid": handler.sid,
+    }, data)
+    return f"    Sent FRA reward conversation {conversation_guid}"
+
+
 # ---------------------------------------------------------------------------
 # Request handlers
 # ---------------------------------------------------------------------------
@@ -4313,6 +4340,7 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
     # query always recreated/selected Panorama and silently took the player
     # out of the dungeon.
     dungeon = _get_existing_campaign_for_champion(db, champ_id, "DUNGEON")
+    d_state = dungeon[4] if dungeon else None
     if dungeon:
         d_cid, d_inst_id, d_inst_hi, d_started, d_state = dungeon
         if d_state and (d_started or d_state.get("Started")) \
@@ -4333,14 +4361,16 @@ def _handle_qcur4champ(handler, db, env_json, comp, session_id,
     # back into the panorama rather than reopening the map.
     authored_panorama = _get_existing_campaign_for_champion(
         db, champ_id, "PANORAMA")
+    panorama_state = authored_panorama[4] if authored_panorama else None
     last_campaign_id = pve_db.db_champion_last_campaign_id(
         champ_id, conn=db)
     if (authored_panorama and last_campaign_id == authored_panorama[0] and
-            authored_panorama[4] and
-            authored_panorama[4].get("PanoramaSceneGuid")):
+            isinstance(panorama_state, dict) and
+            panorama_state.get("PanoramaSceneGuid")):
         area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
         if area and area[4]:
-            p_cid, _p_lo, _p_hi, _p_started, p_state = authored_panorama
+            p_cid = authored_panorama[0]
+            p_state = panorama_state
             p_state = _build_az1_panorama_state(
                 db, p_cid, champ_id, p_state.get("PanoramaSceneGuid"),
                 p_state.get("PanoramaNode"), area[4])
@@ -4682,6 +4712,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         cfg = _az0_config(champ[2])
     if cfg is None:
         cfg = _az0_config(1)  # fall back to Human layout
+    if cfg is None:
+        raise RuntimeError("AZ0 campaign configuration is unavailable")
 
     intro_npc = cfg["intro_npc"]
     trainer_npc = cfg["trainer_npc"]
@@ -4841,16 +4873,15 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                  if (loc.get("Data") or {}).get("node") == current_node),
                 {},
             )
-            path_mentions_current = any(
-                current_node in {
-                    _resolve_node(state, part)
-                    for part in re.fullmatch(
-                        r"Path_([^_]+)_([^_]+)", str(path or "")
-                    ).groups()
-                }
-                for path in values
-                if re.fullmatch(r"Path_([^_]+)_([^_]+)", str(path or ""))
-            )
+            path_mentions_current = False
+            for path in values:
+                match = re.fullmatch(
+                    r"Path_([^_]+)_([^_]+)", str(path or ""))
+                if match and current_node in {
+                    _resolve_node(state, part) for part in match.groups()
+                }:
+                    path_mentions_current = True
+                    break
             current_scene = _az1_scene_for_node(db, current_node)
             if (arrived_node is None and current_data.get("completed") and
                     path_mentions_current and
@@ -5531,6 +5562,8 @@ def _apply_gameend(db, camp_id, won):
         cfg = _az0_config(champ[2])
     if cfg is None:
         cfg = _az0_config(1)
+    if cfg is None:
+        raise RuntimeError("AZ0 campaign configuration is unavailable")
 
     is_dungeon = (ctype or "").upper() == "DUNGEON"
 
@@ -6136,9 +6169,12 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
                   or reward.get("pack_guid"))
     if chest_guid:
         chest_guid = str(chest_guid)
-        chest_id = int(db_create_treasure_chest(
+        chest_id = db_create_treasure_chest(
             user_id, "00000000-0000-0000-0000-000000000000", "Promo", db,
-            template_guid=chest_guid))
+            template_guid=chest_guid)
+        if chest_id is None:
+            raise RuntimeError("Could not persist the campaign reward chest")
+        chest_id = int(chest_id)
         inventory_id = 9000 + chest_id
         applied["Items"].append({"Item": {
             "Id": inventory_id,
@@ -6403,6 +6439,8 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                 player_user_id,
                 "00000000-0000-0000-0000-000000000000", "Promo", db,
                 template_guid=chest_guid)
+            if chest_id is None:
+                raise RuntimeError("Could not persist the campaign reward chest")
             chest = {"id": int(chest_id),
                      "template": chest_guid}
         items = []
@@ -6563,6 +6601,61 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     return result
 
 
+def prepare_fra_battle_gameend(handler, db, session, won):
+    """Persist and clean up a non-campaign FRA/PvE battle result.
+
+    The client leaves the battle as soon as it receives ``GameEnded`` and
+    immediately joins the Arena lobby again.  Callers that publish that event
+    themselves must therefore run this step first, otherwise the join can read
+    the previous ``challenger_index`` and show the same opponent again.
+
+    ``None`` means the session belongs to the separate campaign/tournament
+    path.  A dict means this was the FRA/PvE path, including a failed attempt
+    whose error is already logged and represented by ``handled=False``.
+    """
+    try:
+        session_name = session.session_name or ""
+        if (session_name.startswith("camp_") or
+                session_name.startswith("tourney-")):
+            return None
+        profile = getattr(handler, "user_profile", None)
+        if not profile:
+            return None
+        from pve_db import db_record_arena_fight
+        from pvp_db import db_delete_game_session
+        result = db_record_arena_fight(
+            profile["id"], won, return_details=True,
+            session_id=session.session_id)
+        db_delete_game_session(session.session_id)
+        return {"handled": True, "result": result}
+    except Exception as exc:
+        getattr(handler, "_log_req", print)(
+            f"    FRA result preparation failed: {exc}")
+        return {"handled": False, "result": None}
+
+
+def publish_fra_battle_gameend(handler, prepared, service_mail_uid):
+    """Publish deferred FRA flags and reward conversations after GameEnded."""
+    if not prepared or not prepared.get("handled"):
+        return False
+    result = prepared.get("result") or {}
+    reward_guid = result.get("reward_conversation_guid", "")
+    if result.get("tier_one_perfect_flag_awarded"):
+        try:
+            handler.push_reckoning_flags_updated()
+        except Exception as exc:
+            getattr(handler, "_log_req", print)(
+                "    Could not publish ARENA_TIER1_PERFECT: "
+                f"{exc}")
+    if result.get("recorded") and reward_guid:
+        try:
+            _push_fra_buff_conversation(handler, reward_guid, service_mail_uid)
+        except Exception as exc:
+            getattr(handler, "_log_req", print)(
+                f"    Could not send FRA reward conversation: {exc}")
+    return True
+
+
 def handle_battle_gameend(handler, db, session, won, service_mail_uid,
                           service_campaign_uid_type=253):
     """Apply a finished PvE/FRA battle and clean up its game session.
@@ -6574,16 +6667,14 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
     """
     try:
         session_name = session.session_name or ""
-        from pve_db import db_record_arena_fight
-        from pvp_db import db_delete_game_session
         if not session_name.startswith("camp_"):
-            profile = getattr(handler, "user_profile", None)
-            if not session_name.startswith("tourney-") and profile:
-                db_record_arena_fight(profile["id"], won)
-                db_delete_game_session(session.session_id)
+            prepared = prepare_fra_battle_gameend(handler, db, session, won)
+            if prepared is not None:
+                publish_fra_battle_gameend(
+                    handler, prepared, service_mail_uid)
                 getattr(handler, "_log_req", print)(
                     f"    FRA result recorded (won={won}); session cleaned")
-                return True
+                return bool(prepared.get("handled"))
             return False
         camp_id = int(session_name[5:])
         reward_result = _apply_encounter_end_rewards(
@@ -6722,23 +6813,11 @@ def _fortune_ability_guid(db, card_guid):
 
 
 def _fortune_starting_hand_bonus(db, ability_guid):
-    """Read a Fortune's typed starting-hand modifier from BOM metadata."""
+    """Read a Fortune's typed starting-hand modifier from its BOM."""
     if not ability_guid:
         return 0
-    for _effect_type, raw_param in pvp_db.db_ability_effect_type_params(
-            ability_guid, conn=db):
-        try:
-            param = json.loads(raw_param or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            param = {}
-        if (param.get("property") or "").lower() != "intattr":
-            continue
-        match = re.search(
-            r"starting hand size(?: is increased by)?\s+(\d+)",
-            str(param.get("text") or "").lower())
-        if match:
-            return int(match.group(1))
-    return 0
+    from rules_port.pregame import ability_starting_hand_size_modifier
+    return ability_starting_hand_size_modifier(db, ability_guid)
 
 
 def consume_fortune(db, camp_id, fortune_guid):
@@ -6807,13 +6886,21 @@ def resolve_battle_config(handler, db, camp_id, session_name):
                 is_tutorial = True
     profile = getattr(handler, "user_profile", None) or {}
     if not deck_db_id and profile:
-        deck_db_id = pve_db.db_first_deck_id_for_user(
-            profile.get("id"), conn=db)
+        profile_id = profile.get("id")
+        if profile_id is not None:
+            deck_db_id = pve_db.db_first_deck_id_for_user(
+                int(profile_id), conn=db)
 
-    race_name = _RACE_DECK_MAP.get(race_num)
+    try:
+        race_key = int(race_num) if race_num is not None else -1
+    except (TypeError, ValueError):
+        race_key = -1
+    race_name = _RACE_DECK_MAP.get(race_key)
     cls_name = {1: "Mage", 2: "Warrior", 3: "Cleric", 4: "Rogue",
-                5: "Warlock", 6: "Ranger", 7: "Boat"}.get(cls_num)
-    gnd_name = {1: "Male", 2: "Female"}.get(gnd_num, "")
+                5: "Warlock", 6: "Ranger", 7: "Boat"}.get(
+                    int(cls_num) if cls_num is not None else -1)
+    gnd_name = {1: "Male", 2: "Female"}.get(
+        int(gnd_num) if gnd_num is not None else -1, "")
     player_champ_guid = None
     if race_name and cls_name:
         player_champ_guid = pve_db.db_player_champion_template(
@@ -6831,7 +6918,7 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     # the client.  Apply their metadata-defined starting-health modifiers at
     # the authoritative battle boundary (e.g. Weight's +5).
     try:
-        from abilities.framework.conditions import \
+        from rules_port.pregame import \
             passive_talent_starting_health_modifier
         talent_guids = json.loads(player_talents_json or "[]")
         player_starting_health += passive_talent_starting_health_modifier(
@@ -6882,10 +6969,8 @@ def resolve_battle_config(handler, db, camp_id, session_name):
 def player_cannot_choose_play_first(db, camp_id):
     """Return whether a campaign champion has a no-Play-first talent.
 
-    The rule is authored in the talent metadata rather than in the champion
-    name or a card-specific battle branch.  Weight is currently a passive
-    talent without an ability row, so its description is the authoritative
-    source for this restriction.
+    ChampionTalentData serializes the rule into its TAC tree as the
+    ``CantGoFirst`` attribute, including for passive talents with no ability.
     """
     if not camp_id:
         return False
@@ -6898,12 +6983,22 @@ def player_cannot_choose_play_first(db, camp_id):
         return False
     if not isinstance(talent_guids, list) or not talent_guids:
         return False
-    descriptions = pve_db.db_talent_descriptions(talent_guids, conn=db)
-    for (description,) in descriptions:
-        text = str(description or "").casefold().replace("’", "'")
-        if ("can't choose to go first" in text or
-                "cannot choose to go first" in text):
-            return True
+    from gamedata import DEFAULT_RECORD_STORE
+    from rules_port.tac import decode_tac_tree, _tac_attr_hash
+    attr = _tac_attr_hash("CantGoFirst")
+    for talent_guid in talent_guids:
+        record = DEFAULT_RECORD_STORE.get(
+            "ChampionTalentData", str(talent_guid or "").lower())
+        serialized = record.field("m_SerializedTAC") or {} if record else {}
+        data = serialized.get("data") if isinstance(serialized, dict) else None
+        if not data:
+            continue
+        try:
+            value = decode_tac_tree(data).get(attr, 0)
+            if int(value or 0):
+                return True
+        except (TypeError, ValueError):
+            continue
     return False
 
 
@@ -6920,7 +7015,7 @@ def resolve_opening_hand_config(db, session, player_id, race_name, cls_name,
         race_name, cls_name, conn=db)
     base_hand = (int(class_hand_size) if class_hand_size is not None
                  else 7)
-    from abilities.framework.conditions import pregame_modifiers
+    from rules_port.pregame import pregame_modifiers
     guids = []
     for ability in ability_guids or []:
         guid = getattr(ability, "guid", ability)
@@ -6928,7 +7023,8 @@ def resolve_opening_hand_config(db, session, player_id, race_name, cls_name,
     mods = pregame_modifiers(db, session, player_id, guids)
     return {
         "starting_hand_size": max(0, base_hand + int(mods["starting_hand"])),
-        "maximum_hand_size": max(0, 7 + int(mods["maximum_hand"])),
+        # Player.MaximumHandSize: PvE and PvE Arena use ten, PvP seven.
+        "maximum_hand_size": max(0, 10 + int(mods["maximum_hand"])),
         "starting_hand_effects": list(mods["starting_hand_effects"]),
     }
 
@@ -6954,7 +7050,7 @@ def apply_starting_hand_talents(handler, db, session, game, pl_t, effects):
             continue
         candidates = pvp_db.db_starting_hand_candidates(
             session.session_id, owner_id,
-            card_types if cost_mod and card_types else None, conn=db)
+            card_types if card_types else None, conn=db)
         if not candidates:
             continue
         card_uid, template_guid, raw_buffs = random.choice(candidates)
@@ -7295,6 +7391,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                 and requested.get("completed")
                 and not requested.get("repeatable"))
             movement_rejected = False
+            previous_data = {}
             path_forks = (_az1_path_fork_ids(db)
                           if ((ctype or "").upper() == "AREA" and
                               str(template_name or "").upper() == "AZ1")
@@ -7436,7 +7533,8 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                             data["conversationId"] = _az1_node_conversation(
                                 db, node, state, champ_id=champ_id)
                         masked_army_variant = (
-                            _az1_masked_army_variant(db, champ_id, node=node)
+                            _az1_masked_army_variant(
+                                db, champ_id, node=str(node or ""))
                             if str(node).lower() in {"noder", "node00r"}
                             else None
                         )
@@ -7601,6 +7699,8 @@ def _handle_cheat(handler, db, env_json, comp, session_id,
             cfg = _az0_config(champ[2]) if champ else _az0_config(1)
             if cfg is None:
                 cfg = _az0_config(1)
+            if cfg is None:
+                raise RuntimeError("AZ0 campaign configuration is unavailable")
             state = _build_initial_gameplay_state(camp_id, camp_champ_id,
                                                   "DUNGEON", _race_for_cfg(cfg))
             _transition_to_dungeon(state, cfg)

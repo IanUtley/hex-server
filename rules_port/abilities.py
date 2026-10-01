@@ -173,8 +173,7 @@ class AbilityInstance:
             inferred = {
                 index: selected
                 for index, _cost in enumerate(cost_targets)
-                for selected in (self.metadata.activation.target_map.get(index,
-                              self.metadata.activation.target_map.get(str(index))),)
+                for selected in (self.metadata.activation.target_map.get(index),)
                 if selected
             }
             # A few Mono serializers omit the target-template index entirely

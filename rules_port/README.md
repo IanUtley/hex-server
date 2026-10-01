@@ -1,5 +1,8 @@
 # Python RulesPort runtime
 
+Semantic coverage, source evidence, focused acceptance and remaining gaps are
+tracked in [`docs/RULES_PORT_PARITY.md`](../docs/RULES_PORT_PARITY.md).
+
 `rules_port` is the Python implementation of the behavioral
 contracts extracted from `HexClient/Game.Shared`. It is deliberately isolated
 from transport and storage:
@@ -44,6 +47,12 @@ ability definitions come from `Records` through `AbilityGraph`; SQLite is the
 mutable session projection. A request classified as a port intent is
 acknowledged even when rejected and is never re-run through the legacy
 dispatcher.
+
+Client events are projections too: a `Game` is one packet's buffer, and the
+host replaces it per packet. The port publishes through `GameEngineEventSink`,
+which queues a projection the host moves off before anything serialized it; the
+session-level serializer drains that queue into the packet it is about to build
+(`GameEngineEventSink.drain_into`) and consumes the buffer when it sends.
 
 ### UI checkpoints and continuations
 
@@ -94,9 +103,9 @@ writing checkpoint counters directly. `AbilityCostPlan` is also applied by a
 RulesPort transition before the host projects its resource, charge, spell-point,
 or life events.
 
-The live HConnect host attaches one fully wired RulesPort session by default
-(`HEX_RULES_PORT_AUTO_ATTACH=1`); `HEX_RULES_PORT_AUTO_ATTACH=0` is the explicit
-rollback switch. A mode can also create one fully wired host with
+The live HConnect host attaches one fully wired RulesPort session for every
+game; there is no legacy rollback mode. A mode can also create one fully wired
+host with
 `enable_rules_port(game_session, game, battle_state)`, or use
 `rules_session_for(game_session, game)` when supplying adapters separately, then
 feed classified commands through `submit_classified_transaction`, and compare
@@ -108,8 +117,14 @@ RulesPort scheduler. Domain callbacks are projection adapters for SQLite and
 Unity events; they do not select or implement gameplay rules. Typed requests
 never fall through to the legacy dispatcher after a RulesPort rejection.
 `DebugCheatTransaction` and `NonsenseTransaction` remain intentionally
-outside the gameplay rules boundary. Live attached sessions use
-`NativeEffectBackend`, `NativeTriggerBackend`, and the native target evaluator;
+outside the gameplay rules boundary. With the port attached, a request the
+decoder cannot classify is acknowledged and dropped instead of being handed to
+the legacy engine; the class belongs in `classify_player_transaction` before it
+can be played. No mode dispatches a live PlayerTransaction through the legacy
+handlers.
+
+Live attached sessions use `NativeEffectBackend`, `NativeTriggerBackend`, and
+the native target evaluator;
 the deprecated compatibility adapters live outside the RulesPort dispatcher and
 are not selectable by a live session.
 

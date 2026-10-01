@@ -1,6 +1,8 @@
 """Tournament PvP game setup — push initial battle events to both players."""
 
-import random, json, threading, re, time
+import random, json, threading, re, time, struct
+from types import SimpleNamespace
+from typing import Any
 
 import game_engine as _ge
 from rules_port.persistence import (load_pvp_state, save_pvp_state)
@@ -18,6 +20,7 @@ from rules_port.pvp_lifecycle import (phase_is_stop as port_phase_is_stop,
                                       queue_stack_item as port_queue_stack_item,
                                       default_pvp_state as port_default_pvp_state,
                                       mulligan_transition as port_mulligan_transition,
+                                      skips_draw_phase as port_skips_draw_phase,
                                       turn_phase_list as port_turn_phase_list)
 from gamedata import DEFAULT_RECORD_STORE, ability_graph, PlayPlan
 from application.player_transactions import extract_ability_guid
@@ -25,6 +28,7 @@ from db import _db, log_req
 from pvp_db import (db_game_session_pids, db_game_champion,
                     db_game_cards_at_location,
                     db_game_deck_cards, db_game_draw_cards, db_game_card_type,
+                    db_card_instance_dynamic_projections,
                     db_game_shuffle_deck, db_champion_template_health,
                     db_discard_card, db_delete_game_session,
                     db_card_ability_list, db_ability_effect_type_params,
@@ -41,6 +45,7 @@ from pvp_db import (db_game_session_pids, db_game_champion,
                     db_card_location, db_card_basic,
                     db_warzone_troops_with_state,
                     db_warzone_attack_option_rows, db_warzone_blocker_uids,
+                    db_game_get_hand,
                     db_card_attribute_rows, db_card_uids_in_zone,
                     db_ability_option_cards, db_card_ability_payload,
                     db_template_ability_payload, db_card_activation_info,
@@ -69,6 +74,17 @@ _PVP_INACTIVITY_TIMEOUT_SECONDS = 5 * 60
 _RECORD_STORE = DEFAULT_RECORD_STORE
 
 
+def _uid_int(value: Any) -> int:
+    """Normalize an integer or protocol UID at dynamic payload boundaries."""
+    return int(getattr(value, "uid64", value))
+
+
+def _raw_player_id(value: Any) -> int:
+    """Return the raw player id from either a raw id or ServicePlayer UID."""
+    value = _uid_int(value)
+    return value >> 8 if (value & 0xFF) == 244 else value
+
+
 def _pvp_dispatch_triggers(handler, game, session, state, player_uid,
                            ai_uid, event_type, source_card_id,
                            source_owner_id=None, target_card_id=None,
@@ -92,14 +108,15 @@ def _pvp_dispatch_triggers(handler, game, session, state, player_uid,
 def _pvp_resolve_ability(handler, game, session, state, player_uid, ai_uid,
                          ability_guid, source_uid, owner_id, *,
                          target_map=None, variables=None,
-                         resume_from_order=None, instance_id=1):
+                         resume_from_order=None, instance_id=1,
+                         event_tac=None):
     """Resolve a PvP continuation through the native RulesPort lifecycle."""
     from rules_port.resolution import resolve_port_ability
     return resolve_port_ability(
         handler, game, session, _db, player_uid, ai_uid, state,
         ability_guid, source_uid, owner_id, target_map=target_map,
         variables=variables, resume_from_order=resume_from_order,
-        instance_id=instance_id)
+        instance_id=instance_id, event_tac=event_tac)
 
 
 def _pvp_resource_charge_points(session, card_uid):
@@ -133,7 +150,8 @@ def _pvp_resource_charge_points(session, card_uid):
     return total
 
 
-def _pvp_gain_charge_trigger_game(handler, session, state, owner_id):
+def _pvp_gain_charge_trigger_game(handler, session, state, owner_id,
+                                  amount=1):
     """Build the objective event stream for a PvP charge-gain trigger."""
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
@@ -152,11 +170,31 @@ def _pvp_gain_charge_trigger_game(handler, session, state, owner_id):
         champion = (getattr(owner_handler, "_player_champ_scid", None) or
                     getattr(owner_handler, "_ai_champ_scid", None))
         source_uid = (int(champion.uid.uid64) if champion is not None else 0)
-    _pvp_dispatch_triggers(
-        owner_handler, game, session, state, pl_uid, opp_uid,
-        "GainChargeEvent", source_uid,
-        owner_id)
+    try:
+        amount = max(0, int(amount or 0))
+    except (TypeError, ValueError):
+        amount = 0
+    for _ in range(amount):
+        _pvp_dispatch_triggers(
+            owner_handler, game, session, state, pl_uid, opp_uid,
+            "GainChargeEvent", source_uid, owner_id)
     return game
+
+
+def _take_pending_gain_charge_amount(state, owner_id):
+    """Consume a deferred resource charge count after its picker closes."""
+    pending_owner = state.get("pending_gain_charge_pid")
+    try:
+        matches = pending_owner is not None and int(pending_owner) == int(owner_id)
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        return 0
+    state.pop("pending_gain_charge_pid", None)
+    try:
+        return max(0, int(state.pop("pending_gain_charge_amount", 1) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _pvp_gain_threshold_trigger_game(handler, session, state, owner_id,
@@ -499,10 +537,9 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
         live = pvp_load_state(session) or {}
         if live.get("pending_discard_ability"):
             return bool(_pvp_resolve_discard_prompt(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         try:
-            card_uid = int(getattr(payload.get("card_id"), "uid64",
-                                   payload.get("card_id")))
+            card_uid = _uid_int(payload.get("card_id"))
         except (TypeError, ValueError):
             return False
         pids = tuple(int(pid) for pid in db_game_session_pids(
@@ -522,31 +559,42 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
         return True
     if kind == "discard_continuation":
         return bool(_pvp_resolve_discard_prompt(
-            current, session, raw, my_pid))
+            current, session, raw, my_pid, typed_payload=payload))
     if kind == "triggered":
         pending = pvp_load_state(session) or {}
         if pending.get("pending_trigger"):
+            if (pending.get("pending_trigger") or {}).get("optional"):
+                return bool(_pvp_resolve_optional_trigger(
+                    current, session, raw, my_pid, typed_payload=payload))
             return bool(_pvp_resolve_trigger_target(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         search = pending.get("pending_deck_search") or {}
         search_kind = str(search.get("kind") or "")
-        if search_kind == "revealed_troop":
+        if search_kind in ("revealed_troop", "revealed_card"):
             return bool(_pvp_resolve_revealed_choice(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         if search_kind == "shard":
             return bool(_pvp_resolve_shard_choice(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         if search_kind == "matching_target":
             return bool(_pvp_resolve_matching_target(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         if search:
             return bool(_pvp_resolve_deck_search(
-                current, session, raw, my_pid))
+                current, session, raw, my_pid, typed_payload=payload))
         return True
     if kind == "attack":
-        return bool(_pvp_declare_attackers(current, session, raw, my_pid))
+        # RulesPort has already validated and staged these declarations.
+        # Pass the accepted attacker IDs through so the legacy event
+        # projection does not re-check them against a stale PvP snapshot and
+        # accidentally drop a valid attack.
+        return bool(_pvp_declare_attackers(
+            current, session, raw, my_pid,
+            declarations=payload.get("declarations")))
     if kind == "defense":
-        return bool(_pvp_declare_blockers(current, session, raw, my_pid))
+        return bool(_pvp_declare_blockers(
+            current, session, raw, my_pid,
+            declarations=payload.get("declarations")))
     if kind == "ready":
         return True
     if kind == "damage":
@@ -555,7 +603,6 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
         # native phase/action-stack boundary.
         live = pvp_load_state(session) or {}
         try:
-            import struct
             selected = []
             for match in re.finditer(
                     rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});', raw):
@@ -582,7 +629,34 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
                 _pvp_resolve_combat(
                     session, live,
                     first_strike=(phase == _ge.ETurnPhases.AssignFirstStrikeDamage))
-                _pvp_advance_from_damage_step(session, live, phase)
+                # AssignDamageOrder is the client's automatic pass through
+                # this phase. Resolve the projected combat effects, then let
+                # the native PriorityWindowAction and phase graph consume that
+                # pass. Manually advancing only the PvP checkpoint leaves the
+                # RulesPort cursor behind (for example native phase 16 while
+                # turn_order says 18); the next request reattaches the native
+                # phase and resolves the same damage step again.
+                if str(getattr(session, "state", "") or "").lower() != "ended":
+                    if port is not None:
+                        player_id = getattr(transaction, "player_id", None)
+                        if not port.pass_priority_and_drive(player_id):
+                            log_req(
+                                "    PvP AssignDamageOrder could not consume "
+                                f"native priority: phase={phase} player={player_id!r}")
+                            return False
+                        live = pvp_load_state(session) or live
+                        port.sync_to_pvp_state(live)
+                        pvp_save_state(session, live)
+                        try:
+                            port.persist()
+                        except Exception as exc:
+                            log_req(
+                                "    PvP RulesPort post-damage persistence "
+                                f"failed: {exc}")
+                    else:
+                        # Compatibility for callers that have not attached a
+                        # native PvP scheduler.
+                        _pvp_advance_from_damage_step(session, live, phase)
             pvp_save_state(session, live)
             return True
         except (TypeError, ValueError, struct.error) as exc:
@@ -590,8 +664,7 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
             return False
     if kind == "play_resource":
         try:
-            card_uid = int(getattr(payload.get("card_id"), "uid64",
-                                   payload.get("card_id")))
+            card_uid = _uid_int(payload.get("card_id"))
         except (TypeError, ValueError):
             return False
         pids = db_game_session_pids(session.session_id)
@@ -628,6 +701,41 @@ def project_accepted_pvp_transaction(handler, session, kind, transaction,
     # by the legacy all-purpose dispatcher.
     log_req(f"    PvP RulesPort projection: unsupported kind={kind}")
     return False
+
+
+def _wire_pvp_state_based_handler(port, handler, session, game):
+    """Run PvP state-based actions before each native priority handoff."""
+    def state_based():
+        live = pvp_load_state(session) or getattr(port, "_pvp_state", None)
+        if not isinstance(live, dict) or not live.get("pvp"):
+            return False
+        pids = db_game_session_pids(session.session_id)
+        if len(pids) < 2:
+            pids = [int(pid) for pid in (live.get("pids") or ())]
+        if len(pids) < 2:
+            return False
+        try:
+            owner_id = _uid_int(getattr(port, "active_player_id", None))
+        except (TypeError, ValueError):
+            owner_id = 0
+        if owner_id not in {int(pid) for pid in pids}:
+            owner_id = int(live.get("turn_pid") or pids[0])
+        opponent_id = next(
+            int(pid) for pid in pids if int(pid) != int(owner_id))
+        current_handler = (getattr(port, "_pvp_current_handler", None)
+                           or handler)
+        projection = (getattr(getattr(port, "event_sink", None), "game", None)
+                      or game)
+        if current_handler is None or projection is None:
+            return False
+        host = _PvpChainHost(
+            current_handler, session, live, owner_id, opponent_id)
+        return host.chain_state_based(
+            session, live, projection,
+            _ge.UID.make(244, owner_id),
+            _ge.UID.make(244, opponent_id))
+
+    port.set_state_based_handler(state_based)
 
 
 def attach_pvp_rules_port(handler, session, game, state):
@@ -684,6 +792,7 @@ def attach_pvp_rules_port(handler, session, game, state):
         sink = getattr(cached, "event_sink", None)
         if sink is not None:
             sink.game = game
+        _wire_pvp_state_based_handler(cached, handler, session, game)
         facts = getattr(cached, "runtime_facts", None)
         if facts is not None:
             facts.battle_state = live_state
@@ -704,6 +813,13 @@ def attach_pvp_rules_port(handler, session, game, state):
     from rules_port import (GameEngineEventSink, PvpAuthoritativeSession,
                             SQLiteRulesSnapshot, attach_pvp_runtime_facts)
     pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        # The participant rows are written with the opening hands, so the
+        # first gameplay transaction of a resumed match can arrive before they
+        # exist.  A tourney game always runs on the native host: fall back to
+        # the checkpoint's own participant list instead of dropping the
+        # session onto the legacy stack.
+        pids = _pvp_session_pids(session, state)
     if len(pids) < 2:
         return None
     # ``session.players`` is legacy transport metadata and may contain the
@@ -811,7 +927,9 @@ def attach_pvp_rules_port(handler, session, game, state):
                     defense=defense, gems=gems)
         # Activation prompts and native effect events must share the same
         # recipient-aware PvP projection used by the rest of the packet path.
-        port.event_sink.game = game
+        event_sink = port.event_sink
+        if event_sink is not None:
+            event_sink.game = game
         result = resolve_port_ability(
             current_handler(), game, session, _db, player_uid, opponent_uid,
             view, ability.ability_template_id, int(ability.source_uid),
@@ -832,25 +950,76 @@ def attach_pvp_rules_port(handler, session, game, state):
             return native_activation_resolver(ability)
         state = pvp_load_state(session) or {}
         descriptor = dict(ability.descriptor)
+        # PvpAuthoritativeSession stores projected-chain owners as typed
+        # ServicePlayer UIDs in memory, while reconnect descriptors contain
+        # raw player ids.  Normalize both representations before rebuilding
+        # a typed UID; shifting an already-typed UID overflows uint64 during
+        # CardUpdated packet serialization.
+        owner_id = _raw_player_id(ability.owner_id)
+        if int(state.get("completed_chain_instance_id", 0) or 0) == int(
+                ability.instance_id):
+            # Manual/champion abilities retain PvP-specific cost and health
+            # projections while they resolve. Once a picker has resumed the
+            # complete BOM, use the shared lifecycle only for its finishing
+            # chain events; running the PvP resolver again would draw again.
+            from rules_port.actions import AbilityResolutionState
+            from rules_port.chain_items import resolve_chain_item
+            pids = db_game_session_pids(session.session_id)
+            if len(pids) < 2:
+                pids = _pvp_session_pids(session, state)
+            if len(pids) < 2:
+                return AbilityResolutionState.COMPLETED
+            opponent_id = next(pid for pid in pids
+                               if int(pid) != int(owner_id))
+            host = _PvpChainHost(
+                current_handler(), session, state, owner_id, opponent_id)
+            resolution = resolve_chain_item(
+                host, port, session, _db, ability,
+                _ge.UID.make(244, int(owner_id)),
+                _ge.UID.make(244, int(opponent_id)))
+            pvp_save_state(session, state)
+            session._rules_port_mutation_emitted = True
+            return resolution
         # The PvP host projection consumes the same persisted descriptor; only
         # its chain ownership has moved to the native action stack.
         stack = state.setdefault("stack", [])
         if not stack or int(stack[-1].get("instance_id", -1)) != int(
                 descriptor.get("instance_id", -2)):
             stack.append(descriptor)
-        owner_id = int(ability.owner_id >> 8) if (
-            isinstance(ability.owner_id, int) and
-            (ability.owner_id & 0xFF) == 244) else int(
-                getattr(ability.owner_id, "uid64", ability.owner_id))
-        if descriptor.get("kind") == "spell":
-            _pvp_resolve_native_spell(
-                session, state, current_handler(), descriptor)
-        elif descriptor.get("kind") == "troop":
-            _pvp_resolve_native_permanent(
-                session, state, current_handler(), descriptor)
+        if descriptor.get("kind") == "ability":
+            # Manual/champion abilities carry PvP-only projections (charge /
+            # spell-power HUD events before the picker opens, and the
+            # champion-health delta after it resolves).  Those stay in the PvP
+            # projection; the chain-item lifecycle around them is the shared
+            # one.
+            _pvp_resolve_ability_item(
+                session, state, current_handler(), owner_id, descriptor)
         else:
-            _pvp_resolve_chain(
-                session, state, current_handler(), owner_id, item=descriptor)
+            # Troop/artifact/constant, spell and triggered chain items resolve
+            # through the same seam as Practice/PvE
+            # (``rules_port.chain_items``): one lifecycle, one picker-
+            # continuation marker, one set of authored effect resolvers.  The
+            # PvP host below supplies only the two-client packet projection.
+            from rules_port.actions import AbilityResolutionState
+            from rules_port.chain_items import resolve_chain_item
+            pids = db_game_session_pids(session.session_id)
+            if len(pids) < 2:
+                pids = _pvp_session_pids(session, state)
+            if len(pids) < 2:
+                session._rules_port_mutation_emitted = True
+                return AbilityResolutionState.COMPLETED
+            opponent_id = next(pid for pid in pids
+                               if int(pid) != int(owner_id))
+            host = _PvpChainHost(current_handler(), session, state,
+                                 owner_id, opponent_id)
+            resolution = resolve_chain_item(
+                host, port, session, _db, ability,
+                _ge.UID.make(244, int(owner_id)),
+                _ge.UID.make(244, int(opponent_id)))
+            session._rules_port_mutation_emitted = True
+            if resolution is not AbilityResolutionState.COMPLETED:
+                return resolution
+            state = host.state
         pvp_save_state(session, state)
         from rules_port.actions import AbilityResolutionState
         if (not bool(getattr(ability, "ignores_chain", False)) and
@@ -858,6 +1027,10 @@ def attach_pvp_rules_port(handler, session, game, state):
                     "pending_choice", "pending_trigger",
                     "pending_deck_search", "pending_conversation",
                     "pending_discard_ability", "resolution_paused"))):
+            if str(descriptor.get("kind") or "") == "ability":
+                state["paused_chain_instance_id"] = int(
+                    ability.instance_id)
+                pvp_save_state(session, state)
             # A real chain ability paused on an interactive prompt.  Keep the
             # chain item (do not forget the projected chain) so the client's
             # picker is not torn down; resolution resumes when the prompt is
@@ -872,6 +1045,9 @@ def attach_pvp_rules_port(handler, session, game, state):
         if remaining and not any(state.get(key) for key in (
                 "pending_choice", "pending_deck_search", "pending_trigger",
                 "pending_discard_ability")):
+            pids = db_game_session_pids(session.session_id)
+            if len(pids) < 2:
+                pids = _pvp_session_pids(session, state)
             next_item = remaining[-1]
             next_source = int(next_item.get("source_uid") or 0)
             next_owner = owner_id
@@ -890,7 +1066,10 @@ def attach_pvp_rules_port(handler, session, game, state):
 
     def native_activation_cost_payer(ability):
         """Apply the numeric portion of a simple native ability cost."""
-        from rules_port.costs import ability_cost_targets, plan_ability_cost
+        from rules_port.costs import (
+            ability_cost_targets, plan_ability_cost,
+            validate_cost_target_selection,
+        )
         from rules_port.resources import pay_resource_for_player
         metadata = getattr(ability, "metadata", ability)
         ability_guid = (getattr(metadata, "ability_template_id", None) or
@@ -912,12 +1091,11 @@ def attach_pvp_rules_port(handler, session, game, state):
                 selected = cost_map.get(index, cost_map.get(str(index), ()))
                 if cost.is_source_auto_target and not selected:
                     selected = (int(metadata.source_uid),)
-                selected = tuple(int(value) for value in (selected or ()))
-                if (len(selected) < int(cost.minimum) or
-                        (int(cost.maximum) > 0 and
-                         len(selected) > int(cost.maximum)) or
-                        any(value not in set(cost.candidates)
-                            for value in selected)):
+                selected = validate_cost_target_selection(
+                    _db, session.session_id, owner_id,
+                    int(getattr(metadata, "source_uid", 0) or 0), cost,
+                    selected, battle_state=state)
+                if selected is None:
                     return False
                 if selected:
                     from rules_port.costs import cost_type_for_kind
@@ -973,8 +1151,6 @@ def attach_pvp_rules_port(handler, session, game, state):
         if cost_selections:
             state["_rules_port_pvp_cost_selections"] = [
                 (spec, list(selected)) for spec, selected in cost_selections]
-        db_bump_card_use(session.session_id, int(metadata.source_uid),
-                         str(ability_guid))
         pvp_save_state(session, state)
         return True
 
@@ -984,6 +1160,48 @@ def attach_pvp_rules_port(handler, session, game, state):
         # Activation is fully owned by the native MetadataCardTransaction
         # executor; this callback exists only for the non-activation kinds.
         return False
+
+    def publish_card_activated(ability, transaction):
+        sink = getattr(port, "event_sink", None)
+        if sink is None:
+            return False
+        raw_player = getattr(transaction, "player_id", 0)
+        raw_player = int(getattr(raw_player, "uid64", raw_player) or 0)
+        owner_id = (raw_player >> 8 if raw_player & 0xFF == 244
+                    else raw_player)
+        pids = db_game_session_pids(session.session_id)
+        opponent_id = next((int(pid) for pid in pids
+                            if int(pid) != int(owner_id)), None)
+        if opponent_id is None:
+            return False
+        state = pvp_load_state(session) or {}
+        from rules_port.triggers import dispatch_card_activated
+
+        def publish(**event):
+            data = dict(event.pop("data", {}) or {})
+            return _pvp_dispatch_triggers(
+                handler, event["game"], session, state,
+                event["player_uid"], event["ai_uid"],
+                event["event_type"], event["source_card_id"],
+                source_owner_id=event["source_player_id"],
+                target_card_id=event.get("target_card_id"), **data)
+
+        try:
+            result = dispatch_card_activated(
+                db=_db, handler=handler, game=sink.game, session=session,
+                player_uid=sink.game.player_uid, ai_uid=sink.game.ai_uid,
+                battle_state=state,
+                ability_guid=getattr(ability, "ability_template_id", ""),
+                source_card_id=int(getattr(ability, "source_uid", 0) or 0),
+                source_player_id=int(owner_id),
+                ability_instance_id=int(ability.instance_id),
+                activation_data=ability.activation.as_dict(),
+                dispatcher=publish)
+            pvp_save_state(session, state)
+            return result is not False
+        except Exception as exc:
+            log_req(f"    PvP CardActivatedEvent failed: {exc}")
+            return False
 
     from rules_port.card_transactions import MetadataCardTransactionExecutor
     from gamedata import ability_graph as _ability_graph
@@ -995,6 +1213,7 @@ def attach_pvp_rules_port(handler, session, game, state):
             if (int(getattr(tx.player_id, "uid64", tx.player_id)) & 0xFF) == 244
             else int(getattr(tx.player_id, "uid64", tx.player_id))),
         projection=native_card_projection,
+        activation_event=publish_card_activated,
         play_plan_loader=lambda template_guid, source_uid, owner_id:
             PlayPlan.from_card(_RECORD_STORE, template_guid,
                                source_uid=source_uid, owner_id=owner_id))
@@ -1038,7 +1257,7 @@ def attach_pvp_rules_port(handler, session, game, state):
                 port.active_player_skips_attack = not bool(has_attackers)
             # Keep a reconnectable pass record, while the native action queue
             # remains the authority for accepting and ordering the pass.
-            raw_player = int(getattr(player_id, "uid64", player_id))
+            raw_player = _uid_int(player_id)
             pass_pid = (raw_player >> 8
                         if (raw_player & 0xFF) == 244 else raw_player)
             responding_to_chain = (
@@ -1152,6 +1371,17 @@ def attach_pvp_rules_port(handler, session, game, state):
             live["priority_pid"] = (defender
                                      if phase == _ge.ETurnPhases.DeclareDefense
                                      else turn_pid)
+        if (phase == _ge.ETurnPhases.DeclareDefensePriorityWindow and
+                live.get("attackers") and not live.get("blockers") and
+                _pvp_defender_blockable_count(session, live) <= 0):
+            # The native graph skips DeclareDefense when nobody can block.
+            # Keep the client-visible empty declaration from the old
+            # auto-pass path, and persist it to prevent duplicate publication
+            # if this phase is re-entered after reconnect.
+            pvp_push_empty_blockers(session, live)
+            live["blockers"] = {
+                str(attacker): []
+                for attacker in (live.get("attackers") or {})}
         if phase == _ge.ETurnPhases.Discard:
             try:
                 live["discard_required"] = (
@@ -1170,10 +1400,55 @@ def attach_pvp_rules_port(handler, session, game, state):
                 session, turn_pid)
         except Exception:
             port.active_player_skips_attack = False
+        # The native Prep state branches straight to FirstMainPhase when the
+        # active player has no draw step.  Without this fact the scheduler
+        # enters Draw and the legacy projection deals a real card, which is
+        # the live symptom in a format whose champion power says "Skip your
+        # draw phase".
+        port.active_player_skips_draw = port_skips_draw_phase(live)
         pvp_save_state(session, live)
         _pvp_run_phase_start(session, live, phase)
         session._rules_port_mutation_emitted = True
         return True
+
+    def native_phase_exit(phase):
+        """Publish C# combat completion when its native phase exits."""
+        if phase == _ge.ETurnPhases.FirstStrikePriorityWindow:
+            if port.combat_has_standard_damage:
+                return None
+        elif phase != _ge.ETurnPhases.AssignDamage:
+            return None
+        live = pvp_load_state(session) or state
+        turn_pid = int(live.get("turn_pid") or 0)
+        pids_live = db_game_session_pids(session.session_id)
+        other_pid = next((int(pid) for pid in pids_live
+                          if int(pid) != turn_pid), None)
+        if not turn_pid or other_pid is None:
+            return None
+        sink = getattr(port, "event_sink", None)
+        projection = getattr(sink, "game", None)
+        if projection is None:
+            projection = _ge.Game(
+                int(session.session_id), _ge.UID.make(244, turn_pid),
+                _ge.UID.make(244, other_pid))
+            _pvp_populate_game_state(
+                projection, live, turn_pid, other_pid)
+            if sink is not None:
+                sink.game = projection
+        view = _pvp_fra_view(live, turn_pid, other_pid)
+        _pvp_dispatch_triggers(
+            current_handler(), projection, session, view,
+            projection.player_uid, projection.ai_uid,
+            "CombatEndedEvent", None, turn_pid)
+        _pvp_sync_view_to_state(live, view, turn_pid, other_pid)
+        pvp_save_state(session, live)
+        # C# enqueues CombatEndedEvent from OnExit before the next phase's
+        # OnEntry events. Flush this objective stream now to both clients;
+        # native_phase_entry will project the subsequent phase/options packet.
+        _pvp_send_same_events(
+            session, projection, projection.player_uid, projection.ai_uid)
+        session._rules_port_mutation_emitted = True
+        return None
 
     def native_turn_boundary(active_player_id):
         """Persist the RulesPort's completed EndTurn rotation for PvP."""
@@ -1263,11 +1538,12 @@ def attach_pvp_rules_port(handler, session, game, state):
                                     if (raw_priority & 0xFF) == 244
                                     else raw_priority)
         pvp_save_state(session, live)
-        if phase in (int(_ge.ETurnPhases.FirstMainPhase),
-                     int(_ge.ETurnPhases.SecondMainPhase)):
-            pvp_push_main_phase_options(session, live)
-        else:
-            pvp_push_phase_options(session, live)
+        # Project the SAME option list the phase entry pushed.  The client
+        # replaces its entire option set on every PlayerOptionList, so
+        # answering a DeclareAttack/DeclareDefense resync with the generic
+        # quick-action window would clear ECardUsage.Attack/Defend and leave
+        # every ready troop unselectable.
+        pvp_push_current_phase_options(session, live)
         return True
 
     # All callbacks are projections. No callback performs a second rules
@@ -1287,6 +1563,7 @@ def attach_pvp_rules_port(handler, session, game, state):
     port.set_turn_phase_resolver(set_stops)
     port.set_turn_boundary_resolver(native_turn_boundary)
     port.set_turn_phase_entry_resolver(native_phase_entry)
+    port.set_turn_phase_exit_resolver(native_phase_exit)
     port.set_discard_transaction_resolver(lambda tx: pvp_projection(
         "discard", tx))
     port.set_discard_continuation_resolver(lambda tx: pvp_projection(
@@ -1314,9 +1591,10 @@ def attach_pvp_rules_port(handler, session, game, state):
     # that the native chain resolver is wired, rebuild the current projected
     # response window if this handler was materialized by reconnect.
     port.rehydrate_projected_chain()
-    port._pvp_current_handler = handler
-    port._pvp_current_session = session
-    port._pvp_state = state
+    setattr(port, "_pvp_current_handler", handler)
+    setattr(port, "_pvp_current_session", session)
+    setattr(port, "_pvp_state", state)
+    _wire_pvp_state_based_handler(port, handler, session, game)
     session._rules_port_session = port
     set_pvp_shared_port(session, port)
     # ``restore_snapshot`` may have loaded a pre-migration native owner while
@@ -1324,7 +1602,8 @@ def attach_pvp_rules_port(handler, session, game, state):
     # snapshot immediately so reconnect cannot resurrect that stale turn
     # owner on the next process or handler attach.
     port.persist()
-    log_req(f"    PvP RulesPort attached session={session.session_id}")
+    log_req(f"    PvP RulesPort attached session={session.session_id}",
+            level="DEBUG")
     return port
 
 
@@ -1753,6 +2032,10 @@ def _pvp_run_draw(session, state):
     CardWouldBeDrawnEvent / CardWouldEnterZoneEvent replacement triggers first,
     then CardMoved+CardDrawn+CardUpdated (full data), then CardDrawnEvent for
     BOTH sides' cards."""
+    # Formats without a draw step (Merry-Melee Corinth) must not deal a card
+    # even if a phase projection still reaches Draw.
+    if port_skips_draw_phase(state):
+        return None
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return None
@@ -1993,16 +2276,16 @@ def _pvp_run_phase_start(session, state, phase):
     # players (each pushes them into its own packet below), with the TURN
     # player as the card controller so both screens untap the right troops.
     prep_wz = []   # (scid, template_guid, card_type, state) ready/untapped
+    prep_cooldown_uids = []
+    prep_champion_cooldowns = {}
     if phase == 8:
         from rules_port.resources import begin_turn_resources_for_player
         resource_refill = begin_turn_resources_for_player(state, turn_uid)
         from rules_port.lifecycle import clear_expired_temporary_attributes
         clear_expired_temporary_attributes(
             _db, session.session_id, turn_uid, "start_turn",
-            clear_stat_buffs=True)
-        clear_expired_temporary_attributes(
-            _db, session.session_id, turn_uid, "prep",
-            clear_stat_buffs=True)
+            clear_stat_buffs=True, battle_state=state,
+            handler=player_handlers.get(turn_uid))
         # Clear combat states (Tapped, Attacking, HasAttacked, Blocking,
         # HasBlocked) and CameOutThisTurn; set StartedATurnOnYourSide so
         # troops that survived to this turn are no longer summoning sick and
@@ -2029,6 +2312,16 @@ def _pvp_run_phase_start(session, state, phase):
             prep_wz.append((_ge.SessionCardId(_ge.UID(wz_uid)), wzr[1],
                             wz_ct, pstate))
         _db.commit()
+        from pvp_db import db_decrement_card_cooldowns_for_owner
+        prep_cooldown_uids = db_decrement_card_cooldowns_for_owner(
+            session.session_id, turn_uid, conn=_db)
+        from rules_port.cooldowns import decrement_champion_cooldowns
+        prep_champion_cooldowns = decrement_champion_cooldowns(
+            state, turn_uid)
+        clear_expired_temporary_attributes(
+            _db, session.session_id, turn_uid, "prep",
+            clear_stat_buffs=True, battle_state=state,
+            handler=player_handlers.get(turn_uid))
         log_req(f"    PvP Prep: refilled {turn_uid} to "
                 f"{resource_refill.new_value}, readied "
                 f"{len(prep_wz)} warzone troop(s)")
@@ -2170,6 +2463,60 @@ def _pvp_run_phase_start(session, state, phase):
                 g.push_card_updated(wz_scid, turn_uid_p,
                                     _ECardCollections.Warzone, wz_ct,
                                     template_id=wz_tpl, state=pstate)
+        if phase == 8 and prep_cooldown_uids:
+            from pvp_db import db_card_source_info
+            from rules_port.runtime_helpers import card_collection_for_location
+            cooldown_handler = player_handlers.get(turn_uid)
+            for cooldown_uid in prep_cooldown_uids:
+                row = db_card_source_info(
+                    session.session_id, cooldown_uid, conn=_db)
+                if not row:
+                    continue
+                template_guid, card_type, location, card_owner = row
+                scid = _ge.SessionCardId(_ge.UID(int(cooldown_uid)))
+                if cooldown_handler:
+                    try:
+                        _tpl, card_type, _name, cost, attack, defense, gems = \
+                            cooldown_handler._card_full_data(
+                                g, scid, template_guid)
+                    except Exception:
+                        continue
+                else:
+                    cost = attack = defense = gems = 0
+                g.push_card_updated(
+                    scid, _ge.UID.make(244, int(card_owner)),
+                    card_collection_for_location(location), card_type,
+                    template_id=template_guid,
+                    state=int(db_card_state_value(
+                        session.session_id, cooldown_uid, conn=_db) or 0),
+                    cost=cost, attack=attack, defense=defense, gems=gems)
+        if phase == 8 and prep_champion_cooldowns:
+            changed_champions = {
+                int(str(key).split(":", 1)[0]) for key in
+                prep_champion_cooldowns if ":" in str(key)}
+            for champion_uid in changed_champions:
+                scid = _ge.SessionCardId(_ge.UID(champion_uid))
+                cdef = g.card_defs.get(scid)
+                if cdef is None:
+                    continue
+                prefix = f"{champion_uid}:"
+                cooldowns = {}
+                for key, value in (
+                        state.get("champion_ability_cooldowns") or {}).items():
+                    if str(key).startswith(prefix):
+                        try:
+                            remaining = int(value or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if remaining > 0:
+                            cooldowns[str(key).split(":", 1)[1]] = remaining
+                cdef.cooldown_counts = {
+                    _ge.ResourceId.from_str(guid): value
+                    for guid, value in cooldowns.items()}
+                g.push_card_updated(
+                    scid, _ge.UID.make(244, int(turn_uid)),
+                    _ECardCollections.None_, _ECardTypes.Champion,
+                    cooldown_counts=cdef.cooldown_counts)
         my_champ_uid = int(champ_map.get(str(pid), 0))
         my_champ = _ge.SessionCardId(_ge.UID(my_champ_uid)) if my_champ_uid else None
 
@@ -2247,17 +2594,34 @@ def _pvp_run_phase_start(session, state, phase):
         else:
             state["priority_pid"] = state.get("turn_pid")
         pvp_save_state(session, state)
-    # Push the phase-appropriate options for the priority holder (mirrors PvE
-    # _push_phase_options): main phases get the full playable list, DeclareAttack
-    # the attack options, DeclareDefense the blocker options; every OTHER stop
-    # phase gets hand QuickActions + champion powers so instant-speed responses
-    # are possible in any priority window.
+    pvp_push_current_phase_options(session, state)
+
+
+def pvp_push_current_phase_options(session, state, pid=None):
+    """Push the PlayerOptionList the current phase requires (mirrors PvE
+    ``_push_phase_options``).
+
+    Single owner of the phase -> options contract: phase entry
+    (``_pvp_run_phase_start``), a client ``RequestPrioritySync``, and debug
+    state refreshes must all project the same list.  The client replaces its
+    whole option set on every push, so a resync answered with the generic
+    quick-action window during DeclareAttack/DeclareDefense clears
+    ``ECardUsage.Attack``/``Defend`` and makes every ready troop unselectable.
+
+    Main phases get the playable list, DeclareAttack the attack options,
+    DeclareDefense the blocker options; every OTHER stop phase gets hand
+    QuickActions + champion powers so instant-speed responses are possible in
+    any priority window.  A live chain item outranks all of them: the holder
+    responds to the chain instead of declaring combat.
+    """
     if _pvp_chain_active(session, state):
         # A draw trigger created a real chain item during phase start.  The
-        # normal phase-9 priority/options path would leave the client in a
-        # normal pass window even though the trigger is waiting to resolve.
-        pvp_push_phase_options(session, state, pid=state.get("priority_pid"))
-    elif phase in (_ge.ETurnPhases.FirstMainPhase,
+        # normal priority/options path would leave the client in a normal pass
+        # window even though the trigger is waiting to resolve.
+        pvp_push_phase_options(session, state, pid=pid)
+        return
+    phase = int(state.get("phase", 0) or 0)
+    if phase in (_ge.ETurnPhases.FirstMainPhase,
                  _ge.ETurnPhases.SecondMainPhase):
         pvp_push_main_phase_options(session, state)
     elif phase == _ge.ETurnPhases.DeclareAttack:
@@ -2268,7 +2632,7 @@ def _pvp_run_phase_start(session, state, phase):
         # Non-main stop phase (combat priority windows, AssignDamage steps,
         # Discard, EndTurn...): the priority player may cast QuickActions and
         # activate champion powers.
-        pvp_push_phase_options(session, state)
+        pvp_push_phase_options(session, state, pid=pid)
 
 
 def pvp_push_attack_options(session, state):
@@ -2308,7 +2672,10 @@ def pvp_push_attack_options(session, state):
     # attack with them.  Idempotent: already-attacking/committed troops are
     # skipped, so re-pushing the options never double-declares.
     champ_map = state.get("champ_map") or {}
-    my_champ = int(champ_map.get(str(turn_pid), 0))
+    # Combat declarations identify the champion being defended.  Storing the
+    # attacking player's champion made the damage resolver reject every open
+    # attack as damage to a Champion card owned by the attacker.
+    opp_champ = int(champ_map.get(str(opp_pid), 0))
     attackers = {int(k): int(v) for k, v in (state.get("attackers") or {}).items()}
     forced = []
     for uid, cstate, _card_type, attrs in rows:
@@ -2328,7 +2695,7 @@ def pvp_push_attack_options(session, state):
         u = int(uid)
         if u in attackers:
             continue
-        attackers[u] = my_champ
+        attackers[u] = opp_champ
         state_bits = (_ge.ECardStates.Attacking |
                       _ge.ECardStates.HasAttacked)
         if not (attrs & _ge.ECardAttributes.Steadfast):
@@ -2361,7 +2728,7 @@ def pvp_push_attack_options(session, state):
         scid = _ge.SessionCardId(_ge.UID(u))
         cid = _ge.CombatId(pl_t, i + 1)
         g.push_attack_declared(cid, pl_t,
-                               _ge.SessionCardId(_ge.UID(my_champ)) if my_champ
+                               _ge.SessionCardId(_ge.UID(opp_champ)) if opp_champ
                                else _ge.SessionCardId(opp_t), scid)
         trow = db_card_basic(session.session_id, u, conn=_db)
         tpl_guid = trow[0] if trow else None
@@ -2780,7 +3147,7 @@ def _pvp_drive_f10_priority(session, state=None, *, max_steps=32):
         priority = action.priority_player_id
         if priority is None:
             break
-        raw_priority = int(getattr(priority, "uid64", priority))
+        raw_priority = _uid_int(priority)
         priority_pid = (raw_priority >> 8
                         if (raw_priority & 0xFF) == 244 else raw_priority)
         if priority_pid != autopass_pid:
@@ -2908,7 +3275,20 @@ def pvp_advance_past_non_stops(session, state):
         if new_phase == _ge.ETurnPhases.Discard:
             hand_count = db_hand_count(
                 session.session_id, turn_pid, conn=_db)
-            if hand_count > DEFAULT_MAX_HAND_SIZE:
+            try:
+                from rules_port.static_rules import hand_size_unlimited
+                guid_map = state.setdefault("champ_guid_map", {})
+                for _pid in (turn_pid, opp_pid):
+                    if str(_pid) in guid_map:
+                        continue
+                    _row = db_game_champion(session.session_id, _pid)
+                    if _row and _row[1]:
+                        guid_map[str(_pid)] = _row[1]
+                unlimited = hand_size_unlimited(
+                    _db, session.session_id, state)
+            except Exception:
+                unlimited = False
+            if hand_count > DEFAULT_MAX_HAND_SIZE and not unlimited:
                 log_req(f"    PvP auto-advance: stopped at Discard "
                         f"(hand {hand_count} > {DEFAULT_MAX_HAND_SIZE})")
                 return advanced
@@ -3018,6 +3398,29 @@ def _pvp_card_playable(session, state, card_uid, tpl_guid, ct_name, cost,
     return True
 
 
+def _pvp_card_source_location(session, state, player_id, card_uid):
+    """Return an authoritative playable zone for this owner's card intent."""
+    from pvp_db import (db_card_owner_location_position,
+                        db_deck_top_card_details)
+    row = db_card_owner_location_position(
+        session.session_id, int(card_uid), conn=_db)
+    if not row or int(row[0] or 0) != int(player_id):
+        return None
+    location = str(row[1] or "").lower()
+    if location == "hand":
+        return location
+    if location != "deck":
+        return None
+    from rules_port.static_rules import player_int_attributes
+    attrs = player_int_attributes(
+        _db, session.session_id, state, player_id)
+    if int(attrs.get("CanPlayTopOfDeck", 0) or 0) <= 0:
+        return None
+    top = db_deck_top_card_details(
+        session.session_id, int(player_id), conn=_db)
+    return location if top and int(top[1]) == int(card_uid) else None
+
+
 def pvp_push_main_phase_options(session, state):
     """Push the PlayerOptionList (golden playable-card outlines) for the turn
     player at a main phase, so the client lets them click cards.  Affordability
@@ -3025,6 +3428,16 @@ def pvp_push_main_phase_options(session, state):
     template cost, plus THRESHOLD requirements (thresh_<pid>) — a card like
     Emberspire Witch (2 Ruby) is not highlighted until the player has the
     thresholds."""
+    if _pvp_chain_active(session, state):
+        if any((state or {}).get(key) for key in (
+                "pending_choice", "pending_trigger", "pending_deck_search",
+                "pending_conversation", "pending_discard_ability",
+                "resolution_paused")):
+            return
+        priority_pid = (state or {}).get("priority_pid")
+        if priority_pid:
+            pvp_push_phase_options(session, state, pid=priority_pid)
+        return
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return
@@ -3037,9 +3450,15 @@ def pvp_push_main_phase_options(session, state):
     opp_t = _ge.UID.make(244, opp_pid)
     resources = int(state.get(f"res_{turn_pid}", 0))
     threshold = dict(state.get(f"thresh_{turn_pid}") or {})
-    resource_played = int(state.get(f"res_played_{turn_pid}", 0))
-    from pvp_db import db_game_get_hand, db_game_card_type
-    from pvp_db import db_card_template_thresholds
+    from rules_port.resources import can_play_resource, resource_play_limit
+    resource_limit = resource_play_limit(
+        _db, session.session_id, state, int(turn_pid))
+    resource_played = not can_play_resource(
+        state, "player", limit=resource_limit, player_id=int(turn_pid))
+    from pvp_db import (db_game_get_hand, db_game_card_type,
+                        db_card_template_thresholds,
+                        db_deck_top_card_details, db_card_play_info,
+                        db_template_ability_payload)
     playable = []
     for cu, tg in db_game_get_hand(session.session_id, turn_pid):
         scid = _ge.SessionCardId(_ge.UID(int(cu)))
@@ -3081,12 +3500,57 @@ def pvp_push_main_phase_options(session, state):
                                   cost, ability_guids, resources, threshold):
             continue
         playable.append(scid)
+    from rules_port.static_rules import player_int_attributes
+    player_attrs = player_int_attributes(
+        _db, session.session_id, state, int(turn_pid))
+    if int(player_attrs.get("CanPlayTopOfDeck", 0) or 0) > 0:
+        top = db_deck_top_card_details(
+            session.session_id, int(turn_pid), conn=_db)
+        if top:
+            top_uid = int(top[1])
+            info = db_card_play_info(
+                session.session_id, top_uid, conn=_db)
+            if info:
+                _top_guid, top_type, _top_name = info[:3]
+                if str(top_type or "").split("|", 1)[0] == "Resource":
+                    if not resource_played:
+                        playable.append(_ge.SessionCardId(_ge.UID(top_uid)))
+                else:
+                    top_template = db_template_by_guid(_top_guid)
+                    top_cost = top_template[3] if top_template else 0
+                    try:
+                        from rules_port.static_rules import effective_cost as _ec
+                        top_cost = _ec(
+                            _db, session.session_id,
+                            _pvp_fra_view(state, turn_pid, opp_pid), top_uid)
+                    except Exception:
+                        pass
+                    top_threshold = db_card_template_thresholds(
+                        _top_guid, conn=_db)
+                    top_ability_json = db_template_ability_payload(
+                        _top_guid, conn=_db)
+                    try:
+                        top_abilities = [str(value).lower() for value in
+                                         json.loads(top_ability_json or "[]")]
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        top_abilities = []
+                    top_type_name = str(top_type or "")
+                    if (top_cost <= resources and _pvp_thresholds_met(
+                            top_threshold[0] if top_threshold else None,
+                            threshold) and _pvp_card_playable(
+                                session, state, top_uid, _top_guid,
+                                top_type_name, top_cost, top_abilities,
+                                resources, threshold)):
+                        playable.append(
+                            _ge.SessionCardId(_ge.UID(top_uid)))
     g = _ge.Game(int(session.session_id), pl_t, opp_t)
     # Options packets can follow a resource packet and may contain state
     # events from card/ability projections.  Hydrate the complete PvP HUD
     # first; a bare Game defaults to health 20/10 and zero charges, which can
     # overwrite the valid resource update on the client.
     _pvp_populate_game_state(g, state, turn_pid, opp_pid)
+    from rules_port.visibility import project_visible_top_decks
+    project_visible_top_decks(_db, session, h, g, pl_t, opp_t, state)
     champ_map = state.get("champ_map") or {}
     g.player_champion_card_id = _ge.SessionCardId(
         _ge.UID(int(champ_map.get(str(turn_pid), 0)))) if champ_map.get(
@@ -3216,6 +3680,27 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
         graph = ability_graph(_RECORD_STORE, str(ag).lower())
         if graph is not None and not graph.manual:
             continue
+        if graph is not None:
+            from rules_port.cooldowns import (champion_cooldown,
+                                              champion_cooldown_key)
+            if champion_cooldown(state, cu, ag) > 0:
+                continue
+            costs = graph.costs
+            use_key = champion_cooldown_key(cu, ag)
+            used = int((state.get("champion_ability_uses") or {}).get(
+                use_key, (state.get("champion_ability_uses") or {}).get(
+                    str(ag).lower(), 0)) or 0)
+            if (costs.uses_per_game and
+                    used >= int(costs.uses_per_game)):
+                continue
+            if costs.uses_per_turn:
+                from rules_port.runtime_helpers import (
+                    champion_ability_use_key,
+                    champion_ability_uses_this_turn)
+                turn_key = champion_ability_use_key(cu, ag)
+                if champion_ability_uses_this_turn(
+                        state, turn_key) >= int(costs.uses_per_turn):
+                    continue
         row = db_champion_ability_costs(str(ag))
         if row is None:
             row = db_talent_ability_costs(str(ag))
@@ -3270,6 +3755,22 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
         hp = int(state.get(f"hp_{pid}", 20))
         g.card_defs[champ_scid] = _ge.CardDef(
             "Champion", _ge.ECardTypes.Champion, 0, hp, hp, [], list(all_rids))
+    cdef = g.card_defs.get(champ_scid)
+    if cdef is not None:
+        from rules_port.ability_usage import remaining_uses_per_game
+        cdef.uses_per_game_counts = {
+            _ge.ResourceId.from_str(guid): int(value)
+            for guid, value in remaining_uses_per_game(
+                _db, session.session_id, cu,
+                [str(value) for value in all_rids], state,
+                champion=True).items()
+        }
+        prefix = f"{cu}:"
+        cdef.cooldown_counts = {
+            _ge.ResourceId.from_str(str(key).split(":", 1)[1]): int(value)
+            for key, value in (state.get("champion_ability_cooldowns") or {}).items()
+            if str(key).startswith(prefix) and int(value or 0) > 0
+        }
     # Target data: for champion abilities with explicit targets (e.g. Dimmid's
     # "Target troop gets Lifedrain") attach legal TargetInstances so the
     # client's target picker shows candidates — mirrors PvE
@@ -3584,7 +4085,6 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
                     ab_list = []
         if not ab_list:
             continue
-        uses = db_card_uses(session.session_id, int(card_uid))
         affordable = []
         for ag in ab_list:
             ag = str(ag)
@@ -3663,10 +4163,19 @@ def _pvp_affordable_troop_abilities(session, state, pid=None):
                 session, state, ability_pid, int(card_uid), ag, champ_targets)
             if cost_targets is None:
                 continue
-            used = int(uses.get(ag, 0))
-            if upg and used >= upg:
+            from pvp_db import (db_card_ability_use_counts,
+                                db_card_cooldown_counts)
+            used_game, used_turn = db_card_ability_use_counts(
+                session.session_id, int(card_uid), ag,
+                state.get("turn_number", 1), conn=_db)
+            if (graph.costs.cooldown and
+                    int(db_card_cooldown_counts(
+                        session.session_id, int(card_uid),
+                        conn=_db).get(ag.lower(), 0) or 0) > 0):
                 continue
-            if upt and used >= upt:
+            if upg and used_game >= upg:
+                continue
+            if upt and used_turn >= upt:
                 continue
             affordable.append(ag)
         if affordable:
@@ -3719,7 +4228,10 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
                                             ability_guid, selected_uids,
                                             champ_targets):
     """Split a champion activation's payment cards from its effect target."""
-    from rules_port.costs import ability_cost_targets, cost_type_for_kind
+    from rules_port.costs import (
+        ability_cost_targets, cost_type_for_kind,
+        validate_cost_target_selection,
+    )
     from rules_port.targeting import legal_targets_for
     graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
     if graph is None:
@@ -3750,6 +4262,11 @@ def _pvp_select_champion_activation_targets(session, state, pid, source_uid,
             return None
         limit = len(available) if int(maximum) < 0 else int(maximum)
         chosen = available[:limit]
+        chosen = validate_cost_target_selection(
+            _db, session.session_id, pid, int(source_uid), cost, chosen,
+            champions=champ_targets, battle_state=state)
+        if chosen is None:
+            return None
         used.update(chosen)
         if int(cost_type) == 2:
             sacrifices.extend(chosen)
@@ -3776,13 +4293,12 @@ def _pvp_discard_prompt_data(ability_guid):
     The prompt is derived from the current effect graph.  Missing effect data
     is invalid Records data and must not be inferred from localized text.
     """
-    from rules_port.metadata import ability_effect_prompt, ability_cost_prompt
+    from rules_port.metadata import ability_effect_prompt
     prompt = ability_effect_prompt(
         ability_guid, "DiscardCardAbilityEffectTemplate")
     if prompt and prompt[1]:
         return prompt
-    prompt = ability_cost_prompt(ability_guid, "discard")
-    return prompt if prompt and prompt[1] else None
+    return None
 
 
 def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
@@ -3820,13 +4336,14 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
             inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
             inst.opt_id = _ge.ResourceId.from_str(ag)
             graph = ability_graph(_RECORD_STORE, str(ag).lower())
-            target_refs = (tuple(target for target in graph.targets
+            target_refs = (tuple((index, target)
+                                 for index, target in enumerate(graph.targets)
                                  if target.requires_input)
                            if graph is not None else ())
             if target_refs:
                 built = []
-                for target in target_refs:
-                    i, tid = target.index, target.guid
+                for i, target in target_refs:
+                    tid = target.guid
                     if target.is_auto or target.target_kind in (
                             "PlayerTargetTemplate",
                             "AbilitySourceCardTargetTemplate",
@@ -3838,7 +4355,7 @@ def _pvp_add_troop_ability_options(g, session, state, pl_t, opp_t, pid,
                         int(card_uid), champions=champ_targets,
                         battle_state=state)
                     if not others:
-                        filt = target.filter
+                        filt = target.card_filter
                         if hasattr(filt, "to_dict"):
                             filt = filt.to_dict()
                         if not filt:
@@ -3976,21 +4493,175 @@ def _pvp_push_discard_prompt(session, state, my_pid, opp_pid, source_uid):
     return True
 
 
-def _pvp_resolve_discard_prompt(handler, session, inner_bytes, my_pid):
+def _pvp_resolve_discard_prompt(handler, session, inner_bytes, my_pid,
+                               typed_payload=None):
     """Resolve the card selected for a pending class-23 discard prompt."""
     state = pvp_load_state(session) or {}
+    native = state.get("pending_discard_continuation")
+    if isinstance(native, dict):
+        from gamedata import DEFAULT_RECORD_STORE, ability_graph
+        from rules_port.resolution import (
+            resolve_port_ability, resume_ability_continuation_parents,
+        )
+        from rules_port.wire import extract_session_card_uids
+        from pvp_db import db_rules_port_hand_card
+
+        child_guid = str(native.get("ability_guid") or "").lower()
+        owner_id = int(native.get("owner_id", -1) or -1)
+        if (not child_guid or owner_id != int(my_pid) or
+                int(state.get("pending_discard_pid", my_pid) or my_pid)
+                != int(my_pid)):
+            return False
+        graph = ability_graph(DEFAULT_RECORD_STORE, child_guid)
+        if graph is None:
+            log_req(f"    PvP RulesPort discard ability missing: {child_guid}")
+            return True
+        target_guid = str(
+            state.get("pending_discard_target_template") or "").lower()
+        target_index = next((index for index, target in enumerate(
+            graph.targets) if str(target.guid).lower() == target_guid), None)
+        if target_index is None:
+            log_req("    PvP RulesPort discard target missing: " + target_guid)
+            return True
+
+        activation = (typed_payload or {}).get("activation_data", {})
+        selected_map = (activation.get("target_map", {})
+                        if isinstance(activation, dict) else {})
+        selected = (selected_map.get(target_index,
+                                    selected_map.get(str(target_index), ()))
+                    if isinstance(selected_map, dict) else ())
+        if isinstance(selected, dict):
+            selected = (selected.get("session_card_ids") or
+                         selected.get("SessionCardIds") or selected)
+        if not isinstance(selected, (list, tuple, set)):
+            selected = (selected,) if selected is not None else ()
+
+        def card_uids(values):
+            result = []
+            for value in values:
+                while isinstance(value, dict):
+                    nested = next((value[key] for key in (
+                        "uid64", "UID", "m_UID64", "value")
+                        if key in value), None)
+                    if nested is None or nested is value:
+                        break
+                    value = nested
+                value = getattr(value, "uid64", value)
+                try:
+                    uid = _uid_int(value)
+                except (TypeError, ValueError):
+                    continue
+                if uid > 0 and (uid & 0xFF) == 1:
+                    result.append(uid)
+            return result
+
+        submitted = card_uids(selected)
+        if not submitted:
+            submitted = list(extract_session_card_uids(
+                inner_bytes if isinstance(inner_bytes, bytes) else b"",
+                exclude=(native.get("source_uid", 0),)))
+        valid = []
+        for uid in dict.fromkeys(submitted):
+            row = db_rules_port_hand_card(
+                session.session_id, uid, owner_id)
+            if row:
+                valid.append(uid)
+        if len(submitted) != 1 or len(valid) != 1:
+            log_req("    PvP RulesPort discard continuation rejected: "
+                    f"target_index={target_index} selected={submitted} "
+                    f"valid_hand_cards={valid}")
+            return True
+
+        pids = [int(pid) for pid in db_game_session_pids(session.session_id)]
+        if len(pids) < 2 or owner_id not in pids:
+            return False
+        opponent_id = next(pid for pid in pids if pid != owner_id)
+        player_uid = _ge.UID.make(244, owner_id)
+        opponent_uid = _ge.UID.make(244, opponent_id)
+        target_map = {int(key): value for key, value in
+                      (native.get("target_map") or {}).items()}
+        target_map[target_index] = (valid[0],)
+        for key in ("pending_discard_continuation",
+                    "pending_discard_continuation_instance_id",
+                    "pending_discard_ability",
+                    "pending_discard_ability_instance_id",
+                    "pending_discard_target_template",
+                    "pending_discard_source_uid", "pending_discard_pid",
+                    "pending_discard_scid"):
+            state.pop(key, None)
+        state.pop("resolution_paused", None)
+        state["rules_port_resume_effect_order"] = int(
+            native.get("resume_effect_order", 0) or 0)
+        pvp_save_state(session, state)
+
+        game = _ge.Game(int(session.session_id), player_uid, opponent_uid)
+        _pvp_populate_game_state(game, state, owner_id, opponent_id)
+        result = resolve_port_ability(
+            handler, game, session, _db, player_uid, opponent_uid, state,
+            child_guid, native.get("source_uid"), owner_id,
+            target_map=target_map,
+            variables=native.get("variables") or {},
+            resume_from_order=int(native.get("resume_effect_order", 0) or 0),
+            instance_id=int(native.get(
+                "instance_id", native.get("ability_instance_id", 1)) or 1))
+        resume_ability_continuation_parents(
+            handler, game, session, _db, player_uid, opponent_uid,
+            state, native)
+        state = pvp_load_state(session) or state
+        completed = 0
+        if not state.get("resolution_paused"):
+            completed = int(state.pop("paused_chain_instance_id", 0) or 0)
+            if completed:
+                state["completed_chain_instance_id"] = completed
+        pvp_save_state(session, state)
+        _pvp_send_same_events(session, game, player_uid, opponent_uid)
+
+        port = getattr(session, "_rules_port_session", None)
+        if completed and port is not None:
+            from rules_port.actions import AbilityResolutionState
+            if port.resolve_top_of_chain(completed) is not AbilityResolutionState.COMPLETED:
+                log_req("    PvP RulesPort discard chain item remains pending: "
+                        f"instance={completed}")
+        elif not state.get("resolution_paused"):
+            phase = int(state.get(
+                "phase", _ge.ETurnPhases.FirstMainPhase))
+            priority_pid = int(state.get("turn_pid") or owner_id)
+            state["priority_pid"] = priority_pid
+            pvp_save_state(session, state)
+            turn_uid = _ge.UID.make(244, int(state.get("turn_pid") or owner_id))
+            priority_uid = _ge.UID.make(244, priority_pid)
+            for pid in pids:
+                recipient = _ge.UID.make(244, int(pid))
+                other = _ge.UID.make(244, next(
+                    value for value in pids if int(value) != int(pid)))
+                gp = _ge.Game(int(session.session_id), recipient, other)
+                gp.push_green_light(
+                    priority_uid, _ge.EPriorityContext.Normal)
+                _pvp_push_turn_phase_with_elapsed(
+                    gp, phase, turn_uid, priority_uid,
+                    _pvp_priority_elapsed_ticks(state, priority_pid) // 10_000_000)
+                _send_pvp_packet(
+                    player_handlers.get(int(pid)) or handler,
+                    session, gp, recipient, "discard-priority")
+            if phase in (_ge.ETurnPhases.FirstMainPhase,
+                         _ge.ETurnPhases.SecondMainPhase):
+                pvp_push_main_phase_options(session, state)
+        log_req(f"    PvP RulesPort discard continuation: {valid[0]} -> {result}")
+        return True
+
     child = state.get("pending_discard_ability")
     if not child or int(state.get("pending_discard_pid", -1)) != int(my_pid):
         return False
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return True
-    card_uids = _pvp_transaction_card_uids(inner_bytes)
-    card_uid = card_uids[-1] if card_uids else None
+    selected_card_uids = _pvp_transaction_card_uids(inner_bytes)
+    card_uid = selected_card_uids[-1] if selected_card_uids else None
     row = None
-    if card_uid is not None:
-        row = db_hand_card_for_discard(
-            session.session_id, card_uid, my_pid, conn=_db)
+    if card_uid is None:
+        return True
+    row = db_hand_card_for_discard(
+        session.session_id, card_uid, my_pid, conn=_db)
     if not row:
         log_req(f"    PvP discard prompt rejected: uid={card_uid} "
                 f"pid={my_pid}")
@@ -4086,19 +4757,29 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     upt = graph.costs.uses_per_turn
     exh = graph.costs.exhausts_card_on_use
     resources = int(state.get(f"res_{my_pid}", 0))
-    uses = db_card_uses(session.session_id, int(source_uid))
-    used = int(uses.get(ability_guid, 0))
+    from pvp_db import (db_card_ability_use_counts,
+                        db_card_cooldown_counts,
+                        db_record_card_ability_use,
+                        db_set_card_cooldown)
+    used_game, used_turn = db_card_ability_use_counts(
+        session.session_id, int(source_uid), ability_guid,
+        state.get("turn_number", 1), conn=_db)
     if cost > resources:
         log_req(f"    PvP troop ability {ability_guid[:8]}: need {cost} "
                 f"resources, have {resources}")
         return True
-    if upg and used >= upg:
+    if upg and used_game >= upg:
         log_req(f"    PvP troop ability {ability_guid[:8]}: uses_per_game "
-                f"exhausted ({used})")
+                f"exhausted ({used_game})")
         return True
-    if upt and used >= upt:
+    if upt and used_turn >= upt:
         log_req(f"    PvP troop ability {ability_guid[:8]}: uses_per_turn "
-                f"exhausted ({used})")
+                f"exhausted ({used_turn})")
+        return True
+    if (graph.costs.cooldown and int(db_card_cooldown_counts(
+            session.session_id, int(source_uid), conn=_db).get(
+                ability_guid.lower(), 0) or 0) > 0):
+        log_req(f"    PvP troop ability {ability_guid[:8]}: cooldown active")
         return True
     if exh:
         crow = db_card_activation_info(
@@ -4157,17 +4838,17 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
         return True
     cost_target_uids = []
     exhausted_target_uids = []
-    deck_target_uids = []
-    sacrifice_target_uids = set()
-    from rules_port.costs import ability_cost_targets
+    cost_selections = []
+    from rules_port.costs import (
+        ability_cost_targets, validate_cost_target_selection,
+    )
     native_costs = ability_cost_targets(
         graph, _db, session.session_id, my_pid, int(source_uid),
         champions=champ_targets, battle_state=state)
-    for _tid, _cost_type, candidates, minimum, maximum in cost_targets:
+    for cost_ref, (_tid, _cost_type, candidates, minimum, maximum) in zip(
+            native_costs, cost_targets):
         candidate_set = set(candidates)
-        cost_ref = next((cost for cost in native_costs
-                         if cost.guid.lower() == str(_tid).lower()), None)
-        auto_source = bool(cost_ref and cost_ref.is_source_auto_target)
+        auto_source = cost_ref.is_source_auto_target
         available = ([int(source_uid)] if auto_source else
                      [uid for uid in selected_uids
                       if int(uid) in candidate_set
@@ -4177,13 +4858,21 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
                     "payment is incomplete — rejected")
             return True
         selected = (available if maximum < 0 else available[:maximum])
+        selected = validate_cost_target_selection(
+            _db, session.session_id, my_pid, int(source_uid), cost_ref,
+            selected, champions=champ_targets, battle_state=state)
+        if selected is None:
+            log_req(f"    PvP troop ability {ability_guid[:8]}: invalid "
+                    f"metadata payment target {_tid} — rejected")
+            return True
         cost_target_uids.extend(selected)
-        if int(_cost_type) == 32:  # metadata m_PutIntoDeckTarget
-            deck_target_uids.extend(selected)
-        else:
+        cost_selections.append((
+            {"kind": cost_ref.kind, "minimum": cost_ref.minimum,
+             "maximum": cost_ref.maximum,
+             "auto": cost_ref.is_source_auto_target},
+            tuple(selected)))
+        if cost_ref.kind == "exhaust":
             exhausted_target_uids.extend(selected)
-        if int(_cost_type) == 2:
-            sacrifice_target_uids.update(int(uid) for uid in selected)
 
     # The remaining selected card, if any, is an explicit effect target.  Do
     # not consider source/auto target templates here; those are resolved by
@@ -4214,7 +4903,15 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     # silently doing nothing.
     from rules_port.resources import pay_resource_for_player
     pay_resource_for_player(state, my_pid, cost)
-    db_bump_card_use(session.session_id, int(source_uid), ability_guid)
+    if upg or upt:
+        db_record_card_ability_use(
+            session.session_id, int(source_uid), ability_guid,
+            state.get("turn_number", 1), conn=_db,
+            uses_per_game=bool(upg), uses_per_turn=bool(upt))
+    if graph.costs.cooldown:
+        db_set_card_cooldown(
+            session.session_id, int(source_uid), ability_guid,
+            graph.costs.cooldown, conn=_db)
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     view = _pvp_fra_view(state, my_pid, opp_pid)
@@ -4235,70 +4932,12 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     _pvp_populate_game_state(g, state, my_pid, opp_pid)
 
-    # Pay card costs before resolving the effect.  The client-visible
-    # CardUpdated is emitted on the same event stream as the ability so both
-    # players see the selected bot become tapped.
-    for pay_uid in sorted(set(cost_target_uids)):
-        if pay_uid in deck_target_uids:
-            continue
-        if pay_uid in sacrifice_target_uids:
-            # Automatic source-card sacrifices ("Sacrifice this") are not
-            # present in the client's TargetMap, but are still real costs.
-            # Move the card before resolving the BOM; its source UID remains
-            # in the resolution context so the draw/effect can complete.
-            handler._sacrifice_troop(g, session, my_uid, opp_uid, pay_uid)
-            log_req(f"    PvP troop ability {ability_guid[:8]}: sacrificed "
-                    f"cost target {hex(pay_uid)}")
-            continue
-        prow = db_owned_warzone_card(
-            session.session_id, pay_uid, my_pid, conn=_db)
-        if not prow:
-            continue
-        db_set_card_state_or(session.session_id, pay_uid,
-                             _ge.ECardStates.Tapped)
-        pay_scid = _ge.SessionCardId(_ge.UID(pay_uid))
-        _tpl_pay, ct_pay, _name_pay, cost_pay, atk_pay, def_pay, gem_pay = \
-            handler._card_full_data(g, pay_scid, prow[0])
-        pay_state = db_card_state_value(
-            session.session_id, pay_uid, conn=_db)
-        g.push_card_updated(
-            pay_scid, my_uid, _ge.ECardCollections.Warzone, ct_pay,
-            template_id=prow[0], state=int(pay_state) if pay_state else
-            _ge.ECardStates.Tapped, cost=cost_pay, attack=atk_pay,
-            defense=def_pay, gems=gem_pay)
-        log_req(f"    PvP troop ability {ability_guid[:8]}: exhausted "
-                f"cost target {hex(pay_uid)}")
-    # m_PutIntoDeckTarget is an ability-level zone operation represented by a
-    # target CostInstance in the client protocol.  It is not a payment and
-    # therefore must move the selected cards rather than exhaust them.
-    for move_uid in sorted(set(deck_target_uids)):
-        move_row = db_card_zone_details(
-            session.session_id, move_uid, conn=_db)
-        if not move_row or move_row[3] != "warzone":
-            continue
-        owner_pid = int(move_row[2] or my_pid)
-        db_set_card_location(
-            session.session_id, int(move_uid), "deck",
-            extra_set="position=?, card_state=?", extra_params=[0, 0])
-        from pvp_db import db_randomly_insert_deck_cards
-        db_randomly_insert_deck_cards(
-            session.session_id, owner_pid, [int(move_uid)], connection=_db)
-        pos = int(db_card_position(
-            session.session_id, move_uid, conn=_db) or 0)
-        move_scid = _ge.SessionCardId(_ge.UID(int(move_uid)))
-        move_owner = _ge.UID.make(244, owner_pid)
-        _tpl_move, ct_move, _name_move, cost_move, atk_move, def_move, gems_move = \
-            handler._card_full_data(g, move_scid, move_row[0], move_row[1])
-        g.push_card_moved(move_scid, move_owner,
-                          _ge.ECardCollections.Deck,
-                          _ge.ECardLocations.Unknown, 0)
-        g.push_card_updated(move_scid, move_owner,
-                            _ge.ECardCollections.Deck, ct_move,
-                            template_id=move_row[0], cost=cost_move,
-                            attack=atk_move, defense=def_move, gems=gems_move,
-                            state=0, nulling=True)
-        log_req(f"    PvP troop ability {ability_guid[:8]}: put "
-                f"{hex(move_uid)} into deck (pos {pos})")
+    # Apply every authored cost kind before resolving or queueing the ability.
+    # In particular, a discard cost targets the hand; treating all non-
+    # sacrifice costs as exhaustions silently ignored Timophy's payment.
+    _pvp_apply_card_play_costs(
+        handler, g, session, state, my_uid, opp_uid, cost_selections,
+        int(source_uid))
 
     # The client treats ordinary manual abilities as chain items unless the
     # authored template explicitly sets IgnoresChain.  Tunnel is one of these
@@ -4481,6 +5120,35 @@ def _pvp_activate_troop_ability(handler, session, inner_bytes, my_pid,
     return True
 
 
+def _pvp_set_handler_champions(handler, player_champ, ai_champ,
+                               player_guid, ai_guid):
+    """Record champion identity and authored ability catalogs on the handler.
+
+    Champion cards are synthetic SessionCardIds with no mutable ``game_cards``
+    row, so ``AbilityCanBeActivatedRequirement`` gates a charge power on the
+    ability catalog projected on the champion.  HConnect's own champion setup
+    records that catalog next to the champion ids; the tournament service
+    builds its own champion projection and must record it there too, otherwise
+    the native facts bridge reads an empty catalog and rejects every champion
+    power (Corinth's charge power among them).
+    """
+    handler._player_champ_scid = player_champ
+    handler._ai_champ_scid = ai_champ
+    handler._player_champ_guid = player_guid
+    handler._ai_champ_guid = ai_guid
+    from pvp_db import db_get_champion_ability_guids
+
+    def catalog(guid):
+        if not guid:
+            return []
+        return [str(value).lower()
+                for value in db_get_champion_ability_guids(guid)]
+
+    handler._player_champ_abilities = [
+        _ge.ResourceId.from_str(value) for value in catalog(player_guid)]
+    handler._ai_champ_ability_guids = catalog(ai_guid)
+
+
 def push_pvp_game_start(handler, session, log_req=log_req):
     """Push initial battle events for a PvP tournament session (tourney-N)."""
     player_pid = int(handler.client_reck_id) if hasattr(handler, 'client_reck_id') else 0
@@ -4562,7 +5230,7 @@ def push_pvp_game_start(handler, session, log_req=log_req):
     log_req(f"    Coin flip: {hex(goes_first_uid)} goes first")
 
     # 1. GameStarted — local player's champion always at index 0 (left side).
-    champ_guids = [None, None]
+    champ_guids: list[str | None] = [None, None]
     champ_names = ["Player 1", "Player 2"]
     for pid in pids:
         idx = 0 if pid == player_pid else 1
@@ -4629,7 +5297,7 @@ def push_pvp_game_start(handler, session, log_req=log_req):
         game1.push_champion_card_played(pt, False, pn, ch_id)
 
     # Persist champion SCIDs so _pvp_run_phase_start passes valid IDs.
-    state = pvp_load_state(session)
+    state = pvp_load_state(session) or state
     if state:
         champ_map = state.get("champ_map", {})
         for pid in pids:
@@ -4638,6 +5306,30 @@ def push_pvp_game_start(handler, session, log_req=log_req):
             champ_map[str(pid)] = ch.uid.uid64
             state[f"hp_{pid}"] = champ_health.get(pid, 20)
         state["champ_map"] = champ_map
+        # Champion template GUIDs drive continuous champion passives that have
+        # no card row (Construct Foreman's "Champions have no maximum hand
+        # size"); static evaluation reads them from the checkpoint.
+        guid_map = state.get("champ_guid_map", {})
+        for pid in pids:
+            idx = 0 if pid == player_pid else 1
+            if idx < len(champ_guids) and champ_guids[idx]:
+                guid_map[str(pid)] = champ_guids[idx]
+        state["champ_guid_map"] = guid_map
+        # AuthoritativeSessionBase stores StartingDeckSize on the champion's
+        # PlayerGameStats TAC before PreGame abilities run. Seed it once while
+        # both PvP decks are still untouched so reconnect setup cannot replace
+        # the original count with the remaining deck size.
+        from rules_port.statistics import set_tac_stat, tac_stat
+        for pid in pids:
+            champ_uid = champ_map.get(str(pid))
+            if champ_uid is None or tac_stat(
+                    state, "cards", champ_uid, "PlayerGameStats",
+                    "StartingDeckSize", default=-1) != -1:
+                continue
+            set_tac_stat(
+                state, "cards", champ_uid, "PlayerGameStats",
+                "StartingDeckSize",
+                len(db_game_deck_cards(session.session_id, int(pid))))
         pvp_save_state(session, state)
         # The shared ability framework (abilities/framework/bom.py _deal_damage,
         # resolution.py _champion_uids, etc.) maps champion targets via the
@@ -4645,10 +5337,10 @@ def push_pvp_game_start(handler, session, log_req=log_req):
         # battle init, PvP never did, so champion-targeting effects (Burn on a
         # champion) resolved as "no card" and dealt no damage.  Set them here.
         try:
-            handler._player_champ_scid = pchamp
-            handler._ai_champ_scid = achamp
-            handler._player_champ_guid = champ_guids[0] if champ_guids else None
-            handler._ai_champ_guid = champ_guids[1] if len(champ_guids) > 1 else None
+            _pvp_set_handler_champions(
+                handler, pchamp, achamp,
+                champ_guids[0] if champ_guids else None,
+                champ_guids[1] if len(champ_guids) > 1 else None)
         except Exception:
             pass
 
@@ -4669,14 +5361,27 @@ def push_pvp_game_start(handler, session, log_req=log_req):
     game2.ai_champion_card_id = achamp
     game2.turn_number = 1
 
-    # Push deck cards face-down + DeckCreated for both players.
+    # Push deck cards face-down + DeckCreated for both players. Fetch the
+    # mutable instance rows in one batch; the per-card encoder still evaluates
+    # current effects and persists any authored gem grants normally.
+    deck_cards_by_pid = {
+        int(pid): db_game_deck_cards(session.session_id, int(pid))
+        for pid in pids
+    }
+    deck_projections = db_card_instance_dynamic_projections(
+        session.session_id,
+        [int(card_uid) for cards in deck_cards_by_pid.values()
+         for card_uid, _template_guid in cards],
+        conn=_db)
     for pid in pids:
         is_me = (pid == player_pid)
         player_t = pl_t if is_me else opp_t
-        deck_cards = db_game_deck_cards(session.session_id, pid)
+        deck_cards = deck_cards_by_pid[int(pid)]
         for cu, tg in deck_cards:
             scid = _ge.SessionCardId(_ge.UID(int(cu)))
-            handler._card_full_data(game2, scid, tg)
+            handler._card_full_data(
+                game2, scid, tg,
+                instance_projection=deck_projections.get(int(cu)))
             ct_str = db_game_card_type(tg)
             ct = _ge.card_type_from_db(ct_str) if ct_str else _ECardTypes.Troop
             game2.push_card_updated(scid, player_t, _ECardCollections.Deck,
@@ -4836,7 +5541,11 @@ def route_pvp_pass(handler, session):
     # can continue or, if the chain is non-empty, resolve it.
     resp_wait = state.get("response_waiting_pid")
     if resp_wait == my_pid:
-        caster_pid = state.get("response_caster_pid") or state.get("turn_pid")
+        caster_pid = (state.get("response_caster_pid") or
+                      state.get("turn_pid"))
+        if caster_pid is None:
+            return True
+        caster_pid = int(caster_pid)
         state.pop("response_waiting_pid", None)
         state.pop("response_caster_pid", None)
         port_set_priority(state, caster_pid)
@@ -4845,7 +5554,7 @@ def route_pvp_pass(handler, session):
         # trigger), the opponent's response pass counts as their stack pass —
         # so the caster is ONE pass from resolving the top item.  Seed
         # stack_passed with the opponent so the caster's Resolve pass triggers
-        # _pvp_resolve_chain (mirrors the both-pass stack rule).
+        # the both-pass stack rule (see _pvp_resolve_stack_item).
         if state.get("stack"):
             sp = set(state.get("stack_passed") or [])
             sp.add(my_pid)  # the opponent just passed the stack
@@ -4917,7 +5626,7 @@ def route_pvp_pass(handler, session):
         state["stack_passed"] = []
         pvp_save_state(session, state)
         _pvp_log_stack(state, f"pass-2/2 by {my_pid}")
-        return _pvp_resolve_chain(session, state, handler, my_pid)
+        return _pvp_resolve_stack_item(session, state, handler, my_pid)
 
     # Record this player's pass.
     passes = port_record_phase_pass(state, my_pid)
@@ -5035,7 +5744,10 @@ def route_pvp_pass(handler, session):
     # (they declared attacks) — otherwise passing DeclareDefense wraps to a NEW
     # turn (phase 7) instead of resolving Swiftstrike/AssignDamage damage, so
     # combat is skipped, the champion takes no damage, and a fresh turn starts.
-    turn_pid = state.get("turn_pid")
+    turn_pid_value = state.get("turn_pid")
+    if turn_pid_value is None:
+        return
+    turn_pid = int(turn_pid_value)
     old_phase = int(old_phase)
     if old_phase >= _ge.ETurnPhases.DeclareAttack \
             and old_phase != _ge.ETurnPhases.SecondMainPhase:
@@ -5066,7 +5778,7 @@ def route_pvp_pass(handler, session):
             end_h = player_handlers.get(turn_pid)
             if end_h:
                 end_opp = pids_[0] if pids_[1] == turn_pid else pids_[1]
-                end_opp_uid = _ge.UID.make(244, end_opp)
+                end_opp_uid = _ge.UID.make(244, int(end_opp))
                 end_uid = _ge.UID.make(244, turn_pid)
                 eg = _ge.Game(int(session.session_id), end_uid, end_opp_uid)
                 eg.player_health = int(state.get(f"hp_{turn_pid}", 20))
@@ -5108,7 +5820,7 @@ def route_pvp_pass(handler, session):
                     port_reset_priority_interval(state, turn_pid)
                     pvp_save_state(session, state)
                     end_uid = _ge.UID.make(244, turn_pid)
-                    end_opp_uid = _ge.UID.make(244, end_opp)
+                    end_opp_uid = _ge.UID.make(244, int(end_opp))
                     eg_priority = _ge.Game(
                         int(session.session_id), end_uid, end_opp_uid)
                     eg_priority.push_green_light(
@@ -5388,9 +6100,46 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
                                my_uid, opp_uid):
     """Project an already RulesPort-validated PvP resource play."""
     opp_pid = pids[0] if pids[1] == my_pid else pids[1]
-    db_set_card_played_to_zone(
-        session.session_id, int(played_card_uid), "PlayedResources")
+    state = pvp_load_state(session) or {}
+    from rules_port.resources import can_play_resource, resource_play_limit
+    resource_limit = resource_play_limit(
+        _db, session.session_id, state, int(my_pid))
+    if not can_play_resource(
+            state, "player", limit=resource_limit,
+            player_id=int(my_pid)):
+        log_req(f"    PvP REJECTED resource {card_name}: per-turn allowance used")
+        return False
+    source_location = _pvp_card_source_location(
+        session, state, my_pid, int(played_card_uid))
+    if source_location is None:
+        log_req(f"    PvP REJECTED resource {card_name}: card is not in a playable zone")
+        return False
+    prior_card_zone = db_card_owner_zone_state(
+        session.session_id, int(played_card_uid), conn=_db)
+    from pvp_db import db_move_card_if_in_zone
+    from domain.constants import PLAYED_CARD_POSITION
+    if db_move_card_if_in_zone(
+            session.session_id, int(played_card_uid), int(my_pid),
+            source_location, "PlayedResources", PLAYED_CARD_POSITION,
+            conn=_db) <= 0:
+        return False
+    _db.commit()
     log_req(f"    PvP resource play: {card_name} by pid {my_pid}")
+
+    # PlayResource raises CardCast before moving the resource card. Preserve
+    # that trigger order in one shared event buffer; each recipient packet
+    # below receives the same ordered trigger events without redispatching.
+    trigger_game = _ge.Game(int(session.session_id), my_uid, opp_uid)
+    _pvp_populate_game_state(trigger_game, state, my_pid, opp_pid)
+    trigger_host = _PvpChainHost(handler, session, state, my_pid, opp_pid)
+    from rules_port import chain_items as _chain_items
+    _chain_items.dispatch_card_cast(
+        trigger_host, session, trigger_game, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid)
+    _chain_items.dispatch_card_zone_transition(
+        trigger_host, session, trigger_game, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid, source_location, "PlayedResources",
+        int(prior_card_zone[2] or 0) if prior_card_zone else 0)
 
     # Resource templates carry their own current/maximum grants.  Most basic
     # shards grant both, while Shards of Fate grants only maximum resources
@@ -5424,41 +6173,51 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
     # Track resources, threshold, and champion charge in PvP state.  Shards of
     # Fate is excluded only from the ordinary-shard threshold path; its
     # selected deck card supplies the threshold after the prompt resolves.
-    state = pvp_load_state(session) or {}
     # Resource charge generation is defined by the card's BOM.  Do not add a
     # universal +1 here: Set 1 shards already contain a gain-one-charge leaf.
     charge_grant = _pvp_resource_charge_points(session, played_card_uid)
-    # A normal resource can fire GainChargeEvent immediately.  Shards of Fate
-    # has a nested deck choice below, so defer its trigger until that choice
-    # has completed and the picker is no longer active.
-    charge_trigger_game = None
-    if charge_grant and not (is_shards_of_fate or resource_choice_ability):
-        charge_trigger_game = _pvp_gain_charge_trigger_game(
-            handler, session, state, my_pid)
-    elif charge_grant:
-        state["pending_gain_charge_pid"] = my_pid
-    # Threshold colour from the shard name ("Ruby Shard" -> Ruby=8).
-    shard_color = None
-    col_map = {'Ruby': _ge.ECardShards.Ruby, 'Sapphire': _ge.ECardShards.Sapphire,
-               'Blood': _ge.ECardShards.Blood, 'Diamond': _ge.ECardShards.Diamond,
-               'Wild': _ge.ECardShards.Wild}
-    if card_name:
-        shard_color = col_map.get(card_name.split()[0])
-    from rules_port.resources import play_resource_for_player
-    play_resource_for_player(
+    # Thresholds come from the resource's authored CardModifier leaves: a
+    # colourless name (Bloodstone, Wakuna Coins, ...) still grants its
+    # authored colour, and Primal-Shard-shaped condition-gated leaves grant
+    # the missing thresholds in this player's hand.
+    from rules_port.resources import (play_resource_for_player,
+                                      resource_threshold_grants)
+    threshold_grants = []
+    if not is_shards_of_fate and not resource_choice_ability:
+        threshold_grants = resource_threshold_grants(
+            _db, session.session_id, my_pid, ability_guids, state,
+            source_uid=played_card_uid)
+    resource_play = play_resource_for_player(
         state, my_pid, current_grant, max_grant,
-        threshold_color=(shard_color if shard_color and not (
-            is_shards_of_fate or resource_choice_ability) else None),
-        charge_amount=charge_grant)
+        charge_amount=charge_grant,
+        additional_plays=max(0, resource_limit - 1))
+    charge_delta = max(
+        0, int(resource_play.charge.new_value) -
+        int(resource_play.charge.old_value))
+    # A normal resource can fire one GainChargeEvent per actual point.
+    # Shards of Fate has a nested deck choice below, so defer those events
+    # until the picker has completed and is no longer active.
+    charge_trigger_game = None
+    if charge_delta and not (is_shards_of_fate or resource_choice_ability):
+        charge_trigger_game = _pvp_gain_charge_trigger_game(
+            handler, session, state, my_pid, amount=charge_delta)
+    elif charge_delta:
+        state["pending_gain_charge_pid"] = my_pid
+        state["pending_gain_charge_amount"] = charge_delta
+    thresholds = state.setdefault(f"thresh_{my_pid}", {})
+    for flag, amount in threshold_grants:
+        thresholds[flag] = int(thresholds.get(flag, 0) or 0) + int(amount)
     pvp_save_state(session, state)
-    # Read the post-payment threshold value for the client event.  This must
+    # Read the post-payment threshold values for the client events.  This must
     # be reconstructed after play_resource_for_player mutates the per-player
     # state; the old path referenced a variable that was never initialized.
     thresh = _pvp_state_thresholds(state, my_pid)
-    threshold_trigger_game = None
-    if shard_color and not (is_shards_of_fate or resource_choice_ability):
-        threshold_trigger_game = _pvp_gain_threshold_trigger_game(
-            handler, session, state, my_pid, shard_color)
+    threshold_trigger_games = []
+    for flag, _amount in threshold_grants:
+        trigger = _pvp_gain_threshold_trigger_game(
+            handler, session, state, my_pid, flag)
+        if trigger is not None:
+            threshold_trigger_games.append(trigger)
     resource_ability_events = _pvp_resolve_granted_resource_abilities(
         handler, session, state, int(played_card_uid), my_pid)
     # The resource is now played — refresh the turn player's options so the
@@ -5472,6 +6231,8 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
 
     # Push card events + resource/threshold/charge/PlayerUpdated for BOTH
     # players in one packet each.
+    trigger_events = list(trigger_game.events)
+    trigger_card_defs = dict(trigger_game.card_defs)
     for pid in pids:
         h = player_handlers.get(pid)
         if not h:
@@ -5519,30 +6280,33 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
             ev_tot.delta = max_grant
             ev_tot.new_value = int(state.get(f"res_total_{my_pid}", 0))
             g._push(ev_tot)
-        # Threshold gem for the played shard's colour.
-        if shard_color and not (is_shards_of_fate or resource_choice_ability):
+        # Threshold gems for every colour the resource granted.
+        for flag, amount in threshold_grants:
             ev_th = _ge.PlayerResourceThresholdChangedSessionEventArgs()
             ev_th.player_id = my_uid_p
-            ev_th.color = shard_color
+            ev_th.color = flag
             ev_th.operation = 1
-            ev_th.delta = 1
-            ev_th.new_value = int(thresh.get(shard_color, 0))
+            ev_th.delta = int(amount)
+            ev_th.new_value = int(thresh.get(flag, 0))
             g._push(ev_th)
         # Champion charge generated by the resource's BOM.
         ev_chg = _ge.ChampionChargePointsChangedSessionEventArgs()
         ev_chg.player_id = my_uid_p
         ev_chg.operation = 1
-        ev_chg.delta = charge_grant
+        ev_chg.delta = charge_delta
         ev_chg.new_value = int(state.get(f"chg_{my_pid}", 0))
         g._push(ev_chg)
         if charge_trigger_game:
             for trigger_event in charge_trigger_game.events:
                 g._push(trigger_event)
-        if threshold_trigger_game:
+        for threshold_trigger_game in threshold_trigger_games:
             for trigger_event in threshold_trigger_game.events:
                 g._push(trigger_event)
         for resource_event in resource_ability_events:
             g._push(resource_event)
+        for trigger_event in trigger_events:
+            g._push(trigger_event)
+        g.card_defs.update(trigger_card_defs)
         # PlayerUpdated for both — health / charges / resources.
         for target_pid in pids:
             target_uid = _ge.UID.make(244, target_pid)
@@ -5632,9 +6396,12 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
             log_req(f"    PvP resource choice: awaiting picker for pid "
                     f"{my_pid}")
             return True
-        if state.pop("pending_gain_charge_pid", None) == my_pid:
+        pending_charge_amount = _take_pending_gain_charge_amount(
+            state, my_pid)
+        if pending_charge_amount:
             charge_trigger_game = _pvp_gain_charge_trigger_game(
-                owner_handler, session, state, my_pid)
+                owner_handler, session, state, my_pid,
+                amount=pending_charge_amount)
             if charge_trigger_game and charge_trigger_game.events:
                 _pvp_send_same_events(
                     session, charge_trigger_game, my_uid, opp_uid)
@@ -5663,9 +6430,12 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
 
         # No picker remains, so a charge trigger deferred above can now be
         # put on the shared PvP chain and offered to the opponent.
-        if state.pop("pending_gain_charge_pid", None) == my_pid:
+        pending_charge_amount = _take_pending_gain_charge_amount(
+            state, my_pid)
+        if pending_charge_amount:
             charge_trigger_game = _pvp_gain_charge_trigger_game(
-                handler, session, state, my_pid)
+                handler, session, state, my_pid,
+                amount=pending_charge_amount)
             if charge_trigger_game and charge_trigger_game.events:
                 _pvp_send_same_events(
                     session, charge_trigger_game, my_uid, opp_uid)
@@ -5717,22 +6487,33 @@ def pvp_handle_transaction(handler, session, inner_bytes, *, typed_payload=None)
         state = pending_state
         if state.get("pending_discard_ability"):
             return _pvp_resolve_discard_prompt(
-                handler, session, inner_bytes, my_pid)
+                handler, session, inner_bytes, my_pid,
+                typed_payload=typed_payload)
         if state.get("pending_trigger"):
+            if (state.get("pending_trigger") or {}).get("optional"):
+                return _pvp_resolve_optional_trigger(
+                    handler, session, inner_bytes, my_pid,
+                    typed_payload=typed_payload)
             return _pvp_resolve_trigger_target(handler, session, inner_bytes,
-                                               my_pid)
-        if (state.get("pending_deck_search") or {}).get("kind") == \
-                "revealed_troop":
+                                               my_pid,
+                                               typed_payload=typed_payload)
+        if (state.get("pending_deck_search") or {}).get("kind") in (
+                "revealed_troop", "revealed_card"):
             return _pvp_resolve_revealed_choice(handler, session,
-                                                inner_bytes, my_pid)
+                                                inner_bytes, my_pid,
+                                                typed_payload=typed_payload)
         if (state.get("pending_deck_search") or {}).get("kind") == "shard":
-            return _pvp_resolve_shard_choice(handler, session, inner_bytes,
-                                             my_pid)
+            return _pvp_resolve_shard_choice(
+                handler, session, inner_bytes, my_pid,
+                typed_payload=typed_payload)
         if ((state.get("pending_deck_search") or {}).get("kind") ==
                 "matching_target"):
             return _pvp_resolve_matching_target(
-                handler, session, inner_bytes, my_pid)
-        return _pvp_resolve_deck_search(handler, session, inner_bytes, my_pid)
+                handler, session, inner_bytes, my_pid,
+                typed_payload=typed_payload)
+        return _pvp_resolve_deck_search(
+            handler, session, inner_bytes, my_pid,
+            typed_payload=typed_payload)
     opp_pid = pids[0] if pids[1] == my_pid else pids[1]
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
@@ -5849,9 +6630,7 @@ def pvp_handle_transaction(handler, session, inner_bytes, *, typed_payload=None)
     played_card_uid = None
     if isinstance(typed_payload, dict):
         try:
-            played_card_uid = int(getattr(
-                typed_payload.get("card_id"), "uid64",
-                typed_payload.get("card_id")))
+            played_card_uid = _uid_int(typed_payload.get("card_id"))
         except (TypeError, ValueError):
             played_card_uid = None
     scid_pos = inner_bytes.find(b"m_SessionCardId")
@@ -5988,7 +6767,8 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid,
                 f"{continuation.get('resume_effect_order')} "
                 f"parent={pending.get('parent', {}).get('ability_guid')} "
                 f"parent_resume="
-                f"{pending.get('parent', {}).get('resume_effect_order')}")
+                f"{pending.get('parent', {}).get('resume_effect_order')}",
+                level="DEBUG")
         _pvp_resolve_ability(
             handler, g, session, view, pl_t, ai_t, child_guid,
             child_source, child_owner, target_map=child_targets,
@@ -6042,10 +6822,13 @@ def _pvp_resolve_choice(handler, session, inner_bytes, my_pid,
     state["stack_ai_passed"] = False
     _pvp_sync_view_to_state(state, view, owner_id, opponent_id)
     charge_trigger_game = None
-    if (not view.get("pending_choice") and
-            state.pop("pending_gain_charge_pid", None) == owner_id):
+    pending_charge_amount = (
+        _take_pending_gain_charge_amount(state, owner_id)
+        if not view.get("pending_choice") else 0)
+    if pending_charge_amount:
         charge_trigger_game = _pvp_gain_charge_trigger_game(
-            handler, session, state, owner_id)
+            handler, session, state, owner_id,
+            amount=pending_charge_amount)
         if charge_trigger_game:
             for trigger_event in charge_trigger_game.events:
                 g._push(trigger_event)
@@ -6192,7 +6975,52 @@ def _pvp_resolve_conversation(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_resolve_deck_search(handler, session, inner_bytes, my_pid):
+def _pvp_typed_picker_uid(typed_payload, target_index=None):
+    """Read a selected card UID from a normalized activation TargetMap."""
+    if not isinstance(typed_payload, dict):
+        return None
+    activation = typed_payload.get(
+        "activation_data", typed_payload.get("AbilityActivationData", {}))
+    if not isinstance(activation, dict):
+        return None
+    target_map = activation.get("target_map", activation.get("TargetMap", {}))
+    if not isinstance(target_map, dict):
+        return None
+
+    if target_index is None:
+        selected_values = list(target_map.values())
+    else:
+        selected = target_map.get(target_index, target_map.get(str(target_index)))
+        if selected is None:
+            return None
+        selected_values = [selected]
+
+    for selected in selected_values:
+        if isinstance(selected, dict):
+            selected = next((selected[key] for key in (
+                "session_card_ids", "SessionCardIds", "cards", "Cards",
+                "targets", "Targets") if key in selected), selected)
+        values = (selected if isinstance(selected, (list, tuple, set))
+                  else (selected,))
+        for value in values:
+            while isinstance(value, dict):
+                nested = next((value[key] for key in (
+                    "uid64", "UID", "m_UID64", "value")
+                    if key in value), None)
+                if nested is None or nested is value:
+                    break
+                value = nested
+            try:
+                uid = _uid_int(value)
+            except (TypeError, ValueError):
+                continue
+            if uid > 0 and (uid & 0xFF) == 1:
+                return uid
+    return None
+
+
+def _pvp_resolve_deck_search(handler, session, inner_bytes, my_pid,
+                             typed_payload=None):
     """Resolve a PvP "search your deck" pick (Darkspire Priestess's Deathcry):
     move the player's chosen matching deck card into their hand and push the
     objective CardMoved / CardDrawn / CardUpdated stream to both players."""
@@ -6213,6 +7041,9 @@ def _pvp_resolve_deck_search(handler, session, inner_bytes, my_pid):
                     chosen_uid = int(uid64)
             except Exception:
                 continue
+    typed_uid = _pvp_typed_picker_uid(typed_payload)
+    if typed_uid is not None:
+        chosen_uid = typed_uid
     if not chosen_uid or chosen_uid not in pend["candidates"]:
         pvp_save_state(session, state)
         log_req(f"    PvP deck-search invalid choice: "
@@ -6238,13 +7069,16 @@ def _pvp_resolve_deck_search(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
+def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid,
+                                 typed_payload=None):
     """Resolve a PvP deck target whose typed effect keeps it in the deck.
 
     This is the PvP counterpart of the FRA continuation: Scheme's selected
     action is never moved to hand, all picker candidates are hidden again,
     and the child BOM is resumed with the selected TargetMap before priority
-    is returned to the active player.
+    is returned to the active player.  A SourceRevealed picker (Oakhenge)
+    shares the same continuation boundary; its child effect owns the move of
+    the chosen card and the return of every other revealed card.
     """
     import struct
 
@@ -6264,6 +7098,11 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
                     chosen_uid = int(uid64)
             except Exception:
                 continue
+    continuation = pend.get("continuation") or {}
+    typed_uid = _pvp_typed_picker_uid(
+        typed_payload, continuation.get("target_index", 0))
+    if typed_uid is not None:
+        chosen_uid = typed_uid
     candidates = [int(uid) for uid in (pend.get("candidates") or [])]
     owner_id = int(pend.get("owner_id", my_pid) or my_pid)
     pids = db_game_session_pids(session.session_id)
@@ -6283,9 +7122,14 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
     view.pop("resolution_paused", None)
     g = _ge.Game(int(session.session_id), pl_t, ai_t)
     _pvp_populate_game_state(g, state, owner_id, opp_pid)
-    handler._hide_candidates_to_deck(g, session, pl_t, ai_t, candidates)
+    # A SourceRevealed picker presents the whole reveal (the cards that were
+    # not legal targets arrive as AdditionalTargets), so all of them go back
+    # to a hidden deck projection; a plain deck search only presents its
+    # candidates.
+    handler._hide_candidates_to_deck(
+        g, session, pl_t, ai_t,
+        [int(uid) for uid in (pend.get("revealed_cards") or candidates)])
 
-    continuation = pend.get("continuation") or {}
     child_guid = str(continuation.get("ability_guid") or "").lower()
     child_source = int(continuation.get("source_uid") or 0)
     child_owner = int(continuation.get("owner_id", owner_id) or owner_id)
@@ -6298,11 +7142,12 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
         handler, g, session, view, pl_t, ai_t,
         child_guid, child_source, child_owner,
         target_map=child_targets,
-        variables=continuation.get("variables") or {})
+        variables=continuation.get("variables") or {},
+        event_tac=continuation.get("event_tac"))
 
     parent = continuation.get("parent") or {}
-    parent_guid = str(parent.get("ability_guid") or "").lower()
-    if parent_guid:
+    while parent.get("ability_guid") and not view.get("resolution_paused"):
+        parent_guid = str(parent.get("ability_guid") or "").lower()
         _pvp_resolve_ability(
             handler, g, session, view, pl_t, ai_t,
             parent_guid, child_source,
@@ -6310,7 +7155,11 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
             target_map={int(key): value for key, value in
                         (parent.get("target_map") or {}).items()},
             variables=parent.get("variables") or {},
-            resume_from_order=int(parent.get("resume_effect_order", 0)))
+            resume_from_order=int(parent.get("resume_effect_order", 0)),
+            instance_id=int(parent.get(
+                "ability_instance_id", parent.get("instance_id", 1))),
+            event_tac=parent.get("event_tac"))
+        parent = parent.get("parent") or {}
 
     state["stack"] = view.get("stack") or []
     state["stack_player_passed"] = False
@@ -6364,17 +7213,29 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_resolve_revealed_choice(handler, session, inner_bytes, my_pid):
-    """Resolve an explicit choice from a private SourceRevealed prompt."""
+def _pvp_resolve_revealed_choice(handler, session, inner_bytes, my_pid,
+                                typed_payload=None):
+    """Resolve an explicit choice from a SourceRevealed prompt.
+
+    A typed continuation resumes the child ability that owns the move
+    (Oakhenge's "put a revealed troop into your hand, then put the remaining
+    cards into your deck") through the shared deck-target continuation; a
+    legacy prompt without one applies the pick directly.
+    """
     import re as _re
     import struct as _st
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return False
     state = pvp_load_state(session) or {}
-    pend = state.pop("pending_deck_search", None)
-    if not pend or pend.get("kind") != "revealed_troop":
+    pend = state.get("pending_deck_search") or {}
+    if pend.get("kind") not in ("revealed_troop", "revealed_card"):
         return False
+    if pend.get("continuation"):
+        return _pvp_resolve_matching_target(
+            handler, session, inner_bytes, my_pid,
+            typed_payload=typed_payload)
+    state.pop("pending_deck_search", None)
     chosen_uid = None
     if isinstance(inner_bytes, bytes):
         for m_du in _re.finditer(
@@ -6386,6 +7247,11 @@ def _pvp_resolve_revealed_choice(handler, session, inner_bytes, my_pid):
                     chosen_uid = int(uid64)
             except Exception:
                 continue
+    continuation = pend.get("continuation") or {}
+    typed_uid = _pvp_typed_picker_uid(
+        typed_payload, continuation.get("target_index", 0))
+    if typed_uid is not None:
+        chosen_uid = typed_uid
     candidates = [int(c) for c in (pend.get("candidates") or [])]
     revealed = [int(c) for c in (pend.get("revealed_cards") or [])]
     owner_id = int(pend.get("owner_id", my_pid))
@@ -6432,7 +7298,8 @@ def _pvp_resolve_revealed_choice(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid):
+def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid,
+                             typed_payload=None):
     """Resolve the PvP Shards of Fate deck choice.
 
     The selected Standard resource remains in the deck; only its threshold is
@@ -6455,6 +7322,9 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid):
                     chosen_uid = int(uid64)
             except Exception:
                 continue
+    typed_uid = _pvp_typed_picker_uid(typed_payload)
+    if typed_uid is not None:
+        chosen_uid = typed_uid
     candidates = [int(c) for c in (pend.get("candidates") or [])]
     if not chosen_uid or chosen_uid not in candidates:
         pvp_save_state(session, state)
@@ -6512,9 +7382,12 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid):
         cu = int(champ_map.get(str(target_pid), 0))
         champ_scid = _ge.SessionCardId(_ge.UID(cu)) if cu else None
         g.push_player_updated(target_uid, champ_id=champ_scid)
-    if state.pop("pending_gain_charge_pid", None) == owner_id:
+    pending_charge_amount = _take_pending_gain_charge_amount(
+        state, owner_id)
+    if pending_charge_amount:
         charge_trigger_game = _pvp_gain_charge_trigger_game(
-            handler, session, state, owner_id)
+            handler, session, state, owner_id,
+            amount=pending_charge_amount)
         if charge_trigger_game:
             for trigger_event in charge_trigger_game.events:
                 g._push(trigger_event)
@@ -6542,11 +7415,119 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid):
-    """Resolve a PvP triggered-ability target choice (Solitary Exile's Deploy,
-    Adamanthian Scrivener, ...): read the chosen card from the transaction,
-    pop the pending trigger from the PvP state, resolve the ability BOM with
-    that target, and push the objective events to both players."""
+def _pvp_resolve_optional_trigger(handler, session, inner_bytes, my_pid,
+                                  typed_payload=None):
+    """Consume a PvP optional-trigger opt-in/opt-out response."""
+    state = pvp_load_state(session) or {}
+    pend = state.get("pending_trigger")
+    if not pend or not pend.get("optional"):
+        return False
+    raw = ((typed_payload or {}).get("activation_data")
+           if isinstance(typed_payload, dict) else None)
+    records = raw if isinstance(raw, (list, tuple)) else (raw,)
+    activation = {}
+    first = None
+    wanted_instance = int(pend.get("instance_id", 0) or 0)
+    wanted_guid = str(pend.get("ability_guid") or "").lower()
+    for candidate in records:
+        if not isinstance(candidate, dict):
+            continue
+        if first is None:
+            first = candidate
+        try:
+            instance = int(candidate.get(
+                "ability_instance_id", candidate.get("instance_id", 0)) or 0)
+        except (TypeError, ValueError):
+            instance = 0
+        guid = str(candidate.get("ability_template_id",
+                                candidate.get("ability_guid", "")) or "").lower()
+        if ((wanted_instance and instance == wanted_instance) or
+                (wanted_guid and guid == wanted_guid)):
+            activation = dict(candidate)
+            break
+    if not activation:
+        activation = dict(first or {})
+
+    def flag(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    declined = (flag(activation.get("disable")) or
+                ("opted" in activation and
+                 not flag(activation.get("opted"))))
+    if not declined:
+        # Preserve the complete activation envelope (including TargetMap) on
+        # the checkpoint, then let the normal target resolver consume it. A
+        # no-target optional ability simply resolves with an empty map.
+        pend["activation_data"] = activation
+        pend.pop("optional", None)
+        pvp_save_state(session, state)
+        return _pvp_resolve_trigger_target(
+            handler, session, b"", my_pid, typed_payload=None)
+
+    owner_id = int(pend.get("owner_id", my_pid) or my_pid)
+    instance_id = int(pend.get("instance_id", 1) or 1)
+    ag = str(pend.get("ability_guid") or "")
+    state.pop("pending_trigger", None)
+    state["priority_pid"] = int(state.get("turn_pid") or owner_id)
+    state["passes"] = []
+    state["stack_passed"] = []
+    pvp_save_state(session, state)
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        return True
+    opponent_id = next(pid for pid in pids if int(pid) != owner_id)
+    pl_t = _ge.UID.make(244, owner_id)
+    ai_t = _ge.UID.make(244, opponent_id)
+    cancelled = _ge.Game(int(session.session_id), pl_t, ai_t)
+    _pvp_populate_game_state(cancelled, state, owner_id, opponent_id)
+    cancelled.push_ability_cancelled(instance_id, pl_t)
+    _pvp_send_same_events(session, cancelled, pl_t, ai_t)
+
+    turn_pid = int(state.get("priority_pid") or owner_id)
+    turn_h = player_handlers.get(turn_pid)
+    if turn_h:
+        turn_uid = _ge.UID.make(244, turn_pid)
+        other_pid = pids[1] if pids[0] == turn_pid else pids[0]
+        other_uid = _ge.UID.make(244, other_pid)
+        resume = _ge.Game(int(session.session_id), turn_uid, other_uid)
+        _pvp_populate_game_state(resume, state, turn_pid, other_pid)
+        if state.get("stack"):
+            resume.push_green_light(
+                turn_uid, _ge.EPriorityContext.ResolveTopOfChain)
+        else:
+            resume.push_chain_empty()
+            resume.push_green_light(turn_uid, _ge.EPriorityContext.Normal)
+        _pvp_push_turn_phase_with_elapsed(
+            resume, int(state.get("phase", 0)), turn_uid, turn_uid,
+            _pvp_priority_elapsed_ticks(state, turn_pid) // 10_000_000)
+        _send_pvp_packet(turn_h, session, resume, turn_uid,
+                         "optional-trigger-declined")
+    phase = int(state.get("phase", 0))
+    if not state.get("stack"):
+        if phase in (_ge.ETurnPhases.FirstMainPhase,
+                     _ge.ETurnPhases.SecondMainPhase):
+            pvp_push_main_phase_options(session, state)
+        elif phase == _ge.ETurnPhases.DeclareAttack:
+            pvp_push_attack_options(session, state)
+        elif phase == _ge.ETurnPhases.DeclareDefense:
+            pvp_push_blocker_options(session, state)
+    log_req(f"    PvP optional trigger declined: {ag[:8]}")
+    return True
+
+
+def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid,
+                                typed_payload=None):
+    """Resolve a PvP triggered-ability continuation.
+
+    The same path handles a target selection after an optional opt-in.  The
+    optional marker is removed by ``_pvp_resolve_optional_trigger`` before it
+    calls this function, so a no-target optional ability can resolve with an
+    empty TargetMap.
+    """
     import re as _re
     import struct as _st
     pids = db_game_session_pids(session.session_id)
@@ -6557,6 +7538,23 @@ def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid):
     if not pend:
         return False
     chosen_uid = None
+    activation_data = pend.get("activation_data")
+    activation_data = (dict(activation_data)
+                       if isinstance(activation_data, dict) else {})
+    pending_target_map = activation_data.get("target_map") or {}
+    target_index = int(pend.get("target_index", 0) or 0)
+    if isinstance(pending_target_map, dict):
+        selected = pending_target_map.get(
+            target_index, pending_target_map.get(str(target_index)))
+        values = selected if isinstance(selected, (list, tuple, set)) else (
+            selected,) if selected is not None else ()
+        for value in values:
+            try:
+                uid = int(getattr(value, "uid64", value))
+            except (TypeError, ValueError):
+                continue
+            if (uid & 0xFF) == 1:
+                chosen_uid = uid
     if isinstance(inner_bytes, bytes):
         for m_du in _re.finditer(
                 rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});',
@@ -6567,6 +7565,33 @@ def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid):
                     chosen_uid = int(uid64)
             except Exception:
                 continue
+    if chosen_uid is None and isinstance(typed_payload, dict):
+        raw_activation = typed_payload.get("activation_data")
+        records = (raw_activation if isinstance(raw_activation, (list, tuple))
+                   else (raw_activation,))
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            target_map = record.get("target_map") or {}
+            selected = (target_map.get(target_index,
+                                       target_map.get(str(target_index)))
+                        if isinstance(target_map, dict) else None)
+            values = selected if isinstance(selected, (list, tuple, set)) else (
+                selected,) if selected is not None else ()
+            for value in values:
+                try:
+                    uid = int(getattr(value, "uid64", value))
+                except (TypeError, ValueError):
+                    continue
+                if (uid & 0xFF) == 1:
+                    chosen_uid = uid
+    if isinstance(typed_payload, dict):
+        raw_activation = typed_payload.get("activation_data")
+        if isinstance(raw_activation, dict):
+            activation_data.update(raw_activation)
+            activation_data["target_map"] = dict(
+                raw_activation.get("target_map") or
+                activation_data.get("target_map") or {})
     state.pop("pending_trigger", None)
     pvp_save_state(session, state)
     ag = str(pend["ability_guid"])
@@ -6590,6 +7615,8 @@ def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid):
             "kind": "trigger", "ability_guid": ag, "source_uid": src,
             "source_owner_uid": owner_id,
             "target_uid": chosen_uid,
+            "trigger_target_uid": pend.get("trigger_target_uid"),
+            "activation_data": activation_data,
             "instance_id": int(pend.get("instance_id", 1)),
         })
     except Exception as e:
@@ -6608,8 +7635,8 @@ def _pvp_resolve_trigger_target(handler, session, inner_bytes, my_pid):
     if _pvp_check_game_end(session, state):
         return True
 
-    # The target-choice transaction completes the same chain item that
-    # _pvp_resolve_chain normally finishes.  Because this path returns early
+    # The target-choice transaction completes the same chain item that the
+    # shared chain seam normally finishes.  Because this path returns early
     # from the normal resolver, it must explicitly restore the ordinary
     # priority/phase/options handoff; otherwise both clients leave the target
     # picker but neither receives a usable next green light.
@@ -6771,8 +7798,11 @@ def _pvp_push_reconnect_snapshot(handler, session, pid):
         if row and row[0]
     }
     champ_map = state.setdefault("champ_map", {})
+    guid_map = state.setdefault("champ_guid_map", {})
     for owner, row in champion_rows.items():
         champ_map[str(owner)] = int(row[0])
+        if len(row) > 1 and row[1]:
+            guid_map[str(owner)] = row[1]
     if champion_rows:
         pvp_save_state(session, state)
     g = _ge.Game(int(session.session_id), pl_uid, opp_uid)
@@ -6822,11 +7852,9 @@ def _pvp_push_reconnect_snapshot(handler, session, pid):
             else "00000000-0000-0000-0000-000000000000")
     player_champion_row = db_game_champion(session.session_id, pid)
     opponent_champion_row = db_game_champion(session.session_id, opp_pid)
-    handler._player_champ_scid = g.player_champion_card_id
-    handler._ai_champ_scid = g.ai_champion_card_id
-    handler._player_champ_guid = (
-        player_champion_row[1] if player_champion_row else None)
-    handler._ai_champ_guid = (
+    _pvp_set_handler_champions(
+        handler, g.player_champion_card_id, g.ai_champion_card_id,
+        player_champion_row[1] if player_champion_row else None,
         opponent_champion_row[1] if opponent_champion_row else None)
     champion_names = [
         db_tournament_player_name_for_session(
@@ -7064,8 +8092,48 @@ def _pvp_send_same_events(session, game, pl_t, ai_t):
     moving onto the opponent's chain) would render blank on the non-controller's
     client.  player_health/resources are copied too so any PlayerUpdated in the
     stream reports the real values, not the 20/0 defaults."""
-    pids = [int(pl_t.uid64) >> 8, int(ai_t.uid64) >> 8]
+    sink = getattr(getattr(session, "_rules_port_session", None),
+                   "event_sink", None)
+    if sink is not None:
+        sink.drain_into(game)
+    # Native RulesPort projections can retain packed integer UIDs, while the
+    # legacy callers usually pass UID wrappers.  Both represent the same
+    # ServicePlayer identity at this packet boundary.
+    pids = [int(getattr(pl_t, "uid64", pl_t)) >> 8,
+            int(getattr(ai_t, "uid64", ai_t)) >> 8]
+    # Visibility projection belongs at the shared packet boundary as deck
+    # movement can change the authorized top card outside an options refresh.
+    # The event itself is tagged for its owner and filtered per recipient by
+    # Game.make_network_packet, so neither client's packet leaks the other
+    # player's deck.
+    state = pvp_load_state(session) or {}
+    visibility_handler = (player_handlers.get(pids[0]) or
+                          player_handlers.get(pids[1]))
+    if visibility_handler is not None:
+        previous_state = getattr(visibility_handler, "_current_bstate", None)
+        visibility_handler._current_bstate = state
+        try:
+            from rules_port.visibility import project_visible_top_decks
+            project_visible_top_decks(
+                _db, session, visibility_handler, game,
+                _ge.UID.make(244, pids[0]), _ge.UID.make(244, pids[1]),
+                state)
+        except Exception as exc:
+            log_req(f"    PvP top-deck projection failed: {exc}")
+        finally:
+            if previous_state is None:
+                try:
+                    del visibility_handler._current_bstate
+                except AttributeError:
+                    pass
+            else:
+                visibility_handler._current_bstate = previous_state
     evs = list(game.events)
+    # This Game is the session-level projection: both recipients are built from
+    # ``evs`` below, so consume it here.  Leaving the events queued made a
+    # later sink re-point (or a drain) replay declarations both clients
+    # already received.
+    game.events = []
     card_defs = dict(game.card_defs)
     # A visible PvP warzone card must never be re-projected with the invalid
     # template used for hidden hand/deck cards. The Device reproduction
@@ -7078,7 +8146,9 @@ def _pvp_send_same_events(session, game, pl_t, ai_t):
             continue
         if event.collection != _ge.ECardCollections.Warzone:
             continue
-        if getattr(getattr(event, "card_id", None), "guid", None).int != 0:
+        template_guid = getattr(
+            getattr(event, "card_id", None), "guid", None)
+        if template_guid is None or template_guid.int != 0:
             continue
         card_uid = int(event.session_card_id.uid.uid64)
         details = db_card_zone_details(session.session_id, card_uid, conn=_db)
@@ -7263,224 +8333,256 @@ def _pvp_check_game_end(session, state):
     return False
 
 
-def _pvp_resolve_native_permanent(session, state, handler, item):
-    """Resolve a native permanent chain item into its warzone projection."""
-    pids = db_game_session_pids(session.session_id)
-    source_uid = int(item.get("source_uid") or 0)
-    if len(pids) < 2 or not source_uid:
-        return False
-    stack = state.get("stack") or []
-    if stack and int(stack[-1].get("instance_id", -1)) == int(
-            item.get("instance_id", -2)):
-        stack.pop()
-    row = db_card_chain_info(session.session_id, source_uid, conn=_db)
-    if not row or db_card_location(session.session_id, source_uid) != "CastSpells":
-        return False
-    owner_row = db_card_basic(session.session_id, source_uid, conn=_db)
-    owner_id = int(owner_row[1]) if owner_row else int(pids[0])
-    opponent_id = next((int(pid) for pid in pids if int(pid) != owner_id),
-                       owner_id)
-    player_uid = _ge.UID.make(244, owner_id)
-    opponent_uid = _ge.UID.make(244, opponent_id)
-    view = _pvp_fra_view(state, owner_id, opponent_id)
-    game = _ge.Game(int(session.session_id), player_uid, opponent_uid)
-    _pvp_populate_game_state(game, state, owner_id, opponent_id)
-    instance_id = int(item.get("instance_id", 1) or 1)
-    game.push_top_of_chain_resolved(instance_id)
-    game.push_removed_top_of_chain(instance_id)
-    db_set_card_location(
-        session.session_id, source_uid, "warzone",
-        extra_set="position=?, card_state=(card_state | ?)",
-        extra_params=[0, _ge.ECardStates.CameOutThisTurn])
-    scid = _ge.SessionCardId(_ge.UID(source_uid))
-    _tpl, _ct, _name, _cost, _attack, _defense, gems = \
-        handler._card_full_data(game, scid, row[0])
-    card_type = _ge.card_type_from_db(row[1])
-    cdef = game.card_defs.get(scid)
-    game.push_card_updated(
-        scid, player_uid, _ge.ECardCollections.Warzone, card_type,
-        template_id=row[0], cost=cdef.cost if cdef else 0,
-        attack=cdef.attack if cdef else 0,
-        defense=cdef.defense if cdef else 0, gems=gems)
-    game.push_card_moved(
-        scid, player_uid, _ge.ECardCollections.Warzone,
-        _ge.ECardLocations.Top, 0)
-    if card_type & _ge.ECardTypes.Troop:
-        game.push_troop_card_played(scid, player_uid)
-    elif card_type & _ge.ECardTypes.Artifact:
-        game.push_artifact_card_played(scid, player_uid)
-    _pvp_dispatch_triggers(
-        handler, game, session, view, player_uid, opponent_uid,
-        "CardEnteredZoneEvent", source_uid, owner_id,
-        event_destination_collection="warzone")
-    view["card_cast_copy_target"] = source_uid
-    _pvp_dispatch_triggers(
-        handler, game, session, view, player_uid, opponent_uid,
-        "CardCastEvent", source_uid, owner_id)
-    view.pop("card_cast_copy_target", None)
-    state["stack"] = view.get("stack") or []
-    state["stack_passed"] = []
-    state["stack_player_passed"] = False
-    state["stack_ai_passed"] = False
-    _pvp_sync_view_to_state(state, view, owner_id, opponent_id)
-    pending = any(state.get(key) for key in (
-        "pending_choice", "pending_deck_search", "pending_trigger",
-        "pending_discard_ability"))
-    if not pending and not state.get("stack"):
-        game.push_chain_empty()
-        turn_pid = int(state.get("turn_pid") or owner_id)
-        state["priority_pid"] = turn_pid
-        game.push_green_light(
-            _ge.UID.make(244, turn_pid), _ge.EPriorityContext.Normal)
-    elif not pending:
-        state["priority_pid"] = opponent_id
-    pvp_save_state(session, state)
-    _pvp_send_same_events(session, game, player_uid, opponent_uid)
-    if not pending and state.get("stack"):
-        next_uid = _ge.UID.make(244, int(state["priority_pid"]))
-        next_handler = player_handlers.get(int(state["priority_pid"]))
-        if next_handler:
-            response = _ge.Game(int(session.session_id), next_uid,
-                                _ge.UID.make(244, int(owner_id)))
-            response.push_green_light(
-                next_uid, _ge.EPriorityContext.ResolveTopOfChain)
-            _send_pvp_packet(next_handler, session, response, next_uid,
-                             "native-permanent-chain-next")
-    return True
+class _PvpChainHost:
+    """Tournament PvP projection for one chain item.
 
+    ``rules_port.chain_items`` owns the lifecycle: resolve the authored
+    effects, hold the item while a client picker is open, consume the
+    picker-continuation marker, and present the chain item.  This adapter
+    supplies only what is specific to a two-human match — the side-oriented
+    effect view the trigger backend evaluates against, the persisted PvP
+    checkpoint round-trip, and the packet projection to both clients.
+    Practice/PvE uses the same lifecycle through the hooks on
+    ``hconnect_server.HCPHandler``.
 
-def _pvp_resolve_native_spell(session, state, handler, item):
-    """Resolve one native RulesPort spell chain item and project its zone.
-
-    The chain/priority decision is made by ``PvpAuthoritativeSession``. This
-    function is deliberately only the PvP storage and wire projection around
-    the shared Records-backed spell resolver.
+    The lifecycle state is the persisted checkpoint itself, not the effect
+    view: ``rules_port.persistence.load_state`` installs that checkpoint as
+    the ability resolver's battle state, so a lifecycle that tracked a copy
+    would miss the pause marker and pending-input keys the effects just wrote
+    (the PvP half of the Darkspire Priestess deck-search loop).
     """
-    pids = db_game_session_pids(session.session_id)
-    source_uid = int(item.get("source_uid") or 0)
-    if len(pids) < 2 or not source_uid:
-        return False
-    stack = state.get("stack") or []
-    if stack and int(stack[-1].get("instance_id", -1)) == int(
-            item.get("instance_id", -2)):
-        stack.pop()
-    source_row = db_card_basic(session.session_id, source_uid, conn=_db)
-    owner_id = int(source_row[1]) if source_row else int(pids[0])
-    opponent_id = next((int(pid) for pid in pids if int(pid) != owner_id),
-                       owner_id)
-    player_uid = _ge.UID.make(244, owner_id)
-    opponent_uid = _ge.UID.make(244, opponent_id)
-    view = _pvp_fra_view(state, owner_id, opponent_id)
-    view["resolving_source_uid"] = source_uid
-    view["resolving_owner_id"] = owner_id
-    view["player_spell_target"] = item.get("target_uid")
-    game = _ge.Game(int(session.session_id), player_uid, opponent_uid)
-    _pvp_populate_game_state(game, state, owner_id, opponent_id)
-    instance_id = int(item.get("instance_id", 1) or 1)
-    game.push_top_of_chain_resolved(instance_id)
-    game.push_removed_top_of_chain(instance_id)
-    # A paused picker continuation already resolved this item's ability chain;
-    # only the card's zone/event projection is left.  Re-running the BOM here
-    # reopened the picker and applied the effects twice.
-    bom_completed = (int(state.pop("completed_chain_instance_id", 0) or 0) ==
-                     instance_id)
-    if db_card_location(session.session_id, source_uid) != "CastSpells":
-        log_req(f"    Native PvP spell {source_uid} already left CastSpells")
-    else:
-        if not bom_completed:
-            game.push_spell_card_played(
-                _ge.SessionCardId(_ge.UID(source_uid)), player_uid)
-            from rules_port.resolution import resolve_port_played_spell
-            resolve_port_played_spell(
-                game, session, _db, handler, player_uid, opponent_uid, view,
-                item.get("ability_guids", ()),
-                activations=item.get("activations") or {})
-        persisted = pvp_load_state(session) or {}
-        for key in ("pending_choice", "pending_deck_search", "pending_trigger",
-                    "pending_discard_ability"):
-            if persisted.get(key):
-                state[key] = persisted[key]
-        if db_card_location(session.session_id, source_uid) != "deck":
-            db_card_discard_spell(session.session_id, source_uid)
-            row = db_card_chain_info(
-                session.session_id, source_uid, conn=_db)
-            if row:
-                scid = _ge.SessionCardId(_ge.UID(source_uid))
-                handler._card_full_data(game, scid, row[0])
-                game.push_card_updated(
-                    scid, player_uid, _ge.ECardCollections.Discard,
-                    _ge.card_type_from_db(row[1]), template_id=row[0])
-                game.push_card_moved(
-                    scid, player_uid, _ge.ECardCollections.Discard,
-                    _ge.ECardLocations.Top, 0)
-                _pvp_dispatch_triggers(
-                    handler, game, session, view, player_uid, opponent_uid,
-                    "CardEnteredZoneEvent", source_uid, owner_id)
-    state["stack"] = view.get("stack") or []
-    state["stack_passed"] = []
-    state["stack_player_passed"] = False
-    state["stack_ai_passed"] = False
-    _pvp_sync_view_to_state(state, view, owner_id, opponent_id)
-    pending = any(state.get(key) for key in (
-        "pending_choice", "pending_deck_search", "pending_trigger",
-        "pending_discard_ability"))
-    if not pending and not (state.get("stack") or []):
-        game.push_chain_empty()
-        turn_pid = int(state.get("turn_pid") or owner_id)
-        state["priority_pid"] = turn_pid
-        game.push_green_light(
-            _ge.UID.make(244, turn_pid), _ge.EPriorityContext.Normal)
-    elif not pending:
-        next_pid = next((int(pid) for pid in pids
-                         if int(pid) != owner_id), owner_id)
-        state["priority_pid"] = next_pid
-    pvp_save_state(session, state)
-    _pvp_send_same_events(session, game, player_uid, opponent_uid)
-    if not pending and state.get("stack"):
-        next_uid = _ge.UID.make(244, int(state["priority_pid"]))
-        next_handler = player_handlers.get(int(state["priority_pid"]))
-        if next_handler:
-            response = _ge.Game(int(session.session_id), next_uid,
-                                _ge.UID.make(244, int(owner_id)))
-            response.push_green_light(
-                next_uid, _ge.EPriorityContext.ResolveTopOfChain)
-            _send_pvp_packet(next_handler, session, response, next_uid,
-                             "native-spell-chain-next")
-    return True
+
+    def __init__(self, handler, session, state, owner_id, opponent_id):
+        self.handler = handler
+        self.session = session
+        self.state = state if isinstance(state, dict) else {}
+        self.owner_id = int(owner_id)
+        self.opponent_id = int(opponent_id)
+
+    def _view(self, state):
+        return _pvp_fra_view(state, self.owner_id, self.opponent_id)
+
+    # --- rules_port.chain_items hooks -------------------------------------
+    def chain_load(self, session):
+        return self.state
+
+    def chain_save(self, session, state):
+        pvp_save_state(self.session, self.state)
+
+    def chain_new_game(self, session, state, player_uid, ai_uid):
+        game = _ge.Game(int(session.session_id), player_uid, ai_uid)
+        _pvp_populate_game_state(
+            game, self.state, self.owner_id, self.opponent_id)
+        return game
+
+    def chain_send(self, session, game, player_uid, ai_uid):
+        _pvp_send_same_events(session, game, player_uid, ai_uid)
+
+    def chain_card_data(self, game, scid, template_guid):
+        return self.handler._card_full_data(game, scid, template_guid)
+
+    def _card_full_data(self, game, scid, template_guid, instance_id=None):
+        """Expose the shared effect-context card projection hook."""
+        return self.handler._card_full_data(
+            game, scid, template_guid, instance_id)
+
+    def chain_dispatch(self, session, game, state, player_uid, ai_uid,
+                       event_type, source_uid, owner_id, **event_data):
+        # The trigger backend evaluates authored conditions against the
+        # side-oriented view (thresholds/resources/health per player); the
+        # chain itself stays aliased to the checkpoint root.
+        view = self._view(state)
+        result = _pvp_dispatch_triggers(
+            self.handler, game, session, view, player_uid, ai_uid,
+            event_type, source_uid, owner_id, **event_data)
+        _pvp_sync_view_to_state(state, view, self.owner_id, self.opponent_id)
+        return result
+
+    def chain_state_based(self, session, state, game, player_uid, ai_uid):
+        """Apply PvP state-based actions in the same chain packet."""
+        from rules_port.context import EffectContext
+        from rules_port.death_effects import state_based_deaths
+
+        view = self._view(state)
+        view["_rules_port_attached"] = True
+        previous = getattr(self.handler, "_current_bstate", None)
+        self.handler._current_bstate = view
+        try:
+            dead = state_based_deaths(EffectContext.from_rules_port(
+                game, session, _db, self.handler, player_uid, ai_uid, view,
+                "state_based_death", ability=None))
+        finally:
+            if previous is None:
+                try:
+                    del self.handler._current_bstate
+                except AttributeError:
+                    pass
+            else:
+                self.handler._current_bstate = previous
+        _pvp_sync_view_to_state(
+            state, view, self.owner_id, self.opponent_id)
+        pvp_save_state(session, state)
+        return bool(dead)
+
+    def chain_push_empty(self, port, state, item, pending):
+        return not pending and not state.get("stack")
+
+    def chain_finalize(self, session, state, game, item, pending,
+                       player_uid, ai_uid):
+        """Priority rides in the same packet as the item's own events."""
+        if pending:
+            return
+        # The item resolved, so the passes recorded for it are stale.
+        state["stack_passed"] = []
+        state["stack_player_passed"] = False
+        state["stack_ai_passed"] = False
+        if not state.get("stack"):
+            turn_pid = int(state.get("turn_pid") or self.owner_id)
+            state["priority_pid"] = turn_pid
+            game.push_green_light(
+                _ge.UID.make(244, turn_pid), _ge.EPriorityContext.Normal)
+        else:
+            state["priority_pid"] = self.opponent_id
+
+    def chain_after_item(self, session, state, game, item, player_uid, ai_uid):
+        # A resolved item can deal a champion's last health.
+        _pvp_check_game_end(self.session, self.state)
+        if not self.state.get("stack") or not self.state.get("priority_pid"):
+            return
+        if any(self.state.get(key) for key in (
+                "pending_choice", "pending_deck_search", "pending_trigger",
+                "pending_conversation", "pending_discard_ability")):
+            return
+        # Another chain item is waiting: hand its response window out in its
+        # own packet (the item's packet already carried the resolved/removed
+        # presentation).
+        priority_pid = int(self.state["priority_pid"])
+        next_handler = player_handlers.get(priority_pid)
+        if not next_handler:
+            return
+        next_uid = _ge.UID.make(244, priority_pid)
+        response = _ge.Game(
+            int(self.session.session_id), next_uid,
+            _ge.UID.make(244, self.owner_id))
+        response.push_green_light(
+            next_uid, _ge.EPriorityContext.ResolveTopOfChain)
+        _send_pvp_packet(next_handler, self.session, response, next_uid,
+                         "native-chain-next")
+
+def _pvp_session_pids(session, state):
+    """Two-participant list for a tourney session.
+
+    ``game_cards`` rows are written with the opening hands, so the very first
+    gameplay transaction of a resumed match can arrive before they exist.
+    The PvP checkpoint and the transport metadata both name the participants;
+    reading them keeps such a transaction on the native host instead of
+    dropping the session onto the legacy stack.
+    """
+    def _pid(value):
+        # ``session.players`` carries typed UIDs; the checkpoint uses raw ids.
+        raw = getattr(value, "uid64", value)
+        try:
+            raw = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return raw >> 8 if (raw & 0xFF) == 244 else raw
+
+    candidates = (
+        (state or {}).get("pids"),
+        list((state or {}).get("champ_map") or {}),
+        [uid for uid, _position in
+         (getattr(session, "players", ()) or ())],
+    )
+    for source in candidates:
+        found = []
+        for value in source or ():
+            pid = _pid(value)
+            if pid and pid not in found:
+                found.append(pid)
+        if len(found) >= 2:
+            return found[:2]
+    return []
 
 
-def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
-    """Resolve the top item of the PvP chain/stack.
+def _pvp_resolve_stack_item(session, state, handler, my_pid):
+    """Resolve the top persisted chain item when no native host is attached.
 
-    The client's "Resolve" button submits a PassPriorityTransaction while the
-    chain is non-empty.  This pops the top item, pushes TopOfChainResolved +
-    RemovedTopOfChain + the effect's own events (e.g. Adamanthian Scrivener's
-    life gain) to BOTH players, persists health, and hands priority on: back
-    to the turn player (Normal) when the chain empties, else to the OTHER
-    player (ResolveTopOfChain) so they can respond to the next item.
-    Returns True when an item was resolved."""
+    Reached only when this tourney session has no RulesPort host — the setup
+    hand-off, or a wrapper that could not build one.  Card, spell and
+    triggered items go through the same shared seam the native path uses, so
+    the two can no longer drift; a manual/champion ability keeps its
+    PvP-specific projection.  Returns True when an item was resolved.
+    """
     from rules_port import lifecycle as _be
-    if item is None:
-        item = _be.stack_pop(state)
-    else:
-        # RulesPort supplied the authoritative typed chain descriptor. The
-        # persisted stack is only a wire/reconnect projection; remove its
-        # matching mirror without selecting a different legacy item.
-        item = dict(item)
-        stack = state.get("stack") or []
-        if stack and int(stack[-1].get("instance_id", -1)) == int(
-                item.get("instance_id", -2)):
-            stack.pop()
+    from rules_port.actions import AbilityResolutionState
+    from rules_port.chain_items import resolve_chain_item
+    from rules_port.session import projected_ability_ignores_chain
+
+    stack = state.get("stack") or []
+    if not stack:
+        return False
+    kind = str((stack[-1] or {}).get("kind") or "")
+    if kind == "ability":
+        # The ability projection owns its own mirror strip.
+        return bool(_pvp_resolve_ability_item(
+            session, state, handler, my_pid, dict(stack[-1])))
+    item = dict(_be.stack_pop(state) or {})
     if not item:
         return False
-    pids = db_game_session_pids(session.session_id)
+    ability = SimpleNamespace(
+        instance_id=int(item.get("instance_id", 1) or 1),
+        descriptor=item,
+        ignores_chain=projected_ability_ignores_chain(item))
+    owner_id = int(my_pid)
+    source_uid = int(item.get("source_uid") or 0)
+    if source_uid:
+        owner_row = db_card_basic(session.session_id, source_uid, conn=_db)
+        if owner_row:
+            owner_id = int(owner_row[1])
+    pids = _pvp_session_pids(session, state) or [
+        owner_id, int(my_pid) if int(my_pid) != owner_id else owner_id]
     if len(pids) < 2:
         return False
-    kind = item.get("kind")
-    # Only champion-ability chain items have an ability GUID.  Keep the
-    # post-resolution discard/continuation checks safe for troop/spell items
-    # instead of leaking an UnboundLocalError after a normal card resolves.
-    ag = ""
+    opponent_id = next((int(pid) for pid in pids
+                        if int(pid) != owner_id), owner_id)
+    host = _PvpChainHost(handler, session, state, owner_id, opponent_id)
+    resolution = resolve_chain_item(
+        host, None, session, _db, ability,
+        _ge.UID.make(244, owner_id), _ge.UID.make(244, opponent_id))
+    return resolution is AbilityResolutionState.COMPLETED
+
+
+def _pvp_resolve_ability_item(session, state, handler, my_pid, item):
+    """Resolve one manual/champion ability chain item in PvP.
+
+    Card, spell and triggered item resolution is shared with Practice/PvE
+    through ``rules_port.chain_items``; a manual/champion ability carries
+    PvP-only projections (charge/spell-power cost events before its picker
+    opens, the champion-health delta after it resolves, and the deferred
+    class-23 discard prompt for a nested discard leaf), so its projection
+    stays here.  The item, its mirror and the chain presentation are owned by
+    the caller; this function only projects the effect and the priority
+    hand-off.
+    """
+    if not item:
+        return False
+    from rules_port import lifecycle as _be
+
+    # The persisted stack is only the reconnect/wire mirror; drop this item's
+    # entry by identity.  Leaving it behind re-queued the resolved item as the
+    # "next" chain item.
+    item = dict(item)
+    stack = state.get("stack") or []
+    if stack and int(stack[-1].get("instance_id", -1)) == int(
+            item.get("instance_id", -2)):
+        stack.pop()
+    pids = db_game_session_pids(session.session_id)
+    if len(pids) < 2:
+        pids = _pvp_session_pids(session, state)
+    if len(pids) < 2:
+        return False
+    kind = "ability"
+    ag = str(item.get("ability_guid") or "")
     instance_id = int(item.get("instance_id", 1))
     src_uid = int(item.get("source_uid") or 0)
     # Owner of the chain item's source card (triggers belong to their card).
@@ -7499,142 +8601,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
     view["player_spell_target"] = item.get("target_uid")
     g = _ge.Game(int(session.session_id), pl_t, ai_t)
     _pvp_populate_game_state(g, state, owner_id, opp_pid)
-    if kind == "trigger":
-        try:
-            from rules_port.resolution import resolve_port_trigger
-            resolve_port_trigger(handler, g, session, _db, pl_t, ai_t, view,
-                                 item)
-        except Exception as e:
-            import traceback
-            log_req(f"    PvP chain trigger resolve error: {e}")
-            traceback.print_exc()
-    elif kind == "troop":
-        # A permanent (troop/artifact/constant) resolves from the chain into
-        # the warzone: mark CameOutThisTurn, push CardUpdated/CardMoved,
-        # fire enters-play triggers — mirrors PvE's troop chain resolution.
-        if src_uid:
-            loc_row = db_card_location(session.session_id, src_uid)
-            if not loc_row or loc_row != "CastSpells":
-                log_req(f"    PvP troop {src_uid} already left the chain "
-                        f"(loc={loc_row}) — skipped")
-                pvp_save_state(session, state)
-                return True
-            scid = _ge.SessionCardId(_ge.UID(src_uid))
-            tw = db_card_chain_info(
-                session.session_id, src_uid, conn=_db)
-            if tw:
-                db_set_card_location(
-                    session.session_id, src_uid, "warzone",
-                    extra_set="position=?, card_state=(card_state | ?)",
-                    extra_params=[0, _ge.ECardStates.CameOutThisTurn])
-                _tpl, ct, _name, cost, attack, defense, gems = \
-                    handler._card_full_data(g, scid, tw[0])
-                ct = _ge.card_type_from_db(tw[1])
-                g.push_card_updated(scid, pl_t, _ge.ECardCollections.Warzone,
-                                    ct, template_id=tw[0],
-                                    cost=cost, attack=attack,
-                                    defense=defense, gems=gems)
-                g.push_card_moved(scid, pl_t, _ge.ECardCollections.Warzone,
-                                  _ge.ECardLocations.Top, 0)
-                if ct & _ge.ECardTypes.Troop:
-                    g.push_troop_card_played(scid, pl_t)
-                elif ct & _ge.ECardTypes.Artifact:
-                    g.push_artifact_card_played(scid, pl_t)
-                try:
-                    # CardEnteredZoneEvent is the native RulesPort trigger
-                    # boundary for permanents entering the warzone.  The
-                    # host still owns the SQLite/event projection above.
-                    _pvp_dispatch_triggers(
-                        handler, g, session, view, pl_t, ai_t,
-                        "CardEnteredZoneEvent", src_uid, owner_id,
-                        event_destination_collection="warzone")
-                    # CardCastEvent also covers permanents.  Keep it separate
-                    # from CardEnteredZoneEvent so cost-based triggers such
-                    # as Jadiim see the card that was actually played.
-                    view["card_cast_copy_target"] = src_uid
-                    _pvp_dispatch_triggers(
-                        handler, g, session, view, pl_t, ai_t,
-                        "CardCastEvent", src_uid, owner_id)
-                    view.pop("card_cast_copy_target", None)
-                except Exception as e:
-                    log_req(f"    PvP troop chain enters-play error: {e}")
-    elif kind == "spell":
-        # A played action resolves its BOM then goes CastSpells -> Discard.
-        # A spell that was countered/interrupted already left the chain —
-        # skip its BOM so a countered spell never also draws/buffs/damages.
-        loc = db_card_location(session.session_id, src_uid) or "discard"
-        if loc != "CastSpells":
-            log_req(f"    PvP spell {src_uid} already left the chain "
-                    f"(loc={loc}) — countered/interrupted, BOM skipped")
-        else:
-            # The client receives SpellCardCast when the card enters
-            # CastSpells and SpellCardPlayed only after it resolves.  A
-            # countered spell never reaches this branch and therefore never
-            # receives the played event.
-            g.push_spell_card_played(
-                _ge.SessionCardId(_ge.UID(src_uid)), pl_t)
-            try:
-                from rules_port.resolution import resolve_port_played_spell
-                view["player_spell_target"] = item.get("target_uid")
-                view["resolving_source_uid"] = src_uid
-                view["resolving_owner_id"] = owner_id
-                view["x_cost"] = int(item.get("x_cost") or 0)
-                resolve_port_played_spell(
-                    g, session, _db, handler, pl_t, ai_t, view,
-                    item.get("ability_guids", []),
-                    activations=item.get("activations"))
-                view.pop("x_cost", None)
-            except Exception as e:
-                import traceback
-                log_req(f"    PvP chain spell resolve error: {e}")
-                _tb = traceback.format_exc()
-                for _tl in _tb.splitlines():
-                    log_req(f"    PvP spell TB: {_tl}")
-            # "When you play an action/..." triggers fire against the played
-            # spell (e.g. Chimes of the Zodiac's "copy it").
-            if src_uid:
-                try:
-                    view["card_cast_copy_target"] = src_uid
-                    _pvp_dispatch_triggers(
-                        handler, g, session, view, pl_t, ai_t,
-                        "CardCastEvent", src_uid, owner_id)
-                    view.pop("card_cast_copy_target", None)
-                except Exception as e:
-                    import traceback
-                    log_req(f"    PvP CardCast trigger error: {e}")
-                    traceback.print_exc()
-            view.pop("player_spell_target", None)
-            view.pop("resolving_source_uid", None)
-            # The spent spell goes to the graveyard (unless a leaf moved it
-            # into the deck — e.g. Eternal Youth's escalation "put this into
-            # your deck").
-            if src_uid:
-                loc = db_card_location(session.session_id, src_uid) or "discard"
-                if loc != "deck":
-                    db_card_discard_spell(session.session_id, src_uid)
-                    scid = _ge.SessionCardId(_ge.UID(src_uid))
-                    tw = db_card_chain_info(
-                        session.session_id, src_uid, conn=_db)
-                    if tw:
-                        handler._card_full_data(g, scid, tw[0])
-                        g.push_card_updated(
-                            scid, pl_t, _ge.ECardCollections.Discard,
-                            _ge.card_type_from_db(tw[1]), template_id=tw[0])
-                        g.push_card_moved(scid, pl_t,
-                                          _ge.ECardCollections.Discard,
-                                          _ge.ECardLocations.Top, 0)
-                        # "When a card enters an opposing crypt" triggers
-                        # (e.g. Incantation of Fear) fire here — mirrors PvE
-                        # hconnect ~2982.
-                        try:
-                            _pvp_dispatch_triggers(
-                                handler, g, session, view, pl_t, ai_t,
-                                "CardEnteredZoneEvent", src_uid, owner_id)
-                        except Exception as e:
-                            import traceback
-                            log_req(f"    PvP spell-crypt trigger error: {e}")
-                            traceback.print_exc()
-    elif kind == "ability":
+    if kind == "ability":
         # Champion charge/spell power on the chain (e.g. Dimmid's Lifedrain):
         # resolve its BOM through the same resolver the PvE "ability" path
         # uses.  The source is the champion card — not a game_cards row — so
@@ -7670,8 +8637,10 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
                 ability_event_start = len(g.events)
                 ability_player_health_before = int(view.get("player_health", 20))
                 ability_ai_health_before = int(view.get("ai_health", 20))
-                target_map = {}
-                if item.get("target_uid") is not None:
+                activation_data = item.get("activation_data") or {}
+                target_map = (dict(activation_data.get("target_map") or {})
+                              if isinstance(activation_data, dict) else {})
+                if not target_map and item.get("target_uid") is not None:
                     from gamedata import ability_graph, DEFAULT_RECORD_STORE
                     graph = ability_graph(DEFAULT_RECORD_STORE, ag)
                     if graph is not None:
@@ -7683,6 +8652,16 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
                     handler, g, session, _db, pl_t, ai_t, view, ag,
                     src_uid, owner_id, target_map=target_map,
                     instance_id=instance_id)
+                # PortAbilityResolver adopts the shared authoritative PvP
+                # checkpoint before walking effects. Rebuild this FRA-shaped
+                # view from that updated checkpoint so the stale pre-resolution
+                # health cannot overwrite damage when we sync below.
+                resolved_state = pvp_load_state(session)
+                if isinstance(resolved_state, dict) and resolved_state:
+                    if resolved_state is not state:
+                        state.clear()
+                        state.update(resolved_state)
+                    view = _pvp_fra_view(state, owner_id, opp_pid)
                 ability_player_health_after = int(
                     view.get("player_health", ability_player_health_before))
                 ability_ai_health_after = int(
@@ -7745,7 +8724,7 @@ def _pvp_resolve_chain(session, state, handler, my_pid, item=None):
     chain_empty = _be.stack_empty(state)
     pending_revealed_choice = (
         (state.get("pending_deck_search") or {}).get("kind")
-        == "revealed_troop")
+        in ("revealed_troop", "revealed_card"))
     pending_trigger = bool(state.get("pending_trigger"))
     pending_choice = bool(state.get("pending_choice"))
     pending_conversation = bool(state.get("pending_conversation"))
@@ -7981,6 +8960,13 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid, inner_bytes,
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     state = pvp_load_state(session) or {}
+    source_location = _pvp_card_source_location(
+        session, state, my_pid, int(played_card_uid))
+    if source_location is None:
+        log_req(f"    PvP REJECTED permanent {card_name}: card is not in a playable zone")
+        return True
+    prior_card_zone = db_card_owner_zone_state(
+        session.session_id, int(played_card_uid), conn=_db)
     try:
         play_plan = PlayPlan.from_card(
             _RECORD_STORE, tpl_guid, source_uid=int(played_card_uid),
@@ -8051,15 +9037,17 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid, inner_bytes,
     # correct regardless of triggers firing.
     from rules_port.card_transactions import apply_card_play_for_player
     card_transition = apply_card_play_for_player(
-        _db, session.session_id, state, int(played_card_uid), my_pid, cost)
+        _db, session.session_id, state, int(played_card_uid), my_pid, cost,
+        expected_location=source_location)
     if card_transition is None:
-        log_req(f"    PvP REJECTED play {card_name}: card was not in hand")
+        log_req(f"    PvP REJECTED play {card_name}: card left its playable zone")
         return True
     view = _pvp_fra_view(state, my_pid, opp_pid)
     # Move the card onto the CHAIN (CastSpells visual) — mirroring how spells
     # are cast.  Troops/artifacts/constants do NOT resolve instantly: they stay
     # on the stack so the opponent can respond (e.g. Countermagic) before they
-    # resolve to the warzone via the both-pass chain flow in _pvp_resolve_chain.
+    # resolve to the warzone via the both-pass chain flow (see
+    # _pvp_resolve_stack_item).
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     _pvp_populate_game_state(g, state, my_pid, opp_pid)
     _pvp_apply_card_play_costs(
@@ -8106,6 +9094,15 @@ def _pvp_play_troop(handler, session, played_card_uid, my_pid, inner_bytes,
     state["stack_player_passed"] = False
     state["stack_ai_passed"] = False
     state["stack_passed"] = []
+    from rules_port import chain_items as _chain_items
+    trigger_host = _PvpChainHost(handler, session, state, my_pid, opp_pid)
+    _chain_items.dispatch_card_zone_transition(
+        trigger_host, session, g, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid, source_location, "CastSpells",
+        int(prior_card_zone[2] or 0) if prior_card_zone else 0)
+    _chain_items.dispatch_card_cast(
+        trigger_host, session, g, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid)
     pvp_save_state(session, state)
     # Reflect the cost paid on BOTH clients (objective UIDs).
     g.player_resources = int(state.get(f"res_{my_pid}", 0))
@@ -8264,6 +9261,13 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     state = pvp_load_state(session) or {}
+    source_location = _pvp_card_source_location(
+        session, state, my_pid, int(played_card_uid))
+    if source_location is None:
+        log_req(f"    PvP REJECTED spell {card_name}: card is not in a playable zone")
+        return True
+    prior_card_zone = db_card_owner_zone_state(
+        session.session_id, int(played_card_uid), conn=_db)
     targets = _pvp_typed_card_targets(typed_payload, played_card_uid)
     if typed_payload is None:
         try:
@@ -8319,7 +9323,8 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
         log_req(f"    PvP REJECTED spell {card_name}: non-variable card has X={x_cost}")
         return True
     available = int(state.get(f"res_{my_pid}", 0))
-    if native_port is None and cost + x_cost > available:
+    x_payment = x_cost * play_plan.cost.variable_multiplier
+    if native_port is None and cost + x_payment > available:
         log_req(f"    PvP REJECTED spell {card_name}: cost {cost} > "
                 f"resources {available}")
         pvp_push_main_phase_options(session, state)
@@ -8344,9 +9349,9 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
     from rules_port.card_transactions import apply_card_play_for_player
     card_transition = apply_card_play_for_player(
         _db, session.session_id, state, int(played_card_uid), my_pid,
-        cost + x_cost)
+        cost + x_payment, expected_location=source_location)
     if card_transition is None:
-        log_req(f"    PvP REJECTED spell {card_name}: card was not in hand")
+        log_req(f"    PvP REJECTED spell {card_name}: card left its playable zone")
         return True
     if x_cost:
         log_req(f"    PvP spell {card_name}: X cost {x_cost} paid "
@@ -8370,12 +9375,15 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
     g.push_card_moved(scid, my_uid, _ge.ECardCollections.CastSpells,
                       _ge.ECardLocations.Top, 0)
     g.push_spell_card_cast(scid, my_uid, free=False)
-    ability_guids = [ability.ability_guid for ability in play_plan.abilities
-                     if not ability.is_triggered]
+    from rules_port.card_transactions import automatic_instance_ability_guids
+    ability_guids = automatic_instance_ability_guids(
+        _db, session.session_id, int(played_card_uid),
+        [ability.ability_guid for ability in play_plan.cast_abilities])
+    played_from_hand = str(source_location).lower() == "hand"
     inst_id = port_queue_stack_item(state, {
         "kind": "spell", "source_uid": int(played_card_uid),
         "ability_guids": ability_guids, "target_uid": target_uid,
-        "x_cost": x_cost,
+        "x_cost": x_cost, "played_from_hand": played_from_hand,
         "activations": {
             guid: activation.as_dict()
             for guid, activation in activations.items()
@@ -8394,6 +9402,15 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
     state["stack_player_passed"] = False
     state["stack_ai_passed"] = False
     state["stack_passed"] = []
+    from rules_port import chain_items as _chain_items
+    trigger_host = _PvpChainHost(handler, session, state, my_pid, opp_pid)
+    _chain_items.dispatch_card_zone_transition(
+        trigger_host, session, g, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid, source_location, "CastSpells",
+        int(prior_card_zone[2] or 0) if prior_card_zone else 0)
+    _chain_items.dispatch_card_cast(
+        trigger_host, session, g, state, my_uid, opp_uid,
+        int(played_card_uid), my_pid)
     pvp_save_state(session, state)
     # Reflect the cost paid on BOTH clients' resource displays (the event
     # carries the caster's absolute UID, so each client renders "You spent"
@@ -8407,7 +9424,7 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
     ev_spent = _ge.PlayerCurrentResourcePoolChangedSessionEventArgs()
     ev_spent.player_id = my_uid
     ev_spent.operation = 2
-    ev_spent.delta = cost + x_cost
+    ev_spent.delta = cost + x_payment
     ev_spent.new_value = g.player_resources
     g._push(ev_spent)
     champ_map = state.get("champ_map") or {}
@@ -8422,7 +9439,7 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
             {"kind": "spell", "source_uid": int(played_card_uid),
              "ability_guids": ability_guids,
              "target_uid": target_uid, "instance_id": int(inst_id),
-             "x_cost": x_cost,
+             "x_cost": x_cost, "played_from_hand": played_from_hand,
              "activations": {
                  guid: activation.as_dict()
                  for guid, activation in activations.items()}},
@@ -8480,7 +9497,10 @@ def _pvp_play_spell(handler, session, played_card_uid, my_pid, inner_bytes,
 def _pvp_select_card_play_costs(handler, session, state, plan, source_uid,
                                 pid, selected_uids, champions):
     """Bind the client TargetMap to the card's authored cost targets."""
-    from rules_port.costs import card_cost_targets, cost_type_for_kind
+    from rules_port.costs import (
+        card_cost_targets, cost_type_for_kind,
+        validate_cost_target_selection,
+    )
 
     selected_uids = [int(uid) for uid in (selected_uids or [])]
     used = set()
@@ -8508,6 +9528,11 @@ def _pvp_select_card_play_costs(handler, session, state, plan, source_uid,
         if len(available) < minimum:
             return None
         chosen = tuple(available[:maximum])
+        chosen = validate_cost_target_selection(
+            _db, session.session_id, pid, int(source_uid), native, chosen,
+            champions=champions, battle_state=state)
+        if chosen is None:
+            return None
         used.update(chosen)
         selections.append((spec, chosen))
     return selections, used
@@ -8612,7 +9637,8 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     from the champion ability button): extract the ability GUID + chosen target,
     pay the charge/spell cost from the PvP state, push the ability onto the
     chain, and hand the caster priority (ResolveTopOfChain) so the chain
-    resolution (both-pass) resolves its BOM through _pvp_resolve_chain."""
+    resolution (both-pass) resolves its BOM through _pvp_resolve_ability_item
+    (or the shared chain seam for card/trigger items)."""
     pids = db_game_session_pids(session.session_id)
     if len(pids) < 2:
         return False
@@ -8634,6 +9660,30 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     row = db_champion_ability_costs(ability_guid)
     if row is None:
         row = db_talent_ability_costs(ability_guid)
+    graph = ability_graph(_RECORD_STORE, str(ability_guid).lower())
+    if graph is not None:
+        from rules_port.cooldowns import (champion_cooldown,
+                                          champion_cooldown_key)
+        if champion_cooldown(state, my_champ_uid, ability_guid) > 0:
+            log_req(f"    PvP champion ability {ability_guid[:8]}: cooldown active — rejected")
+            return True
+        costs = graph.costs
+        use_key = champion_cooldown_key(my_champ_uid, ability_guid)
+        uses = state.get("champion_ability_uses") or {}
+        used_game = int(uses.get(
+            use_key, uses.get(str(ability_guid).lower(), 0)) or 0)
+        if costs.uses_per_game and used_game >= int(costs.uses_per_game):
+            log_req(f"    PvP champion ability {ability_guid[:8]}: uses_per_game exhausted — rejected")
+            return True
+        if costs.uses_per_turn:
+            from rules_port.runtime_helpers import (
+                champion_ability_use_key,
+                champion_ability_uses_this_turn)
+            turn_key = champion_ability_use_key(my_champ_uid, ability_guid)
+            if champion_ability_uses_this_turn(
+                    state, turn_key) >= int(costs.uses_per_turn):
+                log_req(f"    PvP champion ability {ability_guid[:8]}: uses_per_turn exhausted — rejected")
+                return True
     cc = int(row[0] or 0) if row else 0
     sc = int(row[1] or 0) if row else 0
     spell_points = int(state.get(f"sp_{my_pid}", 0))
@@ -8712,16 +9762,78 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
         spell_uses[str(ability_guid)] = int(
             spell_uses.get(str(ability_guid), 0) or 0) + 1
         state[f"sp_uses_{my_pid}"] = spell_uses
+    if graph is not None:
+        from rules_port.cooldowns import (champion_cooldown_key,
+                                          set_champion_cooldown)
+        use_key = champion_cooldown_key(my_champ_uid, ability_guid)
+        costs = graph.costs
+        if costs.uses_per_game:
+            usage = state.setdefault("champion_ability_uses", {})
+            usage[use_key] = int(usage.get(use_key, 0) or 0) + 1
+        cooldown = int(costs.cooldown or 0)
+        if cooldown > 0:
+            set_champion_cooldown(
+                state, my_champ_uid, ability_guid, cooldown)
+        if costs.uses_per_turn:
+            from rules_port.runtime_helpers import (
+                champion_ability_use_key,
+                record_champion_ability_use_this_turn)
+            record_champion_ability_use_this_turn(
+                state, champion_ability_use_key(my_champ_uid, ability_guid))
     from rules_port import lifecycle as _be
     inst_id = port_queue_stack_item(state, {
         "kind": "ability", "ability_guid": ability_guid,
         "source_uid": my_champ_uid, "target_uid": target_uid,
     })
+    if cc > 0:
+        from rules_port.statistics import add_ability_stat
+        add_ability_stat(state, "ChargePointsSpent", cc,
+                        instance_id=inst_id)
     pvp_save_state(session, state)
     my_uid = _ge.UID.make(244, my_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     _pvp_populate_game_state(g, state, my_pid, opp_pid)
+    if graph is not None:
+        cdef = g.card_defs.get(_ge.SessionCardId(_ge.UID(my_champ_uid)))
+        if cdef is None:
+            from pvp_db import db_champion_ability_guids
+            champion_template = db_game_champion(
+                session.session_id, my_pid, conn=_db)
+            champion_abilities = db_champion_ability_guids(
+                champion_template[1]) if champion_template else []
+            cdef = _ge.CardDef(
+                "Champion", _ge.ECardTypes.Champion, 0,
+                int(state.get(f"hp_{my_pid}", 20)),
+                int(state.get(f"hp_{my_pid}", 20)), [], [
+                    _ge.ResourceId.from_str(guid)
+                    for guid in champion_abilities])
+            g.card_defs[_ge.SessionCardId(_ge.UID(my_champ_uid))] = cdef
+        from rules_port.ability_usage import remaining_uses_per_game
+        cdef.uses_per_game_counts = {
+            _ge.ResourceId.from_str(guid): int(value)
+            for guid, value in remaining_uses_per_game(
+                _db, session.session_id, my_champ_uid,
+                [str(ability) for ability in cdef.abilities], state,
+                champion=True).items()
+        }
+        prefix = f"{my_champ_uid}:"
+        cooldowns = {}
+        for key, value in (
+                state.get("champion_ability_cooldowns") or {}).items():
+            if str(key).startswith(prefix):
+                try:
+                    remaining = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if remaining > 0:
+                    cooldowns[_ge.ResourceId.from_str(
+                        str(key).split(":", 1)[1])] = remaining
+        cdef.cooldown_counts = cooldowns
+        g.push_card_updated(
+            _ge.SessionCardId(_ge.UID(my_champ_uid)), my_uid,
+            _ECardCollections.None_, _ECardTypes.Champion,
+            cooldown_counts=cooldowns)
     for sacrifice_uid in sacrifice_uids:
         handler._sacrifice_troop(
             g, session, my_uid, opp_uid, int(sacrifice_uid))
@@ -8729,19 +9841,28 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     g.push_ability_on_chain(_ge.SessionCardId(_ge.UID(my_champ_uid)),
                             _ge.ResourceId.from_str(ability_guid),
                             ability_instance_id=inst_id)
-    # CardActivatedEvent is distinct from charge-point gain.  It drives
-    # metadata-defined passives such as Lorenzo's "when you use a charge
-    # power, copy that ability" and carries the original activation so the
-    # CopyAbility leaf can put the correct ability back on the chain.
-    state["activated_ability_guid"] = ability_guid
-    state["activated_source_uid"] = my_champ_uid
-    state["activated_target_uid"] = target_uid
-    _pvp_dispatch_triggers(
-        handler, g, session, state, my_uid, opp_uid,
-        "CardActivatedEvent", my_champ_uid, my_pid)
-    state.pop("activated_ability_guid", None)
-    state.pop("activated_source_uid", None)
-    state.pop("activated_target_uid", None)
+    # CardActivatedEvent is distinct from charge-point gain.  Its event
+    # envelope carries the activated AbilityInstance so copied powers retain
+    # their activation target and native instance identity.
+    from rules_port.triggers import dispatch_card_activated
+
+    def publish_activation(**event):
+        data = dict(event.pop("data", {}) or {})
+        return _pvp_dispatch_triggers(
+            handler, event["game"], session, state,
+            event["player_uid"], event["ai_uid"],
+            event["event_type"], event["source_card_id"],
+            source_owner_id=event["source_player_id"],
+            target_card_id=event.get("target_card_id"), **data)
+
+    dispatch_card_activated(
+        db=_db, handler=handler, game=g, session=session,
+        player_uid=my_uid, ai_uid=opp_uid, battle_state=state,
+        ability_guid=ability_guid, source_card_id=my_champ_uid,
+        source_player_id=my_pid, ability_instance_id=inst_id,
+        activation_data={"target_map": ({0: int(target_uid)}
+                                        if target_uid is not None else {})},
+        dispatcher=publish_activation)
     # Refresh HUD (charges) + hand/deck counts for both players.
     g.player_health = int(state.get(f"hp_{my_pid}", 20))
     g.ai_health = int(state.get(f"hp_{opp_pid}", 20))
@@ -8788,7 +9909,8 @@ def _pvp_activate_champion_ability(handler, session, inner_bytes, my_pid):
     return True
 
 
-def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
+def _pvp_declare_attackers(handler, session, inner_bytes, my_pid,
+                           declarations=None):
     """Record the turn player's declared attackers and push the combat
     listing to both players."""
     pids = db_game_session_pids(session.session_id)
@@ -8799,7 +9921,14 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
     if state.get("turn_pid") != my_pid:
         return False
     attacker_uids = []
-    if isinstance(inner_bytes, bytes):
+    if declarations is not None:
+        for _defender, declared in declarations:
+            for attacker in declared or ():
+                try:
+                    attacker_uids.append(int(attacker))
+                except (TypeError, ValueError):
+                    continue
+    elif isinstance(inner_bytes, bytes):
         for m_du in re.finditer(rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});',
                                 inner_bytes):
             try:
@@ -8809,34 +9938,34 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
                     attacker_uids.append(int(uid64))
             except Exception:
                 continue
-    # Treat the transaction as untrusted input.  The client normally only
-    # includes cards marked with ECardUsage.Attack, but a stale/forged
-    # transaction must not turn Constants, Artifacts, or summoning-sick cards
-    # into attackers.  This also keeps the server rule identical to the list
-    # offered by pvp_push_attack_options above.
-    wz_rows = [
-        (uid, card_state, attrs)
-        for uid, card_state, _card_type, attrs in
-        db_warzone_attack_option_rows(
-            session.session_id, my_pid, conn=_db)
-    ]
-    from rules_port.static_rules import effective_attributes
-    wz = set()
-    for uid, cstate, attrs in wz_rows:
-        cstate = int(cstate or 0)
-        attrs = int(attrs or 0) | int(effective_attributes(
-            _db, session.session_id, state, int(uid)) or 0)
-        if ((cstate & (_ge.ECardStates.Tapped |
-                       _ge.ECardStates.Attacking)) or
-                attrs & (_ge.ECardAttributes.CantAttack |
-                         _ge.ECardAttributes.Defensive) or
-                not ((cstate & _ge.ECardStates.StartedATurnOnYourSide) or
-                     attrs & _ge.ECardAttributes.Speed)):
-            continue
-        wz.add(int(uid))
-    attacker_uids = [u for u in attacker_uids if u in wz]
+    if declarations is None:
+        # Legacy ingress has not crossed RulesPort validation, so still treat
+        # the raw transaction as untrusted and enforce the authored combat
+        # eligibility checks here.
+        wz_rows = [
+            (uid, card_state, attrs)
+            for uid, card_state, _card_type, attrs in
+            db_warzone_attack_option_rows(
+                session.session_id, my_pid, conn=_db)
+        ]
+        from rules_port.static_rules import effective_attributes
+        wz = set()
+        for uid, cstate, attrs in wz_rows:
+            cstate = int(cstate or 0)
+            attrs = int(attrs or 0) | int(effective_attributes(
+                _db, session.session_id, state, int(uid)) or 0)
+            if ((cstate & (_ge.ECardStates.Tapped |
+                           _ge.ECardStates.Attacking)) or
+                    attrs & (_ge.ECardAttributes.CantAttack |
+                             _ge.ECardAttributes.Defensive) or
+                    not ((cstate & _ge.ECardStates.StartedATurnOnYourSide) or
+                         attrs & _ge.ECardAttributes.Speed)):
+                continue
+            wz.add(int(uid))
+        attacker_uids = [u for u in attacker_uids if u in wz]
     champ_map = state.get("champ_map") or {}
     my_champ = int(champ_map.get(str(my_pid), 0))
+    opp_champ = int(champ_map.get(str(opp_pid), 0))
     # MERGE the manually-committed attackers with what's ALREADY declared in
     # state — which includes auto-declared ForceAttack troops (Savage Raider
     # "must attack") that the server pushed at DeclareAttack.  Without this
@@ -8847,7 +9976,7 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
                 for k, v in (state.get("attackers") or {}).items()}
     merged = dict(existing)
     for u in attacker_uids:
-        merged[u] = my_champ
+        merged[u] = opp_champ
     attackers = list(merged.keys())
     state["attackers"] = {str(u): str(v) for u, v in merged.items()}
     pvp_save_state(session, state)
@@ -8871,7 +10000,7 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
         cid = _ge.CombatId(my_uid, i + 1)
         scid = _ge.SessionCardId(_ge.UID(u))
         g.push_attack_declared(cid, my_uid,
-                               _ge.SessionCardId(_ge.UID(my_champ)) if my_champ
+                               _ge.SessionCardId(_ge.UID(opp_champ)) if opp_champ
                                else _ge.SessionCardId(opp_uid), scid)
         trow = db_card_template_attrs_joined(session.session_id, int(u))
         tpl_guid = trow[0] if trow else None
@@ -8940,7 +10069,8 @@ def _pvp_declare_attackers(handler, session, inner_bytes, my_pid):
     # DeclareDefense (14) and hand the DEFENDER priority + blocker options so
     # they can set up blockers.  The responder (attacker) gets a QuickAction
     # window at 13; the defender acts at 14.
-    pvp_advance_to_declare_defense(session, state)
+    if declarations is None:
+        pvp_advance_to_declare_defense(session, state)
     return True
 
 
@@ -9017,7 +10147,8 @@ def pvp_push_empty_blockers(session, state):
         return
     my_uid = _ge.UID.make(244, turn_pid)
     opp_uid = _ge.UID.make(244, opp_pid)
-    my_champ = int((state.get("champ_map") or {}).get(str(turn_pid), 0))
+    # Empty blocker events still name the champion being defended.
+    opp_champ = int((state.get("champ_map") or {}).get(str(opp_pid), 0))
     g = _ge.Game(int(session.session_id), my_uid, opp_uid)
     g.player_health = int(state.get(f"hp_{turn_pid}", 20))
     g.ai_health = int(state.get(f"hp_{opp_pid}", 20))
@@ -9025,7 +10156,7 @@ def pvp_push_empty_blockers(session, state):
         cid = _ge.CombatId(my_uid, i + 1)
         g.push_blockers_assigned(
             cid, _ge.SessionCardId(_ge.UID(int(u))),
-            _ge.SessionCardId(_ge.UID(my_champ)) if my_champ
+            _ge.SessionCardId(_ge.UID(opp_champ)) if opp_champ
             else _ge.SessionCardId(opp_uid), [])
     _pvp_send_same_events(session, g, my_uid, opp_uid)
     log_req(f"    PvP empty blockers assigned for "
@@ -9102,7 +10233,8 @@ def pvp_phase_after_blockers(session, state):
         pvp_combat_has_swiftstrike(session, state))
 
 
-def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
+def _pvp_declare_blockers(handler, session, inner_bytes, my_pid,
+                          declarations=None):
     """Record the defender's declared blockers and push BlockersAssigned to
     both players."""
     pids = db_game_session_pids(session.session_id)
@@ -9116,7 +10248,21 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
     my_wz = set(r[0] for r in db_card_uids_in_zone(
         session.session_id, my_pid, "warzone", conn=_db))
     all_uids = []
-    if isinstance(inner_bytes, bytes):
+    blockers_map = {}
+    if declarations is not None:
+        for attacker, blockers in declarations:
+            try:
+                attacker_uid = int(getattr(attacker, "uid64", attacker))
+            except (TypeError, ValueError):
+                continue
+            parsed = []
+            for blocker in blockers or ():
+                try:
+                    parsed.append(int(getattr(blocker, "uid64", blocker)))
+                except (TypeError, ValueError):
+                    continue
+            blockers_map[attacker_uid] = parsed
+    elif isinstance(inner_bytes, bytes):
         for m_du in re.finditer(rb'm_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});',
                                 inner_bytes):
             try:
@@ -9126,17 +10272,17 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
                     all_uids.append(int(uid64))
             except Exception:
                 continue
-    blockers_map = {}
-    cur = None
-    for u in all_uids:
-        if u in attackers:
-            cur = u
-            blockers_map.setdefault(cur, [])
-        elif cur is not None and u in my_wz:
-            from rules_port.combat_rules import can_block
-            if can_block(_db, session.session_id, _pvp_fra_view(state, opp_pid, my_pid),
-                         cur, u):
-                blockers_map[cur].append(u)
+    if declarations is None:
+        cur = None
+        for u in all_uids:
+            if u in attackers:
+                cur = u
+                blockers_map.setdefault(cur, [])
+            elif cur is not None and u in my_wz:
+                from rules_port.combat_rules import can_block
+                if can_block(_db, session.session_id, _pvp_fra_view(state, opp_pid, my_pid),
+                             cur, u):
+                    blockers_map[cur].append(u)
     state["blockers"] = {str(k): [str(b) for b in v]
                          for k, v in blockers_map.items()}
     # Mark each blocker Blocking in the DB so reconnect / HasBlocked logic and
@@ -9183,7 +10329,8 @@ def _pvp_declare_blockers(handler, session, inner_bytes, my_pid):
     # StrikeDamage (16) -> ... -> AssignDamage (18) -> SecondMain (19).
     # (Without this the game sat on DeclareDefense forever once the defender
     # declared — even declaring NO blockers.)
-    _pvp_advance_past_declare_defense(session, state)
+    if declarations is None:
+        _pvp_advance_past_declare_defense(session, state)
     return True
 
 
@@ -9293,9 +10440,19 @@ def _pvp_resolve_combat(session, state, first_strike=False):
     # needs them; only the final (non-first-strike) resolution clears them.
     state[f"hp_{attacker_pid}"] = int(view.get("player_health", 20))
     state[f"hp_{defender_pid}"] = int(view.get("ai_health", 20))
+    # The Swiftstrike step can drop a troop from the combat (a blocker killed
+    # there and returned to play by a Deathcry, or bounced).  Persist the same
+    # pruned declaration plus the sticky "blocked" fact so the normal step sees
+    # the C# combat state instead of the pre-combat declaration.
+    if first_strike:
+        state["attackers"] = dict(view.get("player_attackers") or {})
+        state["blockers"] = dict(view.get("ai_blockers") or {})
+        if view.get("blocked_attackers"):
+            state["blocked_attackers"] = dict(view["blocked_attackers"])
     if not first_strike:
         state.pop("attackers", None)
         state.pop("blockers", None)
+        state.pop("blocked_attackers", None)
         state.pop("damage_order", None)
     pvp_save_state(session, state)
     log_req(f"    PvP combat resolved: {attacker_pid} hp "

@@ -4,7 +4,9 @@ import os
 import sys
 import asyncio
 import json
+from typing import Any
 from types import SimpleNamespace
+from collections.abc import Mapping
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -131,10 +133,12 @@ class AbilityStub:
         self.instance_id = instance_id
 
 
-class PersistedSessionStub:
+class PersistedSessionStub(SimpleNamespace):
+    turn_order: dict[str, Any]
+    persisted: int
+
     def __init__(self):
-        self.turn_order = {"legacy_phase_idx": 4}
-        self.persisted = 0
+        super().__init__(turn_order={"legacy_phase_idx": 4}, persisted=0)
 
     def _persist(self, conn=None):
         self.persisted += 1
@@ -265,10 +269,13 @@ def test_native_ai_attacker_declaration_is_idempotent_after_phase_entry():
     port = SimpleNamespace(
         combat_manager=SimpleNamespace(combats=[object(), object()]))
     session = SimpleNamespace(_rules_port_session=port)
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    handler = SimpleNamespace(_player_champ_scid=game_engine.SessionCardId(pl_t))
+    game = game_engine.Game(1, pl_t, ai_t)
 
     result = ai.ai_declare_attackers(
-        SimpleNamespace(), SimpleNamespace(), session,
-        "ai", "player", state)
+        handler, game, session, ai_t, pl_t, state)
 
     assert result is state
     assert state["ai_attackers"] == declarations
@@ -451,29 +458,30 @@ def test_pass_priority_accepts_equivalent_raw_wire_priority_identity():
     assert window.priority_player_id is None
 
 
-def test_checkpoint_phase_refresh_precedes_transaction_normalization():
-    """A pass must normalize against the phase it will be validated on.
+def test_checkpoint_phase_refresh_preserves_native_combat_window():
+    """A stale compatibility cursor must not rewind native combat progress.
 
-    Practice keeps two phase representations: the native port's
-    ``current_turn_phase`` and the compatibility checkpoint's ``phase_idx``.
-    When the AI driver advances one without the other, a client pass for the
-    checkpoint phase was normalized against the native phase and rejected as a
-    phase mismatch (the live symptom logged ``requirements=phase/player/handler``
-    while both requirements passed on re-inspection).
+    FRA can declare AI attackers and enter their trigger response while the
+    older ``phase_idx`` still names DeclareCombatPriorityWindow. Rewinding the
+    scheduler to that cursor makes its next pass skip DeclareDefense, even
+    though the native attack window and combat objects are already live.
     """
     player = game_engine.UID.make(244, 91)
     ai = game_engine.UID.make(3, 1000)
     phases = ["FirstMainPhase", "DeclareCombatPriorityWindow", "DeclareAttack"]
     game_session = SimpleNamespace(
         _rules_port_battle_state={"turn_phases": phases, "phase_idx": 1,
-                                  "turn_player": "ai"})
+                                  "turn_player": "ai",
+                                  "rules_port": {
+                                      "phase": "DeclareAttackPriorityWindow"}})
     session = AuthoritativeSession(
         190, (ai, player), seed_z=1, seed_w=2,
         snapshot=SimpleNamespace(game_session=game_session))
     session.runtime_facts = SimpleNamespace(battle_state={})
-    # Native port advanced to DeclareAttack; the compatibility checkpoint (and
-    # the client) are still at DeclareCombatPriorityWindow.
+    # Native port advanced beyond combat declaration; the compatibility
+    # checkpoint still points at DeclareCombatPriorityWindow.
     session.current_turn_phase = game_engine.ETurnPhases.DeclareAttack
+    session.has_legal_blockers = True
     session.active_player_id = ai
     window = PriorityWindowAction(TurnPhasePlayers.ALL)
     session.push_game_action(window)
@@ -485,7 +493,9 @@ def test_checkpoint_phase_refresh_precedes_transaction_normalization():
     assert submit_classified_transaction(session, command, player)
     from rules_port.phases import phase_name
     assert phase_name(session.current_turn_phase) == (
-        "DeclareCombatPriorityWindow")
+        "DeclareAttackPriorityWindow")
+    assert session.phase_states["DeclareAttackPriorityWindow"].get_next_turn_phase(
+        session) == "DeclareDefense"
 
 
 def test_choose_draw_first_reorders_players_like_client_transaction():
@@ -535,6 +545,7 @@ def test_native_combat_descriptors_rehydrate_after_reconnect():
     session.runtime_facts = SimpleNamespace(
         get_card=lambda uid: {1001: attacker, 1002: blocker}.get(int(uid)))
     combat = session.declare_attack(player, defender, attacker)
+    assert combat is not None
     combat.declare_blockers((blocker,))
     saved = session.snapshot()
     restored = AuthoritativeSession(56, (player,), seed_z=8, seed_w=9)
@@ -554,7 +565,9 @@ def test_ported_ability_instance_preserves_metadata_effect_order_and_identity():
     ability = AbilityFactory(90).create(metadata, activating_player_id=7)
     assert ability.instance_id == 90
     assert ability.source_uid == 123
-    assert [item["effect_group_id"] for item in ability.ordered_effects] == [0, 1]
+    assert [(item["effect_group_id"] if isinstance(item, Mapping)
+             else item.effect_group_id)
+            for item in ability.ordered_effects] == [0, 1]
     assert ability.continuation()["ability_instance_id"] == 90
 
 
@@ -835,6 +848,42 @@ def test_chain_resolution_keeps_first_main_phase():
     assert isinstance(top, PriorityWindowAction)
     assert top.ability_responding_to is None
     assert top.priority_player_id == player
+
+
+def test_resolved_item_below_trigger_is_detached_from_chain():
+    """A resolved item must not stay as a ghost below a trigger it queued.
+
+    C# defers triggers discovered during resolution behind a
+    ``PushOntoChainAction``, so the resolved item is still the chain top when
+    it is removed.  This port pushes the new trigger immediately; a top-only
+    pop then leaves the resolved item on the chain forever, keeping the chain
+    non-empty and stranding the new trigger's response window.
+    """
+    player = game_engine.UID.make(244, 31)
+    ai = game_engine.UID.make(3, 1000)
+    session = AuthoritativeSession(71, (player, ai), seed_z=1, seed_w=2)
+    session.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+
+    def resolver(item):
+        if int(item.instance_id) == 10:
+            session.queue_projected_chain(
+                {"kind": "trigger",
+                 "ability_guid": "00000000-0000-0000-0000-0000000000aa",
+                 "source_uid": 902, "target_uid": 903, "instance_id": 11},
+                0, first_player_id=ai)
+        return AbilityResolutionState.COMPLETED
+
+    session.set_ability_resolver(resolver)
+    session.queue_projected_chain(
+        {"kind": "troop", "source_uid": 901, "instance_id": 10},
+        player, first_player_id=player)
+    assert isinstance(session.action_stack.peek(), PriorityWindowAction)
+    assert session.pass_player_priority(player)
+    session.drive_until_input()
+    assert session.chain._instance_ids == [11]
+    top = session.action_stack.peek()
+    assert isinstance(top, PriorityWindowAction)
+    assert int(top.ability_responding_to.instance_id) == 11
 
 
 def test_generic_projected_card_chain_is_owned_by_native_action_stack():
@@ -1529,11 +1578,11 @@ def test_ai_events_use_native_trigger_backend_when_port_is_attached():
         _rules_port_session = object()
 
     old = ai._dispatch_triggers
+    import rules_port.triggers as port_triggers
+    native = port_triggers.dispatch_native_trigger
     try:
         # Exercise the actual helper's branch while replacing only its
         # transport-independent native dispatcher.
-        import rules_port.triggers as port_triggers
-        native = port_triggers.dispatch_native_trigger
         port_triggers.dispatch_native_trigger = lambda **kwargs: calls.append(kwargs) or "native"
         result = old(None, object(), object(), Session(), "p", "a", {},
                      "CardDrawnEvent", 12, source_owner_uid=0,
@@ -1815,7 +1864,8 @@ def test_metadata_filters_cover_attributes_cost_keywords_and_flags():
                             InCollection, IsQuick, IsResource, IsToken)
     card = {"collection": 4, "attributes": 8, "casting_cost": 3,
             "abilities": ("Swiftstrike",), "is_token": True,
-            "is_resource": True, "quick_action": True}
+            "is_resource": True, "is_basic_resource": True,
+            "quick_action": True}
     assert InCollection(4).matches(card)
     assert HasAnyAttributeFlags(8).matches(card)
     assert HasCastingCost(3).matches(card)
@@ -1870,9 +1920,55 @@ def test_type_and_print_variant_filters_use_runtime_flags():
 
 def test_socket_filters_use_socket_counts_and_comparison_metadata():
     from rules_port import IsSocketable, IsSocketed
+    from rules_port.filters import _gem_minor_types, _gem_rows
     card = {"socket_count": 2, "socketed_count": 1}
     assert IsSocketable(2).matches(card)
-    assert IsSocketed().matches(card)
+    assert IsSocketed(socketed_value=1,
+                      comparison="GreaterThanOrEqual").matches(card)
+
+    packed = (1 << 10) | 3
+    assert IsSocketed(socketed_value=2, comparison="Equals").matches(
+        {"gems": packed})
+    assert IsSocketed(compare_to_ability_source=True).matches(
+        {"gems": 1}, source={"gems": 3})
+    minor = sorted(_gem_minor_types())
+    assert minor, "gem seed missing"
+    major = next(int(row[0]) for row in _gem_rows()
+                 if int(row[0]) not in set(minor))
+    assert IsSocketed(socketed_value=1, must_be_minor=True).matches(
+        {"gems": minor[0]})
+    assert not IsSocketed(socketed_value=1, must_be_minor=True).matches(
+        {"gems": major})
+
+
+def test_generated_socketable_cards_use_empty_socket_format():
+    """Generated socketable cards must retain the client's empty-socket bit."""
+    import db
+    import pvp_db
+
+    row = db._db.execute(
+        "SELECT guid FROM card_templates "
+        "WHERE socket_count > 0 AND card_type LIKE '%Troop%' "
+        "ORDER BY guid LIMIT 1").fetchone()
+    assert row, "socketable troop metadata missing"
+    template_guid = row[0]
+    payload = pvp_db.db_copy_template_payload(template_guid, conn=db._db)
+    assert payload
+    session_id = 987654399
+    card_uid = 987654399
+    db._db.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, card_uid, template_guid, "choosing", payload[0],
+            payload[1], payload[2], session_id, conn=db._db)
+        db._db.commit()
+        gems = db._db.execute(
+            "SELECT gems FROM game_cards WHERE session_id=? AND card_uid=?",
+            (session_id, card_uid)).fetchone()[0]
+        assert gems == pvp_db.EMPTY_SOCKET_GEMS, gems
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+        db._db.commit()
 
 
 def test_tag_subtype_and_threshold_filters_match_client_metadata():
@@ -1930,7 +2026,7 @@ def test_target_factory_builds_filter_backed_target_from_normalized_metadata():
     from rules_port import target_from_metadata
     adapter = target_from_metadata(
         {"filter": {"type": "IsArtifact"}},
-        lambda: ({"card_type": 4}, {"card_type": 2}))
+        lambda: ({"card_type": 32}, {"card_type": 2}))
     assert len(adapter.candidates()) == 1
 
 
@@ -2054,6 +2150,29 @@ def test_wire_continuation_marker_outranks_fresh_activation():
     assert tx.requirements == ()
 
 
+def test_wire_class23_picker_answer_resumes_its_host_prompt():
+    """A class-23 deck/revealed-card picker answer must resume, not activate.
+
+    Oakhenge's revealed-card picker is a class-23 activation-data request whose
+    answer arrives as a SetAbilityActivationDataTransaction.  The host marks
+    that payload while its deck-search checkpoint is pending, so the
+    normalizer must produce the continuation intent instead of validating a
+    fresh activation of the picker's child ability (an instance the port does
+    not own) and dropping it.
+    """
+    player = game_engine.UID.make(244, 1)
+    command = SimpleNamespace(is_set_ability_data=True,
+                              is_ability_activate=False,
+                              pass_turn_phase=None,
+                              inner_bytes=b"SetAbilityActivationDataTransaction")
+    data = {"target_map": {"0": [903]}}
+    tx = normalize_player_transaction(
+        command, player,
+        payload={"_triggered_continuation": True, "activation_data": data})
+    assert tx.kind == "resolve_triggered_continuation"
+    assert tx.payload["activation_data"] == data
+
+
 def test_wire_normalizer_maps_play_card_transactions_from_typed_payload():
     player = game_engine.UID.make(244, 1)
     command = SimpleNamespace(is_play_troop=True, is_play_resource=False,
@@ -2094,11 +2213,13 @@ def test_common_client_filter_primitives_are_metadata_constructible():
 def test_combat_and_source_filter_primitives_use_runtime_relationships():
     from rules_port.filters import filter_from_metadata
     source = {"session_card_id": 1, "card_type": 2}
-    card = {"session_card_id": 2, "card_type": 2,
-            "is_blocking": True, "is_blocked": True}
+    card = {"session_card_id": 2, "card_type": 2}
+    session = {"ai_blockers": {1: (2,)}}
     assert filter_from_metadata({"type": "OtherTroops"}).matches(card, source=source)
-    assert filter_from_metadata({"type": "BlockingFilter"}).matches(card)
-    assert filter_from_metadata({"type": "BeingBlockedByFilter"}).matches(card)
+    assert filter_from_metadata({"type": "BlockingFilter"}).matches(
+        card, session=session)
+    assert filter_from_metadata({"type": "BeingBlockedByFilter"}).matches(
+        source, session=session)
     assert filter_from_metadata({"type": "IsAbilitySource"}).matches(source, source=source)
 
 
@@ -2115,9 +2236,10 @@ def test_compare_attack_and_defense_filter_matches_client_direction_flags():
 
 def test_runtime_flag_filters_cover_pve_transformed_equipped_and_stored_cards():
     from rules_port.filters import filter_from_metadata
-    card = {"is_pve": True, "is_transformed": True,
+    card = {"card_type": 1, "is_pve": True, "is_transformed": True,
             "is_equipped": True, "is_stored": True, "is_mercenary": True,
-            "color_flags": 4, "is_prismatic": True}
+            "color_flags": 4, "is_prismatic": True,
+            "thresholds": ({"color": "ruby"}, {"color": "diamond"})}
     for kind in ("IsPvECard", "IsTranformed", "IsEquippedCardFilter",
                  "IsStoredCardFilter", "IsMercenaryFilter"):
         assert filter_from_metadata({"type": kind}).matches(card)
@@ -2130,43 +2252,51 @@ def test_runtime_flag_filters_cover_pve_transformed_equipped_and_stored_cards():
 
 def test_attack_extrema_filters_use_explicit_runtime_card_collection():
     from rules_port.filters import filter_from_metadata
-    session = type("S", (), {"cards": ({"attack": 2}, {"attack": 5})})()
+    session = type("S", (), {"cards": (
+        {"collection": 8, "attack": 2},
+        {"collection": 8, "attack": 5})})()
     low = filter_from_metadata({"type": "CompareAttackToLowestFilter",
-                                "comparison": "Equals"})
+                                "comparison": "Equals", "collection": 8})
     high = filter_from_metadata({"type": "CompareAttackToHighestFilter",
-                                 "comparison": "Equals"})
-    assert low.matches({"attack": 2}, session=session)
-    assert high.matches({"attack": 5}, session=session)
+                                 "comparison": "Equals", "collection": 8})
+    assert low.matches({"collection": 8, "attack": 2}, session=session)
+    assert high.matches({"collection": 8, "attack": 5}, session=session)
 
 
 def test_defense_and_champion_health_extrema_filters():
     from rules_port.filters import filter_from_metadata
     session = type("S", (), {"cards": (
-        {"card_type": 1, "health": 8, "defense": 8},
-        {"card_type": 1, "health": 12, "defense": 12},
+        {"card_type": 1, "location": "warzone", "health": 8, "defense": 8},
+        {"card_type": 1, "location": "warzone", "health": 12, "defense": 12},
     )})()
     assert filter_from_metadata({"type": "CompareDefenseToLowestFilter"}).matches(
-        {"defense": 8}, session=session)
-    assert filter_from_metadata({"type": "CompareHealthToHighestFilter"}).matches(
+        {"card_type": 1, "location": "warzone", "defense": 8}, session=session)
+    assert filter_from_metadata({"type": "CompareHealthToHighestFilter",
+                                 "comparison": "Equals"}).matches(
         {"card_type": 1, "health": 12}, session=session)
 
 
 def test_resource_cost_highest_filter_uses_runtime_candidates():
     from rules_port.filters import filter_from_metadata
-    session = type("S", (), {"cards": ({"resource_cost": 1}, {"resource_cost": 4})})()
-    filt = filter_from_metadata({"type": "CompareResourceCostToHighestFilter"})
-    assert filt.matches({"resource_cost": 4}, session=session)
+    session = type("S", (), {"cards": (
+        {"collection": 8, "resource_cost": 1},
+        {"collection": 8, "resource_cost": 4})})()
+    filt = filter_from_metadata({"type": "CompareResourceCostToHighestFilter",
+                                 "collection": 8, "comparison": "Equals"})
+    assert filt.matches({"collection": 8, "resource_cost": 4}, session=session)
 
 
 def test_resource_cost_my_highest_filter_scopes_to_source_owner():
     from rules_port.filters import filter_from_metadata
     source = {"owner_id": 1}
     session = type("S", (), {"cards": (
-        {"owner_id": 1, "resource_cost": 3},
-        {"owner_id": 2, "resource_cost": 9},
+        {"owner_id": 1, "location": "warzone", "resource_cost": 3},
+        {"owner_id": 2, "location": "warzone", "resource_cost": 9},
     )})()
-    filt = filter_from_metadata({"type": "CompareResourceCostToMyHighestFilter"})
-    assert filt.matches({"owner_id": 1, "resource_cost": 3},
+    filt = filter_from_metadata({"type": "CompareResourceCostToMyHighestFilter",
+                                 "comparison": "Equals"})
+    assert filt.matches({"owner_id": 1, "location": "warzone",
+                         "resource_cost": 3},
                         session=session, source=source)
 
 
@@ -2179,7 +2309,8 @@ def test_source_relative_filters_compare_runtime_card_metadata():
     assert filter_from_metadata({"type": "HasSourceTypeFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasSourceResourceCost",
                                 "comparison": "LessThan"}).matches(card, source=source)
-    assert filter_from_metadata({"type": "HasSourceCastingCostFilter"}).matches(card, source=source)
+    assert filter_from_metadata({"type": "HasSourceCastingCostFilter",
+                                 "comparison": "Equals"}).matches(card, source=source)
 
 
 def test_shared_source_filters_and_owner_filter():
@@ -2210,8 +2341,9 @@ def test_source_relationship_and_damage_filters():
 
 def test_shared_shard_and_champion_metadata_filters():
     from rules_port.filters import filter_from_metadata
-    source = {"shards": 3, "classes": ("Warrior",), "subtypes": ("Elf",)}
-    card = {"shards": 1, "classes": ("Warrior",), "subtypes": ("Elf",)}
+    source = {"shards": 4, "classes": ("Warrior",), "subtypes": ("Elf",)}
+    card = {"shards": 4, "classes": ("Warrior",),
+            "subtypes": ("Elf", "Warrior")}
     assert filter_from_metadata({"type": "HasASharedShardWithSourceFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasASharedClassWithSourceChampionFilter"}).matches(card, source=source)
     assert filter_from_metadata({"type": "HasASharedSubtypeWithSourceChampionFilter"}).matches(card, source=source)
@@ -2232,8 +2364,8 @@ def test_casting_cost_source_counter_filter_uses_named_counter():
     filt = filter_from_metadata({"type": "CompareCastingCostToSourceCountersFilter",
                                  "comparison": "Equals", "counter_type": "charge"})
     source = {"counters": {"charge": 3}}
-    assert filt.matches({"casting_cost": 3}, source=source)
-    assert not filt.matches({"casting_cost": 2}, source=source)
+    assert filt.matches({"resource_cost": 3}, source=source)
+    assert not filt.matches({"resource_cost": 2}, source=source)
 
 
 def test_has_counters_value_compares_card_counter_amount():
@@ -2249,7 +2381,8 @@ def test_attribute_and_set_filters_read_nested_runtime_metadata():
     from rules_port.filters import filter_from_metadata
     card = {"stats": {"power": 4}, "name": "Alpha", "set_id": "set-a", "set_number": 7}
     assert filter_from_metadata({"type": "IntAttrFilter", "attribute": "stats>power",
-                                "value": 4}).matches(card)
+                                "value": 4,
+                                "comparison": "Equals"}).matches(card)
     assert filter_from_metadata({"type": "StringAttrFilter", "attribute": "name",
                                 "value": "Alpha"}).matches(card)
     assert filter_from_metadata({"type": "SetIdFilter", "set_id": "set-a"}).matches(card)
@@ -2258,10 +2391,11 @@ def test_attribute_and_set_filters_read_nested_runtime_metadata():
 
 def test_target_top_deck_and_tac_filters_use_explicit_context():
     from rules_port.filters import filter_from_metadata
-    card = {"name": "Alpha", "is_quick_action": True}
+    card = {"name": "Alpha", "is_quick_action": True, "location": "deck",
+            "position": 0}
     effect = {"targets": {"0": ({"name": "Alpha"},)}}
     assert filter_from_metadata({"type": "MatchesTargetFilter"}).matches(card, effect=effect)
-    session = type("S", (), {"deck_top": (card,)})()
+    session = type("S", (), {"cards": (card,)})()
     assert filter_from_metadata({"type": "TopNOfDeck", "amount": 1}).matches(card, session=session)
     assert filter_from_metadata({"type": "TACFilter", "template": "IsQuick"}).matches(card)
 
@@ -2284,6 +2418,501 @@ def test_players_who_control_matching_filter_counts_controller_cards():
                                  "required_quantity": 2,
                                  "comparison": "GreaterThanOrEqual"})
     assert filt.matches(card, session=session)
+
+
+def test_pack_raptors_count_other_controlled_copies_for_their_stats():
+    """Their authored self-buff counts friendly Raptors, excluding itself."""
+    import db
+    import pvp_db
+    from rules_port.static_rules import effective_stats
+
+    session_id = 987654321
+    template_guid = "b1c80936-b1a9-4a65-8919-2f89895ec4ac"
+    abilities = pvp_db.db_card_template_ability_payload(
+        template_guid, conn=db._db)
+    cards = ((987650001, 7), (987650002, 7), (987650003, 9))
+    try:
+        for position, (uid, owner) in enumerate(cards):
+            pvp_db.db_insert_generated_card(
+                session_id, owner, uid, template_guid, "warzone", "Troop",
+                abilities, 0, uid, conn=db._db, position=position)
+        db._db.commit()
+
+        for uid, owner in cards[:2]:
+            assert effective_stats(db._db, session_id, {}, uid)[:2] == (2, 2)
+        # A single opposing copy has no other opposing Raptor to count.
+        assert effective_stats(db._db, session_id, {}, cards[2][0])[:2] == (
+            1, 1)
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_gladiator_projects_by_side_and_gladiatorboth():
+    """Card.Current*Value adds Gladiator to attack/defense by active side."""
+    import db
+    import pvp_db
+    from rules_port.static_rules import effective_stats
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654322
+    uid = 987650101
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, uid, conn=db._db,
+            permanent_buffs=json.dumps({"int_attrs": {"Gladiator": 2}}))
+        db._db.commit()
+        base = effective_stats(db._db, session_id, {}, uid)[:2]
+        assert effective_stats(
+            db._db, session_id, {"turn_player": "player"}, uid)[:2] == (
+                base[0] + 2, base[1])
+        assert effective_stats(
+            db._db, session_id, {"turn_player": "ai"}, uid)[:2] == (
+                base[0], base[1] + 2)
+        assert effective_stats(
+            db._db, session_id, {"pvp": True, "turn_pid": 5}, uid)[:2] == (
+                base[0] + 2, base[1])
+        assert effective_stats(
+            db._db, session_id, {"pvp": True, "turn_pid": 9}, uid)[:2] == (
+                base[0], base[1] + 2)
+        both = {"pvp": True, "turn_pid": 9, "champ_map": {"5": 777},
+                "champion_int_attrs": {"777": {"GladiatorBoth": 1}}}
+        assert effective_stats(db._db, session_id, both, uid)[:2] == (
+            base[0] + 2, base[1] + 2)
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_owner_can_play_for_free_and_champion_flag_zero_the_cost():
+    import db
+    import pvp_db
+    from rules_port.static_rules import effective_cost, _card_play_for_free
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654323
+    uid = 987650111
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, uid, TPL_GLADIATOR, "hand", "Troop",
+            "[]", 0, uid, conn=db._db)
+        db._db.commit()
+        base = effective_cost(db._db, session_id, {}, uid)
+        assert base > 0, base
+        assert not _card_play_for_free(db._db, session_id, {}, uid)
+        pvp_db.db_set_card_mutation_field(
+            session_id, uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"OwnerCanPlayForFree": 1}}),
+            conn=db._db)
+        state = {"turn_player": "player"}
+        assert _card_play_for_free(db._db, session_id, state, uid)
+        assert effective_cost(db._db, session_id, state, uid) == 0
+        pvp_db.db_set_card_mutation_field(
+            session_id, uid, "permanent_buffs", "{}", conn=db._db)
+        champion = {"pvp": True, "turn_pid": 5, "champ_map": {"5": 777},
+                    "champion_int_attrs": {"777": {
+                        "CanPlayCardsForFree": 1}}}
+        assert effective_cost(db._db, session_id, champion, uid) == 0
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_start_of_turn_ready_honors_cantready_intattrs():
+    import db
+    import pvp_db
+    from rules_port.lifecycle import card_ready_blocked, ready_cards_for_turn
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654324
+    uid = 987650121
+    tapped = int(game_engine.ECardStates.Tapped)
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, uid, conn=db._db, card_state=tapped)
+        db._db.commit()
+        assert not card_ready_blocked(db._db, session_id, uid)
+        ready_cards_for_turn(db._db, session_id, 5)
+        state = db._db.execute(
+            "SELECT card_state FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0]
+        assert not int(state) & tapped
+        pvp_db.db_set_card_mutation_field(
+            session_id, uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"CantReadyNormallyHidden": 1}}),
+            conn=db._db)
+        db._db.execute("UPDATE game_cards SET card_state=? WHERE card_uid=?",
+                       (tapped, uid))
+        db._db.commit()
+        assert card_ready_blocked(db._db, session_id, uid)
+        ready_cards_for_turn(db._db, session_id, 5)
+        state = db._db.execute(
+            "SELECT card_state FROM game_cards WHERE card_uid=?",
+            (uid,)).fetchone()[0]
+        assert int(state) & tapped
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_mobilize_reduces_payment_from_ready_troops():
+    import db
+    import pvp_db
+    from rules_port.static_rules import mobilize_payment
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654325
+    card_uid = 987650131
+    troops = (987650132, 987650133, 987650134)
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, card_uid, TPL_GLADIATOR, "hand", "Troop",
+            "[]", 0, card_uid, conn=db._db)
+        for uid in troops:
+            pvp_db.db_insert_generated_card(
+                session_id, 5, uid, TPL_GLADIATOR, "warzone", "Troop",
+                "[]", 0, uid, conn=db._db)
+        pvp_db.db_set_card_mutation_field(
+            session_id, card_uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"Mobilize": 2}}), conn=db._db)
+        pvp_db.db_update_card_state(
+            session_id, troops[1],
+            set_bits=game_engine.ECardStates.Tapped, conn=db._db)
+        db._db.commit()
+        assert mobilize_payment(
+            db._db, session_id, 5, card_uid, 7, [troops[0]]) == 5
+        assert mobilize_payment(
+            db._db, session_id, 5, card_uid, 7, [troops[1]]) is None
+        assert mobilize_payment(
+            db._db, session_id, 5, card_uid, 7, [troops[0], troops[1]]) is None
+        assert mobilize_payment(
+            db._db, session_id, 5, card_uid, 7, troops) is None
+        assert mobilize_payment(db._db, session_id, 5, card_uid, 3, []) == 3
+        assert mobilize_payment(
+            db._db, session_id, 5, card_uid, 3, [troops[0], troops[2]]) == 0
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_opposing_deathcries_cant_trigger_gate():
+    from rules_port.triggers import _opponents_block_deathcries
+
+    state = {"champ_map": {"5": 777, "0": 888},
+             "champion_int_attrs": {"888": {
+                 "OpposingDeathcriesCantTrigger": 1}}}
+    assert _opponents_block_deathcries(state, 5)
+    assert not _opponents_block_deathcries(state, 0)
+
+
+def test_opposing_enters_play_exhausted_flags():
+    from gamedata import DEFAULT_RECORD_STORE
+    from rules_port.static_rules import opposing_enters_play_exhausted
+    from tests.tests_combat import TPL_GLADIATOR
+
+    state = {"champ_map": {5: 777, 0: 888},
+             "champion_int_attrs": {"888": {
+                 "OpposingTroopsEnterPlayExhausted": 1}}}
+    assert opposing_enters_play_exhausted(state, 5, TPL_GLADIATOR)
+    assert not opposing_enters_play_exhausted(state, 0, TPL_GLADIATOR)
+    state["champion_int_attrs"] = {"888": {
+        "OpposingNonArdentTroopsEnterPlayExhausted": 1}}
+    assert not opposing_enters_play_exhausted(state, 5, TPL_GLADIATOR)
+    non_aria = None
+    for card in DEFAULT_RECORD_STORE.load("CardTemplate"):
+        if ("Troop" in str(card.field("m_CardType", ""))
+                and str(card.field("m_Faction", "")) != "Aria"):
+            non_aria = card.guid
+            break
+    assert non_aria and opposing_enters_play_exhausted(state, 5, non_aria)
+
+
+def test_end_of_turn_damage_heal_skips_cant_heal_at_end_of_turn():
+    import db
+    import pvp_db
+    from rules_port.lifecycle import clear_combat_damage
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654326
+    exempt_uid, healed_uid = 987650141, 987650142
+    try:
+        for uid in (exempt_uid, healed_uid):
+            pvp_db.db_insert_generated_card(
+                session_id, 5, uid, TPL_GLADIATOR, "warzone", "Troop",
+                "[]", 0, uid, conn=db._db)
+        db._db.execute(
+            "UPDATE game_cards SET card_damage=3 WHERE session_id=?",
+            (session_id,))
+        pvp_db.db_set_card_mutation_field(
+            session_id, exempt_uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"CantHealAtEndOfTurn": 1}}),
+            conn=db._db)
+        db._db.commit()
+        clear_combat_damage(db._db, session_id)
+        rows = dict(db._db.execute(
+            "SELECT card_uid, card_damage FROM game_cards WHERE session_id=?",
+            (session_id,)).fetchall())
+        assert rows[exempt_uid] == 3
+        assert rows[healed_uid] == 0
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_charge_point_cost_modifier_applies_to_the_plan():
+    import db
+    import pvp_db
+    from rules_port.costs import plan_ability_cost
+    from rules_port.static_rules import charge_point_cost_modifier
+    from tests.tests_combat import TPL_GLADIATOR
+
+    class Costs:
+        charge_points = 3
+
+    assert plan_ability_cost(
+        Costs(), None, current_resource=0, charges=2, spell_points=0,
+        health=20) is None
+    plan = plan_ability_cost(
+        Costs(), None, current_resource=0, charges=2, spell_points=0,
+        health=20, charge_modifier=-1)
+    assert plan is not None and plan.charge_points == 2
+
+    session_id = 987654327
+    source_uid = 987650151
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, source_uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, source_uid, conn=db._db)
+        pvp_db.db_set_card_mutation_field(
+            session_id, source_uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"ChargePointCostModifier": -2}}),
+            conn=db._db)
+        db._db.commit()
+        assert charge_point_cost_modifier(
+            db._db, session_id, {}, 5, source_uid) == -2
+        champion_state = {"champ_map": {5: 777},
+                          "champion_int_attrs": {"777": {
+                              "ChargePointCostModifier": -1}}}
+        assert charge_point_cost_modifier(
+            db._db, session_id, champion_state, 5, None) == -1
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_lifebound_returns_marked_discard_cards():
+    import db
+    import pvp_db
+    from types import SimpleNamespace
+    from rules_port import zone_effects
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654328
+    in_play, buried, plain = 987650161, 987650162, 987650163
+    try:
+        for uid, location in ((in_play, "warzone"), (buried, "discard"),
+                              (plain, "discard")):
+            pvp_db.db_insert_generated_card(
+                session_id, 5, uid, TPL_GLADIATOR, location, "Troop",
+                "[]", 0, uid, conn=db._db)
+        for uid in (in_play, buried):
+            pvp_db.db_set_card_mutation_field(
+                session_id, uid, "permanent_buffs",
+                json.dumps({"int_attrs": {"Lifebound": 1}}), conn=db._db)
+        db._db.commit()
+        events = []
+        context = SimpleNamespace(
+            db=db._db, session=SimpleNamespace(session_id=session_id),
+            bstate={}, _emit_trigger=lambda *args, **kwargs:
+                events.append((args, kwargs)))
+        original = zone_effects.project_card
+        zone_effects.project_card = lambda *args, **kwargs: True
+        try:
+            moved = zone_effects.lifebound(context, 5)
+        finally:
+            zone_effects.project_card = original
+        assert moved == [buried]
+        locations = dict(db._db.execute(
+            "SELECT card_uid, location FROM game_cards WHERE session_id=?",
+            (session_id,)).fetchall())
+        assert locations[buried] == "warzone"
+        assert locations[plain] == "discard"
+        assert [event[0][0] for event in events] == ["CardEnteredZoneEvent"]
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_verdict_creates_pool_tokens_and_activates_choose():
+    import db
+    import pvp_db
+    from types import SimpleNamespace
+    from unittest import mock
+    from rules_port import context as context_mod
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654329
+    source_uid, target_uid = 987650171, 987650172
+    try:
+        for uid, owner in ((source_uid, 5), (target_uid, 0)):
+            pvp_db.db_insert_generated_card(
+                session_id, owner, uid, TPL_GLADIATOR, "warzone", "Troop",
+                "[]", 0, uid, conn=db._db)
+        db._db.commit()
+        pushed = []
+        game = SimpleNamespace(
+            _push=lambda event: pushed.append(event),
+            push_card_moved=lambda *a, **k:
+                pushed.append(("moved", a[0].uid.uid64)),
+            push_card_updated=lambda *a, **k:
+                pushed.append(("updated", a[0].uid.uid64)))
+        ctx = SimpleNamespace(
+            db=db._db, session=SimpleNamespace(session_id=session_id),
+            bstate={"resolving_owner_id": 5},
+            player_uid=game_engine.UID.make(244, 5),
+            ai_uid=game_engine.UID.make(3, 1000),
+            game=game,
+            handler=SimpleNamespace(
+                _card_full_data=lambda *a, **k: (
+                    TPL_GLADIATOR, int(game_engine.ECardTypes.Troop),
+                    "T", 1, 1, 1, 0)),
+            resolved_target=lambda: target_uid,
+            target_owner=lambda uid, default=None:
+                {5: 5, 0: 0, target_uid: 0}.get(int(uid), default))
+        calls = []
+        with mock.patch("rules_port.resolution.resolve_port_ability",
+                        side_effect=lambda *a, **k: calls.append((a, k))):
+            result = context_mod.EffectContext.verdict(ctx)
+        assert "verdict" in result, result
+        assert calls, "the choose ability was not activated"
+        chosen = db._db.execute(
+            "SELECT COUNT(*) FROM game_cards WHERE session_id=? "
+            "AND owner_user_id=0 AND location='choosing'",
+            (session_id,)).fetchone()[0]
+        assert chosen == 2, chosen
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_resource_cast_activates_momentum_and_expires_at_owner_start_turn():
+    import db
+    import pvp_db
+    from types import SimpleNamespace
+    from rules_port.chain_items import dispatch_card_cast
+    from rules_port.lifecycle import clear_expired_temporary_attributes
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654330
+    troop_uid, resource_uid = 987650181, 987650182
+    resource_guid, resource_type = db._db.execute(
+        "SELECT guid, card_type FROM card_templates "
+        "WHERE card_type LIKE '%Resource%' LIMIT 1").fetchone()
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, troop_uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, troop_uid, conn=db._db)
+        pvp_db.db_set_card_mutation_field(
+            session_id, troop_uid, "permanent_buffs",
+            json.dumps({"int_attrs": {"Momentum": 1}}), conn=db._db)
+        pvp_db.db_insert_generated_card(
+            session_id, 5, resource_uid, resource_guid, "CastSpells",
+            resource_type, "[]", 0, resource_uid, conn=db._db)
+        db._db.commit()
+        pushed = []
+        host = SimpleNamespace(
+            _dispatch_game_trigger=lambda *a, **k: None,
+            _card_full_data=lambda game, scid, tpl=None:
+                (tpl, 1, "T", 1, 2, 2, 0))
+        game = SimpleNamespace(push_card_updated=lambda *a, **k: pushed.append(a))
+        state = {"champ_map": {"5": 777}}
+        session = SimpleNamespace(session_id=session_id)
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        granted = dispatch_card_cast(
+            host, session, game, state, pl_t, ai_t, resource_uid, 5)
+        assert granted == [troop_uid], granted
+        buffs = json.loads(db._db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (troop_uid,)).fetchone()[0])
+        assert (buffs["atk"], buffs["def"]) == (1, 1), buffs
+        assert state["temporary_card_stats"][0]["duration"] == \
+            "BeginningOfOwnersTurn"
+        clear_expired_temporary_attributes(
+            db._db, session_id, 5, "start_turn", battle_state=state)
+        buffs = json.loads(db._db.execute(
+            "SELECT permanent_buffs FROM game_cards WHERE card_uid=?",
+            (troop_uid,)).fetchone()[0])
+        assert "atk" not in buffs and "def" not in buffs, buffs
+        assert not state.get("temporary_card_stats")
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_replica_projection_carries_artifact_type_and_subtype():
+    import db
+    import pvp_db
+    from types import SimpleNamespace
+    from rules_port.replica import (apply_replica_mods, project_replica,
+                                    replica_projection)
+    from tests.tests_combat import TPL_GLADIATOR
+
+    session_id = 987654331
+    uid = 987650191
+    try:
+        pvp_db.db_insert_generated_card(
+            session_id, 5, uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, uid, conn=db._db)
+        db._db.commit()
+        pushed = []
+        context = SimpleNamespace(
+            db=db._db, session=SimpleNamespace(session_id=session_id),
+            bstate={},
+            player_uid=game_engine.UID.make(244, 5),
+            ai_uid=game_engine.UID.make(3, 1000),
+            game=SimpleNamespace(
+                push_card_updated=lambda *a, **k: pushed.append((a, k))),
+            handler=SimpleNamespace(
+                _card_full_data=lambda game, scid, tpl=None:
+                    (tpl, 1, "T", 1, 2, 2, 0)))
+        assert apply_replica_mods(context, uid, TPL_GLADIATOR)
+        card_type, subtype = replica_projection(db._db, session_id, uid)
+        assert card_type & int(game_engine.ECardTypes.Artifact), card_type
+        assert "Replica" in subtype, subtype
+        assert project_replica(context, uid)
+        _args, kwargs = pushed[-1]
+        assert kwargs["sub_type"] == subtype
+        assert int(_args[3]) & int(game_engine.ECardTypes.Artifact)
+    finally:
+        db._db.execute("DELETE FROM game_cards WHERE session_id=?",
+                       (session_id,))
+        db._db.commit()
+
+
+def test_max_hand_size_is_ten_in_pve_and_seven_in_pvp():
+    from types import SimpleNamespace
+    from hconnect_server import HCPHandler
+
+    handler = SimpleNamespace(_campaign_max_hand_size=10)
+    assert HCPHandler._max_hand_size(
+        handler, SimpleNamespace(session_name="camp_123")) == 10
+    assert HCPHandler._max_hand_size(
+        handler, SimpleNamespace(session_name="practice")) == 10
+    assert HCPHandler._max_hand_size(
+        handler, SimpleNamespace(session_name="tourney-7")) == 7
 
 
 def test_wire_bridge_submits_classified_intent_against_port_phase():
@@ -3584,7 +4213,7 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
         def fake_played_spell(*_args, **_kwargs):
             calls.append(("bom", None))
 
-        def run(bstate):
+        def run(bstate, bom_completed):
             db.execute("UPDATE game_cards SET location='CastSpells' "
                        "WHERE session_id=1 AND card_uid=?", (uid,))
             db.commit()
@@ -3592,27 +4221,33 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
             previous_db = db_module._db
             db_module._db = db
             try:
+                from rules_port.chain_items import resolve_card_item
                 with mock.patch.object(host, "_db", db), \
                         mock.patch(
                             "rules_port.resolution.resolve_port_played_spell",
                             fake_played_spell):
-                    host.HCPHandler._resolve_native_card_chain_item(
-                        handler, SessionStub(), pl_t, ai_t, bstate, dict(item),
-                        game)
+                    resolve_card_item(
+                        handler, SessionStub(), db, game, bstate, dict(item),
+                        pl_t, ai_t, bom_completed)
             finally:
                 db_module._db = previous_db
             return db.execute(
                 "SELECT location FROM game_cards WHERE session_id=1 "
                 "AND card_uid=?", (uid,)).fetchone()[0]
 
-        assert run({"completed_chain_instance_id": 4}) == "discard"
+        # The chain boundary consumes the picker-continuation marker and
+        # passes the resulting flag down; the card still leaves CastSpells. Its
+        # CardCastEvent was emitted when played, so resolution must not emit it
+        # again.
+        assert run({"completed_chain_instance_id": 4}, True) == "discard"
         assert ("bom", None) not in calls, calls
-        assert ("trigger", "CardCastEvent") in calls, calls
+        assert ("trigger", "CardCastEvent") not in calls, calls
 
         # A different chain instance still resolves its own BOM.
         calls.clear()
-        assert run({"completed_chain_instance_id": 99}) == "discard"
+        assert run({}, False) == "discard"
         assert ("bom", None) in calls, calls
+        assert ("trigger", "CardCastEvent") not in calls, calls
     finally:
         db.close()
 

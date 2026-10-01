@@ -63,12 +63,13 @@ def test_missing_events_have_client_class_ids_and_serialize():
     ]
     expected_ids = [4, 8, 11, 12, 18, 19, 21, 24, 25, 26,
                     43, 44, 45, 46, 49]
+    assert classes
     for cls, expected_id in zip(classes, expected_ids):
         ev = cls()
         ev.session_id = game_engine.UID(123)
         raw = ev.to_byte_array()
         assert int.from_bytes(raw[:4], "little", signed=True) == expected_id
-    assert len(raw) >= 12, cls.__name__
+        assert len(raw) >= 12, cls.__name__
 
 
 def test_encounter_mod_dialog_event_uses_client_class_55_wire_order():

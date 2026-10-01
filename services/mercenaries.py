@@ -222,18 +222,17 @@ def battle_mercenary(db, user_id, champion_id, item_guid):
 # ── Persistence ───────────────────────────────────────────────────────
 
 def get_flags(db, user_id):
+    """Profile flags live in the shared ``reckoning_flags`` table, which the
+    login stream sends as the one List<FlagData>."""
     return [tuple(row) for row in db.execute(
-        "SELECT name, progress, maximum, completed FROM profile_flags "
+        "SELECT name, progress, maximum, completed FROM reckoning_flags "
         "WHERE user_id=? ORDER BY name", (user_id,)).fetchall()]
 
 
 def set_flag(db, user_id, name, progress, maximum=0, completed=False):
-    db.execute(
-        "INSERT INTO profile_flags (user_id, name, progress, maximum, completed) "
-        "VALUES (?,?,?,?,?) ON CONFLICT(user_id, name) DO UPDATE SET "
-        "progress=excluded.progress, maximum=excluded.maximum, "
-        "completed=excluded.completed",
-        (user_id, name, int(progress), int(maximum), 1 if completed else 0))
+    from profile_db import db_set_reckoning_flag
+    db_set_reckoning_flag(user_id, name, progress, maximum, completed,
+                          conn=db)
 
 
 def get_parties(db, user_id):

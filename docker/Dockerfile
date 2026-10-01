@@ -37,6 +37,7 @@ COPY tests/ /hex/tests/
 # The root wildcard above includes replay_server.py; this package includes the
 # tournament scheduler used by the running services.
 COPY docker/docker_bootstrap.py /hex/docker/docker_bootstrap.py
+COPY docker/healthcheck.py /hex/docker/healthcheck.py
 COPY supervisord.conf /hex/supervisord.conf
 COPY run_hconnect.sh /hex/run_hconnect.sh
 # Records and generated starter-deck data are materialized into the writable
@@ -58,6 +59,11 @@ RUN python3 -m compileall -q /hex
 
 # Ports: 9933 = HConnect game server, 8081 = HTTP proxy.
 EXPOSE 9933 8081
+
+# Docker/ECS can replace the task when either public service stops accepting
+# connections. Supervisor still handles ordinary process exits internally.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python3", "/hex/docker/healthcheck.py"]
 
 # Supervisor entrypoint: keep all services under one process supervisor.
 COPY docker/docker_entrypoint.sh /hex/docker_entrypoint.sh

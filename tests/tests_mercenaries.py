@@ -143,9 +143,28 @@ def test_login_push_sends_flags_and_parties():
     stream.sid = "test"
     stream.send = lambda headers, body=b"": pushed.append(_unwrap(body))
     stream._push_mercenary_stream({"id": user_id})
+    # Flags travel in the one shared Reckoning flag list, not a second
+    # List<FlagData> that could replace it in the client.
+    assert len(pushed) == 1, len(pushed)
+    assert b"ChampionParty" in pushed[0] and b"FlagData" not in pushed[0]
+    stream._push_reckoning_flags_stream({"id": user_id})
     assert len(pushed) == 2, len(pushed)
-    assert b"FlagData" in pushed[0] and b"CAMP_PARTYCAP" in pushed[0]
-    assert b"ChampionParty" in pushed[1]
+    assert b"FlagData" in pushed[1] and b"CAMP_PARTYCAP" in pushed[1]
+
+
+def test_old_party_cap_flags_carry_over():
+    """Saves made before the move keep CAMP_PARTYCAP in profile_flags; the
+    schema step copies them into reckoning_flags without overwriting."""
+    import static
+    user_id = _new_user(9490)
+    db._db.execute(
+        "INSERT INTO profile_flags (user_id, name, progress, maximum, "
+        "completed) VALUES (?, 'CAMP_PARTYCAP', 2, 4, 0)", (user_id,))
+    static.ensure_schema(db._db)
+    assert mercenaries.get_flags(db._db, user_id) == [("CAMP_PARTYCAP", 2, 4, 0)]
+    mercenaries.set_flag(db._db, user_id, mercenaries.PARTY_CAP_FLAG, 4, 4)
+    static.ensure_schema(db._db)
+    assert mercenaries.get_flags(db._db, user_id) == [("CAMP_PARTYCAP", 4, 4, 0)]
 
 
 def _deck_template_bytes(name, cards=()):
@@ -273,6 +292,7 @@ if __name__ == "__main__":
     run("party JSON accepts ResourceId shapes", test_party_json_accepts_resource_id_shapes)
     run("partysave/partyload round trip", test_partysave_and_partyload_round_trip)
     run("login push sends flags and parties", test_login_push_sends_flags_and_parties)
+    run("old party cap flags carry over", test_old_party_cap_flags_carry_over)
     run("template name and storage", test_template_name_and_storage)
     run("pdecktsave returns ObjFmt template", test_pdecktsave_returns_objfmt_template_and_login_lists_it)
     run("mercenary champions are seeded", test_mercenary_champions_are_seeded)

@@ -18,7 +18,35 @@ SRC = fresh_database()
 
 import game_engine
 
-from abilities.framework.bom import _LEAFS
+class _NativeLeafs:
+    """Legacy-shaped leaf lookup backed by the native RulesPort dispatcher.
+
+    Focused leaf tests keep their historical call signature; the executor is
+    ``rules_port.effects.dispatch`` with a native ``EffectContext`` and no
+    effect instance, so compatibility leaves use their source-target path.
+    """
+
+    def __contains__(self, effect_type):
+        from rules_port.coverage import NATIVE_EFFECTS
+        return effect_type in NATIVE_EFFECTS
+
+    def __getitem__(self, effect_type):
+        def call(game, session, db, handler, pl_t, ai_t, bstate,
+                 effect_guid="", param=None, **kwargs):
+            from rules_port import effects as native_effects
+            from rules_port.context import EffectContext
+
+            if bstate is None:
+                bstate = {}
+            bstate["_rules_port_native_effect"] = True
+            context = EffectContext.from_rules_port(
+                game, session, db, handler, pl_t, ai_t, bstate,
+                effect_guid, param or "")
+            return native_effects.dispatch(effect_type, context, None)
+        return call
+
+
+_LEAFS = _NativeLeafs()
 
 
 
@@ -84,6 +112,18 @@ def new_game(db):
     game = game_engine.Game(1, pl_t, ai_t)
     bstate = {"resolving_ability": "test-ability"}
     return pl_t, ai_t, game, bstate
+
+
+def _native_dispatch(effect_type, game, session, db, handler, pl_t, ai_t,
+                     bstate, param=None):
+    """Run one leaf through the native RulesPort dispatcher."""
+    from rules_port import effects as native_effects
+    from rules_port.context import EffectContext
+
+    bstate["_rules_port_native_effect"] = True
+    context = EffectContext.from_rules_port(
+        game, session, db, handler, pl_t, ai_t, bstate, "e", param or "")
+    return native_effects.dispatch(effect_type, context, {"param": param or ""})
 
 
 def run(name, fn):
@@ -167,8 +207,9 @@ def test_block_assigns_secondary_target_and_emits_event(db):
         "resolving_secondary_target_uid": 100,
         "player_spell_target": 200,
     }
-    result = _LEAFS["BlockEffectTemplate"](
-        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
+    result = _native_dispatch(
+        "BlockEffectTemplate", game, SessionStub(), db, HandlerStub(),
+        pl_t, ai_t, bstate)
     assert result == "blocked 0xc8 with 0x64", result
     state_value, _ = state(db, 100)
     assert state_value & game_engine.ECardStates.Blocking
@@ -195,8 +236,9 @@ def test_block_assigns_pve_player_blocker(db):
         "resolving_secondary_target_uid": 100,
         "player_spell_target": 200,
     }
-    result = _LEAFS["BlockEffectTemplate"](
-        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "e", None)
+    result = _native_dispatch(
+        "BlockEffectTemplate", game, SessionStub(), db, handler,
+        pl_t, ai_t, bstate)
     assert result == "blocked 0xc8 with 0x64", result
     state_value, _ = state(db, 100)
     assert state_value & game_engine.ECardStates.Blocking
@@ -234,9 +276,12 @@ def test_store_targets_fallback(db):
     pl_t, ai_t, game, bstate = new_game(db)
     bstate["player_spell_target"] = 100
     bstate["player_mod_target"] = 100
+    bstate["resolving_source_uid"] = 100
     _LEAFS["StoreTargetsAbilityEffectTemplate"](
         game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
-    assert bstate.get("stored_targets", {}).get("test-ability") == [100]
+    # StoreInAbility is a TAC operand; without it the client stores the target
+    # on the source card, which the native leaf mirrors.
+    assert bstate.get("stored_targets_by_card", {}).get("100") == [100]
 
 
 def test_move_to_hand(db):
@@ -278,6 +323,36 @@ def test_revert_mods(db):
         "FROM game_cards WHERE card_uid=100").fetchone()
     assert row[:3] == (0, 0, 0), row
     assert '"atk": 0' in row[3] and '"def": 0' in row[3], row[3]
+
+
+def test_card_cost_replace_assigns_effective_cost(db):
+    """A CardCostModifier with ReplaceExistingValue sets the cost.
+
+    Raucous Revelry ("your cards with Rowdy in all zones become cost 1")
+    authors ``m_ReplaceExistingValue``; the stored delta must make the
+    effective cost equal the authored value, not add to it.
+    """
+    add_card(db, 100, 5)
+    db.execute("UPDATE game_cards SET card_cost_mod=2 WHERE card_uid=100")
+    db.commit()
+    pl_t, ai_t, game, bstate = new_game(db)
+    bstate["player_spell_target"] = 100
+    _native_dispatch(
+        "CardModifierAbilityEffectTemplate", game, SessionStub(), db,
+        HandlerStub(), pl_t, ai_t, bstate,
+        '{"property": "cardcost", "amount": 1, "duration": "Permanent", '
+        '"replaceexistingvalue": 1}')
+    from rules_port.static_rules import effective_cost
+    assert effective_cost(db, 1, bstate, 100) == 1, db.execute(
+        "SELECT card_cost_mod FROM game_cards WHERE card_uid=100").fetchone()
+    # A replace modifier can legitimately assign 0 ("... cost [(0)]").
+    _native_dispatch(
+        "CardModifierAbilityEffectTemplate", game, SessionStub(), db,
+        HandlerStub(), pl_t, ai_t, bstate,
+        '{"property": "cardcost", "amount": 0, "duration": "Permanent", '
+        '"replaceexistingvalue": 1}')
+    assert effective_cost(db, 1, bstate, 100) == 0, db.execute(
+        "SELECT card_cost_mod FROM game_cards WHERE card_uid=100").fetchone()
 
 
 def test_battle_damage(db):
@@ -458,6 +533,8 @@ if __name__ == "__main__":
     run("MoveCardToZone hand destination", test_move_to_hand)
     run("MoveCardToZone clears Dead on warzone entry", test_move_to_warzone_clears_dead)
     run("RevertPermanentModifications resets mods", test_revert_mods)
+    run("CardCostModifier replace assigns effective cost",
+        test_card_cost_replace_assigns_effective_cost)
     run("Battle2Cards deals damage", test_battle_damage)
     run("SacrificeCard kills target", test_sacrifice)
     run("StoreName remembers name", test_store_name)

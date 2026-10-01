@@ -8,8 +8,12 @@ malformed typed payloads from reaching a legacy fallback implicitly.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any, cast
+
+from .resources import ResourceChange
 
 
 CARD_TRANSACTION_KINDS = frozenset({
@@ -18,16 +22,62 @@ CARD_TRANSACTION_KINDS = frozenset({
 })
 
 
+def automatic_instance_ability_guids(db, session_id, card_uid,
+                                     ability_guids=()):
+    """Include automatic abilities currently granted to this card instance.
+
+    The static Records card graph does not contain runtime-granted keywords
+    such as Runic. C# ``CastSpell`` calls ``CreateAutomaticAbilities`` on the
+    live card, so the cast graph must also read the card instance's serialized
+    ability list and retain only abilities that C# classifies as automatic.
+    """
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    from pvp_db import db_card_ability_payload
+
+    result = [str(guid).lower() for guid in (ability_guids or ()) if guid]
+    seen = set(result)
+    try:
+        payload = db_card_ability_payload(
+            int(session_id), int(card_uid), conn=db)
+        values = json.loads(payload or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return result
+    if not isinstance(values, list):
+        return result
+
+    for value in values:
+        if isinstance(value, Mapping):
+            value = (value.get("guid") or value.get("m_Guid") or
+                     value.get("ability_guid"))
+        if not isinstance(value, str):
+            continue
+        guid = value.lower()
+        if not guid or guid in seen:
+            continue
+        graph = ability_graph(DEFAULT_RECORD_STORE, guid)
+        if graph is None:
+            continue
+        # Mirrors AbilityTemplate.IsAutomatic: !Manual, no trigger, and no
+        # explicit ability index.
+        if (graph.manual or graph.trigger_event_type or
+                graph.trigger_condition or int(graph.ability_index) >= 0):
+            continue
+        result.append(guid)
+        seen.add(guid)
+    return result
+
+
 @dataclass(frozen=True)
 class CardPlayTransition:
     card_uid: int
     owner_id: int
     payment: int
-    resource_change: object
+    resource_change: ResourceChange
 
 
 def apply_card_play(db, session_id, battle_state, card_uid, owner_id, payment,
-                    *, destination="CastSpells", position=None):
+                    *, destination="CastSpells", position=None,
+                    expected_location="hand"):
     """Apply the shared state part of a typed card play.
 
     Legality and effect/chain ordering are handled by RulesPort callers. This
@@ -48,7 +98,7 @@ def apply_card_play(db, session_id, battle_state, card_uid, owner_id, payment,
         battle_state, side, "currentresource", -payment)
     if not move_card_to_zone(
             db, session_id, uid, destination, owner_id=owner,
-            expected_location="hand", position=position):
+            expected_location=expected_location, position=position):
         # The resource change must not survive a failed hand transition.
         apply_resource_change(battle_state, side, "currentresource", payment)
         return None
@@ -57,7 +107,8 @@ def apply_card_play(db, session_id, battle_state, card_uid, owner_id, payment,
 
 def apply_card_play_for_player(db, session_id, battle_state, card_uid,
                                owner_id, payment, *,
-                               destination="CastSpells", position=None):
+                               destination="CastSpells", position=None,
+                               expected_location="hand"):
     """Apply payment and hand-to-chain movement for a raw PvP player ID."""
     from .resources import pay_resource_for_player
     from .zone_effects import move_card_to_zone
@@ -73,7 +124,7 @@ def apply_card_play_for_player(db, session_id, battle_state, card_uid,
     change = pay_resource_for_player(battle_state, owner, payment)
     if not move_card_to_zone(
             db, session_id, uid, destination, owner_id=owner,
-            expected_location="hand", position=position):
+            expected_location=expected_location, position=position):
         battle_state[resource_key] = old_resources
         return None
     return CardPlayTransition(uid, owner, payment, change)
@@ -133,13 +184,15 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
     def __init__(self, port, *, graph_loader, owner_id, store=None,
                  projection=None, compatibility=None,
                  resource_compatibility=None, owner_id_resolver=None,
-                 activation_compatibility=None, play_plan_loader=None) -> None:
+                 activation_compatibility=None, play_plan_loader=None,
+                 activation_event=None) -> None:
         self.port = port
         self.graph_loader = graph_loader
         self.owner_id = int(owner_id or 0)
         self.owner_id_resolver = owner_id_resolver
         self.activation_compatibility = activation_compatibility
         self.play_plan_loader = play_plan_loader
+        self.activation_event = activation_event
         self.store = store
         # ``compatibility`` remains an import-level alias for older callers;
         # new wiring uses the explicit host projection name.
@@ -157,15 +210,21 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                     kind in {"play_troop", "play_artifact", "play_spell",
                              "play_champion"}):
                 card_id = payload.get("card_id")
+                card_uid = getattr(card_id, "uid64", card_id)
+                if card_uid is None:
+                    return False
                 card = self.port.get_card(card_id)
                 if card is None:
                     return False
                 owner_id = (self.owner_id_resolver(transaction)
                             if callable(self.owner_id_resolver)
                             else self.owner_id)
+                if owner_id is None:
+                    return False
                 try:
                     plan = self.play_plan_loader(
-                        card.template_guid, int(card_id), int(owner_id))
+                        card.template_guid, int(cast(Any, card_uid)),
+                        int(cast(Any, owner_id)))
                     values = []
                     for activation in payload.get("ability_data") or ():
                         if not isinstance(activation, Mapping):
@@ -189,13 +248,12 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                         return False
                 except (TypeError, ValueError, KeyError):
                     return False
-            resolver = (self.resource_compatibility if kind == "play_resource" and
-                        self.resource_compatibility is not None else self.projection)
-            if resolver is None:
+            if (kind == "play_resource" and
+                    self.resource_compatibility is not None):
+                return bool(self.resource_compatibility(transaction))
+            if self.projection is None:
                 return False
-            return bool(resolver(transaction) if kind == "play_resource" and
-                        self.resource_compatibility is not None else
-                        resolver(kind, transaction))
+            return bool(self.projection(kind, transaction))
         if (payload.get("source_card_id") is None or
                 not payload.get("ability_template_id") or
                 payload.get("activation_data") is None):
@@ -207,8 +265,8 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         exhausted = getattr(facts, "champion_ability_uses_exhausted", None)
         if callable(exhausted) and exhausted(int(payload["source_card_id"]),
                                              graph):
-            # ONE-SHOT (m_UsesPerGame) champion powers are spent once; a
-            # replayed transaction must not resolve a second counter.
+            # Enforce authored per-game and per-turn limits before paying or
+            # queuing a champion power activation.
             return False
         if (getattr(graph, "additional_cost_targets", ()) and
                 self.activation_compatibility is not None):
@@ -218,7 +276,8 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         owner_id = self.owner_id
         if callable(self.owner_id_resolver):
             try:
-                owner_id = int(self.owner_id_resolver(transaction))
+                owner_id = int(cast(
+                    Any, self.owner_id_resolver(transaction)))
             except (TypeError, ValueError):
                 return False
         metadata = MetadataAbility.from_graph(
@@ -250,6 +309,9 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
         consume = getattr(facts, "consume_champion_ability_use", None)
         if callable(consume):
             consume(int(payload["source_card_id"]), graph)
+        consume_card = getattr(facts, "consume_card_ability_use", None)
+        if callable(consume_card):
+            consume_card(int(payload["source_card_id"]), graph)
         activation = ability.activation.as_dict()
         descriptor = {
             "kind": "ability",
@@ -267,4 +329,6 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
             priority = self.port.action_stack.priority_player_id
             if priority is not None:
                 sink.green_light(priority)
+        if callable(self.activation_event):
+            self.activation_event(ability, transaction)
         return True

@@ -1,6 +1,15 @@
 """Profile/reward output projection mixin for HConnect connections."""
 
+from typing import TYPE_CHECKING, Any
+
 from profile_db import db_get_unopened_chests
+
+if TYPE_CHECKING:
+    # HConnect still binds these legacy protocol and DB names into this
+    # module at startup. Import them for static analysis without creating a
+    # runtime dependency cycle.
+    from hconnect_server import *  # noqa: F403
+    from hconnect_server import _db
 
 
 def bind_runtime_globals(namespace):
@@ -9,6 +18,11 @@ def bind_runtime_globals(namespace):
 
 
 class ProfileStreamMixin:
+    def __getattr__(self, name: str) -> Any:
+        # The mixin is attached to HCPHandler after its runtime dependencies
+        # and protocol state have been assembled.
+        raise AttributeError(name)
+
     def _handle_chat_command(self, cmd: str, room: str, username: str) -> str:
         import commands
         return commands.handle_command(self, cmd, room, username)
@@ -72,8 +86,11 @@ class ProfileStreamMixin:
         # The client collects List<chest_bits> from the profile stream and
         # feeds them to CreateLocalTreasureCache (PlayerProfile.cs).
         self._push_chests_stream(p)
-        # Profile flags (e.g. CAMP_PARTYCAP) and mercenary parties.
+        # Saved deck templates and mercenary parties.
         self._push_mercenary_stream(p)
+        # The single List<FlagData>: Reckoning account flags, including the
+        # mercenary party cap (CAMP_PARTYCAP).
+        self._push_reckoning_flags_stream(p)
 
         now_str = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
         
@@ -398,15 +415,14 @@ class ProfileStreamMixin:
         log_req(f">>> PUSH {label} (dt=2210) dw_sz={len(dw)}")
 
     def _push_mercenary_stream(self, profile):
-        """Push List<FlagData> and List<ChampionParty> for mercenary parties."""
+        """Push saved deck templates and List<ChampionParty>.
+
+        Flags (CAMP_PARTYCAP) travel in the shared Reckoning flag stream; a
+        second List<FlagData> could replace the first in the client.
+        """
         from services import mercenaries
         if not profile:
             return
-        flags = mercenaries.get_flags(_db, profile["id"])
-        if flags:
-            self._push_profile_stream_object(
-                mercenaries.encode_flag_list(flags),
-                f"FlagData list {[f[0] + '=' + str(f[1]) for f in flags]}")
         from services import deck_templates
         templates = deck_templates.list_templates(_db, profile["id"])
         if templates:
@@ -460,6 +476,76 @@ class ProfileStreamMixin:
             "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
         }, dw)
         log_req(f">>> PUSH Chests stream (dt=2210) {len(chests)} chests, dw_sz={len(dw)}")
+
+    def _push_reckoning_flags_stream(self, profile):
+        """Include persistent account flags in PlayerProfile's login stream."""
+        if not profile:
+            return
+        from encoder import encode_profile_flag_list
+        from profile_db import db_get_reckoning_flags
+
+        flags = db_get_reckoning_flags(profile["id"], conn=_db)
+        inner = encode_profile_flag_list(flags)
+        profile_args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileStreamEventArgs",
+             "System.Byte[]", "System.Boolean"],
+            [("Data", "bytes", inner), ("done", "bool", False)])
+        dw = encode_datawrapper(
+            0, 2210, compress_gzip(profile_args), 1,
+            "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+            f"ServicePlayer.{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH Reckoning flags stream (dt=2210) "
+                f"{len(flags)} flags, dw_sz={len(dw)}")
+
+    def push_reckoning_flags_updated(self):
+        """Notify the active client after a server-awarded account flag."""
+        if not self.user_profile:
+            return
+        from profile_db import db_get_reckoning_flags
+        from objfmt_builder import ObjFmtBuilder
+
+        flags = db_get_reckoning_flags(self.user_profile["id"], conn=_db)
+        builder = ObjFmtBuilder(
+            "Game.Shared.Network.Profile.UserFlagsUpdatedEventArgs")
+        list_type = (
+            "System.Collections.Generic.List`1#"
+            "Reckoning.Profile.Messages.FlagData")
+        list_idx, list_start = builder.begin_list(
+            "UserFlags", list_type, len(flags))
+        for index, flag in enumerate(flags):
+            element_idx = builder.begin_element(
+                index, "Reckoning.Profile.Messages.FlagData", 4)
+            element_start = builder._element_starts[element_idx]
+            builder.field_str("Name", flag["name"])
+            builder.field_int("Progress", flag["progress"])
+            builder.field_int("Maximum", flag["maximum"])
+            builder.field_bool("Completed", flag["completed"])
+            builder._set_size(element_idx, element_start)
+        builder._set_size(list_idx, list_start)
+        builder.field_int("OriginClusterHash", 0)
+        builder.field_guid(
+            "RequestHandlerSessionId",
+            "00000000-0000-0000-0000-000000000000")
+        body = compress_gzip(builder.finish(3))
+        dw = encode_datawrapper(
+            0, 2201, body, 1, "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}."
+            f"ServicePlayer.{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(f">>> PUSH UserFlagsUpdated (dt=2201) "
+                f"{len(flags)} flags, dw_sz={len(dw)}")
 
     def push_cards_to_client(self):
         """Push card instances from DB to the client via CardsAdded event (2205), chunked."""
@@ -701,3 +787,41 @@ class ProfileStreamMixin:
             db_set_inventory_client_uid(
                 self.user_profile["id"], template_guid, item_id, conn=_db)
             _db.commit()
+
+    def push_currency_to_client(self, gold_delta=0, platinum_delta=0):
+        """Push an atomic profile currency delta through the generic stream."""
+        if not self.user_profile or (not gold_delta and not platinum_delta):
+            return
+        batch_bytes = encode_objfmt_response(
+            ["Game.Shared.ProfileGenericBatchUpdate",
+             "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+             "Game.Shared.Domain.inventory_bits", "System.UInt64",
+             "Game.Shared.ResourceId", "System.Guid", "System.Boolean",
+             "System.Int32", "System.DateTime", "System.String"],
+            [("Items", "coll", (
+                "System.Collections.Generic.List`1#Game.Shared.Domain.inventory_bits",
+                0, [])),
+             ("GoldDelta", "int", int(gold_delta or 0)),
+             ("PlatDelta", "int", int(platinum_delta or 0))]
+        )
+        args = encode_objfmt_response(
+            ["Game.Shared.Network.Profile.ProfileGenericUpdateEventArgs",
+             "Game.Shared.ProfileGenericMessage", "System.Byte[]"],
+            [("Message", "struct", ("Game.Shared.ProfileGenericMessage", [
+                ("Data", "bytes", batch_bytes)]))]
+        )
+        compressed = compress_gzip(args)
+        dw = encode_datawrapper(
+            0, 2211, compressed, 1,
+            "00000000-0000-0000-0000-000000000000")
+        issuer = (
+            f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer."
+            f"{self.client_uid}.{self.scnt}")
+        self.scnt += 1
+        self.send({
+            "issuer": issuer, "target": "ServiceProfile", "instance": "Shared",
+            "reqid": 0, "c": 0, "conh": 0, "sid": self.sid,
+        }, dw)
+        log_req(
+            f">>> PUSH currency delta (dt=2211) gold={int(gold_delta or 0)} "
+            f"platinum={int(platinum_delta or 0)}, dw_sz={len(dw)}")

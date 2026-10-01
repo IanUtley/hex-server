@@ -193,7 +193,8 @@ def ability_graph(store: RecordStore, ability_guid: str) -> AbilityGraph | None:
     with store._lock:
         cache = getattr(store, "_ability_graph_cache", None)
         if cache is None:
-            cache = store._ability_graph_cache = {}
+            cache = {}
+            setattr(store, "_ability_graph_cache", cache)
         if key in cache:
             return cache[key]
         graph = _build_ability_graph(store, key)
@@ -225,7 +226,12 @@ def _build_ability_graph(store: RecordStore,
         manual=ability.manual,
         optional=ability.optional,
         trigger_event_type=ability.trigger_event_type,
-        trigger_collection_flags=str(ability.field("m_TriggerCollectionFlags", "")),
+        # C# defaults an omitted collection mask to Warzone.  Serializing a
+        # null as the literal "None" made the native trigger gate treat those
+        # abilities as allowed from no collection at all, so every
+        # AsEntersPlay ability with null flags was silently skipped.
+        trigger_collection_flags=str(
+            ability.field("m_TriggerCollectionFlags", "") or "Warzone"),
         trigger_condition=ability.trigger_condition,
         ability_condition=ability.ability_condition,
         ability_free_condition=ability.ability_free_condition,

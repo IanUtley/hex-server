@@ -218,14 +218,15 @@ def enable_rules_port(game_session, game: game_engine.Game, battle_state: dict,
         if isinstance(shared, dict):
             shared["_rules_port_attached"] = True
         _align_cached_participants(game_session, game, cached)
-        if cached.event_sink.mutation_adapter is None:
-            cached.event_sink.mutation_adapter = SQLiteCardMutationAdapter(
+        event_sink = cached.event_sink
+        if event_sink is not None and event_sink.mutation_adapter is None:
+            event_sink.mutation_adapter = SQLiteCardMutationAdapter(
                 game_session.session_id, pvp_api=pvp_api)
-        elif cached.event_sink is not None:
+        elif event_sink is not None:
             # Reconnects may supply a replacement mutable checkpoint. Keep
             # the cached native facts bridge on that same object so every
             # requirement observes current resources, phases, and card state.
-            cached.event_sink.game = game
+            event_sink.game = game
         if cached.runtime_facts is not None:
             cached.runtime_facts.battle_state = (
                 shared if isinstance(shared, dict) else battle_state)

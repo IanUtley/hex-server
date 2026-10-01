@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum
-from typing import Deque, Dict, Iterable, Iterator, Optional
+from typing import Any, Deque, Dict, Iterable, Iterator, Optional, cast
 
 from .phases import phase_name
 
@@ -106,6 +106,16 @@ class GameAction:
         self.session = session
         self.instance_id = GameAction._next_instance_id
         GameAction._next_instance_id += 1
+
+    def _require_session(self) -> Any:
+        if self.session is None:
+            raise RuntimeError("GameAction has not been initialized")
+        return self.session
+
+    def _require_action_stack(self) -> "GameActionStack":
+        if self.action_stack is None:
+            raise RuntimeError("GameAction has not been initialized")
+        return self.action_stack
 
     def on_enter(self) -> None:
         pass
@@ -235,6 +245,21 @@ class Chain:
         self._instance_ids.remove(instance_id)
         return self.ability_manager.remove(instance_id)
 
+    def detach_ability(self, instance_id: int):
+        """Remove one already-resolved id from the chain, not only its top.
+
+        C# defers triggers discovered during a resolution behind a
+        ``PushOntoChainAction``, so ``RemoveFromTopOfChain`` still sees the
+        resolved item on top.  This port pushes the discovered item onto the
+        chain immediately, so the resolved id can sit below the new trigger
+        and a top-only pop would leave a ghost item that never resolves.
+        """
+        instance_id = int(instance_id)
+        if instance_id not in self._instance_ids:
+            return None
+        self._instance_ids.remove(instance_id)
+        return self.ability_manager.get(instance_id)
+
 
 class GameActionStack:
     """LIFO action scheduler matching ``GameActionStack.Update`` ordering."""
@@ -243,7 +268,7 @@ class GameActionStack:
         self.session = session
         self._stack: list[GameAction] = []
         self.current_action: Optional[GameAction] = None
-        self.priority_player_id = None
+        self.priority_player_id: object | None = None
 
     @property
     def count(self) -> int:
@@ -256,16 +281,16 @@ class GameActionStack:
         if not self._stack:
             self.current_action = None
             return False
-        if self.peek() is not self.current_action:
-            self.current_action = self.peek()
-            self.current_action.on_enter()
-        action = self.peek()
+        action = self._stack[-1]
+        if action is not self.current_action:
+            self.current_action = action
+            action.on_enter()
         result = action.update()
         if result is GameActionResult.COMPLETE:
             self._stack.pop()
             # This intentionally calls the action entered for this update,
             # exactly as the C# code does, even if a child was pushed mid-call.
-            self.current_action.on_exit()
+            action.on_exit()
             return True
         if result is GameActionResult.WAITING_FOR_INPUT:
             return False
@@ -331,6 +356,7 @@ class PriorityWindowAction(GameAction):
         self.priority_players = priority_players
         self.ability_responding_to = ability_responding_to
         self._priority_queue: Deque[object] = deque()
+        self._rules_port_phase: str | None = None
 
     @property
     def priority_player_id(self):
@@ -341,10 +367,12 @@ class PriorityWindowAction(GameAction):
         self.reset_priority_window(start_with_active_player=False)
 
     def update(self) -> GameActionResult:
-        self.session.handle_game_event()
-        if self.action_stack.peek() is not self:
+        session = self._require_session()
+        action_stack = self._require_action_stack()
+        session.handle_game_event()
+        if action_stack.peek() is not self:
             return GameActionResult.WORKING
-        top = self.session.chain_top()
+        top = session.chain_top()
         if self.ability_responding_to is not None and top is not self.ability_responding_to:
             return GameActionResult.COMPLETE
         if top is not None and getattr(top, "ignores_chain", False):
@@ -355,46 +383,56 @@ class PriorityWindowAction(GameAction):
     def on_enter(self) -> None:
         if self.was_interrupted:
             self.reset_priority_window(start_with_active_player=True)
-            self.session.send_turn_phase_update()
+            self._require_session().send_turn_phase_update()
 
     def could_pass_priority(self, player_id) -> bool:
-        coerce = getattr(self.session, "coerce_transaction_player_id", None)
+        session = self._require_session()
+        coerce = getattr(session, "coerce_transaction_player_id", None)
         current = self.priority_player_id
         if callable(coerce):
             current = coerce(current)
             player_id = coerce(player_id)
         if current != player_id:
             try:
-                if int(getattr(current, "uid64", current)) != int(
-                        getattr(player_id, "uid64", player_id)):
+                if int(cast(Any, getattr(current, "uid64", current))) != int(
+                        cast(Any, getattr(player_id, "uid64", player_id))):
                     return False
             except (TypeError, ValueError):
                 return False
-        if (phase_name(getattr(self.session, "current_turn_phase", "")) == "Discard" and
-                self.session.hand_larger_than_maximum(player_id)):
+        if (phase_name(getattr(session, "current_turn_phase", "")) == "Discard" and
+                session.hand_larger_than_maximum(player_id)):
             return False
-        return bool(self.session.can_player_pass_priority(player_id))
+        return bool(session.can_player_pass_priority(player_id))
 
     def pass_priority(self, player_id) -> bool:
         if not self.could_pass_priority(player_id):
             return False
         self._priority_queue.popleft()
-        self.action_stack.priority_player_id = self.priority_player_id
-        self.session.send_turn_phase_update()
+        self._require_action_stack().priority_player_id = self.priority_player_id
+        session = self._require_session()
+        # Passing can expose another responder immediately.  Run state-based
+        # actions before publishing that new priority, including for a chain
+        # response window rather than only ordinary turn phases.
+        run_state_based = getattr(session, "run_state_based_checks", None)
+        if callable(run_state_based):
+            run_state_based()
+        session.send_turn_phase_update()
         return True
 
     def reset_priority_window(self, start_with_active_player: bool) -> None:
+        session = self._require_session()
+        action_stack = self._require_action_stack()
         self._priority_queue.clear()
         if self.priority_players is TurnPhasePlayers.ALL:
-            if start_with_active_player or self.action_stack.priority_player_id is None:
-                players: Iterable[object] = self.session.player_ids_in_turn_order()
+            if start_with_active_player or action_stack.priority_player_id is None:
+                players: Iterable[object] = session.player_ids_in_turn_order()
             else:
-                players = self.session.player_ids_in_priority_order()
+                players = session.player_ids_in_priority_order()
             self._priority_queue.extend(players)
         elif self.priority_players is TurnPhasePlayers.ACTIVE:
-            active = self.session.active_player_id
+            active = session.active_player_id
             if active is not None:
                 self._priority_queue.append(active)
         elif self.priority_players is TurnPhasePlayers.DEFENDING:
-            self._priority_queue.extend(self.session.defending_player_ids())
-        self.action_stack.priority_player_id = self.priority_player_id
+            self._priority_queue.extend(session.defending_player_ids())
+        action_stack.priority_player_id = self.priority_player_id

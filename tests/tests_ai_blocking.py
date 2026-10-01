@@ -164,9 +164,55 @@ def test_ai_turn_pauses_while_a_client_prompt_is_open():
     assert not ai._ai_turn_prompt_pending(None)
 
 
+def test_native_attack_declaration_survives_the_next_projection():
+    """The AI's declaration must reach the packet Unity renders.
+
+    With RulesPort attached the attackers are chosen during the native
+    ``DeclareAttack`` phase entry, which publishes the class-27
+    ``AttackDeclaredSessionEventArgs`` onto the port's current projection Game.
+    Practice builds a fresh Game per packet, so the same phase walk replaces
+    that projection (blocker options, then the AI loop) before anything is
+    serialized.  Carrying the unsent queue keeps the declaration in the next
+    packet; dropping it left Unity with no line from the troop to the champion
+    (``UIBattle.OnAttackDeclared`` -> ``ELineConnectorType.Attack``), which is
+    why blocking and unblocking redrew it from the client's own combat state.
+    """
+    from rules_port.session import GameEngineEventSink
+
+    attacker = 0x4001
+    defender = 0x101
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    # The transaction's projection: the native phase entry declares here.
+    phase_game = game_engine.Game(1, pl_t, ai_t)
+    phase_game.push_attack_declared(
+        game_engine.CombatId(ai_t, attacker & 0xFFFF), ai_t,
+        game_engine.SessionCardId(game_engine.UID(defender)),
+        game_engine.SessionCardId(game_engine.UID(attacker)))
+    # A later call in the same phase walk builds the next packet's Game.
+    next_game = game_engine.Game(1, pl_t, ai_t)
+    next_game.push_turn_phase(game_engine.ETurnPhases.DeclareDefense, ai_t,
+                              pl_t)
+    sink = GameEngineEventSink(phase_game)
+    sink.game = next_game
+    # Serializing the new projection drains the unpublished declaration.
+    sink.drain_into(next_game)
+    assert not phase_game.events, phase_game.events
+    packet = next_game.make_network_packet(pl_t)
+    declared = game_engine.AttackDeclaredSessionEventArgs.CLASS_ID
+    assert declared in packet.event_ids, packet.event_ids
+    # Publication order survives the move: the declaration precedes the events
+    # the new projection queued for itself.
+    assert packet.event_ids.index(declared) == 0, packet.event_ids
+    # The carried event is delivered exactly once.
+    later = next_game.make_network_packet(pl_t)
+    assert declared not in later.event_ids, later.event_ids
+
+
 if __name__ == "__main__":
     test_incomplete_dogpile_is_not_committed()
     test_lethal_attack_uses_one_lowest_attack_chump()
     test_ai_block_declaration_queues_the_blocked_attackers_trigger()
     test_ai_turn_pauses_while_a_client_prompt_is_open()
+    test_native_attack_declaration_survives_the_next_projection()
     print("PASS AI blocking")

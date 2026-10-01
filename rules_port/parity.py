@@ -60,7 +60,9 @@ class ParityCapture:
         seed_z, seed_w = session.random_number_generator.get_seed()
         transactions = tuple(getattr(session, "transaction_history", ()))
         state_builder = getattr(session, "parity_state", None)
-        state = dict(state_builder() if callable(state_builder) else {})
+        raw_state = state_builder() if callable(state_builder) else {}
+        state = ({str(key): item for key, item in raw_state.items()}
+                 if isinstance(raw_state, Mapping) else {})
         events = tuple(event_record(event) for event in (
             getattr(game, "events", ()) if game is not None else ()))
         return cls(int(seed_z), int(seed_w), transactions, state, events)

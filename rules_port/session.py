@@ -12,8 +12,10 @@ Source counterparts: ``Session.cs:InternalTick2`` and
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Callable, Deque, Dict, Mapping, Optional
 
 import game_engine
@@ -36,8 +38,7 @@ from .transactions import (AbilityExistsRequirement, AllDamageAssignedRequiremen
                            PlayerIsAtFrontOfTriggeredAbilityQueueRequirement,
                            AbilitiesAreTriggeredRequirement,
                            DefenseDeclarationsLegalRequirement, Requirement,
-                           MainPhaseRequirement, PriorityWindowRequirement,
-                           QuickActionCardRequirement,
+                           CardPlayTimingRequirement,
                            OrRequirement,
                            PlayerHasPriorityRequirement,
                            PlayerIsActiveRequirement,
@@ -85,6 +86,11 @@ def _json_value(value):
         return {key: _json_value(item) for key, item in value.__dict__.items()
                 if not key.startswith("_")}
     return str(value)
+
+
+def _serial_combatant_id(value):
+    """Serialize a runtime combat participant or its raw card identity."""
+    return _serial_id(getattr(value, "session_card_id", value))
 
 
 @dataclass(frozen=True)
@@ -255,8 +261,17 @@ class RulesTransaction:
     @classmethod
     def resolve_triggered_continuation(cls, player_id, activation_data) -> "RulesTransaction":
         """Resume a metadata trigger target without a transient ability id."""
+        if isinstance(activation_data, Mapping):
+            normalized = dict(activation_data)
+        elif isinstance(activation_data, (list, tuple)):
+            # AbilityActivationData can be serialized as a one-element
+            # collection for triggered abilities. Preserve that shape so an
+            # optional opt-in is not discarded before the host sees it.
+            normalized = tuple(activation_data)
+        else:
+            normalized = {}
         return cls(player_id, "resolve_triggered_continuation", None,
-                   payload={"activation_data": dict(activation_data or {})})
+                   payload={"activation_data": normalized})
 
     @classmethod
     def resolve_discard_continuation(cls, player_id, activation_data) -> "RulesTransaction":
@@ -298,10 +313,10 @@ class RulesTransaction:
 
     @classmethod
     def play_resource(cls, player_id, card_id) -> "RulesTransaction":
-        """Port ``PlayResourceTransaction`` (its sole C# requirement)."""
+        """Port resource-play validation and client card timing rules."""
         return cls(player_id, "play_resource", None,
                    payload={"card_id": card_id, "playing_for_free": False},
-                   requirements=(MainPhaseRequirement(),
+                   requirements=(CardPlayTimingRequirement(card_id),
                                  PlayerHasPriorityRequirement(player_id),
                                  CardCanBePlayedRequirement(card_id, False)))
 
@@ -310,15 +325,8 @@ class RulesTransaction:
                   playing_for_free=False, phase=None) -> "RulesTransaction":
         """Build troop/artifact/spell play transactions from typed payloads."""
         data = tuple(dict(item or {}) for item in (ability_data or ()))
-        # Permanents use the two main phases; actions may also be cast during
-        # a priority response window.  The requirement is evaluated against
-        # the authoritative port phase, never the phase claimed by the wire
-        # request.
-        phase_requirement = OrRequirement((MainPhaseRequirement(),
-                                           PriorityWindowRequirement(),
-                                           QuickActionCardRequirement(card_id)))
         requirements: list[Requirement] = [
-            phase_requirement,
+            CardPlayTimingRequirement(card_id),
             PlayerHasPriorityRequirement(player_id),
             CardCanBePlayedRequirement(card_id, bool(playing_for_free))]
         requirements.extend(XCostRequirement(item) for item in data)
@@ -473,13 +481,63 @@ class SQLiteRulesSnapshot:
 
 
 class GameEngineEventSink:
-    """Emit already-supported Python session events, not a parallel protocol."""
+    """Emit already-supported Python session events, not a parallel protocol.
+
+    A ``Game`` is one packet's projection: the host builds a fresh one per
+    packet and serializes it with ``make_network_packet``, which consumes its
+    events.  The port publishes through this sink, so the sink is the one place
+    that can tell when a projection is replaced before anything serialized it.
+    Pointing ``game`` at a new projection queues the outgoing one; the
+    session-level serializer then calls ``drain_into`` so those events ride the
+    next packet instead of being dropped.
+    """
 
     def __init__(self, game: game_engine.Game, *, mutation_adapter=None,
                  event_observer: Optional[Callable[[object], None]] = None) -> None:
-        self.game = game
+        self._unpublished: list[Any] = []
+        self._game = game
         self.mutation_adapter = mutation_adapter
         self.event_observer = event_observer
+
+    @property
+    def game(self) -> game_engine.Game:
+        """Return the projection the port publishes onto."""
+        return self._game
+
+    @game.setter
+    def game(self, game: game_engine.Game) -> None:
+        """Publish onto ``game``, queueing the outgoing projection if unsent."""
+        previous = getattr(self, "_game", None)
+        # Test doubles and parity stubs implement only the publishing half of
+        # a Game, so read the queue duck-typed rather than demanding the field.
+        if (previous is not None and previous is not game and
+                getattr(previous, "events", None)):
+            self._unpublished.append(previous)
+        self._game = game
+
+    def drain_into(self, packet_game: game_engine.Game) -> int:
+        """Move never-serialized events into ``packet_game``, oldest first.
+
+        This is the session-level serialization boundary: call it immediately
+        before building a packet from ``packet_game``, and consume that Game
+        after sending.  Events are prepended because they were published
+        before whatever the packet already queued for itself.  The queue is
+        cleared either way, so a projection is never delivered twice.
+        """
+        carried: list = []
+        for stale in self._unpublished:
+            if stale is packet_game:
+                continue
+            events = getattr(stale, "events", None)
+            if not events:
+                continue
+            carried.extend(events)
+            stale.events = []
+        self._unpublished = []
+        if carried:
+            packet_game.events = carried + list(
+                getattr(packet_game, "events", None) or ())
+        return len(carried)
 
     def _publish(self, event) -> None:
         self.game._push(event)
@@ -516,6 +574,8 @@ class GameEngineEventSink:
         projection, leaving the client showing only the cost change.
         """
         source_uid = getattr(ability, "source_uid", None)
+        if source_uid is None:
+            source_uid = 0
         try:
             source_uid = int(getattr(source_uid, "uid64", source_uid))
         except (TypeError, ValueError):
@@ -636,7 +696,7 @@ class AuthoritativeSession:
 
     def __init__(self, session_id, player_ids, *, seed_z: int, seed_w: int,
                  event_sink: Optional[GameEngineEventSink] = None,
-                 snapshot: Optional[SQLiteRulesSnapshot] = None) -> None:
+                 snapshot: Any = None) -> None:
         players = tuple(player_ids)
         if not players:
             raise ValueError("an authoritative session needs at least one player")
@@ -652,12 +712,14 @@ class AuthoritativeSession:
         self.action_stack = GameActionStack(self)
         self.event_sink = event_sink
         self.snapshot_store = snapshot
+        self._native_phase_already_entered = False
         self._transactions: Deque[RulesTransaction] = deque()
         self._transaction_history: list[dict[str, Any]] = []
         self._trigger_events: Deque[object] = deque()
         self._transaction_handlers: Dict[str, Callable[[RulesTransaction], bool]] = {}
         self._trigger_handler: Optional[Callable[[object], None]] = None
         self._state_based_handler: Optional[Callable[[], bool]] = None
+        self._state_based_lock = RLock()
         # C# Session.cardsReadyToPlay: cards a host/effect chose to play
         # without an ordinary client transaction, finalized on the next tick.
         self._cards_ready_to_play: list[dict[str, Any]] = []
@@ -665,6 +727,7 @@ class AuthoritativeSession:
         self._turn_start_resolver: Optional[Callable[[], object]] = None
         self._turn_boundary_resolver: Optional[Callable[[object], object]] = None
         self._turn_phase_entry_resolver: Optional[Callable[[object], object]] = None
+        self._turn_phase_exit_resolver: Optional[Callable[[object], object]] = None
         self._phase_priority_resolver: Optional[Callable[[object, object], object]] = None
         self._ability_resolver: Optional[Callable[[object], AbilityResolutionState]] = None
         self._activation_requester: Optional[Callable[[object, tuple], None]] = None
@@ -780,6 +843,14 @@ class AuthoritativeSession:
         """
         self._turn_phase_entry_resolver = resolver
 
+    def set_turn_phase_exit_resolver(self, resolver) -> None:
+        """Register the mode projection run when a native phase exits.
+
+        The callback mirrors C# phase OnExit mutations/events. Phase choice and
+        action ordering remain owned by the native scheduler.
+        """
+        self._turn_phase_exit_resolver = resolver
+
     def set_phase_priority_resolver(self, resolver) -> None:
         """Register the mode's stop policy for newly entered phase windows."""
         self._phase_priority_resolver = resolver
@@ -806,6 +877,15 @@ class AuthoritativeSession:
         if self._turn_phase_entry_resolver is None:
             return None
         result = self._turn_phase_entry_resolver(
+            self.current_turn_phase if phase is None else phase)
+        self.persist()
+        return result
+
+    def resolve_turn_phase_exit(self, phase=None):
+        """Run mode mutations/events at the native phase-exit boundary."""
+        if self._turn_phase_exit_resolver is None:
+            return None
+        result = self._turn_phase_exit_resolver(
             self.current_turn_phase if phase is None else phase)
         self.persist()
         return result
@@ -856,6 +936,20 @@ class AuthoritativeSession:
 
     def set_state_based_handler(self, handler: Callable[[], bool]) -> None:
         self._state_based_handler = handler
+
+    def run_state_based_checks(self) -> bool:
+        """Run state-based actions at a priority handoff.
+
+        The callback is host-owned because lethal cleanup needs the live
+        SQLite card state and packet projection.  The session owns the
+        boundary and serialization so a re-entrant projection cannot run the
+        same check concurrently while a Deathcry is adding chain work.
+        """
+        handler = self._state_based_handler
+        if handler is None:
+            return False
+        with self._state_based_lock:
+            return bool(handler())
 
     def set_ability_resolver(self, resolver: Callable[[object], AbilityResolutionState]) -> None:
         self._ability_resolver = resolver
@@ -1285,12 +1379,24 @@ class AuthoritativeSession:
         if not (isinstance(live_state, dict) and live_state):
             return
         facts.battle_state = live_state
-        # Practice/PvE stores the native phase at the checkpoint cursor. PvP
-        # supplies its own raw-phase synchronization in
-        # PvpAuthoritativeSession.submit_transaction.
+        # The compatibility cursor can lag while an internal RulesPort phase
+        # is running (for example, AI attackers are declared before an
+        # attack trigger opens its response window). Prefer the nested native
+        # scheduler phase when it has been persisted; rewinding to the older
+        # cursor can send the next pass back through DeclareCombat and skip
+        # the defender's blocker window. Older checkpoints without a native
+        # snapshot still use the compatibility phase. PvP supplies its own
+        # raw-phase synchronization in PvpAuthoritativeSession.
         if not live_state.get("pvp"):
             from .persistence import current_phase
-            live_phase = current_phase(live_state)
+            native = live_state.get(SQLiteRulesSnapshot.KEY)
+            native_phase_name = (native.get("phase")
+                                 if isinstance(native, Mapping) else None)
+            live_phase = (getattr(game_engine.ETurnPhases,
+                                  str(native_phase_name), None)
+                          if native_phase_name else None)
+            if live_phase is None:
+                live_phase = current_phase(live_state)
             if live_phase is not None:
                 self.current_turn_phase = live_phase
 
@@ -1357,7 +1463,8 @@ class AuthoritativeSession:
                 self.action_stack.priority_player_id, desired):
             return False
 
-        queue = list(getattr(top, "_priority_queue", ()) or ())
+        queue: list[object] = list(
+            getattr(top, "_priority_queue", ()) or ())
         queue = [player for player in queue if not same(player, desired)]
         if (top.priority_players is TurnPhasePlayers.ACTIVE and
                 not same(desired, self.active_player_id)):
@@ -1426,18 +1533,25 @@ class AuthoritativeSession:
         if not self._transactions:
             return False
         transaction = self._transactions.popleft()
+        profile_callback = getattr(self, "_transaction_profile_callback", None)
+        started = time.perf_counter() if callable(profile_callback) else None
         handler = self._transaction_handlers.get(transaction.kind)
-        self._in_transaction_handler = True
         try:
-            handled = bool(handler and handler(transaction))
+            self._in_transaction_handler = True
+            try:
+                handled = bool(handler and handler(transaction))
+            finally:
+                self._in_transaction_handler = False
+            # A successful mutation is the authoritative transaction boundary.
+            # Rejected/unknown intents are not persisted, matching the host's
+            # existing DB ownership and avoiding snapshots that imply a mutation.
+            if handled:
+                self.persist()
+            return handled
         finally:
-            self._in_transaction_handler = False
-        # A successful mutation is the authoritative transaction boundary.
-        # Rejected/unknown intents are not persisted, matching the host's
-        # existing DB ownership and avoiding snapshots that imply a mutation.
-        if handled:
-            self.persist()
-        return handled
+            if started is not None:
+                profile_callback(
+                    transaction.kind, time.perf_counter() - started)
 
     def _resolve_pass_priority(self, transaction: RulesTransaction) -> bool:
         resolver = self.projection("priority_transaction")
@@ -1556,6 +1670,15 @@ class AuthoritativeSession:
             if not handled:
                 for combat in staged:
                     self.combat_manager.remove_combat(combat.combat_id)
+            else:
+                # The PvP compatibility adapter only publishes the accepted
+                # attack. Let its native scheduler consume the empty Declare
+                # Attack window after that projection returns; advancing from
+                # inside the adapter would run phase callbacks before the
+                # attack mutation and wire events are complete.
+                drive = getattr(self, "drive_after_combat_declaration", None)
+                if callable(drive):
+                    drive()
             return handled
         return True
 
@@ -1594,6 +1717,10 @@ class AuthoritativeSession:
                     combat.flags &= ~(CombatFlags.BLOCKERS_DECLARED |
                                       CombatFlags.ATTACK_BLOCKED |
                                       CombatFlags.DAMAGE_ASSIGNED)
+            else:
+                drive = getattr(self, "drive_after_combat_declaration", None)
+                if callable(drive):
+                    drive()
             return handled
         return True
 
@@ -1691,12 +1818,12 @@ class AuthoritativeSession:
                 ability = self.ability_manager.get(int(instance_id))
             except (TypeError, ValueError):
                 return False
-            if (ability is None or
+            bind_activation = getattr(ability, "bind_activation", None)
+            if (ability is None or not callable(bind_activation) or
                     getattr(ability, "responsible_player_id", None) !=
-                    transaction.player_id or
-                    not hasattr(ability, "bind_activation")):
+                    transaction.player_id):
                 return False
-            if not ability.bind_activation(activation):
+            if not bind_activation(activation):
                 return False
             if not self.pay_ability_cost(ability):
                 return False
@@ -1846,12 +1973,13 @@ class AuthoritativeSession:
         except (TypeError, ValueError):
             return False
         ability = self.ability_manager.get(instance_id)
-        if ability is None or not hasattr(ability, "bind_activation"):
+        bind_activation = getattr(ability, "bind_activation", None)
+        if ability is None or not callable(bind_activation):
             return False
         responsible = getattr(ability, "responsible_player_id", None)
         if responsible != player_id:
             return False
-        if not ability.bind_activation(activation_data):
+        if not bind_activation(activation_data):
             return False
         if not self.pay_ability_cost(ability):
             return False
@@ -1916,6 +2044,14 @@ class AuthoritativeSession:
         state = self._ability_resolver(ability)
         if state is AbilityResolutionState.COMPLETED:
             popped = self.chain.pop_ability(ability_instance_id)
+            if popped is None:
+                # The resolver discovered and queued a new chain item before
+                # it returned (a troop's Deploy trigger, for example), so the
+                # resolved id is no longer the chain top.  C# defers that push
+                # behind the resolve action and still pops the top; here the
+                # push already happened, so detach the resolved id by identity
+                # or it stays as a ghost that blocks the chain forever.
+                popped = self.chain.detach_ability(ability_instance_id)
             # ``Session.RemoveFromTopOfChain`` removes the manager entry once
             # resolution is over, except for an ability with ongoing effects.
             if popped is not None and not getattr(popped, "has_ongoing_effects", False):
@@ -2003,7 +2139,8 @@ class AuthoritativeSession:
                     card = getter(int(raw_uid))
                 except (TypeError, ValueError):
                     card = None
-                if card is not None and card.cares_about_combat_phase(
+                phase_check = getattr(card, "cares_about_combat_phase", None)
+                if callable(phase_check) and phase_check(
                         CombatPhase.FIRST_STRIKE):
                     return True
         return False
@@ -2047,6 +2184,14 @@ class AuthoritativeSession:
             new_state = self.phase_states.get(phase_name(next_phase))
             if new_state is not None:
                 new_state.on_entry(self)
+            # TurnPhaseState.on_entry materializes the priority action before
+            # the phase update is published.  State-based actions belong
+            # between those two operations, so a player never receives a
+            # priority packet containing an already-lethal troop.
+            top = self.action_stack.peek()
+            if (isinstance(top, PriorityWindowAction) and
+                    top.priority_player_id is not None):
+                self.run_state_based_checks()
             self.send_turn_phase_update()
             # Phase transitions are authoritative scheduler mutations too.
             # Save after the client-visible update so reconnect resumes here.
@@ -2372,12 +2517,38 @@ class AuthoritativeSession:
         """Perform one C#-ordered scheduler step; never await a UI callback."""
         if self.terminated or phase_name(self.current_turn_phase) == "NotPlaying":
             return False
-        if self._state_based_handler is not None and self._state_based_handler():
+        # A triggered-ability/deck/choice prompt is the native equivalent of
+        # WaitForTriggeredAbilitiesAction.  It must be allowed to consume the
+        # client's answer, but no automatic phase/AI work may run while the
+        # prompt owns the UI.  In particular, a pending trigger can be left
+        # after its source chain item completes, with no action on the stack;
+        # advancing that empty stack here made optional dialogs flash and then
+        # let the AI continue through combat in the same request.
+        from .chain_items import pending_input
+        state = getattr(getattr(self, "runtime_facts", None),
+                        "battle_state", None)
+        if not isinstance(state, dict):
+            game_session = getattr(self.snapshot_store, "game_session", None)
+            if game_session is not None:
+                from .persistence import load_state
+                state = load_state(game_session)
+        if isinstance(state, dict) and (
+                pending_input(state) or state.get("resolution_paused")):
+            if self.handle_transaction():
+                return True
+            return False
+        # Normally the phase/chain/pass boundaries invoke this directly.  The
+        # scheduler check is a reconnect/rehydration safety net for a live
+        # PriorityWindowAction that was restored without replaying its entry.
+        from .kernel import PriorityWindowAction
+        top = self.action_stack.peek()
+        if (isinstance(top, PriorityWindowAction) and
+                top.priority_player_id is not None and
+                self.run_state_based_checks()):
             return True
         # C# InternalTick2 drains the trigger queue and finishes queued plays
         # only when the phase permits chain resolution and no chain action owns
         # the top of the stack.
-        from .kernel import PriorityWindowAction
         if (self.chain_can_resolve() and
                 (self.action_stack.count == 0 or
                  isinstance(self.action_stack.peek(), PriorityWindowAction))):
@@ -2458,13 +2629,11 @@ class AuthoritativeSession:
             "chain_instance_ids": [int(instance_id)
                                    for instance_id in self.chain._instance_ids],
             "combats": [
-                {"attacker_id": _serial_id(combat.attacker.session_card_id),
-                 "defender_id": _serial_id(combat.defender.session_card_id)
-                 if hasattr(combat.defender, "session_card_id")
-                 else _serial_id(combat.defender),
+                {"attacker_id": _serial_combatant_id(combat.attacker),
+                 "defender_id": _serial_combatant_id(combat.defender),
                  "combat_serial": int(combat.combat_id.serial_number),
                  "blocker_ids": [
-                     _serial_id(blocker.session_card_id)
+                     _serial_combatant_id(blocker)
                      for blocker in combat.blockers
                      if hasattr(blocker, "session_card_id")
                  ],

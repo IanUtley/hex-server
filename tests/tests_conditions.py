@@ -345,6 +345,45 @@ def test_has_source_resource_cost_compares_live_source(db):
     assert evaluate_card_filter(pricier, filt, 1, source_card=source)
 
 
+def test_native_trigger_uses_effective_resource_cost(db):
+    """Strict cost triggers compare the current payable costs."""
+    from rules_port.condition_context import ConditionContext as NativeContext
+    from rules_port.conditions import trigger_condition_met as native_trigger
+
+    add_card(db, 800, 5, "Troop")
+    add_card(db, 801, 5, "Troop")
+    db.execute("ALTER TABLE game_cards ADD COLUMN card_cost_mod INTEGER DEFAULT 0")
+    db.execute("ALTER TABLE game_cards ADD COLUMN cost_mod_json TEXT DEFAULT '[]'")
+    db.execute("UPDATE game_cards SET card_cost_mod=1 WHERE card_uid IN (800, 801)")
+    db.commit()
+    condition = {
+        "m_TriggerCondition": {
+            "_t": "TriggerCardMatchesFilter",
+            "m_TriggerTest": "TriggerTarget",
+            "m_CardFilter": {
+                "_t": "HasSourceResourceCost",
+                "m_ComparisonOp": "GreaterThan",
+            },
+        }
+    }
+
+    equal = NativeContext(
+        db, SessionStub(), {}, ability_source_uid=800,
+        trigger_uid=801, extra_target=801)
+    assert equal.card(800)["cost"] == 2
+    assert equal.card(801)["cost"] == 2
+    assert not native_trigger(condition, equal)
+
+    db.execute("UPDATE game_cards SET card_cost_mod=2 WHERE card_uid=801")
+    db.commit()
+    greater = NativeContext(
+        db, SessionStub(), {}, ability_source_uid=800,
+        trigger_uid=801, extra_target=801)
+    assert greater.card(800)["cost"] == 2
+    assert greater.card(801)["cost"] == 3
+    assert native_trigger(condition, greater)
+
+
 def test_champion_health_condition_honors_controller_and_opponent(db):
     """Gortezuma checks the opposing champion, in PvE and persisted PvP."""
     pve = ctx(db, ability_source_uid=700, ability_source_owner_id=5,
@@ -392,6 +431,8 @@ if __name__ == "__main__":
         test_common_trigger_conditions_are_metadata_faithful)
     run("HasSourceResourceCost compares live source",
         test_has_source_resource_cost_compares_live_source)
+    run("Native trigger compares effective resource cost",
+        test_native_trigger_uses_effective_resource_cost)
     run("Champion health condition honors opponent",
         test_champion_health_condition_honors_controller_and_opponent)
     run("TAC trigger matches threshold event TAC",

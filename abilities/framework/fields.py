@@ -8,6 +8,8 @@ rules-data source.
 """
 
 import json
+from typing import Any
+from typing import cast
 
 from gamedata import DEFAULT_RECORD_STORE
 
@@ -270,7 +272,7 @@ def modifier_metadata(effect_guid):
         "AttackImmunityModifier": "attackimmunity",
         "SubTypeModifier": "subtype",
     }
-    out = {"property": properties.get(kind, "")}
+    out: dict[str, Any] = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
                 "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
                 "m_CardFilter", "m_CopySourceCard", "m_SetThresholds",

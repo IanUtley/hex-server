@@ -6,6 +6,8 @@ Unity card representation without calling the legacy BOM utility.
 
 from __future__ import annotations
 
+import json
+
 import game_engine
 
 
@@ -92,3 +94,64 @@ def project_card(context, card_uid: int, location: str) -> bool:
         context.game, context.session, context.db, context.handler,
         context.player_uid, context.ai_uid, context.bstate,
         card_uid, location)
+
+
+def has_lifebound(db, session_id, card_uid) -> bool:
+    """Whether one card's runtime intattrs carry Lifebound."""
+    from pvp_db import db_card_mutation_field
+    for column in ("permanent_buffs", "temporary_buffs"):
+        try:
+            data = json.loads(db_card_mutation_field(
+                session_id, int(card_uid), column, conn=db) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attrs = data.get("int_attrs") if isinstance(data, dict) else None
+        if isinstance(attrs, dict) and any(
+                str(name).lower() == "lifebound" and int(value or 0) > 0
+                for name, value in attrs.items()):
+            return True
+    return False
+
+
+def lifebound(context, owner_id):
+    """Session.Lifebound: a player's discard Lifebound cards return to play.
+
+    C# StartTurnState calls this for the active player; the discard cards
+    return when one of that player's warzone cards carries the marker.
+    """
+    import game_engine
+    from pvp_db import db_card_zone_details, db_move_card_for_effect
+    session_id = context.session.session_id
+    owner = int(owner_id or 0)
+    warzone = context.db.execute(
+        "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
+        "AND location='warzone'", (session_id, owner)).fetchall()
+    if not any(has_lifebound(context.db, session_id, uid)
+               for (uid,) in warzone):
+        return []
+    discard = context.db.execute(
+        "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
+        "AND location='discard'", (session_id, owner)).fetchall()
+    moved = []
+    from .static_rules import opposing_enters_play_exhausted
+    for (uid,) in discard:
+        uid = int(uid)
+        if not has_lifebound(context.db, session_id, uid):
+            continue
+        entering_state = int(game_engine.ECardStates.CameOutThisTurn)
+        details = db_card_zone_details(session_id, uid, conn=context.db)
+        if details and opposing_enters_play_exhausted(
+                context.bstate, owner, details[0]):
+            entering_state |= int(game_engine.ECardStates.Tapped)
+        db_move_card_for_effect(
+            session_id, uid, "warzone", 0, entering_state, clear_dead=True,
+            clear_bits=int(game_engine.ECardStates.Dead), conn=context.db)
+        context.db.commit()
+        project_card(context, uid, "warzone")
+        context._emit_trigger(
+            "CardEnteredZoneEvent", uid, owner,
+            event_source_collection="discard",
+            event_destination_collection="warzone",
+            event_previous_state=int(game_engine.ECardStates.Dead))
+        moved.append(uid)
+    return moved

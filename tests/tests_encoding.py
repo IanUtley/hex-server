@@ -66,6 +66,16 @@ def _encode_objfmt_response(type_names, fields):
         return type_names.index(tname)
 
     def encode_field(name, tcode, val):
+        evalue = ""
+        evalue_int = 0
+        ecount = 0
+        elem_data = []
+        card_data = []
+        deck_data = []
+        champ_data = []
+        uid_val = 0
+        sub_fields = []
+        raw_bytes = b""
         if tcode == "long":
             tname = "System.Int64"
         elif tcode == "ulong":

@@ -58,6 +58,7 @@ _SERVICE_TABLE = {
     10009: ("services.arena", "handle_request", {"data_type": 10009}),
     10011: ("services.arena", "handle_request", {"data_type": 10011}),
     10013: ("services.arena", "handle_request", {"data_type": 10013}),
+    10017: ("services.arena", "handle_request", {"data_type": 10017}),
     10019: ("services.arena", "handle_request", {"data_type": 10019}),
     10027: ("services.arena", "handle_request", {"data_type": 10027}),
     10029: ("services.arena", "handle_request", {"data_type": 10029}),

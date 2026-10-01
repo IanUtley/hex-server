@@ -7,6 +7,8 @@
 # processes, validates all Python sources, starts the services fresh, and
 # verifies each port is actually listening before exiting.
 #
+# Only to be used in development
+#
 #   server  : hconnect_server.py  ->  TCP 9933  (HConnect game protocol)
 #   proxy   : proxy.py 8081        ->  TCP 8081  (Steam auth / collection HTTP)
 #
@@ -20,6 +22,10 @@ BASE_DIR="/home/ianutley/Hex"
 LOG_DIR="/tmp"
 SERVER_PORT=9933
 PROXY_PORT=8081
+
+echo ------------------------------------------------------------------------
+echo For development purposes only. Please use Docker version for deployment.
+echo ------------------------------------------------------------------------
 
 # Python files that must compile cleanly before we start anything.
 SOURCES=(
@@ -37,7 +43,9 @@ SOURCES=(
     "$BASE_DIR/ai.py"
     "$BASE_DIR/debug_runtime.py"
     "$BASE_DIR/battle_engine.py"
+    "$BASE_DIR/ai_deck_strategy.py"
     "$BASE_DIR/AssetExtraction/generate_starter_decks.py"
+    "$BASE_DIR/AssetExtraction/evaluate_fra_deck_personalities.py"
     "$BASE_DIR/campaign_chains/__init__.py"
     "$BASE_DIR/gamemodes/__init__.py"
     "$BASE_DIR/gamemodes/tournament_server.py"
@@ -166,11 +174,10 @@ for logfile in "$LOG_DIR/hconnect_log.txt" "$LOG_DIR/proxy_log.txt" "$LOG_DIR/hc
 done
 echo "=================================" >> "$LOG_DIR/hconnect_log.txt"
 
-if [[ "${HEX_USE_SUPERVISOR:-0}" == "1" ]]; then
+if [[ "${HEX_USE_SUPERVISOR:-1}" == "1" ]]; then
     command -v supervisord >/dev/null 2>&1 || die \
         "HEX_USE_SUPERVISOR=1 but supervisord is not installed (pip install -r requirements.txt)"
     log "Starting Supervisor-managed Hex services ..."
-    export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
     setsid nohup supervisord -n -c "$BASE_DIR/supervisord.conf" \
         >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
     SUPERVISOR_PID=$!
@@ -179,10 +186,8 @@ if [[ "${HEX_USE_SUPERVISOR:-0}" == "1" ]]; then
     REPLAY_PID=$SUPERVISOR_PID
 else
 log "Starting HConnect server on :$SERVER_PORT ..."
-# The migrated RulesPort is the active transaction path for live client
-# sessions.  Keep an explicit override for rollback/probes, but make a plain
-# restart deterministic so the port cannot be silently skipped.
-export HEX_RULES_PORT_AUTO_ATTACH="${HEX_RULES_PORT_AUTO_ATTACH:-1}"
+# The migrated RulesPort is the only transaction path for live client
+# sessions; there is no legacy rollback mode.
 setsid nohup "$BASE_DIR/run_hconnect.sh" \
     >> "$LOG_DIR/hconnect_log.txt" 2>&1 < /dev/null &
 SERVER_PID=$!

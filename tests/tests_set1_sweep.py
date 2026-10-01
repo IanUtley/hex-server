@@ -34,7 +34,7 @@ SRC = fresh_database()
 import game_engine
 
 from tests.tests_combat import HandlerStub, SessionStub
-from abilities.framework.resolution import resolve_ability
+from rules_port.resolution import resolve_port_ability
 from abilities.framework.triggers import (
     resolve_triggers,
     resolve_stack_trigger,
@@ -215,8 +215,8 @@ def _resolve_one(db, handler, game, session, pl_t, ai_t, bstate, ability_guid,
     # Manual / automatic: resolve the BOM directly with explicit targets.
     target_map = _explicit_target_map(db, ability_guid)
     bstate["player_spell_target"] = 201
-    resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
-                    ability_guid, src_uid, 5, target_map)
+    resolve_port_ability(handler, game, session, db, pl_t, ai_t, bstate,
+                         ability_guid, src_uid, 5, target_map=target_map)
     bstate.pop("player_spell_target", None)
     return "bom"
 

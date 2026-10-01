@@ -3,13 +3,16 @@
 Commands accept either the historical `!` prefix or `/` prefix. Type in chat
 (any tab works after session room join). `thresholds` is accepted as an alias
 for `threshold`.
-The server accepts these commands only when `allowcon` is present in
-`HEX_PROFILE_FLAGS`.
+Debug commands require `allowcon` in `HEX_PROFILE_FLAGS`. The public commands
+`!help`/`!commands`, `!version`, `!arena-cleanup`, `!account-cleanup`, and
+`!issue <title>`
+work without it.
 
 The status column reflects the server command router in `commands.py`.
 “Implemented” means the command is accepted and has a server handler; it may
-still require an active game/session as noted below. The `!help` output is the
-authoritative in-game list.
+still require an active game/session as noted below. Without `allowcon`, `!help`
+and `!commands` list the public commands; with it, they list the full command
+set.
 
 ## Session & Test Controls
 
@@ -28,12 +31,11 @@ authoritative in-game list.
 
 | Command | Usage | Status | Description |
 |---------|-------|--------|-------------|
-| `!hand` | `!hand` | Implemented | List cards in hand: `CardName [card_id]` |
+| `!hand` | `!hand [me\|opp]` | Implemented | List the selected player's hand: `CardName [card_id]`; defaults to `me`. |
 | `!aihand` | `!aihand` | Implemented | Reveal the AI hand to the player for debugging. |
 | `!zones` | `!zones` | Implemented | List all cards grouped by zone (one message per zone) |
 | `!playable` | `!playable [id\|name ...]` | Implemented | Set which cards get golden outlines. No args = all playable. |
-| `!drawcard` | `!drawcard <id\|name> [id\|name ...]` | Not implemented | No server handler currently exists; use `!draw N` or `!addcard <name\|id>`. |
-| `!draw` | `!draw N` | Implemented | Draw N cards from deck. |
+| `!draw` | `!draw [N]` | Implemented | Draw up to N cards from your deck; defaults to one card. |
 | `!gencard` | `!gencard <name>` | Implemented | Generate a copy of a card template into hand. |
 | `!addcard` | `!addcard <name\|id>` | Implemented | Draw the next matching copy from the deck to hand. |
 | `!top` | `!top <id\|name>` | Implemented | Move a card from hand to the top of the deck. |
@@ -46,7 +48,7 @@ authoritative in-game list.
 | Command | Usage | Status | Description |
 |---------|-------|--------|-------------|
 | `!state` | `!state <id> <flags>` | Implemented | Set card state: `Tapped\|Attacking\|Blocking\|Damaged\|Healed\|Dead\|HasAttacked\|HasBlocked\|EffectExpired\|Activated` |
-| `!attr` | `!attr <id> <flags>` | Implemented | Set attributes: `Flight\|Speed\|SkyGuard\|Crush\|Steadfast\|Invincible\|SpellShield\|Unique\|LifeDrain` |
+| `!attr` / `!attributes` | `!attr <id> <flags>` | Implemented | Set attributes: `Flight\|Speed\|SkyGuard\|Crush\|Steadfast\|Invincible\|SpellShield\|Unique\|LifeDrain` |
 
 Flags can be pipe-separated (`Tapped\|Attacking`) or space-separated. Unknown flags are rejected without changes.
 
@@ -66,6 +68,11 @@ Flags can be pipe-separated (`Tapped\|Attacking`) or space-separated. Unknown fl
 |---------|-------|--------|-------------|
 | `!pass` | `!pass` | Implemented | Cycle through turn phases: FirstMainPhase → DeclareCombatPW → DeclareAttack → DeclareAttackPW → DeclareDefense → DeclareDefensePW → AssignFirstStrike → FirstStrikePW → AssignDamage → SecondMainPhase → EndPhase → Discard → EndTurn |
 | `!phase` | `!phase <Name>` | Implemented | Jump to a phase: `Mulligan`, `FirstMainPhase`, `DeclareAttack`, `EndTurn`, etc. |
+
+## Priority
+
+| Command | Usage | Status | Description |
+|---------|-------|--------|-------------|
 
 ## Card Zones
 
@@ -116,3 +123,8 @@ Flags can be pipe-separated (`Tapped\|Attacking`) or space-separated. Unknown fl
 | Command | Usage | Status | Description |
 |---------|-------|--------|-------------|
 | `!help` | `!help` | Implemented | Show the command list. |
+| `!version` | `!version` | Implemented | Show the server version; available without `allowcon`. |
+| `!arena-cleanup` | `!arena-cleanup` | Implemented | Clear your Frost Ring Arena run; available without `allowcon`. |
+| `!account-cleanup` | `!account-cleanup` | Implemented | Reset your account to its new-player state; available without `allowcon`. |
+| `!issue` | `!issue <title>` | Implemented | Open a prefilled GitHub issue containing the last 32 player-log lines and the newest matching game-log lines, plus an active-session snapshot when available. Available without `allowcon`. |
+| `!commands` | `!commands` | Implemented | Alias for `!help`; command output is sent only to the issuing user. |

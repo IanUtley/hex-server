@@ -43,12 +43,12 @@ def _clear_choice_zone(context):
 def _create_choice_cards(context, owner_id, template_guids):
     from pvp_db import (db_copy_template_payload, db_next_game_card_row_id,
                         db_insert_generated_card)
+    from .runtime_helpers import next_game_card_uid, owner_uid
     created = []
     for template_guid in template_guids:
         row = db_copy_template_payload(template_guid, conn=context.db)
         if not row:
             continue
-        from .runtime_helpers import next_game_card_uid, owner_uid
         uid = next_game_card_uid(context.db, context.session.session_id)
         db_insert_generated_card(
             context.session.session_id, int(owner_id), uid, template_guid,
@@ -118,6 +118,12 @@ def _resolve_choice_card_abilities(context, chosen_uid, source_uid, owner_id):
     except (TypeError, ValueError, json.JSONDecodeError):
         values = []
     results = []
+    # The client gives a generated Choice card a parent link to the ability's
+    # source card, and ``this`` inside the choice ability resolves to that
+    # real parent (Soul Cavalry/Armaments transform Soul Marble, not the
+    # temporary token).  Resolve against the parent the caller supplied.
+    parent_uid = (int(source_uid) if source_uid is not None
+                  else int(chosen_uid))
     for guid in values or ():
         meta = db_ability_activation_metadata(str(guid).lower(), conn=context.db)
         if meta and int(meta[4] or 0):
@@ -127,14 +133,14 @@ def _resolve_choice_card_abilities(context, chosen_uid, source_uid, owner_id):
             key: context.bstate.get(key)
             for key in ("player_spell_target", "player_mod_target",
                         "resolving_target_uid")}
-        context.bstate["resolving_source_uid"] = int(chosen_uid)
+        context.bstate["resolving_source_uid"] = parent_uid
         for key in old_targets:
             context.bstate.pop(key, None)
         try:
             results.append(resolve_port_ability(
                 context.handler, context.game, context.session, context.db,
                 context.player_uid, context.ai_uid, context.bstate,
-                str(guid).lower(), int(chosen_uid), owner_id,
+                str(guid).lower(), parent_uid, owner_id,
                 target_map={}, variables={}))
         finally:
             if old_source is None:

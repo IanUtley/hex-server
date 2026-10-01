@@ -10,10 +10,20 @@ from gamedata import DEFAULT_RECORD_STORE, ability_graph
 from gamedata.records import reference_guid
 
 
-def modifier_metadata(effect_guid):
+# Typed modifier fields are projected to runtime param names by lower-casing
+# the Records field name, except for ``attribute_flags``: every RulesPort
+# attribute reader (and the legacy BOM merge it mirrors) uses that underscored
+# key, so map it explicitly instead of emitting ``attributeflags``.
+_PARAM_NAMES = {"m_AttributeFlags": "attribute_flags",
+                "m_LoseHalfHealth": "lose_half_health"}
+
+
+def modifier_metadata(effect_guid=None, *, template=None):
     """Return typed CardModifier fields from the Records effect template."""
-    effect = DEFAULT_RECORD_STORE.get(
-        "AbilityEffectTemplate", str(effect_guid or "").lower())
+    effect = template
+    if effect is None:
+        effect = DEFAULT_RECORD_STORE.get(
+            "AbilityEffectTemplate", str(effect_guid or "").lower())
     if effect is None:
         return {}
     modifier = effect.field("m_Modifier", {})
@@ -37,15 +47,18 @@ def modifier_metadata(effect_guid):
         "BlockRestrictionModifier": "blockrestriction",
         "TargetingImmunityModifier": "targetingimmunity",
         "AttackImmunityModifier": "attackimmunity", "SubTypeModifier": "subtype",
+        "TagModifier": "tag",
     }
     result = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
-                "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_Value", "m_Double", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_Tag",
                 "m_CardFilter", "m_SetThresholds", "m_RemoveAllCounters",
                 "m_ReplaceExistingValue", "m_IsCombatDamage", "m_CombatDamageOnly",
-                "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely"):
+                "m_NonCombatDamageOnly", "m_OneShot", "m_LastsIndefinitely",
+                "m_RandomLowestThreshold", "m_Random", "m_LoseHalfHealth"):
         if key in modifier:
-            result[key[2:].lower()] = modifier[key]
+            result[_PARAM_NAMES.get(key, key[2:].lower())] = modifier[key]
     counter = modifier.get("m_CardCounterTemplateId")
     if isinstance(counter, dict) and counter.get("m_Guid"):
         result["counter_template_guid"] = str(counter["m_Guid"]).lower()

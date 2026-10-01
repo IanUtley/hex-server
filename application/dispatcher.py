@@ -172,11 +172,12 @@ class ApplicationCommandDispatcher:
         from services.store import apply_purchase
         value = apply_purchase(
             tx, command.user_id, command.item_id, command.quantity)
-        return CommandResult(value=value, events=(StoreChanged(
+        events = (StoreChanged(
             user_id=command.user_id,
             operation="purchase",
             item_id=command.item_id,
-        ),))
+        ),) if value.get("success", True) else ()
+        return CommandResult(value=value, events=events)
 
     @staticmethod
     def _redeem_code(tx, command):

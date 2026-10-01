@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections import defaultdict
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, cast
 
 from .parity import event_record
 
@@ -130,7 +130,7 @@ class AsyncRulesCoordinator:
         """Run ticks until waiting/idle, yielding to transport each step."""
         steps = 0
         while steps < int(max_steps):
-            if not self.session.tick():
+            if not cast(Any, self.session).tick():
                 return steps
             steps += 1
             await asyncio.sleep(0)

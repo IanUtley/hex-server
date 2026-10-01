@@ -85,7 +85,7 @@ def load_player_deck(context):
 def move_deck_card_to_hand(context, card_uid, owner_id):
     """Apply a validated deck-search result and its typed projection."""
     from pvp_db import db_card_zone_details, db_move_card_to_location
-    from .runtime_helpers import owner_uid
+    from .runtime_helpers import owner_uid, raw_uid
 
     details = db_card_zone_details(
         context.session.session_id, int(card_uid), conn=context.db)
@@ -108,5 +108,6 @@ def move_deck_card_to_hand(context, card_uid, owner_id):
     context.game.push_card_updated(
         scid, recipient, game_engine.ECardCollections.Hand, card_type,
         template_id=details[0], cost=cost, attack=attack,
-        defense=defense, gems=gems)
+        defense=defense, gems=gems,
+        nulling=raw_uid(recipient) != raw_uid(context.player_uid))
     return f"searched deck card {hex(int(card_uid))} to hand"

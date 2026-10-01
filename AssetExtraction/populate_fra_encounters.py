@@ -60,6 +60,7 @@ FRA_RANK_RANGES = {
     "Arena_Zakiir": (17, 19),
     "Arena_Hogarth": (20, 20),
 }
+FRA_BOSS_DECKS = frozenset(("Arena_Eternal_Guardian",))
 
 
 def parse_jsonl(records_path: Path) -> list[dict[str, Any]]:
@@ -172,6 +173,8 @@ def extract_rows(records_dir: Path, classifications: dict[str, dict[str, Any]]) 
         default_rank = FRA_RANK_RANGES.get(deck_name)
         if default_rank:
             classification.update({"min_rank": default_rank[0], "max_rank": default_rank[1]})
+        if deck_name in FRA_BOSS_DECKS:
+            classification["is_boss"] = True
         classification.update(
             classifications.get(deck_guid)
             or classifications.get(deck_name)
@@ -279,6 +282,19 @@ def apply_rows(db_path: Path, encounter_rows: list[tuple[Any, ...]], card_rows: 
                 db.execute(
                     f"ALTER TABLE fra_encounters ADD COLUMN {column} INTEGER DEFAULT NULL"
                 )
+        if "ai_deck_personality" not in columns:
+            db.execute(
+                "ALTER TABLE fra_encounters "
+                "ADD COLUMN ai_deck_personality TEXT DEFAULT NULL"
+            )
+        challenger_columns = {
+            item[1] for item in db.execute("PRAGMA table_info(fra_challengers)")
+        }
+        if "ai_deck_personality" not in challenger_columns:
+            db.execute(
+                "ALTER TABLE fra_challengers "
+                "ADD COLUMN ai_deck_personality TEXT DEFAULT NULL"
+            )
         db.execute("DELETE FROM fra_encounters")
         db.executemany(
             f"INSERT INTO fra_encounters ({','.join(ENCOUNTER_COLUMNS)}) "
@@ -297,7 +313,13 @@ def apply_rows(db_path: Path, encounter_rows: list[tuple[Any, ...]], card_rows: 
             "(deck_guid, card_guid, quantity, gem_types_new_list_json) VALUES (?,?,?,?)",
             card_rows,
         )
+        from AssetExtraction.evaluate_fra_deck_personalities import (
+            update_fra_deck_personalities,
+        )
+
+        evaluated = update_fra_deck_personalities(db, force=True)
         db.commit()
+        print(f"Evaluated AI deck personalities for {evaluated} FRA deck(s)")
         return len(encounter_rows), len(card_rows)
     except Exception:
         db.rollback()

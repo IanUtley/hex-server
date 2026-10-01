@@ -5,6 +5,7 @@ import os
 import sys
 import gzip
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -121,6 +122,17 @@ def test_tournament_session_pids_ignore_non_player_card_owners():
         test_db.close()
 
 
+def test_projected_chain_owner_normalizes_typed_service_player_uid():
+    raw_player_id = 2408558011085730
+    typed_player_id = game_engine.UID.make(244, raw_player_id)
+
+    assert tournament_game._raw_player_id(raw_player_id) == raw_player_id
+    assert tournament_game._raw_player_id(typed_player_id) == raw_player_id
+    assert game_engine.UID.make(
+        244, tournament_game._raw_player_id(typed_player_id)).uid64 == (
+            typed_player_id.uid64)
+
+
 def test_orphaned_started_tournaments_are_closed_but_live_and_waiting_remain():
     previous_db = db._db
     test_db = sqlite3.connect(":memory:")
@@ -201,6 +213,91 @@ def test_old_tournaments_close_and_remove_only_their_game_state():
         assert test_db.execute(
             "SELECT session_id FROM game_cards ORDER BY session_id"
         ).fetchall() == [("new-session",)]
+    finally:
+        db._db = previous_db
+        test_db.close()
+
+
+def test_stale_session_sweep_removes_only_unowned_old_sessions():
+    """Abandoned Practice/PvE sessions are swept; tournament/replay state is not.
+
+    Practice/FRA/PvE sessions never write replays, so nothing else removes
+    their game_sessions row and full deck copy of game_cards.  The sweep must
+    stay away from sessions referenced by a tournament or tournament match,
+    and from a session whose replay is still awaiting indexing.
+    """
+    import pvp_db
+
+    previous_db = db._db
+    test_db = sqlite3.connect(":memory:")
+    try:
+        test_db.executescript(
+            """
+            CREATE TABLE game_sessions (
+                session_id TEXT PRIMARY KEY, state TEXT, created_at TEXT
+            );
+            CREATE TABLE game_cards (session_id TEXT, card_uid INTEGER);
+            CREATE TABLE session_events (session_id TEXT);
+            CREATE TABLE session_transactions (session_id TEXT);
+            CREATE TABLE game_replays (session_id TEXT, status TEXT);
+            CREATE TABLE tournaments (id INTEGER PRIMARY KEY, session_id TEXT);
+            CREATE TABLE tournament_matches (
+                id INTEGER PRIMARY KEY, session_id TEXT
+            );
+            INSERT INTO tournaments VALUES (1, 'tourney-linked');
+            INSERT INTO tournament_matches VALUES (1, 'corinth-match');
+            INSERT INTO game_sessions VALUES
+                ('Session-old', 'joined', datetime('now', '-30 days')),
+                ('Session-new', 'joined', datetime('now')),
+                ('tourney-linked', 'setup', datetime('now', '-30 days')),
+                ('corinth-match', 'setup', datetime('now', '-30 days')),
+                ('replay-pending', 'setup', datetime('now', '-30 days')),
+                ('replay-ready', 'setup', datetime('now', '-30 days'));
+            INSERT INTO game_cards VALUES
+                ('Session-old', 1), ('Session-old', 2), ('Session-new', 3),
+                ('tourney-linked', 4), ('corinth-match', 5),
+                ('replay-pending', 6), ('replay-ready', 7);
+            INSERT INTO session_events VALUES
+                ('Session-old'), ('replay-ready'), ('replay-pending'),
+                ('lost-session'), ('ghost-replay');
+            INSERT INTO session_transactions VALUES
+                ('Session-old'), ('replay-ready'), ('replay-pending'),
+                ('lost-txn');
+            INSERT INTO game_replays VALUES
+                ('replay-pending', 'pending'), ('replay-ready', 'ready'),
+                ('ghost-replay', 'ready');
+            """
+        )
+        db._db = test_db
+
+        assert pvp_db.db_cleanup_stale_sessions(7) == {
+            "sessions_removed": 2,
+            "cards_removed": 3,
+            "events_removed": 3,
+            "transactions_removed": 3,
+        }
+        assert test_db.execute(
+            "SELECT session_id FROM game_sessions ORDER BY session_id"
+        ).fetchall() == [
+            ("Session-new",), ("corinth-match",), ("replay-pending",),
+            ("tourney-linked",),
+        ]
+        # Source rows survive while a session or replay record can read them;
+        # a session-less event with no replay is unreachable and reclaimed.
+        assert test_db.execute(
+            "SELECT session_id FROM session_events ORDER BY session_id"
+        ).fetchall() == [("ghost-replay",), ("replay-pending",)]
+        assert test_db.execute(
+            "SELECT session_id FROM session_transactions ORDER BY session_id"
+        ).fetchall() == [("replay-pending",)]
+        # The ready replay keeps its index row (the replay worker owns the
+        # artifact retention); only its source session is released.
+        assert test_db.execute(
+            "SELECT session_id, status FROM game_replays ORDER BY session_id"
+        ).fetchall() == [
+            ("ghost-replay", "ready"), ("replay-pending", "pending"),
+            ("replay-ready", "ready"),
+        ]
     finally:
         db._db = previous_db
         test_db.close()
@@ -481,13 +578,299 @@ def test_completed_result_publishes_final_full_snapshot_synchronously():
     timer.assert_not_called()
 
 
+def test_tournament_champion_setup_publishes_the_charge_power_catalog():
+    """Corinth's charge power is a synthetic champion card.
+
+    ``AbilityCanBeActivatedRequirement`` gates it on the ability catalog
+    projected on the champion.  The tournament setup recorded only the
+    champion SessionCardId/GUID, so the native facts bridge read an empty
+    catalog and rejected every champion power (live: Corinth's charge power).
+    """
+    from rules_port.runtime_adapter import PvpRuntimeFacts
+    CORINTH = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
+    CHARGE = "286f1891-4404-585e-4fb6-bd9f783f222b"
+
+    class Handler:
+        client_reck_id = 2408558011085730
+
+    handler = Handler()
+    tournament_game._pvp_set_handler_champions(
+        handler, game_engine.SessionCardId(game_engine.UID(10753)),
+        game_engine.SessionCardId(game_engine.UID(5377)), CORINTH, CORINTH)
+    catalog = {str(value.guid).lower()
+               for value in handler._player_champ_abilities}
+    assert CHARGE in catalog, catalog
+
+    state = {"pvp": True, "champ_map": {"2408558011085730": 10753,
+                                        "1925190388022160": 5377}}
+    player_uid = game_engine.UID.make(244, 2408558011085730)
+    facts = PvpRuntimeFacts(4242, state, player_uid=player_uid,
+                            ai_uid=game_engine.UID.make(244, 1925190388022160))
+    facts.client_player_uid = player_uid
+    facts.player_champion_card_id = handler._player_champ_scid
+    facts.ai_champion_card_id = handler._ai_champ_scid
+    facts.ai_champion_ability_guids = list(handler._ai_champ_ability_guids)
+    # Pre-fix shape: an empty catalog refused the authored charge power.
+    facts.player_champion_ability_guids = ()
+    assert not facts.can_activate_champion_ability(10753, player_uid, CHARGE)
+    # The catalog published by champion setup lets the gate accept it.
+    facts.player_champion_ability_guids = tuple(catalog)
+    assert facts.can_activate_champion_ability(10753, player_uid, CHARGE)
+
+
+def test_pvp_ability_item_releases_its_stack_mirror():
+    """A resolved champion ability must not re-queue itself as the next item.
+
+    The persisted stack is only the reconnect/wire mirror.  The ability
+    projection drops this item's entry by identity, which is what stops the
+    native chain resolver from re-queueing the item it just resolved.
+    """
+    item = {"kind": "ability",
+            "ability_guid": "286f1891-4404-585e-4fb6-bd9f783f222b",
+            "source_uid": 9003, "owner_id": 1001, "instance_id": 31}
+    state = {"pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+             "phase": int(game_engine.ETurnPhases.FirstMainPhase),
+             "champ_map": {"1001": 9001, "1002": 9002},
+             "hp_1001": 20, "hp_1002": 20,
+             "stack": [dict(item)], "stack_passed": []}
+
+    class Session:
+        session_id = 42765
+        session_name = "tourney-7"
+        turn_order = state
+        players = ()
+
+        def _persist(self):
+            pass
+
+    class Handler:
+        client_reck_id = 1001
+        _card_full_data = lambda *args, **kwargs: (None,) * 7
+
+    resolved = []
+    with mock.patch.object(tournament_game, "db_game_session_pids",
+                           return_value=[1001, 1002]), \
+            mock.patch.object(tournament_game, "_pvp_send_same_events"), \
+            mock.patch.object(tournament_game, "_pvp_populate_game_state"), \
+            mock.patch.object(tournament_game, "_pvp_dispatch_triggers"), \
+            mock.patch("rules_port.resolution.resolve_port_ability",
+                       lambda *args, **kwargs: resolved.append(1)):
+        ok = tournament_game._pvp_resolve_ability_item(
+            Session(), state, Handler(), 1001, dict(item))
+    assert ok is True
+    assert resolved == [1], resolved
+    assert not state.get("stack"), state
+
+
+def test_pvp_session_pids_fall_back_to_the_checkpoint_and_transport():
+    """A tourney host names its participants before the card rows exist.
+
+    ``db_game_session_pids`` reads ``game_cards``, which is written with the
+    opening hands.  The first gameplay transaction of a resumed match can
+    therefore arrive with fewer than two participant rows; the attach used to
+    give up and drop the session onto the legacy stack.  The checkpoint and
+    the transport metadata both name both players.
+    """
+
+    class Session:
+        players = ()
+
+    state = {"pvp": True, "pids": [1001, 1002]}
+    assert tournament_game._pvp_session_pids(Session(), state) == [1001, 1002]
+    assert tournament_game._pvp_session_pids(
+        Session(), {"pvp": True, "champ_map": {"7": 9001, "9": 9002}}
+    ) == [7, 9]
+    typed = [(game_engine.UID.make(244, 31), 0),
+             (game_engine.UID.make(244, 32), 1)]
+    assert tournament_game._pvp_session_pids(
+        SimpleNamespace(players=typed), {"pvp": True}) == [31, 32]
+    # A session that names only one participant is still not a two-human game.
+    assert tournament_game._pvp_session_pids(
+        Session(), {"pvp": True, "pids": [1001]}) == []
+
+
+def test_pvp_resolves_a_stack_item_without_a_native_host():
+    """The no-host pass path resolves through the shared chain seam.
+
+    A tourney session without a native host used to run its own copy of the
+    chain-item resolution (``_pvp_resolve_chain``).  It now goes through
+    ``rules_port.chain_items``, so the authored effect resolvers and the
+    picker-continuation marker cannot drift from the attached path.
+    """
+    item = {"kind": "trigger",
+            "ability_guid": "9853659b-89f4-1e16-f940-67bdb37f5729",
+            "source_uid": 9003, "source_owner_uid": 1001,
+            "trigger_target_uid": 9003, "instance_id": 21}
+    state = {"pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+             "phase": int(game_engine.ETurnPhases.FirstMainPhase),
+             "stack": [dict(item)], "stack_passed": [],
+             "champ_map": {"1001": 9001, "1002": 9002},
+             "hp_1001": 20, "hp_1002": 20}
+
+    class Session:
+        session_id = 42765
+        session_name = "tourney-7"
+        turn_order = state
+        players = ()
+
+        def _persist(self):
+            pass
+
+    class Handler:
+        _card_full_data = lambda *args, **kwargs: (None,) * 7
+
+    calls = []
+
+    def fake_trigger(*_args, **_kwargs):
+        calls.append("bom")
+
+    with mock.patch.object(tournament_game, "db_game_session_pids",
+                           return_value=[1001, 1002]), \
+            mock.patch.object(tournament_game, "_pvp_send_same_events"), \
+            mock.patch("rules_port.resolution.resolve_port_trigger",
+                       fake_trigger):
+        resolved = tournament_game._pvp_resolve_stack_item(
+            Session(), state, Handler(), 1001)
+    assert resolved is True
+    assert calls == ["bom"], calls
+    assert not state.get("stack"), state
+    assert state.get("priority_pid") == 1001, state
+
+
+def test_pvp_chain_item_uses_the_shared_seam_and_its_picker_marker():
+    """PvP resolves chain items through the shared RulesPort seam.
+
+    Practice/PvE and tournament PvP used to keep a copy of the chain-item
+    lifecycle each, and the PvP copy never produced
+    ``completed_chain_instance_id``: a Deathcry deck search re-ran its BOM
+    once per remaining candidate (Darkspire Priestess asked four times for a
+    single death), and PvP carried three overlapping per-kind resolvers.
+    """
+    from rules_port import chain_items
+    from rules_port.actions import AbilityResolutionState
+
+    state = {
+        "pvp": True, "pids": [1001, 1002], "turn_pid": 1001,
+        "phase": int(game_engine.ETurnPhases.FirstMainPhase),
+        "stack": [], "stack_passed": [],
+        "champ_map": {"1001": 9001, "1002": 9002},
+        "hp_1001": 20, "hp_1002": 20,
+    }
+    item = {"kind": "trigger",
+            "ability_guid": "9853659b-89f4-1e16-f940-67bdb37f5729",
+            "source_uid": 9003, "source_owner_uid": 1001,
+            "trigger_target_uid": 9003, "instance_id": 12}
+    state["stack"].append(dict(item))
+    ability = SimpleNamespace(descriptor=dict(item), instance_id=12,
+                             ignores_chain=False)
+
+    class Session:
+        session_id = 42765
+        session_name = "tourney-7"
+        turn_order = state
+
+        def _persist(self):
+            pass
+
+    class Handler:
+        _card_full_data = lambda *args, **kwargs: (None,) * 7
+
+    session = Session()
+    host = tournament_game._PvpChainHost(Handler(), session, state, 1001, 1002)
+    calls = []
+
+    def fake_trigger(*_args, **_kwargs):
+        calls.append("bom")
+        # The authored BOM parks on its deck-search picker.
+        state["resolution_paused"] = True
+
+    pl_uid = game_engine.UID.make(244, 1001)
+    ai_uid = game_engine.UID.make(244, 1002)
+    with mock.patch.object(tournament_game, "db_game_session_pids",
+                           return_value=[1001, 1002]), \
+            mock.patch.object(tournament_game, "_pvp_send_same_events"), \
+            mock.patch("rules_port.resolution.resolve_port_trigger",
+                       fake_trigger):
+        first = chain_items.resolve_chain_item(
+            host, None, session, db._db, ability, pl_uid, ai_uid)
+        assert first is AbilityResolutionState.WAITING_FOR_INPUT, first
+        assert calls == ["bom"], calls
+        # The picker's chain item is held with the shared marker.
+        assert state["paused_chain_instance_id"] == 12, state
+        assert state["resolution_paused"] is True, state
+        # The picker answer resolves that BOM and marks the chain item.
+        state.pop("resolution_paused")
+        state.pop("paused_chain_instance_id", None)
+        state["completed_chain_instance_id"] = 12
+        # Production builds the projection host per request, so the next pass
+        # reads the marker that the answer just wrote.
+        answer_host = tournament_game._PvpChainHost(
+            Handler(), session, state, 1001, 1002)
+        second = chain_items.resolve_chain_item(
+            answer_host, None, session, db._db, ability, pl_uid, ai_uid)
+    assert second is AbilityResolutionState.COMPLETED, second
+    assert calls == ["bom"], calls
+    assert "completed_chain_instance_id" not in state, state
+    assert "paused_chain_instance_id" not in state, state
+    assert state["priority_pid"] == 1001, state
+
+
+def test_corinth_format_never_deals_a_draw_step():
+    """Merry-Melee Corinth has no draw step.
+
+    The native Prep branch reaches Draw only when the port's
+    ``active_player_skips_draw`` fact is clear, and the draw projection must
+    not deal a card even if a phase cursor still reaches Draw.  Live symptom:
+    the turn player drew a card while the champion power says "Skip your draw
+    phase".
+    """
+    from rules_port.pvp_lifecycle import skips_draw_phase
+
+    state = {"pvp": True, "corinth_mode": True, "skip_draw_phase": True,
+             "turn_pid": 2408558011085730, "turn_number": 3,
+             "draws_first_pid": 1925190388022160}
+    assert skips_draw_phase(state)
+    phases = tournament_game._pvp_turn_phase_list(
+        state, state["turn_pid"], False)
+    assert game_engine.ETurnPhases.Draw not in phases, phases
+
+    class Session:
+        session_id = 199437
+
+        def _persist(self):
+            pass
+
+    with mock.patch.object(tournament_game, "db_game_session_pids",
+                           return_value=[2408558011085730,
+                                         1925190388022160]), \
+            mock.patch.object(tournament_game, "pvp_save_state"), \
+            mock.patch.object(tournament_game, "db_game_draw_cards",
+                              return_value=[(1, db._db.execute(
+                                  "SELECT guid FROM card_templates "
+                                  "WHERE card_type='Troop' LIMIT 1"
+                              ).fetchone()[0])]) as draw:
+        assert tournament_game._pvp_run_draw(Session(), state) is None
+        draw.assert_not_called()
+        # An ordinary format still draws on turn 3.
+        ordinary = dict(state, corinth_mode=False, skip_draw_phase=False)
+        tournament_game._pvp_run_draw(Session(), ordinary)
+        assert draw.called
+
+
 if __name__ == "__main__":
     test_pvp_concede_ends_for_both_players()
     test_tournament_session_pids_ignore_non_player_card_owners()
     test_old_tournaments_close_and_remove_only_their_game_state()
+    test_stale_session_sweep_removes_only_unowned_old_sessions()
     test_pvp_champion_damage_uses_target_player_health()
     test_completed_match_is_visible_in_tournament_lobby()
     test_forfeit_completes_active_bo1_match()
     test_complete_status_event_uses_client_tournament_enums()
     test_completed_result_publishes_final_full_snapshot_synchronously()
+    test_tournament_champion_setup_publishes_the_charge_power_catalog()
+    test_pvp_ability_item_releases_its_stack_mirror()
+    test_pvp_session_pids_fall_back_to_the_checkpoint_and_transport()
+    test_pvp_resolves_a_stack_item_without_a_native_host()
+    test_pvp_chain_item_uses_the_shared_seam_and_its_picker_marker()
+    test_corinth_format_never_deals_a_draw_step()
     print("tournament lobby tests passed")

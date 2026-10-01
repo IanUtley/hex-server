@@ -16,18 +16,44 @@ def _champion_uid(context, owner):
     return int(champion.uid.uid64) if champion is not None else None
 
 
+def _drawn_this_turn(context, owner):
+    turn = int(context.bstate.get("turn_number", 1) or 1)
+    entry = (context.bstate.get("cards_drawn_this_turn") or {}).get(str(owner))
+    if not isinstance(entry, dict) or int(entry.get("turn", -1)) != turn:
+        return 0
+    return int(entry.get("count", 0) or 0)
+
+
+def _record_draw(context, owner):
+    turn = int(context.bstate.get("turn_number", 1) or 1)
+    store = context.bstate.setdefault("cards_drawn_this_turn", {})
+    store[str(owner)] = {"turn": turn,
+                         "count": _drawn_this_turn(context, owner) + 1}
+
+
 def draw_cards(context, count, owner=None):
     """Draw cards through the native zone, replacement, and trigger path."""
     from pvp_db import db_deck_top_card_details, db_draw_card_to_hand
-    from .runtime_helpers import owner_uid
+    from .runtime_helpers import owner_uid, raw_uid
+    from .static_rules import champion_int_attribute, \
+        champion_int_attr_optional
     count = max(0, int(count or 0))
     if owner is None:
         owner = context.target_owner(default=None)
     if owner is None:
         owner = context.bstate.get("resolving_owner_id", 0)
     owner = int(owner or 0)
+    # Session.DrawCard: MaxCardsDrawablePerTurn (-1/absent is unlimited,
+    # CantDrawCards forces zero) refuses a draw without a deck-out loss.
+    draw_cap = champion_int_attr_optional(
+        context.bstate, owner, "MaxCardsDrawablePerTurn")
+    if champion_int_attribute(context.bstate, owner, "CantDrawCards") > 0:
+        draw_cap = 0
     drawn = 0
     for _ in range(count):
+        if (draw_cap is not None and draw_cap != -1
+                and _drawn_this_turn(context, owner) >= draw_cap):
+            break
         row = db_deck_top_card_details(
             context.session.session_id, owner, conn=context.db)
         if not row:
@@ -66,7 +92,8 @@ def draw_cards(context, count, owner=None):
         context.game.push_card_updated(
             scid, recipient, game_engine.ECardCollections.Hand, card_type,
             template_id=_tpl, cost=cost, attack=attack, defense=defense,
-            gems=gems, nulling=owner == 0)
+            gems=gems,
+            nulling=raw_uid(recipient) != raw_uid(context.player_uid))
         context._emit_trigger(
             "CardEnteredZoneEvent", card_uid, owner,
             event_source_collection="deck",
@@ -74,5 +101,8 @@ def draw_cards(context, count, owner=None):
         context._emit_trigger(
             "CardDrawnEvent", _champion_uid(context, owner), owner,
             target_card_id=card_uid)
+        from .statistics import record_ability_card_list
+        record_ability_card_list(context.bstate, "DrawnCards", card_uid)
+        _record_draw(context, owner)
         drawn += 1
     return f"draw {drawn} for owner {owner}"

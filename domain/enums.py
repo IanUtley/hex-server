@@ -115,6 +115,11 @@ class ECardTypes:
     Constant = 2048
     Token = 4096
     Quick = 8192
+    Mod = 16384
+    Bane = 32768
+    Simulacrum = 65536
+    Choice = 131072
+    AnyCard = 190586
 
 
 CARD_TYPE_BY_DB = {
@@ -127,6 +132,11 @@ CARD_TYPE_BY_DB = {
     "Gear": ECardTypes.Gear,
     "Token": ECardTypes.Token,
     "Quick": ECardTypes.Quick,
+    "Champion": ECardTypes.Champion,
+    "Mod": ECardTypes.Mod,
+    "Bane": ECardTypes.Bane,
+    "Simulacrum": ECardTypes.Simulacrum,
+    "Choice": ECardTypes.Choice,
 }
 
 
@@ -254,6 +264,8 @@ class ECardShards:
     Sapphire = 16
     Wild = 32
     Diamond = 64
+    Any = 125
+    AnyColor = 124
 
 
 class EGemTypesNew:

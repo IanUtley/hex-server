@@ -161,6 +161,38 @@ def test_typed_activation_x_cost_data_maps_resource_cost():
     assert activation["x_cost"] == 3
 
 
+def test_typed_activation_member_prefixed_x_cost_data_maps_resource_cost():
+    """``XCostData`` serializes its private members with the ``m_`` prefix.
+
+    Live Mono transactions therefore carry ``m_ResourceXCost`` and
+    ``m_CardsToSacrifice`` inside the activation, not the public
+    ``ResourceXCost`` the synthetic envelope above uses.  Without the
+    prefixed aliases the chosen X was dropped and a variable-cost card
+    resolved for 0 (a Burn to the Ground for 3 dealt no damage).
+    """
+    payload = typed_payload_from_decoded(
+        classify_player_transaction(b"PlaySpellTransaction"), {
+            "m_SessionCardId": {"m_UID64": 0x101},
+            "m_AbilityDataList": [{
+                "SourceCardId": {"value": {"m_UID64": 0x101}},
+                "TargetMap": {"0": {
+                    "m_SessionCardIds": [{"m_UID64": 0x201}],
+                    "m_PlayerIds": [],
+                }},
+                "xCostData": {
+                    "m_ResourceXCost": 3,
+                    "m_CardsToSacrifice": [{"value": {"m_UID64": 0x301}}],
+                },
+            }],
+        })
+    activation = payload["ability_data"][0]
+    assert activation["x_cost"] == 3
+    assert activation["x_cost_data"]["resource_x_cost"] == 3
+    # The cost card stays a cost target instead of becoming the effect target.
+    assert activation["target_map"] == {0: [0x201]}
+    assert activation["cost_target_map"] == {0: [0x301]}
+
+
 def test_typed_card_play_preserves_ability_data_and_free_flag():
     command = classify_player_transaction(b"PlaySpellTransaction")
     payload = typed_payload_from_decoded(command, {
@@ -580,6 +612,7 @@ def main():
     test_triggered_flag_wins_when_wire_command_has_both_activation_flags()
     test_typed_activation_target_instances_become_port_target_lists()
     test_typed_activation_x_cost_data_maps_resource_cost()
+    test_typed_activation_member_prefixed_x_cost_data_maps_resource_cost()
     test_typed_payload_extracts_encounter_conversation_id()
     test_typed_payload_extracts_combat_declarations()
     test_empty_assign_damage_order_is_a_typed_noop()

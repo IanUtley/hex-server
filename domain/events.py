@@ -1,6 +1,6 @@
 """SessionEventArgs event classes extracted from game_engine.py."""
 
-from typing import List, Dict
+from typing import Any, List, Dict
 
 from domain.types import UID, ResourceId, SessionCardId, CombatId
 from domain.enums import (
@@ -17,6 +17,16 @@ class SessionEventArgs:
     def __init__(self):
         self.session_id = UID.invalid()
         self.ser = Serializer()
+
+    def __getattr__(self, name: str) -> Any:
+        # Several wire event types are constructed from runtime-selected
+        # classes and receive their payload fields after construction. Keep
+        # those fields dynamically typed while preserving normal attribute
+        # storage and AttributeError behavior.
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
 
     def begin_write(self):
         self.ser.begin_write()
@@ -960,34 +970,6 @@ class PlayerUpdatedSessionEventArgs(SessionEventArgs):
         s.add_bool(self.can_see_enemy_underground)
         s.add_resource_id(self.deck_sleeve_id)
         s.add_int(self.spell_points)
-        return self.end_write()
-
-
-class CostInstanceSessionEventArgs(SessionEventArgs):
-    """A cost the player must pay to activate an ability option (class 66).
-
-    Delivered inside OptionInstanceSessionEventArgs.TargetInstances. The client
-    (PlayerOptions.cs:125) reads it into a CostInstance; a DiscardAbilityCostType
-    cost prompts the 'discard a card' picker (BattleStateAssignXCost).
-    """
-    CLASS_ID = 66
-
-    def __init__(self):
-        super().__init__()
-        self.min = 0
-        self.max = 0
-        self.cost_type = 0
-        self.targets: List[SessionCardId] = []
-        self.target_template_id = ResourceId.invalid()
-
-    def to_byte_array(self) -> bytes:
-        self.begin_write()
-        s = self.ser
-        s.add_int(self.min)
-        s.add_int(self.max)
-        s.add_int(self.cost_type)
-        s.add_list_scid(self.targets)
-        s.add_resource_id(self.target_template_id)
         return self.end_write()
 
 

@@ -4,6 +4,7 @@ import json
 import random
 import re
 import sqlite3
+from typing import Any, cast
 
 import game_engine
 
@@ -332,7 +333,7 @@ def conscript_cards(game, session, db, handler, pl_t, ai_t, bstate,
             card_type, abilities, attributes,
             db_next_game_card_row_id(session.session_id, conn=db), conn=db,
             position=100, card_state=0, owner_user_id=owner_id,
-            original_template_guid=tpl_guid, gems=0)
+            original_template_guid=tpl_guid)
         created.append((card_uid, tpl_guid))
     db.commit()
 
@@ -490,7 +491,7 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     typed_exhausted = effect_template_value(
         db, bstate, effect_guid, "m_EntersPlayExhausted")
     if typed_exhausted is not None:
-        enters_exhausted = int(typed_exhausted or 0)
+        enters_exhausted = int(cast(Any, typed_exhausted) or 0)
     typed_attacking = effect_template_value(
         db, bstate, effect_guid, "m_EntersPlayAttacking")
     copy_gems = bool(effect_template_value(
@@ -599,13 +600,19 @@ def summon_token(game, session, db, handler, pl_t, ai_t, bstate, effect_guid,
     if typed_attacking and not into_hand and not into_deck and not into_choosing:
         token_state |= game_engine.ECardStates.Attacking
 
-    copied_gems = 0
+    copied_gems = None
     if copy_gems:
         source_uid = (bstate or {}).get("resolving_source_uid")
         if source_uid is not None:
             from pvp_db import db_card_gem_type
-            copied_gems = int(db_card_gem_type(
-                session.session_id, int(source_uid), conn=db) or 0)
+            source_gems = db_card_gem_type(
+                session.session_id, int(source_uid), conn=db)
+            try:
+                source_gems = int(source_gems or 0)
+            except (TypeError, ValueError):
+                source_gems = 0
+            if source_gems:
+                copied_gems = source_gems
 
     try:
         from pvp_db import db_template_subtype

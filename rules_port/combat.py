@@ -232,6 +232,47 @@ def _card_key(card):
         return id(card)
 
 
+def remove_troop_from_combat(state, card_uid) -> bool:
+    """Port of C# ``Session.RemoveTroopFromCombat`` for the persisted combat.
+
+    ``Session.DeactivateCard`` runs it the moment a troop leaves play, so the
+    C# combat object drops the card (attacker -> cleared, blocker -> removed
+    from the list) while ``ECombatFlags.AttackBlocked`` stays set.  The
+    checkpoint's declaration maps *are* the port's combat, so a troop that
+    leaves play has to be removed from them as well: otherwise a blocker killed
+    in the Swiftstrike step that a Deathcry returns to play (Bone Warrior ->
+    Pile of Bones, Spiritbound Spy -> Phantom) is still treated as a live
+    blocker during the normal damage step and absorbs damage the C# gives to
+    nobody.  Pruning the last blocker also records the attack as blocked, the
+    way the client's sticky ``AttackBlocked`` flag keeps the normal step
+    blocked (no champion damage without Crush) once its blocker is gone.
+    """
+    if not isinstance(state, dict):
+        return False
+    uid = _card_key(card_uid)
+    removed = False
+    for key in ("player_attackers", "ai_attackers"):
+        declarations = state.get(key)
+        if not isinstance(declarations, dict):
+            continue
+        for declared in list(declarations):
+            if _card_key(declared) == uid:
+                del declarations[declared]
+                removed = True
+    blockers = state.get("ai_blockers")
+    if isinstance(blockers, dict):
+        for attacker, values in list(blockers.items()):
+            if not isinstance(values, (list, tuple)):
+                continue
+            kept = [value for value in values if _card_key(value) != uid]
+            if len(kept) == len(values):
+                continue
+            blockers[attacker] = kept
+            state.setdefault("blocked_attackers", {})[str(attacker)] = True
+            removed = True
+    return removed
+
+
 def _is_troop(card) -> bool:
     return bool(getattr(card, "is_troop", True))
 
@@ -261,7 +302,8 @@ class CombatResolver:
     """The source algorithm with session damage delegated through ``damage``.
 
     ``damage(source, target, amount, only_minimum_to_kill)`` must mutate the
-    authoritative state and return actual damage dealt.  That makes simultaneous
+    authoritative state and return damage absorbed (dealt plus prevention),
+    matching Session.DamageCard's out parameter. That makes simultaneous
     result accumulation and existing trigger/event order testable at the
     adapter boundary.
     """
@@ -283,11 +325,14 @@ class CombatResolver:
         if _cares_about_phase(attacker, phase):
             remaining = _combat_damage(attacker)
             if combat.blockers:
-                last = combat.blockers[-1]
                 for blocker in combat.blockers:
                     if _in_warzone(blocker) and _is_troop(blocker):
-                        minimum = blocker is not last or _has_juggernaut(attacker)
-                        dealt = int(damage(attacker, blocker, remaining, minimum))
+                        # C#'s assignment gives each blocker only the minimum
+                        # lethal damage; the remainder stays with the attacker
+                        # and breaks through to the champion only with Crush.
+                        # Overkill is therefore not dealt (nor healed by
+                        # SpiritDrain) unless Juggernaut applies.
+                        dealt = int(damage(attacker, blocker, remaining, True))
                         remaining -= dealt
                         results.append(CombatResult(attacker, blocker, dealt))
             if not combat.is_attack_blocked or _has_juggernaut(attacker):

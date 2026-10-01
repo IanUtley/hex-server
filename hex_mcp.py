@@ -509,6 +509,7 @@ def _card_detail(card: Mapping[str, Any]) -> dict[str, Any]:
         "no_pvp": bool(card["no_pvp"]),
         "equipment_modified": bool(card["equipment_modified"]),
         "variable_cost": bool(card["variable_cost"]),
+        "variable_cost_double": bool(card["variable_cost_double"]),
         "variable_cost_minimum": card["variable_cost_minimum"],
         "sacrifice_target": card["sacrifice_target"] or None,
         "abilities": [

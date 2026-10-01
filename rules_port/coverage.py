@@ -90,7 +90,7 @@ FILTER_COVERAGE = {
     "HasKeywordAbility": "native", "HasName": "native", "IsRarity": "native",
     "IsToken": "native", "IsResource": "native", "IsQuick": "native",
     "IsTroop": "native", "IsArtifact": "native",
-    "IsHero": "native", "IsDamaged": "native", "IsAttacking": "native",
+    "IsHero": "native", "IsDamaged": "structural", "IsAttacking": "native",
     "IsBlocking": "native", "IsPlayedThisTurn": "native",
     "IsDamagedThisTurn": "native", "IsHealedThisTurn": "native",
     "IsSocketable": "native", "IsSocketed": "native", "HasTag": "native",

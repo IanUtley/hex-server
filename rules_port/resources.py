@@ -34,6 +34,46 @@ class ResourcePlay:
     threshold: ResourceChange | None
 
 
+def resource_play_count(state, side: str, *, player_id=None) -> int:
+    """Return this turn's resource plays, including older boolean checkpoints."""
+    state = state if isinstance(state, dict) else {}
+    if player_id is not None:
+        try:
+            return max(0, int(state.get(f"res_played_{int(player_id)}", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    side = "player" if str(side).lower() == "player" else "ai"
+    key = f"{side}_resource_plays_this_turn"
+    if key in state:
+        try:
+            return max(0, int(state.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    # Existing turn checkpoints stored only a boolean. Treat that as one
+    # already-played resource so hot-loaded sessions retain their allowance.
+    return int(bool(state.get(f"{side}_resource_played_this_turn")))
+
+
+def resource_play_limit(db, session_id, battle_state, owner_id) -> int:
+    """Compute the current allowance from the owner's champion-context IntAttrs."""
+    from .static_rules import player_int_attributes
+    attrs = player_int_attributes(
+        db, session_id, battle_state, int(owner_id or 0))
+    try:
+        additional = int(attrs.get(
+            "AdditionalResourcesPlayableOnYourTurn", 0) or 0)
+    except (TypeError, ValueError):
+        additional = 0
+    return max(0, 1 + additional)
+
+
+def can_play_resource(state, side: str, *, limit: int = 1,
+                      player_id=None) -> bool:
+    """Whether the controller has remaining authored resource plays this turn."""
+    return resource_play_count(
+        state, side, player_id=player_id) < max(0, int(limit))
+
+
 def printed_resource_choice_ability(ability_guids):
     """Find an authored resource ability that creates a choice picker."""
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
@@ -142,6 +182,151 @@ def _resource_grant_property(param):
     }
 
 
+class _ResourceSession:
+    """Minimal session view needed by the shared authored-condition engine."""
+
+    def __init__(self, session_id):
+        self.session_id = int(session_id)
+
+
+_THRESHOLD_INDEX_FLAGS = {0: 0, 1: 4, 2: 8, 3: 16, 4: 32, 5: 64}
+
+
+def _hand_threshold_requirements(db, session_id, owner_id):
+    """Return the greatest authored threshold need in the controller's hand.
+
+    Conditional resource leaves such as Primal Shard are authored as
+    ``YouHaveA<colour>CardInYourHand``.  The condition tells us that a colour
+    is relevant, while the hand card's typed threshold tells us whether the
+    controller still needs more of it.  Keep this derived view local to the
+    resource operation; normal fixed-colour resources continue to grant their
+    authored threshold on every play.
+    """
+    rows = db.execute(
+        "SELECT ct.threshold_json FROM game_cards gc "
+        "JOIN card_templates ct ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.user_id=? AND gc.location='hand'",
+        (int(session_id), int(owner_id))).fetchall()
+    requirements = {}
+    for (raw,) in rows:
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        values = payload.get("values")
+        if isinstance(values, (list, tuple)) and values:
+            for index, count in enumerate(values):
+                try:
+                    amount = int(count or 0)
+                except (TypeError, ValueError):
+                    continue
+                flag = _THRESHOLD_INDEX_FLAGS.get(index, index)
+                if amount > 0 and flag:
+                    requirements[flag] = max(
+                        requirements.get(flag, 0), amount)
+            continue
+        counts = {}
+        for item in payload.get("list", ()) or ():
+            try:
+                flag = _THRESHOLD_INDEX_FLAGS.get(int(item), int(item))
+            except (TypeError, ValueError):
+                continue
+            if flag:
+                counts[flag] = counts.get(flag, 0) + 1
+        for flag, amount in counts.items():
+            requirements[flag] = max(requirements.get(flag, 0), amount)
+    return requirements
+
+
+def _active_threshold_count(state, owner_id, flag):
+    """Read one owner's threshold count from either PVE or PvP state."""
+    state = state if isinstance(state, dict) else {}
+    try:
+        owner_id = int(owner_id or 0)
+        flag = int(flag)
+    except (TypeError, ValueError):
+        return 0
+    thresholds = state.get(f"thresh_{owner_id}")
+    if not isinstance(thresholds, dict):
+        thresholds = state.get(
+            "ai_threshold" if owner_id == 0 else "player_threshold", {})
+    if not isinstance(thresholds, dict):
+        return 0
+    return int(thresholds.get(flag, thresholds.get(str(flag), 0)) or 0)
+
+
+def resource_threshold_grants(db, session_id, owner_id, ability_guids, state,
+                              *, source_uid=None):
+    """Return the ``(shard_flag, amount)`` thresholds a resource grants.
+
+    The typed ``ThresholdModifier`` color and amount and the effect's authored
+    condition are the source of truth. Missing metadata produces no grant.
+
+    Conditions are evaluated from their authored metadata against the
+    controller's current hand. A qualifying card enables that effect's own
+    threshold amount; unrelated card costs in hand do not change the grant.
+    """
+    from pvp_db import db_ability_effect_rows
+    from rules_port.metadata import modifier_metadata
+    leaves = []
+    for guid in ability_guids or ():
+        for effect_guid, effect_type, param in db_ability_effect_rows(
+                str(guid).lower(), conn=db):
+            if effect_type != "CardModifierAbilityEffectTemplate":
+                continue
+            try:
+                value = json.loads(param or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            typed = modifier_metadata(effect_guid)
+            property_name = str(typed.get("property") or
+                                value.get("property") or "").lower()
+            if property_name != "threshold":
+                continue
+            threshold_color = (typed.get("thresholdcolor") or
+                               value.get("thresholdcolor"))
+            color_name = str(threshold_color or "").rsplit(".", 1)[-1].lower()
+            flag = int(game_engine.SHARD_TO_FLAG.get(color_name, 0))
+            if not flag:
+                continue
+            amount = int(value.get("amount") or 0)
+            if amount <= 0:
+                continue
+            condition_id = str(value.get("condition_id") or "")
+            if condition_id.lower() == "0" * 36:
+                condition_id = ""
+            leaves.append((flag, amount, condition_id))
+    if leaves:
+        from rules_port.condition_context import ConditionContext
+        from rules_port.conditions import evaluate_effect_condition
+        context = ConditionContext(
+            db, _ResourceSession(session_id), state,
+            ability_source_uid=(int(source_uid) if source_uid is not None
+                               else None),
+            ability_source_owner_id=int(owner_id or 0))
+        hand_needs = _hand_threshold_requirements(
+            db, session_id, owner_id)
+        grants = []
+        for flag, amount, condition_id in leaves:
+            if condition_id and not evaluate_effect_condition(
+                    db, condition_id, context):
+                continue
+            # A condition that is satisfied by a qualifying hand card should
+            # not add a redundant threshold once that card's authored
+            # requirement is already met.  No hand requirement means the
+            # condition is not this resource-need pattern, so preserve the
+            # authored grant.
+            required = hand_needs.get(flag)
+            if (condition_id and required is not None and
+                    _active_threshold_count(state, owner_id, flag) >= required):
+                continue
+            grants.append((flag, amount))
+        return grants
+    return []
+
+
 def apply_resource_change(state: MutableMapping, side: str, property: str,
                           amount: int, *, color: int = 0) -> ResourceChange:
     """Apply one typed resource change and return its client-facing delta."""
@@ -160,6 +345,12 @@ def apply_resource_change(state: MutableMapping, side: str, property: str,
         return ResourceChange(side, property, amount, old, new, int(color))
     if property not in {"currentresource", "totalresource", "chargepoints"}:
         raise ValueError(f"unsupported resource property: {property}")
+    if property == "chargepoints" and amount > 0:
+        # Session.SetChampionChargePoints: positive charge gains add the
+        # controller champion's ChargePointBonus.
+        from .static_rules import champion_int_attribute
+        amount += champion_int_attribute(
+            state, _owner_for_side(state, side), "ChargePointBonus")
     key = {
         "currentresource": f"{side}_resources",
         "totalresource": f"{side}_total_resources",
@@ -168,12 +359,37 @@ def apply_resource_change(state: MutableMapping, side: str, property: str,
     old = int(state.get(key, 0) or 0)
     new = max(0, old + amount)
     state[key] = new
+    if property == "chargepoints" and new > old:
+        from .statistics import record_charge_gained
+        record_charge_gained(state, _owner_for_side(state, side), new - old)
     return ResourceChange(side, property, amount, old, new)
+
+
+def _owner_for_side(state, side):
+    """Return a raw participant ID from either the PvP or practice view."""
+    if isinstance(state, dict):
+        pids = [int(pid) for pid in (state.get("pids") or ())]
+        if state.get("pvp") and len(pids) >= 2:
+            return pids[0] if str(side).lower() == "player" else pids[1]
+        mapping = state.get("champ_map") or {}
+        for pid in mapping:
+            try:
+                value = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if (str(side).lower() == "ai" and value == 0) or (
+                    str(side).lower() == "player" and value != 0):
+                return value
+        if str(side).lower() == "ai":
+            return 0
+        return int(state.get("player_owner_id", 0) or 0)
+    return 0
 
 
 def play_resource(state: MutableMapping, side: str, current_amount: int,
                   total_amount: int, *, threshold_color: int | None = None,
-                  charge_amount: int = 1) -> ResourcePlay:
+                  charge_amount: int = 1,
+                  additional_plays: int = 0) -> ResourcePlay:
     """Apply the complete authored resource-play transition.
 
     Card movement, triggered abilities, and client events are projections and
@@ -181,7 +397,8 @@ def play_resource(state: MutableMapping, side: str, current_amount: int,
     gameplay state are one atomic RulesPort transition.
     """
     side = "player" if str(side).lower() == "player" else "ai"
-    if state.get(f"{side}_resource_played_this_turn"):
+    if not can_play_resource(
+            state, side, limit=max(0, 1 + int(additional_plays))):
         raise ValueError("resource already played this turn")
     current = apply_resource_change(
         state, side, "currentresource", int(current_amount))
@@ -193,6 +410,8 @@ def play_resource(state: MutableMapping, side: str, current_amount: int,
             state, side, "threshold", 1, color=int(threshold_color))
     charge = apply_resource_change(
         state, side, "chargepoints", int(charge_amount))
+    state[f"{side}_resource_plays_this_turn"] = resource_play_count(
+        state, side) + 1
     state[f"{side}_resource_played_this_turn"] = True
     return ResourcePlay(current, total, charge, threshold)
 
@@ -200,11 +419,14 @@ def play_resource(state: MutableMapping, side: str, current_amount: int,
 def play_resource_for_player(state: MutableMapping, player_id,
                              current_amount: int, total_amount: int,
                              *, threshold_color: int | None = None,
-                             charge_amount: int = 1) -> ResourcePlay:
+                             charge_amount: int = 1,
+                             additional_plays: int = 0) -> ResourcePlay:
     """Apply resource play to a raw-player-id PvP checkpoint."""
     pid = int(player_id)
     played_key = f"res_played_{pid}"
-    if state.get(played_key):
+    if not can_play_resource(
+            state, "player", limit=max(0, 1 + int(additional_plays)),
+            player_id=pid):
         raise ValueError("resource already played this turn")
 
     def change(property_name, amount, *, color=0):
@@ -235,8 +457,17 @@ def play_resource_for_player(state: MutableMapping, player_id,
     total = change("totalresource", total_amount)
     threshold = (change("threshold", 1, color=int(threshold_color))
                  if threshold_color is not None else None)
-    charge = change("chargepoints", charge_amount)
-    state[played_key] = 1
+    bonus = 0
+    if int(charge_amount) > 0:
+        from .static_rules import champion_int_attribute
+        bonus = champion_int_attribute(state, pid, "ChargePointBonus")
+    charge = change("chargepoints", int(charge_amount) + bonus)
+    if charge.new_value > charge.old_value:
+        from .statistics import record_charge_gained
+        record_charge_gained(state, pid,
+                             charge.new_value - charge.old_value)
+    state[played_key] = resource_play_count(
+        state, "player", player_id=pid) + 1
     return ResourcePlay(current, total, charge, threshold)
 
 
@@ -330,6 +561,7 @@ def begin_turn_resources(state: MutableMapping, side: str) -> ResourceChange:
     """Refill one side's current pool and reopen its resource play."""
     normalized = "player" if str(side).lower() == "player" else "ai"
     state[f"{normalized}_resource_played_this_turn"] = False
+    state[f"{normalized}_resource_plays_this_turn"] = 0
     total = int(state.get(f"{normalized}_total_resources", 0) or 0)
     bonus = int(state.pop(f"start_turn_resource_bonus_{normalized}", 0) or 0)
     return apply_resource_change(
@@ -358,6 +590,7 @@ def project_resource_change(game, session, state: MutableMapping, player_uid,
         setattr(game, f"{change.side}_resources", change.new_value)
         event_type = game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs
     elif property == "totalresource":
+        setattr(game, f"{change.side}_total_resources", change.new_value)
         event_type = game_engine.PlayerTotalResourcePoolChangedSessionEventArgs
     elif property == "chargepoints":
         setattr(game, f"{change.side}_charges", change.new_value)
@@ -371,7 +604,8 @@ def project_resource_change(game, session, state: MutableMapping, player_uid,
     event = event_type()
     event.player_id = player_uid if change.side == "player" else ai_uid
     event.operation = 1 if amount >= 0 else 2
-    event.delta = int(amount)
+    event.delta = (abs(int(change.new_value) - int(change.old_value))
+                   if property == "chargepoints" else int(amount))
     event.new_value = change.new_value
     if property == "threshold":
         event.color = int(color)

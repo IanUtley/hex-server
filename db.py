@@ -23,8 +23,10 @@ import hashlib
 import re
 from collections import Counter
 from contextlib import contextmanager
+from contextvars import ContextVar
 from binascii import hexlify
 from datetime import datetime, timezone
+from typing import Any, Callable, TypeVar
 
 DB_PATH = os.environ.get(
     "HEX_DB_PATH",
@@ -36,12 +38,246 @@ REQUEST_LOG = os.environ.get(
     os.path.join(tempfile.gettempdir(), "hconnect_requests.log"),
 )
 _log_req_file = open(REQUEST_LOG, "a", buffering=1)
+SESSION_LOG_DIR = os.environ.get("HEX_SESSION_LOG_DIR", "/tmp/hconnect_sessions")
+PLAYER_LOG_DIR = os.environ.get("HEX_PLAYER_LOG_DIR", SESSION_LOG_DIR)
+_log_session_id = ContextVar("hex_log_session_id", default=None)
+_log_player_id = ContextVar("hex_log_player_id", default=None)
+_log_session_players = ContextVar("hex_log_session_players", default=())
+
+# Logging is intentionally small and dependency-free because this module is
+# imported by every service.  Keep INFO as the default for compatibility with
+# the existing server diagnostics; callers such as the simulator can select a
+# quieter threshold without changing the individual logging call sites.
+LOG_LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+    "OFF": 100,
+}
+_LOG_LEVEL_NAMES = {value: name for name, value in LOG_LEVELS.items()}
+_log_level_lock = threading.RLock()
+log_lock = threading.RLock()
+
+
+def _coerce_log_level(level: str | int) -> int:
+    if isinstance(level, int):
+        if level in _LOG_LEVEL_NAMES:
+            return level
+        raise ValueError(f"unknown log level value: {level}")
+    name = str(level).strip().upper()
+    try:
+        return LOG_LEVELS[name]
+    except KeyError as exc:
+        valid = ", ".join(LOG_LEVELS)
+        raise ValueError(
+            f"unknown log level {level!r}; expected one of {valid}") from exc
+
+
+try:
+    _log_level = _coerce_log_level(os.environ.get("HEX_LOG_LEVEL", "INFO"))
+except ValueError:
+    # A malformed environment setting must not prevent the server from
+    # starting.  The explicit set_log_level API still rejects bad values.
+    _log_level = LOG_LEVELS["INFO"]
+
+
+def set_log_level(level: str | int) -> str:
+    """Set the process-wide logging threshold and return its canonical name."""
+    global _log_level
+    value = _coerce_log_level(level)
+    with _log_level_lock:
+        _log_level = value
+    return _LOG_LEVEL_NAMES[value]
+
+
+def get_log_level() -> str:
+    """Return the current process-wide logging threshold."""
+    with _log_level_lock:
+        return _LOG_LEVEL_NAMES[_log_level]
+
+
+def _log_enabled(level: str | int) -> bool:
+    value = _coerce_log_level(level)
+    with _log_level_lock:
+        return value >= _log_level
+
+
+def _normalize_log_token(value):
+    """Return a safe, stable token for a log filename or lookup."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def _normalize_log_session_id(session_id):
+    return _normalize_log_token(session_id)
+
+
+def _normalize_log_participants(participant_ids):
+    if participant_ids is None:
+        return ()
+    if isinstance(participant_ids, (str, bytes)):
+        participant_ids = (participant_ids,)
+    else:
+        try:
+            participant_ids = tuple(participant_ids)
+        except TypeError:
+            participant_ids = (participant_ids,)
+    values = {_normalize_log_token(value) for value in participant_ids}
+    return tuple(sorted(value for value in values if value is not None))
+
+
+def set_log_context(player_id=None, session_id=None, participant_ids=None):
+    """Bind player and optional game-session logging context."""
+    _log_player_id.set(_normalize_log_token(player_id))
+    _log_session_id.set(_normalize_log_session_id(session_id))
+    _log_session_players.set(_normalize_log_participants(participant_ids))
+    return get_log_session()
+
+
+def set_log_session(session_id, player_id=None, participant_ids=None):
+    """Compatibility wrapper for binding the session logging context."""
+    return set_log_context(player_id, session_id, participant_ids)
+
+
+def get_log_session():
+    """Return the current thread/context's bound game-session token."""
+    return _log_session_id.get()
+
+
+def get_log_player():
+    """Return the current thread/context's stable profile token."""
+    return _log_player_id.get()
+
+
+def get_log_session_players():
+    """Return normalized game participant tokens for the current context."""
+    return _log_session_players.get()
+
+
+def player_log_path(player_id=None):
+    """Return a player's cross-session log path, if a player is bound."""
+    value = (_normalize_log_token(player_id)
+             if player_id is not None else get_log_player())
+    if value is None:
+        return None
+    return os.path.join(PLAYER_LOG_DIR, f"player-{value}.log")
+
+
+def session_log_path(session_id=None, participant_ids=None):
+    """Return the per-session log path, including known player tokens."""
+    value = (_normalize_log_session_id(session_id)
+             if session_id is not None else get_log_session())
+    if value is None:
+        return None
+    participants = (_normalize_log_participants(participant_ids)
+                    if participant_ids is not None
+                    else get_log_session_players())
+    suffix = "".join(f"-p{participant}" for participant in participants)
+    return os.path.join(SESSION_LOG_DIR, f"session-{value}{suffix}.log")
+
+
+def session_log_paths_for_players(player_ids):
+    """Return session logs containing any exact participant token, newest first."""
+    tokens = _normalize_log_participants(player_ids)
+    if not tokens:
+        return []
+    try:
+        entries = os.scandir(SESSION_LOG_DIR)
+    except OSError:
+        return []
+
+    matches = []
+    try:
+        for entry in entries:
+            name = entry.name
+            if (not entry.is_file() or not name.startswith("session-") or
+                    not name.endswith(".log")):
+                continue
+            if not any(re.search(
+                    rf"(?:^|-)p{re.escape(token)}(?:-|\.log$)", name)
+                    for token in tokens):
+                continue
+            try:
+                matches.append((entry.stat().st_mtime, entry.path))
+            except OSError:
+                continue
+    finally:
+        entries.close()
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [path for _mtime, path in matches]
+
+
+def latest_session_log_path_for_players(player_ids, session_id=None):
+    """Return the newest matching session log, optionally for one session."""
+    paths = session_log_paths_for_players(player_ids)
+    if session_id is not None:
+        token = _normalize_log_session_id(session_id)
+        prefix = f"session-{token}-"
+        exact = f"session-{token}.log"
+        paths = [path for path in paths
+                 if (os.path.basename(path).startswith(prefix) or
+                     os.path.basename(path) == exact)]
+    return paths[0] if paths else None
+
+
+@contextmanager
+def log_session_context(session_id, player_id=None, participant_ids=None):
+    """Temporarily route logger output to player and session files."""
+    session_token = _log_session_id.set(_normalize_log_session_id(session_id))
+    player_token = _log_player_id.set(_normalize_log_token(player_id))
+    participant_token = _log_session_players.set(
+        _normalize_log_participants(participant_ids))
+    try:
+        yield
+    finally:
+        _log_session_players.reset(participant_token)
+        _log_player_id.reset(player_token)
+        _log_session_id.reset(session_token)
+
+
+def _write_log_path_locked(path, line):
+    """Append one already-timestamped line to one diagnostic log."""
+    if path is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8", buffering=1) as stream:
+            stream.write(line)
+    except OSError:
+        return
+
+
+def _write_session_log_locked(line):
+    """Append one already-timestamped line to the bound session log.
+
+    Logging must never be allowed to break gameplay if a temporary directory
+    is unavailable or becomes read-only, so file errors are deliberately
+    ignored after the process-wide log has been written.
+    """
+    _write_log_path_locked(session_log_path(), line)
+
+
+def _write_bound_logs_locked(line):
+    """Append the line to the player log and, when present, session log."""
+    paths = (player_log_path(), session_log_path())
+    written = set()
+    for path in paths:
+        if path is not None and path not in written:
+            _write_log_path_locked(path, line)
+            written.add(path)
 
 # SQLITE_BUSY honors the connection busy timeout; SQLITE_LOCKED variants do
 # not.  The latter can occur while another service is finishing a short
-# session/tournament save, so keep retrying long enough for that writer to
-# finish instead of consuming a valid PvP action and acknowledging a no-op.
-_SQLITE_RETRY_DELAYS = (0.05, 0.10, 0.25, 0.50, 1.00, 2.00, 4.00, 8.00)
+# session/tournament save, so retry briefly instead of consuming a valid PvP
+# action and acknowledging a no-op.
+# Keep the explicit SQLITE_LOCKED backoff below the five-second busy timeout.
+_SQLITE_RETRY_DELAYS = (0.05, 0.10, 0.25, 0.50, 1.00, 2.00)
 _SQLITE_LOCK_CODES = {
     getattr(sqlite3, "SQLITE_BUSY", 5),
     getattr(sqlite3, "SQLITE_LOCKED", 6),
@@ -53,6 +289,7 @@ _sqlite_retry_stats_lock = threading.Lock()
 _SQLITE_RETRY_LOG_MILESTONES = {1, 2, 3, 5, 10, 25, 50, 100}
 
 _named_row_types = {}
+_RetryResult = TypeVar("_RetryResult")
 
 
 def _named_row_factory(cursor, values):
@@ -107,9 +344,12 @@ def _record_sqlite_retry(label):
     message = f"[sqlite-retry] count={count} statement={label}"
     # Keep every retry in the request log so a run can be ranked afterward;
     # only milestone counts go to stdout to avoid flooding the server console.
-    _log_req_file.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
-    if count in _SQLITE_RETRY_LOG_MILESTONES:
-        print(message, flush=True)
+    with log_lock:
+        line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
+        _log_req_file.write(line)
+        _write_bound_logs_locked(line)
+        if count in _SQLITE_RETRY_LOG_MILESTONES:
+            print(message, flush=True)
 
 
 def sqlite_retry_stats():
@@ -134,6 +374,120 @@ def _is_sqlite_lock_error(exc):
     )
 
 
+class _LockedCursor:
+    """Serialize a cursor's execute/fetch pair on its shared connection.
+
+    ``sqlite3`` permits a connection to be shared when
+    ``check_same_thread=False`` is set, but a bare ``execute(...).fetchone()``
+    still has two C-level operations with a scheduling point between them.
+    The server uses that shape throughout its data layer.  Keeping the
+    connection lock until the first fetch prevents another thread from
+    interleaving a statement between those operations while retaining the
+    existing per-statement retry behavior.
+    """
+
+    def __init__(self, connection, cursor):
+        self._connection = connection
+        self._cursor = cursor
+        self._lease_held = False
+
+    def hold_lease(self):
+        self._connection._retry_lock.acquire()
+        self._lease_held = True
+
+    def _release_lease(self):
+        if self._lease_held:
+            self._lease_held = False
+            self._connection._retry_lock.release()
+
+    def __del__(self):
+        # Queries such as startup PRAGMAs are often intentionally discarded
+        # without a fetch. Release their connection lease when the temporary
+        # cursor wrapper goes out of scope instead of leaving other threads
+        # blocked indefinitely. CPython drops these short-lived wrappers at
+        # the end of the expression; explicit ``close`` remains available for
+        # retained cursors.
+        try:
+            self._release_lease()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def fetchone(self):
+        if self._lease_held:
+            try:
+                return self._cursor.fetchone()
+            finally:
+                self._release_lease()
+        with self._connection._retry_lock:
+            return self._cursor.fetchone()
+
+    def fetchmany(self, size=None):
+        if self._lease_held:
+            try:
+                if size is None:
+                    return self._cursor.fetchmany()
+                return self._cursor.fetchmany(size)
+            finally:
+                self._release_lease()
+        with self._connection._retry_lock:
+            if size is None:
+                return self._cursor.fetchmany()
+            return self._cursor.fetchmany(size)
+
+    def fetchall(self):
+        if self._lease_held:
+            try:
+                return self._cursor.fetchall()
+            finally:
+                self._release_lease()
+        with self._connection._retry_lock:
+            return self._cursor.fetchall()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._lease_held:
+            try:
+                return next(self._cursor)
+            finally:
+                self._release_lease()
+        with self._connection._retry_lock:
+            return next(self._cursor)
+
+    def close(self):
+        if self._lease_held:
+            try:
+                return self._cursor.close()
+            finally:
+                self._release_lease()
+        with self._connection._retry_lock:
+            return self._cursor.close()
+
+    def __enter__(self):
+        with self._connection._retry_lock:
+            self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            with self._connection._retry_lock:
+                return self._cursor.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._release_lease()
+
+    def __getattr__(self, name):
+        value = getattr(self._cursor, name)
+        if not callable(value):
+            return value
+
+        def call(*args, **kwargs):
+            with self._connection._retry_lock:
+                return value(*args, **kwargs)
+
+        return call
+
+
 class RetryingConnection(sqlite3.Connection):
     """SQLite connection that retries only transient lock operations.
 
@@ -148,7 +502,8 @@ class RetryingConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._retry_lock = threading.RLock()
 
-    def _with_retry(self, label, operation, *args, **kwargs):
+    def _with_retry(self, label: str, operation: Callable[..., _RetryResult],
+                    *args: Any, **kwargs: Any) -> _RetryResult:
         for attempt, delay in enumerate((0.0,) + _SQLITE_RETRY_DELAYS):
             try:
                 return operation(*args, **kwargs)
@@ -159,35 +514,53 @@ class RetryingConnection(sqlite3.Connection):
                 _record_sqlite_retry(label)
                 if delay:
                     time.sleep(delay)
+        raise RuntimeError("SQLite retry loop exhausted without a result")
 
-    def execute(self, sql, parameters=()):
+    def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql)
-            return self._with_retry(
+            cursor = self._with_retry(
                 f"execute {_sqlite_sql_shape(sql)}",
                 super().execute, sql, parameters)
+            wrapped = _LockedCursor(self, cursor)
+            # A statement with a result set is normally consumed immediately
+            # by ``execute(...).fetchone/fetchall``. Hold the lock through that
+            # first fetch so another thread cannot interleave on this shared
+            # sqlite3 connection. DML cursors have no result set and release
+            # the execute lock as usual.
+            if cursor.description is not None:
+                wrapped.hold_lease()
+            return wrapped
 
-    def executemany(self, sql, parameters):
+    def executemany(self, sql: str, parameters: Any) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql)
-            return self._with_retry(
+            cursor = self._with_retry(
                 f"executemany {_sqlite_sql_shape(sql)}",
                 super().executemany, sql, parameters)
+            wrapped = _LockedCursor(self, cursor)
+            if cursor.description is not None:
+                wrapped.hold_lease()
+            return wrapped
 
-    def executescript(self, sql_script):
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
         with self._retry_lock:
             self._last_sql_shape = _sqlite_sql_shape(sql_script)
-            return self._with_retry(
+            cursor = self._with_retry(
                 f"executescript {_sqlite_sql_shape(sql_script)}",
                 super().executescript, sql_script)
+            wrapped = _LockedCursor(self, cursor)
+            if cursor.description is not None:
+                wrapped.hold_lease()
+            return wrapped
 
-    def commit(self):
+    def commit(self) -> None:
         with self._retry_lock:
             return self._with_retry(
                 f"commit after {getattr(self, '_last_sql_shape', '(unknown)')}",
                 super().commit)
 
-    def rollback(self):
+    def rollback(self) -> None:
         with self._retry_lock:
             return super().rollback()
 
@@ -202,7 +575,7 @@ def connect(database_path=None, *, check_same_thread=True):
     """
     conn = sqlite3.connect(
         database_path or DB_PATH,
-        timeout=30.0,
+        timeout=5.0,
         factory=RetryingConnection,
         check_same_thread=check_same_thread,
         # Autocommit: a write releases SQLite's write lock immediately, so a
@@ -211,7 +584,7 @@ def connect(database_path=None, *, check_same_thread=True):
         # explicit ``transaction()`` context manager (BEGIN IMMEDIATE).
         isolation_level=None,
     )
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = _named_row_factory
     return conn
 
@@ -480,18 +853,45 @@ def db_card_stat_mods(session_id, card_uid):
 
 
 
-def log_req(msg: str):
-    log(msg)
-    _log_req_file.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-
-
-log_lock = threading.Lock()
-
-
-def log(msg):
+def log_req(msg: str, level: str | int = "INFO") -> bool:
+    """Print and persist a message when *level* meets the threshold."""
+    if not _log_enabled(level):
+        return False
     with log_lock:
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] {msg}", flush=True)
+        line = f"[{ts}] {msg}\n"
+        print(line.rstrip("\n"), flush=True)
+        _log_req_file.write(line)
+        _write_bound_logs_locked(line)
+    return True
+
+
+def log(msg: str, level: str | int = "INFO") -> bool:
+    """Print a message when *level* meets the process-wide threshold."""
+    if not _log_enabled(level):
+        return False
+    with log_lock:
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        print(line.rstrip("\n"), flush=True)
+        _write_bound_logs_locked(line)
+    return True
+
+
+def log_debug(msg: str) -> bool:
+    return log_req(msg, level="DEBUG")
+
+
+def log_info(msg: str) -> bool:
+    return log_req(msg, level="INFO")
+
+
+def log_warning(msg: str) -> bool:
+    return log_req(msg, level="WARNING")
+
+
+def log_error(msg: str) -> bool:
+    return log_req(msg, level="ERROR")
 
 
 # --- Idle-transaction watchdog -------------------------------------------
@@ -558,11 +958,10 @@ def start_lock_watchdog():
 
 # The HConnect process and the tournament scheduler are separate processes
 # sharing this WAL database.  A short write collision is normal when a game
-# session is persisted while the scheduler refills its room pool; the default
-# sqlite3 timeout (5 seconds) can turn that collision into a request failure.
-# Wait longer for the writer to finish instead.
+# session is persisted while the scheduler refills its room pool; five seconds
+# gives the writer a brief chance to finish without holding the request open.
 _db = connect(DB_PATH, check_same_thread=False)
-_db.execute("PRAGMA busy_timeout=30000")
+_db.execute("PRAGMA busy_timeout=5000")
 _db.execute("PRAGMA journal_mode=WAL")
 _db.execute("PRAGMA foreign_keys=ON")
 
@@ -647,6 +1046,7 @@ def db_get_or_create_user(name, steam_id=None):
                 log(f"    WARN: catch-up new-player grant failed: {e}")
         old_last_login = row[7] if len(row) > 7 else None
         daily_bonus_xp = 0
+        new_xp = row[4] or 0
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if old_last_login:
             try:
@@ -1178,6 +1578,14 @@ def db_record_arena_fight(user_id, won):
 
 def db_update_arena_state(user_id, **kwargs):
     """Update arena state fields."""
+    if not kwargs:
+        return
+    invalid = set(kwargs) - {
+        "deck_id", "wins", "losses", "challenger_index", "fight_history",
+        "gold_earned", "chests_earned", "sacks_earned",
+    }
+    if invalid:
+        raise ValueError("unsupported arena state fields: " + ", ".join(sorted(invalid)))
     sets = ", ".join(f"{k}=?" for k in kwargs)
     vals = list(kwargs.values()) + [user_id]
     _db.execute(f"UPDATE arena_state SET {sets} WHERE user_id=?", vals)
@@ -1206,7 +1614,8 @@ def db_create_fra_challengers(user_id, rng=None):
         SELECT deck_guid, name, champion_guid,
                COALESCE(is_boss, 0), COALESCE(is_elite, 0),
                base_deck_name, COALESCE(min_rank, 6),
-               COALESCE(max_rank, 19)
+               COALESCE(max_rank, 19),
+               COALESCE(NULLIF(TRIM(ai_deck_personality), ''), 'Default')
         FROM fra_encounters
         """
     ).fetchall()
@@ -1215,6 +1624,7 @@ def db_create_fra_challengers(user_id, rng=None):
             "deck": row[0], "name": row[1], "champion": row[2],
             "is_boss": bool(row[3]), "is_elite": bool(row[4]),
             "base": row[5], "min_rank": row[6], "max_rank": row[7],
+            "ai_deck_personality": row[8],
         }
         for row in rows
     ]
@@ -1228,6 +1638,7 @@ def db_create_fra_challengers(user_id, rng=None):
             chosen["champion"],
             chosen["deck"],
             int(is_boss_encounter(chosen)),
+            chosen["ai_deck_personality"],
         ) for rank, chosen in select_fra_roster(encounters, rng=rng)]
 
     _db.execute("DELETE FROM fra_challengers WHERE user_id=?", (user_id,))
@@ -1235,8 +1646,8 @@ def db_create_fra_challengers(user_id, rng=None):
         """
         INSERT INTO fra_challengers
             (user_id, challenger_index, name, champion_guid,
-             encounter_deck_guid, is_boss)
-        VALUES (?, ?, ?, ?, ?, ?)
+             encounter_deck_guid, is_boss, ai_deck_personality)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         selected,
     )
@@ -1249,7 +1660,8 @@ def db_get_fra_challengers(user_id):
     rows = _db.execute(
         """
         SELECT challenger_index, name, champion_guid,
-               encounter_deck_guid, is_boss
+               encounter_deck_guid, is_boss,
+               COALESCE(NULLIF(TRIM(ai_deck_personality), ''), 'Default')
         FROM fra_challengers
         WHERE user_id=?
         ORDER BY challenger_index
@@ -1263,6 +1675,7 @@ def db_get_fra_challengers(user_id):
             "champion_guid": r[2],
             "deck": r[3],
             "boss": "True" if r[4] else "False",
+            "ai_deck_personality": r[5],
         }
         for r in rows
     ]
@@ -1597,7 +2010,7 @@ def db_get_decks(user_id):
 
 # === Sessions (reconnect) ===
 
-def db_save_session(sid, user_id, username, auth_id, reck_id, uid, addr):
+def db_save_connection_session(sid, user_id, username, auth_id, reck_id, uid, addr):
     _db.execute("INSERT OR REPLACE INTO sessions (sid, user_id, username, client_auth_id, client_reck_id, client_uid, addr) VALUES (?,?,?,?,?,?,?)",
                 (sid, user_id, username, auth_id, reck_id, uid, addr))
     _db.commit()
@@ -1708,7 +2121,7 @@ def db_record_session_transaction(session_id, player_uid, request_id,
              json.dumps(classification or {}, sort_keys=True, default=str),
              payload, str(pre_state_hash or "")))
         capture_db.commit()
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
     except BaseException:
         capture_db.rollback()
         raise
@@ -3696,13 +4109,6 @@ def db_get_chest_by_id(chest_db_id, user_id):
         "SELECT id, set_guid, chest_rarity, opened, template_guid FROM treasure_chests "
         "WHERE id=? AND user_id=? AND opened=0",
         (chest_db_id, user_id)).fetchone()
-
-
-def db_next_card_instance_id():
-    """Return the next free card_instances.instance_id."""
-    row = _db.execute(
-        "SELECT COALESCE(MAX(instance_id), 5000) FROM card_instances").fetchone()
-    return row[0] + 1 if row else 5001
 
 
 def db_create_card_instance(user_id, instance_id, template_guid):
