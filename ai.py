@@ -13,7 +13,7 @@ import json
 import random
 
 import game_engine
-from db import _db, log_req
+from db import _db, card_label, log_req
 from debug_runtime import trace_rules_port
 from pvp_db import (db_set_card_state_or,
                     db_discard_card,
@@ -431,8 +431,12 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         combats.append(cs)
     if combats:
         game.push_combat_listing(pl_t, combats)
-    log_req(f"    AI declares {len(assignment)} block(s): "
-            f"{[(hex(k), [hex(b) for b in v]) for k, v in assignment.items()]}")
+    block_summary = [
+        (card_label(session.session_id, k, stats=True),
+         [card_label(session.session_id, b, stats=True) for b in v])
+        for k, v in assignment.items()
+    ]
+    log_req(f"    AI declares {len(assignment)} block(s): {block_summary}")
     # ``Session.EmitBlockerEvents``: the blocker's "when this blocks" and the
     # blocked attacker's "when this becomes blocked" abilities fire with the
     # declaration, i.e. before combat damage.  The declaration owns them for
@@ -822,10 +826,12 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
         port.persist()
     if combats:
         game.push_combat_listing(ai_t, combats)
+    attacker_labels = [card_label(session.session_id, int(u), stats=True)
+                       for u in attackers]
     log_req(f"    AI declares {len(attackers)} attacker(s) targeting "
             f"{hex(player_champ_uid64)} (attitude={attitude}, alpha={alpha}; "
             f"eligible={len(all_attackers)} chosen={len(chosen)} held={held}): "
-            f"{[hex(int(u)) for u in attackers]}")
+            f"{attacker_labels}")
     return battle_state
 
 

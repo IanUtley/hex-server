@@ -2336,6 +2336,69 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
         ai._db, ai_eval._db = old_ai_db, old_eval_db
 
 
+def test_ai_spreads_a_reapplied_grant_to_the_clean_same_name_troop(db):
+    """A target that already carries the card's granted ability scores lower.
+
+    Live symptom: the AI cast Spider Nest three times on the same Neophyte of
+    Xarlox while an identically-statriced clean copy sat in the same warzone.
+    CardInfo read only the printed template abilities, so both troops scored
+    the same and the deterministic tie-break re-picked the cursed one.
+    """
+    from types import SimpleNamespace
+    import ai_eval
+
+    def troop(uid, granted):
+        return SimpleNamespace(
+            card_uid=uid, value=10.0, is_troop=lambda: True,
+            effective_attack=lambda: 1, effective_defense=lambda: 4,
+            granted_ability_guids=granted,
+            has_attribute=lambda _flag: False)
+
+    cursed = troop(0x301, ("curse-guid",))
+    clean = troop(0xe01, ())
+
+    selector = object.__new__(ai_eval.CardEvaluator)
+    selector.player_warzone = [cursed, clean]
+    selector.ai_warzone = []
+    selector.player_champ_uid = None
+    selector._connection = lambda: db
+    selector.get_card_value = lambda card: card.value
+    selector.granted_ability_guids_for = lambda _card: frozenset({"curse-guid"})
+    selector._target_side_uids = lambda: (set(), {0x301, 0xe01})
+    selector._metadata_action_target_slots = lambda _card, _ag: [
+        {"index": 0, "candidates": (0x301, 0xe01), "minimum": 1,
+         "maximum": 1}]
+    selector._action_target_intent = lambda _card, _ag: "opponent"
+    selector.effects_for = lambda _ag: ()
+    selector.hints_for = lambda _card: SimpleNamespace(removal=None, buff=None)
+
+    spider_nest = SimpleNamespace(ability_guids=["grant"])
+    target_map = selector.choose_action_target_map(spider_nest)
+    assert target_map == {0: (0xe01,)}, target_map
+
+    # ``reapply_penalty`` is price-driven: the cursed troop only loses the
+    # comparison because it already owns the grant.
+    assert selector.reapply_penalty(spider_nest, cursed) > 0
+    assert selector.reapply_penalty(spider_nest, clean) == 0
+
+
+def test_evaluator_card_info_reads_instance_abilities(db):
+    """CardInfo must expose live grants/attributes, not just the template."""
+    from ai_eval import CardInfo
+
+    printed = json.dumps(["11111111-1111-1111-1111-111111111111"])
+    instance = json.dumps(["11111111-1111-1111-1111-111111111111",
+                           "22222222-2222-2222-2222-222222222222"])
+    row = (101, "tpl", "warzone", "Troop", "Neophyte", "Common", 2, 1, 4,
+           "[]", printed, 0, "", 0, 0, 0, 0, 0, 0, "{}", "{}", 0,
+           1, 2, instance, 4)
+    card = CardInfo(row)
+    assert card.card_attack_mod == 1 and card.card_defense_mod == 2
+    assert card.granted_ability_guids == (
+        "22222222-2222-2222-2222-222222222222",)
+    assert card.attributes & 4
+
+
 def test_concubunny_exhausts_selected_ready_shinhare(db):
     """Concubunny pays its authored ExhaustTarget before resolving its BOM.
 
@@ -2505,6 +2568,10 @@ def main():
          test_wind_whisperer_ai_exhausts_best_blocker),
         ("AI action target side and required-target safety",
          test_ai_action_targets_follow_effect_and_require_legal_selection),
+        ("AI spreads a re-applied grant to the clean twin",
+         test_ai_spreads_a_reapplied_grant_to_the_clean_same_name_troop),
+        ("Evaluator CardInfo reads instance abilities",
+         test_evaluator_card_info_reads_instance_abilities),
         ("Concubunny exhausts selected ready Shin'hare",
          test_concubunny_exhausts_selected_ready_shinhare),
         ("Discard positions survive reconnect ordering",

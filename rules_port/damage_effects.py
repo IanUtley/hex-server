@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from functools import wraps
 from threading import RLock
@@ -347,6 +348,34 @@ def _additive_adjustment(context, target, dealer, combat, is_champion):
         "CombatDamageReceivedModifier" if combat
         else "NonCombatDamageReceivedModifier"))
     delta += _int_attr(context, target, "DamageReceivedModifier")
+    if is_champion:
+        # Champions are synthetic cards, so their authored continuous
+        # modifiers do not exist in the normal per-card IntAttr store.  Ask
+        # the shared metadata projection for this exact champion target; the
+        # runtime store above remains separate so persisted modifiers are not
+        # counted twice.
+        from .static_rules import player_int_attributes
+        target_owner = context.target_owner(target, default=None)
+        if target_owner is not None:
+            try:
+                authored = player_int_attributes(
+                    context.db, context.session.session_id, context.bstate,
+                    int(target_owner), target_uid=int(target),
+                    include_runtime=False)
+            except (AttributeError, KeyError, TypeError, ValueError,
+                    RuntimeError, sqlite3.Error):
+                authored = {}
+
+            def authored_attr(name):
+                lowered = name.lower()
+                return sum(
+                    int(value or 0) for key, value in authored.items()
+                    if str(key).lower() == lowered)
+
+            delta += authored_attr(
+                "CombatDamageReceivedModifier" if combat
+                else "NonCombatDamageReceivedModifier")
+            delta += authored_attr("DamageReceivedModifier")
     if not combat and dealer is not None:
         from .runtime_helpers import champion_uid_for_owner
         owner = context.target_owner(dealer, default=None)

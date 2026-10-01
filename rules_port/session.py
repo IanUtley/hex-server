@@ -1328,6 +1328,22 @@ class AuthoritativeSession:
         checker = getattr(self.runtime_facts, "can_play_card", None)
         return bool(checker(card, player_id, playing_for_free)) if callable(checker) else False
 
+    def can_play_card_reason(self, card, player_id, playing_for_free=False) -> str:
+        """Why ``can_play_card`` refuses the card ('' when the play is legal).
+
+        Diagnostics only: the requirement path still calls ``can_play_card``.
+        """
+        checker = getattr(self.runtime_facts, "play_card_rejection_reason",
+                          None)
+        if callable(checker):
+            try:
+                return str(checker(card, player_id,
+                                   bool(playing_for_free)) or "")
+            except Exception as exc:
+                return f"play-reason-error({exc!r})"
+        return ("" if self.can_play_card(card, player_id, playing_for_free)
+                else "rejected")
+
     def can_activate_ability(self, card, player_id, ability_template_id) -> bool:
         checker = getattr(self.runtime_facts, "can_activate_ability", None)
         return bool(checker(card, player_id, ability_template_id)) if callable(checker) else False
@@ -1410,10 +1426,12 @@ class AuthoritativeSession:
         # freshly re-entered PriorityWindowAction still rejects that pass.
         self.reconcile_projected_chain_priority()
         if self.terminated or transaction.player_id not in self.player_ids:
+            self._log_rejection(transaction, "terminated/unknown-player")
             return False
         if ((transaction.phase is not None and
              phase_name(transaction.phase) != phase_name(self.current_turn_phase))
                 or not transaction.validate(self)):
+            self._log_rejection(transaction, self.explain_rejection(transaction))
             return False
         self._transactions.append(transaction)
         self._transaction_history.append({
@@ -1424,6 +1442,85 @@ class AuthoritativeSession:
             "payload": _json_value(transaction.payload),
         })
         return True
+
+    def explain_rejection(self, transaction) -> str:
+        """Name the phase or requirement that refused a transaction ('' = valid).
+
+        Diagnostics only; evaluated on the rejection path after
+        ``transaction.validate`` already failed, so normal play computes
+        nothing extra.
+        """
+        if transaction is None:
+            return "unclassified"
+        if transaction.phase is not None:
+            intent = phase_name(transaction.phase)
+            current = phase_name(self.current_turn_phase)
+            if intent != current:
+                return f"phase detail=intent={intent} current={current}"
+        failures = []
+        for requirement in getattr(transaction, "requirements", ()):
+            try:
+                if requirement.is_valid(self, transaction.player_id):
+                    continue
+            except Exception as exc:
+                failures.append(f"{type(requirement).__name__}"
+                                f" detail=raised {exc!r}")
+                continue
+            detail = self._requirement_detail(transaction, requirement)
+            failures.append(f"{type(requirement).__name__}"
+                            + (f" detail={detail}" if detail else ""))
+        return "; ".join(failures) or "no-failing-requirement"
+
+    def _requirement_detail(self, transaction, requirement) -> str:
+        describe = getattr(requirement, "failure_detail", None)
+        if callable(describe):
+            try:
+                detail = describe(self, transaction.player_id)
+            except Exception as exc:
+                return f"detail-error({exc!r})"
+            if detail:
+                return str(detail)
+        fields = getattr(type(requirement), "__dataclass_fields__", None)
+        if not fields:
+            return ""
+        parts = []
+        for name in fields:
+            value = getattr(requirement, name, None)
+            if value is None or value == "" or value == () or value == []:
+                continue
+            if name.endswith("card_id") or name in {
+                    "source_card_id", "attacker", "blocker"}:
+                parts.append(f"{name}={self._card_ref(value)}")
+            else:
+                parts.append(f"{name}={value!r}")
+            if len(parts) >= 4:
+                break
+        return " ".join(parts)
+
+    def _card_ref(self, value) -> str:
+        label = getattr(self.runtime_facts, "card_label", None)
+        if callable(label):
+            try:
+                return str(label(value))
+            except Exception:
+                pass
+        try:
+            return hex(int(getattr(value, "uid64", value)))
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _log_rejection(self, transaction, reason) -> None:
+        """One INFO line per refused transaction (no work on the accept path)."""
+        try:
+            from db import log_req
+            from .wire import describe_transaction
+            log_req(f"    RulesPort reject: "
+                    f"{describe_transaction(transaction, self)} "
+                    f"req={reason or 'unknown'} "
+                    f"phase={phase_name(self.current_turn_phase)} "
+                    f"player={_serial_id(transaction.player_id)}")
+        except Exception:
+            pass
 
     def reconcile_projected_chain_priority(self) -> bool:
         """Align a live chain response queue with its durable priority.

@@ -1803,14 +1803,18 @@ def effective_cost(db, session_id, battle_state, card_uid):
     return _cost_from_deltas(db, session_id, card_uid, native)
 
 
-def player_int_attributes(db, session_id, battle_state, owner_id):
-    """Project active Records IntAttr modifiers onto each player's context.
+def player_int_attributes(db, session_id, battle_state, owner_id, *,
+                          target_uid=None, include_runtime=True):
+    """Project active Records IntAttr modifiers onto a player or champion.
 
     Player permissions can come from active deck-top effects or continuous
     abilities on cards in play.  Keep the source zone, duration, target's
     player filter, and effect condition tied to Records metadata so player
     rules such as additional resource plays are available to both AI and
-    transaction validation.
+    transaction validation.  When ``target_uid`` is supplied, authored card
+    target templates are also evaluated against that synthetic champion.  This
+    lets damage resolution share the normal target metadata for effects such
+    as ``OpposingChampions``.
     """
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from pvp_db import (db_deck_top_card_details, db_card_ability_list,
@@ -1825,18 +1829,19 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
     # Synthetic champion instance IntAttrs are persisted in the shared
     # checkpoint because champion cards have no game_cards row.
     champion_map = state.get("champ_map") or {}
-    champion_uid = champion_map.get(owner, champion_map.get(str(owner)))
-    try:
-        champion_attrs = (state.get("champion_int_attrs") or {}).get(
-            str(int(champion_uid)), {}) if champion_uid is not None else {}
-    except (TypeError, ValueError):
-        champion_attrs = {}
-    if isinstance(champion_attrs, dict):
-        for name, value in champion_attrs.items():
-            try:
-                result[str(name)] = int(value or 0)
-            except (TypeError, ValueError):
-                continue
+    if include_runtime:
+        champion_uid = champion_map.get(owner, champion_map.get(str(owner)))
+        try:
+            champion_attrs = (state.get("champion_int_attrs") or {}).get(
+                str(int(champion_uid)), {}) if champion_uid is not None else {}
+        except (TypeError, ValueError):
+            champion_attrs = {}
+        if isinstance(champion_attrs, dict):
+            for name, value in champion_attrs.items():
+                try:
+                    result[str(name)] = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
 
     # Each source tuple records which authored duration can currently apply.
     # The top-of-deck source has its own lifetime; ordinary static player
@@ -1888,6 +1893,60 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
             return True
         return False
 
+    def targets_champion(target, source_owner, source_uid):
+        """Match an authored target template against ``target_uid``."""
+        if target_uid is None:
+            return False
+        from .filters import records_filter_matches
+        from .targeting import (
+            _player_filter_accepts,
+            _source_card,
+            target_template,
+            template_targets_champions,
+        )
+
+        if getattr(target, "target_kind", "") == "PlayerTargetTemplate":
+            return targets_player(target.player_filter, source_owner)
+
+        player_filter = str(getattr(target, "player_filter", "") or "")
+        if player_filter and not _player_filter_accepts(
+                player_filter, owner, source_owner):
+            return False
+
+        template = target_template(db, str(getattr(target, "guid", "")))
+        if not template or not template_targets_champions(template):
+            return False
+        filter_json = template.get("filter_json", "{}")
+        if isinstance(filter_json, str):
+            try:
+                filter_json = json.loads(filter_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+        if not isinstance(filter_json, dict):
+            return False
+
+        source_card = _source_card(db, session_id, source_uid, source_owner)
+        target_card = {
+            "card_uid": int(target_uid),
+            "card_type": "Champion",
+            "location": "champions",
+            "user_id": owner,
+            "owner_id": owner,
+            "controller_id": owner,
+            "name": "Champion",
+            "attack": 0,
+            "defense": 0,
+            "attributes": 0,
+            "int_attrs": {},
+        }
+        return records_filter_matches(
+            target_card,
+            filter_json,
+            source=source_card,
+            context=dict(state),
+            player=source_owner,
+        )
+
     for source_owner, source_uid, abilities, active_durations in sources:
         if isinstance(abilities, str):
             try:
@@ -1906,9 +1965,12 @@ def player_int_attributes(db, session_id, battle_state, owner_id):
                         effect.target_index >= len(graph.targets)):
                     continue
                 target = graph.targets[effect.target_index]
-                if target.target_kind != "PlayerTargetTemplate":
-                    continue
-                if not targets_player(target.player_filter, source_owner):
+                if target_uid is None:
+                    if target.target_kind != "PlayerTargetTemplate":
+                        continue
+                    if not targets_player(target.player_filter, source_owner):
+                        continue
+                elif not targets_champion(target, source_owner, source_uid):
                     continue
                 metadata = modifier_metadata(effect.guid)
                 if str(metadata.get("property") or "").lower() != "intattr":

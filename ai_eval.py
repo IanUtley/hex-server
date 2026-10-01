@@ -183,6 +183,16 @@ class CardInfo:
         self.card_damage = int(self.card_damage or 0)
         self.card_attack_mod = 0
         self.card_defense_mod = 0
+        # Optional trailing instance columns: warzone rows carry the two
+        # stat-mod columns first, then the live ability/attribute lists.
+        # Legacy callers that pass the shorter shapes simply skip this block.
+        tail = tuple(row[22:])
+        if tail and isinstance(tail[0], int):
+            self.card_attack_mod = int(tail[0] or 0)
+            self.card_defense_mod = int(tail[1] or 0) if len(tail) > 1 else 0
+            tail = tail[2:]
+        self.instance_abilities_json = tail[0] if tail else None
+        self.instance_attributes = int(tail[1] or 0) if len(tail) > 1 else 0
         self.variable_cost = int(self.variable_cost or 0)
         self.variable_cost_double = int(self.variable_cost_double or 0)
         self.has_variable_cost = bool(
@@ -193,10 +203,12 @@ class CardInfo:
         self.max_resources_granted = int(self.max_resources_granted or 0)
         self.current_resources_granted = int(
             self.current_resources_granted or 0)
-        self.attributes = int(self.attributes or 0) | int(
-            self.temporary_attributes or 0)
+        self.attributes = (int(self.attributes or 0)
+                           | int(self.temporary_attributes or 0)
+                           | int(self.instance_attributes or 0))
         self.type_flags = _card_type_flags(self.card_type)
         self.ability_guids = self._load_ability_guids()
+        self.granted_ability_guids = self._load_granted_ability_guids()
         self._effects_cache = None
 
     def _load_ability_guids(self):
@@ -206,6 +218,23 @@ class CardInfo:
             return [str(g).lower() for g in json.loads(self.abilities_json)]
         except Exception:
             return []
+
+    def _load_granted_ability_guids(self):
+        """Live abilities beyond the printed template list (grants).
+
+        ``game_cards.card_abilities`` is the authoritative per-instance list;
+        anything not on the printed template was granted during the game.
+        """
+        if not self.instance_abilities_json:
+            return ()
+        try:
+            instance = [str(g).lower()
+                        for g in json.loads(self.instance_abilities_json)]
+        except Exception:
+            return ()
+        printed = {guid.lower() for guid in self.ability_guids}
+        return tuple(guid for guid in dict.fromkeys(instance)
+                     if guid and guid not in printed)
 
     # -- type predicates ---------------------------------------------------
     def is_resource(self):
@@ -512,6 +541,10 @@ class CardEvaluator:
     """Board/play evaluation for the AI's hand.  Construction reads the AI's
     hand + warzone + opponent warzone from the DB (single snapshot)."""
 
+    # Large enough to always lose a tie between same-name troops, small
+    # relative to real value swings so it never overrides a genuine target.
+    REDUNDANT_GRANT_PENALTY = 1000.0
+
     def __init__(self, handler, session, battle_state, ai_uid, player_uid,
                  player_champ_uid=None, ai_owner_id=0,
                  player_owner_id=None):
@@ -551,6 +584,7 @@ class CardEvaluator:
         self.player_warzone = self._load_warzone(self.player_db_id)
         self.player_hand_count = self._hand_count(self.player_db_id)
         self._hints = {}
+        self._granted_guids_cache = {}
 
     def _connection(self):
         """Return the connection belonging to this evaluator's host.
@@ -833,6 +867,86 @@ class CardEvaluator:
 
     def get_list_value(self, cards):
         return sum(self.get_card_value(c) for c in cards)
+
+    # -- granted-ability awareness ----------------------------------------
+    def granted_ability_guids_for(self, card):
+        """Ability template IDs the hand card would grant on resolution.
+
+        Read from the authored ``GrantAbilityEffectTemplate`` rows.  The
+        stored ``ability_effects.param`` is either the bare granted GUID or a
+        JSON object with ``m_GrantedAbilityTemplateId`` depending on the
+        extraction, so both shapes are accepted.
+        """
+        if card is None:
+            return frozenset()
+        cache = getattr(self, "_granted_guids_cache", None)
+        if cache is None:
+            cache = self._granted_guids_cache = {}
+        key = getattr(card, "card_uid", None)
+        if key in cache:
+            return cache[key]
+        guids = set()
+        try:
+            from pvp_db import db_ability_effect_type_params
+            connection = getattr(self, "_connection", None)
+            conn = connection() if callable(connection) else _db
+            for ability_guid in getattr(card, "ability_guids", ()) or ():
+                for effect_type, raw in db_ability_effect_type_params(
+                        ability_guid, conn=conn):
+                    if str(effect_type) != "GrantAbilityEffectTemplate":
+                        continue
+                    guid = self._grant_param_guid(raw)
+                    if guid:
+                        guids.add(guid)
+        except Exception:
+            # Target ranking must never fail because authored effect metadata
+            # is unavailable; fall back to no-grant scoring.
+            guids = set()
+        result = frozenset(guids)
+        cache[key] = result
+        return result
+
+    @staticmethod
+    def _grant_param_guid(raw):
+        if raw is None:
+            return ""
+        text = str(raw).strip()
+        if not text:
+            return ""
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            value = (data.get("m_GrantedAbilityTemplateId")
+                     or data.get("granted_ability_template_id"))
+            text = str(value or "")
+        elif isinstance(data, str):
+            text = data
+        text = text.strip().strip('"').lower()
+        return text if len(text) == 36 and "-" in text else ""
+
+    def reapply_penalty(self, card, target):
+        """Penalty when ``card`` would re-grant an ability ``target`` has.
+
+        Keeps a debuff/curse from stacking on the same troop when an
+        identically-statriced twin is available: the cursed troop scores
+        lower, so the same-name clean troop wins the tie.
+        """
+        grants = self.granted_ability_guids_for(card)
+        if not grants:
+            return 0.0
+        owned = set(getattr(target, "granted_ability_guids", ()) or ())
+        if grants & owned:
+            return self.REDUNDANT_GRANT_PENALTY
+        return 0.0
+
+    def target_score(self, card, target):
+        """``get_card_value`` adjusted for abilities the card would re-grant."""
+        if card is None:
+            return self.get_card_value(target)
+        return (self.get_card_value(target)
+                - self.reapply_penalty(card, target))
 
     def is_high_value_target(self, card):
         name = (card.name or "").lower()
@@ -1415,6 +1529,13 @@ class CardEvaluator:
             elif (target.is_troop()
                   and target.has_attribute(ECardAttributes.Immortal)):
                 continue
+            # A non-hard "removal" that only re-applies an ability the target
+            # already carries is spent: let the threat loop consider the next
+            # target (e.g. the clean same-name twin) instead of stacking the
+            # same curse on one troop (Spider Nest).
+            if (not h.removal.hard
+                    and self.reapply_penalty(card, target) > 0):
+                continue
             if self._can_target(card, target):
                 # Match the C# GetRemovalFor(c) contract: the target being
                 # evaluated is also the target passed to the activation. Do
@@ -1803,10 +1924,10 @@ class CardEvaluator:
             opposing.add(int(self.player_champ_uid))
         return friendly, opposing
 
-    def _best_target(self, candidates):
+    def _best_target(self, candidates, card=None):
         """Apply the C# evaluator's card-value ordering to legal candidates."""
         return max(candidates, key=lambda c: (
-            c.is_troop(), self.get_card_value(c), c.effective_attack(),
+            c.is_troop(), self.target_score(card, c), c.effective_attack(),
             c.effective_defense(), c.card_uid))
 
     def choose_ability_target_map(self, source_uid, ability_guid,
@@ -1907,7 +2028,10 @@ class CardEvaluator:
                 ordered = [item.card_uid for item in sorted(
                     available,
                     key=lambda item: (item.is_troop(),
-                                      self.get_card_value(item),
+                                      # Deprioritize a target that already
+                                      # carries an ability this card would
+                                      # re-grant, so same-name troops spread.
+                                      self.target_score(card, item),
                                       item.effective_attack(),
                                       item.effective_defense(), item.card_uid),
                     reverse=True)]
@@ -2038,7 +2162,7 @@ class CardEvaluator:
                     available = [c for c in available
                                  if c.card_uid in opposing_uids]
                     if available:
-                        return self._best_target(available).card_uid
+                        return self._best_target(available, card=card).card_uid
                     champions = [uid for uid in candidates
                                  if uid in opposing_uids]
                     if champions:
@@ -2048,7 +2172,7 @@ class CardEvaluator:
                     available = [c for c in available
                                  if c.card_uid in friendly_uids]
                     if available:
-                        return self._best_target(available).card_uid
+                        return self._best_target(available, card=card).card_uid
                     champions = [uid for uid in candidates
                                  if uid in friendly_uids]
                     if champions:
@@ -2076,13 +2200,13 @@ class CardEvaluator:
             if intent == "opponent":
                 troops = [c for c in self.player_warzone if c.is_troop()]
                 if troops:
-                    return self._best_target(troops).card_uid
+                    return self._best_target(troops, card=card).card_uid
                 if self.player_champ_uid is not None:
                     return self.player_champ_uid
             elif intent == "friendly":
                 troops = [c for c in self.ai_warzone if c.is_troop()]
                 if troops:
-                    return self._best_target(troops).card_uid
+                    return self._best_target(troops, card=card).card_uid
             for etype, pm in self.effects_for(ag):
                 if etype == "TapCardAbilityEffectTemplate":
                     troops = [c for c in self.player_warzone if c.is_troop()]

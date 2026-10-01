@@ -226,6 +226,7 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                         card.template_guid, int(cast(Any, card_uid)),
                         int(cast(Any, owner_id)))
                     values = []
+                    cost_target_map: dict[int, list[int]] = {}
                     for activation in payload.get("ability_data") or ():
                         if not isinstance(activation, Mapping):
                             continue
@@ -235,11 +236,27 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                                 selected, (list, tuple, set)) else (selected,)
                             values.extend(int(getattr(value, "uid64", value))
                                            for value in selected)
+                        # Additional card costs arrive separately from
+                        # TargetMap (XCostData.CardsToSacrifice).  Keep them
+                        # distinct so the cost never consumes an effect target
+                        # (Abominate).
+                        for index, selected in (activation.get(
+                                "cost_target_map") or {}).items():
+                            try:
+                                index = int(index)
+                            except (TypeError, ValueError):
+                                continue
+                            selected = selected if isinstance(
+                                selected, (list, tuple, set)) else (selected,)
+                            cost_target_map.setdefault(index, []).extend(
+                                int(getattr(value, "uid64", value))
+                                for value in selected)
                     x_cost = max((int(item.get("x_cost", 0) or 0)
                                   for item in (payload.get("ability_data") or ())
                                   if isinstance(item, Mapping)), default=0)
                     activations, cost_map = plan.activation_bundle(
-                        values, x_cost=x_cost)
+                        values, x_cost=x_cost,
+                        cost_target_map=cost_target_map or None)
                     if plan.validate(
                             variable_cost=x_cost,
                             activations=activations,

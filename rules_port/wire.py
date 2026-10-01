@@ -255,3 +255,102 @@ def submit_classified_transaction(session, command, player_id, *,
         command, player_id, current_phase=session.current_turn_phase,
         payload=payload)
     return bool(transaction is not None and session.submit_transaction(transaction))
+
+
+def _describe_uid(value, session=None) -> str:
+    label = getattr(getattr(session, "runtime_facts", None), "card_label", None)
+    if callable(label):
+        try:
+            return str(label(value))
+        except Exception:
+            pass
+    try:
+        return hex(int(getattr(value, "uid64", value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _describe_map(value, session=None) -> str:
+    if not isinstance(value, Mapping) or not value:
+        return "{}"
+    parts = []
+    for key in sorted(value, key=lambda item: str(item)):
+        selected = value[key]
+        if not isinstance(selected, (list, tuple, set)):
+            selected = (selected,)
+        rendered = ", ".join(_describe_uid(item, session) for item in selected)
+        parts.append(f"{key}:[{rendered}]")
+    return "{" + ", ".join(parts) + "}"
+
+
+def describe_transaction(transaction, session=None) -> str:
+    """One-line normalized payload for rejection diagnostics.
+
+    Reports the card identity, every decoded target/additional-cost map, the
+    chosen X, and the free-play flag so a refused play or ability activation
+    can be replayed from the log without the raw ObjFmt envelope.
+    """
+    if transaction is None:
+        return "kind=-"
+    kind = str(getattr(transaction, "kind", "-"))
+    payload = getattr(transaction, "payload", {}) or {}
+    parts = [f"kind={kind}"]
+    for name in ("card_id", "source_card_id"):
+        value = payload.get(name)
+        if value is not None:
+            parts.append(f"card={_describe_uid(value, session)}")
+            break
+    ability = payload.get("ability_template_id")
+    if ability:
+        parts.append(f"ability={ability}")
+    activations = []
+    data = payload.get("ability_data")
+    if isinstance(data, Mapping):
+        activations.append(data)
+    elif isinstance(data, (list, tuple)):
+        activations.extend(item for item in data if isinstance(item, Mapping))
+    activation_data = payload.get("activation_data")
+    if isinstance(activation_data, Mapping):
+        activations.append(activation_data)
+    target_map = {}
+    cost_map = {}
+    x_cost = 0
+    for activation in activations:
+        for source, destination in (("target_map", target_map),
+                                    ("cost_target_map", cost_map)):
+            value = activation.get(source)
+            if isinstance(value, Mapping):
+                for index, selected in value.items():
+                    if not isinstance(selected, (list, tuple, set)):
+                        selected = (selected,)
+                    destination.setdefault(index, [])
+                    destination[index].extend(selected)
+        try:
+            x_cost = max(x_cost, int(activation.get("x_cost", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    if activations:
+        parts.append(f"target_map={_describe_map(target_map, session)}")
+        if cost_map:
+            parts.append(f"cost_target_map={_describe_map(cost_map, session)}")
+        if x_cost:
+            parts.append(f"x={x_cost}")
+        parts.append(f"free={bool(payload.get('playing_for_free', False))}")
+    declarations = payload.get("declarations")
+    if declarations:
+        rendered = []
+        for first, second in declarations:
+            selected = second if isinstance(second, (list, tuple, set)) else (second,)
+            rendered.append(
+                f"{_describe_uid(first, session)}<-"
+                f"[{', '.join(_describe_uid(item, session) for item in selected)}]")
+        parts.append(f"declarations={{{', '.join(rendered)}}}")
+    assignments = payload.get("assignments")
+    if assignments:
+        rendered = []
+        for combat_id, cards in assignments:
+            selected = cards if isinstance(cards, (list, tuple, set)) else (cards,)
+            rendered.append(
+                f"{combat_id}:[{', '.join(_describe_uid(item, session) for item in selected)}]")
+        parts.append(f"assignments={{{', '.join(rendered)}}}")
+    return " ".join(parts)

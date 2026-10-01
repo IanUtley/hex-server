@@ -179,7 +179,7 @@ _ERROR_LOG_TAIL_BYTES = 256 * 1024
 _ERROR_MESSAGE_LIMIT = 900
 # The issue body can carry the complete bounded report; keep enough context to
 # diagnose a multi-step failure without attaching the whole session log.
-_SESSION_LOG_TAIL_LINES = 32
+_SESSION_LOG_TAIL_LINES = 100
 _SESSION_LOG_LINE_LIMIT = 360
 _SESSION_PENDING_KEYS = (
     "pending_choice", "pending_trigger", "pending_deck_search",

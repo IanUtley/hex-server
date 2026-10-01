@@ -304,8 +304,20 @@ class PvpRuntimeFacts:
         return True
 
     def can_play_card(self, card: RuntimeCard, player_id, playing_for_free=False) -> bool:
+        return self.play_card_rejection_reason(
+            card, player_id, playing_for_free) == ""
+
+    def play_card_rejection_reason(self, card: RuntimeCard, player_id,
+                                   playing_for_free=False) -> str:
+        """One-line reason ``can_play_card`` refuses this card ('' = legal).
+
+        Every refusal branch reports why, so a dead-ended play transaction can
+        name the sub-check instead of only logging ``False``.
+        """
         if self.play_validator is not None:
-            return bool(self.play_validator(card, player_id, playing_for_free))
+            allowed = bool(self.play_validator(
+                card, player_id, playing_for_free))
+            return "" if allowed else "play-validator"
         player = self.get_player(player_id)
         request_uid = getattr(self, "client_player_uid", self.player_uid)
         if self.battle_state.get("pvp"):
@@ -317,11 +329,12 @@ class PvpRuntimeFacts:
         if owner_id is None:
             owner_id = player.player_id
         if card.owner_id != int(owner_id):
-            return False
+            return (f"not-owner(card={card.owner_id} "
+                    f"expected={int(owner_id)})")
         location = str(card.location or "").lower()
         if location != "hand":
             if location != "deck":
-                return False
+                return f"not-in-hand(location={location or '-'})"
             from .static_rules import player_int_attributes
             db = getattr(getattr(self._pvp, "_db_layer", None), "_db", None)
             if db is None:
@@ -330,17 +343,17 @@ class PvpRuntimeFacts:
             attrs = player_int_attributes(
                 db, self.session_id, self.battle_state, owner_id)
             if int(attrs.get("CanPlayTopOfDeck", 0) or 0) <= 0:
-                return False
+                return "not-hand-and-cant-play-top-of-deck"
             top = self._pvp.db_deck_top_card_details(
                 self.session_id, int(owner_id))
             if not top or int(top[1]) != int(card.session_card_id):
-                return False
+                return f"deck-not-top(card={hex(int(card.session_card_id))})"
         if not self._has_thresholds(card, player):
             from .static_rules import champion_int_attribute
             if champion_int_attribute(
                     self.battle_state, owner_id,
                     "CanIgnoreCardsThresholds") <= 0:
-                return False
+                return "thresholds"
         if playing_for_free:
             # C# PlayTroop/Spell/ArtifactTransaction only accept a free play
             # when the card has OwnerCanPlayForFree or the controller's
@@ -350,10 +363,25 @@ class PvpRuntimeFacts:
             if db is None:
                 import db as db_layer
                 db = db_layer._db
-            return bool(_card_play_for_free(
-                db, self.session_id, self.battle_state,
-                int(card.session_card_id)))
-        return bool(player.current_resource_pool >= card.casting_cost)
+            if not _card_play_for_free(
+                    db, self.session_id, self.battle_state,
+                    int(card.session_card_id)):
+                return "not-free"
+            return ""
+        if player.current_resource_pool < card.casting_cost:
+            return (f"cost {int(card.casting_cost)} > "
+                    f"pool {int(player.current_resource_pool)}")
+        return ""
+
+    def card_label(self, card_id, *, stats=True) -> str:
+        """``"0x301 Abominate (0/0)"`` for diagnostics (never raises)."""
+        try:
+            from db import card_label as _card_label
+            return _card_label(self.session_id,
+                               int(getattr(card_id, "uid64", card_id)),
+                               stats=stats)
+        except Exception:
+            return hex(int(getattr(card_id, "uid64", card_id) or 0))
 
     def can_activate_ability(self, card: RuntimeCard, player_id, ability_template_id) -> bool:
         # ``game_cards.owner_user_id`` is the profile/reckoning id, while the

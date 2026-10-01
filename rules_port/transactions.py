@@ -315,6 +315,16 @@ class CardCanBePlayedRequirement:
         return card is not None and _bool_call(
             session, "can_play_card", card, player_id, self.playing_for_free)
 
+    def failure_detail(self, session, player_id) -> str:
+        card = _card(session, self.card_id)
+        if card is None:
+            return f"card {self.card_id} not found"
+        reason = getattr(session, "can_play_card_reason", None)
+        detail = (reason(card, player_id, self.playing_for_free)
+                  if callable(reason) else "")
+        free = " free" if self.playing_for_free else ""
+        return f"can_play_card{free}: {detail or 'rejected'}"
+
 
 @dataclass(frozen=True)
 class CardInCollectionRequirement:
@@ -658,6 +668,25 @@ class CardPlayTimingRequirement:
             and chain is not None
             and bool(getattr(chain, "is_empty", False))
         )
+
+    def failure_detail(self, session, player_id) -> str:
+        reasons = []
+        if not MainPhaseRequirement().is_valid(session, player_id):
+            reasons.append("not-main-phase")
+        if not PlayerIsActiveRequirement(player_id).is_valid(
+                session, player_id):
+            reasons.append("not-active-player")
+        chain = getattr(session, "chain", None)
+        if chain is None or not bool(getattr(chain, "is_empty", False)):
+            reasons.append("chain-not-empty")
+        card_ref = getattr(session, "_card_ref", None)
+        label = ""
+        if callable(card_ref):
+            try:
+                label = f"card={card_ref(self.card_id)} "
+            except Exception:
+                label = ""
+        return f"{label}{'/'.join(reasons) or 'timing'}"
 
 
 class PriorityWindowRequirement:

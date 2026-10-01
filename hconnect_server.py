@@ -176,7 +176,7 @@ def _target_count_from_text(game_text):
 def _talent_ability_guid(talent_guid: str) -> str | None:
     """Resolve a champion talent GUID to its actual ability GUID via DB."""
     return db_talent_data_ability_guid(talent_guid, conn=_db)
-from db import _db, log, log_req, hexdump, set_log_context
+from db import _db, log, log_req, hexdump, set_log_context, card_label
 from debug_runtime import enable_debugpy, trace_rules_port
 from db import (player_id_from_name, player_id_from_steam, display_name_from_identity,
                 STARDUST_TEMPLATES, CHEST_TEMPLATE)
@@ -2626,19 +2626,17 @@ class HCPHandler(ProfileStreamMixin):
             rejected = normalize_player_transaction(
                 command, player_uid, current_phase=port.current_turn_phase,
                 payload=payload)
-            failed = []
-            if rejected is not None:
-                for requirement in rejected.requirements:
-                    try:
-                        if not requirement.is_valid(port, rejected.player_id):
-                            failed.append(type(requirement).__name__)
-                    except Exception as exc:
-                        failed.append(f"{type(requirement).__name__}:{exc}")
             coerce_player = getattr(port, "coerce_transaction_player_id", None)
             intent_player = (coerce_player(player_uid)
                              if callable(coerce_player) else player_uid)
-            log_req("    RulesPort rejected classified transaction"
-                    f" requirements={failed or 'phase/player/handler'}"
+            if rejected is None:
+                # The typed decoder could not build an intent (for example a
+                # play transaction whose nested payload never decoded).  The
+                # port has nothing to explain, so name the boundary directly.
+                log_req("    RulesPort reject: unclassified transaction"
+                        f" phase={port.current_turn_phase!r}"
+                        f" player={player_uid!r}")
+            log_req("    RulesPort boundary diagnostic:"
                     f" intent_phase="
                     f"{getattr(rejected, 'phase', None)!r}"
                     f" native_phase={port.current_turn_phase!r}"
@@ -2871,7 +2869,12 @@ class HCPHandler(ProfileStreamMixin):
                 except Exception as exc:
                     log_req(f"    RulesPort option refresh failed: {exc}")
         else:
-            log_req("    RulesPort transaction handler returned false: "
+            from rules_port.wire import describe_transaction
+            described = normalize_player_transaction(
+                command, player_uid, current_phase=port.current_turn_phase,
+                payload=payload)
+            log_req("    RulesPort handler reject: "
+                    f"{describe_transaction(described, port)} "
                     f"phase={getattr(port, 'current_turn_phase', None)} "
                     f"priority={getattr(getattr(port, 'action_stack', None), 'priority_player_id', None)} "
                     f"action={type(getattr(getattr(port, 'action_stack', None), 'peek', lambda: None)()).__name__}")
@@ -3485,23 +3488,52 @@ class HCPHandler(ProfileStreamMixin):
         return n >= count
 
     def _card_play_cost_selections(self, session, play_plan, source_uid,
-                                   selected_uids):
-        """Bind a card-play TargetMap to its authored CostInstances."""
+                                   selected_uids, client_cost_map=None):
+        """Bind a card-play TargetMap to its authored CostInstances.
+
+        ``client_cost_map`` carries the decoder's already-separated cost
+        selections (XCostData.CardsToSacrifice -> ability_data
+        cost_target_map).  Client picks are validated and used as-is; the
+        TargetMap positional/best-effort fallback only applies to costs the
+        client did not name.
+        """
         from rules_port.costs import (
             card_cost_targets, cost_type_for_kind,
             validate_cost_target_selection,
         )
         selected_uids = [int(uid) for uid in (selected_uids or [])]
+        named_costs = {
+            int(index): [int(uid) for uid in selected]
+            for index, selected in (client_cost_map or {}).items()
+            if selected
+        }
         used = set()
         selections = []
         if not play_plan.cost_instances:
             return selections, used
+        def trace(reason, cost, available):
+            # Rejection-only trace: selected names the client's TargetMap,
+            # candidates the legal cost pool, so a refused play can be
+            # replayed without the raw ObjFmt envelope.
+            log_req(f"    Card cost selection reject: "
+                    f"card={card_label(session.session_id, source_uid)} "
+                    f"kind={cost.kind} guid={cost.guid} "
+                    f"reason={reason} "
+                    f"selected={[card_label(session.session_id, uid) for uid in selected_uids]} "
+                    f"available={[card_label(session.session_id, uid) for uid in available]} "
+                    f"candidates({len(cost.candidates)})="
+                    f"{[card_label(session.session_id, uid) for uid in list(cost.candidates)[:8]]} "
+                    f"minimum={cost.minimum} maximum={cost.maximum} "
+                    f"source_auto={cost.is_source_auto_target} "
+                    f"best_effort={cost.allow_best_effort_minimum}")
+
         for cost in card_cost_targets(
                 play_plan, _db, session.session_id,
                 self.user_profile["id"] if self.user_profile else 0,
                 source_uid, champions=self._champion_targets(),
                 battle_state=getattr(self, "_current_bstate", None)):
             spec = {"kind": cost.kind, "target_guid": cost.guid,
+                    "index": int(cost.index),
                     "cost_type": cost_type_for_kind(cost.kind),
                     "minimum": cost.minimum, "maximum": cost.maximum,
                     "auto": cost.is_source_auto_target,
@@ -3512,7 +3544,24 @@ class HCPHandler(ProfileStreamMixin):
                 selections.append((spec, candidates))
                 continue
             if not candidates:
+                trace("no-candidates", cost, ())
                 return None
+            named = named_costs.get(int(cost.index))
+            if named:
+                # The client named this cost's payment (XCostData
+                # CardsToSacrifice).  Never steal an effect target to pay it.
+                chosen = validate_cost_target_selection(
+                    _db, session.session_id,
+                    self.user_profile["id"] if self.user_profile else 0,
+                    source_uid, cost, tuple(named),
+                    champions=self._champion_targets(),
+                    battle_state=getattr(self, "_current_bstate", None))
+                if chosen is None:
+                    trace("client-selection-invalid", cost, tuple(named))
+                    return None
+                used.update(chosen)
+                selections.append((spec, chosen))
+                continue
             candidate_set = {int(uid) for uid in candidates}
             available = [uid for uid in selected_uids
                          if uid in candidate_set and uid not in used]
@@ -3531,6 +3580,7 @@ class HCPHandler(ProfileStreamMixin):
                     available = [uid for uid in candidates
                                  if uid not in used and uid not in selected_uids]
                 if len(available) < minimum:
+                    trace("selected<minimum", cost, available)
                     return None
             chosen = tuple(available[:maximum])
             chosen = validate_cost_target_selection(
@@ -3540,6 +3590,8 @@ class HCPHandler(ProfileStreamMixin):
                 champions=self._champion_targets(),
                 battle_state=getattr(self, "_current_bstate", None))
             if chosen is None:
+                trace(f"validate-rejected({[hex(int(uid)) for uid in available[:maximum]]})",
+                      cost, available)
                 return None
             used.update(chosen)
             selections.append((spec, chosen))
@@ -4212,7 +4264,9 @@ class HCPHandler(ProfileStreamMixin):
                                         resource_played, friendly_count, enemy_count):
                 playable.append(scid)
             else:
-                log_req(f"    Playability: skip {card_uid} type {ct} "
+                log_req(f"    Playability: skip "
+                        f"{card_label(session.session_id, card_uid)} "
+                        f"type {ct} "
                         f"(cost {cost} > resources {resources} / thresholds / no troop target)")
         game2 = self._fresh_game(session, pl_t, ai_t, bstate)
         game2.push_options(pl_t, playable)
@@ -4478,14 +4532,22 @@ class HCPHandler(ProfileStreamMixin):
         payload = getattr(transaction, "payload", {}) or {}
         card_uid = int(payload.get("card_id") or 0)
         kind = str(getattr(transaction, "kind", ""))
+
+        def reject(reason):
+            log_req(f"    Card play reject: "
+                    f"card={card_label(session.session_id, card_uid)} "
+                    f"kind={kind or '-'} reason={reason}")
+            return False
+
         if not card_uid or kind not in {
                 "play_troop", "play_artifact", "play_spell",
                 "play_champion"}:
-            return False
+            return reject("untyped-intent")
         from pvp_db import db_rules_port_card_projection
         row = db_rules_port_card_projection(session.session_id, card_uid)
         if not row or int(row[2] or 0) != owner_id:
-            return False
+            return reject(f"missing-or-not-owner(row_owner="
+                          f"{int(row[2]) if row else '-'})")
         source_location = str(row[1] or "").lower()
         if source_location == "deck":
             from pvp_db import db_deck_top_card_details
@@ -4497,11 +4559,11 @@ class HCPHandler(ProfileStreamMixin):
                 _db, session.session_id, _be.load_state(session), owner).get(
                     "CanPlayTopOfDeck", 0)
             if not top or int(top[1]) != card_uid or int(allowed or 0) <= 0:
-                return False
+                return reject("deck-top-not-allowed")
         elif source_location != "hand":
-            return False
+            return reject(f"not-in-hand(location={source_location or '-'})")
         if row[4] == "Resource":
-            return False
+            return reject("resource-card")
         bstate = _be.load_state(session)
         self._current_bstate = bstate
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
@@ -4518,9 +4580,10 @@ class HCPHandler(ProfileStreamMixin):
         play_plan = self._card_play_plan(
             row[0], card_uid, owner_id)
         if play_plan is None:
-            return False
+            return reject(f"no-play-plan(template={row[0]})")
         ability_data = payload.get("ability_data") or ()
         targets = []
+        client_cost_uids = {}
         x_cost = 0
         for activation in ability_data:
             if not isinstance(activation, dict):
@@ -4541,6 +4604,26 @@ class HCPHandler(ProfileStreamMixin):
                         # Only the source card itself is excluded.
                         if uid != card_uid:
                             targets.append(uid)
+            # XCostData.CardsToSacrifice arrives separately from TargetMap
+            # (the decoder normalized it to cost_target_map).  Keep it
+            # distinct so the authored cost pays the client's pick instead of
+            # consuming the effect target.
+            cost_map = activation.get("cost_target_map")
+            if isinstance(cost_map, dict):
+                for index, selected in cost_map.items():
+                    try:
+                        index = int(index)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(selected, (list, tuple, set)):
+                        selected = (selected,)
+                    for value in selected:
+                        try:
+                            uid = int(getattr(value, "uid64", value))
+                        except (TypeError, ValueError):
+                            continue
+                        if uid not in client_cost_uids.setdefault(index, []):
+                            client_cost_uids[index].append(uid)
         if not x_cost:
             # ``XCostData`` is a nested record the generic ObjFmt walker can
             # stop before, so the typed activation can lose the value the
@@ -4553,15 +4636,17 @@ class HCPHandler(ProfileStreamMixin):
                 x_cost = max(0, int(self._extract_int32_field(
                     bytes(inner_bytes), "m_ResourceXCost") or 0))
         cost_selection = self._card_play_cost_selections(
-            session, play_plan, card_uid, targets)
+            session, play_plan, card_uid, targets,
+            client_cost_map=client_cost_uids)
         if cost_selection is None:
-            return False
+            return reject("cost-selection")
         cost_selections, cost_uids = cost_selection
         if play_plan.cost.variable:
             if x_cost < int(play_plan.cost.variable_minimum or 0):
-                return False
+                return reject(f"x-cost {x_cost} < minimum "
+                              f"{int(play_plan.cost.variable_minimum or 0)}")
         elif x_cost:
-            return False
+            return reject(f"x-cost {x_cost} on fixed-cost card")
         playing_for_free = bool(payload.get("playing_for_free", False))
         x_payment = x_cost * play_plan.cost.variable_multiplier
         payment = 0 if playing_for_free else cost + x_payment
@@ -4593,24 +4678,28 @@ class HCPHandler(ProfileStreamMixin):
                 _db, session.session_id, owner_id, card_uid, payment,
                 mobilized)
             if reduced is None:
-                return False
+                return reject("mobilize-payment")
             payment = reduced
-        if payment > int(bstate.get("player_resources", 0) or 0):
-            return False
-        activations, _cost_target_map = play_plan.activation_bundle(
-            targets, x_cost=x_cost)
+        resources = int(bstate.get("player_resources", 0) or 0)
+        if payment > resources:
+            return reject(f"cost {payment} > pool {resources}")
         selected_cost_map = {
-            index: tuple(selected)
-            for index, (_spec, selected) in enumerate(cost_selections)
+            int(spec.get("index", position)): tuple(selected)
+            for position, (spec, selected) in enumerate(cost_selections)
             if selected
         }
-        if play_plan.validate(variable_cost=x_cost,
-                              activations=activations,
-                              cost_target_map=selected_cost_map):
-            return False
+        activations, _cost_target_map = play_plan.activation_bundle(
+            targets, x_cost=x_cost, cost_target_map=selected_cost_map)
+        validation_errors = play_plan.validate(
+            variable_cost=x_cost,
+            activations=activations,
+            cost_target_map=selected_cost_map)
+        if validation_errors:
+            return reject(f"plan-validate {list(validation_errors)}")
         if not self._card_costs_valid(
                 session, cost_selections, owner_id):
-            return False
+            return reject(f"cost-invalid "
+                          f"{[(spec.get('kind'), [hex(u) for u in chosen]) for spec, chosen in cost_selections]}")
         if mobilized:
             from pvp_db import db_update_card_state
             for uid in mobilized:
@@ -4628,7 +4717,7 @@ class HCPHandler(ProfileStreamMixin):
             destination="CastSpells",
             expected_location=source_location)
         if transition is None:
-            return False
+            return reject("zone-transition")
         resource_change = transition.resource_change
         from rules_port.cast_stats import record_card_cast
         record_card_cast(

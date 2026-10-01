@@ -135,6 +135,37 @@ def test_play_plan_exposes_authored_card_cost_instance():
         cost_target_map={0: [11]})
 
 
+def test_card_level_cost_does_not_consume_effect_target():
+    """Abominate: the XCostData sacrifice must not bind the +3/+3 target.
+
+    The client sends TargetMap={0:[buff troop]} and cost_target_map={0:[the
+    sacrificed troop]}.  Feeding only the TargetMap value positionally made the
+    card cost eat the effect target, so validation failed with "missing target
+    input at index 0" and the play was dropped.
+    """
+    plan = PlayPlan.from_card(
+        RecordStore(), "8eebaeb5-5ff9-48c2-ae2f-2edf2f7cad59")
+    buff, sacrifice = 0x201, 0x301
+    activations, costs = plan.activation_bundle(
+        [buff], cost_target_map={0: (sacrifice,)})
+    assert costs == {0: (sacrifice,)}
+    assert activations, "the cast ability must receive an activation"
+    assert all(value.target_map == {0: (buff,)}
+               for value in activations.values()), activations
+    # Card-level costs are not ability-level costs: copying them onto the
+    # ability activation made validate_activation report an unknown index.
+    assert all(not value.cost_target_map for value in activations.values())
+    assert plan.validate(activations=activations, cost_target_map=costs) == ()
+    # A payload without the client's cost selection must not spend the effect
+    # target as the sacrifice.
+    fallback_activations, fallback_costs = plan.activation_bundle([buff])
+    assert plan.validate(activations=fallback_activations,
+                         cost_target_map=fallback_costs) == (
+        "missing target input at index 0",
+        "card play is awaiting activation data",
+    )
+
+
 def test_activation_data_validates_client_style_prompts():
     source = deserialize({
         "_t": "Reckoning.Game.AbilityTemplate",

@@ -517,7 +517,8 @@ class PlayPlan:
     def activation_bundle(self, target_uids: Any = None, *,
                           x_cost: int | None = None,
                           option_map: Mapping[int, int] | None = None,
-                          variables: Mapping[str, Any] | None = None
+                          variables: Mapping[str, Any] | None = None,
+                          cost_target_map: Mapping[int, Any] | None = None
                           ) -> tuple[dict[str, ActivationData], dict[int, tuple[int, ...]]]:
         """Bind one client card-play selection to every affected ability.
 
@@ -530,6 +531,12 @@ class PlayPlan:
 
         Returns ``(ability activations, card-cost target map)``.  The latter is
         keyed by the order of ``CardTemplate`` additional-cost target fields.
+
+        ``cost_target_map`` carries the client's already-separated cost
+        selections (``AbilityActivationData.cost_target_map`` populated from
+        ``XCostData.CardsToSacrifice``).  When supplied, ``target_uids`` binds
+        only to effect targets; the flat-selection fallback is never allowed to
+        spend an effect target to pay a cost (Abominate).
         """
         values = []
         raw_values = target_uids if isinstance(target_uids, (list, tuple, set)) \
@@ -540,7 +547,8 @@ class PlayPlan:
             except (TypeError, ValueError):
                 continue
 
-        cost_target_map: dict[int, tuple[int, ...]] = {}
+        supplied_costs = _normalise_targets(cost_target_map)
+        resolved_costs: dict[int, tuple[int, ...]] = {}
         offset = 0
         for index, (_kind, _guid) in enumerate(self.cost.additional_cost_targets):
             # Singular card cost fields are represented by one target in the
@@ -549,13 +557,17 @@ class PlayPlan:
             spec = self.cost_instances[index]
             if spec["auto"]:
                 continue
+            if supplied_costs:
+                if index in supplied_costs:
+                    resolved_costs[index] = supplied_costs[index]
+                continue
             count = max(1, int(spec["minimum"]))
             maximum = int(spec["maximum"])
             if maximum >= 0:
                 count = min(count, maximum)
             selected = values[offset:offset + count]
             if selected:
-                cost_target_map[index] = tuple(selected)
+                resolved_costs[index] = tuple(selected)
                 offset += len(selected)
 
         slots = []
@@ -598,14 +610,20 @@ class PlayPlan:
         activations = {}
         for ability in play_abilities:
             bound = assignments.get(ability.ability_guid.lower(), {})
+            # Card-level costs live on ``PlayPlan.cost`` (CardTemplate
+            # m_SacrificeTarget and friends) and are validated by
+            # ``PlayPlan.validate(cost_target_map=...)``.  An ability's
+            # ``ActivationData.cost_target_map`` is its own namespace
+            # (AbilityTemplate cost fields), so copying the card map here made
+            # ability validation report "unknown additional-cost index 0"
+            # (Abominate).
             activations[ability.ability_guid.lower()] = ActivationData.from_values(
                 target_map=bound,
                 option_map=option_map,
                 variables=variables,
                 x_cost=x_cost,
-                cost_target_map=cost_target_map,
             )
-        return activations, cost_target_map
+        return activations, resolved_costs
 
     @property
     def cast_abilities(self) -> tuple[AbilityInstance, ...]:

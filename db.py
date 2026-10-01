@@ -848,6 +848,55 @@ def db_card_stat_mods(session_id, card_uid):
     return (row[0] or 0), (row[1] or 0)
 
 
+# Diagnostics-only UID -> name annotation.  Template names are immutable so
+# they cache by GUID; the instance -> template mapping is read per call so a
+# transformed or replaced card never logs a stale name.  The cache is guarded
+# because log lines are emitted from several session threads, and it stays
+# bounded by the template table (~7k rows).
+_template_label_cache: dict = {}
+_template_label_lock = threading.Lock()
+
+
+def db_card_template_label(template_guid):
+    """``(name, attack, defense)`` for one card template (cached by GUID)."""
+    if not template_guid:
+        return "", 0, 0
+    with _template_label_lock:
+        cached = _template_label_cache.get(str(template_guid))
+        if cached is not None:
+            return cached
+    row = _db.execute(
+        "SELECT name, attack, defense FROM card_templates WHERE guid=?",
+        (str(template_guid),)).fetchone()
+    label = ((row[0] if row and row[0] else ""),
+             int(row[1] or 0) if row else 0,
+             int(row[2] or 0) if row else 0)
+    with _template_label_lock:
+        _template_label_cache.setdefault(str(template_guid), label)
+    return label
+
+
+def card_label(session_id, card_uid, *, stats=False):
+    """``"0x301 Abominate (0/0)"`` for diagnostics; ``"0x301"`` when unknown."""
+    try:
+        uid = int(card_uid)
+    except (TypeError, ValueError):
+        return str(card_uid)
+    try:
+        row = _db.execute(
+            "SELECT template_guid FROM game_cards "
+            "WHERE session_id=? AND card_uid=?",
+            (int(session_id), uid)).fetchone()
+    except (TypeError, ValueError):
+        row = None
+    name, attack, defense = db_card_template_label(row[0] if row else None)
+    text = hex(uid)
+    if name:
+        text += f" {name}"
+        if stats:
+            text += f" ({attack}/{defense})"
+    return text
+
 
 def log_req(msg: str, level: str | int = "INFO") -> bool:
     """Print and persist a message when *level* meets the threshold."""

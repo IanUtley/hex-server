@@ -3038,6 +3038,10 @@ def db_ai_evaluator_card_rows(session_id, user_id, zone, conn=None):
                "current_resources_granted" in ct_cols else "0")
     maximum = ("ct.max_resources_granted" if
                "max_resources_granted" in ct_cols else "0")
+    # ``card_abilities``/``card_attributes`` are the live instance values
+    # (granted/revoked abilities and attribute flags).  The AI evaluator must
+    # see them or a troop carrying a granted curse/keyword is scored as its
+    # printed template (Spider Nest re-targeting the same trooper).
     extra = ", gc.card_attack_mod, gc.card_defense_mod" if zone == "warzone" else ""
     return connection.execute(
         "SELECT gc.card_uid, gc.template_guid, gc.location, ct.card_type, "
@@ -3046,7 +3050,8 @@ def db_ai_evaluator_card_rows(session_id, user_id, zone, conn=None):
         "ct.variable_cost, ct.variable_cost_double, " + current + ", " +
         maximum + ", gc.card_state, "
         "gc.card_damage, gc.permanent_buffs, gc.temporary_buffs, "
-        "gc.temporary_attributes" + extra + " FROM game_cards gc "
+        "gc.temporary_attributes" + extra +
+        ", gc.card_abilities, gc.card_attributes FROM game_cards gc "
         "JOIN card_templates ct ON ct.guid=gc.template_guid "
         "WHERE gc.session_id=? AND gc.user_id=? AND gc.location=? "
         "ORDER BY gc.position", (session_id, int(user_id), zone)).fetchall()
@@ -3074,7 +3079,8 @@ def db_ai_evaluator_card_row(session_id, card_uid, conn=None):
         "ct.variable_cost, ct.variable_cost_double, " + current + ", " +
         maximum + ", gc.card_state, "
         "gc.card_damage, gc.permanent_buffs, gc.temporary_buffs, "
-        "gc.temporary_attributes FROM game_cards gc "
+        "gc.temporary_attributes, gc.card_abilities, gc.card_attributes "
+        "FROM game_cards gc "
         "JOIN card_templates ct ON ct.guid=gc.template_guid "
         "WHERE gc.session_id=? AND gc.card_uid=? LIMIT 1",
         (session_id, int(card_uid))).fetchone()
