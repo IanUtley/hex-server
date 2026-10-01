@@ -182,7 +182,11 @@ offer its Play-or-Tunnel choice. A card with only the manual route receives
   player, and has begun a turn on that side, unless it has Speed/haste. It is
   normally exhausted on attack unless Steadfast applies.
 - Any legal untapped defender may block; summoning sickness does not prevent
-  blocking. The attacker chooses damage order among multiple blockers.
+  blocking. A troop blocks at most one attacker per combat (the client's
+  `Card.CanBlock` returns `InCombat` while `ECardStates.Blocking` is set and
+  `Session.AssignBlocker` refuses an already blocking blocker), while several
+  blockers may block the same attacker. The attacker chooses damage order
+  among multiple blockers.
 - First-strike damage resolves in phases 16/17, then normal damage resolves in
   phase 18. A blocker deals its legal combat damage back to the attacker.
 - Crush/Trample carries excess damage through blockers to the defending

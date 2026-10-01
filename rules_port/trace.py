@@ -44,6 +44,10 @@ def begin_effect(db, session, game, state: dict[str, Any], effect: dict,
         "cards": _cards(db, session.session_id),
         "champions": _champions(state),
         "event_count": len(getattr(game, "events", []) or []),
+        "ability_guid": str(state.get("resolving_ability") or "").lower(),
+        "source_uid": (int(state["resolving_source_uid"])
+                       if state.get("resolving_source_uid") is not None
+                       else None),
         "effect_guid": str(effect.get("effect_guid") or "").lower(),
         "effect_type": str(effect.get("effect_type") or ""),
         "effect_order": int(effect.get("effect_order", 0) or 0),

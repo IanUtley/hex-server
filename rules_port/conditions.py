@@ -33,6 +33,31 @@ def _compare(value, operation, target):
     }.get(str(operation or "GreaterThanOrEqual"), True)
 
 
+def _event_tac(ctx):
+    """Return the typed event TAC visible to authored condition leaves."""
+    actual = dict(ctx.event_tac or ctx.bstate.get("event_tac") or {})
+    # The client serializes GainThresholdEvent's colour as an event TAC
+    # IntAttr. Native host callers expose the typed colour separately as
+    # ``gain_threshold_color``; reconstruct the same event-local TAC here so
+    # all resource paths evaluate authored conditions identically.
+    if _last(ctx.event_type) != "GainThresholdEvent":
+        return actual
+    color = (ctx.bstate or {}).get("gain_threshold_color")
+    try:
+        color = int(color) if color is not None else None
+    except (TypeError, ValueError):
+        color = None
+    if color is None:
+        return actual
+    import game_engine
+    from rules_port.tac import _tac_attr_hash
+    for name, flag in game_engine.SHARD_TO_FLAG.items():
+        if int(flag) == color:
+            actual[_tac_attr_hash(str(name).title())] = 1
+            break
+    return actual
+
+
 def _native_condition(node, ctx):
     """Evaluate condition forms already represented by RulesPort types.
 
@@ -230,7 +255,7 @@ def _native_condition(node, ctx):
         attr = str(node.get("m_Attribute") or "")
         if attr.startswith("AbilityTAC>"):
             from rules_port.tac import _tac_attr_hash
-            actual = int((ctx.event_tac or {}).get(
+            actual = int(_event_tac(ctx).get(
                 _tac_attr_hash(attr.split(">", 1)[1]), 0) or 0)
             return _compare(actual, node.get("m_ComparisonOp"), int(
                 node.get("m_Value", 0) or 0))
@@ -351,7 +376,7 @@ def _native_condition(node, ctx):
             required = decode_tac_tree(data)
         except (TypeError, ValueError):
             return True
-        actual = dict(ctx.event_tac or ctx.bstate.get("event_tac") or {})
+        actual = _event_tac(ctx)
         conditions = required.get(_tac_attr_hash("Conditions")) or [required]
         minimum = _tac_attr_hash("MinimumValues")
         subset = _tac_attr_hash("HasAsSubset")

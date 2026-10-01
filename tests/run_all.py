@@ -24,6 +24,10 @@ sys.path.insert(0, str(ROOT))
 REMOVED_SWEEPS = {
     "tests_set1_pvp_sweep.py",
     "tests_core_sets_sweep.py",
+    # The full card matrix is an opt-in catalogue audit; running it on every
+    # normal test invocation would turn a focused suite into a multi-hour
+    # generated integration sweep.
+    "tests_card_play_matrix.py",
 }
 QUICK_TESTS = {
     "tests_application.py",

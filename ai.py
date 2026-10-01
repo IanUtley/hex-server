@@ -277,10 +277,11 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
     if defending_lethal:
         log_req(f"    AI defense: unblocked damage {incoming_damage} is "
                 f"lethal at {ai_health} health; blocking for survival")
-    # Decide blocks, biggest threats first (attack descending). Supports
-    # MULTIBLOCK (one blocker facing several attackers it can survive) and
-    # DOGPILE (several blockers trading for one big attacker when no single
-    # blocker survives).
+    # Decide blocks, biggest threats first (attack descending).  A troop can
+    # block at most one attacker per combat (the client's Card.CanBlock returns
+    # InCombat while ECardStates.Blocking is set and Session.AssignBlocker
+    # refuses an already blocking blocker), but several blockers may gang up on
+    # one attacker (DOGPILE) when no single blocker survives.
     # Value gate (client SolveBlock): only trade a blocker for an attacker
     # when the attacker is worth at least twice the blocker (or the attacker
     # is a real threat / we're at low life).  Otherwise chump-blocking gives
@@ -370,15 +371,7 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
             used.add(pick["uid"])
             blocker_dmg[pick["uid"]] += a["atk"]
             continue
-        # 2) MULTIBLOCK: a blocker already blocking (and surviving so far) can
-        #    also take this attacker.
-        reuse = [b for b in avail if b["uid"] in used and can_face(b) and flight_ok(b)]
-        if reuse:
-            pick = max(reuse, key=lambda b: b["def"])
-            assignment[u] = [pick["uid"]]
-            blocker_dmg[pick["uid"]] += a["atk"]
-            continue
-        # 3) DOGPILE: no single survivor. If the attacker is a real threat,
+        # 2) DOGPILE: no single survivor. If the attacker is a real threat,
         #    trade enough blockers (combined attack >= attacker defense) to kill
         #    it — they take the hit (most die) but bring down the bigger threat.
         if (a["atk"] >= 3 or defending_lethal) and free and any(

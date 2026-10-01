@@ -54,6 +54,13 @@ def to_effect_view(state, player_id, opponent_id):
         "stack_player_passed": state.get("stack_player_passed", False),
         "stack_ai_passed": state.get("stack_ai_passed", False),
         "_next_instance_id": state.get("_next_instance_id", 1),
+        # Opt-in resolver traces must survive the PvP side-oriented view and
+        # a later choice/deck continuation. Without these aliases the first
+        # half of a choice was traceable while the resumed effect silently
+        # disappeared from the audit projection.
+        "trace_ability_resolution": bool(
+            state.get("trace_ability_resolution", False)),
+        "ability_trace": state.setdefault("ability_trace", []),
     }
     # Records abilities read and update these shared TAC/list values while
     # they resolve through the FRA-shaped PvP adapter. Keep the nested roots
@@ -116,4 +123,9 @@ def apply_effect_view(state, view, player_id, opponent_id):
         state["stack"] = view["stack"]
     if "_next_instance_id" in view:
         state["_next_instance_id"] = int(view["_next_instance_id"] or 1)
+    if "trace_ability_resolution" in view:
+        state["trace_ability_resolution"] = bool(
+            view.get("trace_ability_resolution", False))
+    if "ability_trace" in view:
+        state["ability_trace"] = view["ability_trace"]
     return state

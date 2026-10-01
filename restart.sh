@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-BASE_DIR="/home/ianutley/Hex"
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 LOG_DIR="/tmp"
 SERVER_PORT=9933
 PROXY_PORT=8081
@@ -27,38 +27,22 @@ echo ------------------------------------------------------------------------
 echo For development purposes only. Please use Docker version for deployment.
 echo ------------------------------------------------------------------------
 
-# Python files that must compile cleanly before we start anything.
-SOURCES=(
-    "$BASE_DIR/hconnect_server.py"
-    "$BASE_DIR/proxy.py"
-    "$BASE_DIR/campaign.py"
-    "$BASE_DIR/commands.py"
-    "$BASE_DIR/db.py"
-    "$BASE_DIR/encoder.py"
-    "$BASE_DIR/game_engine.py"
-    "$BASE_DIR/game_session.py"
-    "$BASE_DIR/objfmt_builder.py"
-    "$BASE_DIR/static.py"
-    "$BASE_DIR/ability.py"
-    "$BASE_DIR/ai.py"
-    "$BASE_DIR/debug_runtime.py"
-    "$BASE_DIR/battle_engine.py"
-    "$BASE_DIR/ai_deck_strategy.py"
-    "$BASE_DIR/AssetExtraction/generate_starter_decks.py"
-    "$BASE_DIR/AssetExtraction/evaluate_fra_deck_personalities.py"
-    "$BASE_DIR/campaign_chains/__init__.py"
-    "$BASE_DIR/gamemodes/__init__.py"
-    "$BASE_DIR/gamemodes/tournament_server.py"
-    "$BASE_DIR/services/__init__.py"
-    "$BASE_DIR/services/social.py"
-    "$BASE_DIR/replay.py"
-    "$BASE_DIR/replay_server.py"
-)
-# Also validate every .py file under these packages compiles.
-PACKAGES=("domain" "abilities")
-
 log()  { echo "[restart] $*"; }
 die()  { echo "[restart] ERROR: $*" >&2; exit 1; }
+
+compile_python_sources() {
+    local source
+    while IFS= read -r -d '' source; do
+        python3 -m py_compile "$source" || die \
+            "syntax error in ${source#"$BASE_DIR/"}"
+    done < <(
+        find "$BASE_DIR" \
+            \( -path "$BASE_DIR/.git" \
+               -o -name '.venv' \
+               -o -name '.venv-*' \) -prune \
+            -o -type f -name '*.py' -print0
+    )
+}
 
 ACTION="${1:-restart}"
 case "$ACTION" in
@@ -106,7 +90,7 @@ fi
 sleep 2
 
 # ---------------------------------------------------------------------------
-# 2. Database — apply pending migrations, or create a fresh database.
+# 2. Database — apply pending migrations and run the shared bootstrap.
 # ---------------------------------------------------------------------------
 log "Checking database ..."
 # Migrations: run migration.py if present, then remove it.
@@ -116,52 +100,24 @@ if [[ -f "$BASE_DIR/migration.py" ]]; then
     rm -f "$BASE_DIR/migration.py"
     log "Migration applied."
 fi
-# Fresh database: created from static.py if it doesn't exist yet.
-if [[ ! -f "$BASE_DIR/hconnect.db" ]]; then
-    log "Creating fresh database from static.py ..."
-    python3 -c "
-import sqlite3, static
-db = sqlite3.connect('$BASE_DIR/hconnect.db')
-static.ensure_schema(db)
-db.close()
-" || die "fresh database creation failed"
-    log "Database created."
-fi
+# Keep local startup behavior aligned with the Docker entrypoint. This applies
+# schema upgrades and server-owned seeds to existing databases, materializes
+# Records when gamedata is configured, repairs missing FRA catalogues, and
+# validates the complete reference projection before any service opens SQLite.
+# Local restart historically did not run the Docker bootstrap test suite; keep
+# that behavior unless the caller explicitly invokes the bootstrap itself with
+# HEX_RUN_TESTS_ON_BOOT enabled.
+log "Running database bootstrap ..."
+HEX_RUN_TESTS_ON_BOOT=0 \
+    python3 "$BASE_DIR/docker/docker_bootstrap.py" \
+    || die "database bootstrap failed"
 
 # ---------------------------------------------------------------------------
 # 3. Validate all sources before starting.
 # ---------------------------------------------------------------------------
 log "Compiling sources..."
-for src in "${SOURCES[@]}"; do
-    if [[ -f "$src" ]]; then
-        python3 -m py_compile "$src" || die "syntax error in $src"
-    fi
-done
-for pkg in "${PACKAGES[@]}"; do
-    if [[ -d "$BASE_DIR/$pkg" ]]; then
-        while IFS= read -r -d '' f; do
-            python3 -m py_compile "$f" || die "syntax error in $f"
-        done < <(find "$BASE_DIR/$pkg" -name '*.py' -print0)
-    fi
-done
+compile_python_sources
 log "All sources compile OK."
-
-# Starter decks are derived from the client data rather than checked into the
-# server repository. Keep a local deployment's generated copy in sync when a
-# gamedata file or Records snapshot is available.
-STARTER_DECK_GENERATOR="$BASE_DIR/AssetExtraction/generate_starter_decks.py"
-if [[ -n "${HEX_GAMEDATA:-}" ]]; then
-    [[ -f "$HEX_GAMEDATA" ]] || die "HEX_GAMEDATA does not exist: $HEX_GAMEDATA"
-    log "Generating starter decks from HEX_GAMEDATA ..."
-    python3 "$STARTER_DECK_GENERATOR" --gamedata "$HEX_GAMEDATA" \
-        --output "$BASE_DIR/generated/starter_decks.json" || die "starter-deck generation failed"
-elif [[ -d "${HEX_RECORDS:-$BASE_DIR/Records}" ]]; then
-    log "Generating starter decks from Records ..."
-    python3 "$STARTER_DECK_GENERATOR" --records-dir "${HEX_RECORDS:-$BASE_DIR/Records}" \
-        --output "$BASE_DIR/generated/starter_decks.json" || die "starter-deck generation failed"
-else
-    log "No gamedata or Records source; keeping any existing generated starter decks."
-fi
 
 # ---------------------------------------------------------------------------
 # 4. Reset logs (keep last 1000 lines) and start detached.

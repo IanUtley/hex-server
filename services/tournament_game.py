@@ -3801,7 +3801,12 @@ def _pvp_add_champion_options(g, session, state, pid, pl_t):
             try:
                 cands = legal_targets_for(
                     _db, session.session_id, pid, target, int(cu),
-                    both_players=False, champions=champ_targets,
+                    # Champion powers are session abilities: the authored
+                    # target filter decides whether an opposing champion or
+                    # card is legal. Restricting enumeration to the
+                    # controller's side hid valid PvP powers whose target was
+                    # an opposing champion (for example a deck-bury power).
+                    both_players=True, champions=champ_targets,
                     battle_state=state)
             except Exception:
                 cands = []

@@ -80,6 +80,31 @@ The hook uses the disposable test database created by `tests/run_all.py` and
 does not access the live `hconnect.db`. Run `python3 tests/run_all.py` before
 pushing to `main` for the full suite and golden verification.
 
+The opt-in `tests/tests_card_play_matrix.py` generates one isolated fixture per
+card template and drives its typed cast/trigger path through the native
+resolver. Run `python3 tests/tests_card_play_matrix.py --all --limit 25` for a
+quick sample or `python3 tests/tests_card_play_matrix.py --all` for the full
+catalogue audit. It checks resolution, persisted zones, target handling, and
+wire serialization; it is a smoke/contract matrix, not proof of every
+conditional branch, which still needs focused scenario tests.
+Pass `--contracts` to enable the slower semantic layer, for example
+`python3 tests/tests_card_play_matrix.py --only 'Dread Harvest' --contracts`.
+That mode enables the native per-effect trace, checks typed persisted deltas
+such as zone moves and token creation, and resolves every authored ability
+graph on a fresh metadata-driven fixture. For an authored choice, it resumes
+every choice branch presented by the fixture (including nested choices) on a
+fresh board and reports the branch count. It reports unresolved non-choice
+continuations, unmet conditions, and missing effect postconditions instead of
+treating a no-crash result as proof that the ability worked. Use
+`--ability-text Fateweave` when the mechanic is a keyword rather than a card
+name; this is only a metadata selector, not a rules source. Trigger fixtures
+must use the same typed event payloads as the host projections; for example,
+`GainThresholdEvent` supplies `gain_threshold_color` and the native condition
+layer derives the event TAC expected by authored threshold conditions.
+For a catalogue-wide printed-text/typed-graph triage, run
+`python3 AssetExtraction/audit_card_text.py --json /tmp/card_text_audit.json`;
+that report is a consistency aid, not a replacement for native resolution.
+
 For client-visible failures, read the client log first:
 `/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Hex_Data/output_log.txt`.
 Search for `Error`, `Exception`, `Command handler not found`,

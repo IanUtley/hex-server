@@ -96,6 +96,46 @@ def test_incomplete_dogpile_is_not_committed():
         os.unlink(path)
 
 
+def test_blocker_is_never_assigned_to_two_attackers():
+    """A troop blocks at most one attacker per combat.
+
+    ``Card.CanBlock`` returns ``InCombat`` while ``ECardStates.Blocking`` is
+    set and ``Session.AssignBlocker`` refuses an already blocking blocker, so
+    the old AI MULTIBLOCK branch (reusing a blocker that could survive the
+    second hit) let a single wall like Cavern Guard or Tribunal Magistrate
+    block the whole attacking team.  Players reported exactly that.
+    """
+    db, path = _database_copy()
+    try:
+        attacker = _template_with_stats(db, 1, 1)
+        _add_card(db, 100, 5, attacker)
+        _add_card(db, 101, 5, attacker)
+        _add_card(db, 201, 0, _template_with_stats(db, 0, 4))
+        db.commit()
+
+        session = SessionStub()
+        session.session_id = 1
+        handler = HandlerStub(db)
+        game = game_engine.Game(
+            1, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000))
+        bstate = {"player_attackers": {"100": "0", "101": "0"},
+                  "ai_health": 2}
+        old_db = ai._db
+        ai._db = db
+        try:
+            ai.ai_pass_declare_defense(
+                handler, session, game.player_uid, game.ai_uid, bstate, game)
+        finally:
+            ai._db = old_db
+        blocks = bstate.get("ai_blockers") or {}
+        blocker_uses = [b for blockers in blocks.values() for b in blockers]
+        assert len(blocker_uses) == len(set(blocker_uses)), blocks
+        assert blocks == {"100": ["201"]}, blocks
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 def test_lethal_attack_uses_one_lowest_attack_chump():
     db, path = _database_copy()
     try:
@@ -211,6 +251,7 @@ def test_native_attack_declaration_survives_the_next_projection():
 
 if __name__ == "__main__":
     test_incomplete_dogpile_is_not_committed()
+    test_blocker_is_never_assigned_to_two_attackers()
     test_lethal_attack_uses_one_lowest_attack_chump()
     test_ai_block_declaration_queues_the_blocked_attackers_trigger()
     test_ai_turn_pauses_while_a_client_prompt_is_open()

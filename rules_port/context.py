@@ -579,6 +579,15 @@ class EffectContext:
             db_draw_card_to_hand(
                 self.session.session_id, row[0], hand_owner, conn=self.db)
             self.db.commit()
+            # ``MovedCards`` is the typed list used by follow-up effect
+            # targets such as ``SourceBuriedTargetTemplate(MovedCards)``.
+            # PutTopOfDeckIntoHand is a zone move, not an ordinary DrawCard
+            # operation, so it must record the moved instance explicitly;
+            # otherwise a subsequent CardModifier silently resolves against
+            # an empty target list.  Renner's "thresholds become Blood"
+            # effect is one authored example of this continuation.
+            from rules_port.statistics import record_ability_card_list
+            record_ability_card_list(self.bstate, "MovedCards", int(row[1]))
             tpl_guid, ct, _name, cost, atk, defense, gem = \
                 self.handler._card_full_data(
                     self.game, scid, row[3], row[2])

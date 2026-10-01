@@ -414,6 +414,28 @@ def test_tac_trigger_condition_matches_threshold_event_tac(db):
     assert not trigger_condition_met(condition, wrong_color)
 
 
+def test_native_tac_trigger_condition_matches_threshold_color(db):
+    """Native GainThresholdEvent callers need no prebuilt TAC payload."""
+    from rules_port.condition_context import ConditionContext as NativeContext
+    from rules_port.conditions import trigger_condition_met as native_trigger
+
+    condition = {
+        "m_TriggerCondition": {
+            "_t": "TACTriggerCondition",
+            "m_Conditions": {
+                "data": "AgBAsJ4iBQga/hhxdo8BAAAAAAAAAAAAAAAAAAAA"}}}
+    matching = NativeContext(
+        db, SessionStub(),
+        {"gain_threshold_color": game_engine.ECardShards.Diamond},
+        event_type="GainThresholdEvent")
+    assert native_trigger(condition, matching)
+    wrong_color = NativeContext(
+        db, SessionStub(),
+        {"gain_threshold_color": game_engine.ECardShards.Ruby},
+        event_type="GainThresholdEvent")
+    assert not native_trigger(condition, wrong_color)
+
+
 if __name__ == "__main__":
     run("Scrivener fires for troop entry", test_scrivener_troop_vs_artifact)
     run("Scrivener blocked for artifact entry", test_scrivener_artifact_blocked)
@@ -437,3 +459,5 @@ if __name__ == "__main__":
         test_champion_health_condition_honors_controller_and_opponent)
     run("TAC trigger matches threshold event TAC",
         test_tac_trigger_condition_matches_threshold_event_tac)
+    run("Native TAC trigger derives threshold event colour",
+        test_native_tac_trigger_condition_matches_threshold_color)
