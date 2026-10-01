@@ -66,7 +66,7 @@ compatibility, while keeping the actual game state and decisions on the server.
 
 ## Current release
 
-This repository is being prepared as version **0.4.2**. It is an early,
+This repository is being prepared as version **0.4.3**. It is an early,
 compatibility-focused private-server release: the feature checklist records
 what has been tested and the remaining parity gaps. See
 [CHANGELOG.md](CHANGELOG.md) for the release summary and
@@ -112,7 +112,7 @@ docker run --rm `
   -v "${ClientData}:/client-data:ro" `
   -e HEX_DB_PATH='/hex/state/hconnect.db' `
   -e HEX_GAMEDATA='/client-data/gamedata' `
-  ghcr.io/ianutley/hex-server:0.4.2
+  ghcr.io/ianutley/hex-server:0.4.3
 ```
 
 ```bash
@@ -130,7 +130,7 @@ docker run --rm \
   -v "${CLIENT_DATA}:/client-data:ro" \
   -e HEX_DB_PATH='/hex/state/hconnect.db' \
   -e HEX_GAMEDATA='/client-data/gamedata' \
-  ghcr.io/ianutley/hex-server:0.4.2
+  ghcr.io/ianutley/hex-server:0.4.3
 ```
 
 You can try using the `latest` tag to be on the bleeding edge.
