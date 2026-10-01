@@ -14,6 +14,7 @@ threads can share it (SQLite serializes writes internally).
 
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 import struct
@@ -32,8 +33,11 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "hconnect.db"),
 )
 
-REQUEST_LOG = "/tmp/hconnect_requests.log"
-_log_req_file = open(REQUEST_LOG, "a", buffering=1)
+REQUEST_LOG = os.environ.get(
+    "HEX_REQUEST_LOG",
+    os.path.join(tempfile.gettempdir(), "hconnect_requests.log"),
+)
+_log_req_file = open(REQUEST_LOG, "a", buffering=1, encoding="utf-8")
 SESSION_LOG_DIR = os.environ.get("HEX_SESSION_LOG_DIR", "/tmp/hconnect_sessions")
 PLAYER_LOG_DIR = os.environ.get("HEX_PLAYER_LOG_DIR", SESSION_LOG_DIR)
 _log_session_id = ContextVar("hex_log_session_id", default=None)
