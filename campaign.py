@@ -19,6 +19,7 @@ Request types:
 
 import json
 import time
+import threading
 import uuid
 import re
 import random
@@ -3834,6 +3835,324 @@ def _build_input_response(cid, state, success=True, applied=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Broken-state diagnostics
+#
+# A campaign state can be structurally valid JSON yet leave the player with
+# nothing to click: a panorama whose NPC conversations are all completed, a
+# location whose node name has no matching LocNode, etc.  The client renders
+# the scene and silently waits, which reads as a soft-lock in bug reports.
+# These helpers surface that condition in the session log (captured by
+# ``!issue``) and through the ``!campaign`` developer command.
+# ---------------------------------------------------------------------------
+
+_CAMPAIGN_DIAG_LOCK = threading.Lock()
+_CAMPAIGN_DIAG_WARNED = {}
+_CAMPAIGN_DIAG_WARN_LIMIT = 256
+
+
+def campaign_state_options(state):
+    """Return ``[(kind, node, detail), ...]`` for the client's clickable options.
+
+    Mirrors what the campaign UI enables: a visible location offering an
+    unfinished (or repeating) conversation, or an unfinished encounter battle.
+    """
+    options = []
+    for loc in (state or {}).get("VisLocs") or []:
+        data = loc.get("Data") or {}
+        if data.get("visible") is False or data.get("enabled") is False:
+            continue
+        node = str(data.get("node") or data.get("name") or "")
+        conversation = str(data.get("conversationId") or "").strip()
+        if conversation and (not data.get("completed") or data.get("repeatable")):
+            options.append(("conversation", node, conversation))
+            continue
+        if (str(data.get("type") or "").lower() in {"encounter", "battle"}
+                and not data.get("completed")):
+            options.append(("encounter", node, str(
+                data.get("encounter") or data.get("battle") or "")))
+    return options
+
+
+def campaign_state_diagnostic(state):
+    """Return ``''`` when the state offers an action, else a reason string.
+
+    Only campaign types with a known interaction contract are judged; an
+    unfinished AREA map legitimately has no *location* option (its movement is
+    path based), so it is only checked for the node-name contract.
+    """
+    if (not isinstance(state, dict) or not state.get("Started")
+            or state.get("Finished")):
+        return ""
+    ctype = str(state.get("TempType") or "").upper()
+    vis = state.get("VisLocs") or []
+    node_names = set()
+    for node in state.get("LocNodes") or []:
+        name = str((node.get("Data") or {}).get("id") or node.get("Name") or "")
+        if name:
+            node_names.add(name.lower())
+    problems = []
+    for loc in vis:
+        data = loc.get("Data") or {}
+        if data.get("visible") is False:
+            continue
+        name = str(data.get("node") or data.get("name") or "").lower()
+        if node_names and name and name not in node_names:
+            problems.append(f"location {name!r} has no matching LocNode")
+    if ctype in {"PANORAMA", "QUEST", "DUNGEON"} and not campaign_state_options(state):
+        # AREA maps move along authored paths, so only the interactive scene
+        # types are judged on a clickable location.
+        problems.append("no conversation or encounter option")
+    if not problems:
+        return ""
+    return ("no actionable campaign option: "
+            + "; ".join(sorted(set(problems)))
+            + f" [type={ctype or '-'}"
+            f" node={state.get('PanoramaNode') or state.get('LastNode') or state.get('ALoc') or '-'}"
+            f" locs={len(vis)} nodes={len(state.get('LocNodes') or [])}]")
+
+
+def log_campaign_state_diagnostic(handler, camp_id, champion_id, state):
+    """Log one broken-state warning per distinct reason (``!issue`` captures it)."""
+    reason = campaign_state_diagnostic(state)
+    if not reason:
+        return ""
+    fingerprint = (int(camp_id or 0), reason)
+    with _CAMPAIGN_DIAG_LOCK:
+        if fingerprint in _CAMPAIGN_DIAG_WARNED:
+            return reason
+        if len(_CAMPAIGN_DIAG_WARNED) >= _CAMPAIGN_DIAG_WARN_LIMIT:
+            _CAMPAIGN_DIAG_WARNED.clear()
+        _CAMPAIGN_DIAG_WARNED[fingerprint] = True
+    log = getattr(handler, "_log_req", print)
+    log(f"    Campaign broken state: {reason} "
+        f"camp={camp_id} champion={champion_id}")
+    return reason
+
+
+def _repair_quest_active_objective(db, champ_id, state, template_name):
+    """Re-materialize the active journal objective for an inert QUEST state."""
+    template = _quest_template(db, template_name)
+    if not template:
+        return False
+    flags = state.setdefault("Flags", {})
+    objectives = _materialize_quest_objectives(
+        db, champ_id, template_name, flags.get("_quest_objectives") or [])
+    if not objectives:
+        return False
+    changed = objectives != flags.get("_quest_objectives")
+    flags["_quest_objectives"] = objectives
+    try:
+        index = int(flags.get("_quest_objective_idx", 0) or 0)
+    except (TypeError, ValueError):
+        index = 0
+    if index < 0 or index >= len(objectives):
+        return changed
+    obj = objectives[index]
+    otype = str(obj.get("type") or "Convo")
+    conversation_id = obj.get("conversation")
+    if otype.lower() in {"convo", "conversation"}:
+        if str(template.get("campaign_group") or "").upper() == "DUNGEON":
+            race = _race_name_for_campaign(db, champ_id)
+            conversation_id = (_CRAYBURN_CASTLE.get("races", {})
+                               .get(race, {}).get("quest_end"))
+    target = str(obj.get("id") or "")
+    seen = False
+    for loc in state.setdefault("VisLocs", []):
+        data = loc.setdefault("Data", {})
+        if str(data.get("node") or data.get("name") or "") != target:
+            continue
+        seen = True
+        repairs = {
+            "type": otype, "enabled": True, "visible": True,
+            "completed": False, "conversationId": conversation_id,
+            "encounter": obj.get("encounter") or data.get("encounter"),
+        }
+        for key, value in repairs.items():
+            if data.get(key) != value:
+                data[key] = value
+                changed = True
+    if not seen:
+        state["VisLocs"].append({
+            "Data": {
+                "name": target, "node": target, "type": otype,
+                "autostart": False, "autopan": False, "autotrigger": False,
+                "battle": None, "completed": False, "enabled": True,
+                "visible": True, "repeatable": False, "givequest": False,
+                "turninquest": False, "impassable": False, "unknown": False,
+                "encounter": obj.get("encounter"), "encounter_desc": None,
+                "allow_cancel": False, "conversationId": conversation_id,
+            }
+        })
+        state.setdefault("LocNodes", []).append(
+            {"Name": target, "Data": {"id": target, "type": "DEFAULT"}})
+        changed = True
+    state["ALoc"] = state.get("ALoc") or target
+    state["LastNode"] = state.get("LastNode") or target
+    return changed
+
+
+def repair_broken_campaign_state(db, camp_id):
+    """Repair one campaign row and return a structured report.
+
+    Runs the same repair passes ``getcampstate`` uses, plus recovery fallbacks,
+    then re-runs the diagnostic.  No client notification is sent here; the
+    caller (the ``!campaign-cleanup`` command) owns the refresh push.
+    """
+    info = pve_db.db_campaign_query_row(camp_id, conn=db)
+    if not info:
+        return None
+    champ_id, is_started, state_json, ctype, template_name = info
+    upper = str(ctype or "").upper()
+    try:
+        state = json.loads(state_json or "{}")
+    except (TypeError, ValueError):
+        state = {}
+    if not isinstance(state, dict) or not state:
+        state = _build_initial_gameplay_state(camp_id, champ_id, ctype or "AREA")
+    original_state = json.dumps(state, sort_keys=True)
+    before = campaign_state_diagnostic(state)
+    before_options = len(campaign_state_options(state))
+    repairs = []
+
+    # The AZ1 map is the source of truth for an authored panorama, so repair
+    # its locations before any panorama rebuild inherits them.
+    area = (_get_existing_campaign_for_champion(db, champ_id, "AREA")
+            if str(template_name or "").upper() == "AZ1" else None)
+    if area and isinstance(area[4], dict):
+        area_state = area[4]
+        if _hydrate_az1_area_scene_metadata(
+                db, area_state.get("VisLocs", []), champ_id=champ_id,
+                state=area_state):
+            repairs.append("hydrated AZ1 area locations")
+        if _az1_reveal_neighbors(
+                db, area_state,
+                area_state.get("LastNode") or area_state.get("ALoc")):
+            repairs.append("revealed AZ1 neighbours")
+        _save_campaign_state(db, area[0], area_state)
+
+    if upper == "PANORAMA":
+        if state.get("PanoramaSceneGuid"):
+            if area and isinstance(area[4], dict):
+                rebuilt = _build_az1_panorama_state(
+                    db, camp_id, champ_id, state.get("PanoramaSceneGuid"),
+                    state.get("PanoramaNode"), area[4])
+                state = rebuilt
+                repairs.append("rebuilt panorama from area state")
+        else:
+            champ = _get_champion(db, champ_id)
+            cfg = _az0_config(champ[2]) if champ else None
+            if cfg and _normalize_starter_panorama_state(state, cfg):
+                repairs.append("restored starter panorama NPCs")
+            if cfg and not campaign_state_options(state):
+                # Last resort: rebuild the authored tutorial panorama, keeping
+                # the client-facing start/progress bookkeeping that is valid.
+                fresh = _build_starter_panorama_state(camp_id, champ_id, cfg)
+                for key in ("Started", "Wins", "Losses", "Flags",
+                            "TrainingVictoryPending", "PostCrayburnReport"):
+                    if key in state:
+                        fresh[key] = state[key]
+                state = fresh
+                repairs.append("rebuilt starter panorama")
+    elif upper == "DUNGEON":
+        rebuilt = _prepare_dungeon_state(
+            state, _race_name_for_campaign(db, camp_id))
+        if rebuilt is not state:
+            state = rebuilt
+            repairs.append("normalized dungeon state")
+    elif upper == "QUEST":
+        if _repair_quest_active_objective(
+                db, champ_id, state, template_name):
+            repairs.append("restored active quest objective")
+
+    after = campaign_state_diagnostic(state)
+    if repairs or json.dumps(state, sort_keys=True) != original_state:
+        _save_campaign_state(db, camp_id, state)
+        db.commit()
+    return {
+        "camp_id": camp_id,
+        "champ_id": champ_id,
+        "campaign_type": upper,
+        "template_name": template_name,
+        "repairs": repairs,
+        "before": before,
+        "after": after,
+        "before_options": before_options,
+        "after_options": len(campaign_state_options(state)),
+        "state": state,
+    }
+
+
+def repair_user_campaigns(db, user_id, camp_id=None):
+    """Repair every broken campaign for a profile, or one explicit campaign.
+
+    ``camp_id`` is validated against the profile so a chat command cannot
+    touch another player's campaign.  With no id, only states whose diagnostic
+    currently fires are repaired; healthy campaigns are never rewritten.
+    """
+    if camp_id is not None:
+        owner = pve_db.db_campaign_owner_user_id(int(camp_id), conn=db)
+        if owner is None or owner != int(user_id):
+            return None
+        candidates = [(int(camp_id),)]
+    else:
+        candidates = []
+        for row in pve_db.db_user_campaign_states(int(user_id), conn=db):
+            cid = int(row[0])
+            try:
+                state = json.loads(row[5] or "{}")
+            except (TypeError, ValueError):
+                state = {}
+            if not isinstance(state, dict) or campaign_state_diagnostic(state):
+                candidates.append((cid,))
+    reports = []
+    for (cid,) in candidates:
+        report = repair_broken_campaign_state(db, cid)
+        if report:
+            reports.append(report)
+    return reports
+
+
+def campaign_diagnostic_report(handler, db=None):
+    """Chat-facing summary of the caller's newest campaign state."""
+    if db is None:
+        import db as _db_module
+        db = _db_module._db
+    profile = getattr(handler, "user_profile", None) or {}
+    user_id = profile.get("id")
+    if not user_id:
+        return "No profile is bound to this session"
+    row = pve_db.db_latest_campaign_for_user(int(user_id), conn=db)
+    if not row:
+        return "No campaign found for this player"
+    camp_id = int(row[0])
+    info = pve_db.db_campaign_query_row(camp_id, conn=db)
+    if not info:
+        return f"Campaign {camp_id} has no state row"
+    champion_id, is_started, state_json, ctype, template_name = info
+    try:
+        state = json.loads(state_json or "{}")
+    except (TypeError, ValueError):
+        return f"Campaign {camp_id} has an unreadable state"
+    options = campaign_state_options(state)
+    lines = [
+        f"Campaign {camp_id} type={ctype or '-'} template={template_name or '-'}"
+        f" champion={champion_id} started={bool(is_started)}",
+        f"  node={state.get('PanoramaNode') or state.get('LastNode') or state.get('ALoc') or '-'}"
+        f" CurState={state.get('CurState') or '-'}"
+        f" locations={len(state.get('VisLocs') or [])}"
+        f" nodes={len(state.get('LocNodes') or [])}",
+        "  options: " + (", ".join(
+            f"{kind}:{node or '-'}={detail or '-'}" for kind, node, detail in options)
+            or "NONE"),
+    ]
+    reason = campaign_state_diagnostic(state)
+    lines.append(f"  diagnostic: {reason or 'ok'}")
+    if reason:
+        log_campaign_state_diagnostic(handler, camp_id, champion_id, state)
+    return "\n".join(lines)
+
+
 def _prepare_dungeon_state(state, race_name=None):
     """Normalize a fresh Castle Crayburn DUNGEON state for delivery to the
     client. If the stored state is stale (built before the per-node
@@ -4554,6 +4873,7 @@ def _handle_getcampstate(handler, db, env_json, comp, session_id,
         if json.dumps(state, sort_keys=True) != before:
             _save_campaign_state(db, camp_id, state)
             db.commit()
+    log_campaign_state_diagnostic(handler, camp_id, champ_id, state)
     resp = _build_input_response(camp_id, state, success=True)
     ret = _send_response(handler, json.dumps(resp), comp, session_id,
                          reqid, target, instance, conh, uid)

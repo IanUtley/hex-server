@@ -1278,6 +1278,17 @@ class EffectContext:
                         ability_guid=self.bstate.get("resolving_ability", ""))
                     # AI discard is completed synchronously by the host
                     # projection; a human discard leaves the port paused.
+                    # A best-effort target with no legal cards is a resolved
+                    # no-op, however.  Do not leave the continuation marker
+                    # behind or pause the chain for a picker that has no
+                    # selectable target (Bloatcap with an empty hand).
+                    if ("ai_discarded_uid" not in self.bstate and
+                            not self.bstate.get("pending_discard_ability")):
+                        self.bstate.pop("pending_discard_continuation", None)
+                        self.bstate.pop("pending_discard_continuation_instance_id",
+                                        None)
+                        self.bstate.pop("rules_port_resume_effect_order", None)
+                        return "discard: no legal target"
                     if "ai_discarded_uid" not in self.bstate:
                         self.bstate["resolution_paused"] = True
                     return str(result or "discard: awaiting target")

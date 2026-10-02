@@ -23,6 +23,26 @@ def _side(value):
     return "ai" if not value else "player"
 
 
+def _owner_is(ctx, owner, expected) -> bool:
+    """Client ownership comparison for trigger control conditions.
+
+    ``_side`` separates the PvE player (nonzero owner) from the AI (owner 0),
+    but tournament PvP has two nonzero participant ids, so every comparison
+    degenerated to ``"player" == "player"``.  ``TriggerPlayerControlsTarget``
+    then matched the *opponent's* cards: Spitfire Elemental's "when you are
+    dealt damage" fired on opposing champion damage and chained 1 damage onto
+    the enemy champion until the resolver cap.  Compare raw participant ids in
+    PvP, matching the client's ``TriggerPlayerControlsTarget.IsValid``
+    (``sourceCard.Controller == sessionEvent.TargetPlayerId``).
+    """
+    if (getattr(ctx, "bstate", None) or {}).get("pvp"):
+        try:
+            return int(owner or 0) == int(expected or 0)
+        except (TypeError, ValueError):
+            return False
+    return _side(owner) == _side(expected)
+
+
 def _compare(value, operation, target):
     return {
         "GreaterThanOrEqual": value >= target,
@@ -100,19 +120,17 @@ def _native_condition(node, ctx):
         trigger_owner = (ctx.trigger_owner_id
                          if ctx.trigger_owner_id is not None
                          else ctx.ability_source_owner_id)
-        if ctx.bstate.get("pvp"):
-            return int(card.get("user_id", 0) or 0) == int(trigger_owner or 0)
-        return _side(card.get("user_id")) == _side(trigger_owner)
+        return _owner_is(ctx, card.get("user_id"), trigger_owner)
     if kind == "TriggerPlayerControlsCard":
         card = ctx.card(ctx.trigger_uid)
         return (True if card is None else
-                _side(card.get("user_id")) ==
-                _side(ctx.ability_source_owner_id))
+                _owner_is(ctx, card.get("user_id"),
+                          ctx.ability_source_owner_id))
     if kind == "TriggerPlayerControlsTarget":
         card = ctx.card(ctx.extra_target)
         return (True if card is None else
-                _side(card.get("user_id")) ==
-                _side(ctx.ability_source_owner_id))
+                _owner_is(ctx, card.get("user_id"),
+                          ctx.ability_source_owner_id))
     if kind == "TriggerPlayerIsActivePlayer":
         return ctx.bstate.get("turn_player") == _side(
             ctx.ability_source_owner_id)
@@ -406,6 +424,13 @@ def _native_condition(node, ctx):
         count = 0
         from rules_port.filters import records_filter_matches
         source = ctx.card(ctx.ability_source_uid)
+        # ``IsAbilitySource`` is an identity test. Preserve that identity
+        # even when a transient/generated source has no joined template row;
+        # otherwise ``Not(IsAbilitySource)`` turns a missing source projection
+        # into a false matching card and incorrectly satisfies conditions such
+        # as Merry Minstrels' Elf Allegiance.
+        if source is None and ctx.ability_source_uid is not None:
+            source = {"card_uid": int(ctx.ability_source_uid)}
         for card in ctx._cards_in_zones(zones):
             card_owner = int(card.get("user_id", 0) or 0)
             if player_filter in ("Self", "You", "Controller"):

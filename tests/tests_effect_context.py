@@ -147,6 +147,8 @@ def test_native_discard_creates_parent_continuation_for_hand_picker():
 
     class Handler:
         def _push_discard_prompt(self, *args, **kwargs):
+            args[4]["pending_discard_ability"] = kwargs.get(
+                "ability_guid", "parent")
             return "prompted"
 
     class Ability:

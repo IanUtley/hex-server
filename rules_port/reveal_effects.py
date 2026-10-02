@@ -39,6 +39,14 @@ def _target_metadata(context):
 
 
 def _find_zone(filter_node):
+    """Return the authored InZone collection anywhere in the filter tree.
+
+    An empty string means the filter does not restrict a collection; callers
+    apply their own default.  Returning a truthy default here made the
+    recursive walk terminate on the first scalar leaf (the ``_t`` key) and
+    every nested filter looked like a deck reveal: "reveal a random card from
+    their hand" looked in the deck and revealed nothing.
+    """
     if isinstance(filter_node, dict):
         kind = str(filter_node.get("_t", "")).rsplit(".", 1)[-1]
         if kind == "InZone" and filter_node.get("m_Collection"):
@@ -52,7 +60,7 @@ def _find_zone(filter_node):
             found = _find_zone(value)
             if found:
                 return found
-    return "deck"
+    return ""
 
 
 def _reveal_owner(context, owner, target_kind):
@@ -77,7 +85,7 @@ def reveal_cards(context):
     """Select and project cards according to the Records target template."""
     from pvp_db import (db_target_template_filter,
                         db_target_template_resolution_info,
-                        db_reveal_card_row, db_reveal_cards,
+                        db_reveal_cards,
                         db_reveal_owned_card)
     from .targeting import legal_targets
     import game_engine
@@ -115,7 +123,7 @@ def reveal_cards(context):
             pass
     owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
     owner = _reveal_owner(context, owner, target_kind)
-    zone = _find_zone(filt)
+    zone = _find_zone(filt) or "deck"
     reveal_collection = card_collection_for_location(zone)
 
     if target_kind == "AbilitySourceCardTargetTemplate":
@@ -134,11 +142,15 @@ def reveal_cards(context):
                 context.bstate.get("resolving_source_uid"), both_players=False,
                 champions=[], battle_state=context.bstate)
         if random_target and candidates is not None:
-            selected = random.choice(candidates) if candidates else None
-            rows = ([db_reveal_card_row(
-                context.session.session_id, selected, owner, zone,
-                conn=context.db)] if selected is not None else [])
-            rows = [row for row in rows if row]
+            # MatchSecondaryTargetTemplate enumerates legal cards from both
+            # players, so a random sample must still be restricted to the
+            # previous target's controller ("a random card from their hand").
+            # Selecting outside that hand made the reveal silently project
+            # nothing when the other player happened to hold more cards.
+            owned = db_reveal_cards(
+                context.session.session_id, owner, zone, 1, candidates,
+                conn=context.db)
+            rows = [random.choice(owned)] if owned else []
         else:
             if zone == "hand" and candidates is not None:
                 if random_target and candidates:

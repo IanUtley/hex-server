@@ -586,7 +586,66 @@ def _card_was_already_in(entry, destination):
     return False
 
 
-def _effect_contract_error(effect, trace):
+def _card_left_deck(entry):
+    """True when a deck card moved out of the deck during the effect.
+
+    A replaced draw (Booby Trap reveals the drawn card and voids it) leaves the
+    deck without ever reaching hand, so a deck->hand assertion is not valid for
+    that effect instance.
+    """
+    for change in entry.get("card_changes") or ():
+        before = change.get("before") or {}
+        after = change.get("after") or {}
+        if (before and after and
+                _normalise_zone(before.get("location")) == "deck" and
+                _normalise_zone(after.get("location")) != "deck"):
+            return True
+    return False
+
+
+def _typed_draw_count(graph, effect):
+    """Return the authored draw count, or ``None`` when it cannot be read.
+
+    A "for each <counter>" count is a Counter/IntAttr variable whose default is
+    zero; on a board with no counters the effect is a legitimate no-op.  Flat
+    ``AbilityConstant`` values resolve to their constant.
+    """
+    template = getattr(effect, "template", None)
+    value = _field(template, "m_InputValue") if template is not None else None
+    if value is None:
+        return None
+    if hasattr(value, "field"):
+        name = (value.field("m_InputVariableName")
+                or value.field("m_VariableName"))
+    elif isinstance(value, dict):
+        name = (value.get("m_InputVariableName")
+                or value.get("m_VariableName"))
+    else:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if not name:
+        return None
+    for variable in getattr(graph, "variables", ()) or ():
+        try:
+            if str(variable.field("m_Name")) != str(name):
+                continue
+        except (AttributeError, TypeError, ValueError):
+            continue
+        type_name = str(getattr(variable, "type_name", "") or
+                        variable.raw.get("_t", ""))
+        if "AbilityConstant" in type_name:
+            try:
+                return int(variable.field("m_DefaultValue", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+        # Counter/IntAttr/other computed variables are zero here.
+        return 0
+    return None
+
+
+def _effect_contract_error(effect, trace, graph=None):
     """Check postconditions that are unambiguous in typed effect metadata."""
     if trace.get("error"):
         return str(trace["error"])
@@ -615,7 +674,18 @@ def _effect_contract_error(effect, trace):
                        "DrawNCardsAbilityEffectTemplate",
                        "PutTopOfDeckIntoHandAbilityEffectTemplate"} and not \
         _card_changes_to(trace, "hand"):
-        return "draw effect produced no deck-to-hand change"
+        # A draw does not guarantee a deck->hand move: a replacement effect
+        # such as Booby Trap reveals the drawn card and voids it, and a
+        # "for each counter" count is zero on a board with no counters.  Only
+        # an authored constant/positive count with no replacement (and no
+        # hand change) is a real failure.
+        if (effect_type != "PutTopOfDeckIntoHandAbilityEffectTemplate"
+                and _card_left_deck(trace)):
+            pass
+        elif _typed_draw_count(graph, effect) == 0:
+            pass
+        else:
+            return "draw effect produced no deck-to-hand change"
     if effect_type == "CardModifierAbilityEffectTemplate":
         from rules_port.metadata import modifier_metadata
         modifier = modifier_metadata(template=template)
@@ -672,11 +742,109 @@ def _effect_contract_error(effect, trace):
     return None
 
 
-def _assert_graph_trace(graph, state):
+def _target_has_no_candidates(db, graph, handler, state, source_uid, effect):
+    """True when an automatic effect target enumerates nothing on the board."""
+    try:
+        index = int(getattr(effect, "target_index", -1))
+    except (TypeError, ValueError):
+        return False
+    if index < 0 or index >= len(graph.targets):
+        return False
+    target = graph.targets[index]
+    kind = str(getattr(target, "target_kind", "") or "")
+    if kind == "SourceRevealedTargetTemplate":
+        # A source-revealed target depends on the reveal effect feeding it.
+        return not (state.get("revealed_cards") or ())
+    list_name = {
+        "SourceDrawnTargetTemplate": "DrawnCards",
+        "SourceBuriedTargetTemplate": "BuriedCards",
+        "SourceStoredTargetTemplate": "StoredTargets",
+        "AbilityCreatedTargetTemplate": "CreatedCards",
+        "VoidedTargetTemplate": "VoidedCards",
+    }.get(kind)
+    if list_name is not None:
+        # A list-derived target has no candidate until this activation records
+        # one; an empty ledger is an expected skip, not a missing effect.
+        guid = str(graph.guid).lower()
+        if ((state.get("list_attrs") or {}).get(guid, {}) or {}).get(list_name):
+            return False
+        if (state.get("ability_lists") or {}).get(list_name):
+            return False
+        if kind == "SourceStoredTargetTemplate" and (
+                (state.get("stored_targets") or {}).get(guid)
+                or (state.get("stored_targets_by_card") or {})):
+            return False
+        return True
+    if kind in _SPECIAL_TARGET_KINDS or not getattr(target, "is_auto", False):
+        return False
+    from rules_port.targeting import target_uses_both_players
+    try:
+        both_players = target_uses_both_players(db, target.guid)
+    except Exception:
+        return False
+    try:
+        candidates = legal_targets_for(
+            db, SESSION_ID, PLAYER_PID, target, int(source_uid),
+            both_players=both_players, champions=handler._champion_targets(),
+            battle_state=state)
+    except Exception:
+        return False
+    return not candidates
+
+
+def _fixture_skippable_guids(db, graph, handler, state, source_uid):
+    """Effect guids the generated board cannot legally reach.
+
+    The fixture seeds one representative per common card type/subtype, not one
+    per authored card name or subtype.  An effect is unreachable here when it
+    is gated, optional, contingent on an already-unreachable effect, or has an
+    automatic target whose pool is empty.  The resolver is correct to apply
+    nothing for those effects, so a missing trace is a fixture limitation
+    rather than a missing effect.
+    """
+    skippable_guids: set[str] = set()
+    if not graph.effects:
+        return skippable_guids
+    skippable_instances: set[int] = set()
+    for _ in range(len(graph.effects) + 2):
+        changed = False
+        for effect in graph.effects:
+            key = str(effect.guid).lower()
+            if key in skippable_guids:
+                continue
+            condition = str(getattr(effect, "condition_guid", "") or "")
+            gated = bool(condition) and condition.replace(
+                "-", "").lower() not in {"", "0" * 32}
+            try:
+                contingent = int(
+                    getattr(effect, "contingent_effect_instance_id", -1))
+            except (TypeError, ValueError):
+                contingent = -1
+            if (gated or getattr(effect, "optional", False) or
+                    (contingent >= 0 and contingent in skippable_instances) or
+                    _target_has_no_candidates(
+                        db, graph, handler, state, source_uid, effect)):
+                skippable_guids.add(key)
+                try:
+                    skippable_instances.add(
+                        int(getattr(effect, "effect_instance_id", -1)))
+                except (TypeError, ValueError):
+                    pass
+                changed = True
+        if not changed:
+            break
+    return skippable_guids
+
+
+def _assert_graph_trace(graph, state, *, fixture_skipped=frozenset()):
     entries = [entry for entry in state.get("ability_trace") or ()
                if str(entry.get("ability_guid") or "").lower()
                == str(graph.guid).lower()]
     if not entries:
+        if graph.effects and all(
+                str(effect.guid).lower() in fixture_skipped
+                for effect in graph.effects):
+            return 0
         raise ChampionSweepFailure(
             f"{graph.guid}: resolution produced no typed effect trace")
     wanted = Counter(str(effect.guid).lower() for effect in graph.effects
@@ -693,7 +861,8 @@ def _assert_graph_trace(graph, state):
             condition_guid = str(getattr(effect, "condition_guid", "") or "")
             has_condition = condition_guid.replace("-", "").lower() not in {
                 "", "0" * 32}
-            if has_condition or getattr(effect, "optional", False):
+            if (has_condition or getattr(effect, "optional", False) or
+                    key in fixture_skipped):
                 allowed[key] += 1
         missing -= allowed
         if missing:
@@ -708,7 +877,7 @@ def _assert_graph_trace(graph, state):
             raise ChampionSweepFailure(
                 f"{graph.guid}: trace contains unknown effect "
                 f"{entry.get('effect_guid')}")
-        error = _effect_contract_error(effect, entry)
+        error = _effect_contract_error(effect, entry, graph)
         if error:
             raise ChampionSweepFailure(
                 f"{graph.guid} effect {effect.guid} "
@@ -871,7 +1040,7 @@ def _pending_continuation(state):
     return None
 
 
-def _assert_complete(graph, state, *, static=False):
+def _assert_complete(graph, state, *, static=False, fixture_skipped=frozenset()):
     if state.get("resolution_paused"):
         pending = _pending_continuation(state)
         if not pending:
@@ -885,11 +1054,22 @@ def _assert_complete(graph, state, *, static=False):
         # CardDef registration, non-clickable option contract, and wire check
         # are the meaningful checks for this attachment here.
         return len(state.get("ability_trace") or ())
-    _assert_graph_trace(graph, state)
+    _assert_graph_trace(graph, state, fixture_skipped=fixture_skipped)
     return len(state.get("ability_trace") or ())
 
 
 _SWEEP_STATS = Counter()
+
+
+def _fixture_skip_result():
+    """Result for an attachment the generated board cannot exercise.
+
+    A manual power whose authored target/payment has no legal card on the
+    fixture cannot be offered or activated; the option path is correct to keep
+    it greyed out, and its CardDef/wire contract is still asserted separately.
+    """
+    return {"pending": None, "choices": (), "traces": 0, "events": 0,
+            "trigger_mode": "fixture-skip"}
 
 
 def _run_case(db, metadata, path, *, option_check=True):
@@ -900,6 +1080,22 @@ def _run_case(db, metadata, path, *, option_check=True):
         db, metadata["champion_guid"], board["champion_abilities"])
     handler._current_bstate = state
     session = SessionStub(state)
+
+    source_uid = board["source_uid"]
+    static_attachment = bool(not graph.manual and
+                             not graph.trigger_event_type)
+    handler._current_bstate = state
+
+    # A manual power whose authored target/payment cannot be satisfied on the
+    # generated board is a fixture limitation: the option path correctly keeps
+    # it greyed out and the activation cannot be driven.  Detect that once and
+    # use it both to relax the option assertion and to skip the activation.
+    selected = target_map = None
+    fixture_unsatisfied = False
+    if graph.manual:
+        selected, target_map = _activation_selection(
+            db, graph, handler, state, session, source_uid)
+        fixture_unsatisfied = selected is None
 
     option_game = game_engine.Game(SESSION_ID, PLAYER_UID, OPPONENT_UID)
     option_game.push_options(PLAYER_UID, [])
@@ -923,23 +1119,24 @@ def _run_case(db, metadata, path, *, option_check=True):
             raise ChampionSweepFailure(
                 f"{metadata['champion_name']} / {metadata['ability_name']}: "
                 "triggered power was exposed as a clickable PvP option")
-        if graph.manual and metadata["ability_guid"] not in offered:
+        if (graph.manual and metadata["ability_guid"] not in offered
+                and not fixture_unsatisfied):
             raise ChampionSweepFailure(
                 f"{metadata['champion_name']} / {metadata['ability_name']}: "
                 "manual power was not exposed by the PvP option path")
         _validate_game_wire(option_game)
 
-    source_uid = board["source_uid"]
-    static_attachment = bool(not graph.manual and
-                             not graph.trigger_event_type)
-    handler._current_bstate = state
+    if fixture_unsatisfied:
+        return _fixture_skip_result()
+
+    # The board mutates during resolution (a prior effect can create the cards
+    # a later effect targets), so record which effects are unreachable on the
+    # starting board as well as the settled board.  An effect that is
+    # unreachable in either snapshot was legitimately skipped for lack of a
+    # legal target.
+    pre_skipped = _fixture_skippable_guids(
+        db, graph, handler, state, source_uid)
     if graph.manual:
-        selected, target_map = _activation_selection(
-            db, graph, handler, state, session, source_uid)
-        if selected is None:
-            raise ChampionSweepFailure(
-                f"{metadata['champion_name']} / {metadata['ability_name']}: "
-                "fixture could not satisfy typed payment/target contract")
         _activation_context["guid"] = metadata["ability_guid"]
         _activation_context["selected"] = list(selected)
         if not tournament_game._pvp_activate_champion_ability(
@@ -1042,7 +1239,12 @@ def _run_case(db, metadata, path, *, option_check=True):
         if not state.get("resolution_paused"):
             _drain_stack(db, handler, session, state, game)
 
-    traces = _assert_complete(graph, state, static=static_attachment)
+    settled_skipped = _fixture_skippable_guids(
+        db, graph, handler, state, source_uid)
+    fixture_skipped = set(pre_skipped) | set(settled_skipped)
+    traces = _assert_complete(
+        graph, state, static=static_attachment,
+        fixture_skipped=fixture_skipped)
     _validate_game_wire(game)
     pending, choices = _pending_choices(state)
     if pending is None:

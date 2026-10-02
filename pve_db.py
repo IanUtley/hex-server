@@ -854,6 +854,25 @@ def db_latest_quest_state(champion_id, conn=None):
     return row
 
 
+def db_user_campaign_states(user_id, conn=None):
+    """Return ``(campaign_id, champion_id, campaign_type, template_name,
+    is_started, state_json)`` for every campaign owned by one profile."""
+    return _connection(conn).execute(
+        "SELECT c.id, c.champion_id, c.campaign_type, c.template_name, "
+        "c.is_started, c.state_json FROM campaigns c "
+        "JOIN champions ch ON ch.id=c.champion_id "
+        "WHERE ch.user_id=? ORDER BY c.id DESC", (int(user_id),)).fetchall()
+
+
+def db_campaign_owner_user_id(campaign_id, conn=None):
+    """Return the profile id owning one campaign, or None."""
+    row = _connection(conn).execute(
+        "SELECT ch.user_id FROM campaigns c JOIN champions ch "
+        "ON ch.id=c.champion_id WHERE c.id=?",
+        (int(campaign_id),)).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
 def db_latest_campaign_any(champion_id, conn=None):
     """Return the newest campaign identity/state for a champion."""
     return _connection(conn).execute(

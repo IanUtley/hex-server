@@ -153,6 +153,63 @@ def _arena_clear_command(handler):
     return "Arena run cleared"
 
 
+def _campaign_cleanup_command(handler, args=()):
+    """Repair the caller's stuck campaign so they can continue playing.
+
+    Diagnoses every campaign owned by the profile (a panorama whose NPC
+    conversations are all completed, a quest journal with no active objective,
+    a dungeon with no actionable node, ...), runs the server's authored repair
+    passes, and pushes a ``cmpupdate`` so the client rebuilds the scene without
+    a relog.  ``!campaign-cleanup <campId>`` targets one campaign.
+    """
+    import campaign
+
+    db = hconnect_server._db
+    profile = getattr(handler, "user_profile", None) or {}
+    user_id = profile.get("id")
+    if not user_id:
+        return "No profile is bound to this session"
+    camp_id = None
+    for token in args or ():
+        try:
+            camp_id = int(token)
+            break
+        except (TypeError, ValueError):
+            continue
+    reports = campaign.repair_user_campaigns(db, int(user_id), camp_id)
+    if reports is None:
+        return "That campaign does not belong to this profile"
+    if not reports:
+        return "No broken campaign state found for this profile"
+    lines = []
+    for report in reports:
+        lines.append(
+            f"Campaign {report['camp_id']} ({report['campaign_type']} "
+            f"{report['template_name'] or '-'}): "
+            f"repairs={', '.join(report['repairs']) or 'none needed'}; "
+            f"{report['before_options']} -> {report['after_options']} "
+            f"option(s)")
+        if report["before"]:
+            lines.append(f"  before: {report['before']}")
+        if report["after"]:
+            lines.append(f"  still broken: {report['after']}")
+    # Refresh the client for the newest repaired campaign (the most likely one
+    # on screen) so a stuck panorama rebuilds immediately.
+    newest = max(reports, key=lambda item: int(item["camp_id"]))
+    try:
+        campaign.push_campupdate(
+            handler, db, newest["camp_id"], newest["champ_id"],
+            "campaign_cleanup", newest["campaign_type"] or "AREA", False,
+            newest["state"], 0, "00000000-0000-0000-0000-000000000000",
+            "ServiceCampaign",
+            str(hconnect_server.UID_TYPE["ServiceCampaign"]), 0,
+            hconnect_server.SERVICE_MAIL_UID)
+        lines.append("Client refresh pushed.")
+    except Exception as exc:  # surfaced rather than hidden in chat
+        lines.append(f"Client refresh failed: {exc}")
+    return "\n".join(lines)
+
+
 def _account_cleanup_command(handler):
     from profile_db import db_reset_account
     user_id = int(handler.user_profile["id"])
@@ -524,7 +581,7 @@ def _issue_command(handler, title):
 
 def _public_help_command():
     return ("Available commands: !help, !commands, !version, !arena-cleanup, "
-            "!account-cleanup, !issue <title>")
+            "!account-cleanup, !campaign-cleanup, !issue <title>")
 
 
 def _full_help_lines():
@@ -534,6 +591,7 @@ def _full_help_lines():
         "!version — show the server version",
         "!arena-cleanup — clear your Frost Ring Arena run",
         "!account-cleanup — reset your account, keeping PvE and alt-art cards",
+        "!campaign-cleanup — repair your campaign when a scene has no options",
         "!issue <title> — open a prefilled GitHub issue with session diagnostics",
         "!game_end victory|defeat — end the campaign battle (test win/loss)",
         "!encounter <name> — start a named campaign encounter",
@@ -576,6 +634,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "account-cleanup":
         try:
             return _account_cleanup_command(handler)
+        except Exception as exc:
+            return f"Error: {exc}"
+    if action == "campaign-cleanup":
+        try:
+            return _campaign_cleanup_command(handler, parts[1:])
         except Exception as exc:
             return f"Error: {exc}"
     if action == "issue":

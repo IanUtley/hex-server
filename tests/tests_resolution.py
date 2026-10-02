@@ -620,6 +620,7 @@ def test_hand_discard_child_asks_the_controller_and_discards_on_resume(db):
         def _push_discard_prompt(self, _game, _session, _pl_t, _ai_t,
                                  _bstate, ability_guid=None):
             self.discard_prompts.append(ability_guid)
+            _bstate["pending_discard_ability"] = ability_guid
             return "prompted"
 
         def _prompt_choice_cards(self, *args):
@@ -656,6 +657,59 @@ def test_hand_discard_child_asks_the_controller_and_discards_on_resume(db):
     assert location() == "discard"
     assert any(ev.__class__.__name__ == "CardDiscardedSessionEventArgs"
                for ev in game.events)
+
+
+def test_hand_discard_child_with_no_legal_card_completes_without_prompt(db):
+    """A best-effort discard with an empty hand must not strand the chain."""
+    import types
+
+    import hconnect_server as hcs
+    from rules_port.resolution import resolve_port_trigger
+    from rules_port.context import EffectContext
+    from rules_port.death_effects import kill_troop
+    from tests.tests_cards_fixes import _copy_card
+
+    bloatcap = "702f45ec-c117-4fc2-9e38-1b9e66ebb8ad"
+
+    class Handler(HandlerStub):
+        _push_discard_prompt = hcs.HCPHandler._push_discard_prompt
+
+        def _checkpoint_engine(self, _session):
+            return types.SimpleNamespace()
+
+    handler = Handler(db)
+    session = SessionStub()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    _copy_card(db, bloatcap)
+    add_card(db, 900, 0, bloatcap)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "_rules_port_attached": True,
+              "_rules_port_native_effect": True, "stack": []}
+
+    old_hcs_db = hcs._db
+    hcs._db = db
+    try:
+        context = EffectContext.from_rules_port(
+            game, session, db, handler, pl_t, ai_t, bstate, "", ability=None)
+        assert kill_troop(context, 900, cause="damage").startswith("killed")
+        assert len(bstate["stack"]) == 1, bstate
+        result = resolve_port_trigger(
+            handler, game, session, db, pl_t, ai_t, bstate,
+            bstate["stack"].pop())
+    finally:
+        hcs._db = old_hcs_db
+
+    assert result == "COMPLETED", result
+    assert not bstate.get("resolution_paused"), bstate
+    assert not bstate.get("pending_discard_ability"), bstate
+    assert not bstate.get("pending_discard_continuation"), bstate
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=900").fetchone()[0] == "discard"
+    assert not any(isinstance(event,
+                              game_engine.AbilityActivationDataRequiredSessionEventArgs)
+                   for event in game.events)
 
 
 def test_native_deck_target_opens_the_deck_search_picker(db):

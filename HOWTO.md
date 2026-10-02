@@ -567,6 +567,16 @@ template with `m_IsAutoTarget` is never a player picker: every activation —
 human, AI, or server-driven — resolves it to its whole legal pool, bounded
 only by `m_MaximumTargetCount` (unset means all). Only an input-bearing
 (explicit) target is picked singly when the server drives an AI activation.
+An authored effect condition is evaluated against that effect instance's own
+resolved target (`RequiresTargetPassesFilterCondition` in particular), so the
+condition context must expose the effect target; otherwise the condition falls
+back to an earlier stored target — Vampire King's "It is a troop" tested the
+damaged champion instead of the revealed card. A reveal's collection is the
+first `InZone` leaf anywhere in the authored filter tree, with `Deck` applied
+only when the filter names no collection: assuming `Deck` made "reveal a
+random card from their hand" look in the deck. A random reveal that enumerates
+through `MatchSecondaryTargetTemplate` must still restrict its sample to the
+previous target's controller's cards.
 
 A resolved trigger is owned by the trigger engine. The death path emits the
 warzone→discard `CardEnteredZoneEvent` and lets trigger discovery resolve the

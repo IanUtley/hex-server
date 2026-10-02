@@ -283,6 +283,128 @@ def test_native_resource_modifier_maps_pvp_owner_to_effect_view_side(db):
     assert calls == [("ai", "currentresource", 1)]
 
 
+def test_pvp_start_turn_resource_bonus_survives_effect_view_round_trip(db):
+    """A StartTurn bonus must survive the PvP view before Prep refills."""
+    from rules_port.pvp_view import apply_effect_view, to_effect_view
+    from rules_port.resources import begin_turn_resources_for_player
+
+    state = {
+        "pvp": True,
+        "pids": [1001, 1002],
+        "res_1001": 2,
+        "res_total_1001": 2,
+        "res_1002": 0,
+        "res_total_1002": 0,
+    }
+    view = to_effect_view(state, 1001, 1002)
+    # This is the marker written by the generic resource effect during
+    # StartTurn, before the view is synchronized back to the raw state.
+    view["start_turn_resource_bonus_1001"] = 1
+
+    apply_effect_view(state, view, 1001, 1002)
+
+    assert state["start_turn_resource_bonus_1001"] == 1
+    change = begin_turn_resources_for_player(state, 1001)
+    assert change.old_value == 2
+    assert change.new_value == 3
+    assert "start_turn_resource_bonus_1001" not in state
+
+
+def test_requires_cards_controlled_excludes_source_and_respects_controller(db):
+    """Typed card-count conditions must not count their own source card."""
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    from rules_port.condition_context import ConditionContext
+    from rules_port.conditions import evaluate_condition
+
+    merry_tpl = "730ea063-830a-4433-a3e9-e62972dda465"
+    merry_ability = "ac3ad632-85e3-d258-7ea1-fddc1e44618c"
+    scrap_tpl = "82b00792-a0e4-4e56-8193-1ae4a35e6214"
+    scrap_ability = "4096461d-a724-af84-271a-8c0b40f57019"
+    _copy_card(db, merry_tpl)
+    _copy_card(db, scrap_tpl)
+    add_card(db, 401, 1001, merry_tpl, loc="warzone")
+    add_card(db, 402, 1001, scrap_tpl, loc="warzone")
+
+    state = {"pvp": True, "pids": [1001, 1002],
+             "champ_map": {"1001": 10001, "1002": 10002}}
+
+    def condition(source_uid, owner, node):
+        context = ConditionContext(
+            db, SessionStub(), state, event_type="CardEnteredZoneEvent",
+            ability_source_uid=source_uid,
+            ability_source_owner_id=owner,
+            trigger_uid=source_uid, trigger_owner_id=owner,
+            event_destination_collection="Warzone")
+        return evaluate_condition(node, context)
+
+    merry_node = ability_graph(
+        DEFAULT_RECORD_STORE, merry_ability).source.to_dict()[
+            "m_AbilityCondition"]
+    # The only Elf is the source itself, so Elf Allegiance is false.
+    assert not condition(401, 1001, merry_node)
+    add_card(db, 403, 1001, merry_tpl, loc="hand")
+    assert condition(401, 1001, merry_node)
+
+    scrap_source = ability_graph(
+        DEFAULT_RECORD_STORE, scrap_ability).source.to_dict()
+    scrap_node = scrap_source["m_TriggerCondition"]["m_Conditions"][-1]
+    assert not condition(402, 1001, scrap_node)
+    add_card(db, 404, 1001, scrap_tpl, loc="warzone")
+    db.execute("UPDATE game_cards SET card_type=? WHERE card_uid=?",
+               ("Troop|Artifact", 404))
+    db.commit()
+    assert condition(402, 1001, scrap_node)
+
+
+def test_native_keyword_modifier_survives_stat_modifier_sequence(db):
+    """A typed CardModifier sequence projects stats and keyword bits."""
+    from rules_port.resolution import resolve_port_trigger
+    from rules_port.triggers import dispatch_native_trigger
+
+    scrap_tpl = "82b00792-a0e4-4e56-8193-1ae4a35e6214"
+    scrap_ability = "4096461d-a724-af84-271a-8c0b40f57019"
+    _copy_card(db, scrap_tpl)
+    add_card(db, 411, 1001, scrap_tpl, loc="warzone")
+    add_card(db, 412, 1001, scrap_tpl, loc="warzone")
+    db.execute("UPDATE game_cards SET card_type=? WHERE card_uid=?",
+               ("Troop|Artifact", 412))
+    db.commit()
+
+    pl_t = game_engine.UID.make(244, 1001)
+    ai_t = game_engine.UID.make(244, 1002)
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    session = SessionStub()
+    bstate = {"pvp": True, "pids": [1001, 1002],
+              "champ_map": {"1001": 10001, "1002": 10002},
+              "player_health": 20, "ai_health": 20, "stack": []}
+    session._rules_port_battle_state = bstate
+
+    log = dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=session,
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="CardEnteredZoneEvent", source_card_id=411,
+        source_player_id=1001,
+        data={"event_source_collection": "CastSpells",
+              "event_destination_collection": "Warzone"})
+    assert scrap_ability[:8] in log, log
+    item = bstate["stack"].pop()
+    resolve_port_trigger(handler, game, session, db, pl_t, ai_t,
+                         bstate, item)
+
+    flight = int(game_engine.ECardAttributes.Flight)
+    speed = int(game_engine.ECardAttributes.Speed)
+    row = db.execute(
+        "SELECT card_attributes, temporary_attributes FROM game_cards "
+        "WHERE card_uid=?", (411,)).fetchone()
+    assert row == (0, flight | speed), row
+    updates = [event for event in game.events
+               if isinstance(event, game_engine.CardUpdatedSessionEventArgs)
+               and int(event.session_card_id.uid.uid64) == 411]
+    assert updates and int(updates[-1].attributes) & (flight | speed) == (
+        flight | speed), updates
+
+
 def test_argus_hand_trigger_fires_at_turn_start(db):
     """Argus's hand-based start-of-turn trigger must be discovered in PvP."""
     from abilities.framework.triggers import resolve_triggers
@@ -2512,6 +2634,12 @@ def main():
          test_malfunctioning_war_bot_hits_a_random_champion_at_turn_start),
         ("Native PvP resource modifier owner mapping",
          test_native_resource_modifier_maps_pvp_owner_to_effect_view_side),
+        ("PvP StartTurn resource bonus survives view refill",
+         test_pvp_start_turn_resource_bonus_survives_effect_view_round_trip),
+        ("RequiresCardsControlled excludes the ability source",
+         test_requires_cards_controlled_excludes_source_and_respects_controller),
+        ("Native keyword modifiers project with stats",
+         test_native_keyword_modifier_survives_stat_modifier_sequence),
         ("Argus reveals itself and gets cost reduction",
          test_argus_hand_trigger_fires_at_turn_start),
         ("Charge Bot Deploy gains a charge",

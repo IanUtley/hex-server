@@ -62,6 +62,20 @@ def to_effect_view(state, player_id, opponent_id):
             state.get("trace_ability_resolution", False)),
         "ability_trace": state.setdefault("ability_trace", []),
     }
+    # A StartTurn current-resource grant is applied in this side-oriented
+    # view, then consumed by the following Prep refill. Preserve its marker
+    # across the view round-trip so Prep does not erase the grant.
+    for participant in (player_id, opponent_id):
+        try:
+            pid = int(participant)
+        except (TypeError, ValueError):
+            continue
+        bonus_key = f"start_turn_resource_bonus_{pid}"
+        if bonus_key in state:
+            try:
+                view[bonus_key] = int(state.get(bonus_key, 0) or 0)
+            except (TypeError, ValueError):
+                view[bonus_key] = 0
     # Records abilities read and update these shared TAC/list values while
     # they resolve through the FRA-shaped PvP adapter. Keep the nested roots
     # aliased so a paused continuation and its later resume see one instance.
@@ -94,6 +108,18 @@ def apply_effect_view(state, view, player_id, opponent_id):
             (f"sp_{opponent_id}", "ai_spell_points")):
         if view_key in view:
             state[key] = int(view.get(view_key, state.get(key, 0)) or 0)
+    for participant in (player_id, opponent_id):
+        try:
+            pid = int(participant)
+        except (TypeError, ValueError):
+            continue
+        bonus_key = f"start_turn_resource_bonus_{pid}"
+        if bonus_key not in view:
+            continue
+        try:
+            state[bonus_key] = int(view.get(bonus_key, 0) or 0)
+        except (TypeError, ValueError):
+            state[bonus_key] = 0
     if "player_threshold" in view:
         state[f"thresh_{player_id}"] = dict(
             view.get("player_threshold") or {})

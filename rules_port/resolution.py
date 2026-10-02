@@ -591,6 +591,7 @@ class NativeEffectBackend:
                 ability_source_uid=ability.source_uid,
                 ability_source_owner_id=ability.responsible_player_id,
                 trigger_uid=target_value,
+                extra_target=target_value,
                 pl_t=player_uid, ai_t=ai_uid,
                 champions=champion_targets,
                 event_int_attribute=None,

@@ -7,6 +7,59 @@ import json
 from .targeting import _shards
 
 
+_COLLECTION_CANONICAL = {
+    "none": None,
+    "none_": None,
+    "null": None,
+    "deck": "deck",
+    "hand": "hand",
+    "champions": "champions",
+    "warzone": "warzone",
+    "discard": "discard",
+    "crypt": "discard",
+    "graveyard": "discard",
+    "void": "void",
+    "playedresources": "PlayedResources",
+    "castspells": "CastSpells",
+    "underground": "underground",
+    "choosing": "choosing",
+    "mod": "mod",
+    "simulacrum": "simulacrum",
+}
+
+
+def normalize_collection(value):
+    """Return the DB spelling for a card collection value.
+
+    Hosts provide these values as lower/upper-case names, serialized enum
+    names, or the client's integer ``ECardCollections`` flags.  The condition
+    layer compares against DB locations, where ``CastSpells`` and
+    ``PlayedResources`` intentionally retain their historical casing.
+    """
+    if value is None:
+        return None
+    named = getattr(value, "name", None)
+    if named is not None:
+        value = named
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None:
+        import game_engine
+        for name, flag in vars(game_engine.ECardCollections).items():
+            if name.startswith("_"):
+                continue
+            try:
+                if int(flag) == numeric:
+                    value = name
+                    break
+            except (TypeError, ValueError):
+                continue
+    key = str(value).rsplit(".", 1)[-1].lower()
+    return _COLLECTION_CANONICAL.get(key, key)
+
+
 class ConditionContext:
     def __init__(self, db, session, bstate, event_type=None,
                  ability_source_uid=None, ability_source_owner_id=None,
@@ -24,8 +77,15 @@ class ConditionContext:
         self.trigger_owner_id = trigger_owner_id
         self.trigger_uid, self.extra_target = trigger_uid, extra_target
         self.pl_t, self.ai_t = pl_t, ai_t
-        self.event_source_collection = event_source_collection
-        self.event_destination_collection = event_destination_collection
+        # Collection values arrive from both enum-shaped host adapters
+        # (``ECardCollections.Warzone``/``Warzone``) and lower-case DB zone
+        # names. Conditions operate on canonical DB zone names so a wire
+        # spelling difference cannot make an authored entry trigger silently
+        # fail.
+        self.event_source_collection = normalize_collection(
+            event_source_collection)
+        self.event_destination_collection = normalize_collection(
+            event_destination_collection)
         self.event_previous_state = event_previous_state
         # The controller the entering card had before the zone move.  The
         # client's ``TriggerCardEnteredZone`` requires both the current and the
@@ -139,14 +199,10 @@ class ConditionContext:
         return card
 
     def _zones(self, flags):
-        mapping = {"Warzone": "warzone", "Hand": "hand", "Deck": "deck",
-                   "Crypt": "discard", "Discard": "discard", "Void": "void",
-                   "CastSpells": "CastSpells", "PlayedResources": "PlayedResources",
-                   "Choosing": "choosing", "Underground": "underground",
-                   "Champions": "champions"}
-        return {mapping.get(value, value.lower()) for value in
-                str(flags or "").split("|")
-                if value and value.lower() not in {"none", "null"}}
+        return {normalized for normalized in (
+            normalize_collection(value)
+            for value in str(flags or "").split("|"))
+            if normalized is not None}
 
     def _cards_in_zones(self, zones, user_id=None):
         from pvp_db import db_condition_cards_in_zones

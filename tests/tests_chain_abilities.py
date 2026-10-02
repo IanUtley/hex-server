@@ -280,6 +280,81 @@ def test_runeweb_infiltrator_puts_two_spiderling_eggs_in_opponent_deck(db):
     assert eggs == [(5, "deck", 2)], (result, eggs, bstate)
 
 
+def test_vampire_king_steals_a_random_troop_from_the_damaged_hand(db):
+    """Vampire King's damage trigger reveals a random card from the damaged
+    champion's controller's hand.
+
+    A revealed troop is transformed into a Vampire and put into play under the
+    King's controller; a revealed non-troop is left where it was.  The reveal
+    must read the *hand* collection (a nested ``InZone`` filter) and the
+    "It is a troop" condition must test the revealed card, not the damaged
+    champion.
+    """
+    from unittest import mock
+    from rules_port.triggers import dispatch_native_trigger
+    from rules_port.resolution import resolve_port_trigger
+
+    TPL_KING = "46c02066-29af-4b7d-bbcb-41ba76e8120f"
+    TPL_VAMPIRE = "8b5adb92-22fc-4c6d-aefa-95dca4c8fe7a"
+    for guid in (TPL_KING, TPL_VAMPIRE, TPL_GLADIATOR, TPL_INCANTATION):
+        _copy_card(db, guid)
+    # The AI (owner 0) controls the King and holds decoy cards; the player
+    # (owner 5) holds the cards the reveal is allowed to look at.
+    add_card(db, 101, 0, TPL_KING, loc="warzone")
+    add_card(db, 301, 0, TPL_GLADIATOR, loc="hand")
+    add_card(db, 302, 0, TPL_VAMPIRE, loc="hand")
+    add_card(db, 201, 5, TPL_GLADIATOR, loc="hand")
+    db.commit()
+
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    player_champ_uid = int(handler._player_champ_scid.uid.uid64)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "stack": [],
+              "champ_map": {5: player_champ_uid,
+                            0: int(handler._ai_champ_scid.uid.uid64)}}
+    handler._current_bstate = bstate
+
+    def deal_damage():
+        dispatch_native_trigger(
+            db=db, handler=handler, game=game, session=SessionStub(),
+            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+            event_type="CardDealtDamageEvent", source_card_id=101,
+            source_player_id=0, target_card_id=player_champ_uid)
+        for item in list(bstate.get("stack") or []):
+            bstate["stack"].remove(item)
+            resolve_port_trigger(
+                handler, game, SessionStub(), db, pl_t, ai_t, bstate, item)
+
+    # Pin the "random" pick to the first legal candidate so a reveal that
+    # samples the King controller's hand is caught deterministically.  The
+    # correct implementation restricts the pool to the damaged hand first, so
+    # the first owned troop is still card 201.
+    with mock.patch("rules_port.reveal_effects.random.choice",
+                    side_effect=lambda seq: list(seq)[0]):
+        deal_damage()
+    assert bstate.get("revealed_cards") == [201], bstate.get("revealed_cards")
+    stolen = db.execute(
+        "SELECT user_id, template_guid, location FROM game_cards "
+        "WHERE card_uid=201").fetchone()
+    assert stolen == (0, TPL_VAMPIRE, "warzone"), stolen
+
+    # A revealed non-troop is left untouched ("if it is a troop" gate).
+    add_card(db, 202, 5, TPL_INCANTATION, loc="hand")
+    # add_card stores every fixture as a Troop; make the type authoritative.
+    db.execute("UPDATE game_cards SET card_type='Constant' WHERE card_uid=202")
+    db.commit()
+    with mock.patch("rules_port.reveal_effects.random.choice",
+                    side_effect=lambda seq: list(seq)[0]):
+        deal_damage()
+    assert bstate.get("revealed_cards") == [202], bstate.get("revealed_cards")
+    untouched = db.execute(
+        "SELECT user_id, template_guid, location FROM game_cards "
+        "WHERE card_uid=202").fetchone()
+    assert untouched == (5, TPL_INCANTATION, "hand"), untouched
+
+
 def test_queued_trigger_source_projection_preserves_combat_state(db):
     """Queueing a trigger must not make its attacking source look ready.
 
@@ -2529,6 +2604,7 @@ def _main():
              test_lose_life_modifier_is_not_damage,
              test_brood_creeper_does_not_fire_on_own_champion,
              test_runeweb_infiltrator_puts_two_spiderling_eggs_in_opponent_deck,
+             test_vampire_king_steals_a_random_troop_from_the_damaged_hand,
              test_queued_trigger_source_projection_preserves_combat_state,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,

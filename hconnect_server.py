@@ -785,9 +785,21 @@ class HCPHandler(ProfileStreamMixin):
             event_publisher=self._publish_application_events)
 
     def _log_participant_tokens(self, session):
-        """Return filename-safe game player IDs for a session log."""
+        """Return filename-safe game player IDs for a session log.
+
+        Logging must never break gameplay: a partially constructed handler or
+        a session double without a ``players`` iterable yields no tokens.
+        """
         tokens = []
-        for participant, _position in getattr(session, "players", ()) or ():
+        try:
+            participants = list(getattr(session, "players", ()) or ())
+        except TypeError:
+            participants = []
+        for entry in participants:
+            try:
+                participant, _position = entry
+            except (TypeError, ValueError):
+                continue
             try:
                 value = int(participant)
             except (TypeError, ValueError):
@@ -798,9 +810,10 @@ class HCPHandler(ProfileStreamMixin):
             if (value & 0xff) == UID_TYPE["ServicePlayer"]:
                 value >>= 8
             tokens.append(value)
-        if not tokens and self.client_reck_id:
+        reck_id = getattr(self, "client_reck_id", None)
+        if not tokens and reck_id:
             try:
-                tokens.append(int(self.client_reck_id))
+                tokens.append(int(reck_id))
             except (TypeError, ValueError):
                 pass
         return tuple(tokens)
@@ -808,8 +821,8 @@ class HCPHandler(ProfileStreamMixin):
     def _bind_log_session(self, session):
         """Route output to this player and, when present, their game."""
         session_id = getattr(session, "session_id", None) if session else None
-        player_id = ((self.user_profile or {}).get("id")
-                     if self.user_profile else None)
+        profile = getattr(self, "user_profile", None)
+        player_id = (profile or {}).get("id") if profile else None
         participant_ids = self._log_participant_tokens(session) if session else ()
         self._log_session_id = session_id
         self._log_player_id = player_id
@@ -910,11 +923,34 @@ class HCPHandler(ProfileStreamMixin):
                 shared_state, dict) and repaired_shared_state else battle_state)
         try:
             from rules_port import enable_rules_port
+
+            def native_turn_start(_session=session, _game=game,
+                                  _state=battle_state):
+                """Run StartTurn against the checkpoint the port currently owns.
+
+                A reconnect can rehydrate ``session._rules_port_battle_state``
+                after this handler has been built.  The old callback closed
+                over the attach-time dictionary, so a TurnStarted resource
+                grant could land in a stale object and disappear before Prep
+                refilled the active player's pool.  Keep the port's original
+                dictionary identity while refreshing its contents from the
+                authoritative session checkpoint.
+                """
+                from rules_port.persistence import load_state
+                current = load_state(
+                    _session, default=lambda: dict(_state))
+                if isinstance(current, dict) and current is not _state:
+                    _state.clear()
+                    _state.update(current)
+                current = _state if isinstance(_state, dict) else current
+                if isinstance(current, dict):
+                    setattr(_session, "_rules_port_battle_state", current)
+                return self._apply_rules_port_start_turn(
+                    _session, _game, current)
+
             port = enable_rules_port(
                 session, game, battle_state,
-                turn_start_resolver=lambda _s=session, _g=game,
-                _b=battle_state: self._apply_rules_port_start_turn(
-                    _s, _g, _b))
+                turn_start_resolver=native_turn_start)
             trace_rules_port(log_req, "attached-before-sync", port, battle_state)
             # A double-clicked ability can persist a ResolveTopOfChainAction
             # after the legacy stack has already emptied.  That orphaned port
@@ -8663,6 +8699,21 @@ class HCPHandler(ProfileStreamMixin):
             else:
                 bstate["ai_discarded_uid"] = None
             return
+        # Ability configuration path (same protocol used by Necrotic Mage's
+        # PVE ability): class-23 opens BattleStateConfigureAbility and the
+        # selected hand card is returned in SetAbilityActivationData.
+        hand = [game_engine.SessionCardId(game_engine.UID(int(uid))) for (uid,) in
+                db_hand_card_uids(
+                    session.session_id,
+                    self.user_profile["id"] if self.user_profile else 0,
+                    conn=_db)]
+        if not hand:
+            # The authored discard target allows a best-effort minimum.  An
+            # empty hand therefore resolves the Deathcry as a no-op; opening
+            # class 23 with min/max=1 and zero targets leaves the client in a
+            # picker it cannot answer and strands the native chain.
+            log_req("    Deathcry discard: no legal hand target")
+            return "discard: no legal target"
         prompt = self._discard_prompt_data(resolving_ability, bstate=bstate)
         if not prompt or not prompt[1]:
             log_req("    Deathcry discard: missing metadata prompt target")
@@ -8672,14 +8723,6 @@ class HCPHandler(ProfileStreamMixin):
         source_card_id = (game_engine.SessionCardId(game_engine.UID(
             int(source_uid))) if source_uid else
             (player_champ_scid if player_champ_scid else pl_t))
-        # Ability configuration path (same protocol used by Necrotic Mage's
-        # PVE ability): class-23 opens BattleStateConfigureAbility and the
-        # selected hand card is returned in SetAbilityActivationData.
-        hand = [game_engine.SessionCardId(game_engine.UID(int(uid))) for (uid,) in
-                db_hand_card_uids(
-                    session.session_id,
-                    self.user_profile["id"] if self.user_profile else 0,
-                    conn=_db)]
         options = game._make_event(game_engine.PlayerOptionListSessionEventArgs)
         options.player_id = pl_t
         opt = game._make_event(game_engine.PlayerOptionSessionEventArgs)
@@ -10044,10 +10087,15 @@ class HCPHandler(ProfileStreamMixin):
                 native_prep = bstate.get("_rules_port_attached")
                 if native_prep:
                     from rules_port.resources import apply_resource_change
+                    prep_side = ("player" if bstate.get("turn_player")
+                                 == "player" else "ai")
+                    prep_bonus = int(bstate.pop(
+                        f"start_turn_resource_bonus_{prep_side}", 0) or 0)
                     apply_resource_change(
-                        bstate, "player", "currentresource",
-                        int(bstate.get("player_total_resources", 0) or 0) -
-                        int(bstate.get("player_resources", 0) or 0))
+                        bstate, prep_side, "currentresource",
+                        int(bstate.get(f"{prep_side}_total_resources", 0) or 0)
+                        + max(0, prep_bonus) -
+                        int(bstate.get(f"{prep_side}_resources", 0) or 0))
                 else:
                     bstate["player_resources"] = bstate.get(
                         "player_total_resources", 0)
