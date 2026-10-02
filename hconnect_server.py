@@ -3316,7 +3316,9 @@ class HCPHandler(ProfileStreamMixin):
         """Read min/max directly from the current target record."""
         store = getattr(self, "_play_plan_store", None)
         if store is None:
-            return 1, 1
+            from gamedata import DEFAULT_RECORD_STORE
+            store = DEFAULT_RECORD_STORE
+            self._play_plan_store = store
         target = store.get("AbilityTargetTemplate", template_guid)
         if target is None:
             return 1, 1
@@ -3387,6 +3389,24 @@ class HCPHandler(ProfileStreamMixin):
                                    targets))
         return result
 
+    @staticmethod
+    def _play_target_bounds(play_plan, ability_guid, index):
+        """Return the authored (minimum, maximum) for one target template.
+
+        The client reads min/max by the position of the template in the
+        ability's TargetTemplateIds list, so each TargetInstance added to one
+        OptionInstance must carry its authored bounds.
+        """
+        minimum, maximum = 1, 1
+        for ability in play_plan.abilities:
+            if ability.ability_guid != ability_guid or index >= len(ability.targets):
+                continue
+            target = ability.targets[index]
+            minimum = max(0, target.minimum)
+            maximum = max(minimum, target.maximum or minimum or 1)
+            break
+        return minimum, maximum
+
     def _add_play_target_options(self, game, session, pl_t, ai_t):
         """Attach targeting TargetInstances to the most recent PlayerOptionList.
 
@@ -3412,46 +3432,61 @@ class HCPHandler(ProfileStreamMixin):
                                              if self.user_profile else 0)
             if play_plan is None:
                 continue
+            # PlayerOptions.Update keys target instances by (card, ability) and
+            # CLEARS the stored list each time it sees another OptionInstance
+            # with the same opt_id (PlayerOptions.cs:117-129).  Emitting one
+            # OptionInstance per target template therefore drops every target
+            # but the last: Survival of the Fittest ("Target troop you control
+            # battles target opposing troop") prompted only for the opposing
+            # troop, so the faction TargetMap was missing index 0 and the
+            # pending battle never resolved.  Group every template of one
+            # ability into a single OptionInstance, exactly like the manual
+            # activation path above and the client's authored
+            # AbilityTargetTemplateIds order.
+            grouped: dict[str, list] = {}
             for ag, idx, tid, targets in self._play_ability_targets(
                     session, play_plan,
                     battle_state=getattr(self, "_current_bstate", None)):
+                grouped.setdefault(ag, []).append((idx, tid, targets))
+            for ag, entries in grouped.items():
                 # Troop abilities are NOT playable from hand.  Only the
                 # card itself may be played (cost/threshold gate).
                 # Manual abilities activate from the warzone, not hand.
-                min_count, max_count = 1, 1
-                for ability in play_plan.abilities:
-                    if ability.ability_guid != ag or idx >= len(ability.targets):
-                        continue
-                    target = ability.targets[idx]
-                    min_count = max(0, target.minimum)
-                    max_count = max(min_count, target.maximum or min_count or 1)
-                    break
                 inst = game._make_event(game_engine.OptionInstanceSessionEventArgs)
                 inst.opt_id = game_engine.ResourceId.from_str(ag)
-                inst.min_target_counts.append(min_count)
-                inst.max_target_counts.append(max_count)
-                inst.target_ids.append(game_engine.ResourceId.from_str(tid))
-                tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
-                tgt.target_index = idx
-                tgt.target_id = game_engine.ResourceId.from_str(tid)
-                tgt.targets = list(targets)
-                inst.target_instances.append(tgt)
+                for idx, tid, targets in entries:
+                    min_count, max_count = self._play_target_bounds(
+                        play_plan, ag, idx)
+                    inst.min_target_counts.append(min_count)
+                    inst.max_target_counts.append(max_count)
+                    inst.target_ids.append(game_engine.ResourceId.from_str(tid))
+                    tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
+                    tgt.target_index = idx
+                    tgt.target_id = game_engine.ResourceId.from_str(tid)
+                    tgt.targets = list(targets)
+                    inst.target_instances.append(tgt)
                 opt.instances.append(inst)
                 # Also attach the picker to the PlayCard option itself so the
                 # client's CanUseAbility finds the target whether it checks the
                 # card's ability or the built-in PlayCard ability (the play-card
                 # flow keys on BuiltInResources.PlayCardAbilityTemplateId).
                 for inst2 in opt.instances:
-                    if str(inst2.opt_id.guid) == game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID:
-                        inst2.target_ids.append(game_engine.ResourceId.from_str(tid))
+                    if str(inst2.opt_id.guid) != game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID:
+                        continue
+                    for idx, tid, targets in entries:
+                        min_count, max_count = self._play_target_bounds(
+                            play_plan, ag, idx)
+                        inst2.target_ids.append(
+                            game_engine.ResourceId.from_str(tid))
                         inst2.min_target_counts.append(min_count)
                         inst2.max_target_counts.append(max_count)
-                        tgt2 = game._make_event(game_engine.TargetInstanceSessionEventArgs)
-                        tgt2.target_index = len(inst2.target_instances)
+                        tgt2 = game._make_event(
+                            game_engine.TargetInstanceSessionEventArgs)
+                        tgt2.target_index = idx
                         tgt2.target_id = game_engine.ResourceId.from_str(tid)
                         tgt2.targets = list(targets)
                         inst2.target_instances.append(tgt2)
-                        break
+                    break
             # Additional-cost sacrifice (e.g. Abominate "sacrifice a troop you
             # control"): attach a SacrificeAbilityCostType CostInstance to the
             # PlayCard instance so the client's BattleStateAssignXCost prompts for
@@ -5239,24 +5274,61 @@ class HCPHandler(ProfileStreamMixin):
         if prompt_owner_id is None:
             prompt_owner_id = 0
         prompt_owner_id = int(prompt_owner_id)
-        target_index = 0
+        # Resolve every explicit target template of this trigger.  The client
+        # keys target instances by (card, ability) and clears the stored list
+        # for each OptionInstance with the same opt_id (PlayerOptions.cs), so
+        # all of them must ride ONE OptionInstance or only the last is offered
+        # (Rowdy Ringmaster's Deploy asked for the friendly troop but never the
+        # opposing one, so its battle had no defender).  ``candidates`` is the
+        # already-computed pool for the first template; additional templates
+        # are computed here with the same evaluator.
+        all_target_ids = []
         if target_template_ids:
             try:
                 all_target_ids = json.loads(
                     db_ability_target_template_ids(
                         ability_guid, conn=_db) or "[]")
-                target_index = next(
-                    (i for i, tid in enumerate(all_target_ids)
-                     if str(tid) == str(target_template_ids[0])), 0)
             except (TypeError, ValueError, json.JSONDecodeError):
-                target_index = 0
+                all_target_ids = []
+        if candidates and all(isinstance(c, (list, tuple, set))
+                              for c in candidates):
+            candidate_sets = [list(c) for c in candidates]
+        elif candidates:
+            candidate_sets = [list(candidates)]
+        else:
+            candidate_sets = []
+        entries = []
+        for position, tid in enumerate(target_template_ids or ()):
+            index = next(
+                (i for i, known in enumerate(all_target_ids)
+                 if str(known).lower() == str(tid).lower()), position)
+            if position < len(candidate_sets) and candidate_sets[position]:
+                uids = [int(u) for u in candidate_sets[position]]
+            else:
+                try:
+                    from rules_port.targeting import legal_targets
+                    uids = [int(u) for u in legal_targets(
+                        _db, session.session_id, prompt_owner_id, tid,
+                        source_uid, both_players=True,
+                        champions=self._champion_targets(),
+                        battle_state=bstate)]
+                except Exception:
+                    uids = []
+            minimum, maximum = self._plan_target_bounds(tid)
+            entries.append((index, tid, uids, int(minimum), int(maximum)))
+        target_index = entries[0][0] if entries else 0
         bstate["pending_trigger"] = {
             "ability_guid": ability_guid,
             "source_uid": int(source_uid),
             "owner_id": prompt_owner_id,
             "instance_id": inst_id,
             "target_index": target_index,
-            "target_template_id": (target_template_ids or [None])[0],
+            "target_template_id": (entries[0][1] if entries
+                                   else (target_template_ids or [None])[0]),
+            "target_entries": [
+                {"index": index, "template_id": tid,
+                 "minimum": minimum, "maximum": maximum}
+                for index, tid, _uids, minimum, maximum in entries],
             "trigger_target_uid": (None if trigger_target_uid is None
                                    else int(trigger_target_uid)),
             "optional": bool(optional),
@@ -5306,21 +5378,20 @@ class HCPHandler(ProfileStreamMixin):
                 opt.state = game_engine.ECardUsage.Activate
                 opt_inst = g2._make_event(game_engine.OptionInstanceSessionEventArgs)
                 opt_inst.opt_id = game_engine.ResourceId.from_str(ability_guid)
-                if target_template_ids:
+                for index, tid, uids, minimum, maximum in entries:
                     opt_inst.target_ids.append(
-                        game_engine.ResourceId.from_str(target_template_ids[0]))
+                        game_engine.ResourceId.from_str(tid))
                     tgt = g2._make_event(
                         game_engine.TargetInstanceSessionEventArgs)
                     # Preserve the authored index. ConfigureAbility uses it
                     # when it serializes this choice into TargetMap.
-                    tgt.target_index = target_index
-                    tgt.target_id = game_engine.ResourceId.from_str(
-                        target_template_ids[0])
+                    tgt.target_index = index
+                    tgt.target_id = game_engine.ResourceId.from_str(tid)
                     tgt.targets = [game_engine.SessionCardId(
-                        game_engine.UID(int(u))) for u in (candidates or [])]
+                        game_engine.UID(int(u))) for u in uids]
                     opt_inst.target_instances.append(tgt)
-                    opt_inst.min_target_counts = [1]
-                    opt_inst.max_target_counts = [1]
+                    opt_inst.min_target_counts.append(minimum)
+                    opt_inst.max_target_counts.append(maximum)
                 opt.instances.append(opt_inst)
                 ev.options.append(opt)
                 g2._push(ev)
@@ -5336,7 +5407,7 @@ class HCPHandler(ProfileStreamMixin):
                 g2.push_green_light(chooser, game_engine.EPriorityContext.Normal)
                 _send_pvp_packet(h, session, g2, chooser, "trigger")
             log_req(f"    PvP trigger prompt: {ability_guid[:8]} -> pid "
-                    f"{chooser_pid} candidates={len(candidates or [])}")
+                    f"{chooser_pid} targets={len(entries)}")
             return
         _be.save_state(session, bstate)
         # PlayerOptionList: trigger card + the ability as an option + the
@@ -5350,19 +5421,17 @@ class HCPHandler(ProfileStreamMixin):
         inst.opt_id = game_engine.ResourceId.from_str(ability_guid)
         # ConfigureAbility matches TargetInstances through this parallel list.
         # PvP otherwise receives candidates but cannot open the target picker.
-        if target_template_ids:
-            inst.target_ids.append(
-                game_engine.ResourceId.from_str(target_template_ids[0]))
+        for index, tid, uids, minimum, maximum in entries:
+            inst.target_ids.append(game_engine.ResourceId.from_str(tid))
             tgt = game._make_event(game_engine.TargetInstanceSessionEventArgs)
             # The explicit target may follow auto targets such as "this".
-            tgt.target_index = target_index
-            tgt.target_id = game_engine.ResourceId.from_str(
-                target_template_ids[0])
+            tgt.target_index = index
+            tgt.target_id = game_engine.ResourceId.from_str(tid)
             tgt.targets = [game_engine.SessionCardId(game_engine.UID(int(u)))
-                           for u in (candidates or [])]
+                           for u in uids]
             inst.target_instances.append(tgt)
-            inst.min_target_counts = [1]
-            inst.max_target_counts = [1]
+            inst.min_target_counts.append(minimum)
+            inst.max_target_counts.append(maximum)
         opt.instances.append(inst)
         ev.options.append(opt)
         game._push(ev)
@@ -5377,7 +5446,7 @@ class HCPHandler(ProfileStreamMixin):
         # BattleStateTriggeredAbilities -> BattleStateConfigureAbility flow).
         game.push_green_light(pl_t, game_engine.EPriorityContext.Normal)
         log_req(f"    Trigger target prompt: {ability_guid[:8]} source={hex(source_uid)} "
-                f"candidates={len(candidates or [])} inst={inst_id}")
+                f"targets={len(entries)} inst={inst_id}")
 
     def _queue_conversation_prompt(self, game, session, pl_t, ai_t, bstate,
                                    conversation_id):
@@ -6573,13 +6642,67 @@ class HCPHandler(ProfileStreamMixin):
         if port is not None:
             owner_id = int(pend.get("owner_id", 0) or 0)
             target_index = int(pend.get("target_index", 0) or 0)
+
+            def normalize_target_map(raw):
+                """Normalize a decoded TargetMap to ``{index: [uids]}``.
+
+                The activation record may carry ``{index: [uid, ...]}`` or
+                ``{index: {"session_card_ids": [...]}}``; a triggered ability
+                with two chosen targets must forward both so the resolver's
+                authored target indexes line up.
+                """
+                result = {}
+                if not isinstance(raw, Mapping):
+                    return result
+                for key, value in raw.items():
+                    try:
+                        index = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    values = value
+                    if isinstance(values, Mapping):
+                        values = (values.get("session_card_ids") or
+                                  values.get("SessionCardIds") or ())
+                    if not isinstance(values, (list, tuple, set)):
+                        values = (values,) if values is not None else ()
+                    uids = []
+                    for item in values:
+                        while isinstance(item, Mapping):
+                            nested = next((item[field] for field in (
+                                "uid64", "UID", "m_UID64", "value")
+                                if field in item), None)
+                            if nested is None or nested is item:
+                                break
+                            item = nested
+                        try:
+                            uid = int(item)
+                        except (TypeError, ValueError):
+                            continue
+                        if uid > 0 and (uid & 0xFF) == 1:
+                            uids.append(uid)
+                    if uids:
+                        result[index] = uids
+                return result
+
             activation_data = pend.get("activation_data")
             activation_data = (dict(activation_data)
                                if isinstance(activation_data, Mapping) else {})
-            target_map = dict(activation_data.get("target_map") or {})
-            if chosen_uid is not None:
-                target_map[str(target_index)] = [int(chosen_uid)]
-            activation_data["target_map"] = target_map
+            target_map = normalize_target_map(
+                activation_data.get("target_map"))
+            # ``chosen_uid`` is the single-pick legacy signal; only fill its
+            # slot when the fuller TargetMap did not already name it.
+            if chosen_uid is not None and target_index not in target_map:
+                target_map[target_index] = [int(chosen_uid)]
+            if chosen_uid is None:
+                primary = target_map.get(target_index)
+                if not primary:
+                    primary = next(iter(target_map.values()), None)
+                if primary:
+                    chosen_uid = int(primary[-1])
+            activation_data["target_map"] = {
+                str(index): uids for index, uids in target_map.items()}
+            selected_uids = [uid for uids in target_map.values()
+                             for uid in uids]
             descriptor = {
                 "kind": "trigger",
                 "ability_guid": ag,
@@ -6602,9 +6725,8 @@ class HCPHandler(ProfileStreamMixin):
             g = self._fresh_game(session, pl_t, ai_t, bstate)
             from gamedata import DEFAULT_RECORD_STORE, ability_graph
             graph = ability_graph(DEFAULT_RECORD_STORE, str(ag).lower())
-            target_cards = ([] if chosen_uid is None else
-                            [game_engine.SessionCardId(
-                                game_engine.UID(int(chosen_uid)))])
+            target_cards = [game_engine.SessionCardId(
+                game_engine.UID(int(uid))) for uid in selected_uids]
             g.push_ability_on_chain(
                 game_engine.SessionCardId(game_engine.UID(src)),
                 game_engine.ResourceId.from_str(ag),
@@ -6753,6 +6875,14 @@ class HCPHandler(ProfileStreamMixin):
                 session._rules_port_mutation_emitted = True
                 return True
             pending.pop("optional", None)
+            _be.save_state(session, state)
+
+        # Forward the whole decoded activation record (including the complete
+        # TargetMap) so a triggered ability that advertises more than one
+        # chosen target resolves with every authored index, not just the
+        # primary slot.
+        if activation:
+            pending["activation_data"] = dict(activation)
             _be.save_state(session, state)
 
         found = []

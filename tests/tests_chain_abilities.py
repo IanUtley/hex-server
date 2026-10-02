@@ -80,6 +80,10 @@ TPL_CEREBRAL_FULMINATION = "8bf3184f-b2b4-4646-b2e9-ac39079978c9"
 AG_CEREBRAL_FULMINATION = "87a0cbaf-85f8-2555-3261-1c373bea1e77"
 TPL_BOOBY_TRAP = "9c1acda8-778b-4dd0-b278-7fee21e203af"
 AG_BOOBY_TRAP = "1a5c43ec-2c65-85f0-0310-8395ec405acf"
+# Survival of the Fittest (PvP/common): "Target troop you control battles
+# target opposing troop." — two explicit authored target templates.
+TPL_SURVIVAL = "c7cac7d9-05a6-44c8-bb2f-51f3700764e6"
+AG_SURVIVAL = "a211532e-8cf5-7fd5-838a-19263b22e6e0"
 
 
 def _pl_ai():
@@ -626,6 +630,65 @@ def test_strength_of_redwood_targets_combat_troop(db):
         assert targets, "Strength of the Redwood needs a troop target"
         assert any(102 in [int(x.uid.uid64) for x in candidate_uids]
                    for _, _, _, candidate_uids in targets), targets
+    finally:
+        dbmod._db, hcs._db = old_db, old_hcs
+
+
+def test_multi_target_play_card_keeps_all_target_instances(db):
+    """Survival of the Fittest exposes both authored targets to the client.
+
+    The client's ``PlayerOptions.Update`` keys target instances by
+    ``(card, ability)`` and clears the stored list on every ``OptionInstance``
+    with the same ``opt_id`` (PlayerOptions.cs).  Emitting one OptionInstance
+    per target template dropped the friendly target, so the client only
+    prompted for the opposing troop and the pending battle never resolved.
+    """
+    import hconnect_server as hcs
+    import db as dbmod
+    _copy_card(db, TPL_SURVIVAL)
+    _copy_card(db, TPL_SPAWN)
+    add_card(db, 101, 5, TPL_SURVIVAL, loc="hand")
+    add_card(db, 102, 5, TPL_SPAWN, loc="warzone")   # friendly troop
+    add_card(db, 202, 0, TPL_SPAWN, loc="warzone")   # opposing troop
+    pl_t, ai_t = _pl_ai()
+    old_db, old_hcs = dbmod._db, hcs._db
+    dbmod._db, hcs._db = db, db
+    try:
+        h = object.__new__(hcs.HCPHandler)
+        h._db = db
+        h.user_profile = {"id": 5}
+        h._player_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(244, 5))
+        h._ai_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(3, 1000))
+        h._current_bstate = {"player_health": 20, "ai_health": 20,
+                             "turn_number": 1, "active_player_id": 5}
+        game = game_engine.Game(1, pl_t, ai_t)
+        ev = game._make_event(game_engine.PlayerOptionListSessionEventArgs)
+        ev.player_id = pl_t
+        opt = game._make_event(game_engine.PlayerOptionSessionEventArgs)
+        opt.card = game_engine.SessionCardId(game_engine.UID(101))
+        opt.state = game_engine.ECardUsage.Play
+        play = game._make_event(game_engine.OptionInstanceSessionEventArgs)
+        play.opt_id = game_engine.ResourceId.from_str(
+            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID)
+        opt.instances.append(play)
+        ev.options.append(opt)
+        game._push(ev)
+        h._add_play_target_options(game, SessionStub(), pl_t, ai_t)
+        ability_instances = [inst for inst in opt.instances
+                             if str(inst.opt_id.guid) == AG_SURVIVAL]
+        # Exactly one OptionInstance for the ability so the client does not
+        # erase the first target when it processes the second.
+        assert len(ability_instances) == 1, ability_instances
+        inst = ability_instances[0]
+        assert [t.target_index for t in inst.target_instances] == [0, 1]
+        assert [int(c.uid.uid64)
+                for c in inst.target_instances[0].targets] == [102]
+        assert [int(c.uid.uid64)
+                for c in inst.target_instances[1].targets] == [202]
+        assert list(inst.min_target_counts) == [1, 1]
+        assert list(inst.max_target_counts) == [1, 1]
     finally:
         dbmod._db, hcs._db = old_db, old_hcs
 
@@ -3079,6 +3142,7 @@ def _main():
              test_countermagic_requires_castspells_target,
              test_countermagic_offered_in_ai_chain_window,
              test_strength_of_redwood_targets_combat_troop,
+             test_multi_target_play_card_keeps_all_target_instances,
              test_chronic_madness_buries_escalates_and_returns_to_deck,
              test_bunjitsu_void_cost_is_a_cost_instance,
              test_champion_power_offer_requires_its_authored_cost_and_target,

@@ -372,6 +372,24 @@ def _session_log_tail(session_id=None, player_tokens=()):
     return _read_log_tail(path)[-_SESSION_LOG_TAIL_LINES:]
 
 
+def _newest_log_lines_first(lines):
+    """Order timestamp groups newest-first while keeping each group intact."""
+    groups = []
+    for line in lines:
+        match = _LOG_TIME_RE.match(line)
+        timestamp = match.group("time") if match else None
+        if timestamp:
+            if groups and groups[-1][0] == timestamp:
+                groups[-1][1].append(line)
+            else:
+                groups.append([timestamp, [line]])
+        elif groups:
+            groups[-1][1].append(line)
+        else:
+            groups.append([timestamp, [line]])
+    return [line for _timestamp, group in reversed(groups) for line in group]
+
+
 def _session_log_display_name(path):
     """Show a session log name without exposing participant IDs in a report."""
     if not path:
@@ -494,16 +512,27 @@ def _error_report(handler):
                 f"Server: version={_version_command()} log_level={get_log_level()}",
                 "Player diagnostics: authenticated profile",
             ]
-        if player_lines:
-            report.append("Recent player log:")
-            report.extend(player_lines)
         if session_lines:
             session_path = _session_log_path_for_issue(
                 session_id, player_tokens)
             report.append(
                 "Recent game log: "
-                f"{_session_log_display_name(session_path)}")
-            report.extend(session_lines)
+                f"{_session_log_display_name(session_path)} "
+                "(newest first)")
+            # Put the current game's newest events at the start of the report:
+            # the prefilled issue URL has a hard size limit and keeps a prefix.
+            report.extend(_newest_log_lines_first(session_lines))
+        if player_lines:
+            # Game-scoped output is also copied to the player log. Include only
+            # player-specific context that is not already present in the game
+            # log, avoiding a second copy of the same diagnostic trace.
+            game_log_lines = set(session_lines)
+            player_only_lines = [
+                line for line in player_lines if line not in game_log_lines]
+            if player_only_lines:
+                report.append(
+                    "Recent player log: additional context, newest first")
+                report.extend(_newest_log_lines_first(player_only_lines))
         safe_lines = []
         for line in report:
             safe = _chat_safe_error_message(line)
@@ -524,9 +553,9 @@ def _error_report(handler):
 
 
 _GITHUB_ISSUE_URL = "HTTPS://github.com/IanUtley/hex-server/issues/new"
-# Keep the generated link below common browser/proxy request-line limits. The
-# report is still bounded by _error_report; this only truncates unusually long
-# tails after the complete URL has been assembled and measured.
+# Keep the generated link below common browser/proxy request-line limits.
+# _error_report puts the newest game events first, so any prefix truncation
+# retains the most recent diagnostic context.
 _GITHUB_ISSUE_URL_LIMIT = 7500
 _GITHUB_ISSUE_TITLE_LIMIT = 256
 
@@ -535,7 +564,8 @@ def _github_issue_url(title, report):
     """Build a prefilled GitHub issue URL with a bounded diagnostics body."""
     body_prefix = "Session diagnostics collected by the Hex server:\n\n```text\n"
     body_suffix = "\n```"
-    truncation_note = "\n\n[diagnostics truncated to fit the issue link]"
+    truncation_note = (
+        "\n\n[additional diagnostics omitted to fit the issue link]")
 
     def build(report_text):
         # A log line can contain Markdown fences. Neutralize them so the

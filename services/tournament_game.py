@@ -3934,6 +3934,14 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
             graph = ability.graph
             if graph is None or graph.manual or ability.is_triggered:
                 continue
+            # PlayerOptions.Update keys target instances by (card, ability) and
+            # CLEARS the stored list each time it sees another OptionInstance
+            # with the same opt_id (PlayerOptions.cs:117-129).  Emitting one
+            # OptionInstance per template dropped every target but the last
+            # (Survival of the Fittest prompted only for the opposing troop and
+            # then hung on the chain).  Collect every template of this ability
+            # into one OptionInstance, mirroring the PvE builder.
+            entries = []
             for i in ability.referenced_target_indexes:
                 if i >= len(graph.targets):
                     continue
@@ -3965,10 +3973,14 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
                         targets = []
                 if not targets:
                     continue
-                inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
-                inst.opt_id = _ge.ResourceId.from_str(ability.ability_guid)
                 minimum = max(0, int(target.minimum))
                 maximum = max(minimum, int(target.maximum or minimum or 1))
+                entries.append((i, tid, targets, minimum, maximum))
+            if not entries:
+                continue
+            inst = g._make_event(_ge.OptionInstanceSessionEventArgs)
+            inst.opt_id = _ge.ResourceId.from_str(ability.ability_guid)
+            for i, tid, targets, minimum, maximum in entries:
                 inst.min_target_counts.append(minimum)
                 inst.max_target_counts.append(maximum)
                 inst.target_ids.append(_ge.ResourceId.from_str(tid))
@@ -3977,21 +3989,23 @@ def _pvp_add_play_target_options(g, session, state, pl_t, opp_t, turn_pid):
                 tgt.target_id = _ge.ResourceId.from_str(tid)
                 tgt.targets = list(targets)
                 inst.target_instances.append(tgt)
-                opt.instances.append(inst)
-                # Also attach the picker to the PlayCard option so the client's
-                # CanUseAbility finds the target on the built-in PlayCard
-                # ability (the play-card flow keys on PlayCardAbilityTemplateId).
-                for inst2 in opt.instances:
-                    if str(inst2.opt_id.guid) == _ge.PLAY_CARD_ABILITY_TEMPLATE_ID:
-                        inst2.target_ids.append(_ge.ResourceId.from_str(tid))
-                        inst2.min_target_counts.append(minimum)
-                        inst2.max_target_counts.append(maximum)
-                        tgt2 = g._make_event(_ge.TargetInstanceSessionEventArgs)
-                        tgt2.target_index = len(inst2.target_instances)
-                        tgt2.target_id = _ge.ResourceId.from_str(tid)
-                        tgt2.targets = list(targets)
-                        inst2.target_instances.append(tgt2)
-                        break
+            opt.instances.append(inst)
+            # Also attach the picker to the PlayCard option so the client's
+            # CanUseAbility finds the target on the built-in PlayCard
+            # ability (the play-card flow keys on PlayCardAbilityTemplateId).
+            for inst2 in opt.instances:
+                if str(inst2.opt_id.guid) != _ge.PLAY_CARD_ABILITY_TEMPLATE_ID:
+                    continue
+                for i, tid, targets, minimum, maximum in entries:
+                    inst2.target_ids.append(_ge.ResourceId.from_str(tid))
+                    inst2.min_target_counts.append(minimum)
+                    inst2.max_target_counts.append(maximum)
+                    tgt2 = g._make_event(_ge.TargetInstanceSessionEventArgs)
+                    tgt2.target_index = i
+                    tgt2.target_id = _ge.ResourceId.from_str(tid)
+                    tgt2.targets = list(targets)
+                    inst2.target_instances.append(tgt2)
+                break
         # Card-level target costs use the same CostInstance contract as
         # activated abilities.  Preserve their authored order so the client
         # assigns them into the matching XCostData collection.

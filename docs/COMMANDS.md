@@ -122,5 +122,5 @@ Flags can be pipe-separated (`Tapped\|Attacking`) or space-separated. Unknown fl
 | `!version` | `!version` | Implemented | Show the server version; available without `allowcon`. |
 | `!arena-cleanup` | `!arena-cleanup` | Implemented | Clear your Frost Ring Arena run; available without `allowcon`. |
 | `!account-cleanup` | `!account-cleanup` | Implemented | Reset your account to its new-player state; available without `allowcon`. |
-| `!issue` | `!issue <title>` | Implemented | Open a prefilled GitHub issue containing the last 32 player-log lines and the newest matching game-log lines, plus an active-session snapshot when available. Available without `allowcon`. |
+| `!issue` | `!issue <title>` | Implemented | Open a prefilled GitHub issue with an active-session snapshot and the newest game-log entries first; duplicate game entries are omitted from the additional player-log context. Lower-priority entries may be omitted to fit the issue link. Available without `allowcon`. |
 | `!commands` | `!commands` | Implemented | Alias for `!help`; command output is sent only to the issuing user. |

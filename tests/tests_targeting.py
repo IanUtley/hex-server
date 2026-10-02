@@ -37,6 +37,11 @@ RESOURCE_TPL = "44444444-4444-4444-4444-444444444444"
 PET_TPL = "55555555-5555-5555-5555-555555555555"
 PET_TARGET = "66666666-6666-6666-6666-666666666666"
 BLOCKING_TARGET = "f4a8f2ec-c96a-29a8-210e-607c936fda99"
+# Rowdy Ringmaster's Deploy: two chosen targets (a friendly troop, then an
+# optional opposing troop) feeding a Battle2Cards ("fight") effect.
+ROWDY_DEPLOY = "aa954593-ad8b-0c1f-67ef-961574d0f9c6"
+ROWDY_TPL_OWN = "f7f7e29d-a47a-65bb-eb06-195ef069148f"
+ROWDY_TPL_OPP = "40c592f3-a428-c30c-ead7-2bf7de86167f"
 
 
 class SessionStub:
@@ -388,6 +393,53 @@ def test_trigger_target_prompt_uses_explicit_controller(db):
     assert target.target_index == 1
 
 
+def test_multi_target_trigger_prompt_advertises_every_target(db):
+    """A triggered ability with two chosen targets advertises both on ONE
+    OptionInstance.
+
+    Rowdy Ringmaster's Deploy asks for a friendly troop and then an optional
+    opposing troop.  The client's ``PlayerOptions.Update`` replaces an
+    ability's target list on every ``OptionInstance`` with the same ``opt_id``,
+    so the prompt must not emit one instance per template (that dropped the
+    friendly target and left the fight with no defender).
+    """
+    import hconnect_server as hcs
+
+    class Checkpoint:
+        def save_state(self, _session, _state):
+            pass
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler._checkpoint_engine = lambda _session: Checkpoint()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    bstate = {"resolving_owner_id": 5, "_next_instance_id": 1}
+    with mock.patch.object(
+            hcs, "db_ability_target_template_ids",
+            return_value=json.dumps([ROWDY_TPL_OWN, ROWDY_TPL_OPP])):
+        hcs.HCPHandler._prompt_trigger_targets(
+            handler, game, pl_t, ai_t, SessionStub(), bstate, 0x101,
+            ROWDY_DEPLOY, [ROWDY_TPL_OWN, ROWDY_TPL_OPP],
+            [[0x201], [0x301]], owner_id=5, trigger_target_uid=0x101)
+
+    inst = game.events[0].options[0].instances[0]
+    assert [t.target_index for t in inst.target_instances] == [0, 1]
+    assert [str(t.target_id.guid) for t in inst.target_instances] == [
+        ROWDY_TPL_OWN, ROWDY_TPL_OPP]
+    assert [int(c.uid.uid64) for c in inst.target_instances[0].targets] == [0x201]
+    assert [int(c.uid.uid64) for c in inst.target_instances[1].targets] == [0x301]
+    # Authored bounds: friendly troop is required, "up to one" opposing is not.
+    assert list(inst.min_target_counts) == [1, 0]
+    assert list(inst.max_target_counts) == [1, 1]
+    # The continuation stores every template so the resume can forward both.
+    assert bstate["pending_trigger"]["target_index"] == 0
+    assert bstate["pending_trigger"]["target_entries"] == [
+        {"index": 0, "template_id": ROWDY_TPL_OWN, "minimum": 1, "maximum": 1},
+        {"index": 1, "template_id": ROWDY_TPL_OPP, "minimum": 0, "maximum": 1},
+    ]
+
+
 def test_optional_trigger_prompt_has_opt_in_without_fake_target(db):
     """Optional triggers use class 39 without inventing a target choice."""
     import hconnect_server as hcs
@@ -498,6 +550,72 @@ def test_pending_trigger_target_queues_reconnectable_chain(db):
     assert resumed.descriptor["trigger_target_uid"] == 0x1801
 
 
+def test_pending_trigger_continuation_forwards_every_target(db):
+    """A two-target triggered ability forwards both chosen targets.
+
+    The native continuation decodes the client's complete TargetMap; the
+    resume must not collapse it to the primary slot, or ``Battle2Cards`` gets
+    an attacker with no defender and the fight silently does nothing.
+    """
+    import hconnect_server as hcs
+    from rules_port.session import AuthoritativeSession
+
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    port = AuthoritativeSession(1, (pl_t, ai_t), seed_z=1, seed_w=2)
+    port.current_turn_phase = game_engine.ETurnPhases.FirstMainPhase
+    port.active_player_id = pl_t
+    port.event_sink = object()
+    state = {
+        "pending_trigger": {
+            "ability_guid": ROWDY_DEPLOY,
+            "source_uid": 0x1801,
+            "owner_id": 5,
+            "instance_id": 42,
+            "target_index": 0,
+            "trigger_target_uid": 0x1801,
+            "activation_data": {"target_map": {0: [0x6801], 1: [0x6901]}},
+        },
+    }
+
+    class Checkpoint:
+        def load_state(self, _session):
+            return state
+
+        def save_state(self, _session, value):
+            state.update(value)
+
+    class Session:
+        session_id = 1
+        _rules_port_session = port
+        _rules_port_battle_state = state
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler._checkpoint_engine = lambda _session: Checkpoint()
+    projected = []
+    handler._fresh_game = lambda *_args: (
+        projected.append(game_engine.Game(1, pl_t, ai_t)) or projected[-1])
+    handler._send_battle_events = lambda *_args: None
+    handler._push_transaction_ack = lambda *_args: None
+    handler._advance_rules_port_to_priority = lambda *args: None
+    session = Session()
+
+    assert handler._resolve_pending_trigger_target(
+        session, pl_t, ai_t, b"", ability_guid=ROWDY_DEPLOY)
+    chain_events = [event for event in projected[0].events
+                    if isinstance(
+                        event,
+                        game_engine.AbilityPushedOnChainSessionEventArgs)]
+    assert len(chain_events) == 1, chain_events
+    assert sorted(int(card.uid.uid64)
+                  for card in chain_events[0].target_card_ids) == [0x6801, 0x6901]
+    saved = port.snapshot()
+    descriptor = next(item for item in saved["projected_chain"]
+                      if item["instance_id"] == 42)
+    assert descriptor["activation_data"]["target_map"] == {
+        "0": [0x6801], "1": [0x6901]}
+
+
 def test_pending_trigger_prompt_survives_priority_projection(db):
     """The practice priority projection must not replace a pending picker.
 
@@ -589,10 +707,14 @@ if __name__ == "__main__":
     run("human deploy triggers class-39 prompt", test_deploy_prompt_human)
     run("trigger target prompt preserves controller",
         test_trigger_target_prompt_uses_explicit_controller)
+    run("multi-target trigger prompt advertises every target",
+        test_multi_target_trigger_prompt_advertises_every_target)
     run("optional trigger prompt requests opt-in",
         test_optional_trigger_prompt_has_opt_in_without_fake_target)
     run("trigger target continuation survives reconnect",
         test_pending_trigger_target_queues_reconnectable_chain)
+    run("two-target trigger continuation forwards both targets",
+        test_pending_trigger_continuation_forwards_every_target)
     run("AI deploy auto-picks + chains", test_deploy_auto_ai)
     run("class-39 event serializes", test_class39_wire)
     run("pending trigger prompt survives the priority projection",
