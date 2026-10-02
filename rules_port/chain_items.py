@@ -23,6 +23,8 @@ Host interface (duck-typed; no base class is required):
     A fresh packet buffer carrying the current battle projection.
 ``chain_send(session, game, player_uid, ai_uid) -> None``
     Publish the buffer (Practice: the one client; PvP: both players).
+``chain_resume_continuation(...) -> state``
+    Resume a saved nested parent chain after its triggered prompt has ended.
 ``chain_card_data(game, scid, template_guid) -> tuple``
     ``(template_guid, card_type, name, cost, attack, defense, gems)``.
 ``chain_dispatch(session, game, state, player_uid, ai_uid, event_type,
@@ -285,9 +287,39 @@ def resolve_chain_item(host, port, session, db, ability, player_uid, ai_uid):
     # A picker continuation may already have resolved this item's whole BOM.
     # Consume the marker once, here, and never re-run the authored effects: the
     # finish pass owns only the zone/event projection.
+    game = host.chain_new_game(session, state, player_uid, ai_uid)
     bom_completed = (int(state.pop("completed_chain_instance_id", 0) or 0)
                      == instance_id)
-    game = host.chain_new_game(session, state, player_uid, ai_uid)
+    suspended = state.get("rules_port_suspended_chain_continuation")
+    try:
+        suspended_id = int((suspended or {}).get("chain_instance_id", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        suspended_id = 0
+    if suspended_id == instance_id:
+        continuation = (suspended or {}).get("continuation") or {}
+        resume = _hook(host, "chain_resume_continuation")
+        if resume is None:
+            from .resolution import resume_ability_continuation_parents
+            resume = resume_ability_continuation_parents
+            resume(getattr(host, "handler", host), game, session, db,
+                   player_uid, ai_uid, state,
+                   continuation)
+        else:
+            resume(session, state, game, player_uid, ai_uid, continuation)
+        if state.get("resolution_paused"):
+            # A further trigger prompt saved its updated continuation. Other
+            # picker types already carry their own continuation and must not
+            # later replay this consumed marker.
+            if not state.get("pending_trigger"):
+                state.pop("rules_port_suspended_chain_continuation", None)
+            state["paused_chain_instance_id"] = instance_id
+            state.setdefault("stack", []).append(descriptor)
+            host.chain_save(session, state)
+            host.chain_send(session, game, player_uid, ai_uid)
+            return AbilityResolutionState.WAITING_FOR_INPUT
+        state.pop("rules_port_suspended_chain_continuation", None)
+        state.pop("completed_chain_instance_id", None)
+        bom_completed = True
     kind = descriptor.get("kind")
     if kind in ("troop", "spell"):
         resolve_card_item(host, session, db, game, state, descriptor,

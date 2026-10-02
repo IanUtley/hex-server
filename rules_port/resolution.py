@@ -1446,6 +1446,37 @@ def resume_ability_continuation_parents(
     continuation = dict(continuation or {})
     parent = ((continuation or {}).get("parent")
               if isinstance(continuation, dict) else None)
+
+    def suspend_for_trigger(current):
+        pending_trigger = state.get("pending_trigger")
+        if (not isinstance(pending_trigger, dict) or
+                isinstance(pending_trigger.get("continuation"), dict)):
+            return
+        try:
+            chain_instance_id = int(
+                state.get("paused_chain_instance_id", 0) or 0)
+        except (TypeError, ValueError):
+            chain_instance_id = 0
+        if chain_instance_id <= 0:
+            return
+        suspended = dict(current)
+        paused_order = state.get("rules_port_resume_effect_order")
+        if paused_order is None:
+            paused_order = state.get("resolving_effect_order")
+        if paused_order is not None:
+            # The trigger was raised by the effect at this order; that effect
+            # has already applied before the resolver exposes its pause point.
+            suspended["resume_effect_order"] = int(paused_order) + 1
+        state["rules_port_suspended_chain_continuation"] = {
+            "chain_instance_id": chain_instance_id,
+            "continuation": {"parent": suspended},
+        }
+
+    if (state.get("resolution_paused") and any(state.get(key) for key in (
+            "pending_choice", "pending_trigger", "pending_deck_search",
+            "pending_conversation", "pending_discard_ability"))):
+        suspend_for_trigger(continuation)
+        return AbilityResolutionState.WAITING_FOR_INPUT
     if not isinstance(parent, dict):
         # A class-23 picker can outlive the process that created it. Older
         # checkpoints stored the child continuation but not the suspended
@@ -1514,6 +1545,15 @@ def resume_ability_continuation_parents(
                 "ability_instance_id", parent.get("instance_id", 1)) or 1),
             event_tac=parent.get("event_tac"))
         if state.get("resolution_paused"):
+            # A nested trigger can pause an already-resumed card ability after
+            # the picker child has completed. Keep the current parent and its
+            # remaining ancestors on the paused native chain item; otherwise
+            # the next chain pass starts the printed BOM from effect zero.
+            # Ordinary pickers own their own continuation and are resumed by
+            # their transaction handler, so this marker is only needed for a
+            # pending triggered-ability prompt, which has no child
+            # continuation of its own.
+            suspend_for_trigger(parent)
             return result
         parent = parent.get("parent")
 

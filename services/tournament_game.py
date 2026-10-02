@@ -7164,35 +7164,22 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid,
         variables=continuation.get("variables") or {},
         event_tac=continuation.get("event_tac"))
 
-    parent = continuation.get("parent") or {}
-    while parent.get("ability_guid") and not view.get("resolution_paused"):
-        parent_guid = str(parent.get("ability_guid") or "").lower()
-        _pvp_resolve_ability(
-            handler, g, session, view, pl_t, ai_t,
-            parent_guid, child_source,
-            int(parent.get("owner_id", child_owner) or child_owner),
-            target_map={int(key): value for key, value in
-                        (parent.get("target_map") or {}).items()},
-            variables=parent.get("variables") or {},
-            resume_from_order=int(parent.get("resume_effect_order", 0)),
-            instance_id=int(parent.get(
-                "ability_instance_id", parent.get("instance_id", 1))),
-            event_tac=parent.get("event_tac"))
-        parent = parent.get("parent") or {}
+    from rules_port.resolution import resume_ability_continuation_parents
+    resume_ability_continuation_parents(
+        handler, g, session, _db, pl_t, ai_t, view, continuation)
 
     state["stack"] = view.get("stack") or []
     state["stack_player_passed"] = False
     state["stack_ai_passed"] = False
     _pvp_sync_view_to_state(state, view, owner_id, opp_pid)
-    if not view.get("resolution_paused"):
-        # Mirror the FRA continuation: the child and its enclosing activation
-        # are resolved, so release the paused-item hold and mark the BOM done.
-        # The next native pass then only finishes the card (zone change and
-        # cast events) instead of reopening the picker and creating the
-        # copies twice.
-        completed = int(state.pop("paused_chain_instance_id", 0) or 0)
-        if completed:
-            state["completed_chain_instance_id"] = completed
+    for key in (
+            "resolution_paused", "paused_chain_instance_id",
+            "completed_chain_instance_id",
+            "rules_port_suspended_chain_continuation"):
+        if key in view:
+            state[key] = view[key]
+        else:
+            state.pop(key, None)
     persisted = pvp_load_state(session) or {}
     for key in ("pending_trigger", "pending_deck_search", "pending_choice",
                 "pending_conversation"):
@@ -8396,6 +8383,43 @@ class _PvpChainHost:
 
     def chain_send(self, session, game, player_uid, ai_uid):
         _pvp_send_same_events(session, game, player_uid, ai_uid)
+
+    def chain_resume_continuation(self, session, state, game, player_uid,
+                                  ai_uid, continuation):
+        from rules_port.resolution import resume_ability_continuation_parents
+        view = self._view(state)
+        view["_rules_port_attached"] = True
+        previous = getattr(self.handler, "_current_bstate", None)
+        self.handler._current_bstate = view
+        try:
+            result = resume_ability_continuation_parents(
+                self.handler, game, session, _db, player_uid, ai_uid,
+                view, continuation)
+        finally:
+            if previous is None:
+                try:
+                    del self.handler._current_bstate
+                except AttributeError:
+                    pass
+            else:
+                self.handler._current_bstate = previous
+        _pvp_sync_view_to_state(
+            state, view, self.owner_id, self.opponent_id)
+        for key in (
+                "resolution_paused", "paused_chain_instance_id",
+                "completed_chain_instance_id",
+                "rules_port_suspended_chain_continuation"):
+            if key in view:
+                state[key] = view[key]
+            else:
+                state.pop(key, None)
+        persisted = pvp_load_state(session) or {}
+        for key in ("pending_trigger", "pending_deck_search",
+                    "pending_choice", "pending_conversation"):
+            if persisted.get(key):
+                state[key] = persisted[key]
+        pvp_save_state(session, state)
+        return result
 
     def chain_card_data(self, game, scid, template_guid):
         return self.handler._card_full_data(game, scid, template_guid)

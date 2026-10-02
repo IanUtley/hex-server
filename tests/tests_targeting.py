@@ -474,6 +474,64 @@ def test_optional_trigger_prompt_has_opt_in_without_fake_target(db):
     ]
 
 
+def test_optional_trigger_decline_serializes_canonical_player_uid():
+    """Declining a Practice trigger serializes its protocol player UID."""
+    import hconnect_server as hcs
+
+    raw_owner_id = 6175190558117173535
+    client_reck_id = 1925190388022160
+    state = {
+        "pending_trigger": {
+            "ability_guid": EXILE_DEPLOY,
+            "owner_id": raw_owner_id,
+            "instance_id": 23,
+            "optional": True,
+        },
+    }
+
+    class Checkpoint:
+        def load_state(self, _session):
+            return state
+
+        def save_state(self, _session, new_state):
+            state.clear()
+            state.update(new_state)
+
+        def stack_empty(self, _state):
+            return True
+
+        def current_phase(self, _state):
+            return game_engine.ETurnPhases.Mulligan
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler.client_reck_id = str(client_reck_id)
+    handler._checkpoint_engine = lambda _session: Checkpoint()
+    handler._fresh_game = lambda _session, player, ai, _state: game_engine.Game(
+        1, player, ai)
+    handler._priority_context_for = lambda *_args: \
+        game_engine.EPriorityContext.Normal
+    sent_games = []
+    handler._send_battle_events = lambda _session, game, _player: \
+        sent_games.append(game)
+    handler._push_transaction_ack = lambda _session: None
+    handler._push_main_phase_options = lambda *_args: None
+
+    session = SimpleNamespace(session_id=1)
+    transaction = SimpleNamespace(payload={
+        "activation_data": {"opted": False},
+    })
+    handled = hcs.HCPHandler._resolve_rules_port_trigger_continuation(
+        handler, session, transaction)
+
+    assert handled is True
+    assert "pending_trigger" not in state
+    event = next(event for event in sent_games[0].events
+                 if isinstance(event, game_engine.AbilityCancelledSessionEventArgs))
+    assert int(event.responsible_player_id.uid64) == int(
+        game_engine.UID.make(244, client_reck_id).uid64)
+    assert event.to_byte_array()
+
+
 def test_pending_trigger_target_queues_reconnectable_chain(db):
     """A class-39 answer must survive the next RulesPort reattach."""
     import hconnect_server as hcs
@@ -711,6 +769,8 @@ if __name__ == "__main__":
         test_multi_target_trigger_prompt_advertises_every_target)
     run("optional trigger prompt requests opt-in",
         test_optional_trigger_prompt_has_opt_in_without_fake_target)
+    run("optional trigger decline uses canonical player UID",
+        test_optional_trigger_decline_serializes_canonical_player_uid)
     run("trigger target continuation survives reconnect",
         test_pending_trigger_target_queues_reconnectable_chain)
     run("two-target trigger continuation forwards both targets",

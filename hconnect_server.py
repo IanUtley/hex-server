@@ -244,7 +244,8 @@ from pvp_db import (db_clear_session_cards, db_game_session_pids,
                     db_ability_effect_rows, db_ability_has_effect,
                     db_ability_target_template_ids, db_target_template_filter,
                     db_template_card_info, db_card_catalog, db_pvp_set_guids,
-                    db_template_subtype, db_gem_abilities,
+                    db_template_subtype, db_gem_ability_guids,
+                    EMPTY_SOCKET_GEMS,
                     db_set_card_abilities, db_cleanup_game_sessions,
                     db_set_card_abilities_and_attributes,
                     db_ability_option_cards, db_card_uids_in_zone,
@@ -3897,7 +3898,6 @@ class HCPHandler(ProfileStreamMixin):
         Shamed Gladiator's Minor Blood Orb of Hatred (gem 5) -> "Rage 1 in all
         zones".  The game later copies these onto game_cards.card_abilities so
         the card is updated with the gem's ability."""
-        import json as _j
         out = {}
         for inst, gem in (active_gems or {}).items():
             try:
@@ -3906,14 +3906,9 @@ class HCPHandler(ProfileStreamMixin):
                 continue
             if gem <= 0:
                 continue
-            gem_abilities_json = db_gem_abilities(gem, conn=_db)
-            if gem_abilities_json:
-                try:
-                    abilities = _j.loads(gem_abilities_json)
-                except Exception:
-                    abilities = []
-                if abilities:
-                    out[str(inst)] = [str(a).lower() for a in abilities]
+            abilities = db_gem_ability_guids(gem, conn=_db)
+            if abilities:
+                out[str(inst)] = abilities
         return out
 
     def _card_gem_type(self, game, scid, instance_id=None,
@@ -6213,7 +6208,9 @@ class HCPHandler(ProfileStreamMixin):
         from rules_port.choice_effects import (
             _play_choice_card as play_choice_card,
             _resolve_choice_card_abilities as resolve_choice_card_abilities)
-        from rules_port.resolution import resolve_port_ability
+        from rules_port.resolution import (
+            resolve_port_ability,
+            resume_ability_continuation_parents)
         bstate = _be.load_state(session)
         pending = bstate.get("pending_choice")
         if not pending:
@@ -6833,15 +6830,17 @@ class HCPHandler(ProfileStreamMixin):
                          not flag(activation.get("opted"))))
             pending["activation_data"] = activation
             if declined:
-                owner_id = int(pending.get("owner_id", 0) or 0)
                 instance_id = int(pending.get("instance_id", 1) or 1)
                 state.pop("pending_trigger", None)
                 _be.save_state(session, state)
                 pl_t = game_engine.UID.make(244, int(self.client_reck_id))
                 ai_t = game_engine.UID.make(3, 1000)
                 game = self._fresh_game(session, pl_t, ai_t, state)
-                game.push_ability_cancelled(
-                    instance_id, game_engine.UID.make(244, owner_id))
+                # This RulesPort bridge handles Practice/PvE prompts, where
+                # pending.owner_id is the raw game_cards.user_id, not the
+                # ServicePlayer UID instance. The prompted controller is the
+                # connected player, so use its already-canonical protocol UID.
+                game.push_ability_cancelled(instance_id, pl_t)
                 port = getattr(session, "_rules_port_session", None)
                 event_sink = getattr(port, "event_sink", None)
                 native_scheduler = port is not None and event_sink is not None
@@ -7253,7 +7252,9 @@ class HCPHandler(ProfileStreamMixin):
         self._hide_candidates_to_deck(g, session, pl_t, ai_t, candidates)
 
         continuation = pend.get("continuation") or {}
-        from rules_port.resolution import resolve_port_ability
+        from rules_port.resolution import (
+            resolve_port_ability,
+            resume_ability_continuation_parents)
         child_guid = str(continuation.get("ability_guid") or "").lower()
         child_source = int(continuation.get("source_uid") or 0)
         child_owner = int(continuation.get("owner_id", pend.get("owner_id", 0)) or 0)
@@ -7264,30 +7265,14 @@ class HCPHandler(ProfileStreamMixin):
             self, g, session, _db, pl_t, ai_t, bstate,
             child_guid, child_source, child_owner,
             target_map=child_targets,
-            variables=continuation.get("variables") or {})
-
-        # The picker paused inside ActivateAbility.  Continue the enclosing
-        # BOM after that activation so any later typed effects still run.
-        parent = continuation.get("parent") or {}
-        parent_guid = str(parent.get("ability_guid") or "").lower()
-        if parent_guid:
-            resolve_port_ability(
-                self, g, session, _db, pl_t, ai_t, bstate,
-                parent_guid, child_source,
-                int(parent.get("owner_id", child_owner) or child_owner),
-                target_map=_numeric_target_map(parent.get("target_map")),
-                variables=parent.get("variables") or {},
-                resume_from_order=int(parent.get("resume_effect_order", 0)))
-
-        if not bstate.get("resolution_paused"):
-            # The child and its enclosing activation are resolved.  Release
-            # the paused-item hold and tell the scheduler's next pass that
-            # this chain item's BOM is done: the card still needs its zone
-            # change and cast events, but re-running the BOM would reopen the
-            # picker and create the copies twice.
-            completed = int(bstate.pop("paused_chain_instance_id", 0) or 0)
-            if completed:
-                bstate["completed_chain_instance_id"] = completed
+            variables=continuation.get("variables") or {},
+            resume_from_order=int(
+                continuation.get("resume_effect_order", 0) or 0),
+            instance_id=int(continuation.get(
+                "ability_instance_id", continuation.get("instance_id", 1))
+                or 1))
+        resume_ability_continuation_parents(
+            self, g, session, _db, pl_t, ai_t, bstate, continuation)
         _be.save_state(session, bstate)
         pending_input = (bstate.get("pending_choice") or
                          bstate.get("pending_trigger") or
@@ -7346,7 +7331,9 @@ class HCPHandler(ProfileStreamMixin):
                     native_continuation.get("target_map"))
                 target_map[int(native_continuation.get("target_index", 0))] = \
                     int(chosen_uid)
-                from rules_port.resolution import resolve_port_ability
+                from rules_port.resolution import (
+                    resolve_port_ability,
+                    resume_ability_continuation_parents)
                 bstate.pop("pending_deck_search", None)
                 bstate.pop("resolution_paused", None)
                 resolve_port_ability(
@@ -7360,31 +7347,9 @@ class HCPHandler(ProfileStreamMixin):
                         "resume_effect_order", 0)),
                     instance_id=int(native_continuation.get(
                         "ability_instance_id", pend.get("instance_id", 1))))
-                parent = native_continuation.get("parent") or {}
-                while (parent.get("ability_guid") and not bstate.get(
-                        "resolution_paused")):
-                    resolve_port_ability(
-                        self, g, session, _db, pl_t, ai_t, bstate,
-                        str(parent.get("ability_guid") or "").lower(),
-                        int(parent.get("source_uid") or
-                            native_continuation.get("source_uid") or 0),
-                        int(parent.get("owner_id", pend.get("owner_id", 0)) or 0),
-                        target_map=_numeric_target_map(parent.get("target_map")),
-                        variables=parent.get("variables") or {},
-                        resume_from_order=int(parent.get(
-                            "resume_effect_order", 0)),
-                        instance_id=int(parent.get(
-                            "ability_instance_id",
-                            parent.get("instance_id", 1))))
-                    parent = parent.get("parent") or {}
-                # The continuation resolved the child plus its enclosing
-                # activation, so the chain item only needs its finishing
-                # projection on the next pass.
-                if not bstate.get("resolution_paused"):
-                    completed = int(bstate.pop(
-                        "paused_chain_instance_id", 0) or 0)
-                    if completed:
-                        bstate["completed_chain_instance_id"] = completed
+                resume_ability_continuation_parents(
+                    self, g, session, _db, pl_t, ai_t, bstate,
+                    native_continuation)
                 _be.save_state(session, bstate)
                 self._send_battle_events(session, g, pl_t)
                 completed = self._resume_completed_rules_port_chain(
@@ -9072,6 +9037,13 @@ class HCPHandler(ProfileStreamMixin):
 
     def chain_send(self, session, game, player_uid, ai_uid):
         self._send_battle_events(session, game, player_uid)
+
+    def chain_resume_continuation(self, session, state, game, player_uid,
+                                  ai_uid, continuation):
+        from rules_port.resolution import resume_ability_continuation_parents
+        return resume_ability_continuation_parents(
+            self, game, session, _db, player_uid, ai_uid, state,
+            continuation)
 
     def chain_card_data(self, game, scid, template_guid):
         return self._card_full_data(game, scid, template_guid, None)
@@ -10887,13 +10859,16 @@ class HCPHandler(ProfileStreamMixin):
                            else card_instance_ref)
         gem_type = HCPHandler._card_gem_type(
             self, game, scid, gem_instance_id, persisted_gem=persisted_gem)
+        display_gems = int(gem_type or 0)
+        if (display_gems > 0x3FF and
+                not (display_gems & EMPTY_SOCKET_GEMS)):
+            # Older deck saves lost the packed-format flag but retained the
+            # socket payload. Restore the marker in the client projection so
+            # its socket renderer decodes every slot instead of treating the
+            # combined value as one legacy gem enum.
+            display_gems |= EMPTY_SOCKET_GEMS
         if gem_type:
-            try:
-                gem_abilities_json = db_gem_abilities(gem_type, conn=_db)
-                gem_guids = (json.loads(gem_abilities_json)
-                             if gem_abilities_json else [])
-            except Exception:
-                gem_guids = []
+            gem_guids = db_gem_ability_guids(gem_type, conn=_db)
             for gem_guid in gem_guids:
                 gem_guid = str(gem_guid).lower()
                 if gem_guid not in ability_guids:
@@ -11176,7 +11151,7 @@ class HCPHandler(ProfileStreamMixin):
         # when the caller omits gems= — e.g. Shamed Gladiator must keep its gem
         # once it resolves to the board.
         if scid is not None and game.card_defs.get(scid) is not None:
-            game.card_defs[scid].gems = gem_type
+            game.card_defs[scid].gems = display_gems
             # Rage display: CardUpdated.rage drives the client's Rage icon, and
             # it was never populated (always 0).  Use the same authoritative
             # static-ability evaluation as combat (template rage_value + granted
@@ -11190,7 +11165,7 @@ class HCPHandler(ProfileStreamMixin):
                 game.card_defs[scid].rage = int(rage or 0)
             except Exception:
                 game.card_defs[scid].rage = 0
-        return tpl_guid, ct, name, cost, atk, def_, gem_type
+        return tpl_guid, ct, name, cost, atk, def_, display_gems
 
     def _champion_targets(self):
         """[(card_uid, user_id, name, health)] for both champions — the client
@@ -18843,7 +18818,7 @@ class HCPHandler(ProfileStreamMixin):
                                 seg = tail.split(b';', 18)
                                 if len(seg) >= 18:
                                     key_val = struct.unpack("<Q", unhexlify(seg[8]))[0]
-                                    v_val = struct.unpack("<Q", unhexlify(seg[17]))[0] & 0xFFFFFFFF
+                                    v_val = struct.unpack("<Q", unhexlify(seg[17]))[0]
                                     active_gems[str(key_val)] = v_val
                                     tail = b';'.join(seg[18:])
                         except: pass
@@ -19123,7 +19098,7 @@ class HCPHandler(ProfileStreamMixin):
                                 seg = tail.split(b';', 18)
                                 if len(seg) >= 18:
                                     key_val = struct.unpack("<Q", unhexlify(seg[8]))[0]
-                                    v_val = struct.unpack("<Q", unhexlify(seg[17]))[0] & 0xFFFFFFFF
+                                    v_val = struct.unpack("<Q", unhexlify(seg[17]))[0]
                                     active_gems[str(key_val)] = v_val
                                     tail = b';'.join(seg[18:])
                         except: pass

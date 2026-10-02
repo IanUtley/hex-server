@@ -2762,6 +2762,45 @@ def db_gem_abilities(gem_type, conn=None):
     return row[0] if row else None
 
 
+def db_gem_ability_guids(gem_value, conn=None):
+    """Return ability GUIDs for a legacy gem or packed socket value.
+
+    The client stores all socket positions in one UInt64.  Bit 62 marks that
+    packed representation; each of the six sockets uses a ten-bit gem type.
+    Older persisted rows can still contain a single gem type, so accept both
+    forms at this boundary.
+    """
+    try:
+        raw = int(gem_value or 0)
+    except (TypeError, ValueError):
+        return []
+    if raw <= 0:
+        return []
+    if raw & EMPTY_SOCKET_GEMS or raw > 0x3FF:
+        # Older server builds truncated the UInt64 marker off at deck-save
+        # time. A value above the ten-bit EGemTypesNew slot range is therefore
+        # still recognizable as the low socket payload (for example 1056 is
+        # slot 0 = 32 and slot 1 = 1).
+        values = [(raw >> (slot * 10)) & 0x3FF for slot in range(6)]
+    else:
+        values = [raw]
+    guids = []
+    for gem_type in dict.fromkeys(value for value in values if value):
+        payload = db_gem_abilities(gem_type, conn=conn)
+        if not payload:
+            continue
+        try:
+            abilities = json.loads(payload or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for ability in abilities:
+            if ability:
+                guid = str(ability).lower()
+                if guid not in guids:
+                    guids.append(guid)
+    return guids
+
+
 def db_card_gem_ability_guids(session_id, card_uid, conn=None):
     """Return the ability GUIDs granted by a card's socketed gems.
 
@@ -2776,27 +2815,7 @@ def db_card_gem_ability_guids(session_id, card_uid, conn=None):
         return []
     if not raw:
         return []
-    values = []
-    if raw & (1 << 62):
-        for slot in range(6):
-            value = (raw >> (slot * 10)) & 0x3FF
-            if value:
-                values.append(value)
-    else:
-        values = [raw]
-    guids = []
-    for value in dict.fromkeys(values):
-        payload = db_gem_abilities(value, conn=conn)
-        if not payload:
-            continue
-        try:
-            abilities = json.loads(payload or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        for ability in abilities:
-            if ability:
-                guids.append(str(ability).lower())
-    return list(dict.fromkeys(guids))
+    return db_gem_ability_guids(raw, conn=conn)
 
 
 def db_card_template_creation_profile(template_guid, conn=None):
