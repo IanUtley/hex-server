@@ -6,6 +6,24 @@ from binascii import unhexlify
 def log(_message):
     return None
 
+
+def _hashable_key(key):
+    """Dictionary keys may be structs (``{"m_UID64": ...}``); a decoded
+    struct is a dict, which Python cannot use as a key.  An unhashable key
+    failed the whole transaction ("unhashable type: 'dict'"), so activation
+    data such as the Construction Plans exhaust selections fell back to the
+    raw-byte path and lost all but one selection."""
+    if isinstance(key, dict):
+        values = [value for value in key.values()
+                  if not isinstance(value, (dict, list))]
+        if len(key) == 1 and len(values) == 1:
+            return values[0]
+        import json
+        return json.dumps(key, sort_keys=True, default=str)
+    if isinstance(key, list):
+        return tuple(_hashable_key(value) for value in key)
+    return key
+
 def parse_datawrapper(body, *, preserve_complex=False):
     """
     Parse an ObjFmt-encoded DataWrapper.
@@ -117,7 +135,7 @@ def parse_datawrapper(body, *, preserve_complex=False):
                     sn, sv = parse_one("", 0)
                     entry[sn] = sv
                 if preserve_complex:
-                    key = entry.get("key", index)
+                    key = _hashable_key(entry.get("key", index))
                     result_map[key] = entry.get("value")
             return name, result_map if preserve_complex else {"__skipped__": f_type}
         elif f_type.startswith("System.Collections.Generic.List`1#") and num == 0:

@@ -465,6 +465,41 @@ def _choose_ai_explicit_target_map(handler, session, battle_state,
         # Target selection must not make an otherwise resolvable ability fail
         # because a legacy/incomplete AI snapshot is unavailable.
         return None
+def _exhausted_cost_cards(ability):
+    """Cards exhausted to pay ``ability``'s additional costs.
+
+    C# records them in the ability instance's ``ExhaustedCards`` list, which
+    CountListAttr variables read ("for each troop exhausted this way" on the
+    Construction Plans).  The activation keeps each cost's selection by its
+    index in the graph's additional cost targets.
+    """
+    metadata = getattr(ability, "metadata", None)
+    graph = getattr(metadata, "graph", None)
+    activation = getattr(ability, "activation", None)
+    costs = tuple(getattr(graph, "additional_cost_targets", ()) or ())
+    if not costs or activation is None:
+        return []
+    cost_map = getattr(activation, "cost_target_map", {}) or {}
+    target_map = getattr(activation, "target_map", {}) or {}
+    out = []
+    for index, (kind, _guid) in enumerate(costs):
+        if str(kind).lower() != "exhaust":
+            continue
+        selected = cost_map.get(index, cost_map.get(str(index)))
+        if not selected:
+            selected = target_map.get(index, target_map.get(str(index)))
+        if selected is None:
+            continue
+        if not isinstance(selected, (list, tuple, set)):
+            selected = (selected,)
+        for value in selected:
+            try:
+                uid = int(getattr(value, "uid64", value))
+            except (TypeError, ValueError):
+                continue
+            if uid not in out:
+                out.append(uid)
+    return out
 
 
 class NativeEffectBackend:
@@ -530,6 +565,10 @@ class NativeEffectBackend:
         # summoned no Spider).  The legacy resolver sets the same key; mirror
         # it here, then restore the caller's value on exit.
         battle_state["session_id"] = int(session.session_id)
+        exhausted = _exhausted_cost_cards(ability)
+        if exhausted:
+            battle_state.setdefault("ability_lists", {})[
+                "ExhaustedCards"] = exhausted
         battle_state["resolving_ability"] = ability.ability_template_id
         battle_state["resolving_source_uid"] = ability.source_uid
         battle_state["resolving_owner_id"] = int(
@@ -934,6 +973,21 @@ class NativeEffectBackend:
                                 target_spec.guid,
                                 battle_state.get("revealed_cards") or [],
                                 battle_state=battle_state, acted_on_uids=acted_on)
+                            if not candidates:
+                                # Nothing revealed matches (no artifact among
+                                # the cards, or every card was already taken).
+                                # C# enumerates an empty target list and the
+                                # effect does nothing; it must not fall back
+                                # to the source card (Gearsmith moved itself
+                                # into the deck).
+                                applied[instance_id] = condition_passes(
+                                    effect, None)
+                                for key in ("resolving_target_uid",
+                                            "player_mod_target",
+                                            "player_spell_target",
+                                            "grant_target"):
+                                    battle_state.pop(key, None)
+                                continue
                             # A SourceRevealed target is input-bearing only when
                             # the authored template asks the player to choose.
                             # Oakhenge's child ability targets "a revealed troop"
@@ -968,7 +1022,11 @@ class NativeEffectBackend:
                                         int(ability.responsible_player_id),
                                         candidates,
                                         list(battle_state.get("revealed_cards") or []),
-                                        optional=bool(target_spec.optional),
+                                        # "Up to one" (minimum 0) may be
+                                        # declined like an optional target.
+                                        optional=bool(
+                                            target_spec.optional or
+                                            int(target_spec.minimum or 0) == 0),
                                         continuation=continuation)
                                     battle_state["resolution_paused"] = True
                                     native_waiting = True
@@ -1061,6 +1119,14 @@ class NativeEffectBackend:
                     target_values = (None,)
                 if not isinstance(target_values, (tuple, list)):
                     target_values = (target_values,)
+                if (effect_type == "RevealCardsAbilityEffectTemplate" and
+                        len(target_values) > 1):
+                    # C# RevealCards reveals the whole target set in one
+                    # CardsRevealed event, and reveal_cards selects that set
+                    # itself.  Running it once per card ("the top three cards
+                    # of your deck") revealed the same three cards three
+                    # times, replaying the client's reveal presentation.
+                    target_values = tuple(target_values[:1])
                 effect_targets = tuple(target_values)
                 resolved_by_instance[instance_id] = tuple(
                     int(value) for value in effect_targets
@@ -1307,7 +1373,7 @@ class PortAbilityResolver:
 
 
 def build_port_ability(ability_guid, source_uid, owner_id, *, instance_id=1,
-                       target_map=None, variables=None):
+                       target_map=None, variables=None, cost_target_map=None):
     """Build one typed ability instance from the authoritative Records graph."""
     from gamedata import DEFAULT_RECORD_STORE, ability_graph
     from gamedata.play_plan import AbilityInstance as MetadataAbility
@@ -1322,8 +1388,14 @@ def build_port_ability(ability_guid, source_uid, owner_id, *, instance_id=1,
     ability = AbilityInstance(
         instance_id=int(instance_id), metadata=metadata,
         activating_player_id=owner_id, responsible_player_id=owner_id)
-    ability.bind_activation({"target_map": target_map or {},
-                             "variables": variables or {}})
+    activation = {"target_map": target_map or {},
+                  "variables": variables or {}}
+    if cost_target_map:
+        # Additional-cost selections (exhaust/sacrifice/...) paid when the
+        # ability was activated; effects such as Construction Plans count
+        # them ("for each troop exhausted this way").
+        activation["cost_target_map"] = cost_target_map
+    ability.bind_activation(activation)
     return ability
 
 
@@ -1332,7 +1404,8 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
                          *, target_map=None, variables=None,
                          resume_from_order=None, instance_id=1,
                          native_effect=None,
-                         effect_groups=None, event_tac=None):
+                         effect_groups=None, event_tac=None,
+                         cost_target_map=None):
     """Resolve a persisted continuation through the port-owned lifecycle."""
     log_targets = target_map
     if not log_targets:
@@ -1345,7 +1418,8 @@ def resolve_port_ability(handler, game, session, db, player_uid, ai_uid,
                        log_targets)
     ability = build_port_ability(
         ability_guid, source_uid, owner_id, instance_id=instance_id,
-        target_map=target_map, variables=variables)
+        target_map=target_map, variables=variables,
+        cost_target_map=cost_target_map)
     # The resume offset is persisted in the existing session snapshot because
     # the continuation may have crossed a reconnect boundary.
     if resume_from_order is not None:

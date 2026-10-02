@@ -1245,14 +1245,77 @@ def _owner_projects_card_properties(db, session_id, owner, cache):
     return cached
 
 
+def is_continuous_self_static(graph):
+    """Whether a CardCreated ability is a continuous self modifier.
+
+    Such abilities ("This has cost -1 in all your zones for each Dwarf and/or
+    Robot you control") are projected by this module in every zone, so they
+    must not also resolve once at card creation.
+    """
+    from .metadata import modifier_metadata
+    if graph is None or "CardCreatedEvent" not in str(
+            graph.trigger_event_type or ""):
+        return False
+    zones = {value.lower() for value in
+             str(graph.trigger_collection_flags or "").split("|") if value}
+    if not {"deck", "hand", "warzone", "discard"} <= zones:
+        return False
+    if not graph.targets or not all(
+            target.target_kind == "AbilitySourceCardTargetTemplate"
+            for target in graph.targets):
+        return False
+    if not graph.effects:
+        return False
+    for effect in graph.effects:
+        if (effect.concrete_type != "CardModifierAbilityEffectTemplate" or
+                str(effect.duration).lower() != "permanent"):
+            return False
+        prop = str((modifier_metadata(effect.guid) or {}).get("property") or "")
+        if prop not in {"attack", "defense", "cardcost", "attribute"}:
+            return False
+    return True
+
+
+def _self_static_abilities(db, session_id, card_uid, location, cache):
+    """A card's own continuous abilities that apply to itself where it is.
+
+    Only in-play cards are scanned as aura sources, but "This has cost -1 in
+    all your zones for each Dwarf and/or Robot you control" (Pterobot) must
+    work in the hand.  Admit an ability of the card itself when it targets
+    only its source and its collection flags include the card's zone.
+    """
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    zone = str(location or "").lower()
+    result = []
+    for ability_guid in _static_abilities(db, session_id, card_uid, cache):
+        graph = ability_graph(DEFAULT_RECORD_STORE, ability_guid)
+        if graph is None or not graph.targets:
+            continue
+        if not all(target.target_kind == "AbilitySourceCardTargetTemplate"
+                   for target in graph.targets):
+            continue
+        zones = {value.lower() for value in
+                 str(graph.trigger_collection_flags or "").split("|") if value}
+        if zone in zones:
+            result.append(ability_guid)
+    return result
+
+
 def _scan_static_deltas(db, session_id, battle_state, card_uid, cache):
     row = _card_location_row(db, session_id, card_uid, cache)
     if not row:
         return _empty_deltas(), False
     owner, location, _position = row
     total = _empty_deltas()
-    for source_uid in _owner_static_sources(db, session_id, owner, cache):
-        for ability_guid in _static_abilities(db, session_id, source_uid, cache):
+    sources = [(source_uid, None) for source_uid in
+               _owner_static_sources(db, session_id, owner, cache)]
+    if int(card_uid) not in {uid for uid, _ in sources}:
+        sources.append((int(card_uid), _self_static_abilities(
+            db, session_id, card_uid, location, cache)))
+    for source_uid, only_abilities in sources:
+        abilities = (_static_abilities(db, session_id, source_uid, cache)
+                     if only_abilities is None else only_abilities)
+        for ability_guid in abilities:
             for param, raw in _static_leaves(db, ability_guid, cache):
                 literal = _native_leaf_value(
                     db, session_id, battle_state, source_uid, owner, param, raw)

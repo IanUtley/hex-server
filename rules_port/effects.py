@@ -979,10 +979,16 @@ def _int_attribute(context, target, param):
         attrs[attr] = value
     else:
         attrs.pop(attr, None)
+    tamed = attr.lower() == "tamed" and value > 0
+    if tamed:
+        # Tamed and Untamed are mutually exclusive.
+        attrs.pop("Untamed", None)
     db_set_card_mutation_field(
         context.session.session_id, int(target), column,
         json.dumps(buffs), conn=context.db)
     context.db.commit()
+    if tamed and _capture_tamed_card(context, int(target), buffs):
+        return f"intattr {attr}={value} target={hex(int(target))} (captured)"
     if duration in temporary_durations:
         from .effect_lifetimes import record_temporary_intattr
         record_temporary_intattr(
@@ -1054,6 +1060,45 @@ def _card_tag(context, target, param):
     context.db.commit()
     context._push_modifier_card(int(target))
     return f"tag {key}={int(tags.get(key, 0) or 0)} target={hex(int(target))}"
+
+
+def _capture_tamed_card(context, target, buffs):
+    """A successful tame voids the troop (Taming Sphere capture).
+
+    Ported from the legacy IntAttrModifier path, which RulesPort battles no
+    longer use: without it a tamed Dire Toad stayed in play and the Tamed
+    quest never saw a tamed troop in the void.  Keyed on the typed Tamed
+    marker, so the 2-cost chance branch and the 5-cost branch behave alike.
+    """
+    import game_engine
+    from pvp_db import db_card_modifier_state, db_tame_card
+    from rules_port.runtime_helpers import owner_uid
+    from rules_port.zone_effects import state_after_zone_exit
+    row = db_card_modifier_state(
+        context.session.session_id, target, conn=context.db)
+    if not row or str(row[2] or "").lower() == "void":
+        return False
+    state = state_after_zone_exit(row[3])
+    db_tame_card(context.session.session_id, target, json.dumps(buffs),
+                 state, conn=context.db)
+    context.db.commit()
+    scid = game_engine.SessionCardId(game_engine.UID(target))
+    _tpl, ct, _name, cost, attack, defense, gems = \
+        context.handler._card_full_data(context.game, scid, row[0])
+    owner = owner_uid(row[1], context.player_uid, context.ai_uid,
+                      context.bstate)
+    context.game.push_card_moved(
+        scid, owner, game_engine.ECardCollections.Void,
+        game_engine.ECardLocations.Top, 0)
+    context.game.push_card_updated(
+        scid, owner, game_engine.ECardCollections.Void, ct,
+        template_id=row[0], cost=cost, attack=attack, defense=defense,
+        state=state, gems=gems)
+    context._emit_trigger(
+        "CardExitedZoneEvent", target, int(row[1] or 0),
+        event_source_collection=str(row[2] or "").lower(),
+        event_destination_collection="void")
+    return True
 
 
 def _targets(context):

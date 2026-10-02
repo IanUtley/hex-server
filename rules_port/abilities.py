@@ -16,6 +16,14 @@ from gamedata.play_plan import AbilityInstance as MetadataAbilityInstance
 from gamedata.play_plan import ActivationData
 
 
+def _index(value) -> int:
+    """TargetMap keys arrive as ints or their decoded string form."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 @dataclass(frozen=True)
 class AbilityContinuation:
     """JSON-safe RulesPort checkpoint for a paused ability."""
@@ -186,8 +194,40 @@ class AbilityInstance:
                 inferred = {0: next(iter(
                     self.metadata.activation.target_map.values()))}
             if inferred:
+                # The flattened cost selection is not an effect target when
+                # the effect template at that index is automatic.  Leaving it
+                # in TargetMap made Construction Plans' "add a construction
+                # counter to this" land on the exhausted troop.
+                effect_targets = tuple(getattr(self.metadata.graph, "targets", ()) or ())
+                target_map = {
+                    index: selected
+                    for index, selected in
+                    self.metadata.activation.target_map.items()
+                    if not (_index(index) in inferred and not (
+                        _index(index) < len(effect_targets) and
+                        effect_targets[_index(index)].requires_input))}
                 self.metadata.activation = replace(
-                    self.metadata.activation, cost_target_map=inferred)
+                    self.metadata.activation, cost_target_map=inferred,
+                    target_map=target_map)
+        elif cost_targets:
+            # Labelled cost selections (XCostData.CardsToExhaust /
+            # CardsToSacrifice) can sit beside a raw-recovered TargetMap that
+            # repeats one of those cards.  A card paid as a cost is not the
+            # automatic effect target at that index ("this").
+            effect_targets = tuple(getattr(self.metadata.graph, "targets", ()) or ())
+            paid = {int(uid) for selected in
+                    self.metadata.activation.cost_target_map.values()
+                    for uid in (selected or ())}
+            target_map = {
+                index: selected
+                for index, selected in self.metadata.activation.target_map.items()
+                if not (selected and
+                        {int(uid) for uid in selected} <= paid and not (
+                            0 <= _index(index) < len(effect_targets) and
+                            effect_targets[_index(index)].requires_input))}
+            if target_map != dict(self.metadata.activation.target_map):
+                self.metadata.activation = replace(
+                    self.metadata.activation, target_map=target_map)
         errors = self.validate_activation()
         # Missing fields are expected during a multi-dialog interaction.
         # Everything else is malformed or no longer legal input.

@@ -2597,8 +2597,475 @@ def test_booby_trap_damages_its_owners_champion(db):
     assert bstate["player_health"] == 20, bstate
 
 
+def test_construction_plans_count_the_exhausted_troops(db):
+    """"Exhaust one or more Dwarves and/or Robots you control: add a
+    construction counter to this for each troop exhausted this way."  The
+    count comes from the ability's ExhaustedCards list, and the counter goes
+    on the Plans, not on the exhausted troop the client flattened into
+    TargetMap[0]."""
+    from rules_port.resolution import resolve_port_ability
+    plan, bot, hornet = "aa325145-6d3d-474e-b990-608619620fe8", "02ed9695-207a-4c23-a3f8-13c7b001203d", "93cf512d-8b01-4e30-bf22-f02bf81cf12b"
+    db.execute("DELETE FROM game_cards")
+    db.execute("CREATE TABLE IF NOT EXISTS card_counter_templates "
+               "(template_id TEXT PRIMARY KEY, name TEXT, description TEXT)")
+    db.execute("INSERT OR IGNORE INTO card_counter_templates VALUES "
+               "('c277b077-04ae-5020-09fb-d5831d3358b8', 'Construction', '')")
+    for tpl in (plan, bot, hornet):
+        _copy_card(db, tpl)
+    add_card(db, 0x401, 5, plan, loc="warzone")
+    add_card(db, 0x301, 5, bot, loc="warzone")
+    add_card(db, 0x501, 5, bot, loc="warzone")
+    db.commit()
+    pl_t, ai_t = _pl_ai()
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "stack": [], "_rules_port_attached": True}
+
+    def activate(*exhausted):
+        # The live chain resolves the saved descriptor: an empty TargetMap and
+        # the exhaust selections in its cost_target_map (string keys, as
+        # persisted).
+        resolve_port_ability(
+            HandlerStub(db), game_engine.Game(1, pl_t, ai_t), SessionStub(), db,
+            pl_t, ai_t, bstate, "257418ed-24ec-98cd-d6f7-faeb02de4d50", 0x401, 5,
+            target_map={}, cost_target_map={"0": list(exhausted)},
+            instance_id=1)
+
+    def plan_row():
+        return db.execute("SELECT template_guid, permanent_buffs FROM game_cards "
+                          "WHERE card_uid=?", (0x401,)).fetchone()
+
+    activate(0x301)
+    assert json.loads(plan_row()[1])["counters"] == {"construction": 1}, plan_row()
+    assert json.loads(db.execute("SELECT permanent_buffs FROM game_cards "
+                                 "WHERE card_uid=?", (0x301,)).fetchone()[0]
+                      or "{}").get("counters", {}) == {}
+    activate(0x501)   # two counters: remove them and become a Hornet Bot
+    assert plan_row()[0] == hornet, plan_row()
+    # Exhausting two troops at once adds two counters in one activation.
+    db.execute("UPDATE game_cards SET template_guid=?, card_template_id=?, "
+               "permanent_buffs='{}', card_state=0 WHERE card_uid=?",
+               (plan, plan, 0x401))
+    db.commit()
+    activate(0x301, 0x501)
+    assert plan_row()[0] == hornet, plan_row()
+
+
+def test_dictionary_with_struct_keys_decodes(db):
+    """A Dictionary whose keys are structs decoded to dict keys and failed
+    the whole transaction with "unhashable type: 'dict'"."""
+    from application.objfmt_wire import _hashable_key
+    assert _hashable_key({"m_UID64": 0x301}) == 0x301
+    assert _hashable_key({"a": 1, "b": 2}) == '{"a": 1, "b": 2}'
+    assert _hashable_key(3) == 3
+    assert hash(_hashable_key([{"m_UID64": 1}, 2])) is not None
+
+
+# A real ActivateAbilityTransaction from the Mono client: Construction Plans:
+# Crank Rocket with two Robots selected in XCostData.CardsToExhaust.
+_TWO_TROOP_EXHAUST_ACTIVATION = bytes.fromhex(
+    "3b303b303b323b506c6179657249643b313b313b313b6d5f55494436343b323b323b303b4634"
+    "36303732304546433144343530363b5472616e73616374696f6e3b333b333b333b6d5f416269"
+    "6c69747941637469766174696f6e446174613b343b343b383b536f757263654361726449643b"
+    "353b353b313b76616c75653b363b313b313b6d5f55494436343b373b323b303b303130393030"
+    "303030303030303030303b4162696c69747954656d706c61746549643b383b363b313b6d5f47"
+    "7569643b393b373b303b33363b63316262636563662d656236622d326436392d333436662d31"
+    "65393231323265333236364162696c697479496e7374616e636549643b31303b383b303b3030"
+    "30303030303030303030303030303b44697361626c653b31313b393b303b304f70746564496e"
+    "3b31323b393b303b314f70746564496e5365743b31333b393b303b3078436f7374446174613b"
+    "31343b31303b373b6d5f53657456616c7565733b31353b31313b313b76616c75655f5f3b3136"
+    "3b31323b303b31303030303030303b6d5f5265736f7572636558436f73743b31373b31323b30"
+    "3b30303030303030303b6d5f436861726765506f696e747358436f73743b31383b31323b303b"
+    "30303030303030303b6d5f5370656c6c506f696e747358436f73743b31393b31323b303b3030"
+    "3030303030303b6d5f4c69666558436f73743b32303b31323b303b30303030303030303b6d5f"
+    "4361726473546f457868617573743b32313b31333b303b313b303b32323b31343b323b6b6579"
+    "3b32333b363b313b6d5f477569643b32343b373b303b33363b38373638613737622d64396134"
+    "2d376466372d656537612d34326364396562643137653976616c75653b32353b31353b303b32"
+    "3b303b32363b353b313b76616c75653b32373b313b313b6d5f55494436343b32383b323b303b"
+    "303131313237303030303030303030303b313b32393b353b313b76616c75653b33303b313b31"
+    "3b6d5f55494436343b33313b323b303b303130383030303030303030303030303b6d5f436f75"
+    "6e74657258436f73743b33323b31323b303b30303030303030303b496e6465783b33333b3132"
+    "3b303b46464646464646463b6d5f506c6179657249643b33343b313b313b6d5f55494436343b"
+    "33353b323b303b463436303732304546433144343530363b6d5f5472616e73616374696f6e49"
+    "643b33363b31323b303b31353030303030303b47616d652e5368617265642e4e6574776f726b"
+    "2e47616d6553657373696f6e2e506c617965725472616e73616374696f6e5265717565737441"
+    "7267733b47616d652e5368617265642e5549443b53797374656d2e55496e7436343b47616d65"
+    "2e5368617265642e4d656368616e6963732e5472616e73616374696f6e732e41637469766174"
+    "654162696c6974795472616e73616374696f6e3b47616d652e5368617265642e4d656368616e"
+    "6963732e4162696c69746965732e4162696c69747941637469766174696f6e446174613b4761"
+    "6d652e5368617265642e53657373696f6e4361726449643b47616d652e5368617265642e5265"
+    "736f7572636549643b53797374656d2e477569643b53797374656d2e496e7436343b53797374"
+    "656d2e426f6f6c65616e3b47616d652e5368617265642e4d656368616e6963732e4162696c69"
+    "746965732e58436f7374446174613b47616d652e5368617265642e4d656368616e6963732e41"
+    "62696c69746965732e58436f7374446174612b4553657456616c7565733b53797374656d2e49"
+    "6e7433323b53797374656d2e436f6c6c656374696f6e732e47656e657269632e44696374696f"
+    "6e61727960322347616d652e5368617265642e5265736f7572636549642153797374656d2e43"
+    "6f6c6c656374696f6e732e47656e657269632e4c69737460312347616d652e5368617265642e"
+    "53657373696f6e4361726449643b53797374656d2e436f6c6c656374696f6e732e47656e6572"
+    "69632e4b657956616c75655061697260322347616d652e5368617265642e5265736f75726365"
+    "49642153797374656d2e436f6c6c656374696f6e732e47656e657269632e4c69737460312347"
+    "616d652e5368617265642e53657373696f6e4361726449643b53797374656d2e436f6c6c6563"
+    "74696f6e732e47656e657269632e4c69737460312347616d652e5368617265642e5365737369"
+    "6f6e4361726449640a3839333b34363b33313b3834303b3733393b36323b34333b33313b3736"
+    "3b35323b34323b31363b31363b31393b3435353b34353b32353b33333b33373b33363b32393b"
+    "3232353b3139383b36343b35333b3132343b35343b34353b33323b35343b34353b33323b3332"
+    "3b32333b35303b33323b3333")
+
+
+def test_two_troop_exhaust_activation_keeps_both_troops(db):
+    """The client sends exhaust costs in XCostData.m_CardsToExhaust.  The
+    ingress normalizer knew only CardsToSacrifice, so a raw fallback kept one
+    card: exhausting two troops exhausted one and added one counter."""
+    from application.objfmt_wire import parse_datawrapper
+    from application.player_transactions import (
+        classify_player_transaction, typed_payload_from_decoded)
+    from rules_port.resolution import build_port_ability, _exhausted_cost_cards
+    raw = _TWO_TROOP_EXHAUST_ACTIVATION
+    decoded = parse_datawrapper(raw, preserve_complex=True)
+    decoded.setdefault("__raw__", raw)
+    payload = typed_payload_from_decoded(classify_player_transaction(raw), decoded)
+    activation = payload["activation_data"]
+    cost = {int(k): list(v) for k, v in activation["cost_target_map"].items()}
+    assert cost == {0: [0x271101, 0x801]}, activation
+    ability = build_port_ability(
+        "c1bbcecf-eb6b-2d69-346f-1e92122e3266", 0x901, 5,
+        target_map=activation.get("target_map"), cost_target_map=cost)
+    # Both troops are paid; neither is left as the automatic "this" target.
+    assert _exhausted_cost_cards(ability) == [0x271101, 0x801]
+    assert dict(ability.activation.target_map) == {}, ability.activation.target_map
+
+
+def test_pterobot_costs_less_for_each_dwarf_and_robot_you_control(db):
+    """"This has cost -1 in all your zones for each Dwarf and/or Robot you
+    control."  Only in-play cards were scanned as static sources, and the
+    count's "you control" filter got no player, so it always cost 7."""
+    from rules_port.static_rules import effective_cost
+    ptero, bot, dwarf = "bef4c375-71cd-4cd7-a8b6-8f7ef6cf6bad", "02ed9695-207a-4c23-a3f8-13c7b001203d", "0260fed3-fceb-40e1-af24-677dcb25fa97"
+    db.execute("DELETE FROM game_cards")
+    for tpl in (ptero, bot, dwarf):
+        _copy_card(db, tpl)
+    add_card(db, 0x101, 5, ptero, loc="hand")
+    db.execute("UPDATE game_cards SET card_abilities=(SELECT abilities_json "
+               "FROM card_templates WHERE guid=?) WHERE card_uid=?", (ptero, 0x101))
+    db.commit()
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3, "stack": []}
+    assert effective_cost(db, 1, bstate, 0x101) == 7
+    add_card(db, 0x201, 5, bot, loc="warzone")
+    add_card(db, 0x301, 5, dwarf, loc="warzone")
+    db.commit()
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+    add_card(db, 0x401, 0, bot, loc="warzone")     # the opponent's Robot
+    db.commit()
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+    # Card creation must not also bake a snapshot of the same modifier
+    # into the card (Pterobot cost 4 with only a Robot and a Dwarf in play).
+    from rules_port.triggers import dispatch_native_trigger
+    pl_t, ai_t = _pl_ai()
+    dispatch_native_trigger(
+        db=db, handler=HandlerStub(db), game=game_engine.Game(1, pl_t, ai_t),
+        session=SessionStub(), player_uid=pl_t, ai_uid=ai_t,
+        battle_state={"stack": [], "ability_lists": {},
+                      "_rules_port_attached": True},
+        event_type="CardCreatedEvent", source_card_id=0x101,
+        source_player_id=5, data={"zones": ()})
+    assert db.execute("SELECT card_cost_mod FROM game_cards WHERE card_uid=?",
+                      (0x101,)).fetchone()[0] in (0, None)
+    assert effective_cost(db, 1, bstate, 0x101) == 5
+
+
+def test_hand_card_shows_its_current_cost(db):
+    """The client shows the cost the server last pushed for a hand card;
+    board-dependent static costs (Pterobot) must be re-pushed."""
+    import hconnect_server as hcs
+    live = hcs._db
+    session_id = 97531
+    ptero, bot = "bef4c375-71cd-4cd7-a8b6-8f7ef6cf6bad", "02ed9695-207a-4c23-a3f8-13c7b001203d"
+    live.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+    def put(uid, tpl, loc, owner=5):
+        live.execute(
+            "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+            "card_template_id, location, position, card_state, card_abilities, "
+            "card_type, card_attributes, card_attack_mod, card_defense_mod, "
+            "card_cost_mod, card_damage, permanent_buffs, temporary_buffs, "
+            "card_uses, original_template_guid) VALUES "
+            "(?,?,?,?,?,?,0,0,(SELECT abilities_json FROM card_templates WHERE guid=?),"
+            "'Troop',0,0,0,0,0,'{}','{}','{}',?)",
+            (session_id, owner, uid, tpl, tpl, loc, tpl, tpl))
+        live.commit()
+    put(0x101, ptero, "hand")
+    pushed = []
+
+    class Game:
+        card_defs = {}
+        def push_card_updated(self, scid, owner, collection, ctype, **kw):
+            pushed.append((int(scid.uid.uid64), kw.get("cost")))
+
+    handler = object.__new__(hcs.HCPHandler)
+    handler.user_profile = {"id": 5}
+    handler._card_full_data = lambda game, scid, tpl, instance_id=None: (
+        tpl, "Troop", "Pterobot", 7, 3, 5, 0)
+    session = type("S", (), {"session_id": session_id})()
+    pl_t, _ai_t = _pl_ai()
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [], pushed                    # printed cost, nothing new
+    put(0x201, bot, "warzone")
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [(0x101, 6)], pushed
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed == [(0x101, 6)], pushed          # unchanged: not re-sent
+    live.execute("DELETE FROM game_cards WHERE session_id=? AND card_uid=?",
+                 (session_id, 0x201))
+    live.commit()
+    handler._push_hand_cost_updates(Game(), session, pl_t, {})
+    assert pushed[-1] == (0x101, 7), pushed
+    live.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))
+    live.commit()
+
+
+AG_GEARSMITH_DEPLOY = "8f2d3151-c6c2-1831-27e6-7bc96df000e5"
+AG_GEARSMITH_PICK = "f1a8b50a-cdb2-775b-3c7e-615e2bf221f3"
+
+
+def _template_by_name(name):
+    source = sqlite3.connect(SRC)
+    try:
+        return source.execute(
+            "SELECT guid FROM card_templates WHERE name=? AND rarity!='Epic' "
+            "ORDER BY guid", (name,)).fetchone()[0]
+    finally:
+        source.close()
+
+
+def _gearsmith_board(db, owner, deck_names):
+    """Gearsmith in play and a known deck order (position 0 is the top)."""
+    gearsmith = _template_by_name("Gearsmith")
+    _copy_card(db, gearsmith)
+    _copy_ability(db, AG_GEARSMITH_PICK)
+    add_card(db, 0x3f01, owner, gearsmith, loc="warzone")
+    deck = []
+    for index, name in enumerate(deck_names):
+        tpl = _template_by_name(name)
+        _copy_card(db, tpl)
+        uid = 0x5001 + index * 0x100
+        add_card(db, uid, owner, tpl, loc="deck")
+        db.execute("UPDATE game_cards SET position=? WHERE card_uid=?",
+                   (index, uid))
+        deck.append(uid)
+    db.execute("UPDATE game_cards SET card_type=(SELECT card_type FROM "
+               "card_templates ct WHERE ct.guid=game_cards.template_guid)")
+    db.commit()
+    return deck
+
+
+def _gearsmith_deploy(db, owner, handler=None):
+    from rules_port.resolution import resolve_port_trigger
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = handler or HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "stack": [], "_rules_port_attached": True}
+    result = resolve_port_trigger(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        {"kind": "trigger", "ability_guid": AG_GEARSMITH_DEPLOY,
+         "source_uid": 0x3f01, "target_uid": 0x3f01,
+         "trigger_target_uid": 0x3f01, "source_owner_uid": owner,
+         "instance_id": 3})
+    return result, game, bstate
+
+
+def _zones(db):
+    return {uid: loc for uid, loc in db.execute(
+        "SELECT card_uid, location FROM game_cards")}
+
+
+def _deck_order(db):
+    return [uid for (uid,) in db.execute(
+        "SELECT card_uid FROM game_cards WHERE location='deck' "
+        "ORDER BY position")]
+
+
+def test_gearsmith_takes_the_revealed_artifact_and_stays_in_play(db):
+    """Gearsmith: "look at the top three cards of your deck, put up to one
+    artifact into your hand, it gets cost -1, put the remaining cards into
+    your deck".  The remaining-cards target excluded every revealed card, so
+    the move fell back to the source and Gearsmith went into the deck, and
+    the revealed cards stayed face-up on top.  The reveal also ran once per
+    revealed card."""
+    top, second, artifact, fourth, fifth = _gearsmith_board(
+        db, 0, ["Ruby Shard", "Construct Foreman", "S.P.A.M. Bot",
+                "Ruby Shard", "Construct Foreman"])
+    result, game, _bstate = _gearsmith_deploy(db, 0)
+    assert str(result).endswith("COMPLETED"), result
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert zones[artifact] == "hand", zones
+    assert all(zones[uid] == "deck" for uid in (top, second, fourth, fifth))
+    order = _deck_order(db)
+    # The cards that were not revealed keep their order (no shuffle).
+    assert [uid for uid in order if uid in (fourth, fifth)] == [fourth, fifth]
+    reveals = [e for e in game.events
+               if isinstance(e, game_engine.CardsRevealedSessionEventArgs)]
+    assert len(reveals) == 1, len(reveals)
+    moves = {int(e.session_card_id.uid.uid64): e for e in game.events
+             if isinstance(e, game_engine.CardMovedSessionEventArgs)}
+    assert set(moves) == {top, second, artifact}, moves
+    for uid in (top, second):
+        assert moves[uid].location == game_engine.ECardLocations.Unknown
+    hidden = {int(e.session_card_id.uid.uid64) for e in game.events
+              if isinstance(e, game_engine.CardUpdatedSessionEventArgs)
+              and getattr(e, "nulling", False)}
+    assert {top, second} <= hidden, hidden
+
+
+def test_gearsmith_without_an_artifact_returns_all_three(db):
+    """No artifact revealed: nothing goes to hand and Gearsmith stays."""
+    deck = _gearsmith_board(
+        db, 0, ["Ruby Shard", "Construct Foreman", "Ruby Shard",
+                "S.P.A.M. Bot", "Construct Foreman"])
+    result, _game, _bstate = _gearsmith_deploy(db, 0)
+    assert str(result).endswith("COMPLETED"), result
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert all(zones[uid] == "deck" for uid in deck), zones
+
+
+def test_gearsmith_player_picks_the_artifact(db):
+    """The player is asked only for the artifact choice (the "remaining
+    cards" target is automatic); resuming with the pick finishes the move."""
+    from rules_port.resolution import resolve_port_ability
+    top, second, artifact, _fourth, _fifth = _gearsmith_board(
+        db, 5, ["Ruby Shard", "Construct Foreman", "S.P.A.M. Bot",
+                "Ruby Shard", "Construct Foreman"])
+    prompts = []
+    handler = HandlerStub(db)
+    handler._prompt_revealed_choice = (
+        lambda *args, **kwargs: prompts.append((args[8], kwargs)))
+    result, game, bstate = _gearsmith_deploy(db, 5, handler)
+    assert len(prompts) == 1, prompts
+    candidates, kwargs = prompts[0]
+    assert list(candidates) == [artifact], candidates
+    assert kwargs["optional"] is True           # "up to one" may be declined
+    assert _zones(db)[0x3f01] == "warzone"
+    continuation = kwargs["continuation"]
+    target_map = {int(k): v for k, v in continuation["target_map"].items()}
+    target_map[int(continuation["target_index"])] = artifact
+    bstate.pop("resolution_paused", None)
+    pl_t, ai_t = _pl_ai()
+    resolve_port_ability(
+        handler, game, SessionStub(), db, pl_t, ai_t, bstate,
+        continuation["ability_guid"], continuation["source_uid"],
+        continuation["owner_id"], target_map=target_map,
+        variables=continuation["variables"],
+        resume_from_order=continuation["resume_effect_order"],
+        instance_id=continuation["ability_instance_id"])
+    zones = _zones(db)
+    assert zones[0x3f01] == "warzone", zones
+    assert zones[artifact] == "hand", zones
+    assert zones[top] == zones[second] == "deck", zones
+
+
+AG_UNTAMED_AURA = "c49e0fa5-a778-24fc-5483-ac6abcba1754"
+AG_SPHERE_CHANCE = "5cd9dfa2-cb88-915a-3c06-8ef0bf6d8672"
+AG_SPHERE_TAME = "153271a7-9117-301f-e4bb-625d53064bfc"
+TID_UNTAMED_TROOP = "b71b0113-0f8f-9d9c-bf8a-1517143f3cab"
+TPL_DIRE_TOAD = "2a419ce5-5e32-0c2f-5019-e4773544c25f"
+TPL_TAMING_SPHERE = "7a8ab8b5-23c2-4359-b8cb-f560c359da27"
+
+
+def _tamed_board(db):
+    """Taming Sphere (player) and a Dire Toad under the AI's Untamed aura."""
+    from rules_port.triggers import dispatch_native_trigger
+    for tpl in (TPL_DIRE_TOAD, TPL_TAMING_SPHERE):
+        _copy_card(db, tpl)
+    for ability in (AG_UNTAMED_AURA, AG_SPHERE_CHANCE, AG_SPHERE_TAME):
+        _copy_ability(db, ability)
+    handler = HandlerStub(db)
+    handler._champion_granted_ability_guids = {
+        int(handler._ai_champ_scid.uid.uid64): [AG_UNTAMED_AURA]}
+    add_card(db, 0x901, 5, TPL_TAMING_SPHERE, loc="warzone")
+    add_card(db, 0x501, 0, TPL_DIRE_TOAD, loc="warzone")
+    db.execute("UPDATE game_cards SET card_abilities=(SELECT abilities_json "
+               "FROM card_templates WHERE guid=template_guid)")
+    db.commit()
+    pl_t, ai_t = _pl_ai()
+    bstate = {"stack": [], "ability_lists": {}, "_rules_port_attached": True}
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game_engine.Game(1, pl_t, ai_t),
+        session=SessionStub(), player_uid=pl_t, ai_uid=ai_t,
+        battle_state=bstate, event_type="CardEnteredZoneEvent",
+        source_card_id=0x501, source_player_id=0,
+        data={"event_source_collection": "CastSpells",
+              "event_destination_collection": "warzone"})
+    return handler, bstate
+
+
+def _toad(db):
+    location, buffs = db.execute(
+        "SELECT location, permanent_buffs FROM game_cards WHERE card_uid=?",
+        (0x501,)).fetchone()
+    return location, json.loads(buffs or "{}").get("int_attrs", {})
+
+
+def test_untamed_aura_makes_the_toad_a_taming_target(db):
+    """"Your non-Tamed Dire Toads are Untamed" is a constant IntAttrModifier
+    (Set Untamed = m_Value 1).  The native leaf read only "amount", so it set
+    Untamed to 0 and the Taming Sphere never had a legal target."""
+    from rules_port.targeting import legal_targets
+    _handler, bstate = _tamed_board(db)
+    assert _toad(db) == ("warzone", {"Untamed": 1}), _toad(db)
+    assert legal_targets(db, 1, 5, TID_UNTAMED_TROOP, 0x901,
+                         both_players=True, champions=[],
+                         battle_state=bstate) == [0x501]
+
+
+def test_taming_sphere_captures_the_toad(db):
+    """A successful tame marks the troop Tamed, clears Untamed and voids it;
+    the Tamed quest looks for a Tamed troop in the void."""
+    from rules_port.resolution import resolve_port_ability
+    handler, bstate = _tamed_board(db)
+    pl_t, ai_t = _pl_ai()
+    resolve_port_ability(
+        handler, game_engine.Game(1, pl_t, ai_t), SessionStub(), db, pl_t,
+        ai_t, bstate, AG_SPHERE_TAME, 0x901, 5, target_map={0: 0x501})
+    assert _toad(db) == ("void", {"Tamed": 1}), _toad(db)
+
+
+def test_taming_sphere_chance_either_captures_or_leaves_the_toad(db):
+    """The 2-cost ability is a 50% tame: every outcome is a clean capture or
+    an untouched Untamed toad, and both outcomes occur."""
+    from rules_port.resolution import resolve_port_ability
+    pl_t, ai_t = _pl_ai()
+    outcomes = set()
+    for _ in range(40):
+        db.execute("DELETE FROM game_cards")
+        db.commit()
+        handler, bstate = _tamed_board(db)
+        resolve_port_ability(
+            handler, game_engine.Game(1, pl_t, ai_t), SessionStub(), db,
+            pl_t, ai_t, bstate, AG_SPHERE_CHANCE, 0x901, 5,
+            target_map={1: 0x501})
+        location, attrs = _toad(db)
+        assert (location, attrs) in (("void", {"Tamed": 1}),
+                                     ("warzone", {"Untamed": 1})),             (location, attrs)
+        outcomes.add(location)
+        if outcomes == {"void", "warzone"}:
+            break
+    assert outcomes == {"void", "warzone"}, outcomes
+
+
+
 def _main():
-    tests = (test_brood_creeper_damage_to_opposing_champion_summons,
+    tests = (test_untamed_aura_makes_the_toad_a_taming_target,
+             test_taming_sphere_captures_the_toad,
+             test_taming_sphere_chance_either_captures_or_leaves_the_toad,
+             test_construction_plans_count_the_exhausted_troops,
+             test_gearsmith_takes_the_revealed_artifact_and_stays_in_play,
+             test_gearsmith_without_an_artifact_returns_all_three,
+             test_gearsmith_player_picks_the_artifact,
+             test_dictionary_with_struct_keys_decodes,
+             test_two_troop_exhaust_activation_keeps_both_troops,
+             test_pterobot_costs_less_for_each_dwarf_and_robot_you_control,
+             test_hand_card_shows_its_current_cost,
+             test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
              test_lose_life_modifier_is_not_damage,

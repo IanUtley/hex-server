@@ -477,7 +477,11 @@ def _advance_quest_campaign(db, champ_id, quest_script=None, scene_guid=None):
                 "battle": None, "completed": False, "enabled": True, "visible": True,
                 "repeatable": False, "givequest": False, "turninquest": False,
                 "impassable": False, "unknown": False,
-                "encounter": None, "encounter_desc": None, "allow_cancel": False,
+                # Encounter objectives keep their scene link (Tamed's next
+                # capture); the retry/complete bookkeeping matches on it.
+                "encounter": (obj.get("encounter")
+                              if otype.lower() == "encounter" else None),
+                "encounter_desc": None, "allow_cancel": False,
                 "conversationId": conversation_id,
             }
         })
@@ -970,7 +974,7 @@ def _activate_az1_transition(db, champ_id, cfg):
     row = pve_db.db_latest_campaign_state(champ_id, "PANORAMA", db)
     if not row:
         return None
-    pano_id, state_json = row
+    pano_id, _uid_lo, _uid_hi, state_json = row
     state = json.loads(state_json) if state_json else None
     if not state:
         return None
@@ -6965,12 +6969,16 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
             # encounter GUID. Advance that objective only after the finished
             # battle actually contains a captured troop.
             if camp_row:
-                _advance_quest_campaign(
+                tamed_state = _advance_quest_campaign(
                     db, camp_row[0], "az01_tamed", reward_result.get("scene_guid"))
+                # The advance was saved but never pushed, so the journal kept
+                # showing the old objective until a reload.
+                if tamed_state:
+                    advanced_quest_states.append(tamed_state)
         if won:
-            advanced_quest_states = _advance_quest_encounter_objectives(
+            advanced_quest_states.extend(_advance_quest_encounter_objectives(
                 db, camp_row[0] if camp_row else 0,
-                reward_result.get("scene_guid"))
+                reward_result.get("scene_guid")))
         push_gameendnotify(
             handler, db, camp_id, won, 0,
             "00000000-0000-0000-0000-000000000000",

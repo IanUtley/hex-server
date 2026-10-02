@@ -520,4 +520,8 @@ def resolve_ability_item(host, session, db, game, state, item, player_uid,
         source_uid, owner_id, target_map=target_map,
         variables=(activation_data.get("variables") or {}
                    if isinstance(activation_data, dict) else {}),
+        # Cards exhausted to pay the cost ("for each troop exhausted this
+        # way" on the Construction Plans).
+        cost_target_map=(activation_data.get("cost_target_map") or {}
+                         if isinstance(activation_data, dict) else {}),
         instance_id=int(item.get("instance_id", 1) or 1))
