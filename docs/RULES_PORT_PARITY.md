@@ -1,10 +1,229 @@
-# Battle rules coverage and acceptance evidence
+# C# and Python rules parity
 
-This is a semantic coverage matrix, not a count of registered Python handlers.
-`rules_port.coverage` inventories class names; registration does not establish
-that every field or interaction of a class has been ported. The complete battle
-port remains unfinished. Rows without a focused acceptance result are not
-certified by the damage tests below.
+This document describes the behavioral contract for the Python RulesPort and
+records source evidence, semantic coverage, acceptance scenarios, and known
+gaps. It is not a count of registered Python handlers: `rules_port.coverage`
+inventories class names, but registration does not establish that every field
+or interaction of a class has been ported. The complete battle port remains
+unfinished. Each acceptance result applies only to the scenarios it names; the
+damage scenarios below do not certify unrelated systems.
+
+## What parity means
+
+For the same initial game state, typed player inputs, and equivalent random
+draws, parity means the Python server makes the same legal/illegal decisions
+and produces the same gameplay result as the reference C# rules engine. The
+comparison includes costs and counters, target candidates and validation,
+effect/trigger order, zone and card state, prompts and resumptions, visibility,
+and the ordered client event stream. Matching only the final board is
+insufficient: different trigger timing or event order can change the next
+legal action or leave the client in a different UI state. A matching seed is
+not enough if the two RNG implementations or their draw order differ.
+
+## Unity is part of the parity contract
+
+The end-to-end path includes Unity's cached game state and UI state machine:
+
+```text
+Unity UI state and options
+  -> typed 3029 PlayerTransaction
+  -> Python classification, RulesPort decision, and persisted mutation
+  -> ordered 3055 session events (or the required acknowledgement)
+  -> Unity SessionEventArgs dispatch and UIBattle state transition
+```
+
+The server can resolve the gameplay rule correctly and still violate parity if
+it encodes the wrong event fields, sends events in the wrong order or to the
+wrong player, omits a required sync, or references a card Unity has not cached.
+The checked-in `HexClient/Assembly-CSharp-firstpass/` disassembly describes
+session, transaction, and event handling; `HexClient/Assembly-CSharp/UIBattle.cs`
+describes the battle UI states that consume those events. The client is fixed,
+so these expectations have to be met by the server's request handling and
+projection.
+
+For a reported client failure, correlate three observations before choosing a
+fix: the Unity `output_log.txt` exception and `UIBattle|...|Pushing/Popping UI
+state` lines, the matching server request/session log, and the exact ordered
+3055 event list plus authoritative state delta. Follow each event through
+`SessionEventArgs.BuildArgs` to its client handler. This separates a rules
+decision defect from a wire/projection defect or a UI state transition that
+never received its expected event.
+
+The implementation does not need the same class layout. In C#, `Session`,
+`Player`, `Card`, `AbilityInstance`, transactions, and the phase state machine
+share a live object graph. Python separates those responsibilities across
+`rules_port/`, the persisted battle checkpoint, SQLite card rows, and host
+adapters that emit `Game` events. The adapter boundary is correct only when it
+projects a decision already made by RulesPort; it must not add a second rules
+decision or resolve the same input again.
+
+The reference for this checkout is the `HexClient/` C# disassembly plus the
+matching structured data in `Records/`. Use `RULES.md` for documented private
+server decisions. The original C# project cannot currently be built from this
+checkout, and `rules_port/parity.py` compares saved captures but cannot produce
+a reference C# run. That means the current claim can be evidence-based parity
+for inspected and accepted scenarios, not an unconditional proof that every
+possible game state is identical. A runnable C# oracle or checked-in C# golden
+captures are needed for automated differential proof.
+
+## Where the implementations differ
+
+| Concern | C# implementation | Python implementation | What must match |
+| --- | --- | --- | --- |
+| State and authority | `Session` mutates live `Card`/`Player` state and emits session events at rule boundaries. | `AuthoritativeSession` owns rule decisions; the host persists accepted mutations through SQLite and a namespaced battle snapshot. | One authoritative transition per request; the persisted result, not a client snapshot, determines the next action. Host projection must not change the ruling. |
+| Authored and runtime data | `TemplateManager` provides typed templates while live `Card`/`AbilityInstance` objects hold mutable session state. | `DEFAULT_RECORD_STORE`/`AbilityGraph` provide authored Records and SQLite `card_templates`/`game_cards` plus the battle snapshot provide runtime state. | Use the same Records snapshot and GUIDs; distinguish authored template fields from per-instance abilities, modifiers, counters, and zones. Never substitute a card name or translated text for available metadata. |
+| Actions and timing | Transaction classes compose requirements and invoke phase/session actions. | Typed transactions are normalized, checked by RulesPort, then passed to one native resolver. | Same phase, priority, speed, ownership, threshold, cost, and rejection behavior, including no partial payment on rejection. |
+| Built-in rules | C# methods on `Session`, `Card`, phase states, and transaction requirements implement rules that are not represented as Records effects. | Python ports these rules in shared RulesPort modules such as `combat_rules.py`, `static_rules.py`, and lifecycle handlers. | Port both authored effects and built-in rules. A complete Records effect inventory does not prove parity for keywords, costs, combat, state-based actions, or turn boundaries. |
+| Ability execution | `AbilityInstance` walks its ordered effect groups and invokes concrete C# effect implementations; nested effects call other abilities through their authored lifecycle. | `AbilityGraph` reads typed Records and `resolution.py` runs the native effect walk through `EffectContext` and focused effect modules. | Same effect-group and child order, input values, variable scope, cost/use accounting, and exactly-once activation. A paused ability resumes the same instance; nested child instances and parent links are created only where C# does so. Resume must not replay the parent or create a duplicate picker. |
+| Targets and filters | `AbilityTargetTemplate.GetAllTargets`, `IsTargetValid`, derived target classes, and `AbilityInstance.ValidateMinimumTargetCount` define separate enumeration and validation behavior. | `targeting.py`, `targets.py`, and `filters.py` compile Records target/filter metadata and validate submitted selections. | Keep candidate enumeration, selection validation, optional/minimum counts, collection-mask behavior, and target-index mapping distinct. Preserve each authored `AbilityTargetIndex` through the picker and continuation; do not rewrite `target_map` globally to repair one effect. |
+| Trigger discovery | `Session` and `AbilityManager` publish/discover triggers from C# mutation and phase boundaries. | Python publishers call `dispatch_native_trigger`; `trigger_discovery.py` evaluates authored trigger metadata and queues abilities. | Publish once at the same before/after mutation point, with the same source, target, owner, event payload, condition context, collection rules, and ordering. Missing or duplicate publication is a semantic bug even if the final board happens to match. |
+| Zones and lifecycle | C# collection moves and card lifecycle methods also drive built-in rules and events. | `zone_effects.py`, lifecycle/effect modules, SQLite helpers, and mode adapters coordinate persisted rows and events. | Same owner/controller distinction, old/new zone, card visibility, duration boundary, state-based action timing, and follow-up triggers. A database row change without its ordered client events is incomplete. |
+| Client contract | C# session synchronization invokes the client event handlers directly. | `domain/events.py`, `game_engine.py`, `encoder.py`, and the HConnect/PvP send paths serialize equivalent event data. | Same event class, field values, valid IDs, viewer-scoped card data, and event order; verify the resulting client transition as well as server state. |
+| Game modes | PvE and PvP both use the shared C# rules model with different session facts. | The core RulesPort is shared, while PvE/PvP adapters translate owner IDs, champions, persistence, and packet destinations. | Adapters may supply mode facts and project results, but must not implement different card rules. Exercise both owner models whenever an interaction has a choice or mode-specific state. |
+
+Live gameplay uses the native RulesPort backends. Legacy `abilities/` leaf
+registrations, old direct APIs, and class inventories are not evidence that a
+behavior is correct on the live RulesPort path. The adapter and implementation
+boundaries are described in [`rules_port/README.md`](../rules_port/README.md).
+
+## Parity gate for a rule change
+
+Use this checklist before describing a behavior as matching C#:
+
+1. **Pin the reference.** Record the relevant C# method/call site and the
+   matching typed Records fields: ability/effect template, conditions, targets,
+   filters, constants, and TAC where applicable. Card names and localized text
+   are labels, not rule inputs, when structured metadata exists.
+2. **Trace the whole decision.** Follow one typed input through classification,
+   phase/priority and cost validation, the ability or combat lifecycle, state
+   mutation, trigger publication, persistence, and client event projection.
+   Include the client behavior when the result uses a picker, chain window, or
+   phase transition.
+3. **Assert semantics, not registration.** A fixture should assert legal and
+   illegal inputs, exact state deltas, selected targets, ordered trigger/effect
+   execution, and ordered emitted events. Include rejection rollback and
+   boundary cases. Generated metadata-driven scenarios should cover rule
+   families; do not hand-maintain one test per card or treat a no-crash sweep as
+   proof of the printed behavior.
+4. **Cover resumptions and interactions.** For a choice, discard, or nested
+   activation, assert the paused instance, source, owner, variables, target
+   slots, parent link, and next effect position survive persistence. Resume the
+   paused instance once; create a nested child only when C# does. Include
+   trigger-on-trigger and reconnect cases where the rule can pause.
+5. **Run both ownership models.** Exercise the shared rule with Practice/PvE
+   and PvP owner/champion mappings when ownership or response priority matters.
+   Assert that the two adapters produce equivalent rule outcomes and the
+   correct viewer-specific events.
+6. **Compare an oracle trace.** When a C# execution or golden capture exists,
+   capture the complete relevant state and normalize it with the exact ordered
+   event sequence before comparing through `ParityCapture` /
+   `compare_captures`. Keep RNG seeds and transaction order fixed. A
+   matching seed is useful only when the RNG algorithm and call order also
+   match; otherwise inject or record equivalent random draws. A Python-only
+   expected result is a regression test, not a differential C# proof.
+7. **Report the evidence honestly.** Update the relevant row below with its
+   tested scenarios and remaining gaps. Use `Partial` or `open` when a handler
+   exists without semantic acceptance or client evidence. Class inventory,
+   compilation, and successful server startup are useful checks, but none
+   certify gameplay parity by themselves.
+
+The automated inventories in `rules_port/coverage.py` help catch new C#
+transaction, effect-template, and filter classes. They do not compare field
+semantics, target subclasses, conditions, variable combinations, built-in
+rules, mutation timing, or client behavior. Those require typed metadata audits
+and focused semantic scenarios. The detailed matrices below state which parts
+currently have that evidence and which remain open.
+
+## Ordered work list to close the parity gap
+
+These are open engineering tasks, ordered so each step supplies evidence for
+the next. Existing protocol catalogues, server fixtures, and individual client
+traces are useful partial evidence; they do not complete a task until its done
+condition is met.
+
+- [ ] **U1 — Map live client flows to C# handlers.** For every live setup,
+  phase, card, ability, target, trigger, combat, and reconnect flow, record the
+  client state, request/event class, C# serializer/parser, C# session or
+  `UIBattle` handler, recipient, reply policy, and expected next UI state.
+  Extend `docs/CLIENT_SERVER_PROTOCOL.md` where its event catalogue lacks the
+  consumer or state transition. **Done when** every live transaction and
+  emitted event has a source-to-client path and no used class has an unknown
+  response policy.
+- [ ] **U2 — Make one correlated trace for a client action.** Capture the raw
+  3029 request, decoded typed intent, pre/post RulesPort and SQLite state,
+  ordered 3055 event classes and recipients, response/ack count, and the
+  matching Unity exception and UI state-stack lines. Correlate them by session
+  and transaction. **Done when** a failing report can be followed from the
+  Unity action through the server mutation and back to the Unity handler in one
+  trace bundle.
+- [ ] **U3 — Gate the packet and acknowledgement contract.** Add focused
+  golden checks for the active 3029 request shapes, 3055 envelope and nested
+  event bytes, and the 3053 game-start response. Verify event class IDs, field
+  order, enum/UID types, recipient privacy, and one response per transaction.
+  Check both empty 3055 acknowledgements for handled requests with no sync and
+  no invented replies for client fire-and-forget requests. **Done when** the
+  golden checks cover every live transaction/event family and a Unity client
+  accepts the packets without handler or decode errors.
+- [ ] **U4 — Close setup, identity, and reconnect flows.** Exercise setup from
+  `ReadyForGameSetup` through the service-level 3053 GameStarted response and
+  the 3055 `GameStartedSessionEventArgs`, valid player/champion/card cache
+  entries, coin-flip/first-player choice, mulligan, and the first normal
+  priority window. Repeat with either player winning the toss and after a
+  reconnect. **Done when** client logs show the expected UI state progression,
+  every referenced `SessionCardId` resolves, and the client and server agree on
+  phase, active player, and priority.
+- [ ] **U5 — Close options, plays, and activation pickers.** Start from the
+  server's `GreenLight` and `PlayerOptionList`, then exercise accepted and
+  rejected card/ability transactions. Cover class 23 activation data, class 39
+  triggered-ability data, additional costs, multiple targets, and nested
+  prompts. Preserve authored `AbilityTargetIndex` slots through decoding and
+  continuation; verify that a paused ability resumes once and its parent is
+  not replayed. **Done when** every picker state reaches its expected selection
+  state and returns to the right parent/priority state in both PvE and PvP.
+- [ ] **U6 — Close chain, trigger, and priority presentation.** For one
+  authored trigger of each event family, compare C# publication timing and
+  payload with Python discovery, queueing, and resolution. Verify the same
+  chain instance IDs across persisted state and `AbilityPushedOnChain`,
+  `TopOfChainResolved`, `RemovedTopOfChain`, and `ChainEmpty`; verify both
+  players see the correct response window. **Done when** each tested trigger
+  resolves once, receives the correct priority window, and leaves Unity's
+  chain/UI state settled.
+- [ ] **U7 — Close card/player projection and visibility.** Exercise draw,
+  reveal, transform, token creation, discard, destroy, zone move, resource and
+  threshold changes, counters, and hidden-card updates. Verify full
+  `CardUpdated` representations precede events that reference new cards,
+  `CardMoved` uses the correct destination, and private identities reach only
+  authorized viewers. Repeat after reconnect. **Done when** Unity's card cache,
+  HUD, zones, and visibility match the authoritative server state at each
+  checkpoint.
+- [ ] **U8 — Close phase and combat UI flows.** Drive attack, blocker, damage
+  assignment, combat resolution, end phase, and automatic phase-entry actions
+  through the real client. Assert one `TurnPhaseUpdated` per transition,
+  correct `GreenLight`/options, matching combat IDs, and no second transaction
+  from a duplicated auto-entered UI state. **Done when** both attack and
+  defense directions complete without client exceptions, stale buttons, or
+  server/client phase disagreement.
+- [ ] **U9 — Complete semantic coverage behind those flows.** For the open
+  rows below, finish typed Records field audits and generated rule-family
+  scenarios for effects, conditions, variables, target/filter subclasses,
+  built-in rules, and interactions. Assert state deltas and ordered events,
+  including boundary/rejection cases. Reuse fixtures across PvE and PvP; do
+  not add one hand-maintained test per card. **Done when** every concrete C#
+  class and meaningful current Records field is native, intentionally staged,
+  or documented as an explicit gap, with semantic acceptance for the claimed
+  behavior.
+- [ ] **U10 — Make client acceptance repeatable.** Maintain a short real-Unity
+  smoke run for the flows above and add a two-real-client PvP run for setup,
+  private pickers, chain priority, combat, and reconnect. Save the relevant
+  client/server trace with each result. **Done when** the run can be repeated
+  after a change and its log/event assertions give a clear pass or failure;
+  headless tests remain separate evidence for rules semantics.
+- [ ] **U11 — Enforce the release bar.** For each changed rule, wire event, or
+  picker, update its matrix row with source references, focused tests, both-mode
+  coverage where applicable, and a Unity trace or an explicit missing client
+  check. Keep unfinished rows marked partial/open. **Done when** no change is
+  called C#-equivalent based only on handler registration, compilation,
+  database state, or a no-crash sweep.
 
 C# paths below are relative to
 `HexClient/Assembly-CSharp-firstpass/Game/Shared/`.

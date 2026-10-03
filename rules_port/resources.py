@@ -111,6 +111,46 @@ def _resource_ability_guids(db, session_id, card_uid):
     return decode(row[0]), decode(row[1])
 
 
+def card_template_threshold_flags(db, session_id, card_uid):
+    """Return threshold colors exposed by the card template's abilities.
+
+    This mirrors CardTemplate.GetThresholdsProvided: OR the colors from its
+    ThresholdModifier effects so a provided color is counted once.
+    """
+    from domain.enums import SHARD_TO_FLAG
+    from gamedata import DEFAULT_RECORD_STORE, ability_graph
+    from pvp_db import db_card_ability_state
+
+    state = db_card_ability_state(
+        session_id, int(card_uid), conn=db)
+    if not state:
+        return 0
+    try:
+        ability_guids = json.loads(state[1] or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+    flags = 0
+    for ability_guid in ability_guids:
+        graph = ability_graph(DEFAULT_RECORD_STORE, str(ability_guid).lower())
+        if graph is None:
+            continue
+        for effect in graph.effects:
+            if effect.concrete_type != "CardModifierAbilityEffectTemplate":
+                continue
+            template = effect.template
+            modifier = (template.field("m_Modifier")
+                        if template is not None else None)
+            if modifier is None or not modifier.is_a("ThresholdModifier"):
+                continue
+            color_value = str(modifier.field("m_ThresholdColor", ""))
+            for color_name in color_value.split("|"):
+                color = SHARD_TO_FLAG.get(
+                    color_name.rsplit(".", 1)[-1].strip().lower(), 0)
+                flags |= int(color or 0)
+    return flags
+
+
 def resolve_granted_resource_abilities(game, session, db, handler, pl_t, ai_t,
                                        bstate, card_uid, owner_id, *,
                                        resolver=None):

@@ -4176,35 +4176,13 @@ class EffectContext:
             owner = int(self.bstate.get("resolving_owner_id", 0) or 0)
             amounts = {}
             if function == "GainTargetsProvidedThresholds":
-                from pvp_db import db_card_ability_payload, db_ability_effect_rows
-                payload = db_card_ability_payload(
-                    self.session.session_id, int(target), conn=self.db)
-                try:
-                    ability_guids = json.loads(payload or "[]") if payload else []
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    ability_guids = []
-                from game_engine import SHARD_TO_FLAG
-                from rules_port.fields import effect_template
-                for ability_guid in ability_guids:
-                    effects = db_ability_effect_rows(
-                        str(ability_guid).lower(), conn=self.db)
-                    for effect_row in effects:
-                        # ``db_ability_effect_rows`` projects more than the
-                        # two columns the old unpack assumed, which raised
-                        # ValueError for every GainTargetsProvidedThresholds.
-                        effect_guid = effect_row[0]
-                        effect_type = effect_row[1]
-                        if effect_type != "CardModifierAbilityEffectTemplate":
-                            continue
-                        modifier = (effect_template(self.ability, effect_guid) or {}).get(
-                            "m_Modifier") or {}
-                        if str(modifier.get("_t", "")).rsplit(".", 1)[-1] != \
-                                "ThresholdModifier":
-                            continue
-                        color = SHARD_TO_FLAG.get(str(
-                            modifier.get("m_ThresholdColor", "")).lower())
-                        if color:
-                            amounts[color] = amounts.get(color, 0) + 1
+                from domain.enums import SHARD_TO_FLAG
+                from rules_port.resources import card_template_threshold_flags
+                provided = card_template_threshold_flags(
+                    self.db, self.session.session_id, int(target))
+                colors = {int(flag) for flag in SHARD_TO_FLAG.values()}
+                amounts = {color: 1 for color in colors
+                           if provided & color}
             else:
                 from pvp_db import db_card_template_threshold_subtype
                 row = db_card_template_threshold_subtype(
@@ -4219,6 +4197,8 @@ class EffectContext:
                 values = self.bstate.setdefault(key, {})
                 old = int(values.get(color, values.get(str(color), 0)) or 0)
                 values[color] = old + int(amount)
+                side = "player" if owner else "ai"
+                setattr(self.game, f"{side}_threshold", dict(values))
                 event = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
                 event.player_id = owner_uid(owner, self.player_uid,
                                             self.ai_uid, self.bstate)
@@ -4227,6 +4207,19 @@ class EffectContext:
                 event.delta = int(amount)
                 event.new_value = values[color]
                 self.game._push(event)
+                from rules_port.runtime_helpers import champion_uid_for_owner
+                champion = champion_uid_for_owner(
+                    self.handler, self.bstate, owner)
+                if champion is not None:
+                    from rules_port.triggers import dispatch_native_trigger
+                    dispatch_native_trigger(
+                        db=self.db, handler=self.handler, game=self.game,
+                        session=self.session, player_uid=self.player_uid,
+                        ai_uid=self.ai_uid, battle_state=self.bstate,
+                        event_type="GainThresholdEvent",
+                        source_card_id=int(champion),
+                        source_player_id=owner,
+                        data={"gain_threshold_color": int(color)})
             return f"gained {sum(amounts.values())} threshold(s)"
 
         if function == "MoveInDeck":

@@ -4102,46 +4102,50 @@ class HCPHandler(ProfileStreamMixin):
         # AI: random Standard resource from its deck -> gain its threshold.
         import random as _rnd
         chosen = _rnd.choice(candidates)
-        card_details = db_card_zone_details(
-            session.session_id, int(chosen), conn=_db)
-        card_name = db_template_name(card_details[0], conn=_db) \
-            if card_details else None
-        color = (card_name.split()[0] if card_name else "").lower()
-        flag = game_engine.SHARD_TO_FLAG.get(color, 0)
-        if flag:
-            from rules_port.resources import apply_resource_change
-            threshold_change = apply_resource_change(
-                bstate, "ai", "threshold", 1, color=int(flag))
+        from rules_port.resources import (
+            apply_resource_change, card_template_threshold_flags)
+        provided = card_template_threshold_flags(
+            _db, session.session_id, int(chosen))
+        threshold_colors = sorted({
+            int(flag) for flag in game_engine.SHARD_TO_FLAG.values()
+            if provided & int(flag)})
+        if threshold_colors:
             th = bstate.setdefault("ai_threshold", {})
+            changes = []
+            for flag in threshold_colors:
+                changes.append(apply_resource_change(
+                    bstate, "ai", "threshold", 1, color=flag))
             _be.save_state(session, bstate)
             game.ai_threshold = dict(th)
-            ev_th = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
-            ev_th.player_id = ai_t
-            ev_th.color = flag
-            ev_th.operation = 1
-            ev_th.delta = 1
-            ev_th.new_value = threshold_change.new_value
-            game._push(ev_th)
-            if bstate.get("_rules_port_attached"):
-                from rules_port.triggers import dispatch_native_trigger
-                champion = getattr(self, "_ai_champ_scid", None)
-                if champion is not None:
-                    dispatch_native_trigger(
-                        db=_db, handler=self, game=game, session=session,
-                        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
-                        event_type="GainThresholdEvent",
-                        source_card_id=int(champion.uid.uid64),
-                        source_player_id=owner_id,
-                        data={"gain_threshold_color": int(flag)})
-            else:
-                from abilities.framework.triggers import resolve_gain_threshold_triggers
-                resolve_gain_threshold_triggers(
-                    _db, self, game, session, pl_t, ai_t, bstate,
-                    owner_id, color=flag)
+            for flag, change in zip(threshold_colors, changes):
+                ev_th = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
+                ev_th.player_id = ai_t
+                ev_th.color = flag
+                ev_th.operation = 1
+                ev_th.delta = 1
+                ev_th.new_value = change.new_value
+                game._push(ev_th)
+                if bstate.get("_rules_port_attached"):
+                    from rules_port.triggers import dispatch_native_trigger
+                    champion = getattr(self, "_ai_champ_scid", None)
+                    if champion is not None:
+                        dispatch_native_trigger(
+                            db=_db, handler=self, game=game, session=session,
+                            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+                            event_type="GainThresholdEvent",
+                            source_card_id=int(champion.uid.uid64),
+                            source_player_id=owner_id,
+                            data={"gain_threshold_color": int(flag)})
+                else:
+                    from abilities.framework.triggers import resolve_gain_threshold_triggers
+                    resolve_gain_threshold_triggers(
+                        _db, self, game, session, pl_t, ai_t, bstate,
+                        owner_id, color=flag)
             game.push_player_updated(
                 ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
-        log_req(f"    Shards of Fate (AI): gained {color} threshold")
-        return f"shards of fate: AI gained {color} threshold"
+        log_req(f"    Shards of Fate (AI): gained threshold flags "
+                f"{threshold_colors}")
+        return f"shards of fate: AI gained {threshold_colors} threshold flags"
 
     def _mobilize_discount(self, session, card_uid):
         """Session.CheckMobilize's affordable reduction for one hand card."""
@@ -4477,10 +4481,9 @@ class HCPHandler(ProfileStreamMixin):
             int(self.user_profile.get("id", 0)), source_location,
             "PlayedResources",
             int(prior_card_zone[2] or 0) if prior_card_zone else 0)
-        if shard_tpl:
-            self._resolve_shards_of_fate(
-                game, session, pl_t, ai_t, bstate, card_uid,
-                shard_ability, shard_tpl, int(self.user_profile.get("id", 0)))
+        # The printed parent ability below invokes the authored target and
+        # threshold effect.  Keep the resource play to one activation; the
+        # manual picker would replace that ability's continuation.
         scid = game_engine.SessionCardId(game_engine.UID(card_uid))
         game.push_card_updated(
             scid, pl_t, game_engine.ECardCollections.PlayedResources,
@@ -7488,42 +7491,46 @@ class HCPHandler(ProfileStreamMixin):
         _be = self._checkpoint_engine(session)
         if chosen_uid and chosen_uid in pend["candidates"]:
             g = self._fresh_game(session, pl_t, ai_t, bstate)
-            row = db_card_play_info(
-                session.session_id, int(chosen_uid), conn=_db)
-            color = (row[2].split()[0] if row else "").lower()
+            from rules_port.resources import card_template_threshold_flags
+            provided = card_template_threshold_flags(
+                _db, session.session_id, int(chosen_uid))
+            threshold_colors = sorted({
+                int(flag) for flag in game_engine.SHARD_TO_FLAG.values()
+                if provided & int(flag)})
             from pvp_db import db_randomly_insert_deck_cards
             db_randomly_insert_deck_cards(
                 session.session_id, int(pend["owner_id"]), pend["candidates"])
-            flag = game_engine.SHARD_TO_FLAG.get(color, 0)
-            if flag:
+            if threshold_colors:
                 th = bstate.setdefault("player_threshold", {})
-                th[flag] = th.get(flag, 0) + 1
+                for flag in threshold_colors:
+                    th[flag] = int(th.get(flag, th.get(str(flag), 0)) or 0) + 1
                 _be.save_state(session, bstate)
                 g.player_threshold = dict(th)
-                ev_th = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
-                ev_th.player_id = pl_t
-                ev_th.color = flag
-                ev_th.operation = 1
-                ev_th.delta = 1
-                ev_th.new_value = th[flag]
-                g._push(ev_th)
-                if bstate.get("_rules_port_attached"):
-                    from rules_port.triggers import dispatch_native_trigger
-                    champion = getattr(self, "_player_champ_scid", None)
-                    if champion is not None:
-                        dispatch_native_trigger(
-                            db=_db, handler=self, game=g, session=session,
-                            player_uid=pl_t, ai_uid=ai_t,
-                            battle_state=bstate,
-                            event_type="GainThresholdEvent",
-                            source_card_id=int(champion.uid.uid64),
-                            source_player_id=int(pend["owner_id"]),
-                            data={"gain_threshold_color": int(flag)})
-                else:
-                    from abilities.framework.triggers import resolve_gain_threshold_triggers
-                    resolve_gain_threshold_triggers(
-                        _db, self, g, session, pl_t, ai_t, bstate,
-                        pend["owner_id"], color=flag)
+                for flag in threshold_colors:
+                    ev_th = game_engine.PlayerResourceThresholdChangedSessionEventArgs()
+                    ev_th.player_id = pl_t
+                    ev_th.color = flag
+                    ev_th.operation = 1
+                    ev_th.delta = 1
+                    ev_th.new_value = th[flag]
+                    g._push(ev_th)
+                    if bstate.get("_rules_port_attached"):
+                        from rules_port.triggers import dispatch_native_trigger
+                        champion = getattr(self, "_player_champ_scid", None)
+                        if champion is not None:
+                            dispatch_native_trigger(
+                                db=_db, handler=self, game=g, session=session,
+                                player_uid=pl_t, ai_uid=ai_t,
+                                battle_state=bstate,
+                                event_type="GainThresholdEvent",
+                                source_card_id=int(champion.uid.uid64),
+                                source_player_id=int(pend["owner_id"]),
+                                data={"gain_threshold_color": int(flag)})
+                    else:
+                        from abilities.framework.triggers import resolve_gain_threshold_triggers
+                        resolve_gain_threshold_triggers(
+                            _db, self, g, session, pl_t, ai_t, bstate,
+                            pend["owner_id"], color=flag)
                 g.push_player_updated(
                     pl_t, champ_id=getattr(self, "_player_champ_scid", None))
             # Hide EVERY candidate again (back to the face-down deck) — the
@@ -7533,7 +7540,8 @@ class HCPHandler(ProfileStreamMixin):
             self._hide_candidates_to_deck(g, session, pl_t, ai_t,
                                           pend["candidates"])
             self._send_battle_events(session, g, pl_t)
-            log_req(f"    Shards of Fate: gained {color} threshold "
+            log_req(f"    Shards of Fate: gained threshold flags "
+                    f"{threshold_colors} "
                     f"(chosen {hex(int(chosen_uid))})")
         else:
             log_req(f"    Shards of Fate: invalid pick "
@@ -13614,10 +13622,6 @@ class HCPHandler(ProfileStreamMixin):
                         bstate.get("player_resources", 0) + cur_grant)
                     bstate["player_charges"] = (
                         bstate.get("player_charges", 0) + 1)
-                    self._resolve_shards_of_fate(
-                        g_tmp, session, pl_t, ai_t, bstate,
-                        played_card_uid, shard_ability, shard_tpl,
-                        self.user_profile["id"])
                     g_tmp.player_total_resources = bstate.get(
                         "player_total_resources", 0)
                     g_tmp.player_resources = bstate.get(
@@ -13626,7 +13630,7 @@ class HCPHandler(ProfileStreamMixin):
                     _be.save_state(session, bstate)
                     log_req(f"    Shards of Fate: resource play consumed; "
                             f"+{max_grant} max/+{cur_grant} current, "
-                            f"threshold chosen")
+                            f"printed threshold ability pending")
                 else:
                     bstate["player_total_resources"] = (
                         bstate.get("player_total_resources", 0) + max_grant)

@@ -6428,24 +6428,39 @@ def _pvp_project_resource_play(handler, session, inner_bytes, my_pid,
                     _pvp_offer_trigger_response(session, state, my_pid)
                     return True
     if is_shards_of_fate:
-        # Resource events must arrive before the class-39 deck picker.  The
-        # picker itself re-grants priority to the chooser, so do not send the
-        # ordinary post-card greenlight here.
+        # Resolve the resource's printed parent once. Its authored child
+        # ability owns the class-39 deck target and threshold effect.
         state["priority_pid"] = my_pid
         pvp_save_state(session, state)
         prompt_game = _ge.Game(int(session.session_id), my_uid, opp_uid)
         _pvp_populate_game_state(prompt_game, state, my_pid, opp_pid)
-        result = handler._resolve_shards_of_fate(
-            prompt_game, session, my_uid, opp_uid, state,
-            int(played_card_uid), shard_ability, shard_tpl, my_pid)
-        if "awaiting" in str(result):
+        prompt_view = _pvp_fra_view(state, my_pid, opp_pid)
+        owner_handler = player_handlers.get(my_pid) or handler
+        from rules_port.resources import resolve_printed_resource_abilities
+        ability_logs = resolve_printed_resource_abilities(
+            prompt_game, session, _db, owner_handler, my_uid, opp_uid,
+            prompt_view, int(played_card_uid), my_pid)
+        if ability_logs:
+            log_req("    PvP Shards of Fate ability: " +
+                    "; ".join(ability_logs))
+        state["stack"] = prompt_view.get("stack") or []
+        state["stack_player_passed"] = False
+        state["stack_ai_passed"] = False
+        _pvp_sync_view_to_state(state, prompt_view, my_pid, opp_pid)
+        persisted = pvp_load_state(session) or {}
+        for pending_key in (
+                "pending_deck_search", "pending_choice", "pending_trigger",
+                "pending_conversation"):
+            if persisted.get(pending_key):
+                state[pending_key] = persisted[pending_key]
+        if prompt_view.get("resolution_paused") or persisted.get(
+                "resolution_paused"):
+            state["resolution_paused"] = True
+        pvp_save_state(session, state)
+        if state.get("pending_deck_search"):
             log_req(f"    PvP Shards of Fate: awaiting threshold choice "
                     f"for pid {my_pid}")
             return True
-        # No eligible Standard resource remained.  Resume priority rather
-        # than leaving the turn waiting for a prompt that was not sent.
-        state["priority_pid"] = my_pid
-        pvp_save_state(session, state)
 
         # No picker remains, so a charge trigger deferred above can now be
         # put on the shared PvP chain and offered to the opponent.
@@ -7185,6 +7200,15 @@ def _pvp_resolve_matching_target(handler, session, inner_bytes, my_pid,
                 "pending_conversation"):
         if persisted.get(key):
             state[key] = persisted[key]
+    pending_charge_amount = _take_pending_gain_charge_amount(
+        state, owner_id)
+    if pending_charge_amount:
+        charge_trigger_game = _pvp_gain_charge_trigger_game(
+            handler, session, state, owner_id,
+            amount=pending_charge_amount)
+        if charge_trigger_game:
+            for trigger_event in charge_trigger_game.events:
+                g._push(trigger_event)
     pvp_save_state(session, state)
     _pvp_send_same_events(session, g, pl_t, ai_t)
 
@@ -7349,19 +7373,21 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid,
     g = _ge.Game(int(session.session_id), pl_t, ai_t)
     _pvp_populate_game_state(g, state, owner_id, opp_pid)
 
-    chosen_info = db_card_play_info(
-        session.session_id, chosen_uid, conn=_db)
-    color = (chosen_info[2].split()[0] if chosen_info else "").lower()
+    from rules_port.resources import card_template_threshold_flags
+    provided = card_template_threshold_flags(
+        _db, session.session_id, int(chosen_uid))
+    threshold_colors = sorted({
+        int(flag) for flag in _ge.SHARD_TO_FLAG.values()
+        if provided & int(flag)})
     from pvp_db import db_randomly_insert_deck_cards
     db_randomly_insert_deck_cards(
         session.session_id, owner_id, pend.get("candidates") or [])
-    flag = _ge.SHARD_TO_FLAG.get(color, 0)
     thresh_key = f"thresh_{owner_id}"
     thresh = dict(state.get(thresh_key) or {})
-    cur = thresh.get(flag)
-    if cur is None:
-        cur = thresh.get(str(flag), 0)
-    if flag:
+    for flag in threshold_colors:
+        cur = thresh.get(flag)
+        if cur is None:
+            cur = thresh.get(str(flag), 0)
         thresh[flag] = int(cur or 0) + 1
         state[thresh_key] = thresh
         g.player_threshold = dict(thresh)
@@ -7377,6 +7403,9 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid,
         if threshold_trigger_game:
             for trigger_event in threshold_trigger_game.events:
                 g._push(trigger_event)
+    if threshold_colors:
+        state[thresh_key] = thresh
+        g.player_threshold = dict(thresh)
 
     # The selected card is not moved into hand or PlayedResources.  All
     # presented candidates, including the selected one, return face-down to
@@ -7399,7 +7428,8 @@ def _pvp_resolve_shard_choice(handler, session, inner_bytes, my_pid,
                 g._push(trigger_event)
     _pvp_send_same_events(session, g, pl_t, ai_t)
     pvp_save_state(session, state)
-    log_req(f"    PvP Shards of Fate resolved: gained {color} threshold "
+    log_req(f"    PvP Shards of Fate resolved: gained threshold flags "
+            f"{threshold_colors} "
             f"(chosen {hex(int(chosen_uid))}, pid {owner_id})")
 
     if state.get("stack"):
