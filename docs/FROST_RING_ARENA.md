@@ -14,6 +14,7 @@ The implemented flow supports:
 - fixed boss positions and elite/boss encounter selection;
 - recording wins, losses, and completed-fight history;
 - showing the current opponent and completed fights in the lobby;
+- rejoining an active saved FRA battle from the FRA screen after disconnect;
 - awarding gold bags equal to the opponent's tier for every win;
 - accumulating one treasure chest for each boss win.
 
@@ -127,6 +128,17 @@ authored answer event displays its objective panel; the reconnect-only
 client has no reachable decline action for an MC challenge, so the server
 never models a declined challenge: an attached challenge is always accepted
 and its mods and rewards apply.
+
+An active FRA session can be rejoined from the FRA screen. The reconnect probe
+sent during login stays silent for FRA so the landing page does not interrupt
+the player with an arena prompt. When the FRA screen sends its probe, the server
+returns the saved session identity; `JoinDisconnectedGame` and
+`ReadyToContinueGame` then rebuild the board from `game_cards` and the persisted
+turn checkpoint. Reconnection does not shuffle or deal cards, replay the last
+transaction, or advance the saved phase.
+Declining the reconnect prompt is saved for that player in the session
+checkpoint, so later visits to the FRA screen do not prompt again for the same
+game. The choice is scoped to that session and player.
 
 ## Game-session result flow
 

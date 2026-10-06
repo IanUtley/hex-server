@@ -4,12 +4,12 @@ import json, gzip, os
 
 from db import log_req
 from profile_db import (db_get_store_items, db_adjust_user_currency,
-                        db_record_purchase, db_add_inventory, db_save_deck,
+                        db_record_purchase,
+                        db_add_inventory_with_unique_client_uid, db_save_deck,
                         db_redeem_code, db_send_email,
                         db_next_card_instance_for_user, db_insert_card_instance,
                         db_add_collection, db_get_store_item,
-                        db_get_user_currency, db_set_user_currency,
-                        db_set_inventory_client_uid)
+                        db_get_user_currency, db_set_user_currency)
 from pvp_db import db_pvp_booster_card_guids
 from encoder import encode_objfmt_response, compress_gzip, encode_datawrapper, encode_store_response
 
@@ -119,6 +119,50 @@ def _grant_deck_to_player(user_id, cards, deck_name, handler=None, conn=None):
     return deck_db_id
 
 
+def store_deck_definition(template_guid):
+    """Return a store starter-pack's authored DeckTemplate contents.
+
+    InventoryStarterPack records point directly at their DeckTemplate.  Use
+    that reference as the source for collector, streamer, and starter decks;
+    store item names and an optional hand-maintained JSON map are not needed.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    from gamedata.records import reference_guid
+
+    inventory_item = DEFAULT_RECORD_STORE.get(
+        "InventoryItemData", str(template_guid or "").lower())
+    if inventory_item is None or inventory_item.short_type != "InventoryStarterPack":
+        return None
+    deck_guid = reference_guid(inventory_item.field("m_DeckTemplateId"))
+    if not deck_guid or deck_guid == "00000000-0000-0000-0000-000000000000":
+        return None
+    deck = DEFAULT_RECORD_STORE.get("DeckTemplate", deck_guid)
+    if deck is None:
+        return None
+
+    cards = []
+    for entry in deck.field("m_DeckResources", ()) or ():
+        if not isinstance(entry, dict):
+            continue
+        card_guid = reference_guid(entry.get("m_idTemplate"))
+        try:
+            count = max(0, int(entry.get("m_Count") or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if card_guid and count:
+            cards.append((card_guid.lower(), count))
+    if not cards:
+        return None
+    champion_guid = reference_guid(deck.field("m_ChampionId"))
+    return {
+        "deck_template_guid": deck.guid,
+        "name": str(deck.field("m_DeckName", "") or
+                     inventory_item.field("m_Name", "") or "Starter Deck"),
+        "champion_guid": champion_guid,
+        "cards": tuple(cards),
+    }
+
+
 def grant_vendor_code_cards(user_id, redeem_code, conn=None):
     """Grant card instances for a card-bearing vendor code."""
     if str(redeem_code).strip().lower() != "allpvp":
@@ -181,8 +225,6 @@ def apply_purchase(conn, user_id, item_id, quantity):
 
     granted_list = []
     deck_granted = False
-    if template_guid:
-        granted_list = [(template_guid, 1000 + int(item_id), int(quantity))]
     if store_tab == "collectordeck" and template_guid:
         deck_data = _STORE_DECK_CARDS.get(template_guid)
         if deck_data:
@@ -202,9 +244,9 @@ def apply_purchase(conn, user_id, item_id, quantity):
         user_id, item_name, template_guid, int(cost) * int(quantity),
         currency_type, conn=conn)
     if template_guid:
-        db_add_inventory(user_id, template_guid, int(quantity), conn=conn)
-        db_set_inventory_client_uid(
-            user_id, template_guid, 1000 + int(item_id), conn=conn)
+        client_item_uid = db_add_inventory_with_unique_client_uid(
+            user_id, template_guid, int(quantity), conn=conn)
+        granted_list = [(template_guid, client_item_uid, int(quantity))]
     return {
         "success": True,
         "error_code": 0,
@@ -223,7 +265,7 @@ def apply_purchase(conn, user_id, item_id, quantity):
 
 def apply_redeem(conn, user_id, redeem_code):
     """Apply a redemption and its system email in one transaction."""
-    result = db_redeem_code(redeem_code, conn=conn)
+    result = db_redeem_code(redeem_code, user_id, conn=conn)
     if not result["redeemed"]:
         return {"gold": 0, "platinum": 0, "redeemed": False,
                 "error_message": result["error_message"]}
@@ -304,9 +346,10 @@ def handle_purchase(handler, target, instance, reqid, comp, session_id, conh,
     if success and result["deck_granted"]:
         handler.push_cards_to_client()
     if success and template_guid:
+        client_item_uid = (granted_list[0][1] if granted_list else 0)
         handler.push_inventory_to_client(
             qty=result["quantity"], template_guid=template_guid,
-            item_id=1000 + result["item_id"])
+            item_id=client_item_uid)
     if success:
         log_req(f"    Sent PurchaseItem response: remaining={remaining} {currency_type}")
     else:

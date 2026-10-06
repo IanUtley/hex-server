@@ -672,10 +672,67 @@ def db_consume_inventory_row(row_id, quantity=1, conn=None):
 
 
 def db_next_inventory_client_uid(user_id, conn=None):
-    row = _profile_connection(conn).execute(
-        "SELECT COALESCE(MAX(client_item_uid), 0) + 1 AS next_uid "
-        "FROM player_inventory WHERE user_id=?", (user_id,)).fetchone()
-    return int(_row_value(row, "next_uid", 0) or 1)
+    connection = _profile_connection(conn)
+    used = {
+        int(_row_value(row, "client_item_uid", 0) or 0)
+        for row in connection.execute(
+            "SELECT client_item_uid FROM player_inventory WHERE user_id=?",
+            (user_id,)).fetchall()
+    }
+    # 9000+ belongs to treasure_chests IDs projected in chest_bits. Keep
+    # inventory-item UIDs below that boundary so the two client UID sources
+    # cannot alias. Preserve the established 1000+ range when it has room.
+    next_uid = max((uid for uid in used if 1000 <= uid < 9000),
+                   default=999) + 1
+    if next_uid < 9000:
+        return next_uid
+    for lower, upper in ((1000, 9000), (1, 1000)):
+        for candidate in range(lower, upper):
+            if candidate not in used:
+                return candidate
+    raise RuntimeError("player inventory has exhausted client item UIDs")
+
+
+def db_add_inventory_with_unique_client_uid(user_id, template_guid,
+                                             quantity=1, conn=None):
+    """Grant inventory and return its unique, stable client item UID.
+
+    Store item IDs are not inventory instance IDs.  Deriving one from the
+    store row can collide with an inventory item previously granted from a
+    different source, causing client requests to address the wrong item.
+    Callers supply a transaction connection so allocation and persistence are
+    serialized with the purchase.
+    """
+    connection = _profile_connection(conn)
+    row = connection.execute(
+        "SELECT id, quantity, client_item_uid FROM player_inventory "
+        "WHERE user_id=? AND template_guid=? ORDER BY id LIMIT 1",
+        (user_id, template_guid)).fetchone()
+    if row:
+        row_id = int(_row_value(row, "id", 0) or 0)
+        current_uid = int(_row_value(row, "client_item_uid", 2) or 0)
+        duplicate = False
+        if current_uid > 0:
+            duplicate = connection.execute(
+                "SELECT 1 FROM player_inventory WHERE user_id=? "
+                "AND client_item_uid=? AND id<>? LIMIT 1",
+                (user_id, current_uid, row_id)).fetchone() is not None
+        client_uid = (db_next_inventory_client_uid(user_id, conn=connection)
+                      if current_uid <= 0 or duplicate else current_uid)
+        connection.execute(
+            "UPDATE player_inventory SET quantity=quantity+?, "
+            "client_item_uid=? WHERE id=?",
+            (int(quantity), client_uid, row_id))
+    else:
+        client_uid = db_next_inventory_client_uid(user_id, conn=connection)
+        connection.execute(
+            "INSERT INTO player_inventory "
+            "(user_id, template_guid, quantity, client_item_uid) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, template_guid, int(quantity), client_uid))
+    if conn is None:
+        connection.commit()
+    return client_uid
 
 
 def db_upsert_inventory_item(user_id, template_guid, quantity=1,
@@ -1280,18 +1337,31 @@ def db_record_purchase(user_id, item_name, template_id, price, currency, conn=No
         connection.commit()
 
 
-def db_redeem_code(code, conn=None):
+def db_redeem_code(code, user_id, conn=None):
+    """Validate and record one redemption for a single account.
+
+    Usage limits are per account: each redemption is recorded as a
+    ``store_purchases`` row (``currency='Redeem'``) and ``max_uses`` is
+    compared against the caller's own redemption count, never a global total.
+    """
     connection = _profile_connection(conn)
     row = connection.execute(
-        "SELECT id, gold_delta, platinum_delta, uses, max_uses "
+        "SELECT id, gold_delta, platinum_delta, max_uses "
         "FROM redeem_codes WHERE code=?", (code,)).fetchone()
     if not row:
         return {"redeemed": False, "error_message": "Invalid redeem code."}
-    if _row_value(row, "uses", 3) >= _row_value(row, "max_uses", 4):
+    used = connection.execute(
+        "SELECT COUNT(*) FROM store_purchases "
+        "WHERE user_id=? AND item_template_id=? AND currency='Redeem'",
+        (int(user_id), str(code))).fetchone()[0]
+    if used >= int(_row_value(row, "max_uses", 3) or 0):
         return {"redeemed": False,
                 "error_message": "This redeem code has already been redeemed or expired."}
-    connection.execute("UPDATE redeem_codes SET uses=uses+1 WHERE id=?",
-                       (_row_value(row, "id", 0),))
+    connection.execute(
+        "INSERT INTO store_purchases "
+        "(user_id, item_name, item_template_id, price, currency) "
+        "VALUES (?, ?, ?, 0, 'Redeem')",
+        (int(user_id), f"Redeem: {code}", str(code)))
     if conn is None:
         connection.commit()
     return {"code": str(code),

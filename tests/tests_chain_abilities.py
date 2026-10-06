@@ -84,6 +84,23 @@ AG_BOOBY_TRAP = "1a5c43ec-2c65-85f0-0310-8395ec405acf"
 # target opposing troop." — two explicit authored target templates.
 TPL_SURVIVAL = "c7cac7d9-05a6-44c8-bb2f-51f3700764e6"
 AG_SURVIVAL = "a211532e-8cf5-7fd5-838a-19263b22e6e0"
+TPL_UNDYING_WEAVER = "f5ae3964-d91c-4dc9-aa01-b6b7bc54e4ce"
+AG_WEAVER_SCROUNGE = "4c23c929-3239-722b-a59f-3027fbd218f5"
+TID_WEAVER_CRYPT_TROOPS = "34a67f1a-4ae8-875c-2cd3-e8441a16cca8"
+# Wailing Banshee: "This can't be blocked except by artifact troops and/or
+# blood troops."  The exception filter is IsColor against the blocker.
+TPL_WAILING_BANSHEE = "5338219e-a902-463f-bd39-9e8b69c5af94"
+TPL_BLOOD_VANILLA = "0213f65b-2868-4ddd-aeaa-2501ec198c22"
+TPL_NONBLOOD_VANILLA = "0052a5d0-f815-4c90-8570-621a135ae86c"
+# Graven Geist grants "Scrounge 2: +2/+2" to your other troops in all zones.
+AG_GEIST_GRANTED_SCROUNGE = "a70ad247-2014-50fc-5f86-b4c5c39d84c3"
+# Echoclaw Terminus: "[ONE-SHOT]: Deploy - Summon a copy of this."
+TPL_ECHOCLAW = "31099f84-08c6-4bb4-a351-64403308605b"
+AG_ECHOCLAW_ONESHOT_COPY = "5c8a6da1-4dab-2b3f-05e2-1245b48e7ae7"
+# Bleak Bladetwister: "Deploy - Destroy each opposing damaged troop."
+TPL_BLADETWISTER = "d25c2bdd-b675-4dc5-b9db-e653ebc9f2e5"
+# Grove Whisperer: "While this is socketed with a minor gem, +1/+1."
+TPL_GROVE_WHISPERER = "75c6dc11-8424-4260-a5ce-02fe708b4d49"
 
 
 def _pl_ai():
@@ -133,6 +150,98 @@ def test_card_battled_dispatch_is_directional(db):
     assert dispatch.call_count == 1
     assert dispatch.call_args.args[7:9] == ("CardBattledEvent", 101)
     assert dispatch.call_args.kwargs["extra_target"] == 202
+
+
+def test_spell_finish_uses_the_effective_post_resolution_type(db):
+    from unittest import mock
+    from rules_port.chain_items import resolve_card_item
+
+    pl_t, ai_t = _pl_ai()
+    uid = 907001
+    original_action = "f0000000-0000-0000-0000-000000000001"
+    db.execute(
+        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (original_action, "Generated Action", "BasicAction", 1, 0, 0, 0,
+         "[]", "[]", "", 0, 0, 0))
+    add_card(
+        db, uid, 5, original_action, loc="CastSpells",
+        state=int(game_engine.ECardStates.Tapped |
+                  game_engine.ECardStates.StartedATurnOnYourSide))
+    db.commit()
+
+    handler = HandlerStub(db)
+    arrivals = []
+    handler.chain_mark_warzone_entry = (
+        lambda _session, card_uid: arrivals.append(int(card_uid)))
+    session = SessionStub()
+    game = game_engine.Game(session.session_id, pl_t, ai_t)
+    state = {"pvp": False}
+    dispatches = []
+    def transform_source(*_args, **_kwargs):
+        db.execute(
+            "UPDATE game_cards SET template_guid=?, card_template_id=?, "
+            "card_type='Troop', card_attributes=? "
+            "WHERE session_id=1 AND card_uid=?",
+            (TPL_GLADIATOR, TPL_GLADIATOR,
+             int(game_engine.ECardAttributes.EntersPlayExhausted), uid))
+        db.commit()
+
+    with mock.patch(
+            "rules_port.chain_items.dispatch",
+            side_effect=lambda *args, **_kwargs: dispatches.append(args[6])):
+        with mock.patch(
+                "rules_port.resolution.resolve_port_played_spell",
+                side_effect=transform_source):
+            resolve_card_item(
+                handler, session, db, game, state,
+                {"kind": "spell", "source_uid": uid,
+                 "ability_guids": []}, pl_t, ai_t)
+
+    row = db.execute(
+        "SELECT location, card_state, original_template_guid, template_guid "
+        "FROM game_cards WHERE session_id=1 AND card_uid=?", (uid,)
+    ).fetchone()
+    assert row[0] == "warzone", row
+    assert row[2] == original_action, row
+    assert row[3] == TPL_GLADIATOR, row
+    assert row[1] & game_engine.ECardStates.CameOutThisTurn, row
+    assert row[1] & game_engine.ECardStates.Tapped, row
+    updated = [event for event in game.events if isinstance(
+        event, game_engine.CardUpdatedSessionEventArgs)]
+    assert len(updated) == 1, game.events
+    assert updated[0].collection == game_engine.ECardCollections.Warzone
+    assert updated[0].card_type & game_engine.ECardTypes.Troop
+    assert updated[0].state & game_engine.ECardStates.CameOutThisTurn
+    assert updated[0].state & game_engine.ECardStates.Tapped
+    assert (updated[0].attributes &
+            game_engine.ECardAttributes.EntersPlayExhausted)
+    assert arrivals == [uid], arrivals
+    assert dispatches == ["CardExitedZoneEvent", "CardEnteredZoneEvent"], dispatches
+
+    spell_uid = uid + 1
+    add_card(db, spell_uid, 5, original_action, loc="CastSpells")
+    db.commit()
+    discard_game = game_engine.Game(session.session_id, pl_t, ai_t)
+    discard_dispatches = []
+    with mock.patch(
+            "rules_port.chain_items.dispatch",
+            side_effect=lambda *args, **_kwargs:
+            discard_dispatches.append(args[6])):
+        resolve_card_item(
+            handler, session, db, discard_game, {"pvp": False},
+            {"kind": "spell", "source_uid": spell_uid}, pl_t, ai_t,
+            bom_completed=True)
+    location = db.execute(
+        "SELECT location FROM game_cards WHERE session_id=1 AND card_uid=?",
+        (spell_uid,)).fetchone()
+    assert location and location[0] == "discard", location
+    discarded_updates = [event for event in discard_game.events if isinstance(
+        event, game_engine.CardUpdatedSessionEventArgs)]
+    assert len(discarded_updates) == 1, discard_game.events
+    assert (discarded_updates[0].collection ==
+            game_engine.ECardCollections.Discard)
+    assert discard_dispatches == [
+        "CardExitedZoneEvent", "CardEnteredZoneEvent"], discard_dispatches
 
 
 def test_lose_life_modifier_is_not_damage(db):
@@ -357,6 +466,80 @@ def test_vampire_king_steals_a_random_troop_from_the_damaged_hand(db):
         "SELECT user_id, template_guid, location FROM game_cards "
         "WHERE card_uid=202").fetchone()
     assert untouched == (5, TPL_INCANTATION, "hand"), untouched
+
+
+def test_vampire_prince_rewards_buried_opponent_resource(db):
+    """Both authored Prince variants use the damaged champion's deck.
+
+    The nested bury child records ``BuriedCards`` on the parent ability.
+    The parent condition must read that live list count so a buried resource
+    is transformed to Bloodstone and moved to the Prince controller's hand.
+    """
+    from rules_port.triggers import dispatch_native_trigger
+    from rules_port.resolution import resolve_port_trigger
+
+    source = sqlite3.connect(SRC)
+    princes = [row[0] for row in source.execute(
+        "SELECT guid FROM card_templates WHERE name='Vampire Prince' "
+        "ORDER BY guid")]
+    resource_guid = source.execute(
+        "SELECT guid FROM card_templates WHERE card_type='Resource' "
+        "AND name!='Bloodstone' ORDER BY name,guid LIMIT 1").fetchone()[0]
+    source.close()
+    tpl_bloodstone = "452ced33-880a-4a3f-9cf6-0f56c23b948a"
+
+    assert len(princes) == 2, princes
+    for prince_guid in princes:
+        for guid in (prince_guid, resource_guid, tpl_bloodstone,
+                     TPL_GLADIATOR):
+            _copy_card(db, guid)
+        add_card(db, 101, 0, prince_guid, loc="warzone")
+        add_card(db, 201, 5, resource_guid, loc="deck")
+        # A deck card owned by the Prince controller catches an incorrect
+        # fallback to the source owner's deck.
+        add_card(db, 202, 0, TPL_GLADIATOR, loc="deck")
+        db.execute(
+            "UPDATE game_cards SET card_type=(SELECT card_type FROM "
+            "card_templates ct WHERE ct.guid=game_cards.template_guid)")
+        db.execute(
+            "UPDATE game_cards SET position=0 WHERE card_uid IN (201,202)")
+        db.commit()
+
+        pl_t, ai_t = _pl_ai()
+        game = game_engine.Game(1, pl_t, ai_t)
+        handler = HandlerStub(db)
+        player_champ_uid = int(handler._player_champ_scid.uid.uid64)
+        bstate = {
+            "player_health": 20, "ai_health": 20, "turn_number": 1,
+            "stack": [],
+            "champ_map": {
+                5: player_champ_uid,
+                0: int(handler._ai_champ_scid.uid.uid64),
+            },
+            "_rules_port_attached": True,
+        }
+        handler._current_bstate = bstate
+        dispatch_native_trigger(
+            db=db, handler=handler, game=game, session=SessionStub(),
+            player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+            event_type="CardDealtDamageEvent", source_card_id=101,
+            source_player_id=0, target_card_id=player_champ_uid)
+        while bstate.get("stack"):
+            item = bstate["stack"].pop(0)
+            resolve_port_trigger(
+                handler, game, SessionStub(), db, pl_t, ai_t, bstate, item)
+
+        rewarded = db.execute(
+            "SELECT user_id,template_guid,location FROM game_cards "
+            "WHERE card_uid=201").fetchone()
+        assert rewarded == (0, tpl_bloodstone, "hand"), (
+            prince_guid, rewarded, bstate)
+        decoy = db.execute(
+            "SELECT user_id,template_guid,location FROM game_cards "
+            "WHERE card_uid=202").fetchone()
+        assert decoy == (0, TPL_GLADIATOR, "deck"), (prince_guid, decoy)
+        db.execute("DELETE FROM game_cards")
+        db.commit()
 
 
 def test_queued_trigger_source_projection_preserves_combat_state(db):
@@ -840,6 +1023,136 @@ def test_bunjitsu_void_cost_is_a_cost_instance(db):
         dbmod._db, hcs._db = old_db, old_hcs
 
 
+def test_undying_weaver_offers_scrounge_cost_during_card_play(db):
+    """Weaver's on-cast Scrounge 2 is an optional, ability-level void cost."""
+    import hconnect_server as hcs
+    import db as dbmod
+    import services.tournament_game as tournament_game
+    from domain.events import CostInstanceSessionEventArgs
+    from gamedata import DEFAULT_RECORD_STORE, PlayPlan
+
+    _copy_card(db, TPL_UNDYING_WEAVER)
+    _copy_card(db, TPL_GLADIATOR)
+    add_card(db, 101, 5, TPL_UNDYING_WEAVER, loc="hand")
+    add_card(db, 201, 5, TPL_GLADIATOR, loc="discard")
+    add_card(db, 202, 5, TPL_GLADIATOR, loc="discard")
+    old_db, old_hcs, old_tournament_db = (
+        dbmod._db, hcs._db, tournament_game._db)
+    dbmod._db, hcs._db, tournament_game._db = db, db, db
+    try:
+        h = object.__new__(hcs.HCPHandler)
+        h._db = db
+        h.user_profile = {"id": 5}
+        h._player_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(244, 5))
+        h._ai_champ_scid = game_engine.SessionCardId(
+            game_engine.UID.make(3, 1000))
+        h._current_bstate = {"player_health": 20, "ai_health": 20}
+        # This focused schema omits FRA-only arena metadata used by the
+        # optional gem display lookup; card-cost mutation needs only the zone
+        # rows and emitted card updates.
+        h._card_full_data = lambda *_args, **_kwargs: None
+        pl_t, ai_t = _pl_ai()
+        game = game_engine.Game(1, pl_t, ai_t)
+        option_list = game._make_event(
+            game_engine.PlayerOptionListSessionEventArgs)
+        option_list.player_id = pl_t
+        option = game._make_event(game_engine.PlayerOptionSessionEventArgs)
+        option.card = game_engine.SessionCardId(game_engine.UID(101))
+        option.state = game_engine.ECardUsage.Play
+        play_instance = game._make_event(
+            game_engine.OptionInstanceSessionEventArgs)
+        play_instance.opt_id = game_engine.ResourceId.from_str(
+            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID)
+        option.instances.append(play_instance)
+        option_list.options.append(option)
+        game._push(option_list)
+
+        h._add_play_target_options(game, SessionStub(), pl_t, ai_t)
+        scrounge_instances = [
+            instance for instance in option.instances
+            if str(instance.opt_id.guid) == AG_WEAVER_SCROUNGE]
+        assert len(scrounge_instances) == 1, option.instances
+        cost_instances = [target for target in
+                          scrounge_instances[0].target_instances
+                          if isinstance(target, CostInstanceSessionEventArgs)]
+        assert len(cost_instances) == 1, scrounge_instances[0].target_instances
+        cost = cost_instances[0]
+        assert cost.cost_type == 16  # VoidAbilityCostType
+        assert str(cost.target_template_id.guid) == TID_WEAVER_CRYPT_TROOPS
+        assert {int(card.uid.uid64) for card in cost.targets} == {201, 202}
+        assert getattr(cost, "min_target_count", None) == 2
+        assert getattr(cost, "max_target_count", None) == 2
+
+        pvp_game = game_engine.Game(1, pl_t, ai_t)
+        pvp_options = pvp_game._make_event(
+            game_engine.PlayerOptionListSessionEventArgs)
+        pvp_options.player_id = pl_t
+        pvp_option = game_engine.PlayerOptionSessionEventArgs()
+        pvp_option.card = game_engine.SessionCardId(game_engine.UID(101))
+        pvp_option.state = game_engine.ECardUsage.Play
+        pvp_play = game_engine.OptionInstanceSessionEventArgs()
+        pvp_play.opt_id = game_engine.ResourceId.from_str(
+            game_engine.PLAY_CARD_ABILITY_TEMPLATE_ID)
+        pvp_option.instances.append(pvp_play)
+        pvp_options.options.append(pvp_option)
+        pvp_game._push(pvp_options)
+        tournament_game._pvp_add_play_target_options(
+            pvp_game, SessionStub(),
+            {"pids": [5, 6], "turn_pid": 5, "champ_map": {}},
+            pl_t, ai_t, 5)
+        pvp_scrounge = next(
+            instance for instance in pvp_option.instances
+            if str(instance.opt_id.guid) == AG_WEAVER_SCROUNGE)
+        pvp_cost = next(
+            target for target in pvp_scrounge.target_instances
+            if isinstance(target, CostInstanceSessionEventArgs))
+        assert pvp_cost.cost_type == 16
+        assert {int(card.uid.uid64) for card in pvp_cost.targets} == {201, 202}
+
+        plan = PlayPlan.from_card(
+            DEFAULT_RECORD_STORE, TPL_UNDYING_WEAVER,
+            source_uid=101, owner_id=5)
+        declined, no_card_costs = plan.activation_bundle([])
+        assert no_card_costs == {}
+        assert plan.validate(
+            activations=declined, cost_target_map=no_card_costs) == ()
+        activations, card_costs = plan.activation_bundle([], ability_data=[{
+            "ability_template_id": AG_WEAVER_SCROUNGE,
+            "opted_in_set": True,
+            "opted": True,
+            "x_cost_data": {"cards_to_void": [201, 202]},
+        }])
+        assert plan.validate(
+            activations=activations, cost_target_map=card_costs) == ()
+        payment, used = h._ability_card_play_cost_selections(
+            SessionStub(), plan, 101, activations, owner_id=5,
+            battle_state=h._current_bstate)
+        assert payment is not None
+        assert [(spec["kind"], selected) for spec, selected in payment] == [
+            ("void", (201, 202))]
+        assert used == {201, 202}
+
+        from unittest import mock
+        dispatched = []
+        payment_state = {"ability_lists": {}}
+        with mock.patch(
+                "rules_port.triggers.dispatch_native_trigger",
+                side_effect=lambda **event:
+                    dispatched.append(event["event_type"])):
+            h._apply_card_play_costs(
+                game, SessionStub(), payment_state, pl_t, ai_t, payment,
+                source_uid=101, expected_owner_id=5, scrounge=True)
+        assert [row[0] for row in db.execute(
+            "SELECT location FROM game_cards WHERE card_uid IN (201, 202) "
+            "ORDER BY card_uid")] == ["void", "void"]
+        assert payment_state["ability_lists"]["VoidedCards"] == [201, 202]
+        assert "CardScroungedEvent" in dispatched
+    finally:
+        dbmod._db, hcs._db, tournament_game._db = (
+            old_db, old_hcs, old_tournament_db)
+
+
 def test_practice_ability_chain_window_reaches_the_client(db):
     """An ability that leaves a chain item must offer the client its resolve
     window.
@@ -925,6 +1238,53 @@ def test_practice_ability_chain_window_reaches_the_client(db):
         if (instruction.opname == "LOAD_GLOBAL" and
             instruction.argval not in vars(hcs) and
             not hasattr(builtins, instruction.argval))}
+
+
+def test_block_exception_reads_the_blockers_template_shards(db):
+    """A block-immunity exception filtered by colour sees the blocker's shards.
+
+    The combat card projection omitted the template threshold, so every troop
+    looked colourless: a Blood blocker could not block Wailing Banshee and
+    the native phase graph skipped DeclareDefense entirely.
+    """
+    from rules_port.combat_rules import can_block
+    for template in (TPL_WAILING_BANSHEE, TPL_BLOOD_VANILLA,
+                     TPL_NONBLOOD_VANILLA):
+        _copy_card(db, template)
+    add_card(db, 101, 5, TPL_WAILING_BANSHEE,
+             state=game_engine.ECardStates.StartedATurnOnYourSide)
+    add_card(db, 201, 1000, TPL_BLOOD_VANILLA)
+    add_card(db, 202, 1000, TPL_NONBLOOD_VANILLA)
+    bstate = {"player_health": 20, "ai_health": 20}
+    assert can_block(db, 1, bstate, 101, 201)
+    assert not can_block(db, 1, bstate, 101, 202)
+
+
+def test_granted_scrounge_joins_the_card_play_plan(db):
+    """A live granted cast ability (Graven Geist) is part of the play plan.
+
+    Declining the optional Scrounge keeps the card playable; opting in binds
+    the client's XCostData void list to that ability's authored cost index.
+    """
+    from gamedata import DEFAULT_RECORD_STORE, PlayPlan
+    granted = AG_GEIST_GRANTED_SCROUNGE
+    base = PlayPlan.from_card(
+        DEFAULT_RECORD_STORE, TPL_NONBLOOD_VANILLA, source_uid=101,
+        owner_id=5)
+    assert not base.cast_abilities
+    plan = PlayPlan.from_card(
+        DEFAULT_RECORD_STORE, TPL_NONBLOOD_VANILLA, source_uid=101,
+        owner_id=5, instance_ability_guids=(granted,))
+    assert [a.ability_guid.lower() for a in plan.cast_abilities] == [granted]
+    declined, _ = plan.activation_bundle([])
+    assert not declined[granted].opted
+    assert plan.validate(variable_cost=0, activations=declined) == ()
+    opted, _ = plan.activation_bundle([], ability_data=[{
+        "ability_template_id": granted,
+        "x_cost_data": {"m_CardsToVoid": [201, 202]}}])
+    assert opted[granted].opted
+    assert opted[granted].cost_target_map == {0: (201, 202)}
+    assert plan.validate(variable_cost=0, activations=opted) == ()
 
 
 def test_champion_power_offer_requires_its_authored_cost_and_target(db):
@@ -1771,10 +2131,15 @@ def test_shifted_paradigm_never_moves_champion_when_crypt_empty(db):
         "SELECT card_uid, location FROM game_cards").fetchall())
     assert locations[9001] == "champion", locations
     # The ability resolves: hand -> deck, (empty) crypt skipped, draw 4.
-    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
-             for ev in game.events
-             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
-    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    updates = [(int(ev.session_card_id.uid.uid64), ev.collection)
+               for ev in game.events
+               if isinstance(ev, game_engine.CardUpdatedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in updates, updates
+    assert not any(
+        int(ev.session_card_id.uid.uid64) == 9003
+        and ev.collection == game_engine.ECardCollections.Deck
+        for ev in game.events
+        if isinstance(ev, game_engine.CardMovedSessionEventArgs))
     drawn = [ev for ev in game.events
              if isinstance(ev, game_engine.CardDrawnSessionEventArgs)]
     assert len(drawn) == 4, drawn
@@ -1839,10 +2204,15 @@ def test_corinth_end_of_turn_ability_resolves_inline(db):
     # Resolved inline: no chain item, and the hand already moved to the deck.
     assert not (bstate.get("stack") or []), bstate.get("stack")
     assert "daf1ed04" in result, result
-    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
-             for ev in game.events
-             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
-    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    updates = [(int(ev.session_card_id.uid.uid64), ev.collection)
+               for ev in game.events
+               if isinstance(ev, game_engine.CardUpdatedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in updates, updates
+    assert not any(
+        int(ev.session_card_id.uid.uid64) == 9003
+        and ev.collection == game_engine.ECardCollections.Deck
+        for ev in game.events
+        if isinstance(ev, game_engine.CardMovedSessionEventArgs))
     # It was shuffled into the deck, not left on top where the draw would
     # immediately recover it.
     locations = dict(db.execute(
@@ -1858,6 +2228,7 @@ def test_native_chain_resolves_trigger_without_legacy_fallback(db):
     GameStarted/first-turn trigger queued by ``queue_projected_chain`` then
     aborted the mulligan-keep transaction, so PvE games failed to start.
     """
+    from unittest import mock
     from rules_port.triggers import dispatch_native_trigger
     champion_guid = "93d8a5ca-d999-461d-84d8-30975ef4dfc1"
     ability_guid = "daf1ed04-6035-b4dd-a11b-48f93e4bfdb2"
@@ -1910,14 +2281,23 @@ def test_native_chain_resolves_trigger_without_legacy_fallback(db):
     old_db, old_hcs = dbmod._db, hcs._db
     dbmod._db, hcs._db = db, db
     try:
-        resolve_trigger_item(
-            handler, SessionStub(), db, game, bstate, item, pl_t, ai_t)
+        with mock.patch(
+                "abilities.framework.resolution.resolve_ability",
+                side_effect=AssertionError(
+                    "native chain entered the legacy ability resolver")):
+            resolve_trigger_item(
+                handler, SessionStub(), db, game, bstate, item, pl_t, ai_t)
     finally:
         dbmod._db, hcs._db = old_db, old_hcs
-    moves = [(int(ev.session_card_id.uid.uid64), ev.collection)
-             for ev in game.events
-             if isinstance(ev, game_engine.CardMovedSessionEventArgs)]
-    assert (9003, game_engine.ECardCollections.Deck) in moves, moves
+    updates = [(int(ev.session_card_id.uid.uid64), ev.collection)
+               for ev in game.events
+               if isinstance(ev, game_engine.CardUpdatedSessionEventArgs)]
+    assert (9003, game_engine.ECardCollections.Deck) in updates, updates
+    assert not any(
+        int(ev.session_card_id.uid.uid64) == 9003
+        and ev.collection == game_engine.ECardCollections.Deck
+        for ev in game.events
+        if isinstance(ev, game_engine.CardMovedSessionEventArgs))
 
 
 def test_trigger_chain_item_does_not_rerun_its_bom_after_a_picker(db):
@@ -2472,6 +2852,125 @@ def test_one_shot_deathcry_consumes_and_keeps_its_deploy_draw(db):
     assert not (bstate.get("stack") or []), bstate.get("stack")
 
 
+def test_one_shot_copy_of_this_summons_exactly_one_copy(db):
+    """The copy inherits the source's spent ONE-SHOT (C# ``Card.CopyFrom``).
+
+    "[ONE-SHOT]: Deploy - Summon a copy of this" pays its per-game use
+    before the effect runs, and a non-replica copy clones ``m_PerGameUses``.
+    The port copied only the template, so every copy's own Deploy summoned
+    another copy without end.
+    """
+    from rules_port.resolution import resolve_port_trigger
+    from rules_port.triggers import dispatch_native_trigger
+    _copy_card(db, TPL_ECHOCLAW)
+    add_card(db, 701, 5, TPL_ECHOCLAW, loc="warzone")
+    # Only the ONE-SHOT under test; the second Deploy needs an input target.
+    db.execute("UPDATE game_cards SET card_abilities=? WHERE card_uid=701",
+               (json.dumps([AG_ECHOCLAW_ONESHOT_COPY]),))
+    db.commit()
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "_rules_port_attached": True, "stack": [],
+              "_next_instance_id": 1, "resolving_owner_id": 5}
+    handler._current_bstate = bstate
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=SessionStub(),
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="CardEnteredZoneEvent", source_card_id=701,
+        source_player_id=5,
+        data={"event_source_collection": "CastSpells",
+              "event_destination_collection": "warzone"})
+    resolved = []
+    for _ in range(5):
+        if not bstate.get("stack"):
+            break
+        item = bstate["stack"].pop()
+        resolve_port_trigger(handler, game, SessionStub(), db, pl_t, ai_t,
+                             bstate, item)
+        resolved.append(item["ability_guid"])
+    assert resolved == [AG_ECHOCLAW_ONESHOT_COPY], resolved
+    assert not bstate.get("stack"), bstate.get("stack")
+    copies = db.execute(
+        "SELECT card_uid FROM game_cards WHERE session_id=1 "
+        "AND template_guid=? AND location='warzone'",
+        (TPL_ECHOCLAW,)).fetchall()
+    assert len(copies) == 2, copies
+
+
+def test_damage_marks_the_troop_damaged_this_turn(db):
+    """Taking damage sets ECardStates.Damaged; the end-of-turn heal clears it.
+
+    C# ``Session.DealDamage`` sets the bit that ``IsDamagedThisTurn`` reads
+    and ``Card.ResetCardDamage`` clears it. The port only added marked
+    damage, so "each opposing damaged troop" (Bleak Bladetwister) never
+    matched anything.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    from gamedata.semantics import ability_graph
+    from pvp_db import db_clear_warzone_damage
+    from rules_port.context import EffectContext
+    from rules_port.damage_effects import deal_damage
+    from rules_port.targeting import legal_targets_for
+    _copy_card(db, TPL_BLADETWISTER)
+    _copy_card(db, TPL_GLADIATOR)
+    abilities = db.execute(
+        "SELECT abilities_json FROM card_templates WHERE guid=?",
+        (TPL_BLADETWISTER,)).fetchone()[0]
+    target = ability_graph(
+        DEFAULT_RECORD_STORE, json.loads(abilities)[0]).targets[0]
+    add_card(db, 101, 5, TPL_BLADETWISTER)
+    add_card(db, 201, 1000, TPL_GLADIATOR)
+    add_card(db, 202, 1000, TPL_GLADIATOR)
+    pl_t, ai_t = _pl_ai()
+    game = game_engine.Game(1, pl_t, ai_t)
+    handler = HandlerStub(db)
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 3,
+              "_rules_port_attached": True, "stack": []}
+    handler._current_bstate = bstate
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, handler, pl_t, ai_t, bstate, "damage", 101)
+
+    def damaged_targets():
+        return set(legal_targets_for(
+            db, 1, 5, target, 101, both_players=True,
+            battle_state=bstate)) & {201, 202}
+
+    assert damaged_targets() == set()
+    deal_damage(context, 201, 1)
+    state = db.execute(
+        "SELECT card_state FROM game_cards WHERE card_uid=201").fetchone()[0]
+    assert state & int(game_engine.ECardStates.Damaged), state
+    assert damaged_targets() == {201}
+    db_clear_warzone_damage(1, conn=db)
+    db.commit()
+    assert damaged_targets() == set()
+
+
+def test_socketed_gem_conditions_see_the_cards_active_gems(db):
+    """Conditions read ActiveGem like C# ``IsSocketed`` does.
+
+    The condition card projection omitted ``gems``, so every "while this is
+    socketed with a minor gem" static and "you control another socketed
+    card" gate evaluated as unsocketed.
+    """
+    from rules_port.static_rules import effective_stats
+    _copy_card(db, TPL_GROVE_WHISPERER)
+    add_card(db, 101, 5, TPL_GROVE_WHISPERER)
+    bstate = {"player_health": 20, "ai_health": 20, "stack": []}
+    base = db.execute(
+        "SELECT attack, defense FROM card_templates WHERE guid=?",
+        (TPL_GROVE_WHISPERER,)).fetchone()
+    # EGemTypesNew slot 1: 5 = Blood_Minor_1, 3 = Wild_Major_1.
+    for gems, bonus in ((0, 0), (5, 1), (3, 0)):
+        db.execute("UPDATE game_cards SET gems=? WHERE card_uid=101", (gems,))
+        db.commit()
+        attack, defense = effective_stats(db, 1, bstate, 101)[:2]
+        assert (attack, defense) == (base[0] + bonus, base[1] + bonus), (
+            gems, attack, defense)
+
+
 def test_deploy_effect_targets_the_chosen_card_not_the_trigger_source(db):
     """A triggered ability's input target outranks the triggering card.
 
@@ -2968,11 +3467,11 @@ def test_gearsmith_takes_the_revealed_artifact_and_stays_in_play(db):
     reveals = [e for e in game.events
                if isinstance(e, game_engine.CardsRevealedSessionEventArgs)]
     assert len(reveals) == 1, len(reveals)
-    moves = {int(e.session_card_id.uid.uid64): e for e in game.events
-             if isinstance(e, game_engine.CardMovedSessionEventArgs)}
-    assert set(moves) == {top, second, artifact}, moves
-    for uid in (top, second):
-        assert moves[uid].location == game_engine.ECardLocations.Unknown
+    moves = [e for e in game.events
+             if isinstance(e, game_engine.CardMovedSessionEventArgs)]
+    # Both cards remain in Deck. The C# cache does not synthesize class 50
+    # for a position-only change, and the client update already homes the view.
+    assert not moves, moves
     hidden = {int(e.session_card_id.uid.uid64) for e in game.events
               if isinstance(e, game_engine.CardUpdatedSessionEventArgs)
               and getattr(e, "nulling", False)}
@@ -3131,10 +3630,12 @@ def _main():
              test_brood_creeper_damage_to_opposing_champion_summons,
              test_cards_attacked_dispatch_uses_group_count_once,
              test_card_battled_dispatch_is_directional,
+             test_spell_finish_uses_the_effective_post_resolution_type,
              test_lose_life_modifier_is_not_damage,
              test_brood_creeper_does_not_fire_on_own_champion,
              test_runeweb_infiltrator_puts_two_spiderling_eggs_in_opponent_deck,
              test_vampire_king_steals_a_random_troop_from_the_damaged_hand,
+             test_vampire_prince_rewards_buried_opponent_resource,
              test_queued_trigger_source_projection_preserves_combat_state,
              test_generated_card_uid_is_independent_of_row_id,
              test_spawn_of_othuyeg_buries_one_or_five,
@@ -3145,6 +3646,9 @@ def _main():
              test_multi_target_play_card_keeps_all_target_instances,
              test_chronic_madness_buries_escalates_and_returns_to_deck,
              test_bunjitsu_void_cost_is_a_cost_instance,
+             test_undying_weaver_offers_scrounge_cost_during_card_play,
+             test_block_exception_reads_the_blockers_template_shards,
+             test_granted_scrounge_joins_the_card_play_plan,
              test_champion_power_offer_requires_its_authored_cost_and_target,
              test_practice_ability_chain_window_reaches_the_client,
              test_bunjitsu_voided_stats_sum_both_troops,
@@ -3178,6 +3682,9 @@ def _main():
              test_booby_trap_damages_its_owners_champion,
              test_generated_card_pool_offers_only_ownable_castable_cards,
              test_one_shot_deathcry_consumes_and_keeps_its_deploy_draw,
+             test_one_shot_copy_of_this_summons_exactly_one_copy,
+             test_damage_marks_the_troop_damaged_this_turn,
+             test_socketed_gem_conditions_see_the_cards_active_gems,
              test_emberspire_witch_blocks_every_champion_health_gain,
              test_deploy_effect_targets_the_chosen_card_not_the_trigger_source,
              test_replaced_projection_drains_into_the_next_packet_once,

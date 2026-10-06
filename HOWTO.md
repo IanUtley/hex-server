@@ -262,6 +262,13 @@ usage in `battle_state["champion_ability_uses"]`, and per-turn usage in
 `battle_state["champion_ability_uses_per_turn"]`; resolve controller identity
 with `rules_port.runtime_helpers.champion_owner_id` / `champion_uid_for_owner`
 instead of converting a participant UID (`game_engine.UID` has no `__int__`).
+Per-player state (health, charges, resources, thresholds, active player,
+per-turn counters) must be read through `runtime_helpers.participant_value`,
+`participant_side`, `is_active_participant` and
+`participant_turn_counter_key`. In PvP both participants are nonzero raw IDs,
+and `pvp_view.to_effect_view` puts the *resolving* participant on `player`
+(often `pids[1]`), so neither the PvE `bool(owner)` mapping nor a `pids[0]`
+mapping is valid there; the view's `pvp_health_map` is the authority.
 Manual champion powers are accepted, paid, and queued by the port
 (`MetadataCardTransactionExecutor`), which also gates and spends their
 authored `m_UsesPerGame` and `m_UsesPerTurn`; the legacy HConnect
@@ -422,8 +429,16 @@ cost, target, and transaction identity before mutating state.
   so only scanning the entering card's own champion leaves the opposing
   champion's trait unfired. The authored trigger conditions still decide what
   actually fires.
-- When moving a card, send `CardUpdated` with the destination collection before
-  `CardMoved`. `CardDrawn` does not change the client's zone by itself.
+- A `CardUpdated` with a changed collection or controller causes
+  `ClientStateCache.Update` to derive the UI `CardMoved` before forwarding the
+  update to `UIBattle`. Do not also send an explicit class-50 `CardMoved` for
+  that same zone/controller transition: `UIBattle.OnCardMoved` processes both
+  and repeats the view move and move sound. `CardDrawn` is a separate sound/deck
+  event and does not change the client's zone. For a movement that does not
+  change collection or controller, `UIBattle.OnCardUpdated` still moves the
+  view home. The C# cache does not derive class 50 for a position-only change,
+  and this checkout has no separate C# class-50 producer; do not add a wire
+  event for an inferred reorder without a concrete client path requiring it.
 - A `CardUpdated` that re-announces a trigger source must carry its current
   card-state bits. Omitting `state` defaults to `None`, which makes a tapped
   attacking troop render ready until a later state refresh.
@@ -431,6 +446,11 @@ cost, target, and transaction identity before mutating state.
   persisted stack item, `AbilityPushedOnChain`, `TopOfChainResolved`, and
   `RemovedTopOfChain`. Card plays may use the client's built-in
   `PLAY_CARD_ABILITY_TEMPLATE_ID` as the chain-rendering template.
+- A permanent chain descriptor must preserve the card instance's automatic
+  cast ability GUIDs, activation data, X value, hand-play context, and voided
+  cost UIDs. Resolve those cast graphs while the card is still in `CastSpells`,
+  before publishing `CardEnteredZoneEvent`, so an additional-cost ability can
+  grant an entry trigger for the Warzone scan to discover.
 - A trigger chain item carries the card that raised the event in
   `trigger_target_uid` and the card chosen for the ability's input-bearing
   target in `target_uid`. Resolve the input target from `target_uid`: the event
@@ -536,8 +556,10 @@ cost, target, and transaction identity before mutating state.
 The server's normalized `game_cards.location` values are `deck`, `hand`,
 `warzone`, `PlayedResources`, `void`, and `discard`. The ordered `position`
 column is scoped by session, owner, and location. A zone mutation updates the
-DB first, then publishes the appropriate `CardUpdated`, movement, draw, play,
-resource, or combat events in client-compatible order.
+DB first, then publishes a destination `CardUpdated`; the client cache derives
+the corresponding UI move when collection or controller changes. Publish
+separate draw, play, resource, or combat events where the C# path does so, and
+do not duplicate a cache-derived move with an explicit class-50 event.
 
 ## 7. Gamedata and generated data
 

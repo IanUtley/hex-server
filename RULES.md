@@ -87,8 +87,9 @@ chain/stack model when the path supports responses:
 
 Within one ability, effect groups execute in the metadata's
 `m_AbilityEffectList` order. Those leaves are not separate priority items.
-Some legacy trigger paths still resolve directly; they are compatibility gaps,
-not a reason to add a new card-name special case.
+The legacy trigger scanner remains for non-attached compatibility callers.
+Attached gameplay dispatches through RulesPort and must fail closed instead of
+falling back to that scanner.
 
 The live RulesPort is the migration boundary for these gameplay transactions.
 Typed card/ability activations, choices, costs, combat declarations, and phase
@@ -150,10 +151,20 @@ zone, owner, mutable state, and affordability determine playability.
 
 Normalized locations are `deck`, `hand`, `warzone`, `PlayedResources`, `void`,
 and `discard`. A card move updates the authoritative DB and ordered position,
-then sends the destination `CardUpdated` before `CardMoved`. A draw needs both a
-zone/card representation update and the draw animation event. Permanent cards
-normally enter the warzone; actions resolve through the cast-spell path and
-then leave for the appropriate destination. A card with the `CantReady`,
+then sends a destination `CardUpdated`. When collection or controller changes,
+the C# client cache derives the UI `CardMoved` from that update, so the server
+must not also send a duplicate class-50 event for the same transition. A
+same-collection position change does not produce a cache-derived `CardMoved`;
+`UIBattle.OnCardUpdated` still moves the view home, and this checkout has no
+separate C# class-50 producer. Do not add a standalone event for an inferred
+reorder without a concrete client path requiring it. A draw needs the
+zone/card representation update and the separate draw animation event.
+Permanent cards
+normally enter the warzone; actions resolve through the cast-spell path. At
+`FinishResolvingCard`, a card still on CastSpells enters Warzone when its
+current effective type is Troop, Artifact, or Constant; other cards enter
+Discard. An effect that already moved the card keeps that destination. A card
+with the `CantReady`,
 `CantReadyNormally`, or `CantReadyNormallyHidden` IntAttr is not readied at its
 controller's Ready step. When a player buries cards, every other player's
 champion `BuryBonus` adds to the number buried. Cards with
@@ -264,6 +275,15 @@ Deathcry does not trigger while any opponent's champion has
 `OpposingDeathcriesCantTrigger`. Verdict builds the authored good/bad choice
 cards into the target player's choice zone and activates the built-in
 choose/play ability; `VerdictChoice` gives the caster the choice instead.
+
+A choice-zone target selection is not itself a play: its child ability decides
+the card's destination. The built-in choose/play path moves the selected
+choice card to `PlayedResources` and activates that card's automatic
+abilities, with the selected card as the activation source. Automatic here
+matches the client definition: the ability is not manual, has no trigger event,
+has no indexed activation, and has effects. Event-triggered abilities remain
+with trigger dispatch. Generated choice cards retain their originating
+ability-source link for authored source and choice-override targeting.
 
 The Records ability interpreter has shared paths for the shipped effect
 leaves, target and condition metadata, output variables, duration boundaries,

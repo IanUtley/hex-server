@@ -196,11 +196,15 @@ def _threshold_provided(card):
     provided = 0
     for threshold in _thresholds_of(card):
         if isinstance(threshold, dict):
-            provided |= _shard_bits(threshold.get(
+            color = threshold.get(
                 "m_ColorFlags", threshold.get("color_flags",
-                                              threshold.get("color"))))
+                                               threshold.get("color")))
         else:
-            provided |= _shard_bits(threshold)
+            try:
+                color = threshold.field("m_ColorFlags", None)
+            except (AttributeError, TypeError):
+                color = threshold
+        provided |= _shard_bits(color)
     return provided
 
 
@@ -216,6 +220,10 @@ def _card_shards(card):
         for item in shards:
             actual |= _shard_bits(item)
         return actual
+    if shards is not None:
+        actual = _shard_bits(shards)
+        if actual:
+            return actual
     actual = _shard_bits(_v(card, "color", "color_flags", "shard",
                             "shard_bits", default=0))
     return actual or int(default)
@@ -1794,6 +1802,21 @@ class IntAttrFilter:
                       default=None)
             if isinstance(tree, dict):
                 lhs = _tac_path_value(tree, parts)
+        # Runtime card TAC is kept in the session statistics projection rather
+        # than on the persisted card row.  C# IntAttrFilter reads this path
+        # directly from Card.Get(...), so preserve the same behavior for card
+        # scoped turn statistics such as TimesDied and TimesDiscarded.
+        if lhs is None and len(parts) >= 2 and parts[0].lower() == \
+                "cardstatsthisturn":
+            card_uid = _v(target, "card_uid", "session_card_id", "id",
+                          default=None)
+            try:
+                from .statistics import tac_stat
+                lhs = tac_stat(
+                    _runtime_state(session), "cards", card_uid, parts[0],
+                    ">".join(parts[1:]), default=None)
+            except (ImportError, TypeError, ValueError):
+                lhs = None
         if lhs is None:
             lhs = _attr_path(target, path, 0)
         try:
@@ -1941,7 +1964,7 @@ class TopNOfDeck:
             amount = (len(deck) + 1) // 2
         else:
             amount = int(self.amount or 0)
-            context = session if isinstance(session, dict) else {}
+            context = _runtime_state(session)
             if self.add_sapphire:
                 thresholds = context.get(f"thresh_{owner}")
                 if thresholds is None:
@@ -1954,11 +1977,43 @@ class TopNOfDeck:
                 amount += int(thresholds.get("Sapphire",
                              thresholds.get(2, thresholds.get("2", 0))) or 0)
             if self.add_x:
-                amount += int(_v(source, "resource_x_cost_paid", "x_cost",
-                                 default=0) or 0)
+                source_x_cost = _v(
+                    source, "resource_x_cost_paid", "card_x_cost_paid",
+                    "x_cost", default=None)
+                source_uid = _id(source)
+                paid_by_card = context.get("card_x_cost_paid") or {}
+                if source_uid is not None and isinstance(paid_by_card, dict):
+                    source_key = str(int(source_uid))
+                    if source_key in paid_by_card:
+                        source_x_cost = paid_by_card[source_key]
+                    elif int(source_uid) in paid_by_card:
+                        source_x_cost = paid_by_card[int(source_uid)]
+                if (source_x_cost is None and source_uid is not None and
+                        int(context.get("resolving_source_uid", -1) or -1)
+                        == int(source_uid)):
+                    # The client reads CardXCostPaid from the active ability
+                    # source. During a RulesPort resolution the equivalent
+                    # value is carried on battle state until it is persisted
+                    # into the card instance's paid-cost map.
+                    source_x_cost = context.get(
+                        "x_cost", context.get("ability_x_cost", 0))
+                amount += int(source_x_cost or 0)
             if self.add_removed_counters:
-                amount += (int(_v(source, "counter_cost_paid",
-                                  "removed_counters", default=0) or 0) *
+                removed = _v(source, "counter_cost_paid",
+                             "removed_counters", default=None)
+                source_uid = _id(source)
+                paid_by_card = context.get("card_counter_cost_paid") or {}
+                if source_uid is not None and isinstance(paid_by_card, dict):
+                    source_key = str(int(source_uid))
+                    if source_key in paid_by_card:
+                        removed = paid_by_card[source_key]
+                    elif int(source_uid) in paid_by_card:
+                        removed = paid_by_card[int(source_uid)]
+                if (removed is None and source_uid is not None and
+                        int(context.get("resolving_source_uid", -1) or -1)
+                        == int(source_uid)):
+                    removed = context.get("counter_cost_paid", 0)
+                amount += (int(removed or 0) *
                            int(self.add_removed_counters_multiplier or 1))
             if self.add_source_cards_attack:
                 amount += int(_v(source, "attack", "attack_value", default=0) or 0)
@@ -2016,8 +2071,18 @@ class TACFilter:
     template: object = None
     def matches(self, card, **kwargs):
         name = self.template if isinstance(self.template, str) else _v(self.template, "name", "template_name", default=None)
-        if name == "IsQuick": return IsQuick().matches(card, **kwargs)
-        if name == "IsBasic": return IsBasic().matches(card, **kwargs)
+        if name == "IsQuick":
+            # C# has distinct Card and CardTemplate overloads. Runtime cards
+            # use the live QuickSpeed attribute; template discovery checks the
+            # authored QuickAction/Quick card-type flags. Random card creation
+            # passes this marker on its SQL template projection.
+            if bool(_v(card, "_card_template_candidate", default=False)):
+                return bool(_card_type_value(card) & (64 | 8192))
+            return IsQuick().matches(card, **kwargs)
+        if name == "IsBasic":
+            if bool(_v(card, "_card_template_candidate", default=False)):
+                return not bool(_card_type_value(card) & (64 | 8192))
+            return IsBasic().matches(card, **kwargs)
         if name == "PlayerMeetsThresholdRequirementsToCast":
             player = kwargs.get("player")
             if player is None:
@@ -2552,7 +2617,15 @@ def records_filter_from_metadata(spec: Any) -> CardFilter:
         field_name = "m_CardSource" if kind == "incollection" else "m_Collection"
         raw = str(normalized.get(field_name, normalized.get(
             "collection", ""))).rsplit(".", 1)[-1].lower()
-        normalized["collection"] = collections.get(raw, 0)
+        # ECardCollections is a flags enum. Records serializes masks such as
+        # "Deck|Hand|Warzone" as a pipe-delimited name list, and C# matches
+        # when any bit overlaps the card's current collection. Resolving the
+        # whole string as one enum name silently produced mask zero, excluding
+        # otherwise legal cards from broad authored filters.
+        collection_mask = 0
+        for name in raw.split("|"):
+            collection_mask |= int(collections.get(name.strip(), 0) or 0)
+        normalized["collection"] = collection_mask
         normalized.pop("m_Collection", None)
     return filter_from_metadata(normalized)
 
@@ -2906,6 +2979,19 @@ def _template_card(template):
             if ref:
                 abilities.append(str(ref).lower())
     cost = int(field("m_ResourceCost", 0) or 0)
+    thresholds = tuple(field("m_Threshold", ()) or ())
+    shards = 0
+    for threshold in thresholds:
+        if isinstance(threshold, dict):
+            color = threshold.get(
+                "m_ColorFlags", threshold.get("color_flags",
+                                               threshold.get("color")))
+        else:
+            try:
+                color = threshold.field("m_ColorFlags", None)
+            except (AttributeError, TypeError):
+                color = threshold
+        shards |= _shard_bits(color)
     return {
         "template_guid": str(getattr(template, "guid", "") or ""),
         "card_type": field("m_CardType", ""),
@@ -2919,7 +3005,8 @@ def _template_card(template):
         "faction": field("m_Faction"),
         "attributes": _attribute_bits(field("m_AttributeFlags", 0)),
         "socket_count": int(field("m_SocketCount", 0) or 0),
-        "thresholds": tuple(field("m_Threshold", ()) or ()),
+        "shards": shards,
+        "thresholds": thresholds,
         "set_id": _normalized_set_id(field("m_SetId")),
         "card_abilities": abilities,
         "tac_data": field("m_SerializedTAC"),

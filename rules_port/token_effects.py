@@ -122,9 +122,6 @@ def create_matching_target(context, target, count, collection,
         _tpl, card_type, _name, cost, attack, defense, gems = \
             context.handler._card_full_data(context.game, scid, template_guid)
         collection_value = card_collection_for_location(location)
-        context.game.push_card_moved(
-            scid, recipient, collection_value,
-            game_engine.ECardLocations.Top, 0)
         context.game.push_card_updated(
             scid, recipient, collection_value, card_type,
             template_id=template_guid, cost=cost, attack=attack,
@@ -268,7 +265,8 @@ def _matching_template_candidates(context, card_filter, banned_guids=(),
                                       or threshold_data.get("values") or [])],
                      "thresholds": candidate_thresholds,
                      "subtype": row[6] or "",
-                     "attributes": int(row[7] or 0), "user_id": owner}
+                     "attributes": int(row[7] or 0), "user_id": owner,
+                     "_card_template_candidate": True}
         if records_filter_matches(candidate, card_filter,
                                   source=source, context=context,
                                   player={"resource_thresholds":
@@ -558,12 +556,18 @@ def summon_token(context, payload=None):
         count = max(0, int(count or 0))
     except (TypeError, ValueError):
         count = 0
-    collection = str(context.template_value(
-        "m_CardCollection", payload.get("collection", "Warzone")) or
-        "Warzone").rsplit(".", 1)[-1].lower()
-    location = {"deck": "deck", "hand": "hand", "choosing": "choosing",
-                "discard": "discard", "underground": "underground",
-                "void": "void"}.get(collection, "warzone")
+    collection_value = context.template_value(
+        "m_CardCollection", payload.get("collection", "Warzone"))
+    collection = str(collection_value or "Warzone").rsplit(".", 1)[-1].lower()
+    # C# CreateNTokensFromResource keeps an ECardCollections.None token in
+    # the owner's None collection. A later authored MoveCardToZone effect may
+    # then put that exact CreatedCards entry into play. Treating None as
+    # Warzone enters it early and makes the later move a no-op, changing both
+    # zone-trigger order and the persisted effect trace.
+    location = ("none" if collection in {"none", "unknown"} else
+                {"deck": "deck", "hand": "hand", "choosing": "choosing",
+                 "discard": "discard", "underground": "underground",
+                 "void": "void"}.get(collection, "warzone"))
     deck_location = str(context.template_value(
         "m_CardLocation", "") or "").rsplit(".", 1)[-1].lower()
     card_filter = payload.get("card_filter")
@@ -782,12 +786,16 @@ def summon_token(context, payload=None):
             context.session.session_id, owner,
             [uid for uid, _create_guid, _card_type in made], connection=context.db)
     for uid, created_guid, created_card_type in made:
+        _publish_created_card(context, uid, owner, created_card_type)
+        if location == "none":
+            # C# creates the card instance and its CreatedCards entry, but
+            # MoveCard(None) has no client collection projection or entered-
+            # zone event. The following typed zone effect owns that boundary.
+            continue
         scid = game_engine.SessionCardId(game_engine.UID(uid))
         _tpl, card_type, name, cost, attack, defense, gems = \
             context.handler._card_full_data(context.game, scid, created_guid)
         collection_value = card_collection_for_location(location)
-        context.game.push_card_moved(scid, recipient, collection_value,
-                                     game_engine.ECardLocations.Top, 0)
         context.game.push_card_updated(
             scid, recipient, collection_value, card_type,
             template_id=created_guid, card_name=name, cost=cost, attack=attack,
@@ -796,7 +804,6 @@ def summon_token(context, payload=None):
             context._push_modifier_card(
                 int(uid), thresholds=[int(value)
                                      for value in conscript_thresholds])
-        _publish_created_card(context, uid, owner, created_card_type)
         dispatch_trigger(context, "CardEnteredZoneEvent", uid, owner,
                          data={"event_destination_collection": location})
         for attribute, previous, current in conscript_gained_attributes.get(
@@ -849,10 +856,16 @@ def create_token_copy(context):
         # CreateTokenCopy contract defaults it to one.
         count = 1
     try:
-        count = max(1, int(count))
+        count = int(count)
     except (TypeError, ValueError):
         raise RuntimeError(
             "RulesPort CreateTokenCopy effect has invalid typed count")
+    # AuthoritativeSessionBase.CreateTokenCopies returns immediately for a
+    # zero or negative amount. Do not coerce a typed zero to one: callers use
+    # zero for variables such as ActionsCastThisTurn, and creating a copy in
+    # that case can recursively retrigger the copied card's enter-play ability.
+    if count <= 0:
+        return "copy: zero copies"
     # C# CreateTokenCopies adds GetCreationBonuses once for the copied
     # template before creating the batch.
     count += _creation_count_bonus(context, row[0])
@@ -907,13 +920,17 @@ def create_token_copy(context):
             apply_replica_mods(context, uid, row[0])
             replica_type, replica_subtype = replica_projection(
                 context.db, context.session.session_id, uid)
+        else:
+            # C# Card.CopyFrom (non-replica) clones the source's per-game,
+            # per-turn and cooldown usage, so a spent ONE-SHOT stays spent.
+            from pvp_db import db_copy_card_uses
+            db_copy_card_uses(context.session.session_id, int(target), uid,
+                              conn=context.db)
         scid = game_engine.SessionCardId(game_engine.UID(uid))
         _tpl, card_type, _name, cost, attack, defense, _gems = \
             context.handler._card_full_data(context.game, scid, row[0])
         from .runtime_helpers import card_collection_for_location
         collection = card_collection_for_location(location)
-        context.game.push_card_moved(scid, recipient, collection,
-                                     game_engine.ECardLocations.Top, 1)
         context.game.push_card_updated(
             scid, recipient, collection, replica_type or card_type,
             template_id=row[0], cost=cost, attack=attack, defense=defense,

@@ -267,6 +267,46 @@ def test_claim_arena_rewards_pays_100_gold_per_sack():
     assert pve_db.db_get_arena_state(user_id)["deck_id"] == 0
 
 
+def test_cashout_closes_unplayed_arena_without_rewards():
+    """A zero-reward cashout clears the run and reopens deck selection."""
+    import db
+    import pve_db
+    import services.arena as arena_service
+
+    user_id = 9111
+    conn = db._db
+    history = [{"result": "NONE"} for _ in range(20)]
+    _seed_arena_reward_state(conn, user_id, 0, 0, history)
+
+    result = pve_db.db_claim_arena_rewards(user_id)
+
+    assert result["success"] is True, result
+    assert result["gold"] == 0, result
+    assert result["loot"] == [], result
+    arena = pve_db.db_get_arena_state(user_id)
+    assert arena["deck_id"] == 0, arena
+    assert arena["challenger_index"] == 0, arena
+
+    encoded = {}
+
+    def encode(types, fields):
+        encoded["types"] = types
+        encoded["fields"] = fields
+        return b"join-failure"
+
+    class Handler:
+        user_profile = {"id": user_id}
+
+    with mock.patch.object(
+            arena_service, "encode_objfmt_response", side_effect=encode), \
+            mock.patch.object(arena_service, "_send_response") as send:
+        arena_service._join(
+            Handler(), "target", "instance", 3, 0, "session", 0, "mail")
+
+    assert encoded["fields"] == [("Success", "bool", False)], encoded
+    assert send.call_args.args[1] == 10001, send.call_args
+
+
 def test_destroy_arena_responds_and_clears_roster():
     """The client's post-cashout DestroyArenaData request is acknowledged."""
     import services.arena as arena_service
@@ -656,6 +696,7 @@ if __name__ == "__main__":
     test_mc_accept_persists_for_the_current_fight()
     test_cashout_sends_revealed_roster_before_response()
     test_claim_arena_rewards_pays_100_gold_per_sack()
+    test_cashout_closes_unplayed_arena_without_rewards()
     test_destroy_arena_responds_and_clears_roster()
     test_start_encounter_fra_flags_are_transient()
     test_elite_win_pairs_reward_with_that_tiers_boss_modification()

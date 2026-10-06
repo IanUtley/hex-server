@@ -1,0 +1,2 @@
+;0;0;5;RoutingPlayerId;1;1;1;m_UID64;2;2;0;F4D2040000000000;Success;3;3;0;1TurnOrderPlayerIds;4;4;0;2;0;5;1;1;m_UID64;6;2;0;F4D2040000000000;1;7;1;1;m_UID64;8;2;0;03E8030000000000;SeedW;9;2;0;0504030201EFCDAB;SeedZ;10;2;0;EFCDAB9078563412;Game.Shared.Network.GameSession.GameStartedEventArgs;Game.Shared.UID;System.UInt64;System.Boolean;System.Collections.Generic.List`1#Game.Shared.UID
+239;53;31;15;105;39;31;39;31;29;30

@@ -603,11 +603,20 @@ class CardEvaluator:
 
     # -- DB loads ----------------------------------------------------------
     def _load_hand(self):
-        from pvp_db import db_ai_evaluator_card_rows
+        from pvp_db import (db_ai_evaluator_card_rows,
+                            db_game_card_effective_cost)
         rows = db_ai_evaluator_card_rows(
             self.session.session_id, self.ai_owner_id, "hand",
             conn=self._connection())
-        return [CardInfo(r) for r in rows]
+        cards = [CardInfo(r) for r in rows]
+        # The joined snapshot's template cost is only the printed value.
+        # Use the same instance/static projection as legality and payment so
+        # reductions in the hand affect both AI playability and evaluation.
+        for card in cards:
+            card.cost = db_game_card_effective_cost(
+                self.session.session_id, card.card_uid, self.bstate,
+                conn=self._connection())
+        return cards
 
     def _load_warzone(self, user_id):
         from pvp_db import db_ai_evaluator_card_rows

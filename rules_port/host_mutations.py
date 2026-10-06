@@ -27,19 +27,13 @@ def discard_card_to_owner(host, session, pl_t, ai_t, card_uid):
     scid = game_engine.SessionCardId(game_engine.UID(int(card_uid)))
     tpl, card_type, _name, cost, attack, defense, gems = host._card_full_data(
         game, scid, template_guid, None)
-    game.push_card_discarded(scid, owner_player_uid)
-    # CardRepresentation.Update emits an implicit CardMoved when its
-    # collection changes. Emit the explicit move first so the subsequent
-    # complete CardUpdated refresh does not schedule a duplicate animation.
-    game.push_card_moved(
-        scid, owner_player_uid, game_engine.ECardCollections.Discard,
-        game_engine.ECardLocations.Top, 0)
     game.push_card_updated(
         scid, owner_player_uid, game_engine.ECardCollections.Discard,
         game_engine.card_type_from_db(card_type)
         if card_type else game_engine.ECardTypes.Troop,
         attack=attack, defense=defense, cost=cost,
         template_id=tpl, gems=gems)
+    game.push_card_discarded(scid, owner_player_uid)
     from . import chain
     from .persistence import load_state
     bstate = load_state(session)
@@ -63,32 +57,25 @@ def project_mulligan_cards(host, game, event_player_uid, old_rows,
     new_player_uid = new_player_uid or event_player_uid
     for row in old_rows or ():
         scid = game_engine.SessionCardId(game_engine.UID(int(row[1])))
-        def update():
-            game.push_card_updated(scid, event_player_uid,
-                                   game_engine.ECardCollections.Deck,
-                                   game_engine.ECardTypes.Unknown, nulling=True)
-        def move():
-            game.push_card_moved(scid, event_player_uid,
-                                 game_engine.ECardCollections.Deck,
-                                 game_engine.ECardLocations.Top, 0)
-        if update_old_first:
-            update(); move()
-        else:
-            move(); update()
+        # CardUpdated changes Hand -> Deck in the client cache, which derives
+        # one UI CardMoved before forwarding the update. ``update_old_first``
+        # remains accepted for existing callers.
+        game.push_card_updated(scid, event_player_uid,
+                               game_engine.ECardCollections.Deck,
+                               game_engine.ECardTypes.Unknown, nulling=True)
     for index, row in enumerate(new_rows or ()):
         card_uid, template_guid = int(row[0]), row[2]
         scid = game_engine.SessionCardId(game_engine.UID(card_uid))
         _tpl, card_type, _name, _cost, _attack, _defense, gems = \
             host._card_full_data(game, scid, template_guid, row[1])
         owner = new_player_uid if reveal_new else event_player_uid
-        if draw_new:
-            game.push_card_drawn(scid, owner, index + 1)
-        if move_new:
-            game.push_card_moved(scid, owner, game_engine.ECardCollections.Hand,
-                                 game_engine.ECardLocations.Top, index)
         game.push_card_updated(
             scid, owner, game_engine.ECardCollections.Hand, card_type,
             template_id=template_guid, nulling=not reveal_new, gems=gems)
+        # The cache derives the collection move from CardUpdated. Keep the
+        # legacy flag in the signature for adapter compatibility.
+        if draw_new:
+            game.push_card_drawn(scid, owner, index + 1)
 
 
 def project_attacking_card(host, game, session_card_id, player_uid,
@@ -142,9 +129,6 @@ def queue_free_played_card(host, game, session, db, player_uid, ai_uid,
         host._card_full_data(game, scid, template_guid)
     if isinstance(card_type_bits, str):
         card_type_bits = game_engine.card_type_from_db(card_type_bits)
-    game.push_card_moved(
-        scid, owner, game_engine.ECardCollections.CastSpells,
-        game_engine.ECardLocations.Top, 0)
     game.push_card_updated(
         scid, owner, game_engine.ECardCollections.CastSpells,
         card_type_bits, template_id=template_guid, cost=cost,

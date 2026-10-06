@@ -56,11 +56,13 @@ def player_has_eligible_attackers(db, session_id, battle_state, player_id):
 
 
 def _combat_card(db, session_id, battle_state, uid):
-    from pvp_db import db_card_location, db_card_mutation_info
+    from pvp_db import (db_card_location, db_card_mutation_info,
+                        db_card_template_field)
     info = db_card_mutation_info(session_id, int(uid), conn=db)
     if not info:
         return None, 0, 0
     from .static_rules import effective_stats
+    from .targeting import shards_from_threshold
     attack, defense, attrs, flags, damage = effective_stats(
         db, session_id, battle_state or {}, int(uid))
     # ``db_card_mutation_info`` returns (template_guid, owner, card_type).
@@ -69,10 +71,17 @@ def _combat_card(db, session_id, battle_state, uid):
     # ``ValueError`` out of the filter player operand and dropped the
     # connection mid-turn.
     owner = int(info[1] or 0)
+    # Records filters such as Wailing Banshee's block exception evaluate
+    # IsColor against the runtime card projection.  Without the current
+    # template's authored threshold shards, a Blood troop is treated as
+    # colorless and the native phase graph skips DeclareDefense entirely.
+    shards = shards_from_threshold(db_card_template_field(
+        info[0], "threshold_json", conn=db))
     return {"card_uid": int(uid), "card_type": info[2] or "",
             "location": db_card_location(session_id, int(uid), conn=db)
             or "warzone",
             "user_id": owner, "owner_id": owner, "controller_id": owner,
+            "template_guid": info[0], "shards": shards,
             "attack": attack, "defense": defense,
             "attributes": attrs, "rule_flags": flags}, attrs, int(damage or 0)
 
@@ -95,8 +104,11 @@ def _rules(db, session_id, battle_state, uid):
     return values
 
 
-def card_int_attr(db, session_id, uid, name):
-    """Sum a dynamic int-attribute across a card's permanent/temporary buffs."""
+def card_int_attr(db, session_id, uid, name, battle_state=None):
+    """Read a card-context IntAttr including Records-backed static auras."""
+    if db is None:
+        import db as db_layer
+        db = db_layer._db
     from pvp_db import db_card_mutation_field
     total = 0
     for column in ("permanent_buffs", "temporary_buffs"):
@@ -109,7 +121,9 @@ def card_int_attr(db, session_id, uid, name):
             attrs = data.get("int_attrs")
             if isinstance(attrs, dict):
                 total += int(attrs.get(name, attrs.get(name.lower(), 0)) or 0)
-    return total
+    from .static_rules import effective_card_int_attr
+    return effective_card_int_attr(
+        db, session_id, battle_state or {}, int(uid), name, total)
 
 
 def can_block(db, session_id, battle_state, attacker_uid, blocker_uid):

@@ -194,6 +194,9 @@ def test_typed_variables_read_highest_charge_and_trigger_damage():
         "_ability_damage_dealt": 5,
         "resolving_ability_instance_id": 77,
         "ability_runtime_state": {"77": {"DamageDealt": 6}},
+        # The authored default is populated in the activation variable map,
+        # but C# IntAttrAbilityVariable reads the active instance TAC instead.
+        "ability_variables": {"AbilityDamage": 0},
     }
     assert _expression_value(None, 1, state, None, 5, raw, "Charges") == 3
     assert _expression_value(None, 1, state, None, 5, raw, "Damage") == 4

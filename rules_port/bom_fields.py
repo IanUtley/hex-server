@@ -273,7 +273,7 @@ def modifier_metadata(effect_guid) -> dict[str, Any]:
     }
     out: dict[str, Any] = {"property": properties.get(kind, "")}
     for key in ("m_AttributeFlags", "m_Attribute", "m_Operation",
-                "m_Value", "m_ThresholdColor", "m_Shard", "m_Subtype",
+                "m_Value", "m_Double", "m_ThresholdColor", "m_Shard", "m_Subtype",
                 "m_CardFilter", "m_CopySourceCard", "m_SetThresholds",
                 "m_RemoveAllCounters", "m_RemoveHalfRoundedUp",
                 "m_ReplaceExistingValue", "m_IsCombatDamage",

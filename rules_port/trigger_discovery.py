@@ -258,56 +258,26 @@ class RecordsTriggerDiscovery:
         if owner_id is None:
             return self._freeze(candidates)
 
+        # C# keeps event-type registrations for cards as they move between
+        # collections (Session.EventMaps.Current/Previous). The event's
+        # ``zones`` payload describes the card involved in that event; it does
+        # not describe where listener cards are registered. Scan every current
+        # listener collection on both sides, then let the native dispatcher
+        # apply each ability's TriggerCollectionFlags and authored conditions.
+        # This includes triggers held in Void or Hand for start-turn, cast,
+        # damage, and other events, and preserves the client behavior where an
+        # opposing champion can observe an unrestricted event.
+        other = self._opposing_owner(owner_id)
         sides = [int(owner_id)]
-        zone_sets: list[tuple[str, ...]] = [
-            tuple(zones or ("warzone",))]
-        if zones is None and event_type in ("TurnStartedEvent", "TurnEndedEvent"):
-            zone_sets = [("warzone", "hand", "deck", "discard", "underground")]
-            # A turn boundary is broadcast to every trigger listener in the
-            # session, not just the active champion's cards.  "At the start of
-            # each champion's turn" (Cerebral Fulmination) and "at the end of
-            # each champion's turn" are owned by cards on either side, so an
-            # AI-owned copy must fire on the human's turn too.  The authored
-            # conditions (TriggerPlayerIsActivePlayer and friends) still decide
-            # which side a particular trigger actually belongs to.
-            other = self._opposing_owner(owner_id)
-            if other is not None and other not in sides:
-                sides.append(other)
-        if event_type == "CardDrawnEvent":
-            other = self._opposing_owner(owner_id)
-            if other is not None:
-                sides.append(other)
-                zone_sets.append(("hand",))
-        elif event_type == "CardCastEvent":
-            # CardCastEvent listeners can react to a card cast by either
-            # champion. Their authored trigger conditions distinguish
-            # "you" from opponent casts, so discover both sides here.
-            other = self._opposing_owner(owner_id)
-            if other is not None:
-                sides.append(other)
-        elif event_type == "CardEnteredZoneEvent":
-            zone_sets.append(("underground",))
-            other = self._opposing_owner(owner_id)
-            if other is not None:
-                sides.append(other)
-        elif event_type == "CombatEndedEvent":
-            other = self._opposing_owner(owner_id)
-            if other is not None:
-                sides.append(other)
-        elif event_type == "CardDealtDamageEvent":
-            for uid, abilities in zone_holders(owner_id, ("hand",)).items():
-                if int(uid) != int(source_uid or 0):
-                    candidates.setdefault(int(uid), []).extend(abilities)
+        if other is not None and int(other) not in sides:
+            sides.append(int(other))
+        zone_sets: list[tuple[str, ...]] = [(
+            "warzone", "hand", "deck", "discard", "void",
+            "underground", "CastSpells", "PlayedResources", "choosing",
+            "mod", "simulacrum")]
 
-        # Each side has a corresponding zone-set.  Additional event-specific
-        # zones are appended above; zip would silently drop a side, so retain
-        # the legacy scanner's Cartesian product deliberately.
-        # A champion's authored trigger can observe the other side's cards
-        # ("When a troop enters play, there is a 25% chance it gets Speed and
-        # +1[ATK]" has no m_Your/m_Opposing restriction).  Champions have no
-        # ``game_cards`` row, so scan each considered side's champion rather
-        # than only the event owner's; the authored trigger conditions still
-        # decide which entries actually fire.
+        # Champions have no ``game_cards`` row, so scan both champion sources;
+        # authored conditions decide which side actually responds.
         for side in sides:
             for uid, abilities in champion_holders(side).items():
                 candidates.setdefault(int(uid), []).extend(abilities)

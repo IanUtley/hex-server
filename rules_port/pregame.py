@@ -596,7 +596,20 @@ def apply_pregame_abilities(game, session, db, handler, player_uid, user_id,
     # grant without individual champion/card-name rules.
     selected = {str(guid).lower() for guid in (ability_guids or [])}
     from pvp_db import db_pregame_talent_rows
-    rows = db_pregame_talent_rows(selected, conn=db)
+    conditions = {
+        str(guid).lower(): condition
+        for guid, condition in db_pregame_talent_rows(selected, conn=db)
+    }
+    # The SQL IN query has no authored ordering. C# resolves the setup ability
+    # list in the order supplied by the champion/talent projection; preserve
+    # that order because an earlier effect can change a later ability's live
+    # deck-count condition.
+    rows = [
+        (guid, conditions[guid])
+        for guid in dict.fromkeys(
+            str(value).lower() for value in (ability_guids or []) if value)
+        if guid in conditions
+    ]
     source_attr = "_player_champ_scid" if user_id else "_ai_champ_scid"
     source_scid = getattr(handler, source_attr, None)
     source_uid = (int(source_scid.uid.uid64) if source_scid is not None

@@ -1,9 +1,8 @@
 """Python implementation of the ``HexClient/Game.Shared`` rules boundary.
 
 RulesPort owns gameplay decisions, state transitions, ordering, and
-continuations.  Runtime adapters project accepted transitions into SQLite and
-HConnect events; the legacy resolver is retained only for explicitly disabled
-rollback sessions and is never selected by an attached live session.
+continuations. Runtime adapters project accepted transitions into SQLite and
+HConnect events. RulesPort has no selectable legacy rules backend.
 """
 
 from .kernel import (
@@ -89,15 +88,13 @@ from .resources import (ResourceChange, ResourcePlay, apply_resource_change,
                         pay_spell_points_for_player, pay_resource,
                         pay_counter, begin_turn_resources,
                         begin_turn_resources_for_player)
-from .ability_adapter import MetadataResolutionAdapter
 from .resolution import (PortAbilityResolver, NativeEffectBackend,
                          build_port_ability, resolve_port_ability,
                          resolve_port_played_spell, resolve_port_trigger)
 from .card_transactions import (CardPlayTransition, CardTransactionExecutor,
                                  MetadataCardTransactionExecutor,
                                  apply_card_play, apply_card_play_for_player)
-from .triggers import (MetadataTriggerAdapter, PortTriggerDispatcher,
-                        TriggerEvent)
+from .triggers import PortTriggerDispatcher, TriggerEvent
 from .metadata import (ability_has_effect, ability_effect_prompt,
                        ability_cost_prompt)
 from .trigger_discovery import RecordsTriggerDiscovery, TriggerCandidate
@@ -186,14 +183,13 @@ __all__ = (
     "pay_counter",
     "begin_turn_resources",
     "begin_turn_resources_for_player",
-    "MetadataResolutionAdapter",
     "PortAbilityResolver", "NativeEffectBackend",
     "build_port_ability",
     "resolve_port_ability",
     "CardTransactionExecutor",
     "MetadataCardTransactionExecutor",
     "CardPlayTransition", "apply_card_play", "apply_card_play_for_player",
-    "MetadataTriggerAdapter", "PortTriggerDispatcher",
+    "PortTriggerDispatcher",
     "TriggerEvent", "RecordsTriggerDiscovery",
     "ability_has_effect", "ability_effect_prompt", "ability_cost_prompt",
     "TriggerCandidate", "ConditionContext", "PortConditionContext",

@@ -695,9 +695,13 @@ conversations, and triggered-ability responses are checkpoints. When one is
 needed, the port persists the ability instance ID, source card, target map,
 variables, and resume effect order. The next matching typed response resumes
 that instance; it must not create a duplicate trigger or restart earlier effect
-groups. A completed mutation updates the card row and emits the corresponding
-`CardMoved`/`CardUpdated` (and `CardDiscarded` for removal) before the client
-receives rebuilt options and priority.
+groups. A completed mutation updates the card row and emits a destination
+`CardUpdated` before the client receives rebuilt options and priority. When
+collection or controller changes, Unity derives the UI `CardMoved` from that
+update. The inspected client cache does not derive class 50 for position-only
+changes, and `UIBattle.OnCardUpdated` still moves the view home; require a
+concrete C# path before emitting a separate class-50 event. `CardDiscarded`
+remains a separate lifecycle event when the C# path publishes it.
 
 Player-level visibility modifiers follow the same projection contract. The
 `CanSeeOpponentsHand` flag is persisted by the RulesPort host, and each fresh

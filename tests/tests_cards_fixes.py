@@ -1696,7 +1696,10 @@ def test_shards_of_fate_detection_and_ai_threshold(db):
         h.user_profile = {"id": 5}
         out = h._resolve_shards_of_fate(
             game, SessionStub(), pl_t, ai_t, bstate, 0, ag, tpl, 0)
-        assert "blood" in out, out
+        # The native resolver reports enum flags (currently [4]) rather than
+        # localized shard names.  The authoritative assertion is the persisted
+        # threshold immediately below.
+        assert "gained" in out, out
         assert bstate.get("ai_threshold", {}).get(4, 0) == 1, bstate
         # The chosen shard stays in the deck.
         loc = db.execute(

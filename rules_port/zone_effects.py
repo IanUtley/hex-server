@@ -73,8 +73,6 @@ def project_card_runtime(game, session, db, handler, player_uid, ai_uid,
         handler._card_full_data(game, scid, template_guid)
     recipient = owner_uid(owner_id, player_uid, ai_uid, battle_state)
     collection = card_collection_for_location(location)
-    game.push_card_moved(
-        scid, recipient, collection, game_engine.ECardLocations.Top, 0)
     game.push_card_updated(
         scid, recipient, collection, card_type,
         template_id=template_guid, cost=cost, attack=attack,

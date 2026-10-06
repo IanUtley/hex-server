@@ -48,6 +48,119 @@ def _is_secret_counter_guid(value):
     return secret
 
 
+def _null_hidden_card_representation(event, *, preserve_counters=False):
+    """Remove private card identity from a viewer-scoped nulling update.
+
+    The C# client ignores every representation field except ``State`` when
+    ``Nulling`` is true.  Keep the wire event consistent with that contract:
+    its SessionCardId, controller, collection, and state remain useful to the
+    HUD, while template-derived identity and stats are omitted.  Underground
+    counters are public progress, so callers may retain their non-secret
+    counter projection; secret counters are filtered separately.
+    """
+    event.card_id = ResourceId.invalid()
+    event.orig_template = ResourceId.invalid()
+    event.affected_id = ResourceId.invalid()
+    event.cost = 0
+    event.armor = 0
+    event.current_armor = 0
+    event.rage = 0
+    event.dmult = 0
+    event.cdmult = 0
+    event.attack = 0
+    event.defense = 0
+    event.min_const = 0
+    event.tunneling = 0
+    event.min_limited = 0
+    event.escalation = 0
+    event.lethal = False
+    event.extended_art = False
+    event.sub_type = ""
+    event.card_type = ECardTypes.Unknown
+    event.ai_states = EAICardStates.None_
+    event.attributes = ECardAttributes.Unknown
+    event.abilities = []
+    event.intger_vars = {}
+    event.int_attrs = {}
+    event.gems = EGemTypesNew.Unknown
+    event.threshold_list = []
+    event.related_cards = []
+    event.string_attrs = {}
+    event.activation_cost_mods = {}
+    event.charge_point_cost_mods = {}
+    event.spell_point_cost_mods = {}
+    event.uses_per_game_counts = {}
+    event.cooldown_counts = {}
+    event.damage_shield = False
+    event.affecting_abilities = []
+    event.feral = False
+    if not preserve_counters:
+        event.counter_templates = []
+        event.counter_counts = []
+
+
+def _has_card_representation(event):
+    """Whether a CardUpdated event carries a usable authored identity."""
+    card_id = getattr(event, "card_id", None)
+    guid = getattr(card_id, "guid", None)
+    return bool(getattr(guid, "int", 0))
+
+
+def _card_update_visible_to_viewer(event, viewer_uid, visibility, *,
+                                   viewer_reveal=False, chain_reveal=False):
+    """Mirror ``Card.CanPlayerSeeCard`` at the outbound packet boundary.
+
+    Producers may queue one shared CardUpdated event for both participants.
+    The C# server evaluates visibility for each receiving Player; perform that
+    same decision here so an omitted producer-side Nulling flag cannot expose
+    a private collection to the other client.
+    """
+    if viewer_reveal or chain_reveal:
+        return _has_card_representation(event)
+
+    try:
+        card_type = int(getattr(event, "card_type", 0) or 0)
+    except (TypeError, ValueError):
+        card_type = 0
+    if card_type & int(ECardTypes.Champion):
+        return True
+
+    collection = int(getattr(event, "collection", ECardCollections.None_))
+    public_collections = (
+        ECardCollections.Champions | ECardCollections.Warzone |
+        ECardCollections.Discard | ECardCollections.Void |
+        ECardCollections.PlayedResources | ECardCollections.CastSpells)
+    if collection == ECardCollections.None_ or collection & public_collections:
+        return True
+
+    if collection & ECardCollections.Deck:
+        # C# keeps Deck face down even for its controller. Top-of-deck
+        # permissions are represented by an explicit viewer-scoped reveal.
+        return False
+
+    controller = getattr(event, "controller", None)
+    if controller is None:
+        controller = getattr(event, "player_id", 0)
+    own_card = _uid64(controller) == _uid64(viewer_uid)
+
+    if (own_card and collection & (ECardCollections.Hand |
+                                   ECardCollections.Underground |
+                                   ECardCollections.Choosing)):
+        return True
+    if collection == ECardCollections.Hand:
+        return (own_card or
+                int(visibility.get("CanSeeOpponentsHand", 0) or 0) > 0)
+    if collection == ECardCollections.Underground:
+        return (own_card or
+                int(visibility.get("CanSeeUndergroundTroops", 0) or 0) > 0)
+    if collection == ECardCollections.Choosing:
+        return own_card
+
+    # C# treats every other non-public collection as face down. The chain
+    # exception is passed explicitly by the trusted native trigger publisher.
+    return False
+
+
 # ======================================================================
 #  CardDef
 # ======================================================================
@@ -316,11 +429,6 @@ class Game:
         ev.defense = kwargs.get('defense', cdef.defense if cdef else 0)
         ev.cost = kwargs.get('cost', cdef.cost if cdef else 0)
         ev.controller = player_uid
-        # Underground cards are face-down to the opposing player.  Keep the
-        # owner's full CardUpdated representation, then make_network_packet
-        # applies Nulling only to the opponent's copy.
-        if collection == ECardCollections.Underground:
-            ev._underground_owner_uid = player_uid
         ev.attributes = kwargs.get('attributes', cdef.attributes if cdef else ECardAttributes.Unknown)
         ev.lethal = kwargs.get('lethal', getattr(cdef, 'lethal', False) if cdef else False)
         ev.int_attrs = dict(kwargs.get('int_attrs', getattr(cdef, 'int_attrs', {}) or {}))
@@ -679,6 +787,13 @@ class Game:
             thresholds.get(ECardShards.Wild, 0),
             thresholds.get(ECardShards.Diamond, 0),
         ]
+        # C# ClientSessionBase applies ThresholdValues by walking this parallel
+        # key list. An empty Thresholds list silently discards all six values
+        # from the player's authoritative resource-threshold map.
+        ev.thresholds = [
+            ECardShards.Colorless, ECardShards.Blood, ECardShards.Ruby,
+            ECardShards.Sapphire, ECardShards.Wild, ECardShards.Diamond,
+        ]
         # Explicit champ_id wins; otherwise fall back to the Game's champion
         # card id for that side.  NOTE: the ternary binds looser than `or`, so
         # `champ_id or X if is_player else Y` would drop champ_id for the
@@ -738,6 +853,14 @@ class Game:
 
     def push_game_started(self, champion_names=None, champion_template_ids=None,
                           player_first=None, sleeve_template_ids=None):
+        """Project C#'s per-player GameStarted data in TurnOrder order.
+
+        The arguments describing each player are supplied in this Game's
+        ``player_uid`` / ``ai_uid`` order. C# builds every parallel
+        ``GameStartedSessionEventArgs`` list while iterating the already
+        ordered player collection, so reorder those lists after resolving the
+        turn order (including a shuffled order when ``player_first`` is unset).
+        """
         ev = self._make_event(GameStartedSessionEventArgs)
         if player_first is None:
             ev.turn_order = [self.player_uid, self.ai_uid]
@@ -746,20 +869,36 @@ class Game:
             ev.turn_order = [self.player_uid, self.ai_uid]
         else:
             ev.turn_order = [self.ai_uid, self.player_uid]
-        ev.champion_names = champion_names or ["TestPlayer", "AI"]
-        if champion_template_ids:
-            ev.champion_template_ids = [ResourceId.from_str(g) for g in champion_template_ids]
-        else:
-            ev.champion_template_ids = [
-                ResourceId.from_str("1d462ffb-0744-4996-804c-ba61b2c5c2f1"),
-                ResourceId.from_str("f8f86969-2e47-4901-8c9e-7fbf8d859e22"),
-            ]
+        canonical_players = (self.player_uid, self.ai_uid)
+        canonical_indexes = {uid.uid64: index
+                             for index, uid in enumerate(canonical_players)}
+        try:
+            order_indexes = [canonical_indexes[uid.uid64]
+                             for uid in ev.turn_order]
+        except (AttributeError, KeyError):
+            order_indexes = list(range(len(canonical_players)))
+
+        def in_turn_order(values):
+            values = list(values or ())
+            if len(values) != len(canonical_players):
+                return values
+            return [values[index] for index in order_indexes]
+
+        ev.champion_names = in_turn_order(
+            champion_names or ["TestPlayer", "AI"])
+        template_ids = champion_template_ids or [
+            "1d462ffb-0744-4996-804c-ba61b2c5c2f1",
+            "f8f86969-2e47-4901-8c9e-7fbf8d859e22",
+        ]
+        ev.champion_template_ids = [
+            ResourceId.from_str(guid) for guid in in_turn_order(template_ids)]
+        canonical_sleeves = list(sleeve_template_ids or ())
         ev.sleeve_template_ids = [
-            ResourceId.from_str(value) for value in (sleeve_template_ids or [])
-            if value]
+            ResourceId.from_str(value)
+            for value in in_turn_order(canonical_sleeves)]
         # Remember the sleeves so every later PlayerUpdated preserves them.
         for _uid, _sleeve in zip(
-                (self.player_uid, self.ai_uid), sleeve_template_ids or ()):
+                canonical_players, canonical_sleeves):
             self.set_deck_sleeve(_uid, _sleeve)
         ev.board_template_ids = []
         ev.coin_template_ids = []
@@ -866,7 +1005,8 @@ class Game:
 
     def push_card_transformed(self, cid: SessionCardId, template_id: str,
                               is_replica: bool = False,
-                              gems: Optional[int] = None):
+                              gems: Optional[int] = None,
+                              visible_to_viewer_uids=None):
         ev = self._make_event(CardTransformedSessionEventArgs)
         ev.session_card_id = cid
         ev.card_template_id = (template_id if isinstance(template_id, ResourceId)
@@ -874,13 +1014,20 @@ class Game:
         ev.is_replica = is_replica
         if gems is not None:
             ev.gems = gems
+        if visible_to_viewer_uids is not None:
+            ev._visible_to_viewer_uids = {
+                _uid64(viewer) for viewer in visible_to_viewer_uids}
         self._push(ev)
 
-    def push_card_reverted(self, cid: SessionCardId, template_id: str):
+    def push_card_reverted(self, cid: SessionCardId, template_id: str,
+                           visible_to_viewer_uids=None):
         ev = self._make_event(CardRevertedSessionEventArgs)
         ev.session_card_id = cid
         ev.card_template_id = (template_id if isinstance(template_id, ResourceId)
                                 else ResourceId.from_str(template_id))
+        if visible_to_viewer_uids is not None:
+            ev._visible_to_viewer_uids = {
+                _uid64(viewer) for viewer in visible_to_viewer_uids}
         self._push(ev)
 
     def push_equipment_set(self, player_uid: UID, equipment_ids: List[str]):
@@ -1049,85 +1196,108 @@ class Game:
         import copy
         visible_events = []
         player_value = getattr(player_uid, "uid64", player_uid)
-        # A visible-hand projection and the normal opponent-hand refresh can
-        # occur in the same checkpoint.  The latter is intentionally a
-        # face-down CardUpdated (it has an invalid template id), but applying
-        # it after the full projection would leave Unity with a visible,
-        # template-less card -- the black rectangle reported for
-        # Subterranean Spy.  Keep the UIDs for which this viewer already has
-        # a complete hand definition so that placeholder updates can be
-        # omitted below without affecting other viewers.
-        revealed_hand_uids = {
-            int(event.session_card_id.uid.uid64)
+        # A viewer-scoped full update may be followed by a generic hidden-zone
+        # placeholder for the same card in one checkpoint. Keep the complete
+        # definition and omit only the matching viewer/collection placeholder.
+        viewer_revealed_cards = {
+            (int(event.session_card_id.uid.uid64), int(event.collection))
             for event in self.events
             if (isinstance(event, CardUpdatedSessionEventArgs)
-                and event.collection == ECardCollections.Hand
                 and getattr(event, "_hand_reveal_viewer_uid", None) is not None
                     and _uid64(player_value) == _uid64(
-                        getattr(event, "_hand_reveal_viewer_uid")))
+                        getattr(event, "_hand_reveal_viewer_uid"))
+                and not bool(getattr(event, "nulling", False))
+                and _has_card_representation(event))
         }
-        chain_revealed_uids = {
-            int(event.session_card_id.uid.uid64)
+        chain_revealed_cards = {
+            (int(event.session_card_id.uid.uid64), int(event.collection))
             for event in self.events
             if (isinstance(event, CardUpdatedSessionEventArgs)
-                and getattr(event, "_chain_reveal", False))
+                and getattr(event, "_chain_reveal", False)
+                and event.collection != ECardCollections.Underground
+                and int(getattr(event, "tunneling", 0) or 0) == 0
+                and not bool(getattr(event, "nulling", False))
+                and _has_card_representation(event)
+                and (getattr(event, "_hand_reveal_viewer_uid", None) is None
+                     or _uid64(player_value) == _uid64(getattr(
+                         event, "_hand_reveal_viewer_uid"))))
         }
         for event in self.events:
             reveal_viewer = getattr(event, "_hand_reveal_viewer_uid", None)
             if (reveal_viewer is not None and
                     _uid64(player_value) != _uid64(reveal_viewer)):
                 continue
-            underground_owner = getattr(event, "_underground_owner_uid", None)
-            filtered = None
-            if (underground_owner is not None and
-                    isinstance(event, CardUpdatedSessionEventArgs) and
-                    int(player_value or 0) != int(getattr(
-                        underground_owner, "uid64", underground_owner) or 0)):
-                # Do not reveal the template of an opponent's tunneled card.
-                # The UID and Underground collection remain public, while the
-                # client receives the same nulling form it uses for a hidden
-                # hand/deck card.
-                filtered = copy.copy(event)
-                filtered.ser = Serializer()
-                filtered.nulling = True
-            if (isinstance(event, CardUpdatedSessionEventArgs) and
-                    event.collection in (ECardCollections.Hand,
-                                         ECardCollections.Deck,
-                                         ECardCollections.Choosing) and
-                    event.nulling and
-                    int(event.session_card_id.uid.uid64) in chain_revealed_uids):
-                # A hidden-zone trigger is publicly identified by its chain
-                # ability. Do not let the ordinary hidden-zone refresh that
-                # follows it immediately face the same source card down again
-                # before UIBattle can render the chain copy.
+            visible_to = getattr(event, "_visible_to_viewer_uids", None)
+            if (visible_to is not None and
+                    _uid64(player_value) not in {
+                        _uid64(viewer) for viewer in visible_to}):
+                # Transform/revert events carry card identity directly. C#
+                # dispatches them only to Players who could see the card at
+                # the event boundary.
                 continue
-            if (isinstance(event, CardUpdatedSessionEventArgs) and
-                    event.collection == ECardCollections.Hand and
-                    int(player_value or 0) != int(getattr(
-                        event.controller, "uid64", event.controller) or 0)):
-                visibility = self._visibility_by_uid.get(
-                    int(player_value or 0), {})
-                if int(visibility.get("CanSeeOpponentsHand", 0) or 0):
-                    # AI/legacy hand refreshes use nulling=True with an
-                    # invalid ResourceId.  If the full viewer-scoped update
-                    # is already queued, dropping this placeholder preserves
-                    # the card definition while still allowing later full
-                    # updates (state/attributes) through.
-                    card_uid = int(event.session_card_id.uid.uid64)
-                    card_guid = getattr(getattr(event, "card_id", None),
-                                        "guid", None)
-                    if (event.nulling and card_uid in revealed_hand_uids
-                            and getattr(card_guid, "int", 0) == 0):
-                        continue
-                    if filtered is None:
-                        filtered = copy.copy(event)
-                        filtered.ser = Serializer()
-                    filtered.nulling = False
+            filtered = None
             private_to = getattr(event, "_private_player_uid", None)
             if private_to is not None:
                 private_value = getattr(private_to, "uid64", private_to)
                 if int(player_value or 0) != int(private_value or 0):
                     continue
+            if isinstance(event, CardUpdatedSessionEventArgs):
+                viewer_reveal = (reveal_viewer is not None and
+                                 _uid64(player_value) ==
+                                 _uid64(reveal_viewer))
+                card_uid = int(event.session_card_id.uid.uid64)
+                collection = int(event.collection)
+                visibility = self._visibility_by_uid.get(
+                    _uid64(player_value), {})
+                chain_reveal = bool(
+                    getattr(event, "_chain_reveal", False)
+                    and event.collection != ECardCollections.Underground
+                    and int(getattr(event, "tunneling", 0) or 0) == 0
+                    and not bool(getattr(event, "nulling", False))
+                    and _has_card_representation(event))
+                if (event.nulling and
+                        (card_uid, collection) in chain_revealed_cards):
+                    # Keep a publicly revealed chain source from being faced
+                    # down again by a later hidden-zone placeholder.
+                    continue
+                visible = _card_update_visible_to_viewer(
+                    event, player_uid, visibility,
+                    viewer_reveal=viewer_reveal,
+                    chain_reveal=chain_reveal)
+                if ((card_uid, collection) in viewer_revealed_cards and
+                        (event.nulling or not visible or
+                         not _has_card_representation(event))):
+                    # A viewer-scoped full update may be preceded or followed
+                    # by either a nulling placeholder or an unscoped full
+                    # update from a shared refresh. Omit that stale form only
+                    # for this viewer and this collection.
+                    continue
+                if not visible:
+                    # Mirror C# Card.CanPlayerSeeCard for this recipient even
+                    # when a producer accidentally queued a full update.
+                    if filtered is None:
+                        filtered = copy.copy(event)
+                        filtered.ser = Serializer()
+                    filtered.nulling = True
+                elif (event.nulling and _has_card_representation(event) and
+                      (viewer_reveal or chain_reveal or
+                       (event.collection == ECardCollections.Hand and
+                        int(visibility.get("CanSeeOpponentsHand", 0) or 0) > 0))):
+                    # A valid full representation is visible through an
+                    # explicit scoped reveal or the authored hand permission.
+                    # Never turn an identity-less placeholder face up.
+                    if filtered is None:
+                        filtered = copy.copy(event)
+                        filtered.ser = Serializer()
+                    filtered.nulling = False
+                if (filtered or event).nulling:
+                    if filtered is None:
+                        filtered = copy.copy(event)
+                        filtered.ser = Serializer()
+                    _null_hidden_card_representation(
+                        filtered,
+                        preserve_counters=(
+                            event.collection == ECardCollections.Underground))
             secret_guids = getattr(event, "_secret_counter_guids", None)
             secret_owner = getattr(event, "_secret_counter_owner_uid", None)
             if (secret_guids and secret_owner is not None and

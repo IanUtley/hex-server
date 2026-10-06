@@ -487,6 +487,45 @@ def _source_card(db, session_id, source_uid, controller_uid):
             "card_type": "Champion", "attack": 0, "defense": 0}
 
 
+def _champion_filter_cards(champions, battle_state=None):
+    """Project champion targets with their authored template identity.
+
+    Champion session cards do not have ``game_cards`` rows. Filters such as
+    HasASharedClassWithSourceChampionFilter still need to find the responsible
+    player's champion while evaluating an ordinary card candidate, so expose
+    the handler's champion IDs together with the template GUIDs carried by the
+    battle state.
+    """
+    state = battle_state or {}
+    raw_guids = state.get("champ_guid_map") or {}
+    guids = {}
+    if isinstance(raw_guids, dict):
+        for owner, guid in raw_guids.items():
+            try:
+                guids[int(owner)] = str(guid or "").lower()
+            except (TypeError, ValueError):
+                continue
+    cards = []
+    for champion in champions or ():
+        try:
+            uid, owner = int(champion[0]), int(champion[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        guid = guids.get(owner, "")
+        cards.append({
+            "card_uid": uid, "card_type": "Champion",
+            "location": "champions", "collection": "champions",
+            "user_id": owner, "owner_id": owner,
+            "controller_id": owner, "template_guid": guid,
+            "template_id": guid,
+            "name": champion[2] if len(champion) > 2 else "Champion",
+            "attack": 0,
+            "defense": int(champion[3] or 0)
+            if len(champion) > 3 else 0,
+        })
+    return cards
+
+
 def _parent_uid(serialized_buffs):
     try:
         value = json.loads(serialized_buffs or "{}")
@@ -652,6 +691,9 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
                           for item in global_pool_kinds)
     use_global_pool = use_global_pool or _requires_global_filter_pool(
         filter_json)
+    champion_cards = _champion_filter_cards(champions, state)
+    champion_cards_by_uid = {
+        int(card["card_uid"]): card for card in champion_cards}
     global_cards = list(cards)
     if use_global_pool:
         all_zones = sorted(set(_ZONE_MAP.values()))
@@ -660,22 +702,11 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
             both_players=True, top_n=False, conn=db)
         global_cards = [_card(row, battle_state, db, session_id)
                         for row in global_rows]
-        for champion in champions or ():
-            try:
-                from domain.enums import ECardCollections
-                uid, owner = int(champion[0]), int(champion[1])
-                global_cards.append({
-                    "card_uid": uid, "card_type": "Champion",
-                    "location": "champions", "user_id": owner,
-                    "owner_id": owner, "controller_id": owner,
-                    "name": champion[2] if len(champion) > 2 else "Champion",
-                    "attack": 0,
-                    "defense": int(champion[3] or 0)
-                    if len(champion) > 3 else 0,
-                    "collection": int(ECardCollections.Champions),
-                })
-            except (IndexError, TypeError, ValueError):
-                continue
+    known_global_uids = {
+        int(candidate.get("card_uid", 0) or 0) for candidate in global_cards}
+    global_cards.extend(
+        card for card in champion_cards
+        if int(card["card_uid"]) not in known_global_uids)
     # One template filter is evaluated against every candidate in the scanned
     # zones, so compile it once per (spec, candidate-pool) pair: rebuilding the
     # Records filter tree per candidate dominated target/static evaluation.
@@ -688,8 +719,16 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
         predicate = evaluators.get(key)
         if predicate is None:
             context = _FilterContext(battle_state or {})
-            context["cards"] = global_cards if use_global_pool else pool
-            context["all_cards"] = global_cards if use_global_pool else pool
+            filter_cards = global_cards if use_global_pool else pool
+            context["cards"] = filter_cards
+            context_all_cards = list(filter_cards)
+            known_uids = {
+                int(candidate.get("card_uid", 0) or 0)
+                for candidate in context_all_cards}
+            context_all_cards.extend(
+                champion for champion in champion_cards
+                if int(champion["card_uid"]) not in known_uids)
+            context["all_cards"] = context_all_cards
             context["active_player_id"] = (battle_state or {}).get(
                 "active_player_id", controller_uid)
             # The activating player is the authoritative ``player`` operand for
@@ -734,10 +773,11 @@ def _legal_targets(db, session_id, controller_uid, template_id, source_uid,
                                   (not opposing or owner != controller_uid))
             if not player_allowed:
                 continue
-            card = {"card_uid": int(uid), "card_type": "Champion",
-                    "location": "champions", "user_id": owner,
-                    "controller_id": owner, "name": name or "Champion",
-                    "defense": int(health or 0), "attack": 0}
+            card = champion_cards_by_uid.get(int(uid)) or {
+                "card_uid": int(uid), "card_type": "Champion",
+                "location": "champions", "user_id": owner,
+                "controller_id": owner, "name": name or "Champion",
+                "defense": int(health or 0), "attack": 0}
             # PlayerTargetTemplate overrides IsCardValidTarget in C# and
             # checks only champion identity, player filter and its own filter.
             if (not player_target and kind not in {
@@ -1049,6 +1089,7 @@ def revealed_target_uids(db, session_id, owner_id, source_uid, template_id,
             "name": row[8] or "", "cost": int(row[9] or 0),
             "subtype": row[10] or "", "shards": _shards(row[11]),
             "attributes": int(row[12] or 0) | int(row[13] or 0),
+            "gems": int(row[20] or 0) if len(row) > 20 else 0,
             "src_owner_side": "player" if int(owner_id or 0) else "ai",
         }
         context = _FilterContext(battle_state or {})

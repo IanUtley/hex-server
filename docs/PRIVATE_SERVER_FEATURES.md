@@ -137,6 +137,42 @@ Frost Ring Arena implementation details are in
   still needs fresh mode-specific traces.
 - [ ] Remove game-text compatibility fallbacks only after confirming the
   corresponding Records field is present and authoritative.
+- [ ] Card-matrix audit follow-ups (`tests/tests_card_play_matrix.py --all
+  --contracts`; 105/7,214 templates failed at the last baseline, and roughly
+  65 of those were fixed or re-classified). Re-run the full matrix serially
+  first; the items below were not re-checked after the last fixes.
+  - Picker continuations the generated fixture does not resume: Scheme,
+    Devour Secrets, Uncover Secrets, Succumb To Madness, Escape the
+    Picaroons, Reginald Imprisoned (choice pauses) and Brutal Commander,
+    Enthralling Gaze, Withering Touch (deck-search / "choose a revealed
+    card" child abilities). Next check: drive each typed continuation in
+    the matrix, or a focused test per mechanic (not per card), in PvE and
+    PvP.
+  - Trigger recursion: Alluring Alemaid, Captured Flag
+    (`CardMatrixTriggerRecursion`). Next check: decide whether this is a
+    real engine loop (compare the C# per-game/per-turn use and trigger
+    claim) or a fixture re-dispatch.
+  - Wrenlocke's Apprentice: "put the remaining cards into your deck" left
+    no effect trace after the random action moved to hand. Likely an engine
+    gap in the "remaining revealed cards" target. Next check: a focused
+    Deploy test that asserts the other three top cards are returned.
+  - Random/RNG branches: Taming Sphere, Wrathwood Larch (one random branch
+    misses an effect), Tricerobot (RNG requested but unused), Dormant Booby
+    Trap (RandomNumber condition not evaluable). Next check: confirm
+    against the C# RNG call order.
+  - Lifecycle/combat triggers the fixture did not fire: Arena Incantation
+    (GameStartedEvent), Nameless Citizen (CardBlockedEvent).
+  - War Machine: static IntAttr not projected onto a legal target.
+  - Fixture witness limits (engine believed correct): Chickatwice (troop
+    blocking the source), Timophy the Turtle, Emberbrute (troop sharing a
+    trait with the champion), Pterobot `ff73e51b`, Harvest of Sorrow (no
+    troops died this turn), and the "Choose * Transform" / Lose Control
+    choice cards run without their parent's stored target.
+  - Known gaps outside the matrix: PvP does not record the starting player
+    (`AbilityControllerIsStartingPlayerAbilityCondition`), optional
+    additional costs with `m_AllowBestEffortMinimumTargetCount` do not
+    count the legal pool server-side, and champion damage does not set
+    `ECardStates.Damaged`.
 
 ## Campaign, tournaments, chat, and replay
 

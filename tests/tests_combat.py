@@ -50,7 +50,8 @@ def make_db():
         cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER,
         permanent_buffs TEXT DEFAULT '{}', temporary_buffs TEXT DEFAULT '{}',
         card_uses TEXT DEFAULT '{}', resolved_at INTEGER DEFAULT 0,
-        original_template_guid TEXT DEFAULT '')""")
+        original_template_guid TEXT DEFAULT '', gems INTEGER DEFAULT 0,
+        original_gems INTEGER)""")
     db.execute("""CREATE TABLE card_templates (
         guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
         defense INTEGER, attributes INTEGER, abilities_json TEXT,
@@ -399,7 +400,7 @@ def run_combat(db, player_deck_has_enforcer=False):
 
 def test_gladiator_priestess_both_die(db):
     """2/2 Shamed Gladiator vs 2/1 Darkspire Priestess: both die and the
-    client receives a CardUpdated + CardMoved to the discard for each."""
+    client cache derives each discard move from CardUpdated."""
     with mock.patch("random.randint", return_value=1):
         loc_a, loc_b, st_a, st_b, game, bstate = run_combat(
             db, player_deck_has_enforcer=True)
@@ -415,7 +416,7 @@ def test_gladiator_priestess_both_die(db):
              and ev.collection == game_engine.ECardCollections.Discard]
     assert len(discards) == 2, [int(e.session_card_id.uid.uid64)
                                 for e in discards]
-    assert len(moves) == 2, [int(e.session_card_id.uid.uid64) for e in moves]
+    assert not moves, [int(e.session_card_id.uid.uid64) for e in moves]
     # The priestess's Deathcry resolved AFTER the combat: roll=1 deals 3 to
     # the opposing (AI) champion.
     assert bstate["ai_health"] == 17, bstate

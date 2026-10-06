@@ -435,9 +435,8 @@ def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
     # ability lifecycle (old target/continuation/stack semantics) alongside
     # the port.  Fail at the boundary so new gameplay paths cannot silently
     # reintroduce the hybrid architecture.
-    if ((getattr(session, "_rules_port_session", None) is not None or
-         bstate.get("_rules_port_attached")) and
-            not bstate.get("_rules_port_allow_legacy_backend")):
+    if (getattr(session, "_rules_port_session", None) is not None or
+            bstate.get("_rules_port_attached")):
         raise RuntimeError(
             "legacy ability resolver bypassed RulesPort; use "
             "rules_port.resolve_port_ability")

@@ -227,9 +227,23 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                         int(cast(Any, owner_id)))
                     values = []
                     cost_target_map: dict[int, list[int]] = {}
-                    for activation in payload.get("ability_data") or ():
+                    ability_data = payload.get("ability_data") or ()
+                    cast_ability_guids = {
+                        ability.ability_guid.lower()
+                        for ability in plan.cast_abilities
+                    }
+                    for activation in ability_data:
                         if not isinstance(activation, Mapping):
                             continue
+                        ability_guid = activation.get(
+                            "ability_template_id",
+                            activation.get("ability_guid", ""))
+                        if isinstance(ability_guid, Mapping):
+                            ability_guid = ability_guid.get(
+                                "guid", ability_guid.get("m_Guid", ""))
+                        is_cast_ability = (
+                            str(ability_guid or "").lower()
+                            in cast_ability_guids)
                         target_map = activation.get("target_map", {}) or {}
                         for selected in target_map.values():
                             selected = selected if isinstance(
@@ -240,6 +254,8 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                         # TargetMap (XCostData.CardsToSacrifice).  Keep them
                         # distinct so the cost never consumes an effect target
                         # (Abominate).
+                        if is_cast_ability:
+                            continue
                         for index, selected in (activation.get(
                                 "cost_target_map") or {}).items():
                             try:
@@ -256,7 +272,8 @@ class MetadataCardTransactionExecutor(CardTransactionExecutor):
                                   if isinstance(item, Mapping)), default=0)
                     activations, cost_map = plan.activation_bundle(
                         values, x_cost=x_cost,
-                        cost_target_map=cost_target_map or None)
+                        cost_target_map=cost_target_map or None,
+                        ability_data=ability_data)
                     if plan.validate(
                             variable_cost=x_cost,
                             activations=activations,

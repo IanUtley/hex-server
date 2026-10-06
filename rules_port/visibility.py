@@ -147,12 +147,20 @@ def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
         if not top:
             return
         _row_id, uid, _instance_template, template_guid = top
+        recipient = _owner_uid(game, viewer, state)
+        recipient_id = int(getattr(recipient, "uid64", recipient))
         if any(
                 isinstance(event, game_engine.CardUpdatedSessionEventArgs) and
                 int(event.session_card_id.uid.uid64) == int(uid) and
                 event.collection == game_engine.ECardCollections.Deck and
-                not bool(getattr(event, "nulling", False))
+                not bool(getattr(event, "nulling", False)) and
+                getattr(event, "_hand_reveal_viewer_uid", None) is not None and
+                int(getattr(
+                    event._hand_reveal_viewer_uid, "uid64",
+                    event._hand_reveal_viewer_uid)) == recipient_id
                 for event in game.events):
+            # An unscoped CardUpdated is not enough: packet projection will
+            # null it for every viewer. Keep one full event for this viewer.
             return
         scid = game_engine.SessionCardId(game_engine.UID(int(uid)))
         try:
@@ -160,7 +168,6 @@ def project_visible_top_decks(db, session, handler, game, pl_t, ai_t, state):
                 handler._card_full_data(game, scid, template_guid)
         except Exception:
             return
-        recipient = _owner_uid(game, viewer, state)
         game.push_card_updated(
             scid, recipient, game_engine.ECardCollections.Deck, card_type,
             template_id=template_guid, cost=cost, attack=attack,
@@ -234,6 +241,34 @@ def project_visible_underground(db, session, handler, game, pl_t, ai_t,
     return projected
 
 
+def merge_underground_visibility_flags(db, session, handler, state, flags,
+                                      owners=None):
+    """Refresh the Unity underground-visibility flag from current Records."""
+    from .static_rules import player_int_attributes
+    merged = {str(owner): dict(attrs or {})
+              for owner, attrs in (flags or {}).items()}
+    if owners is None:
+        if state.get("pvp"):
+            owners = {int(owner) for owner in state.get("pids", ()) or ()}
+        else:
+            profile = getattr(handler, "user_profile", None) or {}
+            owners = {int(profile.get("id", 0) or 0), 0}
+    for owner in owners:
+        key = str(int(owner))
+        owner_flags = dict(merged.get(key) or {})
+        attrs = player_int_attributes(
+            db, session.session_id, state, int(owner))
+        if int(attrs.get("CanSeeUndergroundTroops", 0) or 0) > 0:
+            owner_flags["CanSeeUndergroundTroops"] = 1
+        else:
+            owner_flags.pop("CanSeeUndergroundTroops", None)
+        if owner_flags:
+            merged[key] = owner_flags
+        else:
+            merged.pop(key, None)
+    return merged
+
+
 def _apply_player_flags(game, state):
     game._visibility_by_uid = {
         int(getattr(_owner_uid(game, int(owner), state), "uid64",
@@ -264,9 +299,21 @@ def refresh_player_visibility(db, session, handler, game, pl_t, ai_t, state):
             if _active_modifier(db, session, handler, pl_t, ai_t, state,
                                 uid, owner, guid):
                 new.setdefault(str(int(owner)), {})["CanSeeOpponentsHand"] = 1
-    changed = {str(owner) for owner in set(old) | set(new) if bool(
-        (old.get(owner) or {}).get("CanSeeOpponentsHand")) != bool(
-        (new.get(owner) or {}).get("CanSeeOpponentsHand"))}
+
+    # UIBattle reads this flag from PlayerUpdated before it decides whether an
+    # opponent's Underground collection is face-down. Replaying full card
+    # representations alone does not make the zone visible. Compute it from
+    # the same active Records-backed player attributes as the card projection.
+    if state.get("pvp"):
+        owners = {int(owner) for owner in state.get("pids", ()) or ()}
+    else:
+        profile = getattr(handler, "user_profile", None) or {}
+        owners = {int(profile.get("id", 0) or 0), 0}
+    new = merge_underground_visibility_flags(
+        db, session, handler, state, new, owners)
+
+    changed = {str(owner) for owner in set(old) | set(new)
+               if (old.get(owner) or {}) != (new.get(owner) or {})}
     state["player_visibility"] = new
     _apply_player_flags(game, state)
     if state.get("pvp"):
@@ -286,7 +333,11 @@ def refresh_player_visibility(db, session, handler, game, pl_t, ai_t, state):
             handler, "_player_champ_scid", game.player_champion_card_id)
         game.ai_champion_card_id = getattr(
             handler, "_ai_champ_scid", game.ai_champion_card_id)
-    for owner in changed:
+    hand_visibility_changed = {
+        owner for owner in changed
+        if bool((old.get(owner) or {}).get("CanSeeOpponentsHand")) != bool(
+            (new.get(owner) or {}).get("CanSeeOpponentsHand"))}
+    for owner in hand_visibility_changed:
         visible = bool((new.get(owner) or {}).get("CanSeeOpponentsHand"))
         _push_hand(db, session, handler, game, pl_t, ai_t, state,
                    int(owner), visible)

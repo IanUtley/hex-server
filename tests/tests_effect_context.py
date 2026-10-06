@@ -22,6 +22,8 @@ from gamedata.semantics import AbilityGraph, EffectSpec
 
 
 class _Cursor:
+    rowcount = 0
+
     def fetchone(self):
         return (5, 7)
 
@@ -44,6 +46,34 @@ class _DrawHandler:
 
     def _player_draw_card(self, game, session, draw_uid, owner):
         self.calls.append((game, session, draw_uid, owner))
+
+
+def test_legacy_effect_context_rejects_rules_port_sessions():
+    """Attached sessions cannot enter legacy leaf or child resolvers."""
+    for session, bstate in (
+            (SimpleNamespace(_rules_port_session=object()), {}),
+            (_Session(), {"_rules_port_attached": True})):
+        try:
+            EffectContext.from_legacy(
+                object(), session, _DB(), object(), "player", "ai",
+                bstate, "legacy-effect")
+        except RuntimeError as exc:
+            assert "bypassed RulesPort" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "attached RulesPort session created a legacy context")
+
+    # Direct construction must not bypass the factory boundary and enter a
+    # legacy context on an attached session.
+    attached = SimpleNamespace(_rules_port_session=object(), session_id=9)
+    try:
+        EffectContext(
+            object(), attached, _DB(), object(), "player", "ai", {},
+            "legacy-effect", param="00000000-0000-0000-0000-000000000001")
+    except RuntimeError as exc:
+        assert "bypassed RulesPort" in str(exc), str(exc)
+    else:
+        raise AssertionError("attached RulesPort created a legacy context")
 
 
 class _Game:
@@ -341,8 +371,323 @@ def test_tunneling_metadata_and_underground_visibility_are_data_driven():
     other = packet_for(opponent)
     assert own.nulling is False
     assert other.nulling is True
+    assert other.card_id.guid.int == 0
     assert [str(value.guid) for value in other.counter_templates] == [counter]
     assert list(other.counter_counts) == [1]
+
+
+def test_hidden_card_update_sends_no_template_identity_or_stats():
+    from domain.game import Game
+    from domain.types import UID, SessionCardId
+    import game_engine
+
+    owner = UID.make(244, 1001)
+    opponent = UID.make(244, 1002)
+    card = SessionCardId(UID(0x6602))
+    template = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    class Packet:
+        def __init__(self):
+            self.events = []
+
+        def add_event(self, event):
+            self.events.append(event)
+
+    game = Game(1, owner, opponent)
+    game.push_card_updated(
+        card, opponent, game_engine.ECardCollections.Hand,
+        game_engine.ECardTypes.Troop, template_id=template,
+        attack=5, defense=4, cost=3, nulling=True)
+    original = game.events[-1]
+    original.orig_template = game_engine.ResourceId.from_str(template)
+    original.int_attrs = {"PrivateAbilityValue": 7}
+    with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+        packet = game.make_network_packet(owner)
+
+    hidden = packet.events[0]
+    assert hidden.nulling is True
+    assert hidden.session_card_id == card
+    assert hidden.collection == game_engine.ECardCollections.Hand
+    assert hidden.card_id.guid.int == 0
+    assert hidden.orig_template.guid.int == 0
+    assert hidden.attack == hidden.defense == hidden.cost == 0
+    assert hidden.int_attrs == {}
+    # Viewer filtering must operate on a clone; the controller's projection
+    # retains the complete card definition for a later authorized packet.
+    assert original.card_id.guid.int != 0
+    assert original.attack == 5
+
+
+def test_other_players_choosing_card_is_hidden_even_without_nulling_flag():
+    from domain.game import Game
+    from domain.types import UID, SessionCardId
+    import game_engine
+
+    owner = UID.make(244, 1001)
+    opponent = UID.make(244, 1002)
+    card = SessionCardId(UID(0x6603))
+    template = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    class Packet:
+        def __init__(self):
+            self.events = []
+
+        def add_event(self, event):
+            self.events.append(event)
+
+    def packet_for(viewer):
+        game = Game(1, owner, opponent)
+        game.push_card_updated(
+            card, opponent, game_engine.ECardCollections.Choosing,
+            game_engine.ECardTypes.Choice, template_id=template,
+            attack=2, nulling=False)
+        with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+            return game.make_network_packet(viewer).events[0]
+
+    opponent_view = packet_for(owner)
+    owner_view = packet_for(opponent)
+
+    assert opponent_view.nulling is True
+    assert opponent_view.card_id.guid.int == 0
+    assert opponent_view.attack == 0
+    assert owner_view.nulling is False
+    assert str(owner_view.card_id.guid) == template
+
+
+def test_packet_visibility_matches_csharp_collections_and_reveal_scopes():
+    from domain.game import Game
+    from domain.types import UID, SessionCardId
+    import game_engine
+
+    owner = UID.make(244, 1001)
+    opponent = UID.make(244, 1002)
+    card = SessionCardId(UID(0x6604))
+    template = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    class Packet:
+        def __init__(self):
+            self.events = []
+
+        def add_event(self, event):
+            self.events.append(event)
+
+    def packet_for(viewer, controller, collection, *, nulling=False,
+                   visibility=None, tag=None, chain=False, card_type=None,
+                   tunneling=0, counters=None,
+                   append_hidden_placeholder=False):
+        game = Game(1, owner, opponent)
+        if visibility:
+            game._visibility_by_uid[int(viewer.uid64)] = visibility
+        game.push_card_updated(
+            card, controller, collection,
+            card_type or game_engine.ECardTypes.Troop,
+            template_id=template, attack=4, defense=3, cost=2,
+            nulling=nulling, tunneling=tunneling, counters=counters)
+        if tag is not None:
+            game.events[-1]._hand_reveal_viewer_uid = tag
+        if chain:
+            game.events[-1]._chain_reveal = True
+        if append_hidden_placeholder:
+            game.push_card_updated(
+                card, controller, collection, game_engine.ECardTypes.Troop,
+                nulling=True)
+        with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+            return game.make_network_packet(viewer).events
+
+    hidden_cases = (
+        # Deck remains face down even for its controller without a scoped
+        # top-of-deck reveal.
+        (owner, owner, game_engine.ECardCollections.Deck),
+        (owner, opponent, game_engine.ECardCollections.Hand),
+        (owner, opponent, game_engine.ECardCollections.Underground),
+        (owner, opponent, game_engine.ECardCollections.Choosing),
+        (owner, opponent, game_engine.ECardCollections.Hand |
+         game_engine.ECardCollections.Choosing),
+        (owner, owner, game_engine.ECardCollections.Mod),
+    )
+    for viewer, controller, collection in hidden_cases:
+        public_tunneling_counter = (
+            {"def75520-0b8b-447f-8705-b34e71043890": 1}
+            if collection == game_engine.ECardCollections.Underground else None)
+        projected = packet_for(
+            viewer, controller, collection,
+            counters=public_tunneling_counter)[0]
+        assert projected.nulling is True, collection
+        assert projected.card_id.guid.int == 0, collection
+        assert projected.attack == projected.defense == projected.cost == 0
+        if collection == game_engine.ECardCollections.Underground:
+            assert [str(value.guid) for value in projected.counter_templates] == [
+                "def75520-0b8b-447f-8705-b34e71043890"]
+            assert list(projected.counter_counts) == [1]
+
+    visible_cases = (
+        (owner, owner, game_engine.ECardCollections.Hand),
+        (owner, owner, game_engine.ECardCollections.Underground),
+        (owner, owner, game_engine.ECardCollections.Choosing),
+        (owner, owner, game_engine.ECardCollections.Hand |
+         game_engine.ECardCollections.Choosing),
+        (owner, opponent, game_engine.ECardCollections.None_),
+        (owner, opponent, game_engine.ECardCollections.Warzone),
+        (owner, opponent, game_engine.ECardCollections.Discard),
+        (owner, opponent, game_engine.ECardCollections.CastSpells),
+    )
+    for viewer, controller, collection in visible_cases:
+        projected = packet_for(viewer, controller, collection)[0]
+        assert projected.nulling is False, collection
+        assert str(projected.card_id.guid) == template, collection
+
+    hand_permission = packet_for(
+        owner, opponent, game_engine.ECardCollections.Hand, nulling=True,
+        visibility={"CanSeeOpponentsHand": 1})[0]
+    assert hand_permission.nulling is False
+    assert str(hand_permission.card_id.guid) == template
+
+    underground_permission = packet_for(
+        owner, opponent, game_engine.ECardCollections.Underground,
+        visibility={"CanSeeUndergroundTroops": 1})[0]
+    assert underground_permission.nulling is False
+    assert str(underground_permission.card_id.guid) == template
+
+    champion_in_deck = packet_for(
+        owner, opponent, game_engine.ECardCollections.Deck,
+        card_type=game_engine.ECardTypes.Champion)[0]
+    assert champion_in_deck.nulling is False
+    assert str(champion_in_deck.card_id.guid) == template
+
+    # Existing shared refreshes can contain an unscoped full Deck update.
+    # The authored top-deck projector must append a separately scoped copy so
+    # the authorized viewer sees it and the other client still gets a nulling
+    # representation.
+    from rules_port.visibility import project_visible_top_decks
+    top_game = Game(1, owner, opponent)
+    top_game.push_card_updated(
+        card, owner, game_engine.ECardCollections.Deck,
+        game_engine.ECardTypes.Troop, template_id=template)
+    top_handler = SimpleNamespace(_card_full_data=lambda *_args: (
+        template, game_engine.ECardTypes.Troop, "Card", 0, 0, 1, 0))
+    top_state = {"pvp": True, "pids": [1001, 1002]}
+
+    def top_attributes(_db, _session_id, _state, player):
+        return {"CanSeeTopOfDeck": int(player) == 1001}
+
+    with mock.patch("pvp_db.db_deck_top_card_details",
+                    return_value=(1, card.uid.uid64, template, template)), \
+            mock.patch("rules_port.static_rules.player_int_attributes",
+                       side_effect=top_attributes):
+        project_visible_top_decks(
+            object(), SimpleNamespace(session_id=1), top_handler, top_game,
+            owner, opponent, top_state)
+    top_updates = list(top_game.events)
+    with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+        top_owner_events = top_game.make_network_packet(owner).events
+        # make_network_packet consumes its event queue; give the second
+        # recipient the same pre-projection batch, as the service adapters do.
+        top_game.events = list(top_updates)
+        top_opponent_events = top_game.make_network_packet(opponent).events
+    assert len(top_owner_events) == 1
+    assert top_owner_events[0].nulling is False
+    assert str(top_owner_events[0].card_id.guid) == template
+    assert len(top_opponent_events) == 1, [
+        (event.collection, event.nulling, event.card_id.guid.int)
+        for event in top_opponent_events]
+    assert top_opponent_events[0].nulling is True
+    assert top_opponent_events[0].card_id.guid.int == 0
+
+    # A public chain reveal is allowed for both players, but Underground has
+    # an explicit C# exception and remains private even with the same marker.
+    for viewer in (owner, opponent):
+        chain_card = packet_for(
+            viewer, opponent, game_engine.ECardCollections.Hand,
+            chain=True, append_hidden_placeholder=True)
+        assert len(chain_card) == 1
+        assert chain_card[0].nulling is False
+        assert str(chain_card[0].card_id.guid) == template
+    tunneled_chain = packet_for(
+        owner, opponent, game_engine.ECardCollections.Underground,
+        chain=True)[0]
+    assert tunneled_chain.nulling is True
+    assert tunneled_chain.card_id.guid.int == 0
+    nonzero_tunneling_chain = packet_for(
+        owner, opponent, game_engine.ECardCollections.Hand,
+        chain=True, tunneling=1)[0]
+    assert nonzero_tunneling_chain.nulling is True
+    assert nonzero_tunneling_chain.card_id.guid.int == 0
+
+    # Reconnect must restore the hidden zone to the owner, hide it from an
+    # unauthorized opponent, and send one full projection to an authorized
+    # opponent. The full reveal suppresses that viewer's hidden placeholder.
+    import services.tournament_game as tournament_game
+    from rules_port.visibility import (
+        apply_player_visibility_to_game,
+        merge_underground_visibility_flags)
+    session = SimpleNamespace(session_id=1)
+    underground_row = (card.uid.uid64, template, 1002, "Troop", 0, "[]", "{}")
+    visible_to = {1001: 0}
+
+    def underground_rows(_session_id, location, **_kwargs):
+        return [underground_row] if location == "underground" else []
+
+    def projected_underground_rows(_session_id, user_id, **_kwargs):
+        return [(card.uid.uid64, template)] if int(user_id) == 1002 else []
+
+    def visibility_attrs(_db, _session_id, _state, player):
+        return {"CanSeeUndergroundTroops": visible_to.get(int(player), 0)}
+
+    handler = SimpleNamespace(_card_full_data=lambda *_args: (
+        template, game_engine.ECardTypes.Troop, "Card", 0, 0, 1, 0))
+
+    def reconnect_underground_packet(viewer, can_see):
+        visible_to[1001] = int(can_see)
+        state = {"pvp": True, "pids": [1001, 1002],
+                 "player_visibility": ({"1001": {
+                     "CanSeeUndergroundTroops": 1}} if can_see else {})}
+        game = Game(1, owner, opponent)
+        with mock.patch.object(
+                tournament_game, "db_game_cards_at_location",
+                side_effect=underground_rows), \
+                mock.patch(
+                    "pvp_db.db_underground_card_rows",
+                    side_effect=projected_underground_rows), \
+                mock.patch(
+                    "rules_port.static_rules.player_int_attributes",
+                    side_effect=visibility_attrs):
+            state["player_visibility"] = merge_underground_visibility_flags(
+                object(), session, handler, state,
+                state.get("player_visibility"), owners=(1001, 1002))
+            apply_player_visibility_to_game(game, state)
+            tournament_game._pvp_push_reconnect_underground(
+                game, session, handler, int(viewer.uid64) >> 8,
+                owner, opponent, state)
+        with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+            return game.make_network_packet(viewer).events
+
+    visible_reconnect = reconnect_underground_packet(owner, True)
+    assert len(visible_reconnect) == 1
+    assert visible_reconnect[0].nulling is False
+    assert str(visible_reconnect[0].card_id.guid) == template
+    hidden_reconnect = reconnect_underground_packet(owner, False)
+    assert len(hidden_reconnect) == 1
+    assert hidden_reconnect[0].nulling is True
+    assert hidden_reconnect[0].card_id.guid.int == 0
+    owner_reconnect = reconnect_underground_packet(opponent, False)
+    assert len(owner_reconnect) == 1
+    assert owner_reconnect[0].nulling is False
+    assert str(owner_reconnect[0].card_id.guid) == template
+
+    # A viewer-scoped reveal must not add its UID to another client's public
+    # chain set or suppress that client's hidden placeholder.
+    scoped_owner = packet_for(
+        owner, opponent, game_engine.ECardCollections.Hand,
+        tag=owner, chain=True, append_hidden_placeholder=True)
+    scoped_opponent = packet_for(
+        opponent, opponent, game_engine.ECardCollections.Hand,
+        tag=owner, chain=True, append_hidden_placeholder=True)
+    assert len(scoped_owner) == 1
+    assert scoped_owner[0].nulling is False
+    assert str(scoped_owner[0].card_id.guid) == template
+    assert len(scoped_opponent) == 1
+    assert scoped_opponent[0].nulling is True
+    assert scoped_opponent[0].card_id.guid.int == 0
 
 
 def test_subterranean_spy_visibility_reveals_only_the_controller_view():
@@ -560,6 +905,50 @@ def test_player_updated_carries_subterranean_spy_hand_permission():
     game.push_player_updated(owner, champ_id=champion)
     event = game.events[-1]
     assert event.can_see_enemy_hand is True
+
+
+def test_visibility_refresh_projects_underground_permission_to_unity_flag():
+    from domain.game import Game
+    from domain.types import UID
+    from rules_port.visibility import refresh_player_visibility
+
+    player = UID.make(244, 1001)
+    opponent = UID.make(244, 1002)
+    game = Game(1, player, opponent)
+    player_champion = game_engine.SessionCardId(UID(0x6501))
+    opponent_champion = game_engine.SessionCardId(UID(0x6502))
+    game.player_champion_card_id = player_champion
+    game.ai_champion_card_id = opponent_champion
+    session = SimpleNamespace(session_id=1)
+    state = {"pvp": True, "pids": [1001, 1002],
+             "champ_map": {"1001": 0x6501, "1002": 0x6502},
+             "player_visibility": {}}
+    allowed = {1001: 1, 1002: 0}
+    player_attrs = lambda _db, _sid, _state, owner: {
+        "CanSeeUndergroundTroops": allowed[int(owner)]}
+    handler = SimpleNamespace(user_profile={})
+    empty_rows = mock.patch(
+        "pvp_db.db_visibility_underground_rows", return_value=[])
+    empty_hands = mock.patch("pvp_db.db_hand_card_uids", return_value=[])
+    empty_underground = mock.patch(
+        "pvp_db.db_underground_card_rows", return_value=[])
+    attrs_patch = mock.patch(
+        "rules_port.static_rules.player_int_attributes",
+        side_effect=player_attrs)
+    with empty_rows, empty_hands, empty_underground, attrs_patch:
+        refresh_player_visibility(
+            object(), session, handler, game, player, opponent, state)
+        assert state["player_visibility"]["1001"] == {
+            "CanSeeUndergroundTroops": 1}
+        assert game.events[-1].player_id == player
+        assert game.events[-1].can_see_enemy_underground is True
+
+        allowed[1001] = 0
+        refresh_player_visibility(
+            object(), session, handler, game, player, opponent, state)
+        assert "1001" not in state["player_visibility"]
+        assert game.events[-1].player_id == player
+        assert game.events[-1].can_see_enemy_underground is False
 
 
 def test_player_updated_preserves_the_established_deck_sleeve():
@@ -854,7 +1243,382 @@ def test_native_transform_uses_typed_stored_target_copy():
 
     assert result == "transformed 1 stored card(s) -> target-t"
     transform.assert_called_once_with(
-        context, 100, "target-template", keep_zone=True)
+        context, 100, "target-template", keep_zone=True,
+        copy_from_uid=200, event_gems=game_engine.EGemTypesNew.Unknown)
+
+
+def test_native_same_collection_transform_emits_no_wire_card_moved():
+    """Transforms restore their saved gems without adding a class-50 move."""
+    from rules_port.transform_effects import revert_instance, transform_instance
+
+    events = []
+
+    class ProjectionGame:
+        def push_card_transformed(self, *_args, **_kwargs):
+            events.append("transformed")
+
+        def push_card_reverted(self, *_args, **_kwargs):
+            events.append("reverted")
+
+        def push_card_updated(self, *_args, **_kwargs):
+            events.append("updated")
+
+        def push_card_moved(self, *_args, **_kwargs):
+            events.append("moved")
+
+    player_uid = game_engine.UID.make(244, 5)
+    ai_uid = game_engine.UID.make(3, 1000)
+    context = SimpleNamespace(
+        game=ProjectionGame(), session=_Session(), db=_DB(),
+        handler=SimpleNamespace(_card_full_data=lambda *_args: (
+            "new-template", game_engine.ECardTypes.Troop, "Target", 1, 2, 2, 0)),
+        player_uid=player_uid, ai_uid=ai_uid, bstate={})
+
+    with mock.patch("pvp_db.db_card_owner_location_position",
+                    return_value=(5, "warzone", 4)), \
+            mock.patch("pvp_db.db_card_owner_zone_state",
+                       return_value=(5, "warzone", 4, 0)), \
+            mock.patch("pvp_db.db_card_sacrifice_info",
+                       return_value=(5, "warzone", "Troop")), \
+            mock.patch("pvp_db.db_copy_template_payload",
+                       return_value=(game_engine.ECardTypes.Troop, "[]", 0)), \
+            mock.patch("pvp_db.db_capture_original_gems",
+                       side_effect=lambda *_args, **_kwargs:
+                       events.append("captured original gems")), \
+            mock.patch("pvp_db.db_card_original_gems", return_value=8), \
+            mock.patch("pvp_db.db_card_original_and_template",
+                       return_value=("original-template", "new-template")), \
+            mock.patch("pvp_db.db_reset_card_modifiers"), \
+            mock.patch("pvp_db.db_reset_card_uses"), \
+            mock.patch("pvp_db.db_card_attribute_value", return_value=0), \
+            mock.patch("rules_port.triggers.dispatch_trigger",
+                       side_effect=lambda _context, event_type, *_args,
+                       **_kwargs: events.append(event_type)) as trigger, \
+            mock.patch("pvp_db.db_transform_card_instance",
+                       side_effect=lambda *_args, **_kwargs:
+                       events.append("mutated")) as transform_db:
+        # Transforming a Warzone card to the same collection resets its
+        # position; this used to add an unsupported standalone class-50 event.
+        # C# also handles CardTransformsEvent before the mutation and queues
+        # CardTransformedEvent after it.
+        assert transform_instance(
+            context, 0x102, "new-template") == 0x102
+        assert revert_instance(context, 0x102) == "reverted 0x102"
+
+    assert [call.args[1] for call in trigger.call_args_list] == [
+        "CardTransformsEvent", "CardTransformedEvent"]
+    transform_calls = transform_db.call_args_list
+    assert len(transform_calls) == 2, transform_calls
+    assert transform_calls[0].kwargs.get("gems") is None
+    assert transform_calls[1].kwargs.get("gems") == 8
+    assert events == ["CardTransformsEvent", "captured original gems",
+                      "mutated", "transformed", "updated",
+                      "CardTransformedEvent", "mutated", "reverted",
+                      "updated"], events
+
+
+def test_persisted_original_gems_survive_transform_and_revert():
+    """Persist the first active gems and restore them on a later reversion."""
+    import sqlite3
+    import pvp_db
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE game_cards (session_id INTEGER, card_uid INTEGER, "
+        "template_guid TEXT, original_template_guid TEXT, "
+        "card_template_id TEXT, card_type TEXT, "
+        "card_abilities TEXT, card_attributes INTEGER, location TEXT, "
+        "position INTEGER, card_state INTEGER, temporary_attributes INTEGER "
+        "DEFAULT 0, temporary_buffs TEXT DEFAULT '{}', gems INTEGER, "
+        "original_gems INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO game_cards (session_id, card_uid, template_guid, "
+        "original_template_guid, card_template_id, card_type, card_abilities, card_attributes, "
+        "location, position, card_state, gems) "
+        "VALUES (9, 258, 'original-template', 'original-template', "
+        "'original-template', 'Troop', '[]', 0, 'warzone', 4, 0, 8)"
+    )
+
+    assert pvp_db.db_capture_original_gems(9, 258, conn=conn) == 1
+    pvp_db.db_transform_card_instance(
+        9, 258, "transformed-template", "Troop", "[]", 0,
+        "warzone", 4, 0, conn=conn, gems=32)
+    assert pvp_db.db_card_original_gems(9, 258, conn=conn) == 8
+    assert pvp_db.db_card_gem_type(9, 258, conn=conn) == 32
+
+    # Later transforms must keep C#'s first-original value, including when
+    # that value is the valid empty-socket enum bit.
+    assert pvp_db.db_capture_original_gems(9, 258, conn=conn) == 0
+    pvp_db.db_transform_card_instance(
+        9, 258, "original-template", "Troop", "[]", 0,
+        "warzone", 4, 0, conn=conn,
+        gems=pvp_db.db_card_original_gems(9, 258, conn=conn))
+    assert pvp_db.db_card_gem_type(9, 258, conn=conn) == 8
+
+    conn.execute("UPDATE game_cards SET original_gems=NULL WHERE card_uid=258")
+    conn.execute("UPDATE game_cards SET gems=? WHERE card_uid=258", (1 << 62,))
+    assert pvp_db.db_capture_original_gems(9, 258, conn=conn) == 1
+    assert pvp_db.db_card_original_gems(9, 258, conn=conn) == 1 << 62
+    conn.execute("UPDATE game_cards SET gems=32 WHERE card_uid=258")
+    assert pvp_db.db_capture_original_gems(9, 258, conn=conn) == 0
+    assert pvp_db.db_card_original_gems(9, 258, conn=conn) == 1 << 62
+
+    conn.execute(
+        "INSERT INTO game_cards (session_id, card_uid, template_guid, "
+        "original_template_guid, card_template_id, card_type, card_abilities, "
+        "card_attributes, location, position, card_state, gems) "
+        "VALUES (9, 259, 'transformed-template', 'original-template', "
+        "'transformed-template', 'Troop', '[]', 0, 'warzone', 4, 0, 32)"
+    )
+    assert pvp_db.db_capture_original_gems(9, 259, conn=conn) == 0
+    assert pvp_db.db_card_original_gems(9, 259, conn=conn) is None
+    pvp_db.db_transform_card_instance(
+        9, 259, "original-template", "Troop", "[]", 0,
+        "warzone", 4, 0, conn=conn,
+        gems=pvp_db.db_card_original_gems(9, 259, conn=conn))
+    assert pvp_db.db_card_gem_type(9, 259, conn=conn) == 32
+    conn.close()
+
+
+def test_native_transform_event_uses_pre_transform_viewer_visibility():
+    """Class 44 identity is limited to viewers of the old card/collection."""
+    from rules_port.transform_effects import transform_instance
+
+    owner = game_engine.UID.make(244, 1001)
+    controller = game_engine.UID.make(244, 1002)
+    template = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    class Packet:
+        def __init__(self):
+            self.events = []
+
+        def add_event(self, event):
+            self.events.append(event)
+
+    def transform_packets(visibility=None, *, zone="hand"):
+        game = game_engine.Game(1, owner, controller)
+        game._visibility_by_uid[int(owner.uid64)] = dict(visibility or {})
+        context = SimpleNamespace(
+            game=game, session=_Session(), db=_DB(),
+            handler=SimpleNamespace(
+                user_profile={"id": 1001},
+                _card_full_data=lambda *_args: (
+                    template, game_engine.ECardTypes.Troop, "Target", 1, 2, 2, 0)),
+            player_uid=owner, ai_uid=controller,
+            bstate={"pvp": True, "pids": [1001, 1002]})
+        with mock.patch("pvp_db.db_card_owner_location_position",
+                        return_value=(1002, zone, 3)), \
+                mock.patch("pvp_db.db_card_owner_zone_state",
+                           return_value=(1002, zone, 0)), \
+                mock.patch("pvp_db.db_card_sacrifice_info",
+                           return_value=(1002, zone, "Troop")), \
+                mock.patch("pvp_db.db_deck_top_card_details",
+                           return_value=(1, 0x6604, "instance", template)), \
+                mock.patch("rules_port.static_rules.player_int_attributes",
+                           side_effect=lambda _db, _sid, _state, player:
+                           {"CanSeeOpponentsTopOfDeck": 1}
+                           if int(player) == 1001 else {}), \
+                mock.patch("pvp_db.db_copy_template_payload",
+                           return_value=("Troop", "[]", 0)), \
+                mock.patch("pvp_db.db_transform_card_instance"), \
+                mock.patch("pvp_db.db_reset_card_uses"), \
+                mock.patch("pvp_db.db_card_attribute_value", return_value=0), \
+                mock.patch("rules_port.triggers.dispatch_trigger"):
+            assert transform_instance(context, 0x6604, template) == 0x6604
+        batch = list(game.events)
+        with mock.patch("domain.game.NetworkPacketSessionEventArgs", Packet):
+            owner_packet = game.make_network_packet(owner)
+            game.events = batch
+            opponent_packet = game.make_network_packet(controller)
+        return owner_packet, opponent_packet
+
+    owner_packet, controller_packet = transform_packets()
+    assert not any(isinstance(event, game_engine.CardTransformedSessionEventArgs)
+                   for event in owner_packet.events)
+    assert any(isinstance(event, game_engine.CardTransformedSessionEventArgs)
+               for event in controller_packet.events)
+    owner_updates = [event for event in owner_packet.events
+                    if isinstance(event, game_engine.CardUpdatedSessionEventArgs)]
+    assert owner_updates and owner_updates[-1].nulling is True
+    assert owner_updates[-1].card_id.guid.int == 0
+
+    _owner_packet, authorized_opponent_packet = transform_packets(
+        {"CanSeeOpponentsHand": 1})
+    assert any(isinstance(event, game_engine.CardTransformedSessionEventArgs)
+               for event in authorized_opponent_packet.events)
+
+    deck_view_packet, deck_controller_packet = transform_packets(zone="deck")
+    assert any(isinstance(event, game_engine.CardTransformedSessionEventArgs)
+               for event in deck_view_packet.events)
+    assert not any(isinstance(event, game_engine.CardTransformedSessionEventArgs)
+                   for event in deck_controller_packet.events)
+
+
+def test_card_transform_reset_and_category_gates_match_csharp():
+    """Check C# use-reset boundaries and type-transition revert gates."""
+    from pvp_db import db_reset_card_uses
+    import json
+
+    initial = {
+        "per-game-ability": 2,
+        "__turn_uses__": {"4:per-turn-ability": 1},
+        "__cooldown_counts__": {"cooldown-ability": 2},
+    }
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class UsageDB:
+        def __init__(self):
+            self.uses = dict(initial)
+
+        def execute(self, sql, params):
+            if sql.startswith("SELECT card_uses"):
+                return Cursor((json.dumps(self.uses),))
+            assert sql.startswith("UPDATE game_cards SET card_uses=")
+            self.uses = json.loads(params[0])
+            return Cursor()
+
+    db = UsageDB()
+    assert db_reset_card_uses(9, 10, conn=db) == 1
+    assert db.uses == {
+        "__turn_uses__": initial["__turn_uses__"],
+        "__cooldown_counts__": initial["__cooldown_counts__"],
+    }
+
+    db.uses = dict(initial)
+    assert db_reset_card_uses(
+        9, 10, preserve_turn_and_cooldowns=False, conn=db) == 1
+    assert db.uses == {}
+
+    from rules_port.transform_effects import _requires_transform_revert
+    assert _requires_transform_revert(
+        game_engine.ECardTypes.Troop,
+        game_engine.ECardTypes.BasicAction)
+    assert _requires_transform_revert(
+        game_engine.ECardTypes.Resource,
+        game_engine.ECardTypes.Constant)
+    assert not _requires_transform_revert(
+        game_engine.ECardTypes.BasicAction,
+        game_engine.ECardTypes.Resource)
+    assert not _requires_transform_revert(
+        game_engine.ECardTypes.Constant,
+        game_engine.ECardTypes.Artifact)
+
+
+def test_copy_transform_copies_supported_csharp_mutable_card_fields():
+    """TransformIntoCopy carries the persisted subset of Card.CopyFrom."""
+    import json
+    import sqlite3
+    from pvp_db import db_copy_transform_instance_state
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE game_cards (session_id INTEGER, card_uid INTEGER, "
+        "gems INTEGER, card_damage INTEGER, card_uses TEXT, "
+        "permanent_buffs TEXT, temporary_buffs TEXT)")
+    destination_permanent = {
+        "counters": {"Charge": 2, "DestinationOnly": 4},
+        "counter_guids": {"Charge": "charge-guid",
+                           "DestinationOnly": "destination-guid"},
+        "card_integer_variables": {"discarded": 9},
+        "escalation_count": 3,
+        "damage_shields": [{"amount": 1, "owner": "destination"}],
+    }
+    destination_temporary = {
+        "damage_shields": [{"amount": 2, "owner": "destination-temp"}],
+        "stat_modifiers": [{"amount": 7}],
+    }
+    source_permanent = {
+        "counters": {"Charge": 5, "SourceOnly": 1},
+        "counter_guids": {"Charge": "charge-guid",
+                           "SourceOnly": "source-guid"},
+        "card_integer_variables": {"copied": 12},
+        "escalation_count": 8,
+        "damage_shields": [{"amount": 3, "owner": "source"}],
+    }
+    source_temporary = {
+        "damage_shields": [{"amount": 4, "owner": "source-temp"}],
+        "stat_modifiers": [{"amount": 11}],
+    }
+    source_uses = {
+        "ability-guid": 2,
+        "__turn_uses__": {"turn-count": 3},
+        "__cooldown_counts__": {"cooldown": 1},
+    }
+    db.executemany(
+        "INSERT INTO game_cards VALUES (9, ?, ?, ?, ?, ?, ?)",
+        [
+            (100, 1, 2, '{"destination-use":1}',
+             json.dumps(destination_permanent),
+             json.dumps(destination_temporary)),
+            (200, 4, 5, json.dumps(source_uses),
+             json.dumps(source_permanent), json.dumps(source_temporary)),
+        ])
+
+    assert db_copy_transform_instance_state(9, 100, 200, conn=db) == 1
+    row = db.execute(
+        "SELECT gems, card_damage, card_uses, permanent_buffs, "
+        "temporary_buffs FROM game_cards WHERE session_id=9 AND card_uid=100"
+    ).fetchone()
+    assert row[0:2] == (4, 5)
+    assert json.loads(row[2]) == source_uses
+    permanent = json.loads(row[3])
+    temporary = json.loads(row[4])
+    assert permanent["counters"] == {
+        "Charge": 7, "DestinationOnly": 4, "SourceOnly": 1}
+    assert permanent["counter_guids"]["SourceOnly"] == "source-guid"
+    assert permanent["card_integer_variables"] == {"copied": 12}
+    assert permanent["escalation_count"] == 8
+    assert [shield["owner"] for shield in permanent["damage_shields"]] == [
+        "destination", "source"]
+    assert [shield["owner"] for shield in temporary["damage_shields"]] == [
+        "destination-temp", "source-temp"]
+    assert temporary["stat_modifiers"] == [{"amount": 7}]
+
+    replica_destination = dict(permanent)
+    replica_destination["card_integer_variables"] = {"replica-only": 6}
+    replica_destination["escalation_count"] = 2
+    db.execute(
+        "UPDATE game_cards SET card_damage=17, card_uses=?, permanent_buffs=? "
+        "WHERE session_id=9 AND card_uid=100",
+        ('{"replica-destination":1}', json.dumps(replica_destination)))
+    assert db_copy_transform_instance_state(
+        9, 100, 200, is_replica=True, conn=db) == 1
+    replica_row = db.execute(
+        "SELECT gems, card_damage, card_uses, permanent_buffs "
+        "FROM game_cards WHERE session_id=9 AND card_uid=100"
+    ).fetchone()
+    assert replica_row[:3] == (4, 17, '{"replica-destination":1}')
+    replica_permanent = json.loads(replica_row[3])
+    assert replica_permanent["card_integer_variables"] == {"copied": 12}
+    assert replica_permanent["escalation_count"] == 8
+    assert replica_permanent["counters"] == permanent["counters"]
+
+
+def test_native_transform_to_target_preserves_source_collection():
+    """TransformIntoCopy changes the source template in its current zone."""
+    context = EffectContext.from_rules_port(
+        _Game(), _Session(), _DB(), object(), "player", "ai",
+        {"resolving_source_uid": 100, "resolving_target_uid": 200},
+        "transform-to-target")
+    with mock.patch("pvp_db.db_card_zone_details",
+                    return_value=("target-template",)), \
+            mock.patch("rules_port.transform_effects.transform_instance",
+                       return_value=100) as transform:
+        result = context.transform_card_to_target()
+
+    assert result == "transformed 0x64 to target copy", result
+    transform.assert_called_once_with(
+        context, 100, "target-template", keep_zone=True,
+        copy_from_uid=200, is_replica=False)
 
 
 # The Verdict effect builds its typed choice tokens and activates the
@@ -896,6 +1660,91 @@ def test_native_draw_routes_empty_deck_to_explicit_result_projection():
     assert len(seen) == 1
     assert seen[0][0:2] == (game, session)
     assert seen[0][2] == 5
+
+
+def test_card_zone_projection_uses_client_derived_moves():
+    from rules_port.choice_effects import (
+        _clear_choice_zone, _create_choice_cards)
+    from rules_port.deck_effects import move_deck_card_to_hand
+    from rules_port.draw_effects import draw_cards
+    from rules_port.host_mutations import project_mulligan_cards
+
+    class RecordingGame:
+        def __init__(self):
+            self.events = []
+
+        def push_card_updated(self, *args, **kwargs):
+            self.events.append(("updated", args[2], kwargs))
+
+        def push_card_moved(self, *args, **kwargs):
+            self.events.append(("moved", args[2], kwargs))
+
+        def push_card_drawn(self, *args, **kwargs):
+            self.events.append(("drawn", args[1], kwargs))
+
+    game = RecordingGame()
+    player_uid = game_engine.UID.make(244, 5)
+    handler = SimpleNamespace(
+        _player_champ_scid=None, _ai_champ_scid=None,
+        _card_full_data=lambda *_args: (
+            "template-guid", game_engine.ECardTypes.Troop, "Troop", 2, 1, 3,
+            []))
+    context = SimpleNamespace(
+        db=_DB(), session=SimpleNamespace(session_id=9), game=game,
+        handler=handler, player_uid=player_uid,
+        ai_uid=game_engine.UID.make(244, 6), bstate={},
+        target_owner=lambda default=None: 5,
+        _emit_trigger=lambda *_args, **_kwargs: False)
+
+    with mock.patch("pvp_db.db_deck_top_card_details",
+                    return_value=(12, 77, "Troop", "template-guid")), \
+            mock.patch("pvp_db.db_draw_card_to_hand"):
+        assert draw_cards(context, 1, owner=5) == "draw 1 for owner 5"
+    assert [kind for kind, _collection, _fields in game.events] == [
+        "updated", "drawn"]
+    assert game.events[0][1] == game_engine.ECardCollections.Hand
+
+    game.events.clear()
+    with mock.patch("pvp_db.db_copy_template_payload",
+                    return_value=("Troop", "[]", "{}")), \
+            mock.patch("pvp_db.db_next_game_card_row_id", return_value=1), \
+            mock.patch("pvp_db.db_insert_generated_card"), \
+            mock.patch("rules_port.runtime_helpers.next_game_card_uid",
+                       return_value=80):
+        assert _create_choice_cards(context, 5, ["template-guid"]) == [80]
+    assert [kind for kind, _collection, _fields in game.events] == [
+        "updated"]
+    assert game.events[0][1] == game_engine.ECardCollections.Choosing
+
+    game.events.clear()
+    with mock.patch("pvp_db.db_choice_card_rows", return_value=[
+            (79, 5, "template-guid", "Troop")]), \
+            mock.patch("pvp_db.db_move_choice_to_played_resources") as move:
+        _clear_choice_zone(context)
+    move.assert_called_once_with(9, 79, conn=context.db)
+    assert [kind for kind, _collection, _fields in game.events] == [
+        "updated"]
+    assert game.events[0][1] == game_engine.ECardCollections.PlayedResources
+
+    game.events.clear()
+    project_mulligan_cards(
+        handler, game, player_uid, [(0, 76)],
+        [(78, "Troop", "template-guid")], new_player_uid=player_uid,
+        draw_new=True)
+    assert [kind for kind, _collection, _fields in game.events] == [
+        "updated", "updated", "drawn"]
+    assert game.events[0][1] == game_engine.ECardCollections.Deck
+    assert game.events[1][1] == game_engine.ECardCollections.Hand
+
+    game.events.clear()
+    with mock.patch("pvp_db.db_card_zone_details",
+                    return_value=("template-guid", "Troop", 5, "deck")), \
+            mock.patch("pvp_db.db_move_card_to_location"):
+        assert move_deck_card_to_hand(context, 77, 5) == \
+            "searched deck card 0x4d to hand"
+    assert [kind for kind, _collection, _fields in game.events] == [
+        "updated", "drawn"]
+    assert game.events[0][1] == game_engine.ECardCollections.Hand
 
 
 def test_context_randomize_variable_uses_typed_bounds():
@@ -1160,9 +2009,12 @@ def test_context_typed_damage_shield_uses_client_flags():
         entry = save.call_args.args[1]["damage_shields"][0]
         assert entry == {
             "amount": 3, "only_combat": True, "one_shot": True,
-            "lasts_indefinitely": False,
+            "lasts_indefinitely": False, "rules_port_order": 0,
         }
-        buffs.assert_called_once_with(123, "temporary_buffs")
+        assert buffs.call_args_list == [
+            mock.call(123, "permanent_buffs"),
+            mock.call(123, "temporary_buffs"),
+        ]
         push.assert_called_once_with(123, damage_shield=True)
 
 
@@ -1392,6 +2244,7 @@ def test_battle2cards_uses_authored_secondary_effect_target():
 
 
 if __name__ == "__main__":
+    test_legacy_effect_context_rejects_rules_port_sessions()
     test_native_grant_ability_can_target_a_champion()
     test_player_target_template_uses_champion_identity_for_grants()
     test_context_decorator_adapts_legacy_leaf_arguments()
@@ -1400,6 +2253,7 @@ if __name__ == "__main__":
     test_tunneling_surface_queue_is_empty_without_underground_cards()
     test_queue_surfaces_registers_the_native_chain_item()
     test_resource_choice_ability_is_detected_from_metadata()
+    test_packet_visibility_matches_csharp_collections_and_reveal_scopes()
     test_subterranean_spy_visibility_reveals_only_the_controller_view()
     test_match_secondary_reveal_uses_stored_target_owner()
     test_player_updated_carries_subterranean_spy_hand_permission()
@@ -1408,8 +2262,15 @@ if __name__ == "__main__":
     test_context_draw_preserves_owner_and_handler_boundary()
     test_context_authored_events_use_typed_event_names()
     test_native_transform_uses_typed_stored_target_copy()
+    test_native_same_collection_transform_emits_no_wire_card_moved()
+    test_persisted_original_gems_survive_transform_and_revert()
+    test_native_transform_event_uses_pre_transform_viewer_visibility()
+    test_card_transform_reset_and_category_gates_match_csharp()
+    test_copy_transform_copies_supported_csharp_mutable_card_fields()
+    test_native_transform_to_target_preserves_source_collection()
     test_context_draw_effect_uses_typed_or_fixture_count()
     test_native_draw_routes_empty_deck_to_explicit_result_projection()
+    test_card_zone_projection_uses_client_derived_moves()
     test_context_randomize_variable_uses_typed_bounds()
     test_context_stat_mod_uses_shared_operation_boundary()
     test_context_damage_modifier_resolves_typed_input_and_target()

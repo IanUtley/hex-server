@@ -21,6 +21,71 @@ from tests.tests_combat import (HandlerStub, SessionStub, TPL_GLADIATOR,
                                 add_card, make_db)
 
 
+def _nth_card_draw_trigger_uses_the_csharp_event_snapshot():
+    """C# compares Nth against CardDrawnEvent, not a mutable global counter."""
+    from rules_port.condition_context import ConditionContext
+    from rules_port.conditions import evaluate_condition
+
+    node = {
+        "_t": ("Game.Shared.Mechanics.Triggers.Conditions."
+               "TriggerCardIsNthCardDrawnThisTurnByThisPlayer"),
+        "m_Nth": 2,
+    }
+    state = {"player_draws_this_turn": 1}
+    matching = ConditionContext(
+        None, SimpleNamespace(session_id=1), state,
+        event_type="CardDrawnEvent", ability_source_owner_id=5,
+        event_data={"nth_card_drawn_this_turn_by_this_player": 2})
+    assert evaluate_condition(node, matching)
+
+    stale = ConditionContext(
+        None, SimpleNamespace(session_id=1), state,
+        event_type="CardDrawnEvent", ability_source_owner_id=5,
+        event_data={"nth_card_drawn_this_turn_by_this_player": 1})
+    assert not evaluate_condition(node, stale)
+
+    wrong_event = ConditionContext(
+        None, SimpleNamespace(session_id=1), state,
+        event_type="TurnStartedEvent", ability_source_owner_id=5,
+        event_data={"nth_card_drawn_this_turn_by_this_player": 2})
+    assert not evaluate_condition(node, wrong_event)
+
+
+def _trigger_player_controlled_source_uses_the_authored_event_selector():
+    """C# selects SourcePlayerId or TargetPlayerId from m_TriggerTest."""
+    from rules_port.condition_context import ConditionContext
+    from rules_port.conditions import evaluate_condition
+
+    state = {"pvp": True, "pids": [5, 7]}
+    context = ConditionContext(
+        None, SimpleNamespace(session_id=1), state,
+        event_type="CardDrawnEvent", ability_source_uid=100,
+        ability_source_owner_id=5, trigger_owner_id=7,
+        event_target_owner_id=5)
+    context.card = lambda _uid: {"user_id": 5}
+    condition = {
+        "_t": ("Game.Shared.Mechanics.Triggers.Conditions."
+               "TriggerPlayerControlsAbilitySource"),
+        "m_TriggerTest": "TriggerTarget",
+    }
+    assert evaluate_condition(condition, context)
+    condition["m_TriggerTest"] = "TriggerSource"
+    assert not evaluate_condition(condition, context)
+    condition["m_TriggerTest"] = "TriggerSourcePlayer"
+    assert not evaluate_condition(condition, context)
+
+    # TriggerPlayerControlsTarget is a separate C# leaf: it compares the
+    # ability source controller directly with sessionEvent.TargetPlayerId.
+    target_condition = {
+        "_t": "Game.Shared.Mechanics.Triggers.Conditions."
+              "TriggerPlayerControlsTarget",
+        "m_TriggerTest": "TriggerSource",
+    }
+    assert evaluate_condition(target_condition, context)
+    context.event_target_owner_id = 7
+    assert not evaluate_condition(target_condition, context)
+
+
 class _SummonContext:
     def __init__(self, db, *, pvp, source_uid, source_owner, target_owner):
         self.db = db
@@ -274,6 +339,38 @@ def _records_trigger_inventory_is_45_authored_event_types():
             "VerdictEvent"}.issubset(names), sorted(names)
 
 
+def _rules_port_checkpoint_cannot_fall_back_to_legacy_trigger_scan():
+    from abilities.framework.triggers import resolve_triggers
+
+    session = SessionStub()
+    session.session_id = 41
+    state = {"_rules_port_attached": True}
+    native_backend = mock.Mock(return_value="native trigger")
+    with mock.patch(
+            "rules_port.triggers.NativeTriggerBackend",
+            return_value=native_backend) as backend_factory:
+        result = resolve_triggers(
+            db=object(), handler=object(), game=object(), session=session,
+            pl_t="player", ai_t="ai", bstate=state,
+            event_type="TestRulesPortTriggerEvent", source_uid=None)
+
+    assert result == "native trigger", result
+    backend_factory.assert_called_once_with()
+    native_backend.assert_called_once()
+    assert native_backend.call_args.kwargs["battle_state"] is state
+    event = native_backend.call_args.kwargs["event"]
+    assert event.event_type == "TestRulesPortTriggerEvent", event
+
+
+def _simulacrum_ignores_authored_trigger_collection_mask():
+    """C# registers a Simulacrum listener and lets it pass any zone mask."""
+    from rules_port.triggers import trigger_collection_allows
+
+    assert not trigger_collection_allows("Warzone", "Void")
+    assert trigger_collection_allows("Warzone", "Simulacrum")
+    assert trigger_collection_allows("Void|Discard", "Discard")
+
+
 def _chain_mutation_events_precede_client_completion_in_both_owner_models(db):
     """C# applies an ability before TopOfChainResolved/RemovedTopOfChain."""
     from rules_port.actions import AbilityResolutionState
@@ -326,11 +423,20 @@ def _chain_mutation_events_precede_client_completion_in_both_owner_models(db):
             game.ai_uid)
         assert result is AbilityResolutionState.COMPLETED, result
         names = [event.__class__.__name__ for event in game.events]
-        moved = names.index("CardMovedSessionEventArgs")
+        assert "CardMovedSessionEventArgs" not in names, names
+        updated = names.index("CardUpdatedSessionEventArgs")
         played = names.index("TroopCardPlayedSessionEventArgs")
         resolved = names.index("TopOfChainResolvedSessionEventArgs")
         removed = names.index("RemovedTopOfChainSessionEventArgs")
-        assert moved < resolved and played < resolved < removed, names
+        assert updated < played < resolved < removed, names
+        resolved_event = game.events[resolved]
+        removed_event = game.events[removed]
+        assert resolved_event.ability_instance_id == instance, resolved_event
+        assert removed_event.ability_instance_id == instance, removed_event
+        chain_empty = [event for event in game.events
+                       if isinstance(event,
+                                     game_engine.ChainEmptySessionEventArgs)]
+        assert len(chain_empty) == 1, names
         location = db.execute(
             "SELECT location FROM game_cards WHERE session_id=? AND card_uid=?",
             (session_id, uid)).fetchone()
@@ -338,6 +444,10 @@ def _chain_mutation_events_precede_client_completion_in_both_owner_models(db):
 
 
 if __name__ == "__main__":
+    _nth_card_draw_trigger_uses_the_csharp_event_snapshot()
+    print("PASS nth-card-drawn trigger uses the event's C# snapshot")
+    _trigger_player_controlled_source_uses_the_authored_event_selector()
+    print("PASS trigger player control uses the C# event selector")
     db = make_db()
     try:
         _conscript_is_filtered_repeatable_and_publishes_faction_in_both_modes(db)
@@ -354,6 +464,10 @@ if __name__ == "__main__":
     print("PASS Deploy keyword matches AsEntersPlay abilities")
     _records_trigger_inventory_is_45_authored_event_types()
     print("PASS 45 authored trigger event types inventory")
+    _rules_port_checkpoint_cannot_fall_back_to_legacy_trigger_scan()
+    print("PASS attached RulesPort trigger entry bypasses legacy scanner")
+    _simulacrum_ignores_authored_trigger_collection_mask()
+    print("PASS Simulacrum trigger collection exception")
     _db = make_db()
     try:
         _chain_mutation_events_precede_client_completion_in_both_owner_models(

@@ -195,6 +195,29 @@ def test_incantation_counter_condition(db):
     assert evaluate_effect_condition(db, INC_COND, c5)
 
 
+def test_native_source_counter_condition_allows_zero(db):
+    """An absent counter is zero, matching C#'s TryGetValue default."""
+    condition_id = "native-zero-counter-condition"
+    counter_guid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    db.execute(
+        "INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+        (condition_id, "NoCounter", json.dumps({
+            "_t": "Game.Shared.Mechanics.Abilities.Conditions."
+                   "SourceCardHasCounters",
+            "m_CardCounterTemplateId": {"m_Guid": counter_guid},
+            "m_ComparisonOp": "Equals",
+            "m_RequiredCounters": 0})))
+    db.commit()
+    add_card(db, 201, 5, "Troop")
+
+    from rules_port.condition_context import ConditionContext as NativeContext
+    from rules_port.conditions import evaluate_effect_condition as native_eval
+    context = NativeContext(
+        db, SessionStub(), {}, ability_source_uid=201,
+        ability_source_owner_id=5)
+    assert native_eval(db, condition_id, context)
+
+
 def test_source_passes_filter_condition(db):
     """Droo's Colossal Walker: 'While this is exhausted: [BASIC] Pay 8 health
     — Ready this.' — RequiresSourcePassesFilterCondition(IsTapped) gates the
@@ -442,6 +465,8 @@ if __name__ == "__main__":
     run("Angel fires on first draw w/ Diamond", test_angel_first_draw_threshold)
     run("Angel blocked on second draw", test_angel_second_draw_blocked)
     run("Incantation SourceCardHasCounters gate", test_incantation_counter_condition)
+    run("Native SourceCardHasCounters accepts a zero threshold",
+        test_native_source_counter_condition_allows_zero)
     run("Source passes filter gates activation", test_source_passes_filter_condition)
     run("Ability variable condition accepts variable RHS",
         test_ability_variable_condition_accepts_variable_rhs)

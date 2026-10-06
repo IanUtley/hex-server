@@ -472,7 +472,7 @@ def test_session_lifecycle_commands_share_one_transaction():
 
 def test_player_transaction_classifier_is_side_effect_free_and_typed():
     raw = (b"PassPriorityTransaction;AcceptStartingHand;"
-           b"m_TransactionId;0;0;0;0000000a;"
+           b"m_TransactionId;0;0;0;0a000000;"
            b"m_QuitEntireSeries;0;0;0;False;")
     command = classify_player_transaction(raw)
 

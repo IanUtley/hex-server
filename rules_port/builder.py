@@ -467,13 +467,8 @@ class AbilityBuilder:
         metadata predicate is identical. Keeping that conversion here prevents
         activation handlers from becoming a second targeting implementation.
         """
-        # Target legality is a RulesPort rule in every live mode.  The old
-        # targeting module remains available only to an explicit rollback
-        # caller, never because the session happens to be Practice/PvE.
-        if (battle_state or {}).get("_rules_port_allow_legacy_backend"):
-            from .targeting import legal_targets_for
-        else:
-            from rules_port.targeting import legal_targets_for
+        # Target legality is owned by RulesPort in every mode.
+        from rules_port.targeting import legal_targets_for
 
         if isinstance(target, TargetRef):
             target_ref = target

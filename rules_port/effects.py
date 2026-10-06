@@ -13,10 +13,9 @@ from typing import Any, cast
 import game_engine
 
 
-# Effect templates that read their *whole* resolved target set from Records
-# instead of acting on a single target.  C# applies these once per
-# AbilityEffectInstance (``AbilityEffectTemplate.Apply``), so the resolver's
-# per-target loop must not invoke them once per member card.
+# Effect templates whose C# Apply(AbilityEffectInstance) runs once for the
+# mapping and handles any target set itself.  The resolver's per-target loop
+# must not invoke them once per member card.
 SELF_TARGETED_EFFECTS = frozenset({
     # "Look at the top five cards of your deck": re-running the reveal for
     # each of the five resolved cards revealed the same five cards five times
@@ -26,6 +25,12 @@ SELF_TARGETED_EFFECTS = frozenset({
     # to the whole target instance once. Calling it once per target multiplies
     # the authored loop count by the target count.
     "RepeatingAbilityEffectTemplate",
+    # RandomizeVariableEffectTemplate overrides CardAbilityEffectTemplate's
+    # per-card Apply and writes one ability-instance variable. Re-running it
+    # for every target made later AbilityVariableCondition branches use only
+    # the final target's roll instead of the single authored roll.
+    "RandomizeVariableEffectTemplate",
+    "RandomizeVariableAbilityEffectTemplate",
 })
 
 
@@ -482,9 +487,6 @@ def create_and_cast_spell(context):
         player = context.player_uid if owner else context.ai_uid
         _tpl, card_type, _name, cost, attack, defense, gems = \
             context.handler._card_full_data(context.game, scid, template_guid)
-        context.game.push_card_moved(
-            scid, player, game_engine.ECardCollections.CastSpells,
-            game_engine.ECardLocations.Top, 0)
         context.game.push_card_updated(
             scid, player, game_engine.ECardCollections.CastSpells, card_type,
             template_id=template_guid, cost=cost, attack=attack,
@@ -582,6 +584,19 @@ def _resource_modifier(context, effect):
     owner = context.target_owner(target, default=None)
     if owner is None:
         owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
+    if property_name == "chargepoints" and target is not None:
+        # Session.AddChargePoints treats a non-champion Card target as a
+        # counter change on that card. Only champion targets modify the
+        # player's charge pool and emit GainChargeEvent. Routing every target
+        # through the player pool made cards such as Eternal Drifter trigger
+        # their own "when you gain a charge" ability indefinitely.
+        from abilities.framework.effects.counters import is_champion_target
+        if not is_champion_target(context.handler, context.bstate, target):
+            old, new = context.counter(
+                int(target), "charge",
+                counter_guid=param.get("counter_template_guid"),
+                amount=amount, operation="add")
+            return f"card charge counter {old}->{new}"
     # Practice uses ``0`` for the AI owner, while PvP uses raw participant
     # IDs for both players.  Truthiness therefore cannot identify the side in
     # a PvP effect view; map the resolved owner against the view's ordered
@@ -1087,9 +1102,6 @@ def _capture_tamed_card(context, target, buffs):
         context.handler._card_full_data(context.game, scid, row[0])
     owner = owner_uid(row[1], context.player_uid, context.ai_uid,
                       context.bstate)
-    context.game.push_card_moved(
-        scid, owner, game_engine.ECardCollections.Void,
-        game_engine.ECardLocations.Top, 0)
     context.game.push_card_updated(
         scid, owner, game_engine.ECardCollections.Void, ct,
         template_id=row[0], cost=cost, attack=attack, defense=defense,
@@ -1136,7 +1148,8 @@ def _tap(context):
         # C# TapCardAbilityEffectTemplate: CantBeExhaustedByOpponent blocks an
         # opponent-authored exhaust.
         if card_int_attr(context.db, context.session.session_id, int(target),
-                         "CantBeExhaustedByOpponent") > 0:
+                         "CantBeExhaustedByOpponent",
+                         battle_state=context.bstate) > 0:
             owner = db_card_owner_id(
                 context.session.session_id, int(target), conn=context.db)
             if owner is not None and int(owner) != resolving:

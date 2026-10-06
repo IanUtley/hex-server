@@ -3,6 +3,8 @@
 import os
 import struct
 import sys
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -53,8 +55,63 @@ def test_action_names_cover_client_enum():
     assert set(debug_cheats.ACTION_NAMES) == set(range(28))
 
 
+def test_debug_card_updates_use_cache_moves_and_hide_deck_identity():
+    import game_engine
+
+    template_guid = "11111111-2222-3333-4444-555555555555"
+    player = game_engine.UID.make(244, 5)
+    ai = game_engine.UID.make(3, 1000)
+    session = SimpleNamespace(session_id=77)
+    handler = SimpleNamespace(
+        client_reck_id=5,
+        _card_full_data=lambda *_args: (
+            template_guid, game_engine.ECardTypes.Troop, "Test Troop",
+            1, 2, 3, 0))
+
+    with mock.patch.object(
+        debug_cheats, "_insert_card",
+            return_value=(0x101, (template_guid,))):
+        deck_result = debug_cheats._add_card(
+            handler, session, {}, 5, template_guid, to_deck=True)
+    deck_game = deck_result[0]
+    deck_updates = [event for event in deck_game.events if isinstance(
+        event, game_engine.CardUpdatedSessionEventArgs)]
+    assert len(deck_updates) == 1, deck_game.events
+    assert deck_updates[0].collection == game_engine.ECardCollections.Deck
+    assert deck_updates[0].nulling is True
+    assert not any(isinstance(event, game_engine.CardMovedSessionEventArgs)
+                   for event in deck_game.events)
+
+    with mock.patch.object(
+        debug_cheats, "_insert_card",
+            return_value=(0x102, (template_guid,))):
+        hand_result = debug_cheats._add_card(
+            handler, session, {}, 5, template_guid)
+    hand_game = hand_result[0]
+    assert [type(event) for event in hand_game.events] == [
+        game_engine.CardUpdatedSessionEventArgs,
+        game_engine.CardDrawnSessionEventArgs,
+    ], hand_game.events
+
+    with mock.patch.object(debug_cheats, "_db",
+                           SimpleNamespace(commit=lambda: None)), \
+            mock.patch.object(debug_cheats, "db_card_basic",
+                              return_value=(template_guid,)), \
+            mock.patch.object(debug_cheats, "db_move_card_to_location"):
+        moved = debug_cheats._move_to_zone(
+            handler, session, {}, 5, 0x103, "discard",
+            game_engine.ECardCollections.Discard)
+    assert moved is not None
+    move_game = moved[0]
+    assert [type(event) for event in move_game.events] == [
+        game_engine.CardUpdatedSessionEventArgs,
+    ], move_game.events
+    assert not any(isinstance(event, game_engine.CardMovedSessionEventArgs)
+                   for event in move_game.events)
+
+
 if __name__ == "__main__":
     test_decode_action_count_uid_and_resource_id()
     test_action_names_cover_client_enum()
+    test_debug_card_updates_use_cache_moves_and_hide_deck_identity()
     print("debug cheat tests: ok")
-

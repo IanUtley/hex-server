@@ -758,7 +758,8 @@ def resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
     # still call this historical function name, so route every attached-session
     # event through the typed dispatcher, including recursive native events.
     port_session = getattr(session, "_rules_port_session", None)
-    if port_session is not None:
+    if (port_session is not None or
+            bstate.get("_rules_port_attached")):
         from rules_port.triggers import NativeTriggerBackend, TriggerEvent
         return NativeTriggerBackend()(
             db=db, handler=handler, game=game, session=session,

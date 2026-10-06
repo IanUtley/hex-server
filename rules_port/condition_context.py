@@ -68,7 +68,9 @@ class ConditionContext:
                  trigger_owner_id=None, event_source_collection=None,
                  event_destination_collection=None, event_previous_state=None,
                  uses_previous_state=False, event_int_attribute=None,
-                 event_tac=None, event_previous_owner_id=None):
+                 event_tac=None, event_previous_owner_id=None,
+                 effect_secondary_target_uids=None, event_data=None,
+                 event_target_owner_id=None):
         self.db, self.session = db, session
         self.bstate = bstate or {}
         self.event_type = event_type
@@ -94,7 +96,16 @@ class ConditionContext:
         self.event_previous_owner_id = event_previous_owner_id
         self.event_int_attribute = event_int_attribute
         self.event_tac = event_tac or {}
+        self.event_data = event_data or {}
+        # TriggerPlayerControlsAbilitySource asks the authored trigger
+        # selector for SourcePlayerId or TargetPlayerId. Keep the target
+        # player from the typed event envelope instead of inferring it from a
+        # card row (some events carry a player target without a target card).
+        self.event_target_owner_id = event_target_owner_id
         self.uses_previous_state = bool(uses_previous_state)
+        self.effect_secondary_target_uids = tuple(
+            int(uid) for uid in (effect_secondary_target_uids or ())
+            if uid is not None)
         self.champions = champions or []
         # C# evaluates an effect condition against the ability instance, so
         # the context reads that instance's variables (RandomizeVariable and
@@ -185,6 +196,11 @@ class ConditionContext:
                 "attack": int(row[5] or 0) + int(row[14] or 0),
                 "defense": int(row[6] or 0) + int(row[15] or 0),
                 "template_guid": row[7] or "", "name": row[8] or "",
+                "original_template_guid": row[19] or "",
+                # Socketed gems feed IsSocketed and shared-gem filters (C#
+                # reads Card.ActiveGem); without them every card looked
+                # unsocketed to conditions.
+                "gems": int(row[20] or 0) if len(row) > 20 else 0,
                 "cost": int(effective_cost or 0),
                 "subtype": row[10] or "",
                 "shards": _shards(row[11]),
@@ -192,6 +208,7 @@ class ConditionContext:
                 "int_attrs": buffs.get("int_attrs", {}),
                 "card_abilities": card_abilities,
                 "counters": counters, "counter_guids": guids,
+                "position": int(row[18] or 0),
                 "tags": buffs.get("tags", {}) or {},
                 "damaged_opponent_this_turn": list(
                     self.bstate.get("damaged_opponent_this_turn") or [])}
@@ -217,6 +234,21 @@ class ConditionContext:
                     if card is not None:
                         cards.append(card)
         return cards
+
+    def iter_cards(self):
+        """Expose the current card pool to Records filters.
+
+        C# filter leaves such as ``TopNOfDeck`` evaluate against the live
+        session's cards, even when the filter is reached through a trigger
+        condition rather than a target scan.  Keep that same contract here by
+        exposing persisted cards from every ordinary collection plus the
+        separately stored champion projections.
+        """
+        return iter(self._cards_in_zones({
+            "deck", "hand", "champions", "warzone", "discard", "void",
+            "underground", "CastSpells", "PlayedResources", "choosing",
+            "mod", "simulacrum",
+        }))
 
     def _counter_count(self, card, counter_guid):
         if not card:

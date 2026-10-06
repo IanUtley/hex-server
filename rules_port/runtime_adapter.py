@@ -731,6 +731,12 @@ class PvpRuntimeFacts:
         if db is None:
             import db as db_layer
             db = db_layer._db
+        if getattr(costs, "counter_costs", ()):
+            from .costs import plan_source_counter_costs
+            if plan_source_counter_costs(
+                    db, self.session_id, source_uid, costs,
+                    self.battle_state) is None:
+                return False
         charge_mod = charge_point_cost_modifier(
             db, self.session_id, self.battle_state, owner, source_uid)
         if self.battle_state.get("pvp") and owner is not None:
@@ -813,7 +819,8 @@ class PvpRuntimeFacts:
         if (bool(attacker.attributes & ECardAttributes.Defensive) and
                 card_int_attr(None, self.session_id,
                               attacker.session_card_id,
-                              "IgnoresDefensive") <= 0):
+                              "IgnoresDefensive",
+                              battle_state=self.battle_state) <= 0):
             return False
         return True
 
@@ -858,7 +865,8 @@ class PvpRuntimeFacts:
         # C# Feral (IntAttrs): an attacker can only be blocked by 2+ troops.
         for attacker_key, count in declared.items():
             if 0 < count < 2 and card_int_attr(
-                    None, self.session_id, attacker_key, "Feral") > 0:
+                    None, self.session_id, attacker_key, "Feral",
+                    battle_state=state) > 0:
                 return False
         return True
 

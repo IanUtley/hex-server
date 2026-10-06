@@ -107,6 +107,21 @@ def _project(context, uid, owner, guid, old, new, champion=False):
         private_player_uid=recipient)
 
 
+def project_counter_cost_change(context, source_uid, counter_guid,
+                               old_value, new_value):
+    """Project one counter delta already applied as an activation cost."""
+    source_uid = int(source_uid)
+    owner = _champion_owner(context, source_uid)
+    is_champion = owner is not None
+    if not is_champion:
+        from pvp_db import db_card_owner_id
+        owner = db_card_owner_id(
+            context.session.session_id, source_uid, conn=context.db)
+    _project(context, source_uid, owner if owner is not None else 0,
+             str(counter_guid or "").lower(), int(old_value),
+             int(new_value), champion=is_champion)
+
+
 def counter_spell(context):
     """Port of ``CounterSpellAbilityEffectTemplate`` / ``Session.CounterCard``.
 
@@ -126,7 +141,8 @@ def counter_spell(context):
         return "counter spell: target not on chain"
     from rules_port.combat_rules import card_int_attr
     if card_int_attr(context.db, context.session.session_id, target,
-                     "CantBeInterrupted") > 0:
+                     "CantBeInterrupted",
+                     battle_state=context.bstate) > 0:
         return "counter spell: cannot be interrupted"
     # Session.CounterCard removes the countered card's own ability from the
     # chain, then discards the card.  The native chain is keyed by ability
@@ -161,9 +177,6 @@ def counter_spell(context):
     context.db.commit()
     owner = owner_uid(owner_id, context.player_uid, context.ai_uid,
                       context.bstate)
-    context.game.push_card_moved(
-        scid, owner, game_engine.ECardCollections.Discard,
-        game_engine.ECardLocations.Top, 0)
     if tpl_row:
         _tpl, card_type, _name, cost, attack, defense, gems = \
             context.handler._card_full_data(
@@ -173,6 +186,13 @@ def counter_spell(context):
             game_engine.card_type_from_db(card_type),
             template_id=tpl_row[0], cost=cost, attack=attack,
             defense=defense, gems=gems)
+    else:
+        # Even if the template row is unavailable, update the destination so
+        # the C# client cache derives the zone move instead of relying on an
+        # explicit class-50 packet with a stale representation.
+        context.game.push_card_updated(
+            scid, owner, game_engine.ECardCollections.Discard,
+            game_engine.ECardTypes.Unknown, nulling=True)
     context._emit_trigger(
         "CardCounteredEvent", target,
         context.bstate.get("resolving_owner_id", 0),

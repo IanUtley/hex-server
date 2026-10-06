@@ -32,7 +32,7 @@ from rules_port import (AbilityRegistry, Chain, GameAction, GameActionResult, Ga
                         PlayerIsNotEliminatedRequirement, XCostRequirement,
                         AbilityFactory, SQLiteRulesSnapshot, ParityCapture,
                         compare_captures, event_record, replay_transactions,
-                        MetadataResolutionAdapter, enable_rules_port)
+                        enable_rules_port)
 from rules_port import (plan_ability_cost, apply_ability_cost_plan,
                         card_cost_targets)
 from rules_port import play_resource
@@ -50,7 +50,7 @@ from rules_port.runtime_adapter import (PvpRuntimeFacts, RuntimeCard,
                                          SQLiteCardMutationAdapter)
 from rules_port.actions import (AbilityResolutionState, PushOntoChainAction,
                                 ResolveTopOfChainAction)
-from rules_port.triggers import MetadataTriggerAdapter, TriggerEvent
+from rules_port.triggers import TriggerEvent
 from rules_port.targets import MetadataTargetAdapter, TargetSelection
 from rules_port.async_bridge import (AsyncActivationPublisher,
                                      AsyncEventPublisher,
@@ -1788,6 +1788,9 @@ def test_triggered_activation_has_native_chain_lifecycle_without_adapter():
         responsible_player_id = "p"
         paid = False
 
+        def needs_activation_data(self):
+            return ()
+
         def bind_activation(self, value):
             self.activation = value
             return True
@@ -1807,6 +1810,65 @@ def test_triggered_activation_has_native_chain_lifecycle_without_adapter():
     assert session.submit_transaction(tx)
     assert session.handle_transaction()
     assert session.chain.contains_ability(4)
+
+
+def test_triggered_activation_waits_for_nested_picker_before_payment_and_push():
+    class TriggeredAbility:
+        instance_id = 14
+        responsible_player_id = 1001
+        parent_instance_id = 7
+        paid = False
+
+        def needs_activation_data(self):
+            activation = getattr(self, "activation", {})
+            return (() if activation.get("option_map", {}).get("1") is not None
+                    else ({"kind": "option", "index": 1},))
+
+        def bind_activation(self, value):
+            self.activation = dict(value)
+            return True
+
+        def continuation(self):
+            return {"ability_instance_id": self.instance_id,
+                    "parent_instance_id": self.parent_instance_id}
+
+    session = AuthoritativeSession(95, (1001,), seed_z=1, seed_w=2)
+    session.set_runtime_facts(type("Facts", (), {
+        "is_at_triggered_ability_queue_front": lambda self, player: player == 1001,
+        "validate_triggered_abilities": lambda self, player, values: True,
+        "validate_x_cost": lambda self, player, value: True,
+    })())
+    payments = []
+    session.set_ability_cost_payer(
+        lambda ability: payments.append(ability.instance_id) or True)
+    ability = TriggeredAbility()
+    session.ability_manager.add_chain(ability.instance_id, ability)
+
+    triggered = RulesTransaction.activate_triggered_abilities(
+        1001, ({"ability_instance_id": 14,
+               "target_map": {"2": [202]}},))
+    assert session.submit_transaction(triggered)
+    assert session.handle_transaction()
+    assert not ability.paid
+    assert not session.chain.contains_ability(14)
+
+    # The selected triggered instance now enters the same prompt-before-push
+    # action used by C# PushAbilityOnChain. Its missing option is a separate
+    # class-23 continuation; the original target slot and parent stay intact.
+    assert not session.action_stack.update()
+    assert session.pending_activation["ability_instance_id"] == 14
+    assert session.pending_activation["continuation"]["parent_instance_id"] == 7
+    assert payments == []
+    reply = RulesTransaction.set_ability_activation_data(
+        1001, 14, {"target_map": {"2": [202]}, "option_map": {"1": 0}})
+    assert session.submit_transaction(reply)
+    assert session.handle_transaction()
+    assert session.action_stack.update()
+
+    assert session.chain.peek_ability() is ability
+    assert ability.activation["target_map"] == {"2": [202]}
+    assert ability.parent_instance_id == 7
+    assert payments == [14]
 
 
 def test_additional_csharp_requirement_predicates_use_session_facts():
@@ -2687,26 +2749,83 @@ def test_charge_point_cost_modifier_applies_to_the_plan():
 
     session_id = 987654327
     source_uid = 987650151
+    champion_uid = 987650152
     try:
         pvp_db.db_insert_generated_card(
             session_id, 5, source_uid, TPL_GLADIATOR, "warzone", "Troop",
             "[]", 0, source_uid, conn=db._db)
+        pvp_db.db_insert_generated_card(
+            session_id, 5, champion_uid, TPL_GLADIATOR, "warzone", "Troop",
+            "[]", 0, champion_uid, conn=db._db)
         pvp_db.db_set_card_mutation_field(
             session_id, source_uid, "permanent_buffs",
             json.dumps({"int_attrs": {"ChargePointCostModifier": -2}}),
             conn=db._db)
         db._db.commit()
-        assert charge_point_cost_modifier(
-            db._db, session_id, {}, 5, source_uid) == -2
-        champion_state = {"champ_map": {5: 777},
-                          "champion_int_attrs": {"777": {
+        champion_state = {"champ_map": {5: champion_uid},
+                          "champion_int_attrs": {str(champion_uid): {
                               "ChargePointCostModifier": -1}}}
-        assert charge_point_cost_modifier(
-            db._db, session_id, champion_state, 5, None) == -1
+        pvp_champion_state = dict(
+            champion_state, pvp=True, pids=[5, 6])
+        for state in (champion_state, pvp_champion_state):
+            assert charge_point_cost_modifier(
+                db._db, session_id, state, 5, source_uid) == -2
+            assert charge_point_cost_modifier(
+                db._db, session_id, state, 5, champion_uid) == -1
+            assert charge_point_cost_modifier(
+                db._db, session_id, state, 5, None) == 0
+
+            troop_plan = plan_ability_cost(
+                Costs(), None, current_resource=0, charges=1,
+                spell_points=0, health=20,
+                charge_modifier=charge_point_cost_modifier(
+                    db._db, session_id, state, 5, source_uid))
+            champion_plan = plan_ability_cost(
+                Costs(), None, current_resource=0, charges=2,
+                spell_points=0, health=20,
+                charge_modifier=charge_point_cost_modifier(
+                    db._db, session_id, state, 5, champion_uid))
+            assert troop_plan is not None and troop_plan.charge_points == 1
+            assert champion_plan is not None and champion_plan.charge_points == 2
     finally:
         db._db.execute("DELETE FROM game_cards WHERE session_id=?",
                        (session_id,))
         db._db.commit()
+
+
+def test_rules_port_chain_dispatch_skips_legacy_trigger_hook():
+    from types import SimpleNamespace
+    from unittest import mock
+
+    import hconnect_server as hcs
+    from rules_port.chain_items import dispatch
+
+    calls = []
+
+    def legacy_hook(*_args, **_kwargs):
+        calls.append("legacy")
+        raise AssertionError("RulesPort called the retired trigger hook")
+
+    host = SimpleNamespace(_db=object(), _dispatch_game_trigger=legacy_hook)
+    hcp_host = object.__new__(hcs.HCPHandler)
+    assert not hasattr(hcp_host, "_dispatch_game_trigger")
+    session, game, state = object(), object(), {}
+    with mock.patch("rules_port.triggers.dispatch_native_trigger",
+                    return_value="native") as native_dispatch:
+        result = dispatch(
+            host, session, game, state, "player", "ai", "CardCastEvent",
+            901, 5, target_card_id=902)
+        hcp_result = hcp_host.chain_dispatch(
+            session, game, state, "player", "ai", "CardCastEvent", 901, 5,
+            target_card_id=902)
+
+    assert result == "native"
+    assert hcp_result == "native"
+    assert calls == []
+    assert native_dispatch.call_count == 2
+    assert native_dispatch.call_args_list[0].kwargs["db"] is host._db
+    assert native_dispatch.call_args_list[0].kwargs["target_card_id"] == 902
+    assert native_dispatch.call_args_list[1].kwargs["handler"] is hcp_host
 
 
 def test_lifebound_returns_marked_discard_cards():
@@ -2800,6 +2919,16 @@ def test_verdict_creates_pool_tokens_and_activates_choose():
             "AND owner_user_id=0 AND location='choosing'",
             (session_id,)).fetchone()[0]
         assert chosen == 2, chosen
+        generated_updates = {
+            event[1] for event in pushed
+            if (isinstance(event, tuple) and len(event) == 2 and
+                event[0] == "updated")}
+        generated_moves = [
+            event for event in pushed
+            if (isinstance(event, tuple) and len(event) == 2 and
+                event[0] == "moved")]
+        assert len(generated_updates) == chosen, generated_updates
+        assert not generated_moves, generated_moves
     finally:
         db._db.execute("DELETE FROM game_cards WHERE session_id=?",
                        (session_id,))
@@ -2832,7 +2961,7 @@ def test_resource_cast_activates_momentum_and_expires_at_owner_start_turn():
         db._db.commit()
         pushed = []
         host = SimpleNamespace(
-            _dispatch_game_trigger=lambda *a, **k: None,
+            chain_dispatch=lambda *a, **k: None,
             _card_full_data=lambda game, scid, tpl=None:
                 (tpl, 1, "T", 1, 2, 2, 0))
         game = SimpleNamespace(push_card_updated=lambda *a, **k: pushed.append(a))
@@ -3108,6 +3237,53 @@ def test_defense_commit_can_drive_past_native_declaration_window():
     assert session.handle_transaction()
     assert session.drive_until_input(max_steps=8)
     assert session.current_turn_phase == game_engine.ETurnPhases.DeclareDefensePriorityWindow
+
+
+def test_empty_defense_commit_consumes_native_declaration_window_once():
+    """An empty blocker set is still a defense declaration in C#.
+
+    The AI uses this transaction when the defending player has no legal
+    blockers.  It must mark each combat's defense as declared and advance from
+    DeclareDefense exactly once, rather than leaving the native cursor on the
+    phase and re-opening the blocker prompt.
+    """
+    from rules_port.combat import CombatFlags
+
+    player = game_engine.UID.make(244, 84)
+    ai = game_engine.UID.make(3, 1000)
+    attacker = SimpleNamespace(session_card_id=9202)
+    session = AuthoritativeSession(184, (player, ai), seed_z=1, seed_w=2)
+    session.runtime_facts = SimpleNamespace(
+        get_card=lambda card_id: attacker if int(card_id) == 9202 else None,
+        validate_blocks=lambda _session, declarations, owner: (
+            owner == player and declarations == ((9202, ()),)))
+    session.active_player_id = ai
+    session.current_turn_phase = game_engine.ETurnPhases.DeclareDefense
+    combat = session.combat_manager.create_attack(
+        CombatId(ai, 1), ai, 9201)
+    combat.declare_attacker(attacker)
+    assert session.materialize_current_phase()
+    assert session.action_stack.priority_player_id == player
+
+    phase_updates = []
+    session.event_sink = SimpleNamespace(
+        turn_phase_updated=lambda phase, *_: phase_updates.append(phase),
+        green_light=lambda *_: None)
+    transaction = RulesTransaction.commit_troops_to_defense(
+        player, game_engine.ETurnPhases.DeclareDefense, ((9202, ()),))
+    assert session.submit_transaction(transaction)
+    assert session.handle_transaction()
+    assert combat.flags & CombatFlags.BLOCKERS_DECLARED
+    assert not combat.flags & CombatFlags.ATTACK_BLOCKED
+    assert combat.blockers == []
+
+    assert session.drive_until_input(max_steps=8)
+    assert session.current_turn_phase == (
+        game_engine.ETurnPhases.DeclareDefensePriorityWindow)
+    next_phase = game_engine.ETurnPhases.DeclareDefensePriorityWindow
+    assert phase_updates.count(next_phase) == 1, phase_updates
+    session.drive_until_input(max_steps=2)
+    assert phase_updates.count(next_phase) == 1, phase_updates
 
 
 def test_checkpoint_resync_does_not_reopen_answered_defense_window():
@@ -3669,6 +3845,10 @@ def test_manual_ability_finish_projects_chain_entry_and_green_light():
         "4ba9e978-53fd-a3ed-88ca-d57632f186cb")
     assert len(green_lights) == 1
     assert green_lights[0].player_id == player
+    assert green_lights[0].context == (
+        game_engine.EPriorityContext.ResolveTopOfChain)
+    assert game.events.index(chain_events[0]) < game.events.index(
+        green_lights[0])
 
 
 def test_practice_manual_ability_response_window_auto_passes_ai():
@@ -3879,19 +4059,6 @@ def test_activation_reply_uses_client_ability_and_responsibility_requirements():
         player, 10, {"target_map": {}}))
 
 
-def test_metadata_resolution_adapter_reuses_existing_activation_data_shape():
-    metadata = MetadataAbilityInstance.from_runtime("ability", [], 0,
-                                                     source_uid=3, owner_id=7)
-    ability = AbilityFactory().create(metadata, activating_player_id=7)
-    calls, state = [], {}
-    adapter = MetadataResolutionAdapter(
-        None, None, type("Session", (), {"session_id": 5})(), None, 7, 0,
-        state, resolver=lambda *args, **kwargs: calls.append((args, kwargs)))
-    assert adapter(ability) is AbilityResolutionState.COMPLETED
-    assert calls[0][0][7:10] == ("ability", 3, 7)
-    assert calls[0][1]["activation_data"] == ability.activation.as_dict()
-
-
 def test_ability_instance_serialization_preserves_csharp_lifecycle_fields():
     metadata = MetadataAbilityInstance.from_runtime("ability", [], 0,
                                                      source_uid=3, owner_id=7)
@@ -3914,19 +4081,6 @@ def test_ability_instance_serialization_is_json_safe_for_trigger_events():
     encoded = json.dumps(ability.as_dict(), sort_keys=True)
     assert "CardMovedEvent" in encoded
     assert "destination_zone" in encoded
-
-
-def test_metadata_trigger_adapter_preserves_csharp_event_source_target_envelope():
-    calls = []
-    adapter = MetadataTriggerAdapter(
-        None, None, type("Session", (), {"session_id": 5})(), None, 7, 0, {},
-        resolver=lambda *args, **kwargs: calls.append((args, kwargs)) or "ok")
-    event = TriggerEvent("CardDealtDamageEvent", 11, 7, 22, 0,
-                         {"CombatDamage": 1})
-    assert adapter(event) == "ok"
-    assert calls[0][0][7:9] == ("CardDealtDamageEvent", 11)
-    assert calls[0][1]["source_owner_uid"] == 7
-    assert calls[0][1]["extra_target"] == 22
 
 
 def test_metadata_target_adapter_uses_one_predicate_for_options_and_validation():
@@ -4207,7 +4361,7 @@ def test_completed_chain_instance_skips_bom_on_the_finishing_pass():
         calls = []
         handler = SimpleNamespace(
             _card_full_data=HandlerStub(db)._card_full_data,
-            _dispatch_game_trigger=lambda *args, **kwargs:
+            chain_dispatch=lambda *args, **kwargs:
                 calls.append(("trigger", args[5])))
 
         def fake_played_spell(*_args, **_kwargs):

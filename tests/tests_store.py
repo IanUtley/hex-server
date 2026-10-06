@@ -133,6 +133,40 @@ def test_full_set_pools_use_the_mapped_core_sets():
     } == expected
 
 
+def _make_users(*user_ids):
+    """Insert minimal user rows so store_purchases FK checks pass."""
+    from db import _db
+    for user_id in user_ids:
+        _db.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)",
+                    (user_id, f"redeem-test-{user_id}"))
+    _db.commit()
+
+
+def test_redeem_code_usage_is_per_account():
+    from profile_db import db_redeem_code
+    a, b = 900001, 900002
+    _make_users(a, b)
+    # max_uses is a per-account limit (5000plat => 10), not a global budget.
+    for _ in range(10):
+        assert db_redeem_code("5000plat", a)["redeemed"]
+    assert not db_redeem_code("5000plat", a)["redeemed"]
+    # Another account is unaffected by the first exhausting its own limit.
+    assert db_redeem_code("5000plat", b)["redeemed"]
+    # A single-use code is once per account, not once for the whole server.
+    assert db_redeem_code("allpvp", a)["redeemed"]
+    assert not db_redeem_code("allpvp", a)["redeemed"]
+    assert db_redeem_code("allpvp", b)["redeemed"]
+
+
+def test_unknown_and_exhausted_redeem_codes_are_rejected():
+    from profile_db import db_redeem_code
+    user = 900003
+    _make_users(user)
+    assert not db_redeem_code("no-such-code", user)["redeemed"]
+    # max_uses=0 acts as an expired code for every account.
+    assert not db_redeem_code("expiredcode", user)["redeemed"]
+
+
 if __name__ == "__main__":
     run("roll always upgrades", test_roll_always_upgrades)
     run("roll never upgrades", test_roll_never_upgrades)
@@ -144,3 +178,6 @@ if __name__ == "__main__":
     run("booster stays in requested set", test_booster_stays_in_requested_set_and_excludes_generated_lands)
     run("pack map uses canonical set GUIDs", test_pack_map_uses_canonical_core_set_guids)
     run("full sets use mapped core sets", test_full_set_pools_use_the_mapped_core_sets)
+    run("redeem code usage is per account", test_redeem_code_usage_is_per_account)
+    run("unknown and exhausted redeem codes rejected",
+        test_unknown_and_exhausted_redeem_codes_are_rejected)

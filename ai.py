@@ -419,7 +419,11 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
     combats = []
     for i, u in enumerate(attackers):
         scid = game_engine.SessionCardId(game_engine.UID(u))
-        combat_id = game_engine.CombatId(pl_t, i + 1)
+        wire_combat_id = getattr(
+            handler, "_wire_combat_id_for_attacker", None)
+        combat_id = (wire_combat_id(session, pl_t, u, i + 1)
+                     if callable(wire_combat_id)
+                     else game_engine.CombatId(pl_t, i + 1))
         blocker_scids = [game_engine.SessionCardId(game_engine.UID(b))
                          for b in assignment.get(u, [])]
         game.push_blockers_assigned(combat_id, scid, ai_champ_scid, blocker_scids)
@@ -583,8 +587,6 @@ def ai_discard_card(handler, game, session, pl_t, ai_t):
     game.push_card_discarded(scid, ai_t)
     game.push_card_updated(scid, ai_t, game_engine.ECardCollections.Discard, ct,
                            template_id=tpl_guid)
-    game.push_card_moved(scid, ai_t, game_engine.ECardCollections.Discard,
-                         game_engine.ECardLocations.Top, 0)
     bstate = getattr(handler, "_current_bstate", None)
     if bstate is None:
         if (getattr(session, "_rules_port_session", None) is not None or
@@ -771,6 +773,11 @@ def ai_declare_attackers(handler, game, session, ai_t, pl_t, battle_state):
             port_combat = port.combat_manager.create_attack(
                 combat_id, ai_t, port_defender or player_champ_uid64)
             port_combat.declare_attacker(port_attacker)
+            wire_combat_id = getattr(
+                handler, "_wire_combat_id_for_attacker", None)
+            if callable(wire_combat_id):
+                combat_id = wire_combat_id(
+                    session, ai_t, uid, uid & 0xFFFF)
         game.push_attack_declared(combat_id, ai_t, player_champ_uid or game_engine.SessionCardId(pl_t), scid)
         # Mark attacking (tapped unless Steadfast). Persist the OR'd state.
         state = (game_engine.ECardStates.Attacking |
@@ -1814,11 +1821,9 @@ def ai_draw_card(handler, game, session, ai_t, battle_state):
     move_card_to_zone(
         _db, session.session_id, card_uid, "hand", position=100)
     tpl_guid, ct, name, cost, atk, def_, _gem = handler._card_full_data(game, scid, row[3], row[2])
-    game.push_card_moved(scid, ai_t, game_engine.ECardCollections.Hand,
-                         game_engine.ECardLocations.Top, 1)
-    game.push_card_drawn(scid, ai_t, 1)
     game.push_card_updated(scid, ai_t, game_engine.ECardCollections.Hand, ct,
                            nulling=True)
+    game.push_card_drawn(scid, ai_t, 1)
     # A draw also emits the normal zone-entry event.  Reginald's granted
     # ability listens for CardEnteredZoneEvent (Hand|Discard), not merely
     # CardDrawnEvent, so it must resolve before the draw trigger pass.
@@ -2028,11 +2033,14 @@ def ai_play_troop(handler, game, session, ai_t, battle_state):
     threshold = battle_state.get("ai_threshold", {})
     rows = db_ai_hand_playables(
         session.session_id, 0, "permanent", conn=_db)
+    from pvp_db import db_game_card_effective_cost
     for row in rows:
-        cost, ct, thresh_json, atk, def_ = row[3], row[4], row[5], row[6], row[7]
+        ct, thresh_json = row[4], row[5]
+        tid = int(row[1])
+        cost = db_game_card_effective_cost(
+            session.session_id, tid, battle_state, conn=_db)
         if cost is not None and cost <= resources:
             if handler._thresholds_met(thresh_json, threshold):
-                tid = row[1]
                 scid = game_engine.SessionCardId(game_engine.UID(tid))
                 # Push to CastSpells (the chain).  The card stays there until
                 # the player passes; the player gets a priority window to
@@ -2062,8 +2070,6 @@ def ai_play_troop(handler, game, session, ai_t, battle_state):
                 game.push_card_updated(scid, ai_t, game_engine.ECardCollections.CastSpells,
                                       game_engine.card_type_from_db(ct),
                                       template_id=row[2], cost=cost2, attack=atk2, defense=def2, gems=gem2)
-                game.push_card_moved(scid, ai_t, game_engine.ECardCollections.CastSpells,
-                                    game_engine.ECardLocations.Top, 0)
                 # Tell the client this is a normal card play. UIBattle only
                 # animates AbilityPushedOnChain when AbilityTemplateId exists
                 # in TemplateManager.Abilities; a card-template GUID is not an
@@ -2108,7 +2114,10 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     if (not native_mode and not _be.stack_empty(battle_state)):
         return False
     resources = int(battle_state.get("ai_resources", 0))
-    cost = int(card.cost or 0)
+    tid = int(card.card_uid)
+    from pvp_db import db_game_card_effective_cost
+    cost = db_game_card_effective_cost(
+        session.session_id, tid, battle_state, conn=_db)
     # Preserve an X value selected by the evaluator (removal/sweeper paths
     # calculate it before calling this function).  The previous unconditional
     # reset silently converted every X spell into an X=0 cast.
@@ -2148,7 +2157,6 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
     if total > resources:
         log_req(f"    AI cannot afford {card.name} ({total}>{resources})")
         return False
-    tid = int(card.card_uid)
     scid = game_engine.SessionCardId(game_engine.UID(tid))
     source_location = db_card_location(
         session.session_id, tid, conn=_db) or "hand"
@@ -2168,8 +2176,6 @@ def ai_play_hand_card(handler, game, session, ai_t, battle_state, card,
         game_engine.card_type_from_db(card.card_type),
         template_id=card.template_guid, cost=cost2, attack=atk2, defense=def2,
         gems=gem2)
-    game.push_card_moved(scid, ai_t, game_engine.ECardCollections.CastSpells,
-                         game_engine.ECardLocations.Top, 0)
     inst_id = int(battle_state.get("_next_instance_id", 1))
     battle_state["_next_instance_id"] = inst_id + 1
     game.push_ability_on_chain(
@@ -4565,8 +4571,11 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
     troop_defs = {int(r[0]): (r[2] or 0) + (r[3] or 0) - (r[4] or 0)
                   for r in troops}
     player_health = int(battle_state.get("player_health", 20))
+    from pvp_db import db_game_card_effective_cost
     for row in rows:
-        cost = row[3] or 0
+        tid = int(row[1])
+        cost = db_game_card_effective_cost(
+            session.session_id, tid, battle_state, conn=_db)
         if cost > resources:
             continue
         if not handler._thresholds_met(row[5], threshold):
@@ -4610,7 +4619,6 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
             x_cost = 0
         if not target_uid:
             continue
-        tid = int(row[1])
         scid = game_engine.SessionCardId(game_engine.UID(tid))
         x_payment = x_cost * int(info.get("x_multiplier", 0) or 0)
         from rules_port.card_transactions import apply_card_play
@@ -4636,8 +4644,6 @@ def ai_play_spell(handler, game, session, ai_t, battle_state):
             scid, ai_t, game_engine.ECardCollections.CastSpells,
             game_engine.card_type_from_db(row[4]),
             template_id=row[2], cost=cost2, attack=atk2, defense=def2, gems=gem2)
-        game.push_card_moved(scid, ai_t, game_engine.ECardCollections.CastSpells,
-                             game_engine.ECardLocations.Top, 0)
         # Render the spell on the chain (GoChainView) during the response
         # window — without AbilityPushedOnChain the client shows an empty
         # chain with the Resolve button.
@@ -4680,19 +4686,22 @@ def resolve_ai_mulligan(handler, session, game, ai_t):
     four-card snap-keep threshold, otherwise reject the personality's no-go
     resource counts and require a sufficient theoretical hand value. Each
     mulligan redraws one fewer card (7 -> 6 -> ... -> 0), while the AI keeps
-    deciding until it keeps or reaches 0 cards. Pushes
-    PlayerMulliganedHand / CardUpdated / AcceptedStartingHand events so the
-    client sees the AI's decisions. Returns True if the AI ended up with a
-    hand (0 is treated as forced-keep at 0 cards).
+    deciding until it keeps or reaches 0 cards. Pushes PlayerMulliganedHand /
+    CardUpdated events for each redraw, then one AcceptedStartingHand event
+    when the AI keeps (or reaches zero cards), with the C# Mulliganed flag.
+    Returns True if the AI ended up with a hand (0 is treated as forced-keep
+    at 0 cards).
     """
     import random as _rnd
+    mulliganed = False
     while True:
         hand_row = db_ai_hand_summary(session.session_id, conn=_db)
         count = hand_row[0] if hand_row else 0
         shard_count = (hand_row[1] or 0) if hand_row else 0
         if count == 0:
             # No cards left to mulligan away: forced keep.
-            game.push_accepted_starting_hand(ai_t, mulliganed=False)
+            game.push_accepted_starting_hand(
+                ai_t, mulliganed=mulliganed)
             log_req("    AI keeps 0-card hand (deck exhausted)")
             return True
         # Client ShouldKeepStartingHand (AITactical.cs:1033):
@@ -4727,15 +4736,16 @@ def resolve_ai_mulligan(handler, session, game, ai_t):
             except Exception:
                 keep = bool(shard_count)
         if keep:
-            game.push_accepted_starting_hand(ai_t, mulliganed=False)
+            game.push_accepted_starting_hand(
+                ai_t, mulliganed=mulliganed)
             log_req(f"    AI keeps hand ({count} cards, {shard_count} shards, "
                     f"value={hand_value:.1f})")
             return True
         # AI mulligans: redraw one fewer card (7->6->...->1).
         game.push_player_mulliganed_hand(ai_t, count)
-        game.push_accepted_starting_hand(ai_t, mulliganed=True)
         log_req(f"    AI mulligans ({count} cards, {shard_count} shards, "
                 f"value={hand_value:.1f})")
+        mulliganed = True
         # Move hand to deck (batch)
         hand_rows = db_ai_zone_rows(session.session_id, "hand", conn=_db)
         for r in hand_rows:

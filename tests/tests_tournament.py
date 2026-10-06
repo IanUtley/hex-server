@@ -815,6 +815,44 @@ def test_pvp_chain_item_uses_the_shared_seam_and_its_picker_marker():
     assert state["priority_pid"] == 1001, state
 
 
+def test_pvp_chain_warzone_entry_stamps_arrival_and_resolve_order():
+    """The PvP chain host preserves shared permanent-arrival bookkeeping."""
+    from pvp_db import db_insert_game_card
+
+    session_id = 199439
+    card_uid = 0x7400000000000001
+    template_guid = db._db.execute(
+        "SELECT guid FROM card_templates WHERE card_type='Troop' LIMIT 1"
+    ).fetchone()[0]
+    db_insert_game_card(
+        session_id, 1001, card_uid, template_guid, "CastSpells",
+        card_type="Troop", conn=db._db)
+    started_tapped = int(
+        game_engine.ECardStates.StartedATurnOnYourSide |
+        game_engine.ECardStates.Tapped)
+    db._db.execute(
+        "UPDATE game_cards SET card_state=? "
+        "WHERE session_id=? AND card_uid=?",
+        (started_tapped, session_id, card_uid))
+
+    state = {"pvp": True, "resolve_counter": 4}
+    session = SimpleNamespace(session_id=session_id)
+    host = tournament_game._PvpChainHost(
+        SimpleNamespace(), session, state, 1001, 1002)
+    host.chain_mark_warzone_entry(session, card_uid)
+
+    row = db._db.execute(
+        "SELECT location, card_state, resolved_at FROM game_cards "
+        "WHERE session_id=? AND card_uid=?", (session_id, card_uid)
+    ).fetchone()
+    assert row[0] == "warzone", row
+    assert row[1] & game_engine.ECardStates.CameOutThisTurn, row
+    assert not row[1] & game_engine.ECardStates.StartedATurnOnYourSide, row
+    assert row[1] & game_engine.ECardStates.Tapped, row
+    assert row[2] == 5, row
+    assert state["resolve_counter"] == 5, state
+
+
 def test_corinth_format_never_deals_a_draw_step():
     """Merry-Melee Corinth has no draw step.
 
@@ -857,6 +895,40 @@ def test_corinth_format_never_deals_a_draw_step():
         assert draw.called
 
 
+def test_pvp_draw_uses_cache_derived_collection_move():
+    """A CardUpdated must produce one Unity move, without wire class 50."""
+    state = {
+        "pvp": True, "corinth_mode": False, "turn_pid": 101,
+        "turn_number": 2, "draws_first_pid": 202, "champ_map": {},
+    }
+
+    class Session:
+        session_id = 199438
+
+    template_guid = "00000000-0000-0000-0000-000000000001"
+    with mock.patch.object(tournament_game, "db_game_session_pids",
+                           return_value=[101, 202]), \
+            mock.patch.object(tournament_game, "db_game_draw_cards",
+                              return_value=[(987654321, template_guid)]), \
+            mock.patch.object(tournament_game, "db_game_card_type",
+                              return_value="Troop"), \
+            mock.patch.object(tournament_game, "_pvp_fra_view",
+                              return_value={"player_health": 20,
+                                            "ai_health": 20, "stack": []}), \
+            mock.patch.object(tournament_game, "pvp_save_state"), \
+            mock.patch.dict(tournament_game.player_handlers, {}, clear=True):
+        drawer_events, opponent_events = tournament_game._pvp_run_draw(
+            Session(), state)
+
+    assert [type(event).__name__ for event in drawer_events] == [
+        "CardUpdatedSessionEventArgs", "CardDrawnSessionEventArgs"]
+    assert [type(event).__name__ for event in opponent_events] == [
+        "CardUpdatedSessionEventArgs"]
+    assert drawer_events[0].collection == game_engine.ECardCollections.Hand
+    assert opponent_events[0].collection == game_engine.ECardCollections.Hand
+    assert opponent_events[0].nulling
+
+
 if __name__ == "__main__":
     test_pvp_concede_ends_for_both_players()
     test_tournament_session_pids_ignore_non_player_card_owners()
@@ -872,5 +944,7 @@ if __name__ == "__main__":
     test_pvp_session_pids_fall_back_to_the_checkpoint_and_transport()
     test_pvp_resolves_a_stack_item_without_a_native_host()
     test_pvp_chain_item_uses_the_shared_seam_and_its_picker_marker()
+    test_pvp_chain_warzone_entry_stamps_arrival_and_resolve_order()
     test_corinth_format_never_deals_a_draw_step()
+    test_pvp_draw_uses_cache_derived_collection_move()
     print("tournament lobby tests passed")

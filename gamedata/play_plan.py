@@ -17,6 +17,7 @@ from typing import Any
 from .models import AbilityCost, AbilityOptionGroup, TargetSpec
 from .records import RecordObject, RecordStore
 from .semantics import (AbilityGraph, EffectSpec, card_ability_graphs,
+                        ability_graph,
                         runtime_effects as graph_runtime_effects)
 
 
@@ -49,10 +50,7 @@ def _normalise_targets(value: Any) -> dict[int, tuple[int, ...]]:
         values = selected if isinstance(selected, (list, tuple, set)) else [selected]
         normalised = []
         for item in values:
-            try:
-                normalised.append(int(item))
-            except (TypeError, ValueError):
-                continue
+            normalised.extend(_wire_card_uids(item))
         result[index] = tuple(normalised)
     return result
 
@@ -67,6 +65,48 @@ def _normalise_options(value: Any) -> dict[int, int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _compact_key(value: Any) -> str:
+    return "".join(character for character in str(value).lower()
+                   if character.isalnum())
+
+
+def _wire_card_uids(value: Any) -> tuple[int, ...]:
+    """Read card UIDs from normalized or typed XCostData values."""
+    if value is None:
+        return ()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if _compact_key(key) in {
+                    "uid", "uid64", "muid64", "sessioncardid",
+                    "msessioncardid", "value"}:
+                return _wire_card_uids(item)
+        for key, item in value.items():
+            if _compact_key(key) in {
+                    "sessioncardids", "cards", "selectedcards", "values"}:
+                return _wire_card_uids(item)
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        return tuple(uid for item in value for uid in _wire_card_uids(item))
+    uid64 = getattr(value, "uid64", None)
+    if uid64 is not None:
+        return _wire_card_uids(uid64)
+    uid = getattr(value, "uid", None)
+    if uid is not None:
+        return _wire_card_uids(uid)
+    try:
+        return (int(value),)
+    except (TypeError, ValueError):
+        return ()
+
+
+def _activation_guid(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = value.get("guid", value.get("m_Guid", value.get("value", "")))
+    else:
+        value = getattr(value, "guid", value)
+    return str(value or "").lower()
 
 
 @dataclass(frozen=True)
@@ -86,12 +126,14 @@ class ActivationData:
     x_cost: int | None = None
     index: int = -1
     opted: bool = False
+    opted_in_set: bool = False
 
     @classmethod
     def from_values(cls, *, target_map: Any = None, option_map: Any = None,
                     variables: Mapping[str, Any] | None = None,
                     cost_target_map: Any = None, x_cost: Any = None,
-                    index: Any = -1, opted: Any = False) -> "ActivationData":
+                    index: Any = -1, opted: Any = False,
+                    opted_in_set: Any = False) -> "ActivationData":
         parsed_x = None if x_cost is None else _int(x_cost, -1)
         return cls(
             target_map=_normalise_targets(target_map),
@@ -101,6 +143,7 @@ class ActivationData:
             x_cost=parsed_x,
             index=_int(index, -1),
             opted=bool(opted),
+            opted_in_set=bool(opted_in_set),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -115,6 +158,7 @@ class ActivationData:
             "x_cost": self.x_cost,
             "index": self.index,
             "opted": self.opted,
+            "opted_in_set": self.opted_in_set,
         }
 
     @classmethod
@@ -137,6 +181,7 @@ class ActivationData:
             x_cost=value.get("x_cost"),
             index=value.get("index", -1),
             opted=value.get("opted", False),
+            opted_in_set=value.get("opted_in_set", False),
         )
 
 
@@ -346,6 +391,13 @@ class AbilityInstance:
             ))
         for index, (kind, guid) in enumerate(
                 self.graph.additional_cost_targets if self.graph is not None else ()):
+            # Scrounge is an optional additional cost on an on-cast ability.
+            # The client can decline it; that must not make the card itself
+            # unplayable. If selected, its normal minimum/maximum validation
+            # still applies below.
+            if (self.is_scrounge and not self.activation.opted and
+                    not self.activation.cost_target_map):
+                continue
             spec = self._cost_target_spec(index)
             if spec is not None and not spec.requires_input:
                 continue
@@ -468,11 +520,31 @@ class PlayPlan:
     @classmethod
     def from_card(cls, store: RecordStore, card_guid: str, *,
                   source_uid: int | None = None,
-                  owner_id: int | None = None) -> "PlayPlan":
+                  owner_id: int | None = None,
+                  instance_ability_guids: Any = None) -> "PlayPlan":
         card = store.get("CardTemplate", card_guid)
         if card is None:
             raise KeyError(f"unknown card template {card_guid}")
-        graphs = card_ability_graphs(store, card_guid)
+        graphs = list(card_ability_graphs(store, card_guid))
+        present = {graph.guid.lower() for graph in graphs}
+        # The live card_abilities list can contain grants from permanents such
+        # as Graven Geist. Those abilities participate in this card's play
+        # transaction too, including optional costs and cast effects.
+        raw_instance_abilities = (
+            instance_ability_guids
+            if isinstance(instance_ability_guids, (list, tuple, set))
+            else (() if instance_ability_guids is None
+                  else (instance_ability_guids,)))
+        for value in raw_instance_abilities:
+            if isinstance(value, Mapping):
+                value = value.get("guid", value.get("m_Guid", ""))
+            guid = str(value or "").lower()
+            if not guid or guid in present:
+                continue
+            graph = ability_graph(store, guid)
+            if graph is not None:
+                graphs.append(graph)
+                present.add(guid)
         abilities = tuple(AbilityInstance.from_graph(
             graph, source_uid=source_uid, owner_id=owner_id,
             responsible_player_id=owner_id, store=store)
@@ -514,11 +586,102 @@ class PlayPlan:
             })
         return tuple(result)
 
+    @staticmethod
+    def _ability_cost_target_map(ability: AbilityInstance,
+                                 activation: Mapping[str, Any] | None
+                                 ) -> dict[int, tuple[int, ...]]:
+        """Bind XCostData card lists to this ability's authored cost indexes."""
+        if not isinstance(activation, Mapping) or ability.graph is None:
+            return {}
+        nested_activation = activation.get("activation_data")
+        if isinstance(nested_activation, Mapping):
+            activation = {**activation, **nested_activation}
+        authored = tuple(ability.graph.additional_cost_targets or ())
+        if not authored:
+            return {}
+
+        result: dict[int, tuple[int, ...]] = {}
+        explicit = activation.get("cost_target_map")
+        if isinstance(explicit, Mapping):
+            for raw_index, selected in explicit.items():
+                key = str(raw_index).lower()
+                try:
+                    candidate = int(raw_index)
+                except (TypeError, ValueError):
+                    candidate = -1
+                if 0 <= candidate < len(authored):
+                    index = candidate
+                else:
+                    index = next((position for position, (_kind, guid)
+                                  in enumerate(authored)
+                                  if str(guid).lower() == key), None)
+                if index is not None:
+                    values = _wire_card_uids(selected)
+                    if values:
+                        result[index] = values
+
+        field_for_kind = {
+            "sacrifice": "cards_to_sacrifice",
+            "exhaust": "cards_to_exhaust",
+            "discard": "cards_to_discard",
+            "void": "cards_to_void",
+            "put_into_deck": "cards_to_put_into_deck",
+            "shuffle_into_deck": "cards_to_shuffle_into_deck",
+            "put_into_hand": "cards_to_put_into_hand",
+            "reveal": "cards_to_reveal",
+        }
+
+        def field_value(source: Mapping[str, Any], wanted: str):
+            target = _compact_key(wanted)
+            for key, value in source.items():
+                compact = _compact_key(key)
+                if compact.startswith("m"):
+                    compact = compact[1:]
+                if compact == target:
+                    return value
+            return None
+
+        xcost = field_value(activation, "x_cost_data")
+        sources = [activation]
+        if isinstance(xcost, Mapping):
+            sources.append(xcost)
+        for index, (kind, guid) in enumerate(authored):
+            if index in result:
+                continue
+            field = field_for_kind.get(str(kind).lower())
+            if not field:
+                continue
+            for source in sources:
+                selected = field_value(source, field)
+                if selected is None:
+                    continue
+                if isinstance(selected, Mapping):
+                    selected_by_guid = next((value for key, value
+                                             in selected.items()
+                                             if str(key).lower() ==
+                                             str(guid).lower()), None)
+                    if selected_by_guid is not None:
+                        selected = selected_by_guid
+                    else:
+                        nonempty = [entry for entry in selected.values()
+                                    if _wire_card_uids(entry)]
+                        # Some client versions key a single cost list by its
+                        # target index instead of its target GUID.
+                        if len(nonempty) != 1:
+                            continue
+                        selected = nonempty[0]
+                values = _wire_card_uids(selected)
+                if values:
+                    result[index] = values
+                    break
+        return result
+
     def activation_bundle(self, target_uids: Any = None, *,
                           x_cost: int | None = None,
                           option_map: Mapping[int, int] | None = None,
                           variables: Mapping[str, Any] | None = None,
-                          cost_target_map: Mapping[int, Any] | None = None
+                          cost_target_map: Mapping[int, Any] | None = None,
+                          ability_data: Any = None
                           ) -> tuple[dict[str, ActivationData], dict[int, tuple[int, ...]]]:
         """Bind one client card-play selection to every affected ability.
 
@@ -570,17 +733,45 @@ class PlayPlan:
                 resolved_costs[index] = tuple(selected)
                 offset += len(selected)
 
+        play_abilities = self.cast_abilities
+        supplied_abilities = {}
+        raw_ability_data = (ability_data if isinstance(
+            ability_data, (list, tuple)) else
+            (() if ability_data is None else (ability_data,)))
+        for item in raw_ability_data:
+            if not isinstance(item, Mapping):
+                continue
+            raw_guid = item.get(
+                "ability_template_id", item.get("ability_guid", ""))
+            guid = _activation_guid(raw_guid)
+            if guid:
+                supplied_abilities[guid] = item
+
+        explicit_targets: dict[str, dict[int, tuple[int, ...]]] = {}
+        for ability in play_abilities:
+            ability_key = ability.ability_guid.lower()
+            raw = supplied_abilities.get(ability_key)
+            if not isinstance(raw, Mapping):
+                continue
+            nested = raw.get("activation_data")
+            target_map = (nested.get("target_map")
+                          if isinstance(nested, Mapping) else None)
+            target_map = target_map or raw.get("target_map")
+            if isinstance(target_map, Mapping):
+                explicit_targets[ability_key] = _normalise_targets(target_map)
+
         slots = []
         # Card-play activations are non-triggered, non-manual graphs.
         # ``m_Manual=1`` is a separately activated warzone ability and must
         # not be validated or prompted while the card is being cast.
-        play_abilities = self.cast_abilities
         for ability in play_abilities:
+            explicitly_bound = explicit_targets.get(
+                ability.ability_guid.lower(), {})
             for index in ability.referenced_target_indexes:
                 if index >= len(ability.targets):
                     continue
                 target = ability.targets[index]
-                if target.requires_input:
+                if target.requires_input and index not in explicitly_bound:
                     slots.append((ability, index, target))
 
         remaining = values[offset:]
@@ -609,7 +800,26 @@ class PlayPlan:
 
         activations = {}
         for ability in play_abilities:
-            bound = assignments.get(ability.ability_guid.lower(), {})
+            ability_key = ability.ability_guid.lower()
+            raw = supplied_abilities.get(ability_key)
+            bound = dict(explicit_targets.get(ability_key, {}))
+            bound.update(assignments.get(ability_key, {}))
+            ability_cost_map = self._ability_cost_target_map(ability, raw)
+            activation_x_cost = x_cost
+            activation_options = option_map
+            activation_variables = variables
+            opted = False
+            opted_in_set = False
+            if isinstance(raw, Mapping):
+                nested = raw.get("activation_data")
+                if isinstance(nested, Mapping):
+                    raw = {**raw, **nested}
+                if raw.get("x_cost") is not None:
+                    activation_x_cost = raw.get("x_cost")
+                activation_options = raw.get("option_map") or option_map
+                activation_variables = raw.get("variables") or variables
+                opted = bool(raw.get("opted", False))
+                opted_in_set = bool(raw.get("opted_in_set", False))
             # Card-level costs live on ``PlayPlan.cost`` (CardTemplate
             # m_SacrificeTarget and friends) and are validated by
             # ``PlayPlan.validate(cost_target_map=...)``.  An ability's
@@ -617,11 +827,14 @@ class PlayPlan:
             # (AbilityTemplate cost fields), so copying the card map here made
             # ability validation report "unknown additional-cost index 0"
             # (Abominate).
-            activations[ability.ability_guid.lower()] = ActivationData.from_values(
+            activations[ability_key] = ActivationData.from_values(
                 target_map=bound,
-                option_map=option_map,
-                variables=variables,
-                x_cost=x_cost,
+                option_map=activation_options,
+                variables=activation_variables,
+                cost_target_map=ability_cost_map,
+                x_cost=activation_x_cost,
+                opted=opted or bool(ability_cost_map),
+                opted_in_set=opted_in_set,
             )
         return activations, resolved_costs
 

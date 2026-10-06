@@ -45,8 +45,7 @@ source_uid, owner_id, **event_data) -> None``
 ``chain_ability_owner(state, item, owner_id, player_uid, ai_uid) -> int``
     Optional owner normalization for a manual/champion ability item.
 
-A hook that is absent falls back to the host's existing projection seam
-(``_card_full_data`` / ``_dispatch_game_trigger``) or to the documented
+A missing chain hook uses the native trigger backend or the documented
 default above, so a focused test double only has to provide the piece under
 test.
 """
@@ -117,21 +116,104 @@ def card_data(host, game, scid, template_guid):
     return host._card_full_data(game, scid, template_guid)
 
 
+def finish_resolving_card(host, session, db, game, state, player_uid,
+                          ai_uid, source_uid):
+    """Apply C# ``Session.MoveSpellAfterFinishedResolving`` semantics.
+
+    The destination depends on the card's current template after its effects:
+    a transformed troop, artifact, or constant enters Warzone; other cards go
+    to Discard. An effect that already moved the source out of CastSpells owns
+    that destination and is left untouched.
+    """
+    from pvp_db import (db_card_attribute_rows, db_card_chain_info,
+                        db_card_discard_spell, db_card_location,
+                        db_card_owner_zone_state, db_set_card_location)
+
+    uid = int(source_uid or 0)
+    location = str(db_card_location(
+        session.session_id, uid, conn=db) or "").lower()
+    if not uid or location != "castspells":
+        return "finish resolving: source already moved"
+    current = db_card_chain_info(session.session_id, uid, conn=db)
+    owner_zone = db_card_owner_zone_state(
+        session.session_id, uid, conn=db)
+    if not current or not owner_zone:
+        return "finish resolving: source not found"
+
+    template_guid, card_type_name = current[0], current[1]
+    card_type = game_engine.card_type_from_db(card_type_name)
+    attribute_rows = db_card_attribute_rows(
+        session.session_id, [uid], conn=db)
+    attributes = int(attribute_rows[0][0] or 0) if attribute_rows else 0
+    permanent_types = (game_engine.ECardTypes.Troop |
+                       game_engine.ECardTypes.Artifact |
+                       game_engine.ECardTypes.Constant)
+    destination = ("warzone" if card_type & permanent_types else "discard")
+    owner_id = int(owner_zone[0] or 0)
+    previous_state = int(owner_zone[2] or 0)
+
+    if destination == "warzone":
+        entering_state = previous_state & ~int(
+            game_engine.ECardStates.Tapped |
+            game_engine.ECardStates.StartedATurnOnYourSide)
+        entering_state |= int(game_engine.ECardStates.CameOutThisTurn)
+        if attributes & game_engine.ECardAttributes.EntersPlayExhausted:
+            entering_state |= int(game_engine.ECardStates.Tapped)
+        if card_type & game_engine.ECardTypes.Troop:
+            from .static_rules import opposing_enters_play_exhausted
+            if opposing_enters_play_exhausted(state, owner_id, template_guid):
+                entering_state |= int(game_engine.ECardStates.Tapped)
+        db_set_card_location(
+            session.session_id, uid, destination,
+            extra_set="position=?, card_state=?",
+            extra_params=[0, entering_state], conn=db)
+    else:
+        db_card_discard_spell(session.session_id, uid, conn=db)
+    db.commit()
+
+    scid = game_engine.SessionCardId(game_engine.UID(uid))
+    _tpl, card_type, _name, cost, attack, defense, gems = cast(
+        Any, card_data(host, game, scid, template_guid))
+    owner_sid = player_uid if owner_id else ai_uid
+    collection = (game_engine.ECardCollections.Warzone
+                  if destination == "warzone" else
+                  game_engine.ECardCollections.Discard)
+    game.push_card_updated(
+        scid, owner_sid, collection, card_type, template_id=template_guid,
+        cost=cost, attack=attack, defense=defense, gems=gems,
+        attributes=attributes,
+        state=(entering_state if destination == "warzone" else 0))
+
+    if destination == "warzone":
+        mark_entry = _hook(host, "chain_mark_warzone_entry")
+        if mark_entry is not None:
+            mark_entry(session, uid)
+    dispatch(
+        host, session, game, state, player_uid, ai_uid,
+        "CardExitedZoneEvent", uid, owner_id,
+        event_source_collection="CastSpells",
+        event_destination_collection=destination,
+        event_previous_state=previous_state)
+    dispatch(
+        host, session, game, state, player_uid, ai_uid,
+        "CardEnteredZoneEvent", uid, owner_id,
+        event_source_collection="CastSpells",
+        event_destination_collection=destination,
+        event_previous_state=previous_state)
+    return f"finish resolving: moved {hex(uid)} to {destination}"
+
+
 def dispatch(host, session, game, state, player_uid, ai_uid, event_type,
              source_uid, owner_id, **event_data):
     hook = _hook(host, "chain_dispatch")
+    target_player_id = event_data.pop("target_player_id", None)
     if hook is not None:
         return hook(session, game, state, player_uid, ai_uid, event_type,
-                    source_uid, owner_id, **event_data)
-    legacy = _hook(host, "_dispatch_game_trigger")
-    if legacy is not None:
-        return legacy(
-            game, session, player_uid, ai_uid, state, event_type, source_uid,
-            owner_id, **event_data)
-    # Small AI/test hosts do not need to duplicate HCPHandler's private
-    # forwarding method.  Keep this shared boundary usable for them by
-    # dispatching directly through the native trigger backend instead of
-    # requiring an otherwise unrelated host adapter method.
+                    source_uid, owner_id,
+                    target_player_id=target_player_id, **event_data)
+    # Small hosts do not need to duplicate the mode hook. Dispatch straight
+    # through the native backend; never probe the retired transaction/trigger
+    # dispatcher by its compatibility name.
     from .triggers import dispatch_native_trigger
     connection = getattr(host, "_db", None)
     if connection is None:
@@ -143,7 +225,7 @@ def dispatch(host, session, game, state, player_uid, ai_uid, event_type,
         player_uid=player_uid, ai_uid=ai_uid, battle_state=state,
         event_type=event_type, source_card_id=source_uid,
         source_player_id=owner_id, target_card_id=target_card_id,
-        data=event_data)
+        target_player_id=target_player_id, data=event_data)
 
 
 def dispatch_card_cast(host, session, game, state, player_uid, ai_uid,
@@ -379,8 +461,8 @@ def resolve_chain_item(host, port, session, db, ability, player_uid, ai_uid):
 def resolve_card_item(host, session, db, game, state, item, player_uid,
                       ai_uid, bom_completed=False):
     """Resolve a troop/artifact/constant or spell chain item."""
-    from pvp_db import (db_card_chain_info, db_card_discard_spell,
-                        db_card_location, db_card_owner_zone_state,
+    from pvp_db import (db_card_chain_info, db_card_location,
+                        db_card_owner_zone_state,
                         db_set_card_location)
 
     kind = str(item.get("kind") or "")
@@ -398,6 +480,16 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
 
     if kind == "troop":
         if loc != "CastSpells":
+            return
+        # Resolve non-triggered cast graphs before the zone event. An
+        # additional-cost ability can grant a Deploy/other entry trigger, and
+        # dispatching CardEnteredZoneEvent before that grant loses the trigger
+        # for the entire play.
+        from .resolution import resolve_port_played_permanent
+        resolve_port_played_permanent(
+            game, session, db, host, player_uid, ai_uid, state, item,
+            owner_id, bom_completed=bom_completed)
+        if state.get("resolution_paused"):
             return
         entering_state = game_engine.ECardStates.CameOutThisTurn
         from .static_rules import opposing_enters_play_exhausted
@@ -417,9 +509,6 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
             scid, owner_sid, game_engine.ECardCollections.Warzone, ctype,
             template_id=row[0], cost=cost, attack=attack, defense=defense,
             gems=gems)
-        game.push_card_moved(
-            scid, owner_sid, game_engine.ECardCollections.Warzone,
-            game_engine.ECardLocations.Top, 0)
         if ctype & game_engine.ECardTypes.Artifact:
             game.push_artifact_card_played(scid, owner_sid)
         else:
@@ -437,12 +526,17 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
 
     if loc != "CastSpells" and not bom_completed:
         return
+    if bom_completed:
+        from .resolution import restore_played_card_ability_lists
+        restore_played_card_ability_lists(state, source_uid)
     if not bom_completed:
         game.push_spell_card_played(scid, owner_sid)
         turn_now = int(state.get("turn_number", 1))
-        side = "ai" if owner_id == 0 else "player"
-        turn_key = f"{side}_actions_cast_turn"
-        count_key = f"{side}_actions_cast_this_turn"
+        from .runtime_helpers import participant_turn_counter_key
+        turn_key = participant_turn_counter_key(
+            state, owner_id, "actions_cast_turn")
+        count_key = participant_turn_counter_key(
+            state, owner_id, "actions_cast_this_turn")
         if state.get(turn_key) != turn_now:
             state[count_key] = 0
             state[turn_key] = turn_now
@@ -456,7 +550,8 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
             game, session, db, host, player_uid, ai_uid, state,
             item.get("ability_guids", ()),
             activations=item.get("activations"),
-            played_from_hand=bool(item.get("played_from_hand")))
+            played_from_hand=bool(item.get("played_from_hand")),
+            voided_cost_uids=item.get("voided_cost_uids", ()))
         if state.get("resolution_paused"):
             return
     state.pop("player_spell_target", None)
@@ -466,20 +561,10 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
     current_location = str(db_card_location(
         session.session_id, source_uid, conn=db) or "").lower()
     if current_location == "castspells":
-        db_card_discard_spell(session.session_id, source_uid, conn=db)
-        dispatch(
-            host,
-            session, game, state, player_uid, ai_uid,
-            "CardEnteredZoneEvent", source_uid, owner_id,
-            event_source_collection="CastSpells",
-            event_destination_collection="discard")
-        card_data(host, game, scid, row[0])
-        game.push_card_moved(
-            scid, owner_sid, game_engine.ECardCollections.Discard,
-            game_engine.ECardLocations.Top, 0)
-        game.push_card_updated(
-            scid, owner_sid, game_engine.ECardCollections.Discard,
-            game_engine.card_type_from_db(row[1]), template_id=row[0])
+        finish_resolving_card(
+            host, session, db, game, state, player_uid, ai_uid, source_uid)
+    from .resolution import restore_played_card_ability_lists
+    restore_played_card_ability_lists(state, source_uid)
     state.pop("_spell_played_from_hand", None)
 
 

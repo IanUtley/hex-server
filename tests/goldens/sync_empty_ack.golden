@@ -1,0 +1,2 @@
+;0;0;2;RoutingPlayerId;1;1;1;m_UID64;2;2;0;F4D2040000000000;SessionArgs;3;3;5;PlayerId;4;1;1;m_UID64;5;2;0;F4D2040000000000;EventIds;6;4;0;0;EventData;7;5;0;0;Class;8;6;0;FF000000;SessionId;9;1;1;m_UID64;10;2;0;2A00000000000000;Game.Shared.Network.GameSession.SessionSyncEventEventArgs;Game.Shared.UID;System.UInt64;Game.Shared.NetworkPacketSessionEventArgs;System.Collections.Generic.List`1#System.Int32;System.Collections.Generic.List`1#System.Byte[];System.Int32
+228;53;31;168;46;31;17;18;21;48;32

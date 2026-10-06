@@ -46,7 +46,8 @@ from .transactions import (AbilityExistsRequirement, AllDamageAssignedRequiremen
                            NotRequirement,
                            TurnPhaseRequirement, XCostRequirement)
 from .turn_states import default_phase_states
-from .actions import AbilityResolutionState, ResolveTopOfChainAction
+from .actions import (AbilityResolutionState, PushOntoChainAction,
+                      ResolveTopOfChainAction)
 from .combat import CombatFlags, CombatId, CombatManager, CombatPhase
 from .projections import TransactionProjection
 
@@ -1922,12 +1923,27 @@ class AuthoritativeSession:
                 return False
             if not bind_activation(activation):
                 return False
-            if not self.pay_ability_cost(ability):
-                return False
             staged.append(ability)
         for ability in staged:
-            if not self.finish_ability_on_chain(ability):
-                return False
+            # C# ActivateTriggeredAbility updates the selected instance, then
+            # calls PushAbilityOnChain. That path schedules PushOntoChainAction
+            # when any target/option/cost data is still missing; payment and
+            # chain insertion happen only after that same instance is complete.
+            # Do not finish directly here or a class-39 choice that needs a
+            # follow-up class-23 picker skips the picker and pays too early.
+            needs_data = getattr(ability, "needs_activation_data", None)
+            prompts = tuple(needs_data()) if callable(needs_data) else ()
+            metadata = getattr(ability, "metadata", None)
+            graph = getattr(metadata, "graph", None)
+            optional = bool(getattr(
+                graph, "optional", getattr(ability, "optional", False)))
+            if prompts and not optional:
+                self.push_game_action(PushOntoChainAction(ability))
+            else:
+                # C# does not open PushOntoChainAction for optional abilities;
+                # their opt-in/disable choice is handled by the class-39
+                # configuration state itself.
+                self.finish_ability_on_chain(ability)
         return True
 
     def _resolve_quit_game(self, transaction: RulesTransaction) -> bool:
@@ -2129,7 +2145,7 @@ class AuthoritativeSession:
             if self.action_stack.priority_player_id is not None:
                 self.event_sink.green_light(
                     self.action_stack.priority_player_id,
-                    game_engine.EPriorityContext.Normal)
+                    game_engine.EPriorityContext.ResolveTopOfChain)
         return True
 
     def resolve_top_of_chain(self, ability_instance_id: int) -> AbilityResolutionState:
@@ -2707,6 +2723,7 @@ class AuthoritativeSession:
             "active_player_id": _serial_id(self.active_player_id),
             "priority_player_id": (None if self.action_stack.priority_player_id is None
                                    else _serial_id(self.action_stack.priority_player_id)),
+            "combat_next_serial": int(self.combat_manager._next_serial),
             "seed_z": z,
             "seed_w": w,
             "total_turns_taken": self.total_turns_taken,
@@ -2728,6 +2745,8 @@ class AuthoritativeSession:
             "combats": [
                 {"attacker_id": _serial_combatant_id(combat.attacker),
                  "defender_id": _serial_combatant_id(combat.defender),
+                 "combat_id_attacker_id": _serial_id(
+                     combat.combat_id.attacker_id),
                  "combat_serial": int(combat.combat_id.serial_number),
                  "blocker_ids": [
                      _serial_combatant_id(blocker)
@@ -2801,6 +2820,12 @@ class AuthoritativeSession:
         except (TypeError, ValueError):
             pass
         self.terminated = bool(saved.get("terminated", False))
+        try:
+            self.combat_manager._next_serial = max(
+                int(self.combat_manager._next_serial),
+                int(saved.get("combat_next_serial", 0) or 0))
+        except (TypeError, ValueError):
+            pass
         eliminated = saved.get("eliminated_player_ids", ())
         if isinstance(eliminated, (list, tuple)):
             self.eliminated_player_ids = {
@@ -2929,9 +2954,20 @@ class AuthoritativeSession:
                     return False
                 defender = get_card(defender_id) or defender_id
                 serial = int(descriptor.get("combat_serial", attacker_id & 0xFFFF))
+                # The client keys CombatManager by CombatId(attacking
+                # player UID, serial), while this descriptor's attacker_id
+                # is the attacking card UID used to restore the card itself.
+                # Older snapshots lack the separate CombatId owner; the
+                # active player is the attacker for the current combat phase.
+                combat_id_attacker = descriptor.get(
+                    "combat_id_attacker_id")
+                if combat_id_attacker is None:
+                    combat_id_attacker = self.active_player_id
                 combat = self.combat_manager.create_attack(
-                    CombatId(attacker_id, serial), self.active_player_id,
-                    defender)
+                    CombatId(as_int(combat_id_attacker), serial),
+                    self.active_player_id, defender)
+                self.combat_manager._next_serial = max(
+                    int(self.combat_manager._next_serial), serial)
                 combat.declare_attacker(attacker)
                 blockers = []
                 for blocker_id in descriptor.get("blocker_ids", ()):

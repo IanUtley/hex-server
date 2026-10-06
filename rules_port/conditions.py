@@ -1,9 +1,8 @@
 """RulesPort condition boundary for Records trigger and effect predicates.
 
 The condition evaluator is stateful only through the supplied typed context.
-This module is the port-owned API used by trigger dispatch; its compatibility
-provider is loaded lazily so old non-battle callers can continue to use the
-historical module while live RulesPort sessions have one condition boundary.
+Unsupported Records condition forms fail closed until they have a native
+RulesPort implementation.
 """
 
 from __future__ import annotations
@@ -19,8 +18,53 @@ def _last(value):
     return str(value or "").rsplit(".", 1)[-1]
 
 
+def _record_filter_zones(node):
+    """Return explicit zone predicates from a Records card-filter tree."""
+    if isinstance(node, dict):
+        zones = set()
+        if _last(node.get("_t")) == "InZone" and node.get("m_Collection"):
+            zones.add(str(node["m_Collection"]).lower())
+        for child in node.values():
+            zones.update(_record_filter_zones(child))
+        return zones
+    if isinstance(node, list):
+        zones = set()
+        for child in node:
+            zones.update(_record_filter_zones(child))
+        return zones
+    return set()
+
+
 def _side(value):
     return "ai" if not value else "player"
+
+
+def _participant_int(state, owner, raw_prefix, side_suffix, default=0):
+    """Read one participant's integer from a PvP checkpoint/view or PvE."""
+    from .runtime_helpers import participant_value
+    try:
+        return int(participant_value(
+            state, owner, raw_prefix, side_suffix, default) or 0)
+    except (TypeError, ValueError):
+        return int(default or 0)
+
+
+def _participant_thresholds(state, owner):
+    from .runtime_helpers import participant_value
+    value = participant_value(state, owner, "thresh", "threshold", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _is_active(ctx, owner):
+    from .runtime_helpers import is_active_participant
+    return is_active_participant(ctx.bstate or {}, owner)
+
+
+def _player_resources(state, owner, *, temporary=False):
+    """Read the C# Player resource pool from either PvP or PvE state."""
+    if temporary:
+        return _participant_int(state, owner, "res", "resources")
+    return _participant_int(state, owner, "res_total", "total_resources")
 
 
 def _owner_is(ctx, owner, expected) -> bool:
@@ -50,7 +94,96 @@ def _compare(value, operation, target):
         "GreaterThan": value > target,
         "LessThan": value < target,
         "Equals": value == target,
+        "NotEqual": value != target,
+        "OneMoreThan": value == target + 1,
+        "TwoMoreThan": value == target + 2,
+        "OneLessThan": value == target - 1,
     }.get(str(operation or "GreaterThanOrEqual"), True)
+
+
+def _same_player(ctx, left, right):
+    if (getattr(ctx, "bstate", None) or {}).get("pvp"):
+        try:
+            return int(left or 0) == int(right or 0)
+        except (TypeError, ValueError):
+            return False
+    return _side(left) == _side(right)
+
+
+def _different_races(card, faction):
+    """Yield the C# ERace tool names on a card for one EFactions value."""
+    faction = _last(faction).lower()
+    races_by_faction = {
+        "aria": ("Human", "Elf", "Coyotle", "Orc"),
+        "underworld": ("Dwarf", "Shin'hare", "Vennen", "Necrotic"),
+    }
+    races = races_by_faction.get(faction, ())
+    if not races:
+        return ()
+    tokens = set(str(card.get("subtype") or "").lower().split())
+    return tuple(race for race in races if race.lower() in tokens)
+
+
+def _requires_cards_count(ctx, source, owner, player_filter, zones,
+                          same_owner, target_owners, card_filter, node):
+    """Count cards with the same filters and distinctness rules as C#.
+
+    ``RequiresCardsControlled.GetFilteredCardCount`` applies its collection,
+    player, SameOwner, and distinct-cost/name/race fields both to the primary
+    card filter and to ``m_QuantityCardFilter``.
+    """
+    from rules_port.filters import records_filter_matches
+
+    wanted_player = _last(player_filter).lower()
+    count = 0
+    different_costs = bool(node.get("m_OnlyIncludeDifferentCosts", 0))
+    different_names = bool(node.get("m_OnlyIncludeDifferentNames", 0))
+    different_races = node.get("m_OnlyIncludeDifferentRacesForFaction")
+    seen_costs = set()
+    seen_names = set()
+    seen_races = set()
+    for card in ctx._cards_in_zones(zones):
+        card_owner = card.get("controller_id", card.get("user_id", 0))
+        if same_owner and int(card_owner or 0) not in target_owners:
+            continue
+        if wanted_player in {"self", "you", "controller"}:
+            if not _same_player(ctx, card_owner, owner):
+                continue
+        elif wanted_player in {
+                "opposing", "opponent", "opponents", "singleopponent",
+                "multipleopponents"}:
+            if _same_player(ctx, card_owner, owner):
+                continue
+        elif wanted_player == "singleplayer":
+            # The original switch deliberately counts no player for this enum.
+            continue
+        if (card_filter is not None and
+                not records_filter_matches(
+                    card, card_filter, source=source, context=ctx)):
+            continue
+        if different_costs:
+            try:
+                value = int(card.get("cost", 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value in seen_costs:
+                continue
+            seen_costs.add(value)
+            count += 1
+        elif different_names:
+            value = str(card.get("name") or "")
+            if value in seen_names:
+                continue
+            seen_names.add(value)
+            count += 1
+        elif _last(different_races).lower() not in {"", "unknown"}:
+            for race in _different_races(card, different_races):
+                if race not in seen_races:
+                    seen_races.add(race)
+                    count += 1
+        else:
+            count += 1
+    return count
 
 
 def _event_tac(ctx):
@@ -116,10 +249,19 @@ def _native_condition(node, ctx):
     if kind == "TriggerPlayerControlsAbilitySource":
         card = ctx.card(ctx.ability_source_uid)
         if card is None:
-            return True
-        trigger_owner = (ctx.trigger_owner_id
-                         if ctx.trigger_owner_id is not None
-                         else ctx.ability_source_owner_id)
+            return False
+        selector = _last(node.get("m_TriggerTest") or "TriggerSource").lower()
+        if selector == "triggersource":
+            trigger_owner = ctx.trigger_owner_id
+        elif selector == "triggertarget":
+            trigger_owner = ctx.event_target_owner_id
+        else:
+            # TriggerCondition.GetTriggerPlayer has no TriggerSourcePlayer
+            # branch and returns null for that selector; the C# leaf rejects
+            # a null trigger player.
+            return False
+        if trigger_owner is None:
+            return False
         return _owner_is(ctx, card.get("user_id"), trigger_owner)
     if kind == "TriggerPlayerControlsCard":
         card = ctx.card(ctx.trigger_uid)
@@ -127,13 +269,17 @@ def _native_condition(node, ctx):
                 _owner_is(ctx, card.get("user_id"),
                           ctx.ability_source_owner_id))
     if kind == "TriggerPlayerControlsTarget":
-        card = ctx.card(ctx.extra_target)
-        return (True if card is None else
-                _owner_is(ctx, card.get("user_id"),
-                          ctx.ability_source_owner_id))
+        # C# compares the ability source controller to the event's
+        # TargetPlayerId. The target card itself is not authoritative here:
+        # several events carry a target player without a target card, and a
+        # card's controller can differ from the event participant.
+        target_owner = ctx.event_target_owner_id
+        if target_owner is None:
+            return False
+        return _owner_is(
+            ctx, ctx.ability_source_owner_id, target_owner)
     if kind == "TriggerPlayerIsActivePlayer":
-        return ctx.bstate.get("turn_player") == _side(
-            ctx.ability_source_owner_id)
+        return _is_active(ctx, ctx.ability_source_owner_id)
     if kind == "TriggerEventIsCombatDamage":
         event = _last(ctx.event_type)
         return event == "CardDealtDamageEvent" or (
@@ -163,9 +309,15 @@ def _native_condition(node, ctx):
             str(ctx.bstate.get("activated_ability_guid") or ""), 0) or 0)
         return used < int(node.get("m_UsesPerGame", node.get("m_Value", 1)) or 1)
     if kind == "TriggerCardIsNthCardDrawnThisTurnByThisPlayer":
-        side = _side(ctx.ability_source_owner_id)
-        return int(ctx.bstate.get(f"{side}_draws_this_turn", 0) or 0) == int(
-            node.get("m_Nth", 1) or 1)
+        if _last(ctx.event_type) != "CardDrawnEvent":
+            return False
+        try:
+            drawn_index = int((ctx.event_data or {}).get(
+                "nth_card_drawn_this_turn_by_this_player", 0) or 0)
+            required_index = int(node.get("m_Nth", 1) or 1)
+        except (TypeError, ValueError):
+            return False
+        return drawn_index == required_index
     if kind == "TurnPhaseCondition":
         wanted = str(node.get("m_TurnPhase") or "")
         current = ctx.bstate.get("phase")
@@ -183,8 +335,18 @@ def _native_condition(node, ctx):
             "m_Amount", node.get("m_Value", 1))) or 1)
         return _compare(value, node.get("m_ComparisonOp"), required)
     if kind == "ChampionActionsCastThisTurn":
-        side = _side(ctx.ability_source_owner_id)
-        value = int(ctx.bstate.get(f"{side}_actions_cast_this_turn", 0) or 0)
+        # C# reads PlayerStatsThisTurn.ActionsCast. The port keeps the count
+        # with the turn it was written in; a count from an earlier turn is 0.
+        from .runtime_helpers import participant_turn_counter_key
+        owner = ctx.ability_source_owner_id
+        state = ctx.bstate or {}
+        value = int(state.get(participant_turn_counter_key(
+            state, owner, "actions_cast_this_turn"), 0) or 0)
+        written_turn = state.get(participant_turn_counter_key(
+            state, owner, "actions_cast_turn"))
+        if (written_turn is not None and
+                int(written_turn) != int(state.get("turn_number", 1) or 1)):
+            value = 0
         required = int(node.get("m_RequiredQuantity", 1) or 1)
         return _compare(value, node.get("m_ComparisonOp"), required)
     if kind == "TriggerCardCounter":
@@ -203,14 +365,13 @@ def _native_condition(node, ctx):
             return _UNSUPPORTED
         return count >= int(node.get("m_RequiredCount", 1) or 1)
     if kind == "TriggerPlayerHealth":
-        side = _side(ctx.ability_source_owner_id)
-        value = int(ctx.bstate.get(f"{side}_health", 20) or 0)
+        value = _participant_int(
+            ctx.bstate, ctx.ability_source_owner_id, "hp", "health", 20)
         required = int(node.get("m_Health", 0) or 0)
         return _compare(value, node.get("m_ComparisonOp"), required)
     if kind in ("AbilityControllerIsActiveAbilityCondition",
                 "AbilityControllerHasPriorityAbilityCondition"):
-        return ctx.bstate.get("turn_player") == _side(
-            ctx.ability_source_owner_id)
+        return _is_active(ctx, ctx.ability_source_owner_id)
     if kind == "AbilityControllerIsStartingPlayerAbilityCondition":
         return ctx.bstate.get("starting_player") == _side(
             ctx.ability_source_owner_id)
@@ -224,10 +385,7 @@ def _native_condition(node, ctx):
         if not flag:
             return True
         owner = int(ctx.ability_source_owner_id or 0)
-        side = _side(owner)
-        thresholds = (ctx.bstate.get(f"thresh_{owner}", {}) or {}
-                      if ctx.bstate.get("pvp") else
-                      ctx.bstate.get(f"{side}_threshold", {}) or {})
+        thresholds = _participant_thresholds(ctx.bstate, owner)
         return int(thresholds.get(flag, thresholds.get(str(flag), 0)) or 0) >= required
     if kind == "SourceCardHasCounters":
         card = ctx.card(ctx.ability_source_uid)
@@ -239,8 +397,9 @@ def _native_condition(node, ctx):
         if not callable(counter_count):
             return _UNSUPPORTED
         value = counter_count(card, str(guid or "").lower())
-        return _compare(value, node.get("m_ComparisonOp"), int(
-            node.get("m_RequiredCounters", 1) or 1))
+        required_raw = node.get("m_RequiredCounters")
+        required = int(1 if required_raw is None else required_raw)
+        return _compare(value, node.get("m_ComparisonOp"), required)
     if kind == "TriggerCardIsStoredTargetOfAbilitySource":
         if ctx.trigger_uid is None:
             return False
@@ -312,8 +471,7 @@ def _native_condition(node, ctx):
             target, node.get("m_Filter") or {}, source=source, context=ctx)
     if kind in ("AbilityControllerIsActiveAbilityCondition",
                 "AbilityControllerHasPriorityAbilityCondition"):
-        return ctx.bstate.get("turn_player") == _side(
-            ctx.ability_source_owner_id)
+        return _is_active(ctx, ctx.ability_source_owner_id)
     if kind == "AbilityControllerHasThresholdAbilityCondition":
         import game_engine
         color = str(node.get("m_ColorFlags", "") or "").lower()
@@ -321,41 +479,64 @@ def _native_condition(node, ctx):
         if not flag:
             return True
         owner = int(ctx.ability_source_owner_id or 0)
-        side = _side(owner)
-        thresholds = (ctx.bstate.get(f"thresh_{owner}", {}) or {}
-                      if ctx.bstate.get("pvp") else
-                      ctx.bstate.get(f"{side}_threshold", {}) or {})
+        thresholds = _participant_thresholds(ctx.bstate, owner)
         return int(thresholds.get(flag, thresholds.get(str(flag), 0)) or 0) >= int(
             node.get("m_RequiredQuantity", 1) or 1)
     if kind == "RequiresChampionHealth":
         owner = int(ctx.ability_source_owner_id or 0)
         health = getattr(ctx, "_champion_health", None)
         if not callable(health):
-            side = _side(owner)
-            value = int(ctx.bstate.get(f"{side}_health", 20) or 0)
+            value = _participant_int(ctx.bstate, owner, "hp", "health", 20)
         else:
             value = int(cast(Any, health(owner)) or 0)
         required = int(node.get("m_RequiredQuantity", 0) or 0)
         return _compare(value, node.get("m_ComparisonOp"), required)
     if kind == "RequiresChampionCharges":
-        side = _side(ctx.ability_source_owner_id)
         return _compare(
-            int(ctx.bstate.get(f"{side}_charges", 0) or 0),
+            _participant_int(
+                ctx.bstate, ctx.ability_source_owner_id, "chg", "charges"),
             node.get("m_ComparisonOp"),
             int(node.get("m_RequiredQuantity", 0) or 0))
     if kind == "RequiresTotalResources":
-        side = _side(ctx.ability_source_owner_id)
-        return _compare(
-            int(ctx.bstate.get(f"{side}_total_resources", 0) or 0),
-            node.get("m_ComparisonOp"),
-            int(node.get("m_RequiredQuantity", node.get("m_Value", 0)) or 0))
+        state = getattr(ctx, "bstate", {}) or {}
+        source_owner = int(ctx.ability_source_owner_id or 0)
+        player_filter = _last(node.get("m_PlayerFilter") or "Self").lower()
+        participants = list(state.get("pids") or ())
+        if not participants:
+            participants = list((state.get("champ_map") or {}).keys())
+        try:
+            participants = list(dict.fromkeys(int(pid) for pid in participants))
+        except (TypeError, ValueError):
+            participants = []
+        if not participants:
+            participants = [source_owner,
+                            0 if source_owner else 1]
+        opponents = [pid for pid in participants if pid != source_owner]
+        quantity = int(node.get(
+            "m_RequiredQuantity", node.get("m_Value", 0)) or 0)
+        temporary = bool(node.get("m_UseTemporaryResources"))
+        if node.get("m_QuantityIsHighestOpposingChampionsMatch"):
+            quantity = max((_player_resources(
+                state, pid, temporary=temporary) for pid in opponents),
+                default=0)
+        operation = node.get("m_ComparisonOp")
+        if player_filter in {"self", "you", "controller"}:
+            return _compare(_player_resources(
+                state, source_owner, temporary=temporary), operation,
+                quantity)
+        if player_filter in {"singleopponent", "singleplayer"}:
+            return any(_compare(_player_resources(
+                state, pid, temporary=temporary), operation, quantity)
+                       for pid in opponents)
+        if player_filter in {"multipleopponents", "multipleplayers"}:
+            return all(_compare(_player_resources(
+                state, pid, temporary=temporary), operation, quantity)
+                       for pid in opponents)
+        return False
     if kind == "RequiresResourceThreshold":
         import game_engine
         owner = int(ctx.ability_source_owner_id or 0)
-        side = _side(owner)
-        thresholds = (ctx.bstate.get(f"thresh_{owner}", {}) or {}
-                      if ctx.bstate.get("pvp") else
-                      ctx.bstate.get(f"{side}_threshold", {}) or {})
+        thresholds = _participant_thresholds(ctx.bstate, owner)
         colors = node.get("m_ColorFlags", node.get("m_Color", ""))
         if isinstance(colors, str):
             colors = [colors]
@@ -415,48 +596,137 @@ def _native_condition(node, ctx):
         return True
     if kind == "RequiresCardsControlled":
         zones = ctx._zones(node.get("m_CardCollection", ""))
-        if not zones:
-            return True
-        required = int(node.get("m_RequiredQuantity", 1) or 1)
-        player_filter = node.get("m_PlayerFilter") or "Self"
+        # Zero is an authored quantity, not a missing value.  In particular,
+        # conditions such as "you control no Candlekin" serialize as
+        # RequiredQuantity=0 and C# compares the filtered count against zero.
+        required = int(node.get("m_RequiredQuantity", 0) or 0)
+        player_filter = str(
+            node.get("m_PlayerFilter") or "Self").rsplit(".", 1)[-1].lower()
         owner = int(ctx.ability_source_owner_id or 0)
-        source_side = _side(owner)
-        count = 0
-        from rules_port.filters import records_filter_matches
         source = ctx.card(ctx.ability_source_uid)
-        # ``IsAbilitySource`` is an identity test. Preserve that identity
-        # even when a transient/generated source has no joined template row;
-        # otherwise ``Not(IsAbilitySource)`` turns a missing source projection
-        # into a false matching card and incorrectly satisfies conditions such
-        # as Merry Minstrels' Elf Allegiance.
         if source is None and ctx.ability_source_uid is not None:
             source = {"card_uid": int(ctx.ability_source_uid)}
-        for card in ctx._cards_in_zones(zones):
-            card_owner = int(card.get("user_id", 0) or 0)
-            if player_filter in ("Self", "You", "Controller"):
-                if ((ctx.bstate.get("pvp") and card_owner != owner) or
-                        (not ctx.bstate.get("pvp") and
-                         _side(card_owner) != source_side)):
+        if source is None:
+            return False
+        same_owner = bool(node.get("m_SameOwner", 0))
+        pregame = (
+            str(getattr(ctx, "event_type", None) or "").rsplit(".", 1)[-1]
+            == "PreGameEvent" or
+            str((ctx.bstate or {}).get("event_type") or "").rsplit(".", 1)[-1]
+            == "PreGameEvent")
+        quantity_filter = node.get("m_QuantityCardFilter")
+        distinct_count = bool(
+            node.get("m_OnlyIncludeDifferentCosts", 0) or
+            node.get("m_OnlyIncludeDifferentNames", 0) or
+            _last(node.get("m_OnlyIncludeDifferentRacesForFaction"))
+            .lower() not in {"", "unknown"})
+        if (pregame and not same_owner and player_filter in
+                ("self", "you", "controller") and
+                _record_filter_zones(node.get("m_CardFilter") or {}) ==
+                {"deck"} and quantity_filter is None and
+                not distinct_count and
+                not node.get("m_QuantityIsHighestOpposingChampionsMatch") and
+                not node.get("m_QuantityIsLowestOpposingChampionsMatch")):
+            snapshots = (ctx.bstate or {}).get(
+                "pregame_initial_deck_counts") or {}
+            snapshot = snapshots.get(str(owner))
+            if snapshot is None:
+                snapshot = snapshots.get(owner)
+            if snapshot is not None:
+                return _compare(
+                    int(snapshot), node.get("m_ComparisonOp"), required)
+        target_owners = set()
+        if same_owner:
+            for uid in getattr(ctx, "effect_secondary_target_uids", ()) or ():
+                target = ctx.card(uid)
+                if target is None:
                     continue
-            elif player_filter in ("Opposing", "Opponents", "MultipleOpponents"):
-                if ((ctx.bstate.get("pvp") and card_owner == owner) or
-                        (not ctx.bstate.get("pvp") and
-                         _side(card_owner) == source_side)):
+                target_owner = target.get(
+                    "controller_id", target.get("user_id"))
+                if target_owner is not None:
+                    target_owners.add(int(target_owner))
+            # C# RequiresCardsControlled returns false when SameOwner has no
+            # effect mapping/target to bind. It must not silently count cards
+            # from every player in that case.
+            if not target_owners:
+                return False
+        quantity = required
+        if (node.get("m_QuantityIsHighestOpposingChampionsMatch") or
+                node.get("m_QuantityIsLowestOpposingChampionsMatch")):
+            highest = bool(node.get(
+                "m_QuantityIsHighestOpposingChampionsMatch"))
+            quantity = -2147483648 if highest else 2147483647
+            all_zones = ctx._zones(
+                "Deck|Hand|Champions|Warzone|Discard|Void|CastSpells|"
+                "PlayedResources|Underground|Choosing|Mod|Simulacrum")
+            source_owner = source.get(
+                "controller_id", source.get("user_id", owner))
+            state = getattr(ctx, "bstate", {}) or {}
+            participant_ids = list(state.get("pids") or
+                                   state.get("player_ids") or ())
+            if not participant_ids:
+                participant_ids = list((state.get("champ_map") or {}).keys())
+            owner_key = (lambda player_id: int(player_id or 0)) if state.get(
+                "pvp") else _side
+            # C# iterates each opponent's Player object, so an opponent with
+            # no matching card rows still contributes a count of zero.
+            opposing_counts = {
+                owner_key(player_id): 0 for player_id in participant_ids
+                if not _same_player(ctx, player_id, source_owner)
+            }
+            for card in ctx._cards_in_zones(all_zones):
+                card_owner = card.get(
+                    "controller_id", card.get("user_id", 0))
+                if _same_player(ctx, card_owner, source_owner):
                     continue
-            if records_filter_matches(
-                    card, node.get("m_CardFilter") or {}, source=source,
-                    context=ctx):
-                count += 1
-        return _compare(count, node.get("m_ComparisonOp"), required)
+                from rules_port.filters import records_filter_matches
+                card_filter = node.get("m_CardFilter")
+                if (card_filter is not None and
+                        not records_filter_matches(
+                            card, card_filter, source=source, context=ctx)):
+                    continue
+                key = owner_key(card_owner)
+                opposing_counts[key] = opposing_counts.get(key, 0) + 1
+            if opposing_counts:
+                quantity = (max(opposing_counts.values()) if highest else
+                            min(opposing_counts.values()))
+        if quantity_filter is not None:
+            quantity = _requires_cards_count(
+                ctx, source, owner, player_filter, zones, same_owner,
+                target_owners, quantity_filter, node)
+        count = _requires_cards_count(
+            ctx, source, owner, player_filter, zones, same_owner,
+            target_owners, node.get("m_CardFilter"), node)
+        return _compare(count, node.get("m_ComparisonOp"), quantity)
     if kind == "AbilityVariableCondition":
         variables = getattr(ctx, "ability_variables", {}) or {}
         lhs, rhs = str(node.get("m_Lhs") or ""), str(node.get("m_Rhs") or "")
-        if lhs not in variables:
-            return False
-        try:
-            left_value = int(variables[lhs])
-        except (TypeError, ValueError):
-            return False
+        state = getattr(ctx, "bstate", {}) or {}
+        # List-producing child abilities (for example, burying a card) record
+        # their results on the invoking ability instance.  A parent
+        # AbilityVariableCondition can name that list directly, but its
+        # authored variable default is still zero.  Resolve a matching
+        # instance list as its current count before falling back to the
+        # scalar variable value.
+        resolving_ability = str(state.get("resolving_ability") or "").lower()
+        scoped_lists = ((state.get("list_attrs") or {}).get(
+            resolving_ability) or {})
+        if lhs in scoped_lists:
+            values = scoped_lists[lhs]
+            if isinstance(values, (list, tuple, set)):
+                left_value = len(values)
+            else:
+                try:
+                    left_value = int(values)
+                except (TypeError, ValueError):
+                    return False
+        else:
+            if lhs not in variables:
+                return False
+            try:
+                left_value = int(variables[lhs])
+            except (TypeError, ValueError):
+                return False
         try:
             right_value = int(rhs)
         except (TypeError, ValueError):
@@ -488,8 +758,8 @@ def _native_condition(node, ctx):
         source_zones = ctx._zones(node.get("m_SourceCollection", ""))
         if source_zones and source is not None and source not in source_zones:
             return False
-        owner = _side(card.get("user_id"))
-        source_owner = _side(ctx.ability_source_owner_id)
+        friendly = _same_player(
+            ctx, card.get("user_id"), ctx.ability_source_owner_id)
         if int(node.get("m_Your", 0) or 0):
             # C# ``TriggerCardEnteredZone.IsValid``: a "friendly zone" entry
             # requires BOTH the card's current controller and the controller it
@@ -499,12 +769,13 @@ def _native_condition(node, ctx):
             # the Grave's "when a troop enters your hand from your crypt" fired
             # for a troop pulled out of the opponent's crypt, because the
             # control-transferring move had already rewritten the card's owner.
-            if owner != source_owner:
+            if not friendly:
                 return False
             previous = getattr(ctx, "event_previous_owner_id", None)
-            if previous is not None and _side(previous) != source_owner:
+            if previous is not None and not _same_player(
+                    ctx, previous, ctx.ability_source_owner_id):
                 return False
-        if int(node.get("m_Opposing", 0) or 0) and owner == source_owner:
+        if int(node.get("m_Opposing", 0) or 0) and friendly:
             return False
         return True
 
@@ -560,19 +831,8 @@ def evaluate_condition(node, context):
     result = _native_condition(node, context)
     if result is not _UNSUPPORTED:
         return result
-    # Native condition evaluation is the default for every mode.  A legacy
-    # evaluator is an explicit rollback seam only; otherwise Practice/PvE
-    # could silently diverge from PvP merely because attachment metadata was
-    # missing from a reconstructed session wrapper.
-    if not (getattr(context, "bstate", None) or {}).get(
-            "_rules_port_allow_legacy_backend"):
-        kind = _last(node.get("_t")) if isinstance(node, dict) else "<invalid>"
-        raise RuntimeError(
-            "RulesPort condition has no native handler: " + kind)
-    evaluator = getattr(_provider(), "evaluate_condition", None)
-    if callable(evaluator):
-        return evaluator(node, context)
-    raise RuntimeError("legacy condition evaluator is unavailable")
+    kind = _last(node.get("_t")) if isinstance(node, dict) else "<invalid>"
+    raise RuntimeError("RulesPort condition has no native handler: " + kind)
 
 
 def evaluate_effect_condition(db, condition_id, context):

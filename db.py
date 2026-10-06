@@ -1762,14 +1762,29 @@ def db_get_player_champion_guid(deck_db_id):
 
 # === Redeem codes / store ===
 
-def db_redeem_code(code, conn=None):
+def db_redeem_code(code, user_id, conn=None):
+    """Validate and record one redemption for a single account.
+
+    Legacy duplicate of :func:`profile_db.db_redeem_code`; usage is tracked
+    per account in ``store_purchases`` rather than a global counter.
+    """
     connection = conn or _db
-    row = connection.execute("SELECT id, gold_delta, platinum_delta, uses, max_uses FROM redeem_codes WHERE code=?", (code,)).fetchone()
+    row = connection.execute(
+        "SELECT id, gold_delta, platinum_delta, max_uses "
+        "FROM redeem_codes WHERE code=?", (code,)).fetchone()
     if not row:
         return None
-    if row[3] >= row[4]:
-        return None  # max uses reached
-    connection.execute("UPDATE redeem_codes SET uses=uses+1 WHERE id=?", (row[0],))
+    used = connection.execute(
+        "SELECT COUNT(*) FROM store_purchases "
+        "WHERE user_id=? AND item_template_id=? AND currency='Redeem'",
+        (int(user_id), str(code))).fetchone()[0]
+    if used >= int(row[3] or 0):
+        return None  # per-user max uses reached
+    connection.execute(
+        "INSERT INTO store_purchases "
+        "(user_id, item_name, item_template_id, price, currency) "
+        "VALUES (?, ?, ?, 0, 'Redeem')",
+        (int(user_id), f"Redeem: {code}", str(code)))
     if conn is None:
         connection.commit()
     return {"gold": row[1], "platinum": row[2]}
@@ -3118,6 +3133,7 @@ def db_delete_game_session(session_id):
     sid = str(session_id)
     _db.execute("DELETE FROM game_cards WHERE session_id=?", (sid,))
     _db.execute("DELETE FROM session_events WHERE session_id=?", (sid,))
+    _db.execute("DELETE FROM session_packets WHERE session_id=?", (sid,))
     _db.execute("DELETE FROM session_transactions WHERE session_id=?", (sid,))
     _db.execute("DELETE FROM game_sessions WHERE session_id=?", (sid,))
     _db.commit()

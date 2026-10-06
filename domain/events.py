@@ -76,10 +76,11 @@ class GameStartedSessionEventArgs(SessionEventArgs):
 
 
 class FirstPlayerDictatedSessionEventArgs(SessionEventArgs):
-    """Game.Shared.FirstPlayerDictatedSessionEventArgs (class 60): tells the
-    clients which player won the coin flip.  Receiving it sets
-    UIBattle.m_CoinFlipSkip so the coin-flip animation completes and the
-    client processes the following phases (Mulligan dialog etc.)."""
+    """C# class-60 forced-first signal; Unity sets ``m_CoinFlipSkip``.
+
+    The ordinary starting player is ``GameStartedSessionEventArgs.TurnOrder[0]``.
+    Sending class 60 for a random toss result skips the visible coin animation.
+    """
     CLASS_ID = 60
 
     def __init__(self):

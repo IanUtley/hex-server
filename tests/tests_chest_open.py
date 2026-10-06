@@ -52,14 +52,14 @@ def _store_item_id(template_guid):
     return int(row[0])
 
 
-def _buy_campaign_booster(user_id):
-    """Buy the AZ1 campaign booster; returns its client inventory UID."""
-    item_id = _store_item_id(AZ1_CAMPAIGN_PACK_GUID)
+def _buy_campaign_booster(user_id, pack_guid=AZ1_CAMPAIGN_PACK_GUID):
+    """Buy one campaign booster and return its client inventory UID."""
+    item_id = _store_item_id(pack_guid)
     result = apply_purchase(db._db, user_id, item_id, 1)
-    assert result["template_guid"] == AZ1_CAMPAIGN_PACK_GUID, result
-    # The store's purchase UID space is ``1000 + store_items.id`` and is
-    # exactly what the client sends back when the pack is opened.
-    return 1000 + item_id
+    assert result["template_guid"] == pack_guid, result
+    assert len(result["granted_list"]) == 1, result
+    # The UID in GrantedInventory is the same one sent in InventoryUpdated.
+    return result["granted_list"][0][1]
 
 
 def test_store_chest_uid_resolves_in_inventory_space():
@@ -85,8 +85,8 @@ def test_opening_store_pack_awards_campaign_contents_and_consumes_it():
     # equipment/Stardust slots.
     assert len(summary["cards"]) == 3
     assert len(summary["card_template_ids"]) == 3
-    assert len(summary["inventory_template_ids"]) == 2
-    assert len(summary["inventory_updates"]) == 2
+    assert sum(quantity for _guid, _uid, quantity in
+               summary["inventory_updates"]) == 2
     # The chest entry is consumed, and reopening it is now invalid.
     assert db_inventory_item_by_client_uid(user_id, chest_uid) is None
     assert hconnect_server._resolve_client_chest(user_id, chest_uid) is None
@@ -104,8 +104,8 @@ def test_opening_store_pack_awards_campaign_contents_and_consumes_it():
 def test_stacked_store_pack_keeps_remaining_quantity():
     user_id = _new_user(9003)
     item_id = _store_item_id(AZ1_CAMPAIGN_PACK_GUID)
-    apply_purchase(db._db, user_id, item_id, 2)
-    chest_uid = 1000 + item_id
+    result = apply_purchase(db._db, user_id, item_id, 2)
+    chest_uid = result["granted_list"][0][1]
     summary = hconnect_server._open_client_chests(
         _stub_handler(user_id), [chest_uid])
     assert [(uid, remaining) for _t, uid, remaining in summary["opened"]] == \
@@ -135,10 +135,81 @@ def test_non_chest_inventory_items_are_not_openable_chests():
     # Set 1 booster is an InventoryCardPack opened through OpenCardPack.
     booster_guid = "a8b78207-686a-4994-b6cd-4548d1349841"
     item_id = _store_item_id(booster_guid)
-    apply_purchase(db._db, user_id, item_id, 1)
-    booster_uid = 1000 + item_id
+    result = apply_purchase(db._db, user_id, item_id, 1)
+    booster_uid = result["granted_list"][0][1]
     assert db_inventory_item(user_id, booster_guid) is not None
     assert hconnect_server._resolve_client_chest(user_id, booster_uid) is None
+
+
+def test_collector_and_streamer_starter_packs_expand_from_records():
+    from services.card_pools import generate_starter_deck
+
+    templates = hconnect_server._load_card_templates()
+    products = (
+        # Collector's Deck - Shamrock, The Goldfather
+        ("45094301-308e-4b90-989f-62cfc4be4f51",
+         "e4f23196-7160-435b-85c2-1b1c33bc75f4"),
+        # NeroJinous' Momentum Mastery (streamer/prebuilt deck)
+        ("b593d10b-d5c6-43bb-b001-50784b53512b",
+         "75555219-d18d-4267-83f3-6312e5820e87"),
+    )
+    for inventory_guid, deck_guid in products:
+        contents = generate_starter_deck(templates, inventory_guid)
+        assert contents is not None, inventory_guid
+        definition = contents["definition"]
+        assert definition["deck_template_guid"] == deck_guid, definition
+        expected = sum(count for _card_guid, count in definition["cards"])
+        assert len(contents["cards"]) == expected, (definition, contents)
+        assert contents["cards"]
+
+
+def test_az2_store_pack_uses_unique_inventory_uid():
+    user_id = _new_user(9006)
+    item_id = _store_item_id(AZ2_CAMPAIGN_PACK_GUID)
+    legacy_uid = 1000 + item_id
+    # This represents an inventory entry created before store and inventory
+    # UIDs were allocated from one per-player namespace.
+    db._db.execute(
+        "INSERT INTO player_inventory "
+        "(user_id,template_guid,quantity,client_item_uid) VALUES (?,?,?,?)",
+        (user_id, "previously-granted-item", 1, legacy_uid))
+    db._db.commit()
+
+    chest_uid = _buy_campaign_booster(user_id, AZ2_CAMPAIGN_PACK_GUID)
+    assert chest_uid != legacy_uid
+    assert 0 < chest_uid < hconnect_server.CLIENT_CHEST_UID_BASE
+    chest = hconnect_server._resolve_client_chest(user_id, chest_uid)
+    assert chest is not None
+    assert chest.template_guid == AZ2_CAMPAIGN_PACK_GUID
+
+    summary = hconnect_server._open_client_chests(
+        _stub_handler(user_id), [chest_uid])
+    assert summary["invalid"] == []
+    assert len(summary["cards"]) == 3
+    assert sum(quantity for _guid, _uid, quantity in
+               summary["inventory_updates"]) == 2
+
+
+def test_legacy_duplicate_uid_prefers_owned_az2_chest():
+    user_id = _new_user(9007)
+    chest_uid = 1000 + _store_item_id(AZ2_CAMPAIGN_PACK_GUID)
+    db._db.execute(
+        "INSERT INTO player_inventory "
+        "(user_id,template_guid,quantity,client_item_uid) VALUES (?,?,?,?)",
+        (user_id, "previously-granted-item", 1, chest_uid))
+    db._db.execute(
+        "INSERT INTO player_inventory "
+        "(user_id,template_guid,quantity,client_item_uid) VALUES (?,?,?,?)",
+        (user_id, AZ2_CAMPAIGN_PACK_GUID, 1, chest_uid))
+    db._db.commit()
+
+    chest = hconnect_server._resolve_client_chest(user_id, chest_uid)
+    assert chest is not None
+    assert chest.template_guid == AZ2_CAMPAIGN_PACK_GUID
+    summary = hconnect_server._open_client_chests(
+        _stub_handler(user_id), [chest_uid])
+    assert summary["invalid"] == []
+    assert len(summary["cards"]) == 3
 
 
 def _promo_chest(template_guid):

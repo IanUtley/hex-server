@@ -90,3 +90,4 @@ class ServiceRequestCommand:
     connection_handle: str
     inner_object: object
     inner_bytes: bytes
+    raw_data_wrapper_bytes: bytes = b""

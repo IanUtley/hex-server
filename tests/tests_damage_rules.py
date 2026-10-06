@@ -89,6 +89,45 @@ class DamageRules(unittest.TestCase):
         self.assertEqual(self.events[1][2]['event_tac']['damage'], 5)
         self.assertEqual(self.events[3], ('heal', 5, 5))
 
+    def test_damage_shield_add_order_spans_duration_stores(self):
+        from rules_port.context import EffectContext
+        effect_context = EffectContext.from_rules_port(
+            self.ctx.game, self.ctx.session, self.db, self.handler,
+            self.ctx.player_uid, self.ctx.ai_uid, self.state, "fixture")
+        effect_context._push_modifier_card = lambda *_args, **_kwargs: None
+
+        # C# walks shields in AddDamageShield order, even when their durations
+        # differ. A legacy temporary shield predates the order field; adding
+        # an indefinite shield must sequence it first before appending the new
+        # shield. The one-shot shield must absorb this hit first.
+        self.buffs(1025, {"damage_shields": [
+            {"amount": 3, "one_shot": True,
+             "lasts_indefinitely": False}]}, "temporary_buffs")
+        effect_context.damage_shield(
+            1025, 5, {"lastsindefinitely": True})
+        temporary = json.loads(self.db.execute(
+            'SELECT temporary_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        permanent = json.loads(self.db.execute(
+            'SELECT permanent_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        self.assertEqual(
+            temporary['damage_shields'][0]['rules_port_order'], 0)
+        self.assertEqual(
+            permanent['damage_shields'][0]['rules_port_order'], 1)
+
+        outcome = DamageOutcome()
+        deal_damage(self.ctx, 1025, 1, outcome=outcome)
+        temporary = json.loads(self.db.execute(
+            'SELECT temporary_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        permanent = json.loads(self.db.execute(
+            'SELECT permanent_buffs FROM game_cards WHERE card_uid=1025'
+        ).fetchone()[0])
+        self.assertEqual((outcome.dealt, outcome.absorbed), (0, 1))
+        self.assertEqual(temporary['damage_shields'], [])
+        self.assertEqual(permanent['damage_shields'][0]['amount'], 5)
+
     def test_immunity_preserves_shields_and_replacement_sees_reduced_damage(self):
         self.buffs(1025, {'damage_shields': [{'amount': 3}]})
         with patch('rules_port.damage_effects._damage_immune', return_value=True):

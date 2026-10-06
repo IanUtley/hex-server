@@ -124,17 +124,41 @@ def reveal_cards(context):
     owner = int(context.bstate.get("resolving_owner_id", 0) or 0)
     owner = _reveal_owner(context, owner, target_kind)
     zone = _find_zone(filt) or "deck"
-    reveal_collection = card_collection_for_location(zone)
+    revealed_zones = {}
 
-    if target_kind == "AbilitySourceCardTargetTemplate":
+    # C# RevealCardsAbilityEffectTemplate applies to the complete
+    # AbilityEffectInstance.TargetInstance.m_SessionCardIds. The native
+    # resolver supplies that exact target set through effect_targets; do not
+    # reconstruct it from the filter's static m_Amount, which is often zero
+    # for dynamic TopNOfDeck targets such as "top X cards".
+    selected_uids = []
+    for value in context.effect_targets or ():
+        try:
+            selected_uids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if selected_uids:
+        rows = []
+        for uid in dict.fromkeys(selected_uids):
+            row = context.db.execute(
+                "SELECT card_uid,position,template_guid,user_id,card_state,"
+                "location FROM game_cards WHERE session_id=? AND card_uid=?",
+                (context.session.session_id, int(uid))).fetchone()
+            if row:
+                rows.append(tuple(row[:5]))
+                revealed_zones[int(row[0])] = str(row[5] or zone)
+    elif target_kind == "AbilitySourceCardTargetTemplate":
         target = context.resolved_target()
         row = (db_reveal_owned_card(
             context.session.session_id, int(target), owner, conn=context.db)
                if target is not None else None)
-        rows = [row] if row else []
+        rows = [tuple(row[:5])] if row else []
         if row:
-            reveal_collection = card_collection_for_location(row[5])
+            revealed_zones[int(row[0])] = str(row[5] or zone)
     else:
+        rows = None
+
+    if rows is None:
         candidates = None
         if template_id and zone in ("hand", "deck"):
             candidates = legal_targets(
@@ -163,6 +187,8 @@ def reveal_cards(context):
                     context.session.session_id, owner, zone, count, conn=context.db)
                 if zone == "hand" and rows:
                     rows = [random.choice(rows)]
+        rows = [tuple(row) for row in rows]
+        revealed_zones.update({int(row[0]): zone for row in rows})
 
     uids = [int(row[0]) for row in rows]
     context.bstate["revealed_cards"] = uids
@@ -189,10 +215,12 @@ def reveal_cards(context):
             scid = game_engine.SessionCardId(game_engine.UID(int(row[0])))
             card_owner = owner_uid(row[3], context.player_uid,
                                    context.ai_uid, context.bstate)
+            card_collection = card_collection_for_location(
+                revealed_zones.get(int(row[0]), zone))
             _tpl, card_type, _name, cost, attack, defense, gems = \
                 context.handler._card_full_data(context.game, scid, row[2])
             context.game.push_card_updated(
-                scid, card_owner, reveal_collection, card_type,
+                scid, card_owner, card_collection, card_type,
                 state=int(row[4] or 0), template_id=row[2], cost=cost,
                 attack=attack, defense=defense, gems=gems, nulling=False)
         event = game_engine.CardsRevealedSessionEventArgs()
@@ -200,8 +228,11 @@ def reveal_cards(context):
                                     context.ai_uid, context.bstate)
         event.session_card_ids = [game_engine.SessionCardId(game_engine.UID(uid))
                                   for uid in uids]
-        event.collections = [reveal_collection] * len(uids)
-        event.owning_players = [event.player_id] * len(uids)
+        event.collections = [card_collection_for_location(
+            revealed_zones.get(uid, zone)) for uid in uids]
+        event.owning_players = [owner_uid(
+            row[3], context.player_uid, context.ai_uid, context.bstate)
+            for row in rows]
         event.positions = [int(row[1] or 0) for row in rows]
         # C# AuthoritativeSessionBase.RevealCards always sends Inactive=true:
         # the Coverflow shows the cards temporarily and does not keep them

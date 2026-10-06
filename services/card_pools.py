@@ -53,6 +53,36 @@ def generate_booster(card_data, set_id):
             for g, n, _rarity, cost, atk, defense, _pve, _nopvp, _type in chosen]
 
 
+def generate_starter_deck(card_data, inventory_template_guid):
+    """Expand an InventoryStarterPack's Records deck into card bits.
+
+    ``None`` means the inventory item is not an authored starter deck. A
+    missing card template is an error so OpenCardPack can preserve the item
+    instead of consuming it and returning an empty pack.
+    """
+    from services.store import store_deck_definition
+
+    definition = store_deck_definition(inventory_template_guid)
+    if definition is None:
+        return None
+    by_guid = {
+        str(card[0]).lower(): card
+        for cards in card_data.values()
+        for card in cards
+    }
+    contents = []
+    for guid, count in definition["cards"]:
+        card = by_guid.get(str(guid).lower())
+        if card is None:
+            raise ValueError(
+                f"starter deck {definition['deck_template_guid']} references "
+                f"missing card template {guid}")
+        contents.extend(
+            (card[0], card[1], card[3], card[4], card[5])
+            for _ in range(int(count)))
+    return {"definition": definition, "cards": tuple(contents)}
+
+
 def generate_crayburn_chest(card_data, chest_template_guid):
     card_guids = CRAYBURN_PACK_CARD_SEEDS.get(chest_template_guid)
     if not card_guids:

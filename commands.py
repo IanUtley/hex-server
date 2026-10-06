@@ -1135,6 +1135,8 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
     collection_override = kwargs.pop('collection_override', None)
     if collection_override is not None:
         zone_val = collection_override
+    kwargs.setdefault(
+        'nulling', zone_val == game_engine.ECardCollections.Deck)
     game.push_card_updated(scid, pl_t, zone_val, ct, state=state_val, **kwargs)
     if attr_override is not None and game.events:
         game.events[-1].attributes = attr_override
@@ -1236,8 +1238,6 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
                                game_engine.card_type_from_db(ct_d) if ct_d else game_engine.ECardTypes.Troop,
                                attack=atk_d, defense=def_d, cost=cost_d,
                                template_id=tpl_d, gems=gem_d)
-        game.push_card_moved(scid, owner_player_uid, game_engine.ECardCollections.Discard,
-                             game_engine.ECardLocations.Top, 0)
         game.push_player_updated(pl_t, champ_id=getattr(handler, "_player_champ_scid", None))
         game.push_green_light(pl_t, game_engine.EPriorityContext.Normal)
         _send_game_events(handler, game, session, pl_t)
@@ -1284,9 +1284,6 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
             handler._card_full_data(game, scid, tpl_guid, card_tpl_id)
         card_type = (game_engine.card_type_from_db(ct_d)
                      if isinstance(ct_d, str) else ct_d)
-        game.push_card_moved(scid, owner_player_uid,
-                             game_engine.ECardCollections.Deck,
-                             game_engine.ECardLocations.Top, 0)
         game.push_card_updated(scid, owner_player_uid,
                                game_engine.ECardCollections.Deck, card_type,
                                template_id=tpl_d, cost=cost_d,
@@ -1653,12 +1650,9 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         from pvp_db import db_move_debug_card
         db_move_debug_card(session.session_id, card_id, zone_name, conn=db)
         db.commit()
-        # CardMoved first (animation), then CardUpdated (updates cache to new zone)
-        game = game_engine.Game(session.session_id, pl_t, ai_t)
-        scid = game_engine.SessionCardId(game_engine.UID(card_id))
-        game.push_card_moved(scid, pl_t, zone_val, game_engine.ECardLocations.Unknown, 0)
-        _send_game_events(handler, game, session, pl_t)
-        _push_card_update(handler, db, session, pl_t, card_id, collection_override=zone_val)
+        _push_card_update(
+            handler, db, session, pl_t, card_id,
+            user_id=command_owner_id, collection_override=zone_val)
         return f"Moved {card_id} to {zone_name} (zone={zone_val})"
 
     elif action == "update":

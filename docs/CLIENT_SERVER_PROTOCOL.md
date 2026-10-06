@@ -127,13 +127,13 @@ class, but the current server does not generally construct it yet.
 | 51 | `CardsRevealedSessionEventArgs` | Cards were revealed, with collections, owners, positions, and ability instance. | Implemented |
 | 52 | `PlayerStateModifiedSessionEventArgs` | Generic player state modifier notification. | Available |
 | 53 | `ReconnectDoneSessionEventArgs` | Reconnect/state-rebuild boundary completed. | Implemented |
-| 54 | `CardCountersChangedSessionEventArgs` | Card counters changed. | Available |
-| 55 | `EncounterModDialogSessionEventArgs` | Encounter modifier dialog/options for PvE. | Available |
+| 54 | `CardCountersChangedSessionEventArgs` | Card counters changed. | Implemented; native counter effects emit it after the full card update. |
+| 55 | `EncounterModDialogSessionEventArgs` | Encounter conversation requested by an ability; resumes through `EncounterModDialogTransaction`. | Implemented; PvE and PvP conversation prompts emit it to the chosen player. |
 | 56 | `ConfigureAISessionEventArgs` | AI configuration/setup data. | Available |
 | 57 | `CardPutInHandSessionEventArgs` | Card was put into a hand by an effect. | Available |
 | 58 | `PlayerWishesToDrawFirstSessionEventArgs` | Player chose draw first. | Implemented |
 | 59 | `PlayerWishesToPlayFirstSessionEventArgs` | Player chose play first. | Implemented |
-| 60 | `FirstPlayerDictatedSessionEventArgs` | Server declares the first player/coin-flip result. | Implemented |
+| 60 | `FirstPlayerDictatedSessionEventArgs` | Forced-first-player signal; Unity sets `m_CoinFlipSkip`. A normal toss winner is first in class-1 `GameStartedSessionEventArgs.TurnOrder`. | Implemented |
 | 61 | `CombatsThatNeedDamageSessionEventArgs` | Combat(s) requiring player damage assignment. | Implemented |
 | 62 | `CombatListingSessionEventArgs` | Lists active combats for the combat UI. | Implemented |
 | 63 | `CombatSessionEventArgs` | Attacker/blocker pairing and combat state. | Implemented |
@@ -164,6 +164,182 @@ envelope, not a nested gameplay event. The nested option types 66–70 are
 normally serialized inside a `PlayerOptionList`; they are not separate
 priority messages on their own.
 
+### Live client flow path inventory (U1)
+
+This section joins the server request/event path to the fixed C# client path.
+The wire source files are under `HexClient/Assembly-CSharp-firstpass/` unless
+noted otherwise.
+
+**Transport and dispatch path.** The client builds a 3029 request from
+`GameSession.PlayerTransactionRequestArgs`; `Mechanics/Transactions/Transaction.cs`
+serializes each concrete transaction with `EncData.Encode` and declares its
+polymorphic `KnownType` set. `Game.Client.SessionClient.SubmitTransaction`
+sends it through `GameClient.SendSessionTransaction` and gates the next normal
+transaction until a 3055 sync packet arrives. In
+`ClientSessionBase`'s class-255 handler, the client parses and routes every
+nested event, then marks the previous transaction responded; this also runs
+for a 3055 packet with no nested events, which is why an empty acknowledgement
+unblocks the next normal request. The server classifies the raw
+request in `application/player_transactions.py:classify_player_transaction`,
+decodes typed values at the `hconnect_server.py` boundary, normalizes them in
+`rules_port/wire.py:normalize_player_transaction`, and dispatches them through
+the RulesPort session.
+
+For server events, the 3055 body is a `NetworkPacketSessionEventArgs` (nested
+class 255). The client parses it with
+`NetworkPacketSessionEventArgs.Get` -> `SessionEventArgs.BuildArgs`; each
+event's `byte[]` constructor reads that event's fields. `ClientSessionBase`
+routes the parsed events, updates `ClientStateCache` for options, combats,
+cards, and players, then forwards them to `UIBattle`'s public event handlers.
+`UIBattle.OnTurnPhaseUpdated` and `PushStateForPhase` select the active
+`BattleState` from phase, active-player, and priority data. The C# parser map is
+the authority for accepted event IDs; `domain/events.py` is the Python
+serializer/model source.
+
+The C# packet parser also performs a cross-event rewrite before routing. In
+`NetworkPacketSessionEventArgs.CombineRevealAndChoose`, when a packet contains
+`CardsRevealed` and a matching class-23 `AbilityActivationDataRequired` (same
+ability instance or parent), the client finds the option for that request's
+source card and appends each revealed card not already in a target's legal
+`Targets` to that `TargetInstance.AdditionalTargets`. This happens inside
+`Get()`, after nested events are decoded but before `ClientSessionBase` sees
+them. Therefore a reveal-plus-picker interaction depends on those events being
+in the same 3055 packet and on the ability/source IDs matching; valid class-51,
+class-23, and class-70 payloads sent in separate packets do not trigger the
+client rewrite. The Python event model serializes `additional_targets`, so
+server-side projection can also express the value explicitly when needed. Any
+change to reveal or picker batching must account for this client behavior and
+verify the resulting `BattleStateAssignTargets` selection in Unity.
+`tests/tests_u3_wire_contract.py::test_csharp_packet_parser_combines_matching_reveal_and_picker`
+projects classes 51, 23, and 70 together for the choosing player and checks
+that the opponent receives none of them. It passes those projected event bytes
+to `tests/csharp_oracles/verify_reveal_picker_combine.sh`, which compiles this
+original packet rewrite and the relevant original event readers against small
+value and base-class stubs. The C# assertions cover the class-23 parent match,
+source-card match, retained authored target slot, and resulting
+`AdditionalTargets`; this does not exercise the Unity scene or a network
+connection.
+
+ObjFmt emits the class-255 packet's declared `NetworkPacketSessionEventArgs`
+members in order (`PlayerId`, `EventIds`, `EventData`), followed by inherited
+`SessionEventArgs` members (`Class`, `SessionId`). Numeric ObjFmt values use
+uppercase hexadecimal. Focused empty-ack and class-70 packet fixtures compare
+the Python envelope byte-for-byte with the extracted C# `ObjFmt.cs` encoder.
+This verifies serialization, not Unity's receipt or recipient privacy.
+
+The full session-entry sequence is driven by `GameClient`: find/join an
+existing session (22019/22021), start a normal session (22015), or start an
+encounter (22017); then receive typed responses, add the players, and send
+ReadyToStartGame (22031), ReadyForGameSetup (22027), and ReadyForGameEvents
+(22029) at the corresponding boundaries. The client decodes these service
+responses through `DataWrapper.FromBytes<T>` in `GameSessionService` or
+`LoadBalancerService`. The 22027 response reaches
+`GameClient.OnReadyForGameSetup`, which installs both players and turn order
+before `Session.StartGame`; the server's 3053 `GameStartedEventArgs` service
+event is separate from nested 3055 class 1 `GameStartedSessionEventArgs`.
+22029 is a fire-and-forget readiness signal: normal sessions do not receive a
+typed reply, while tournament PvP waits until both players send it before
+publishing the game start packets.
+For reconnect, `TryReconnectionToDisconnectedGame` (22013) and
+`JoinDisconnectedGame` (22023) receive typed responses; tournament PvP then
+uses `ReadyToContinueGame` (22025), which is fire-and-forget and receives no
+typed response; its 3055 reconnect snapshot is the only resulting packet.
+`QuitOnReconnectionGame` (22011) is also fire-and-forget and has no response.
+The server records a 22011 decline per player in that session's checkpoint;
+later 22013 probes return no reconnect offer to that player, while other
+participants remain eligible. Reconnect snapshot events arrive through 3055
+after the session is restored.
+
+| Live flow | Request or event classes | C# consumer and expected next client state | Recipient and reply policy |
+|---|---|---|---|
+| Session setup | Load Balancer/GameSession 22019, 22015, 22017, 22021, 22031, 22027, 22029; service event 3053 `GameStartedEventArgs`; session events 1, 47, 50, 64, 65, 82, 83 | `GameClient.OnFindSession`, `OnStartSession`, `OnStartEncounter`, `OnJoinSession`, and `OnReadyForGameSetup` create the session and install the players/turn order. `GameSessionService.GameStarted` dispatches 3053; nested class 1 reaches `ClientSessionBase` and `UIBattle.OnGameStarted`. `OnSkipSetup` (82) advances the setup presentation and `OnDisabledInterface` (83) controls input. Deck/player/card cache is populated before setup animation and phase states. | 22019/22015/22017/22021/22031/22027 receive typed responses. 22029 and 3053 are one-way signals/events. 3055 setup packets carry a per-viewer `PlayerId`; public setup is sent to both players, while hidden card identity is viewer-filtered. |
+| Coin choice and opening hand | 3029 `ChoosePlayTransaction`, `ChooseDrawTransaction`, `AcceptStartingHandTransaction`, `MulliganTransaction`; events 3, 5, 6, 58–60 | `UIBattle.OnTurnPhaseUpdated` pushes `BattleStatePickGoesFirst` or `BattleStateMulligan`; handlers `OnPlayerWishesToPlayFirst`, `OnPlayerWishesToDrawFirst`, `OnFirstPlayerDictated`, `OnHandMulliganed`, and `OnAcceptedStartingHand` update choice/dialog state. | Choice/mulligan state is public; each private hand/card representation is sent only to its authorized viewer. Every handled 3029 request is completed by a 3055 packet, event-bearing or empty. |
+| Priority and phase options | 3029 `PassPriorityTransaction`, `SetTurnPhasesTransaction`, `RequestPrioritySyncTransaction`, `SetAutoPassTransaction`, `CancelAutoPassTransaction`; events 3, 48, 70, 79 | `ClientSessionBase` records phase and priority; `UIBattle.OnTurnPhaseUpdated` enters the corresponding phase state, `OnGreenLight` grants/withdraws local priority, and `OnWaitingOnPlayer` presents the wait state. Class 70 updates cached legal uses before `OnPlayerOptionsUpdated` refreshes selection and the active state. | Phase/priority/wait events are public; class 70 is private to the player whose legal options it describes. SetTurnPhases and stale/no-op requests still need an empty 3055 when they emit no state events. Auto-pass requests are allowed through the client's ordinary transaction gate. |
+| Card play and zone changes | 3029 `PlayChampionTransaction`, `PlayTroopTransaction`, `PlayResourceTransaction`, `PlayArtifactTransaction`, `PlaySpellTransaction`, `DiscardTransaction`; events 7, 8, 10–12, 14–19, 24–26, 43–50, 54, 64 | `UIBattle` maps them to `OnCardDrawn`, `OnCardDestroyed`, `OnCardDiscarded`, `OnCardVoided`, `OnCardGraveyarded`, `OnChampionCardPlayed`, `OnTroopCardPlayed`, `OnResourceCardPlayed`, `OnSpellCardPlayed`, `OnSpellCardCast`, `OnArtifactCardPlayed`, `OnCardTapped`, `OnCardUntapped`, `OnCardPrimed`, `OnEncounterCardsCreatedInZone`, `OnCardTransformed`, `OnCardReverted`, `OnEquipmentItemSet`, `OnDeckCreated`, `OnCardCollectionsMerged`, `OnCardMoved`, `OnCardCountersChanged`, and `OnCardUpdated`. Class 64 refreshes or creates the cached card representation before its view is updated. | Public board/zone changes go to both viewers. Class 64 for a hidden hand/deck card is projected per viewer; the complete `CardUpdated` must precede an event that references a newly created card. Event-bearing 3055 is the requester's completion signal. |
+| Ability activation, targets, and triggers | 3029 `ActivateAbilityTransaction`, `ActivateTriggeredAbiliesTransaction`, `SetAbilityActivationDataTransaction`; events 22, 23, 39, 41, 42, 51, 70, 77, with nested option classes 66–69 | Class 70 populates `ClientStateCache.Options`; classes 66–69 are parsed as nested cost/target/option records. `UIBattle.OnAbilityPushedOnChain`, `OnAbilityActivationDataRequested`, `OnTriggeredAbilityActivationDataRequested`, `OnTopOfChainResolved`, `OnRemovedTopOfChain`, `OnAbilityCancelled`, and `OnCardsRevealed` drive chain animation, selection states, and resolution cleanup. Class 77 is parsed but has no `ClientSessionBase` or `UIBattle` message handler in this client; it does not itself choose the next UI state. The client submits the chosen activation/continuation as another 3029 request. | Player options, activation-data requests, and private reveals are delivered only to the choosing player; public chain/resolution events go to both. The event packet that opens a continuation also releases the preceding request; its answer then requires its own 3055 completion packet. |
+| Attack, block, and damage | 3029 `CommitTroopsToAttackTransaction`, `CommitTroopsToDefenseTransaction`, `AssignDamageOrderTransaction`; events 3, 27–32, 48, 61–63, 64, 70 | Class 3 selects `BattleStateDeclareAttackers`, `BattleStateDeclareBlockers`, or `BattleStateAssignDamage` through `UIBattle.PushStateForPhase`. `OnAttackDeclared`, `OnBlockersAssigned`, `OnBeginCombatResolution`, `OnCombatPhaseResolved`, `OnEndCombatResolution`, and `OnCombatRemoved` animate combat; `ClientSessionBase` updates its combat cache from classes 61–63 before forwarding. | Combat and phase state are public; class 70 remains private. A handled attack/block/damage transaction completes with the event-bearing 3055 for its sender. |
+| Resource and player HUD state | Events 33–38, 65 | `UIBattle.OnPlayerCurrentResourcePoolChanged`, `OnPlayerTotalResourcePoolChanged`, `OnPlayerResourceThresholdChanged`, `OnChampionChargePointsChanged`, `OnChampionSpellPointsChanged`, and `OnChampionHealthChanged` update HUD state. Class 65 first updates `ClientStateCache`/`PlayerRepresentation` and the session's player fields, including ChampionId and resource thresholds. `ClientSessionBase` and `PlayerRepresentation.Update` both consume `Thresholds[i]` paired with `ThresholdValues[i]`; Python must send both lists in matching order and length or the client silently drops threshold values. | Player/HUD values are public in the current two-player game. The event packet's recipient remains explicit in the class-255 envelope. |
+| Reconnect | 22013 `TryReconnectionToDisconnectedGame`, 22023 `JoinDisconnectedGame`, and tournament 22025 `ReadyToContinueGame`; events 53, then the relevant 47, 50, 64, 65, 3, 48, and 70 snapshot events | `GameClient.OnTryReconnectionToDisconnectedGame` marks the reconnect probe complete; `GameClient.JoinDisconnectedGame` creates the session, then `OnJoinDisconnectedGame` attaches the player. `ClientSessionBase` routes class 53 to `UIBattle.SyncReconnectDone`. Earlier cache/player/card events rebuild references, then phase, priority, and private options restore the correct state. | 22013/22023 receive typed responses. 22025 receives none; the 3055 snapshot is its only response. Snapshot packets are per player. Rebuild valid player/champion and card cache entries before phase events or any event that references those IDs. Reconnect's final event marks the UI synchronization boundary. |
+
+Class 57 (`CardPutInHandSessionEventArgs`) is a client-supported event path, but
+the current Python event model has no class-57 constructor or emitter. Current
+put-into-hand projections use card update/move events; class 57 is therefore
+not included in the active server event list above.
+
+### Concrete 3029 transaction paths
+
+The table enumerates the concrete transaction types declared by
+`Transaction.cs` and the additional compiled client request types used by
+`LocalPlayer` or encounter UI. The additional types are not in that base
+class's `KnownType` list, but the server has explicit classifiers for them.
+The Python route follows `classify_player_transaction` through
+`normalize_player_transaction` and the RulesPort host. `DebugCheatTransaction`
+uses the server's debug handler; `NonsenseTransaction` is intentionally
+acknowledged and dropped.
+
+| Client transaction type | Python dispatch and outcome | C# client state/event result | Completion and recipient |
+|---|---|---|---|
+| `ChoosePlayTransaction` | `is_choose_pick` -> `choose_play_first`; records play-first and advances setup. | Class 59 records the choice; opening-hand/mulligan events and class 3 select the next phase. | No 3029 response wrapper. Requester receives event-bearing or empty 3055; public choice events go to both players. |
+| `ChooseDrawTransaction` | `is_choose_pick` -> `choose_draw_first`; rotates the selected player behind the other and advances setup. | Class 58 updates player order; opening-hand/mulligan events and class 3 select the next phase. | Same setup completion policy; private hand contents remain owner-only. |
+| `AcceptStartingHandTransaction` | `is_mulligan_keep` -> `accept_starting_hand`; enters the kept-hand/start-turn path. | Class 6 confirms the kept hand; phase/priority events select the first gameplay state. | Requester receives event-bearing or empty 3055; no 3029 wrapper. |
+| `MulliganTransaction` | `is_mulligan_redraw` -> `mulligan`; replaces the opening hand and remains in setup. | Class 5 and private draw/card updates refresh the hand; mulligan state stays active until accepted. | Requester receives event-bearing or empty 3055; hand data is owner-only. |
+| `PassPriorityTransaction` | `is_pass_priority` -> `pass_priority`; validates the submitted phase and drives the current priority action/chain. | Classes 3/48 select the next phase and priority; class 70 refreshes private legal options when needed. | Requester receives event-bearing or empty 3055, including stale/no-op passes. Public phase/chain events go to both; class 70 is private. |
+| `RequestPrioritySyncTransaction` | `is_priority_sync` -> `request_priority_sync`; reprojects the existing window without changing rules state. | Classes 3/48 and phase-appropriate class 70 restore the current battle state and legal actions. | Requester receives that event 3055, or an empty 3055 if no battle window exists. |
+| `SetTurnPhasesTransaction` (compiled client type) | `is_set_stops` -> `set_turn_phases`; persists self/opponent stop preferences and may resume an AI phase that is no longer a stop. | No immediate `UIBattle` state transition; preferences control later phase stops. | No 3029 wrapper. Empty 3055 releases the ordinary Mono request gate when no event packet was sent. |
+| `SetAutoPassTransaction` (compiled client type) | `is_set_auto_pass` -> `set_auto_pass`; records the passing state and routes it through priority. | Later classes 3/48 reflect the resulting phase or priority window. | Mono exempts this type from its request gate; any 3055 is sent to the requester, with public phase state sent to both players. |
+| `CancelAutoPassTransaction` (compiled client type) | `is_cancel_auto_pass` -> `cancel_auto_pass`; clears the player's auto-pass preference. | No immediate state change; later priority events follow normal phase rules. | Mono exempts this type from its request gate; any 3055 is sent to the requester. |
+| `RequestPlayerOptionsTransaction` (compiled client type) | `is_request_player_options` -> `request_player_options`; rebuilds legal options for the current phase. | Class 70 refreshes `ClientStateCache.Options`; `UIBattle.OnPlayerOptionsUpdated` refreshes selection. | Class 70 is private to the requester and arrives in a 3055 packet. |
+| `PlayResourceTransaction` | `is_play_resource` -> `play_resource`; validates the resource action and applies pool/threshold changes. | Class 16, applicable classes 34/35, and class 64/card movement update board and HUD; class 70 refreshes legal actions. | Requester receives event 3055; public resource state goes to both, hidden card identity remains viewer-filtered. |
+| `PlayTroopTransaction` | `is_play_troop` -> `play_troop`; validates cost/ability data, pays, and resolves the card. | Class 15 and class 64 place/update the troop; chain/trigger events precede the next class 3/48/70 window. | Requester receives event 3055; public board/chain state goes to both, private picker/options/reveals stay with the chooser. |
+| `PlayArtifactTransaction` | `is_play_artifact` -> `play_artifact`; validates cost/ability data, pays, and resolves the card. | Class 19 and class 64 place/update the artifact; chain/trigger events precede the next class 3/48/70 window. | Same card-play completion and visibility contract as `PlayTroopTransaction`. |
+| `PlaySpellTransaction` | `is_play_spell` -> `play_spell`; validates cost/targets, pays, and resolves the spell. | Classes 17/18, chain classes 22/23/41/42, and effect events lead to the next class 3/48/70 window. | Requester receives event 3055; resolution is public, picker/options/reveal data is private. |
+| `PlayChampionTransaction` | `is_play_champion` -> `play_champion`; validates and applies the champion play. | Class 14 and class 64 initialize/update the champion view and player cache; class 3/48/70 establish the next state. | Requester receives event 3055; public champion state goes to both. |
+| `ActivateAbilityTransaction` | `is_ability_activate` -> `activate_ability`; a persisted choice/discard checkpoint can reclassify it as a continuation. | Class 22 opens the chain; class 23 may open target/cost selection; classes 41/42 and 3/48/70 restore the next action state. | Requester receives event 3055; chain is public, class 23/70 and private reveal data go only to the chooser. |
+| `ActivateTriggeredAbiliesTransaction` | `is_activate_triggered_abilities` -> `activate_triggered_abilities`, or resumes a persisted trigger/deck-search continuation. | Class 39 opens trigger selection; class 22 pushes accepted instances; classes 23/51 may continue a private picker; 41/42 finish resolution. | Requester receives event 3055; chain changes are public, trigger targets/reveals/options are private. |
+| `SetAbilityActivationDataTransaction` | `is_set_ability_data` -> `set_ability_activation_data`, or the typed choice/trigger/discard continuation selected from persisted state. | Completes the open class-23 picker and resumes its chain item; classes 41/42 and phase/priority/options events select the next state. | Requester receives event 3055; picker and selection options stay private to the chooser. |
+| `DiscardTransaction` | `is_discard` -> `discard`; moves the selected card or resolves a hand-limit discard. | Classes 10/64 update the hand/graveyard; class 3/48/70 update phase and actions when the discard window ends. | Requester receives event 3055; card identity and hand updates are viewer-filtered. |
+| `ReadyCardTransaction` | `is_ready_card` -> `ready_card`; clears tapped/combat state through the mode projection. | Classes 25/64 refresh the card; phase is unchanged unless the action advances it. | Requester receives event-bearing 3055; successful no-event projections receive an empty 3055. |
+| `CommitTroopsToAttackTransaction` | `is_commit_attack` -> `commit_troops_to_attack`; validates attackers, declares combats, and consumes declaration priority. | Class 27 and combat classes 62/63 update attack lines; class 3/48 enter response/blocker state and class 70 supplies private actions. | Requester receives event 3055; combat events are public and options private. |
+| `CommitTroopsToDefenseTransaction` | `is_commit_defense` -> `commit_troops_to_defense`; validates blockers and consumes defense priority. | Class 28 and classes 62/63 redraw combat lines, followed by class 3/48 and combat resolution. | Requester receives event 3055; blocker/combat state is public. |
+| `AssignDamageOrderTransaction` | `is_assign_damage` -> `assign_damage_order`; validates/stages order and resolves or advances the damage phase. | Class 29 and damage/death events update combat; classes 30/31/32 and class 3/48 leave combat and select the next phase. | Requester receives event 3055; combat and damage state is public. |
+| `EncounterModDialogTransaction` (compiled encounter UI type) | `is_encounter_mod_dialog` -> `encounter_mod_dialog`; forwards the conversation ID to the encounter handler. | The matching class-55 prompt pauses the ability chain; this typed answer resumes that continuation rather than selecting a normal priority state. | Requester receives event-bearing or empty 3055; no 3029 response wrapper. |
+| `QuitGameTransaction` | `is_quit_game` -> `quit_game`; tournament PvP uses `pvp_concede`, other sessions use the game-end projection. | Class 2 `GameEnded` marks `UIBattle.GameOver`, collapses battle states, leaves the room, and queues inactive priority. | Requester receives event 3055; game-end state is public. |
+| `DebugCheatTransaction` | `is_cheat` -> `_handle_debug_cheat_transaction`; privileged debug handling is outside player-action normalization. | Result depends on the debug operation; any board/phase changes use their corresponding events. | Debug handler sends event-bearing or empty 3055 to requester; no 3029 response wrapper. |
+| `SendGameStateChecksumTransaction` | `is_state_checksum` -> `send_state_checksum`; C# marks it defunct, so the default port treats it as diagnostic-only. | No gameplay state transition. | Requester receives an empty 3055 if no event packet was sent; no 3029 response wrapper. |
+| `TipWindowClosed` | `is_tip_window_closed` -> `tip_window_closed`; accepted as a no-op acknowledgement. | Tip animation/dialog closes; battle phase is unchanged. | Requester receives an empty 3055 if no event packet was sent; no 3029 response wrapper. |
+| `NonsenseTransaction` | No RulesPort classification or mutation; the unclassified boundary drops the intent. | No state transition. | Requester receives an empty 3055 so the client gate is released; no 3029 response wrapper. |
+
+After a successful RulesPort handler, the server checks whether `sendall`
+delivered a 3055 on the requester's connection. If no event packet or handler-
+owned empty sync was sent, it sends an empty 3055. This covers valid no-event
+intents and successful projections that published no event, without adding a
+duplicate acknowledgement. Fire-and-forget means there is no 3029
+`PlayerTransactionResponse`; the 3055 session packet releases the client's
+ordinary one-request gate.
+
+Additional client consumers include class 2 `GameEnded`, which runs
+`UIBattle.OnGameEnded` and moves the battle to its terminal inactive state,
+and class 80 `ShowTip`, which runs `UIBattle.OnShowTip` and queues a tip
+animation. Class 4 `ChessTimerUpdated` runs `UIBattle.OnTimerUpdated` and
+updates the indicated player's timer, but the current Python server has no
+call site that emits it, so it is not a current outbound flow. Classes 79 and
+82/83 are covered by the priority/setup flows above. Event classes marked
+`Available` in the catalogue are understood by the client parser but are not
+currently constructed by the Python event model.
+
+The RulesPort event packet builder is `domain/game.py:Game.make_network_packet`;
+it stamps the recipient and applies private-hand, underground-card, secret
+counter, and other viewer filters before serializing events. Session event
+history records both `event_class` and `target_player_uid` in
+`session_events`. Persisted saved traces through 2026-09-30 contain classes 1, 3, 5–7, 14–19, 22,
+23, 27–31, 33–36, 38, 41–42, 47–48, 50, 53, 58–60, 62, 64–65, 70, 77, 79,
+and 83. Each class maps to the C# parser above and to the consumer listed here;
+class 62 carries class-63 combat records, while class 65 and nested option and
+combat records first affect the session cache rather than owning an independent
+`UIBattle` handler. This is a static
+source and saved-capture inventory. A correlated current Unity trace and
+real-client acceptance are tracked separately by U2 and U10.
+
 ### Event ordering rules
 
 The client treats event order as meaningful. A typical play/ability sequence
@@ -172,7 +348,14 @@ is:
 1. `GreenLight` and a private `PlayerOptionList` establish who may act.
 2. The client sends a transaction containing the selected card/ability and
    any target/cost selections.
-3. The server emits card movement/play events and `CardUpdated` events.
+3. The server emits destination `CardUpdated` state and the semantic
+   play/draw/discard events required by the C# lifecycle. When collection or
+   controller changes, `ClientStateCache.Update(CardUpdated)` derives the UI
+   `CardMoved`; do not also send a wire class-50 event for that transition.
+   The cache does not derive class 50 for position-only changes, while
+   `UIBattle.OnCardUpdated` still moves the view home. The inspected C# source
+   has no separate class-50 producer, so do not add one for an inferred reorder
+   without a concrete client path that requires it.
 4. Ability effects emit chain, card, player, resource, combat, or reveal
    events in resolution order.
 5. `TopOfChainResolved`/`ChainEmpty`, `TurnPhaseUpdated`, and the next
@@ -217,10 +400,15 @@ snapshot:
 7. `GreenLight` identifies the player currently allowed to act.
 
 Every card that the client may reference must first have a valid cached
-representation. A `CardMoved` event normally describes the zone transition;
-`CardUpdated` supplies or refreshes the full representation and mutable
-fields. On reconnect, the server republishes enough player, card, zone, and
-priority state to rebuild that projection.
+representation. A destination `CardUpdated` supplies or refreshes the full
+representation and mutable fields. If its collection or controller differs
+from the cached representation, the client cache derives an internal UI
+`CardMoved` before forwarding the update. A separate wire class-50 event is
+not synthesized for same-collection position changes; `UIBattle.OnCardUpdated`
+still moves the view home. This checkout has no separate C# class-50 producer,
+so require a concrete client path before adding one. On reconnect, the server
+republishes enough player, card, zone, and priority state to rebuild that
+projection.
 
 ## Transactions and priority
 

@@ -6,7 +6,7 @@ import json
 import random
 import game_engine
 from dataclasses import dataclass, field
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,9 @@ class TriggerEvent:
 
 def trigger_collection_allows(trigger_flags, card_location):
     """Mirror ``Card.PassesCollectionFlagRequirements`` from the client."""
+    location = str(card_location or "").strip().lower()
+    if location in ("", "none", "simulacrum"):
+        return True
     if not trigger_flags:
         return True
     flags = str(trigger_flags)
@@ -35,8 +38,7 @@ def trigger_collection_allows(trigger_flags, card_location):
         return True
     allowed = {value.strip().lower() for value in flags.split("|")
                if value.strip()}
-    location = str(card_location or "").lower()
-    return not location or location in allowed
+    return location in allowed
 
 
 def consume_one_shot_trigger(handler, session, game, db, player_uid, ai_uid,
@@ -130,47 +132,6 @@ def _claim_trigger_uses(db, session, battle_state, graph, source_uid) -> bool:
         "turn_uses": turn_uses + (1 if turn_limit > 0 else 0),
     }
     return True
-
-
-class RecordsTriggerBackend:
-    """Execute Records trigger metadata behind the RulesPort boundary."""
-
-    def __init__(self, resolver: Callable | None = None) -> None:
-        self.resolver = resolver
-
-    def __call__(self, *, db, handler, game, session, player_uid, ai_uid,
-                 battle_state, event: TriggerEvent):
-        if ((getattr(session, "_rules_port_session", None) is not None or
-             battle_state.get("_rules_port_attached")) and
-                not battle_state.get("_rules_port_allow_legacy_backend")):
-            raise RuntimeError(
-                "RecordsTriggerBackend cannot run in an attached live session; "
-                "use NativeTriggerBackend or explicitly enable rollback")
-        if self.resolver is None:
-            raise RuntimeError(
-                "RecordsTriggerBackend requires an explicit resolver")
-        previous = battle_state.get("_rules_port_native_effect")
-        battle_state["_rules_port_native_effect"] = True
-        try:
-            return self.resolver(
-                db, handler, game, session, player_uid, ai_uid, battle_state,
-                event.event_type, event.source_card_id,
-                source_owner_uid=event.source_player_id,
-                extra_target=event.target_card_id,
-                zones=event.data.get("zones"),
-                event_source_collection=event.data.get(
-                    "event_source_collection"),
-                event_destination_collection=event.data.get(
-                    "event_destination_collection"),
-                event_previous_state=event.data.get("event_previous_state"),
-                event_int_attribute=event.data.get("event_int_attribute"),
-                event_tac=dict(event.data.get("event_tac") or {}),
-            )
-        finally:
-            if previous is None:
-                battle_state.pop("_rules_port_native_effect", None)
-            else:
-                battle_state["_rules_port_native_effect"] = previous
 
 
 class NativeTriggerBackend:
@@ -489,16 +450,10 @@ class NativeTriggerBackend:
                         if graph.uses_previous_state and
                         event.data.get("event_source_collection") else
                         event.data.get("event_destination_collection"))
-                # C# treats an unset/None collection mask as unrestricted
-                # (``Card.PassesCollectionFlagRequirements`` and
-                # ``Session.cs`` skip the zone test for None); only a real
-                # mask restricts where the trigger can fire from.
-                allowed = {str(value).lower() for value in
-                           str(graph.trigger_collection_flags or "").split("|")
-                           if value}
-                allowed.discard("none")
-                if (trigger_location and allowed and
-                        str(trigger_location).lower() not in allowed):
+                # ``trigger_collection_allows`` mirrors the client collection
+                # check, including its None and Simulacrum exceptions.
+                if not trigger_collection_allows(
+                        graph.trigger_collection_flags, trigger_location):
                     continue
                 source_card_owner = source_owner
                 context = ConditionContext(
@@ -516,6 +471,8 @@ class NativeTriggerBackend:
                     uses_previous_state=graph.uses_previous_state,
                     event_int_attribute=event.data.get("event_int_attribute"),
                     event_tac=event.data.get("event_tac"),
+                    event_data=event.data,
+                    event_target_owner_id=event.target_player_id,
                     event_previous_owner_id=event.data.get(
                         "event_previous_owner_id"))
                 if not trigger_condition_met(graph.source.to_dict(), context):
@@ -643,6 +600,7 @@ class NativeTriggerBackend:
                             target_map=({requires_input_index: int(target)}
                                         if (requires_input_index is not None
                                             and target is not None) else {}),
+                            event_tac=event.data.get("event_tac"),
                             instance_id=instance_id)
                     finally:
                         battle_state["resolving_source_uid"] = old_source
@@ -664,10 +622,20 @@ class NativeTriggerBackend:
                         else:
                             battle_state["resolving_trigger_event_data"] = old_event_data
                     logs.append(f"{event_name} {key[1][:8]} -> {result}")
+                    if event_name == "ChampionWouldLoseEvent":
+                        # C# CheckForReplacementAbilities returns as soon as
+                        # the first replacement is accepted. The helper that
+                        # emitted this event uses this marker to distinguish
+                        # an accepted replacement from diagnostics such as a
+                        # failed chance roll.
+                        battle_state[
+                            "_champion_would_lose_replacement_accepted"] = True
                     if not battle_state.get("resolution_paused"):
                         consume_one_shot_trigger(
                             handler, session, game, db, player_uid, ai_uid,
                             battle_state, key[1], source_uid)
+                    if event_name == "ChampionWouldLoseEvent":
+                        return "; ".join(logs)
                 else:
                     import game_engine
                     from . import chain
@@ -736,6 +704,10 @@ class NativeTriggerBackend:
                             **activation_payload,
                         }, source_card_owner, first_player_id=first_player)
                     logs.append(f"{event_name} {key[1][:8]} -> chain")
+                    if event_name == "ChampionWouldLoseEvent":
+                        battle_state[
+                            "_champion_would_lose_replacement_accepted"] = True
+                        return "; ".join(logs)
         logs_result = "; ".join(logs)
         if (event_name == "CardEnteredZoneEvent" and
                 event.source_card_id is not None and
@@ -780,31 +752,15 @@ class PortTriggerDispatcher:
         )
 
 
-class MetadataTriggerAdapter(PortTriggerDispatcher):
-    """Deprecated compatibility adapter; live dispatch is native-only."""
-
-    def __init__(self, handler, game, game_session, db, player_uid, ai_uid,
-                 battle_state: dict, *, resolver=None, backend=None) -> None:
-        if resolver is None and backend is None:
-            super().__init__(handler, game, game_session, db, player_uid, ai_uid,
-                             battle_state)
-            return
-        self.handler, self.game = handler, game
-        self.game_session, self.db = game_session, db
-        self.player_uid, self.ai_uid = player_uid, ai_uid
-        self.battle_state = battle_state
-        self.backend = backend or RecordsTriggerBackend(resolver)
-
-
 def dispatch_trigger(context, event_type, source_card_id, source_player_id=None,
-                     target_card_id=None, *, data=None):
+                     target_card_id=None, *, target_player_id=None, data=None):
     """Emit a trigger through the native dispatcher for an effect context."""
     dispatcher = PortTriggerDispatcher(
         context.handler, context.game, context.session, context.db,
         context.player_uid, context.ai_uid, context.bstate)
     return dispatcher(TriggerEvent(
         event_type, source_card_id, source_player_id, target_card_id,
-        data=dict(data or {})))
+        target_player_id, data=dict(data or {})))
 
 
 def dispatch_card_activated(*, db, handler, game, session, player_uid, ai_uid,
@@ -889,7 +845,8 @@ def _opponents_block_deathcries(battle_state, owner):
 def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
                             battle_state, event_type, source_card_id,
                             source_player_id=None, target_card_id=None,
-                            data=None, force_ignores_chain=False):
+                            target_player_id=None, data=None,
+                            force_ignores_chain=False):
     """Dispatch a host-emitted event without constructing a legacy context.
 
     ``force_ignores_chain`` lets a mode resolve an authored trigger inline
@@ -936,15 +893,12 @@ def dispatch_native_trigger(*, db, handler, game, session, player_uid, ai_uid,
             db=db, handler=handler, game=game, session=session,
             player_uid=player_uid, ai_uid=ai_uid, battle_state=battle_state,
             force_ignores_chain=force_ignores_chain,
-            # ``data`` must be passed by keyword: the positional slot after
-            # ``target_card_id`` is ``target_player_id``.  Passing it
-            # positionally dropped every authored collection/state fact
-            # (event_source_collection, event_destination_collection,
-            # event_previous_state, event_tac, ...) from host-emitted events,
-            # which silently made the zone-entry conditions lenient.
+            # Keep the typed event's TargetPlayerId separate from its extra
+            # metadata. Conditions such as TriggerPlayerControlsTarget read
+            # that participant field directly, as they do on the C# event.
             event=TriggerEvent(event_name, source_card_id,
                                source_player_id, target_card_id,
-                               data=dict(data or {})))
+                               target_player_id, data=dict(data or {})))
     finally:
         if previous_event_type is None:
             battle_state.pop("event_type", None)

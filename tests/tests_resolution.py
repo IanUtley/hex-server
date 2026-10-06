@@ -525,13 +525,52 @@ def test_summon_choosing_collection_stays_out_of_warzone(db):
     assert db.execute(
         "SELECT location, card_state FROM game_cards WHERE card_uid=?",
         (uid,)).fetchone() == ("choosing", 0)
+    # The client derives its CardMoved notification from a CardUpdated whose
+    # collection changes; the wire stream must not contain a duplicate class
+    # 50 for this new card.
     assert any(
-        ev.__class__.__name__ == "CardMovedSessionEventArgs" and
+        ev.__class__.__name__ == "CardUpdatedSessionEventArgs" and
+        int(ev.session_card_id.uid.uid64) == uid and
         ev.collection == game_engine.ECardCollections.Choosing
         for ev in game.events)
     assert not any(
         ev.__class__.__name__ == "CardMovedSessionEventArgs" and
-        ev.collection == game_engine.ECardCollections.Warzone
+        int(ev.session_card_id.uid.uid64) == uid
+        for ev in game.events)
+
+
+def test_summon_none_collection_waits_for_authored_zone_move(db):
+    """A None summon stays detached until its later zone effect resolves."""
+    from rules_port.context import EffectContext
+    from rules_port.token_effects import summon_token
+
+    token = _ag("none-collection-token")
+    db.execute(
+        "INSERT INTO card_templates "
+        "(guid,name,card_type,cost,attack,defense,attributes,"
+        "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (token, "Detached Token", "Troop", 0, 1, 1, 0, "[]", "[]", ""))
+    db.commit()
+    session = SessionStub()
+    pl_t = game_engine.UID.make(244, 5)
+    ai_t = game_engine.UID.make(3, 1000)
+    game = game_engine.Game(1, pl_t, ai_t)
+    state = {"resolving_owner_id": 5}
+    context = EffectContext.from_rules_port(
+        game, session, db, HandlerStub(db), pl_t, ai_t, state, "", "")
+
+    result = summon_token(context, {
+        "token_guid": token, "amount": 1, "collection": "None"})
+
+    assert "summoned 1" in result, result
+    uid = state["created_token_uids"][0]
+    assert db.execute(
+        "SELECT location FROM game_cards WHERE card_uid=?", (uid,)
+    ).fetchone()[0] == "none"
+    assert not any(
+        ev.__class__.__name__ == "CardUpdatedSessionEventArgs" and
+        int(getattr(getattr(ev, "session_card_id", None), "uid", 0)
+            .uid64) == uid
         for ev in game.events)
 
 
@@ -967,6 +1006,8 @@ def main():
          test_double_choice_creates_random_choices_and_clears_before_second),
         ("Choosing summon creates option cards",
          test_summon_choosing_collection_stays_out_of_warzone),
+        ("None summon awaits authored zone move",
+         test_summon_none_collection_waits_for_authored_zone_move),
         ("Native choice target opens one picker",
          test_native_choice_target_opens_one_picker_for_all_options),
         ("Hand discard asks then discards on resume",

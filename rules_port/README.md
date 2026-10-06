@@ -20,7 +20,9 @@ from transport and storage:
    `pvp_db` mutation APIs, and the namespaced SQLite snapshot.
 6. `resolution.py` owns the port ability lifecycle, typed effect walk, and
    continuation boundary. Legacy effect walking remains available only through
-   the old direct APIs; RulesPort has no hybrid effect-backend injection path.
+   old direct APIs on non-attached sessions; creating a legacy effect context
+   or invoking the legacy ability resolver on a RulesPort-attached session
+   fails closed. RulesPort has no hybrid effect-backend injection path.
 7. `tunneling.py` owns the StartTurn Tunneling counter advance and serialized
    Surface queue; it uses the native counter projection and port ability
    lifecycle in both Practice/PvE and tournament PvP.
@@ -75,8 +77,12 @@ awaitable event-bus shape for non-Unity callers.
 
 On completion, the resolver returns a continuation if another prompt is needed,
 or the next priority event. A completed mutation must update the SQLite row and
-emit the matching `CardMoved`/`CardUpdated` (and `CardDiscarded` for removal)
-before options are rebuilt.
+emit a destination `CardUpdated` before options are rebuilt. When collection or
+controller changes, Unity derives the UI `CardMoved` from that update; an
+explicit class-50 event is not derived for a same-collection position change.
+`UIBattle.OnCardUpdated` still moves the view home, and the inspected C# source
+has no separate class-50 producer; only emit one when a concrete C# path
+requires it. Emit `CardDiscarded` separately when the C# lifecycle does so.
 
 Player visibility is projected at the same boundary. A continuous modifier
 such as Subterranean Spy persists `CanSeeOpponentsHand` in the battle
@@ -123,10 +129,9 @@ the legacy engine; the class belongs in `classify_player_transaction` before it
 can be played. No mode dispatches a live PlayerTransaction through the legacy
 handlers.
 
-Live attached sessions use `NativeEffectBackend`, `NativeTriggerBackend`, and
-the native target evaluator;
-the deprecated compatibility adapters live outside the RulesPort dispatcher and
-are not selectable by a live session.
+Live sessions use `NativeEffectBackend`, `NativeTriggerBackend`, and the native
+target evaluator. RulesPort has no compatibility resolver injection or
+rollback backend; unsupported native conditions and effects fail closed.
 
 Run `python3 tests/run_all.py --quick` to exercise the port alongside the
 existing server tests. `coverage.py` exposes

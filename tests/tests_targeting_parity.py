@@ -520,6 +520,10 @@ def _template_and_cost_value_support(db):
         rows = source.execute(
             "SELECT guid, card_type FROM card_templates WHERE card_type IN "
             "('Troop','Choice','QuickAction') GROUP BY card_type").fetchall()
+        threshold_guids = source.execute(
+            "SELECT guid FROM card_templates WHERE card_type='Troop' "
+            "AND threshold_json NOT IN ('[]','null','') ORDER BY guid"
+        ).fetchall()
     finally:
         source.close()
     for guid, card_type in rows:
@@ -541,6 +545,15 @@ def _template_and_cost_value_support(db):
         filter_from_metadata({"type": "IsQuick"}), quick)
     assert not filter_matches_template(
         filter_from_metadata({"type": "IsBasic"}), quick)
+    color_filter = filter_from_metadata(
+        {"type": "IsColor", "m_ColorFlags": "Blood"})
+    threshold_troops = [
+        DEFAULT_RECORD_STORE.get("CardTemplate", str(guid).lower())
+        for (guid,) in threshold_guids]
+    assert any(filter_matches_template(color_filter, record)
+               for record in threshold_troops if record is not None)
+    assert any(not filter_matches_template(color_filter, record)
+               for record in threshold_troops if record is not None)
     assert filter_matches_template(
         filter_from_metadata({"type": "IsExtendedArt"}), troop)
     assert filter_matches_template(

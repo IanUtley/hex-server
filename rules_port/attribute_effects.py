@@ -152,10 +152,10 @@ def _choose_boon(context, uid):
     feral = int_attrs.get("Feral", int_attrs.get("feral", 0))
     if not lethal:
         lethal = card_int_attr(context.db, context.session.session_id,
-                               uid, "Lethal")
+                               uid, "Lethal", battle_state=context.bstate)
     if not feral:
         feral = card_int_attr(context.db, context.session.session_id,
-                              uid, "Feral")
+                              uid, "Feral", battle_state=context.bstate)
 
     def already_has(flag):
         if flag == int(game_engine.ECardAttributes.DualStrike):

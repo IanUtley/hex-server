@@ -27,8 +27,9 @@ def _drawn_this_turn(context, owner):
 def _record_draw(context, owner):
     turn = int(context.bstate.get("turn_number", 1) or 1)
     store = context.bstate.setdefault("cards_drawn_this_turn", {})
-    store[str(owner)] = {"turn": turn,
-                         "count": _drawn_this_turn(context, owner) + 1}
+    count = _drawn_this_turn(context, owner) + 1
+    store[str(owner)] = {"turn": turn, "count": count}
+    return count
 
 
 def draw_cards(context, count, owner=None):
@@ -85,24 +86,25 @@ def draw_cards(context, count, owner=None):
         _tpl, card_type, _name, cost, attack, defense, gems = \
             context.handler._card_full_data(
                 context.game, scid, row[3], row[2])
-        context.game.push_card_moved(
-            scid, recipient, game_engine.ECardCollections.Hand,
-            game_engine.ECardLocations.Top, 1)
-        context.game.push_card_drawn(scid, recipient, 1)
         context.game.push_card_updated(
             scid, recipient, game_engine.ECardCollections.Hand, card_type,
             template_id=_tpl, cost=cost, attack=attack, defense=defense,
             gems=gems,
             nulling=raw_uid(recipient) != raw_uid(context.player_uid))
+        # C# ClientStateCache.Update derives the UI CardMoved notification
+        # from this CardUpdated when Collection changes. Sending class 50 as
+        # well would make Unity process the same move twice.
+        context.game.push_card_drawn(scid, recipient, 1)
         context._emit_trigger(
             "CardEnteredZoneEvent", card_uid, owner,
             event_source_collection="deck",
             event_destination_collection="hand")
+        nth_draw = _record_draw(context, owner)
         context._emit_trigger(
             "CardDrawnEvent", _champion_uid(context, owner), owner,
-            target_card_id=card_uid)
+            target_card_id=card_uid,
+            nth_card_drawn_this_turn_by_this_player=nth_draw)
         from .statistics import record_ability_card_list
         record_ability_card_list(context.bstate, "DrawnCards", card_uid)
-        _record_draw(context, owner)
         drawn += 1
     return f"draw {drawn} for owner {owner}"

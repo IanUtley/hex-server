@@ -318,15 +318,17 @@ def _insert_card(handler, session, state, pid, guid, location):
                                  location, conn=_db)
 
 
-def _card_event(handler, session, state, pid, card_uid, collection, location, index=0):
+def _card_event(handler, session, state, pid, card_uid, collection):
     game, me, _ = _game(handler, session, state, pid)
     scid = _ge.SessionCardId(_ge.UID(int(card_uid)))
     row = db_card_basic(session.session_id, card_uid, conn=_db)
     guid = row[0] if row else None
     tpl, ct, _name, cost, atk, defense, gems = handler._card_full_data(game, scid, guid)
-    game.push_card_updated(scid, _owner_uid(pid) if state and state.get("pvp") else me,
-                           collection, ct, template_id=tpl, cost=cost, attack=atk, defense=defense, gems=gems)
-    game.push_card_moved(scid, _owner_uid(pid) if state and state.get("pvp") else me, collection, location, index)
+    game.push_card_updated(
+        scid, _owner_uid(pid) if state and state.get("pvp") else me,
+        collection, ct, template_id=tpl, cost=cost, attack=atk,
+        defense=defense, gems=gems,
+        nulling=collection == _ge.ECardCollections.Deck)
     return game, me
 
 
@@ -336,7 +338,7 @@ def _move_to_zone(handler, session, state, pid, card_uid, zone, collection):
     db_move_card_to_location(session.session_id, card_uid, zone, position=0,
                              conn=_db)
     _db.commit()
-    return _card_event(handler, session, state, pid, card_uid, collection, _ge.ECardLocations.Top)
+    return _card_event(handler, session, state, pid, card_uid, collection)
 
 
 def _draw(handler, session, state, pid, count):
@@ -367,12 +369,16 @@ def _add_card(handler, session, state, pid, guid, to_deck=False, play=False):
     scid = _ge.SessionCardId(_ge.UID(card_uid))
     full = handler._card_full_data(game, scid, tpl[0])
     if to_deck:
-        game.push_card_updated(scid, owner_uid, _ge.ECardCollections.Deck, full[1], template_id=full[0], cost=full[3], attack=full[4], defense=full[5], gems=full[6])
-        game.push_card_moved(scid, owner_uid, _ge.ECardCollections.Deck, _ge.ECardLocations.Top, 0)
+        game.push_card_updated(
+            scid, owner_uid, _ge.ECardCollections.Deck, full[1],
+            template_id=full[0], cost=full[3], attack=full[4],
+            defense=full[5], gems=full[6], nulling=True)
     else:
-        game.push_card_updated(scid, owner_uid, _ge.ECardCollections.Hand, full[1], template_id=full[0], cost=full[3], attack=full[4], defense=full[5], gems=full[6])
+        game.push_card_updated(
+            scid, owner_uid, _ge.ECardCollections.Hand, full[1],
+            template_id=full[0], cost=full[3], attack=full[4],
+            defense=full[5], gems=full[6])
         game.push_card_drawn(scid, owner_uid, 1)
-        game.push_card_moved(scid, owner_uid, _ge.ECardCollections.Hand, _ge.ECardLocations.Top, 1)
     if state and state.get("pvp"):
         from services.tournament_game import pvp_save_state
         pvp_save_state(session, state)

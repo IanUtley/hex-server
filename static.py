@@ -33,6 +33,22 @@ def _ensure_column(db, table: str, column: str, declaration: str) -> None:
             raise
 
 
+def _drop_column(db, table: str, column: str) -> None:
+    """Remove a retired migration column once.
+
+    ``DROP COLUMN`` requires SQLite 3.35+; on an older engine the column is
+    left in place, which is harmless because the runtime no longer reads or
+    writes it.
+    """
+    present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in present:
+        return
+    try:
+        db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def _seed_conflict_columns(db, table, columns):
     """Primary-key columns shared by the database table and the seed row.
 
@@ -371,7 +387,6 @@ DDL = [
         code TEXT NOT NULL UNIQUE,
         gold_delta INTEGER DEFAULT 0,
         platinum_delta INTEGER DEFAULT 0,
-        uses INTEGER DEFAULT 0,
         max_uses INTEGER DEFAULT 1
     )
     """,
@@ -733,10 +748,41 @@ DDL = [
     """
     CREATE INDEX IF NOT EXISTS idx_session_events ON session_events (session_id, seq)
     """,
-    # Raw inbound PvP PlayerTransaction payloads. This is deliberately
-    # separate from session_events: session_events contains server-to-client
-    # packets used to build .replay files, while this table preserves the
-    # client actions needed to replay rules resolution.
+    # A projected packet-batch stream complements session_events, whose
+    # one-row-per-event layout cannot represent an empty 3055 acknowledgement
+    # or preserve the event batch boundary for a client transaction. A
+    # transaction-scoped send hook records successful sendall calls afterward.
+    """
+    CREATE TABLE IF NOT EXISTS session_packets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        target_player_uid TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        data_type INTEGER NOT NULL DEFAULT 3055,
+        request_id INTEGER NOT NULL DEFAULT 0,
+        transaction_id INTEGER NOT NULL DEFAULT -1,
+        transaction_row_id INTEGER,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        event_batch_json TEXT NOT NULL DEFAULT '[]',
+        projection_recorded INTEGER NOT NULL DEFAULT 1,
+        send_count INTEGER NOT NULL DEFAULT 0,
+        sent_body BLOB,
+        sent_at TEXT,
+        captured_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_session_packets
+        ON session_packets (session_id, seq, id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_session_packets_transaction
+        ON session_packets (transaction_row_id, seq, id)
+    """,
+    # Raw inbound PlayerTransaction payloads. PvP sessions are captured by
+    # default; local sessions are captured only when explicitly enabled. This
+    # is separate from session_events, which contains server-to-client events
+    # used to build .replay files.
     """
     CREATE TABLE IF NOT EXISTS session_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -750,9 +796,15 @@ DDL = [
         transaction_id INTEGER NOT NULL DEFAULT -1,
         transaction_type TEXT NOT NULL DEFAULT '',
         classification_json TEXT NOT NULL DEFAULT '{}',
+        decoded_intent_json TEXT NOT NULL DEFAULT '{}',
+        raw_request_body BLOB NOT NULL DEFAULT X'',
         inner_bytes BLOB NOT NULL,
         pre_state_hash TEXT NOT NULL DEFAULT '',
+        pre_state_json TEXT NOT NULL DEFAULT '',
+        pre_rules_port_json TEXT NOT NULL DEFAULT '',
         post_state_hash TEXT,
+        post_state_json TEXT NOT NULL DEFAULT '',
+        post_rules_port_json TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'received',
         handled INTEGER,
         completed_at TEXT,
@@ -1095,7 +1147,8 @@ DDL = [
         temporary_buffs TEXT DEFAULT '{}',
         original_template_guid TEXT DEFAULT '',
         resolved_at INTEGER DEFAULT 0,
-        gems INTEGER DEFAULT 0
+        gems INTEGER DEFAULT 0,
+        original_gems INTEGER
     )
     """,
 
@@ -1558,6 +1611,27 @@ def ensure_schema(db):
     """
     for stmt in DDL:
         db.execute(stmt)
+    # Redeem-code usage is tracked per account in ``store_purchases``; the old
+    # global ``uses`` counter is retired.
+    _drop_column(db, "redeem_codes", "uses")
+    _ensure_column(db, "session_transactions", "decoded_intent_json",
+                   "TEXT NOT NULL DEFAULT '{}'")
+    _ensure_column(db, "session_transactions", "raw_request_body",
+                   "BLOB NOT NULL DEFAULT X''")
+    _ensure_column(db, "session_transactions", "pre_state_json",
+                   "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(db, "session_transactions", "pre_rules_port_json",
+                   "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(db, "session_transactions", "post_state_json",
+                   "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(db, "session_transactions", "post_rules_port_json",
+                   "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(db, "session_packets", "send_count",
+                   "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(db, "session_packets", "projection_recorded",
+                   "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(db, "session_packets", "sent_body", "BLOB")
+    _ensure_column(db, "session_packets", "sent_at", "TEXT")
     template_columns = {row[1] for row in db.execute(
         "PRAGMA table_info(card_templates)")}
     added_variable_cost_double = "variable_cost_double" not in template_columns
@@ -1923,6 +1997,8 @@ def ensure_schema(db):
             db.execute("ALTER TABLE game_cards ADD COLUMN resolved_at INTEGER DEFAULT 0")
         if "gems" not in cols:
             db.execute("ALTER TABLE game_cards ADD COLUMN gems INTEGER DEFAULT 0")
+        if "original_gems" not in cols:
+            db.execute("ALTER TABLE game_cards ADD COLUMN original_gems INTEGER")
         db.commit()
 
         # Existing databases were seeded before the client TAC-derived Lethal

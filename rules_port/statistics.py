@@ -279,3 +279,17 @@ def record_ability_card_list(state, name, card_uid):
         values = flat.setdefault(str(name), [])
         if uid not in values:
             values.append(uid)
+        # Some C# nested effect APIs write the result to Chain.PeekAbility(),
+        # which is the invoking ability instance rather than the child that
+        # performed the leaf (BuryCard is the relevant case for Xarlox). Keep
+        # that chain-owner list alongside the child-local list so following
+        # parent effects can evaluate CountListAttr/SourceBuried targets.
+        parent = state.get("_choice_parent")
+        parent_guid = (str(parent.get("ability_guid") or "").lower()
+                       if isinstance(parent, dict) else "")
+        if parent_guid and parent_guid != guid:
+            scoped = state.setdefault("list_attrs", {}).setdefault(
+                parent_guid, {})
+            parent_values = scoped.setdefault(str(name), [])
+            if uid not in parent_values:
+                parent_values.append(uid)

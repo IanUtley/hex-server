@@ -428,7 +428,7 @@ def encode_champion_bits_minimal(buf, sizes, ft, cu64, cname, cid, lvl, xp, cc, 
 #  Core ObjFmt encoder
 # =============================================================================
 
-def encode_objfmt_response(type_names, fields):
+def encode_objfmt_response(type_names, fields, *, uppercase_hex=False):
     sizes = []
     buf = io.BytesIO()
 
@@ -438,6 +438,9 @@ def encode_objfmt_response(type_names, fields):
         buf.write(b";")
     def lf():
         buf.write(b"\n")
+    def encode_number_hex(value):
+        encoded = hexlify(value).decode("ascii")
+        return encoded.upper() if uppercase_hex else encoded
 
     def find_type(tname):
         if tname not in type_names:
@@ -567,19 +570,19 @@ def encode_objfmt_response(type_names, fields):
         sep()
 
         if tcode == "long":
-            w(hexlify(struct.pack("<q", val)).decode("ascii"))
+            w(encode_number_hex(struct.pack("<q", val)))
             sep()
         elif tcode == "ulong":
-            w(hexlify(struct.pack("<Q", val)).decode("ascii"))
+            w(encode_number_hex(struct.pack("<Q", val)))
             sep()
         elif tcode == "int":
-            w(hexlify(struct.pack("<i", val)).decode("ascii"))
+            w(encode_number_hex(struct.pack("<i", val)))
             sep()
         elif tcode == "uint":
-            w(hexlify(struct.pack("<I", val)).decode("ascii"))
+            w(encode_number_hex(struct.pack("<I", val)))
             sep()
         elif tcode == "byte":
-            w(hexlify(bytes([val])).decode("ascii"))
+            w(encode_number_hex(bytes([val])))
             sep()
         elif tcode == "bool":
             w('1' if val else '0')
@@ -606,7 +609,7 @@ def encode_objfmt_response(type_names, fields):
         elif tcode == "enum1":
             f_enum_start = buf.tell(); sizes.append(0)
             w("value__"); sep(); w(str(len(sizes)-1)); sep(); w(str(find_type("System.Int32"))); sep(); w("0"); sep()
-            w(hexlify(struct.pack("<i", evalue_int)).decode("ascii")); sep()
+            w(encode_number_hex(struct.pack("<i", evalue_int))); sep()
             sizes[-1] = buf.tell() - f_enum_start
         elif tcode == "coll":
             w(str(ecount))
@@ -644,7 +647,7 @@ def encode_objfmt_response(type_names, fields):
         elif tcode == "uid":
             f_uid_start = buf.tell(); sizes.append(0)
             w("m_UID64"); sep(); w(str(len(sizes)-1)); sep(); w(str(find_type("System.UInt64"))); sep(); w("0"); sep()
-            w(hexlify(struct.pack("<Q", uid_val)).decode("ascii")); sep()
+            w(encode_number_hex(struct.pack("<Q", uid_val))); sep()
             sizes[-1] = buf.tell() - f_uid_start
         elif tcode == "intlist":
             w(str(ecount))
@@ -653,7 +656,7 @@ def encode_objfmt_response(type_names, fields):
                 se = buf.tell(); sizes.append(0)
                 w(str(i)); sep(); w(str(len(sizes)-1)); sep()
                 w(str(find_type("System.Int32"))); sep(); w("0"); sep()
-                w(hexlify(struct.pack("<i", e)).decode("ascii")); sep()
+                w(encode_number_hex(struct.pack("<i", e))); sep()
                 sizes[-1] = buf.tell() - se
         elif tcode == "thresholdlist":
             w(str(len(threshold_data)))
@@ -807,7 +810,7 @@ def encode_objfmt_response(type_names, fields):
                 fe = buf.tell(); sizes.append(0)
                 w("m_UID64"); sep(); w(str(len(sizes)-1)); sep()
                 w(str(find_type("System.UInt64"))); sep(); w("0"); sep()
-                w(hexlify(struct.pack("<Q", e)).decode("ascii")); sep()
+                w(encode_number_hex(struct.pack("<Q", e))); sep()
                 sizes[-1] = buf.tell() - fe
                 sizes[-2] = buf.tell() - se
         elif tcode == "class":
@@ -1317,9 +1320,8 @@ def encode_sync_event(packet) -> bytes:  # packet: game_engine.NetworkPacketSess
     SessionSyncEventEventArgs:
       - RoutingPlayerId (UID)
       - SessionArgs (NetworkPacketSessionEventArgs)
-        - PlayerId (UID)
-        - EventIds (List`1#System.Int32)
-        - EventData (List`1#System.Byte[])
+        - PlayerId (UID), EventIds (List`1#System.Int32), EventData (List`1#System.Byte[])
+        - inherited SessionEventArgs fields Class (int), SessionId (UID)
     """
     sizes = []
     buf = io.BytesIO()
@@ -1330,10 +1332,6 @@ def encode_sync_event(packet) -> bytes:  # packet: game_engine.NetworkPacketSess
         "Game.Shared.Network.GameSession.SessionSyncEventEventArgs",
         "Game.Shared.UID", "System.UInt64",
         "Game.Shared.NetworkPacketSessionEventArgs",
-        "System.Int32",
-        "System.Collections.Generic.List`1#System.Int32",
-        "System.Collections.Generic.List`1#System.Byte[]",
-        "System.Byte[]",
     ]
     def ft(tn):
         if tn not in type_names:
@@ -1350,21 +1348,36 @@ def encode_sync_event(packet) -> bytes:  # packet: game_engine.NetworkPacketSess
     w("RoutingPlayerId"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("Game.Shared.UID"))); sep(); w("1"); sep()
     f1a = buf.tell(); sizes.append(0)
     w("m_UID64"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
-    w(hexlify(struct.pack("<Q", packet.player_id.to_uint64())).decode("ascii")); sep()
+    w(hexlify(struct.pack("<Q", packet.player_id.to_uint64())).decode("ascii").upper()); sep()
     sizes[-1] = buf.tell() - f1a
     sizes[-2] = buf.tell() - f1
 
-    # SessionArgs (NetworkPacketSessionEventArgs) — 5 fields alphabetically
+    # ObjFmt follows NetworkPacketSessionEventArgs' declared members, then its
+    # SessionEventArgs base members. This ordering is significant to the C# reader.
     f2 = buf.tell(); f2_sz_idx = len(sizes); sizes.append(0)
     w("SessionArgs"); sep(); w(str(f2_sz_idx)); sep(); w(str(ft("Game.Shared.NetworkPacketSessionEventArgs"))); sep(); w("5"); sep()
 
-    # -- Class (int)
-    f2c = buf.tell(); sizes.append(0)
-    w("Class"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Int32"))); sep(); w("0"); sep()
-    w(hexlify(struct.pack("<i", 255)).decode("ascii")); sep()
-    sizes[-1] = buf.tell() - f2c
+    # -- PlayerId (UID), a direct NetworkPacketSessionEventArgs member
+    f2p = buf.tell(); sizes.append(0)
+    w("PlayerId"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("Game.Shared.UID"))); sep(); w("1"); sep()
+    f2p1 = buf.tell(); sizes.append(0)
+    w("m_UID64"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
+    w(hexlify(struct.pack("<Q", packet.player_id.to_uint64())).decode("ascii").upper()); sep()
+    sizes[-1] = buf.tell() - f2p1
+    sizes[-2] = buf.tell() - f2p
 
-    # -- EventData (List<byte[]>)
+    # -- EventIds (List<int>), a direct member
+    f2e = buf.tell(); f2e_sz_idx = len(sizes); sizes.append(0)
+    w("EventIds"); sep(); w(str(f2e_sz_idx)); sep(); w(str(ft("System.Collections.Generic.List`1#System.Int32"))); sep(); w("0"); sep()
+    w(str(len(packet.event_ids))); sep()
+    for idx, eid in enumerate(packet.event_ids):
+        se = buf.tell(); sizes.append(0)
+        w(str(idx)); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Int32"))); sep(); w("0"); sep()
+        w(hexlify(struct.pack("<i", eid)).decode("ascii").upper()); sep()
+        sizes[-1] = buf.tell() - se
+    sizes[f2e_sz_idx] = buf.tell() - f2e
+
+    # -- EventData (List<byte[]>), a direct member
     f2d = buf.tell(); f2d_sz_idx = len(sizes); sizes.append(0)
     w("EventData"); sep(); w(str(f2d_sz_idx)); sep(); w(str(ft("System.Collections.Generic.List`1#System.Byte[]"))); sep(); w("0"); sep()
     w(str(len(packet.event_data))); sep()
@@ -1376,32 +1389,18 @@ def encode_sync_event(packet) -> bytes:  # packet: game_engine.NetworkPacketSess
         sizes[-1] = buf.tell() - se
     sizes[f2d_sz_idx] = buf.tell() - f2d
 
-    # -- EventIds (List<int>)
-    f2e = buf.tell(); f2e_sz_idx = len(sizes); sizes.append(0)
-    w("EventIds"); sep(); w(str(f2e_sz_idx)); sep(); w(str(ft("System.Collections.Generic.List`1#System.Int32"))); sep(); w("0"); sep()
-    w(str(len(packet.event_ids))); sep()
-    for idx, eid in enumerate(packet.event_ids):
-        se = buf.tell(); sizes.append(0)
-        w(str(idx)); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Int32"))); sep(); w("0"); sep()
-        w(hexlify(struct.pack("<i", eid)).decode("ascii")); sep()
-        sizes[-1] = buf.tell() - se
-    sizes[f2e_sz_idx] = buf.tell() - f2e
+    # -- Class (int), inherited from SessionEventArgs
+    f2c = buf.tell(); sizes.append(0)
+    w("Class"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Int32"))); sep(); w("0"); sep()
+    w(hexlify(struct.pack("<i", 255)).decode("ascii").upper()); sep()
+    sizes[-1] = buf.tell() - f2c
 
-    # -- PlayerId (UID)
-    f2p = buf.tell(); sizes.append(0)
-    w("PlayerId"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("Game.Shared.UID"))); sep(); w("1"); sep()
-    f2p1 = buf.tell(); sizes.append(0)
-    w("m_UID64"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
-    w(hexlify(struct.pack("<Q", packet.player_id.to_uint64())).decode("ascii")); sep()
-    sizes[-1] = buf.tell() - f2p1
-    sizes[-2] = buf.tell() - f2p
-
-    # -- SessionId (UID)
+    # -- SessionId (UID), inherited from SessionEventArgs
     f2s = buf.tell(); sizes.append(0)
     w("SessionId"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("Game.Shared.UID"))); sep(); w("1"); sep()
     f2s1 = buf.tell(); sizes.append(0)
     w("m_UID64"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
-    w(hexlify(struct.pack("<Q", packet.session_id.to_uint64())).decode("ascii")); sep()
+    w(hexlify(struct.pack("<Q", packet.session_id.to_uint64())).decode("ascii").upper()); sep()
     sizes[-1] = buf.tell() - f2s1
     sizes[-2] = buf.tell() - f2s
 
@@ -1658,6 +1657,28 @@ def encode_datawrapper(request_id, data_type, body_bytes, comp,
          "System.Guid", "System.Byte"],
         fields
     )
+
+
+def encode_game_started_response(routing_player_id, turn_order_player_ids,
+                                 seed_w, seed_z, success=True):
+    """Encode the service-level 3053 ``GameStartedEventArgs`` body.
+
+    This is separate from the nested class-1 ``GameStartedSessionEventArgs``
+    carried by 3055. Keep the DataContract members aligned with the C# type.
+    UID values are the uint64 representations used by ``encode_objfmt_response``.
+    """
+    return encode_objfmt_response(
+        ["Game.Shared.Network.GameSession.GameStartedEventArgs",
+         "Game.Shared.UID", "System.UInt64", "System.Boolean",
+         "System.Collections.Generic.List`1#Game.Shared.UID"],
+        [("RoutingPlayerId", "uid", routing_player_id),
+         ("Success", "bool", success),
+         ("TurnOrderPlayerIds", "uidlist",
+          ("System.Collections.Generic.List`1#Game.Shared.UID",
+           len(turn_order_player_ids), list(turn_order_player_ids))),
+         ("SeedW", "ulong", seed_w),
+         ("SeedZ", "ulong", seed_z)],
+        uppercase_hex=True)
 
 
 def encode_get_unread_mail_count_response(unread_count=0):

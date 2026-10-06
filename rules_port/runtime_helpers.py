@@ -29,6 +29,77 @@ def card_collection_for_location(location):
     }.get(str(location or "").lower(), game_engine.ECardCollections.Warzone)
 
 
+def participant_side(battle_state, owner_id):
+    """Return the ``player``/``ai`` prefix that holds ``owner_id``'s values.
+
+    Practice/PvE identifies the AI as owner 0. In PvP both participants are
+    nonzero raw IDs, and an effect view maps its *resolving* participant to
+    ``player`` (``pvp_view.to_effect_view``), so neither ``bool(owner)`` nor
+    ``pids[0]`` is a safe mapping there. The view's ``pvp_health_map`` is the
+    authoritative per-view mapping; the participant order is only a fallback
+    for a raw checkpoint, which keeps per-participant values in raw keys.
+    """
+    state = battle_state if isinstance(battle_state, dict) else {}
+    try:
+        owner = int(owner_id or 0)
+    except (TypeError, ValueError):
+        owner = 0
+    if not state.get("pvp"):
+        return "player" if owner else "ai"
+    health_map = state.get("pvp_health_map") or {}
+    mapped = health_map.get(owner, health_map.get(str(owner)))
+    if mapped in ("player_health", "ai_health"):
+        return str(mapped).split("_", 1)[0]
+    try:
+        pids = [int(pid) for pid in (state.get("pids") or ())]
+    except (TypeError, ValueError):
+        pids = []
+    if owner in pids[:2]:
+        return "player" if owner == pids[0] else "ai"
+    return None
+
+
+def participant_value(battle_state, owner_id, raw_prefix, side_suffix,
+                      default=0):
+    """Read one participant's value from a PvP checkpoint, view, or PvE state.
+
+    A raw PvP checkpoint stores ``<raw_prefix>_<pid>``; the side-oriented
+    view and Practice/PvE store ``<side>_<side_suffix>``.
+    """
+    state = battle_state if isinstance(battle_state, dict) else {}
+    if state.get("pvp"):
+        try:
+            raw_key = f"{raw_prefix}_{int(owner_id or 0)}"
+        except (TypeError, ValueError):
+            raw_key = ""
+        if raw_key in state:
+            return state.get(raw_key, default)
+    side = participant_side(state, owner_id)
+    if side is None:
+        return default
+    return state.get(f"{side}_{side_suffix}", default)
+
+
+def is_active_participant(battle_state, owner_id):
+    """Is ``owner_id`` the active (turn) player in this state or view?"""
+    state = battle_state if isinstance(battle_state, dict) else {}
+    if state.get("pvp") and state.get("turn_pid") is not None:
+        try:
+            return int(state.get("turn_pid")) == int(owner_id or 0)
+        except (TypeError, ValueError):
+            return False
+    side = participant_side(state, owner_id)
+    return side is not None and state.get("turn_player") == side
+
+
+def participant_turn_counter_key(battle_state, owner_id, name):
+    """State key for a per-participant per-turn counter (PvP keys by pid)."""
+    state = battle_state if isinstance(battle_state, dict) else {}
+    if state.get("pvp"):
+        return f"{name}_{int(owner_id or 0)}"
+    return f"{'player' if int(owner_id or 0) else 'ai'}_{name}"
+
+
 def owner_uid(owner_id, player_uid, ai_uid, battle_state=None):
     if (battle_state or {}).get("pvp"):
         return game_engine.UID.make(244, int(owner_id or 0))

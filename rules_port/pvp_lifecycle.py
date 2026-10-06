@@ -88,7 +88,9 @@ def mulligan_transition(state, player_ids, just_acted_pid) -> dict:
         return {"action": "start_turn", "next_player": None}
     acted = int(just_acted_pid)
     other = next((value for value in players if value != acted), None)
-    next_player = other if other not in kept else acted
+    # C# MulliganTransaction redraws without passing priority. Accepting the
+    # hand is the action that passes priority to the other player.
+    next_player = other if acted in kept else acted
     return {"action": "prompt", "next_player": next_player}
 
 

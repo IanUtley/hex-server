@@ -15,6 +15,7 @@ from domain.enums import ECardStates, ECardTypes, ETurnPhases
 
 _CARD_COOLDOWN_LOCK = threading.RLock()
 _CARD_COOLDOWNS_KEY = "__cooldown_counts__"
+_DAMAGED_STATE_BIT = 16  # ECardStates.Damaged
 
 # Card/template, ability, and target-template rows are seeded from the
 # extracted client data and are not mutated during a game.  The runtime still
@@ -27,6 +28,9 @@ _STATIC_METADATA_DB = None
 _STATIC_METADATA_CACHE = OrderedDict()
 _STATIC_METADATA_CACHE_LIMIT = 16384
 _STATIC_CACHE_MISS = object()
+_TARGET_PROJECTION_LOCK = threading.RLock()
+_TARGET_PROJECTION_CACHE = OrderedDict()
+_TARGET_PROJECTION_CACHE_LIMIT = 32
 
 # The client uses the format bit even when a socketable card has no gems in
 # its sockets. A persisted zero is interpreted as the old gem format, so the
@@ -182,7 +186,8 @@ def db_cleanup_stale_sessions(age_days=7):
 
         optional = {
             name for name in ("tournaments", "tournament_matches",
-                              "session_events", "session_transactions",
+                              "session_events", "session_packets",
+                              "session_transactions",
                               "game_replays")
             if _has(name)
         }
@@ -218,6 +223,10 @@ def db_cleanup_stale_sessions(age_days=7):
                     "DELETE FROM session_events "
                     "WHERE CAST(session_id AS TEXT)=?",
                     (session_id,)).rowcount or 0)
+            if "session_packets" in optional:
+                connection.execute(
+                    "DELETE FROM session_packets "
+                    "WHERE CAST(session_id AS TEXT)=?", (session_id,))
             if "session_transactions" in optional:
                 result["transactions_removed"] += int(connection.execute(
                     "DELETE FROM session_transactions "
@@ -819,6 +828,28 @@ def db_card_uses(session_id, card_uid, conn=None):
         return {}
 
 
+def db_reset_card_uses(session_id, card_uid, *,
+                       preserve_turn_and_cooldowns=True, conn=None):
+    """Reset instance usage like C# TransformCardBase/Card.Revert.
+
+    A direct transform clears only per-game counts. Reverting first runs
+    ``Card.Revert``, which clears per-turn counts and cooldowns too.
+    """
+    connection = conn or _db_layer._db
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, card_uid, conn=connection)
+        if preserve_turn_and_cooldowns:
+            uses = {key: value for key, value in uses.items()
+                    if key in {"__turn_uses__", _CARD_COOLDOWNS_KEY}}
+        else:
+            uses = {}
+        return connection.execute(
+            "UPDATE game_cards SET card_uses=? "
+            "WHERE session_id=? AND card_uid=?",
+            (json.dumps(uses, separators=(",", ":")),
+             session_id, int(card_uid))).rowcount
+
+
 def db_bump_card_use(session_id, card_uid, ability_guid, conn=None):
     """Increment and return one instance ability's usage count."""
     connection = conn or _db_layer._db
@@ -831,6 +862,23 @@ def db_bump_card_use(session_id, card_uid, ability_guid, conn=None):
         if conn is None:
             connection.commit()
         return uses[ability_guid]
+
+
+def db_copy_card_uses(session_id, from_uid, to_uid, conn=None):
+    """Copy per-game/per-turn uses and cooldowns onto a card copy.
+
+    Mirrors C# ``Card.CopyFrom`` for a non-replica copy, which clones
+    ``m_PerTurnUses``, ``m_PerGameUses`` and ``m_Cooldowns``: a copy summoned
+    by "[ONE-SHOT]: Deploy - Summon a copy of this" inherits the spent ONE-SHOT.
+    The caller owns the commit.
+    """
+    connection = conn or _db_layer._db
+    with _CARD_COOLDOWN_LOCK:
+        uses = db_card_uses(session_id, from_uid, conn=connection)
+        connection.execute(
+            "UPDATE game_cards SET card_uses=? WHERE session_id=? AND card_uid=?",
+            (json.dumps(uses, separators=(",", ":")),
+             session_id, int(to_uid)))
 
 
 def db_card_ability_use_counts(session_id, card_uid, ability_guid,
@@ -1388,7 +1436,8 @@ def db_condition_card_row(session_id, card_uid, conn=None):
         "ct.name, COALESCE(ct.cost,0), ct.subtype, ct.threshold_json, "
         "gc.card_attributes, ct.attributes, gc.card_attack_mod, "
         "gc.card_defense_mod, COALESCE(gc.permanent_buffs,'{}') "
-        ", COALESCE(gc.card_abilities, '[]') "
+        ", COALESCE(gc.card_abilities, '[]'), gc.position, "
+        "COALESCE(gc.original_template_guid,''), COALESCE(gc.gems,0) "
         "FROM game_cards gc LEFT JOIN card_templates ct "
         "ON ct.guid = gc.template_guid "
         "WHERE gc.session_id=? AND gc.card_uid=?",
@@ -1764,6 +1813,19 @@ def db_cards_in_zones_with_abilities(session_id, owner_id, zones, conn=None):
         "WHERE session_id=? AND user_id=? AND location IN (" + marks + ") "
         "AND card_abilities IS NOT NULL AND card_abilities != ''",
         [session_id, int(owner_id), *zones])
+    return cursor.fetchall() if hasattr(cursor, "fetchall") else []
+
+
+def db_all_cards_in_zones_with_abilities(session_id, zones, conn=None):
+    """Return all players' card UIDs and controllers for static aura scans."""
+    if not zones:
+        return []
+    marks = ",".join("?" for _ in zones)
+    cursor = (conn or _db_layer._db).execute(
+        "SELECT card_uid, user_id, card_abilities FROM game_cards "
+        "WHERE session_id=? AND location IN (" + marks + ") "
+        "AND card_abilities IS NOT NULL AND card_abilities != ''",
+        [session_id, *zones])
     return cursor.fetchall() if hasattr(cursor, "fetchall") else []
 
 
@@ -2605,10 +2667,15 @@ def db_debug_nonchampion_cards(session_id, owner_id, conn=None):
 
 
 def db_clear_warzone_damage(session_id, conn=None):
-    """Clear marked damage from cards currently in the warzone."""
+    """Clear marked damage from cards currently in the warzone.
+
+    C# ``Card.ResetCardDamage`` also clears ``ECardStates.Damaged``.
+    """
     return (conn or _db_layer._db).execute(
-        "UPDATE game_cards SET card_damage=0 "
-        "WHERE session_id=? AND location='warzone'", (session_id,))
+        "UPDATE game_cards SET card_damage=0, "
+        "card_state = COALESCE(card_state, 0) & ? "
+        "WHERE session_id=? AND location='warzone'",
+        (~_DAMAGED_STATE_BIT, session_id))
 
 
 def db_clear_warzone_damage_except(session_id, exempt_uids, conn=None):
@@ -2618,9 +2685,11 @@ def db_clear_warzone_damage_except(session_id, exempt_uids, conn=None):
         return db_clear_warzone_damage(session_id, conn=conn)
     marks = ",".join("?" for _ in uids)
     return (conn or _db_layer._db).execute(
-        "UPDATE game_cards SET card_damage=0 "
+        "UPDATE game_cards SET card_damage=0, "
+        "card_state = COALESCE(card_state, 0) & ? "
         "WHERE session_id=? AND location='warzone' "
-        "AND card_uid NOT IN (" + marks + ")", (session_id, *uids))
+        "AND card_uid NOT IN (" + marks + ")",
+        (~_DAMAGED_STATE_BIT, session_id, *uids))
 
 
 def db_temporary_attribute_rows(session_id, conn=None):
@@ -2738,7 +2807,8 @@ def db_static_target_template(template_id, conn=None):
     connection = conn or _db_layer._db
     return _cached_static_row(
         connection, ("static_target", str(template_id)),
-        "SELECT collection_flags, player_filter, filter_json, game_text "
+        "SELECT collection_flags, player_filter, filter_json, game_text, "
+        "target_kind "
         "FROM target_templates WHERE template_id=?", (template_id,))
 
 
@@ -2971,17 +3041,36 @@ def db_cards_with_name(session_id, name, conn=None):
 
 def _target_projection_columns(connection):
     """Return optional columns used by the generic target projection."""
+    # Target candidate enumeration is repeated for each generated target
+    # witness in the card contract sweep.  Reading both table schemas on every
+    # call made a large catalogue pass spend most of its time in PRAGMA table
+    # introspection.  Include SQLite's schema version so migrations and test
+    # fixture DDL naturally invalidate the cached projection.
+    version_row = connection.execute("PRAGMA schema_version").fetchone()
+    cache_key = (connection, int(version_row[0] or 0)
+                 if version_row else 0)
+    with _TARGET_PROJECTION_LOCK:
+        cached = _TARGET_PROJECTION_CACHE.get(cache_key)
+        if cached is not None:
+            _TARGET_PROJECTION_CACHE.move_to_end(cache_key)
+            return cached
     gc = {row[1] for row in connection.execute(
         "PRAGMA table_info(game_cards)").fetchall()}
     ct = {row[1] for row in connection.execute(
         "PRAGMA table_info(card_templates)").fetchall()}
-    return (
+    result = (
         "ct.rarity" if "rarity" in ct else "''",
         "ct.socket_count" if "socket_count" in ct else "0",
         "gc.gems" if "gems" in gc else "0",
         "gc.original_template_guid" if "original_template_guid" in gc else "''",
         "gc.card_abilities" if "card_abilities" in gc else "'[]'",
     )
+    with _TARGET_PROJECTION_LOCK:
+        _TARGET_PROJECTION_CACHE[cache_key] = result
+        _TARGET_PROJECTION_CACHE.move_to_end(cache_key)
+        while len(_TARGET_PROJECTION_CACHE) > _TARGET_PROJECTION_CACHE_LIMIT:
+            _TARGET_PROJECTION_CACHE.popitem(last=False)
+    return result
 
 
 def db_target_source_row(session_id, card_uid, conn=None):
@@ -3663,16 +3752,147 @@ def db_kill_card_to_discard(session_id, card_uid, clear_mask, dead_state,
 
 def db_transform_card_instance(session_id, card_uid, template_guid, card_type,
                                abilities_json, attributes, location, position,
-                               card_state, conn=None):
+                               card_state, conn=None,
+                               preserve_instance_state=False, gems=None):
     """Apply the canonical template projection for an existing card instance."""
+    connection = conn or _db_layer._db
+    if preserve_instance_state:
+        return connection.execute(
+            "UPDATE game_cards SET template_guid=?, card_template_id=?, "
+            "card_type=?, card_abilities=?, card_attributes=?, location=?, "
+            "position=?, card_state=?, gems=COALESCE(?,gems) "
+            "WHERE session_id=? AND card_uid=?",
+            (template_guid, template_guid, card_type, abilities_json,
+             int(attributes or 0), location, int(position), int(card_state),
+             gems, session_id, int(card_uid)))
     return (conn or _db_layer._db).execute(
         "UPDATE game_cards SET template_guid=?, card_template_id=?, "
         "card_type=?, card_abilities=?, card_attributes=?, "
         "temporary_attributes=0, temporary_buffs='{}', location=?, "
-        "position=?, card_state=? WHERE session_id=? AND card_uid=?",
+        "position=?, card_state=?, gems=COALESCE(?,gems) "
+        "WHERE session_id=? AND card_uid=?",
         (template_guid, template_guid, card_type, abilities_json,
          int(attributes or 0), location, int(position), int(card_state),
-         session_id, int(card_uid)))
+         gems, session_id, int(card_uid)))
+
+
+def db_capture_original_gems(session_id, card_uid, conn=None):
+    """Save a card's pre-transform active gems once, as C# does in Card."""
+    connection = conn or _db_layer._db
+    cursor = connection.execute(
+        "UPDATE game_cards SET original_gems=gems "
+        "WHERE session_id=? AND card_uid=? AND original_gems IS NULL "
+        "AND (original_template_guid IS NULL OR original_template_guid='' "
+        "OR original_template_guid=template_guid)",
+        (session_id, int(card_uid)))
+    if conn is None:
+        connection.commit()
+    return cursor.rowcount
+
+
+def db_card_original_gems(session_id, card_uid, conn=None):
+    """Return the active gems recorded before the card's first transform."""
+    row = (conn or _db_layer._db).execute(
+        "SELECT original_gems FROM game_cards "
+        "WHERE session_id=? AND card_uid=?", (session_id, int(card_uid))
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def db_copy_transform_instance_state(session_id, target_uid, source_uid, *,
+                                     is_replica=False, conn=None):
+    """Copy persisted ``Card.CopyFrom`` fields for TransformIntoCopy.
+
+    All copies take the source's active gems, card integer variables, and
+    escalation count. Ordinary copies also take damage and use state and add
+    the source's counters/shields. Active C# effect instances, activation data,
+    extended/resource-spend fields, and session-only boon maps are not
+    represented by these rows.
+    """
+    connection = conn or _db_layer._db
+    session_id = int(session_id)
+    target_uid = int(target_uid)
+    source_uid = int(source_uid)
+    with _CARD_COOLDOWN_LOCK:
+        target = connection.execute(
+            "SELECT gems, card_damage, card_uses, permanent_buffs, "
+            "temporary_buffs FROM game_cards "
+            "WHERE session_id=? AND card_uid=?", (session_id, target_uid)
+        ).fetchone()
+        source = connection.execute(
+            "SELECT gems, card_damage, card_uses, permanent_buffs, "
+            "temporary_buffs FROM game_cards "
+            "WHERE session_id=? AND card_uid=?", (session_id, source_uid)
+        ).fetchone()
+        if not target or not source:
+            return 0
+
+        def read_payload(value):
+            try:
+                parsed = json.loads(value or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        permanent = read_payload(target[3])
+        temporary = read_payload(target[4])
+        source_permanent = read_payload(source[3])
+        source_temporary = read_payload(source[4])
+
+        # Card.CopyFrom copies these fields even when making a replica.
+        source_variables = source_permanent.get("card_integer_variables", {})
+        if isinstance(source_variables, dict) and source_variables:
+            permanent["card_integer_variables"] = source_variables
+        else:
+            permanent.pop("card_integer_variables", None)
+        try:
+            permanent["escalation_count"] = int(
+                source_permanent.get("escalation_count", 1))
+        except (TypeError, ValueError):
+            permanent["escalation_count"] = 1
+
+        if is_replica:
+            return connection.execute(
+                "UPDATE game_cards SET gems=?, permanent_buffs=? "
+                "WHERE session_id=? AND card_uid=?",
+                (source[0], json.dumps(permanent, separators=(",", ":")),
+                 session_id, target_uid)).rowcount
+
+        target_counters = permanent.setdefault("counters", {})
+        source_counters = source_permanent.get("counters", {})
+        if isinstance(target_counters, dict) and isinstance(source_counters, dict):
+            for name, value in source_counters.items():
+                target_counters[name] = (
+                    int(target_counters.get(name, 0) or 0) + int(value or 0))
+        target_counter_guids = permanent.setdefault("counter_guids", {})
+        source_counter_guids = source_permanent.get("counter_guids", {})
+        if isinstance(target_counter_guids, dict) and isinstance(
+                source_counter_guids, dict):
+            target_counter_guids.update(source_counter_guids)
+
+        for destination, copied in ((permanent, source_permanent),
+                                    (temporary, source_temporary)):
+            existing = destination.get("damage_shields", [])
+            incoming = copied.get("damage_shields", [])
+            if not isinstance(existing, list):
+                existing = []
+            if isinstance(incoming, list) and incoming:
+                destination["damage_shields"] = existing + incoming
+        try:
+            source_uses = json.loads(source[2] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            source_uses = {}
+        if not isinstance(source_uses, dict):
+            source_uses = {}
+        return connection.execute(
+            "UPDATE game_cards SET gems=?, card_damage=?, card_uses=?, "
+            "permanent_buffs=?, temporary_buffs=? "
+            "WHERE session_id=? AND card_uid=?",
+            (source[0], int(source[1] or 0),
+             json.dumps(source_uses, separators=(",", ":")),
+             json.dumps(permanent, separators=(",", ":")),
+             json.dumps(temporary, separators=(",", ":")),
+             session_id, target_uid)).rowcount
 
 
 def db_warzone_card_state_attributes(session_id, card_uid, conn=None):
@@ -4318,12 +4538,18 @@ def db_move_card_if_in_zone(session_id, card_uid, owner_user_id, source_zone,
 
 
 def db_add_card_damage(session_id, card_uid, amount, conn=None):
-    """Add combat damage to one card; the caller owns the transaction."""
+    """Add damage to one card; the caller owns the transaction.
+
+    Like C# ``Session.DealDamage``, taking damage also sets
+    ``ECardStates.Damaged``, which ``IsDamagedThisTurn`` filters read.
+    """
     connection = conn or _db_layer._db
+    damaged = _DAMAGED_STATE_BIT if int(amount) > 0 else 0
     connection.execute(
-        "UPDATE game_cards SET card_damage = card_damage + ? "
+        "UPDATE game_cards SET card_damage = card_damage + ?, "
+        "card_state = COALESCE(card_state, 0) | ? "
         "WHERE session_id=? AND card_uid=?",
-        (int(amount), session_id, int(card_uid)),
+        (int(amount), damaged, session_id, int(card_uid)),
     )
 
 

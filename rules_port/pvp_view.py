@@ -28,6 +28,9 @@ def to_effect_view(state, player_id, opponent_id):
         "player_max_health": int(state.get(f"hp_{player_id}", 20)),
         "ai_max_health": int(state.get(f"hp_{opponent_id}", 20)),
         "turn_number": int(state.get("turn_number", 1)),
+        # Read-only: conditions such as "if it's your turn" compare the raw
+        # active participant; the view's player/ai sides are per-resolution.
+        "turn_pid": state.get("turn_pid"),
         "damaged_opponent_this_turn": list(
             state.get("damaged_opponent_this_turn") or []),
         "damaged_opponent_turn": int(
@@ -88,6 +91,8 @@ def to_effect_view(state, player_id, opponent_id):
                 "temporary_champion_int_attrs",
                 "talent_guids_by_owner", "escalation_counts_by_card"):
         view[key] = state.setdefault(key, {})
+    view["card_counter_cost_paid"] = state.setdefault(
+        "card_counter_cost_paid", {})
     return view
 
 
