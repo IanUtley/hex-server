@@ -1,6 +1,6 @@
 # Hex TCG Private Server — AI Assistant Instructions
 
-Always read `/home/ianutley/Hex/HOWTO.md` before making changes to this project.
+Always read `HOWTO.md` (repo root) before making changes to this project.
 HOWTO.md contains architecture docs, encoding rules, card zone events, database
 schema details, and client data format information.
 
