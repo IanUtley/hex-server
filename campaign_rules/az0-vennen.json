@@ -1,0 +1,75 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-vennen",
+ "scene": "AZ0 Vennen",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "Orzh",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "Orzh": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Vennen)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Vennen)",
+    "!conversation(Crayburn Castle - Vennen - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Vennen - Quest End)"
+   ]
+  },
+  "Zilth": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Vennen)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Vennen Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Vennen Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Vennen Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "Xarlot": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Vennen Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Vennen - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Vennen - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Vennen - Quest End)"
+   ]
+  }
+ },
+ "hooks": []
+}

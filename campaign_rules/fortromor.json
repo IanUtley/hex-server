@@ -1,0 +1,94 @@
+{
+ "schema_version": 1,
+ "campaign": "fortromor",
+ "scene": "Fort Romor",
+ "start": {
+  "node": "Node001",
+  "node_completed": true,
+  "flags": []
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_Node001_NodeA",
+    "from": "Node001",
+    "to": "NodeA"
+   },
+   {
+    "id": "Path_Node6_Node7",
+    "from": "Node6",
+    "to": "Node7"
+   },
+   {
+    "id": "Path_Node6_Node8",
+    "from": "Node6",
+    "to": "Node8"
+   },
+   {
+    "id": "Path_Node6_NodeC",
+    "from": "Node6",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_Node6_NodeD",
+    "from": "Node6",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_Node6_NodeE",
+    "from": "Node6",
+    "to": "NodeE"
+   },
+   {
+    "id": "Path_Node7_NodeA",
+    "from": "Node7",
+    "to": "NodeA"
+   },
+   {
+    "id": "Path_Node7_NodeB",
+    "from": "Node7",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_Node8_NodeB",
+    "from": "Node8",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_Node8_NodeC",
+    "from": "Node8",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_NodeA_NodeD",
+    "from": "NodeA",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_NodeD_NodeE",
+    "from": "NodeD",
+    "to": "NodeE"
+   }
+  ]
+ },
+ "quests": {},
+ "nodes": {
+  "NodeE": {
+   "completed": [
+    "flag(romor_adam_told)"
+   ],
+   "visible": [
+    "completed(NodeB)",
+    "completed(NodeC)",
+    "completed(NodeD)"
+   ]
+  }
+ },
+ "hooks": [],
+ "edited_states": {
+  "NodeE": [
+   "completed",
+   "visible"
+  ]
+ }
+}

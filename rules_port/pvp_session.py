@@ -209,6 +209,11 @@ class PvpAuthoritativeSession(AuthoritativeSession):
                 int(game_engine.ETurnPhases.Prep),
                 int(game_engine.ETurnPhases.Draw)}:
             return TurnPhasePlayers.NONE
+        # DeclareAttack is an active-player choice, not a response window.
+        # Stop preferences must not transfer it to the opponent, because the
+        # authored CommitTroopsToAttack transaction requires the active player.
+        if phase == int(game_engine.ETurnPhases.DeclareAttack):
+            return TurnPhasePlayers.ACTIVE
         if (phase == int(game_engine.ETurnPhases.Discard) and
                 state.get("discard_required")):
             return TurnPhasePlayers.ACTIVE
@@ -247,9 +252,22 @@ class PvpAuthoritativeSession(AuthoritativeSession):
         CommitTroopsToAttack/Defense consume their phase priority as part of
         the accepted transaction. The host projection publishes the resulting
         combat events; only after it returns can the native scheduler advance
-        and emit the next phase/options packet.
+        and emit the next phase/options packet. Persist that native phase back
+        into the PvP checkpoint before another request wrapper reads it.
         """
-        return self.drive_until_input(max_steps=max_steps)
+        steps = self.drive_until_input(max_steps=max_steps)
+        state = getattr(self, "_pvp_state", None)
+        if not isinstance(state, dict):
+            state = getattr(getattr(self, "runtime_facts", None),
+                            "battle_state", None)
+        if isinstance(state, dict) and state.get("pvp"):
+            self.sync_to_pvp_state(state)
+            session = getattr(self.snapshot_store, "game_session", None)
+            if session is not None:
+                from .persistence import save_pvp_state
+                save_pvp_state(session, state)
+            self.persist()
+        return steps
 
     def begin_pvp_turn(self, *, max_steps=128) -> int:
         """Leave mulligan and run the native first-turn lifecycle.

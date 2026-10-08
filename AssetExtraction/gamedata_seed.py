@@ -739,15 +739,14 @@ def _extract_encounters(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[An
         if not str(record.get("_t") or "").endswith("EncounterScene"):
             continue
         name = record.get("m_Name") or ""
-        # Keep the AZ0 training scenes and the race-specific Crayburn tutorial
-        # scenes used by campaign/FRA.  The latter carry the real encounter
+        # The AZ0 training scenes and the race-specific Crayburn tutorial
+        # scenes are used by campaign/FRA.  The latter carry the real encounter
         # deck-template mapping (for example Orc -> Vilefang), so omitting
         # them silently causes the battle setup to use placeholder cards.
-        if not (name.startswith("AZ0_") or
-                name.startswith("AZ 1") or name.startswith("AZ 2") or
-                " Tutorial Castle Gatehouse" in name or
-                " Tutorial Tower Gatehouse" in name or
-                " Tutorial Tower of Penworth" in name):
+        # Dungeon and other authored encounter scenes are kept as well so the
+        # campaign editor can author their rewards, actions and AI personality
+        # (the server only *plays* AZ1/AZ2/Crayburn today).
+        if not name:
             continue
         ai_deck = ""
         for player in record.get("m_EncounterPlayers") or []:
@@ -1036,13 +1035,9 @@ _QUEST_FACTIONS = {
 _QUEST_OWNER_FACTIONS = {
     "belarius": "Ardent", "takumi": "Underworld",
 }
-_QUEST_START_HOOKS = {
-    "az01_tamed": "az1_tamed_start",
-    "az01_q_cross_the_river": "az1_cross_the_river_start",
-    "q_seawitch": "az1_find_horwich_sea_start",
-    "az01_uw_find_cave_in": "az1_find_cave_in_start",
-    "az01_ar_find_ambling_mesa": "az1_find_ambling_mesa_start",
-}
+# Quest-start map changes (node visibility) are campaign editor data
+# (campaign_rules/AZ1.json); no quest is seeded with a start hook.
+_QUEST_START_HOOKS: dict[str, str] = {}
 
 
 def _normalise_quest_label(value: str) -> str:
@@ -1091,11 +1086,12 @@ def _conversation_role(label: str) -> str:
         return "complete"
     if "quest start" in lower:
         return "start"
-    # A number of authored records use ``<Quest> Quest`` without the words
-    # ``Quest Start``.  Treat that generic conversation as another start
-    # variant; the per-champion quest row makes the operation idempotent.
+    # A generic ``<Quest> Quest`` record (Takumi's "Tamed Quest" at the
+    # Cave-In: "have you tried taming any beasts like I told you?") is the
+    # quest-giver's in-progress check-in, not a start: the quest is granted
+    # by the welcome conversation.
     if re.search(r"\bquest\b", lower):
-        return "start"
+        return "not_complete"
     return ""
 
 
@@ -1235,7 +1231,7 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
-_EXTRACT_CACHE_VERSION = 3
+_EXTRACT_CACHE_VERSION = 5   # 5: no quest start hooks (editor data owns map gates)
 
 
 def _extract_cache_file(cache_key: str) -> str:

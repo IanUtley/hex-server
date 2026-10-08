@@ -13,6 +13,11 @@ def _thresholds(state, player_id):
     return result
 
 
+# effect_lifetimes ledgers: lists of duration-bound grants and writes.
+_LIFETIME_LIST_KEYS = ("temporary_ability_grants", "temporary_card_int_attrs",
+                       "temporary_champion_int_attrs", "temporary_card_stats")
+
+
 def to_effect_view(state, player_id, opponent_id):
     """Return a side-oriented view while aliasing mutable stack state."""
     if not isinstance(state, dict):
@@ -88,9 +93,16 @@ def to_effect_view(state, player_id, opponent_id):
                 "stored_targets", "champion_int_attrs",
                 "stored_targets_by_card",
                 "stored_targets_by_card_this_turn",
-                "temporary_champion_int_attrs",
                 "talent_guids_by_owner", "escalation_counts_by_card"):
         view[key] = state.setdefault(key, {})
+    # Duration ledgers (effect_lifetimes) are lists. Alias them too so a
+    # "this turn"/"until your next turn" grant recorded while resolving in
+    # the view reaches the checkpoint the turn boundary later expires from.
+    for key in _LIFETIME_LIST_KEYS:
+        value = state.get(key)
+        if not isinstance(value, list):
+            value = state[key] = []
+        view[key] = value
     view["card_counter_cost_paid"] = state.setdefault(
         "card_counter_cost_paid", {})
     return view
@@ -146,10 +158,13 @@ def apply_effect_view(state, view, player_id, opponent_id):
                 "stored_targets", "champion_int_attrs",
                 "stored_targets_by_card",
                 "stored_targets_by_card_this_turn",
-                "temporary_champion_int_attrs",
                 "talent_guids_by_owner", "escalation_counts_by_card"):
         if key in view:
             state[key] = dict(view.get(key) or {})
+    for key in _LIFETIME_LIST_KEYS:
+        if key in view:
+            value = view.get(key)
+            state[key] = value if isinstance(value, list) else []
     if "stack" in view:
         state["stack"] = view["stack"]
     if "_next_instance_id" in view:

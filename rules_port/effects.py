@@ -885,6 +885,24 @@ def _card_cost(context, target, param):
     else:
         db_add_card_cost_modifier(
             context.session.session_id, int(target), amount, conn=context.db)
+        if duration in ("BeginningOfOwnersTurn",
+                        "AfterCardsReadyOnPlayersTurn"):
+            # "Cost [(1)] until the start of your next turn" (Thk'tatcha) is
+            # reversed at the owner's boundary instead of staying forever.
+            from .effect_lifetimes import record_temporary_stat
+            resolving_owner = int(
+                context.bstate.get("resolving_owner_id", 0) or 0)
+            expiration_owner = (
+                resolving_owner if duration == "BeginningOfOwnersTurn"
+                else int(context.target_owner(
+                    int(target), default=resolving_owner) or 0))
+            from pvp_db import db_card_location
+            record_temporary_stat(
+                context.bstate, int(target), 0, 0, duration=duration,
+                owner_id=expiration_owner, cost=int(amount),
+                location=db_card_location(
+                    context.session.session_id, int(target), conn=context.db),
+                source_uid=context.bstate.get("resolving_source_uid"))
     context.db.commit()
     row = db_card_zone_details(
         context.session.session_id, int(target), conn=context.db)

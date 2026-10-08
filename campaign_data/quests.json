@@ -1,0 +1,74 @@
+{
+ "schema_version": 1,
+ "tables": {
+  "quest_templates": [
+   {
+    "script_name": "az01_ar_find_ambling_mesa",
+    "rewards_json": {
+     "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+     "card_guid_by_race": {
+      "Coyotle": "ccb1ff54-7ec8-40da-8fee-edb47088baa8",
+      "Elf": "cbe436a8-f2e1-4b0f-ba0b-f6c03cada4f2",
+      "Human": "e82bf676-2f7d-4f61-a3c4-51639a03b1b5",
+      "Orc": "57755e0a-2714-412f-bc77-1af48e5bdd55"
+     }
+    }
+   },
+   {
+    "script_name": "az01_uw_find_cave_in",
+    "rewards_json": {
+     "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+     "card_guid_by_race": {
+      "Dwarf": "2d4a9914-91b8-46c2-a08d-4164b123befe",
+      "Necrotic": "6c7da206-8693-4df8-993a-2f9aa5e0c349",
+      "Shin'hare": "87623711-9085-40fe-b656-c99026c87b7a",
+      "Vennen": "d415df01-337e-465c-8409-92f8670f1ceb"
+     }
+    }
+   },
+   {
+    "script_name": "az01_q_cross_the_river",
+    "rewards_json": {
+     "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+     "item_guid_by_race": {
+      "Coyotle": "d1799dff-0ed3-4661-826f-c256521a9f98",
+      "Dwarf": "12bc0098-4711-470a-8e67-751cf8f8b522",
+      "Elf": "93ab440b-4cb8-4e33-84a2-6a703ff98ee7",
+      "Human": "7bdee007-e1b9-4c9c-96a0-31d2a9f4c179",
+      "Necrotic": "f1418009-ae0f-49dc-bb9f-ec64426776c3",
+      "Orc": "8ba3b68a-ed55-40a8-a30f-ae8b86400e11",
+      "Shin'hare": "36e048f3-5f09-48ae-b99f-22b2f6768199",
+      "Vennen": "09303fe4-de67-4a0f-bf41-22b80983b504"
+     }
+    }
+   },
+   {
+    "script_name": "az01_q_cross_the_river_part2",
+    "rewards_json": {
+     "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+     "card_guid_by_race": {
+      "Coyotle": "ff2165e8-0396-4e68-a7ca-7d95ec1052a0",
+      "Dwarf": "572be440-0f92-4152-8aa6-f09b2a76c5eb",
+      "Elf": "7e67acb6-4cd3-4107-bb50-4c3b088a85b3",
+      "Human": "6b0637fe-cf0a-4d91-9954-06c55f40ad6d",
+      "Necrotic": "61b17836-5c7e-4092-a074-3dd27104291b",
+      "Orc": "03ff50ca-1e2a-4190-9513-eab2e91e9194",
+      "Shin'hare": "043e8e48-ee7e-474d-8489-22f4eefb3208",
+      "Vennen": "75c26b27-66fe-4700-a584-967ab12b15e7"
+     }
+    }
+   },
+   {
+    "script_name": "q_gnomes_come_home",
+    "rewards_json": {
+     "cards": [
+      {
+       "guid": "0508927a-0e01-45c7-9413-81159898323c",
+       "quantity": 1
+      }
+     ]
+    }
+   }
+  ]
+ }
+}

@@ -1,0 +1,75 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-human",
+ "scene": "AZ0 Human",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "CaptainCedric",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "CaptainCedric": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Human)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Human)",
+    "!conversation(Crayburn Castle - Human - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Human - Quest End)"
+   ]
+  },
+  "GarethKay": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Human)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Human Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Human Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Human Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "ColonelSterling": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Human Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Human - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Human - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Human - Quest End)"
+   ]
+  }
+ },
+ "hooks": []
+}

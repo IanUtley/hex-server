@@ -500,12 +500,34 @@ def _choose_ai_explicit_target_map(handler, session, battle_state,
         # Target selection must not make an otherwise resolvable ability fail
         # because a legacy/incomplete AI snapshot is unavailable.
         return None
-def _exhausted_cost_cards(ability):
-    """Cards exhausted to pay ``ability``'s additional costs.
+# C# PayCardActionCost appends each paid card to the ability instance list
+# that list-attr variables read ("for each troop exhausted this way",
+# "equal to the voided troop's [ATK]").
+_COST_LIST_NAMES = {
+    "exhaust": "ExhaustedCards",
+    "void": "VoidedCards",
+    "sacrifice": "SacrificedCards",
+    "discard": "DiscardedCards",
+}
 
-    C# records them in the ability instance's ``ExhaustedCards`` list, which
-    CountListAttr variables read ("for each troop exhausted this way" on the
-    Construction Plans).  The activation keeps each cost's selection by its
+
+def _cost_card_lists(ability):
+    """Return ``{list_name: [uid, ...]}`` for every paid card-cost kind."""
+    out = {}
+    for kind, list_name in _COST_LIST_NAMES.items():
+        uids = _exhausted_cost_cards(ability, kind=kind)
+        if uids:
+            out[list_name] = uids
+    return out
+
+
+def _exhausted_cost_cards(ability, kind="exhaust"):
+    """Cards paid for one kind of ``ability``'s additional costs.
+
+    C# records exhausted cards in the ability instance's ``ExhaustedCards``
+    list, which CountListAttr variables read ("for each troop exhausted this
+    way" on the Construction Plans); other card costs have their own lists
+    (``_COST_LIST_NAMES``).  The activation keeps each cost's selection by its
     index in the graph's additional cost targets.
     """
     metadata = getattr(ability, "metadata", None)
@@ -517,11 +539,13 @@ def _exhausted_cost_cards(ability):
     cost_map = getattr(activation, "cost_target_map", {}) or {}
     target_map = getattr(activation, "target_map", {}) or {}
     out = []
-    for index, (kind, _guid) in enumerate(costs):
-        if str(kind).lower() != "exhaust":
+    for index, (cost_kind, _guid) in enumerate(costs):
+        if str(cost_kind).lower() != kind:
             continue
         selected = cost_map.get(index, cost_map.get(str(index)))
-        if not selected:
+        if not selected and kind == "exhaust":
+            # Mono flattens exhaust selections into TargetMap; other kinds
+            # are only trusted from the dedicated cost map.
             selected = target_map.get(index, target_map.get(str(index)))
         if selected is None:
             continue
@@ -600,10 +624,19 @@ class NativeEffectBackend:
         # summoned no Spider).  The legacy resolver sets the same key; mirror
         # it here, then restore the caller's value on exit.
         battle_state["session_id"] = int(session.session_id)
-        exhausted = _exhausted_cost_cards(ability)
-        if exhausted:
-            battle_state.setdefault("ability_lists", {})[
-                "ExhaustedCards"] = exhausted
+        for list_name, paid in _cost_card_lists(ability).items():
+            # Union with anything the host's cost payment already recorded
+            # for this activation; the activation's own cost map survives the
+            # chain round trip even when the host's flat list did not (PvP
+            # Bun'jitsu summoned a bare 3/3 Abomination).
+            lists = battle_state.setdefault("ability_lists", {})
+            if list_name == "ExhaustedCards":
+                lists[list_name] = list(paid)
+                continue
+            current = lists.get(list_name)
+            current = list(current) if isinstance(current, list) else []
+            current.extend(uid for uid in paid if uid not in current)
+            lists[list_name] = current
         battle_state["resolving_ability"] = ability.ability_template_id
         battle_state["resolving_source_uid"] = ability.source_uid
         battle_state["resolving_owner_id"] = int(

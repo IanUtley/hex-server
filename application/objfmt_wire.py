@@ -158,6 +158,12 @@ def parse_datawrapper(body, *, preserve_complex=False):
                     v = body[idx:idx+slen].decode("utf-8")
                     idx += slen
                     vals.append(v)
+                elif elem_type == "System.Byte[]":
+                    raw_len = struct.unpack("!I", body[idx:idx+4])[0]
+                    idx += 4
+                    v = bytes(body[idx:idx+raw_len])
+                    idx += raw_len
+                    vals.append(v)
                 else:
                     # Complex list elements (notably
                     # AbilityActivationData) carry their own property count
@@ -201,5 +207,4 @@ def parse_datawrapper(body, *, preserve_complex=False):
         result[fn] = fv
 
     return result
-
 

@@ -157,12 +157,10 @@ def finish_resolving_card(host, session, db, game, state, player_uid,
             game_engine.ECardStates.Tapped |
             game_engine.ECardStates.StartedATurnOnYourSide)
         entering_state |= int(game_engine.ECardStates.CameOutThisTurn)
-        if attributes & game_engine.ECardAttributes.EntersPlayExhausted:
+        from .static_rules import card_enters_play_exhausted
+        if card_enters_play_exhausted(db, session.session_id, state, uid,
+                                      owner_id, template_guid):
             entering_state |= int(game_engine.ECardStates.Tapped)
-        if card_type & game_engine.ECardTypes.Troop:
-            from .static_rules import opposing_enters_play_exhausted
-            if opposing_enters_play_exhausted(state, owner_id, template_guid):
-                entering_state |= int(game_engine.ECardStates.Tapped)
         db_set_card_location(
             session.session_id, uid, destination,
             extra_set="position=?, card_state=?",
@@ -492,8 +490,9 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
         if state.get("resolution_paused"):
             return
         entering_state = game_engine.ECardStates.CameOutThisTurn
-        from .static_rules import opposing_enters_play_exhausted
-        if opposing_enters_play_exhausted(state, owner_id, row[0]):
+        from .static_rules import card_enters_play_exhausted
+        if card_enters_play_exhausted(
+                db, session.session_id, state, source_uid, owner_id, row[0]):
             entering_state |= game_engine.ECardStates.Tapped
         db_set_card_location(
             session.session_id, source_uid, "warzone",
@@ -505,10 +504,13 @@ def resolve_card_item(host, session, db, game, state, item, player_uid,
             mark_entry(session, source_uid)
         _tpl, ctype, _name, cost, attack, defense, gems = cast(
             Any, card_data(host, game, scid, row[0]))
+        from pvp_db import db_card_state_value
         game.push_card_updated(
             scid, owner_sid, game_engine.ECardCollections.Warzone, ctype,
             template_id=row[0], cost=cost, attack=attack, defense=defense,
-            gems=gems)
+            gems=gems,
+            state=int(db_card_state_value(
+                session.session_id, source_uid, conn=db) or 0))
         if ctype & game_engine.ECardTypes.Artifact:
             game.push_artifact_card_played(scid, owner_sid)
         else:

@@ -896,6 +896,16 @@ def db_campaign_clear_state(campaign_id, conn=None):
         "UPDATE campaigns SET state_json=NULL WHERE id=?", (campaign_id,))
 
 
+def db_campaign_delete_for_champion(champion_id, conn=None):
+    """Delete every campaign row of a champion (restart from the AZ0 start)."""
+    connection = _connection(conn)
+    count = connection.execute(
+        "DELETE FROM campaigns WHERE champion_id=?", (champion_id,)).rowcount
+    connection.execute(
+        "UPDATE champions SET last_campaign_id=0 WHERE id=?", (champion_id,))
+    return count
+
+
 def db_campaign_set_last_campaign(champion_id, campaign_id, conn=None):
     _connection(conn).execute(
         "UPDATE champions SET last_campaign_id=? WHERE id=?",
@@ -1083,7 +1093,7 @@ def db_panorama_quest_rows(node, conn=None):
     return _connection(conn).execute(
         "SELECT qc.quest_script, qc.conversation_guid, qc.role, qc.faction, "
         "qc.npc, qc.priority, COALESCE(NULLIF(qc.start_hook, ''), "
-        "NULLIF(qt.start_hook, ''), '') "
+        "NULLIF(qt.start_hook, ''), ''), COALESCE(qc.conditions_json, '{}') "
         "FROM quest_conversations qc "
         "LEFT JOIN quest_templates qt ON qt.script_name=qc.quest_script "
         "WHERE qc.campaign_template='AZ1' AND qc.node_id=? "
@@ -1110,6 +1120,47 @@ def db_node_conversation_rows(node, campaign_template="AZ1", conn=None):
         (str(campaign_template or "AZ1"), str(node))).fetchall()
 
 
+def db_conversation_name(conversation_guid, conn=None):
+    """Return the authored name of a catalogued campaign conversation."""
+    guid = str(conversation_guid or "").lower()
+    connection = _connection(conn)
+    for table in ("campaign_node_conversations", "quest_conversations"):
+        row = connection.execute(
+            f"SELECT conversation_name FROM {table} "
+            "WHERE LOWER(conversation_guid)=? LIMIT 1", (guid,)).fetchone()
+        if row and row[0]:
+            return row[0]
+    return None
+
+
+def db_conversation_action_tables(conversation_guid, conn=None):
+    """Return the editor's ending-action tables (``{ending|"*": [action]}``)
+    authored on a conversation's node and quest rows."""
+    guid = str(conversation_guid or "").lower()
+    connection = _connection(conn)
+    tables = []
+    for sql in ("SELECT trigger_json FROM campaign_node_conversations "
+                "WHERE LOWER(conversation_guid)=? AND enabled=1",
+                "SELECT conditions_json FROM quest_conversations "
+                "WHERE LOWER(conversation_guid)=? AND enabled=1"):
+        for (raw,) in connection.execute(sql, (guid,)).fetchall():
+            try:
+                actions = (json.loads(raw or "{}") or {}).get("actions")
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if isinstance(actions, dict):
+                tables.append(actions)
+    return tables
+
+
+def db_quest_template_start(quest_script, conn=None):
+    """Return ``(start_hook, campaign_group)`` for a quest template, or None."""
+    return _connection(conn).execute(
+        "SELECT COALESCE(start_hook, ''), COALESCE(campaign_group, 'AREA') "
+        "FROM quest_templates WHERE script_name=?",
+        (str(quest_script),)).fetchone()
+
+
 def db_panorama_npc_quest_scripts(node, npc, conn=None):
     """Return quest scripts associated with an AZ1 node/NPC pair."""
     return _connection(conn).execute(
@@ -1122,6 +1173,14 @@ def db_encounter_scene_rewards(scene_guid, conn=None):
     """Return the authored serialized rewards for one encounter scene."""
     row = _connection(conn).execute(
         "SELECT rewards_json FROM encounter_scenes WHERE guid=?",
+        (str(scene_guid),)).fetchone()
+    return row[0] if row else None
+
+
+def db_encounter_scene_actions(scene_guid, conn=None):
+    """Serialized ``{"pre"|"victory"|"defeat": [action]}`` for one scene."""
+    row = _connection(conn).execute(
+        "SELECT actions_json FROM encounter_scenes WHERE guid=?",
         (str(scene_guid),)).fetchone()
     return row[0] if row else None
 
@@ -1268,7 +1327,8 @@ def db_quest_start_rows(conversation_guid, campaign_template, conn=None):
 def db_quest_node_rows(node, conn=None):
     """Return enabled AZ1 quest conversations for one node."""
     return _connection(conn).execute(
-        "SELECT quest_script, conversation_guid, role, faction "
+        "SELECT quest_script, conversation_guid, role, faction, "
+        "COALESCE(conditions_json, '{}') "
         "FROM quest_conversations WHERE campaign_template='AZ1' "
         "AND node_id=? AND enabled=1 ORDER BY priority, conversation_guid",
         (str(node),)).fetchall()
@@ -1279,6 +1339,13 @@ def db_conversation_reward(conversation_guid, conn=None):
     return _connection(conn).execute(
         "SELECT reward_json, one_time, enabled FROM conversation_rewards "
         "WHERE conversation_guid=?", (str(conversation_guid),)).fetchone()
+
+
+def db_quest_template_reward(quest_script, conn=None):
+    """``(rewards_json, enabled)`` for a quest's completion reward, or None."""
+    return _connection(conn).execute(
+        "SELECT rewards_json, enabled FROM quest_templates WHERE script_name=?",
+        (str(quest_script),)).fetchone()
 
 
 def db_fortune_card_guids(set_guid, conn=None):

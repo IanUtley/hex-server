@@ -17735,10 +17735,15 @@ class HCPHandler(ProfileStreamMixin):
                     f"challenge={(fra_mod_setup.get('challenge') or {}).get('challenge_name', 'none')}, "
                     f"mods={len(fra_mod_setup.get('modifications') or [])}")
 
+            campaign_encounter_conversation_guid = None
+            campaign_mod_choice_guid = None
             if is_campaign:
                 camp_id = int((session.session_name or "camp_0").split("_")[-1] or 0)
                 cfg = campaign.resolve_battle_config(
                     self, _db, camp_id, session.session_name)
+                campaign_encounter_conversation_guid = cfg.get(
+                    "encounter_mod_conversation_guid")
+                campaign_mod_choice_guid = cfg.get("encounter_mod_choice_guid")
                 scene_guid = cfg["scene_guid"]
                 ai_deck_guid = cfg["ai_deck_guid"]
                 ai_champ_guid = cfg["ai_champ_guid"]
@@ -18279,6 +18284,11 @@ class HCPHandler(ProfileStreamMixin):
                         scene_mods = _aj.loads(scene_mods_json or "[]")
                     except (TypeError, ValueError):
                         scene_mods = []
+                    # A "choice" mod (card-selector battle) applies only the
+                    # card the player picked; unpicked options are dropped.
+                    import campaign_rules as _campaign_rules
+                    scene_mods = _campaign_rules.chosen_scene_mods(
+                        scene_mods, campaign_mod_choice_guid)
                     # A card attached to a concrete encounter player is a
                     # hidden battleboard controller, not a scene-wide grant.
                     # The scene metadata can also repeat that card in a
@@ -18676,6 +18686,15 @@ class HCPHandler(ProfileStreamMixin):
             self._ai_starting_health = game.ai_health
             log_req(f"    PreGame: player health {game.player_health}, AI health {game.ai_health}")
             game.push_turn_phase(game_engine.ETurnPhases.PreGame)
+            if campaign_encounter_conversation_guid:
+                event = game._make_event(
+                    game_engine.EncounterModDialogSessionEventArgs)
+                event.player_id = pl_uid_t
+                event.conversation_template_id = game_engine.ResourceId.from_str(
+                    campaign_encounter_conversation_guid)
+                game._push(event)
+                log_req("    Campaign encounter conversation queued internally: "
+                        f"{campaign_encounter_conversation_guid[:8]}")
             if fra_mod_setup:
                 # A challenge can carry dialogue without one of the supported
                 # round-zero mod classes.  Queue the saved challenge

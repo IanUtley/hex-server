@@ -138,11 +138,220 @@ from `conversation_rewards`: the latter records what a completed conversation
 grants, while this table records which conversation can be triggered at a
 node.
 
+`tools/campaign_editor/` is a local read-only viewer for AZ1: the client's node
+layout over the extracted terrain, joined to SceneData, conversations,
+encounter scenes and quests, with a per-champion live-state overlay. See its
+README for how to extract the assets and run it.
+`campaign_rules/AZ1.json` (evaluated by `campaign_rules.py`) is the
+declarative form of the AZ1 node gates, offers, hooks and quest steps that
+`campaign.py` currently implements in code; the editor simulates it. The
+server does not drive the campaign from it yet; the opt-in
+`campaign_shadow.py` (`CAMPAIGN_RULES_SHADOW=1` or `!campaign_rules on|off|diff|reset`)
+only compares the engine's AZ1 AREA map state against what legacy sends
+(visible/completed/repeatable/blocked) and logs differences.
+
 The checked-in `SceneData` records contain node metadata but do not contain the
 map path graph. The `campaign_node_edges` seed is extracted from the client
 `Nodes`/`Paths` prefab roots in `Hex_Data/resources.assets`: 80 AZ1 paths and
 94 AZ2 paths, stored bidirectionally. Deriving edges from `m_ItemData` order
 would create false routes.
+
+### Playing the starter run (AZ0 -> Crayburn -> AZ1)
+
+- **Real game:** `!campaign-restart confirm` deletes every campaign row of the
+  profile's newest champion and recreates the AZ0 starter panorama; re-select
+  the champion. The server's normal transitions then lead through Crayburn
+  into AZ1. Without `confirm` it only explains what it would delete.
+- **Editor / engine:** `python3 tools/campaign_editor/playthrough.py [Race]`
+  auto-plays the same run through `campaign_rules` (all 8 races reach AZ1).
+
+### Quest-driven map gates
+
+Which AZ1 nodes a quest reveals, hides, blocks or marks is data, not code:
+`campaign_rules/AZ1.json` `nodes.<id>.visible|hidden|blocked|marker` (edit them
+with the node-state tag editor). `campaign_gates.apply` evaluates them against
+the champion's quest rows and conversation flags and writes the `PublicState`
+lists `_az1_reveal_neighbors` reads; `_sync_az1_quest_gates` runs it on every
+state rebuild and `_grant_quests_for_conversation` runs it the moment a quest
+starts. The `az1_*_start` visibility hooks (Find Cave-In / Ambling Mesa / Horwich
+Sea, Tamed, Cross the River / Zodiac) are gone, and their names are cleared from
+existing databases; a tagged quest start row is offered whenever its editor tags
+hold. No start hooks remain (the former `az1_smoldering_dead_start`, which moved
+the Smoldering Dead battle onto Brink Ridge, was wrong: that battle stays inside
+the Tomb of the Rose Knights dungeon). Brink Ridge's blockade nodes
+(Node021/023/077) remain in `_az1_reveal_neighbors`.
+
+Node colours on the client map come from `UIDungeonMapNode`: completed is
+green, `impassable` red, repeatable blue, visited yellow, otherwise gray. A
+location's `/impassable` field also stops the character token there until the
+location is completed. The `impassable` node state in `campaign_rules/AZ1.json`
+drives it (`campaign_gates.apply` writes it to the location). It is not the
+same as `blocked`: a blocked node is hidden and cannot be reached unless already
+visited, while an impassable node is reachable but cannot be passed through.
+Brink Ridge is impassable once visited and until `flag(blockade_cleared)`; its
+northbound neighbours (Node021/023/077) are blocked over the same period.
+
+### Scene reward conditions
+
+An encounter scene's reward entry (`encounter_scenes.rewards_json`, edited from
+the node's scene card -> *Rewards...*, saved to `campaign_data/encounter_scenes.json`) is
+gated only by `when`: `flag(X)` tags. After a won battle the server turns the
+battle's events (currently `tamed_troop`, from the Tamed IntAttr on an opponent
+troop) into flags through the AZ1 rules hooks (`encounter_victory` + `scene` +
+`events`) and stores them in the campaign's public data, where `flag(X)` tags
+read them. A Tamed scene therefore pays `{"when": ["flag(tamed:150b0ed9)"],
+"card_guid": <Dire Toad>}`; the same flag completes the node. A
+conversation ending named `Diff_<N>` (Army of Myth's difficulty choice) is also
+a battle event for the next won battle, so `flag(battle:<scene8>:Diff_6)` gates
+a reward on that level; the importer generates its hook. The old
+`end_of_game_condition` / `$condition.template_guid` form is still understood by
+the server but the editor no longer writes it.
+
+### Stardust rewards
+
+Any reward object (quest rewards, scene entries, conversation rewards) may carry
+`"stardust": [{"rarity": "common|uncommon|rare|legendary|promo", "amount": N,
+"probability": P}]`. Each entry is rolled independently when the reward is
+granted (`probability` is a percentage, default 100); a hit adds the stardust to
+the player's inventory item and stardust ledger and appears in the reward window.
+Both reward editors have a Stardust section for these.
+
+### Item art in the reward editors
+
+`python3 AssetExtraction/extract_item_icons.py` extracts thumbnails of equipment,
+chests/packs, stardust, gems and mercenaries from the client's
+`AssetBundles/general/icons.ab` into `tools/campaign_editor/generated/items/`
+(git-ignored; keyed by the Records `m_ArtNumber`, with an `index.json` from item
+GUID to art). `python3 AssetExtraction/extract_card_art.py` does the same for
+cards from `AssetBundles/cardsets/*.harc` into `generated/cards/`. The reward
+dialogs show the picked item's picture beside each chest, equipment, stardust
+and card picker, and the quest and scene summaries show a strip of pictures.
+
+### AZ1 quest dependencies (read from the Ardent and Underworld playthroughs)
+
+The start conversations at Ambling Mesa (Ardent) / the Cave-In (Underworld) carry
+prerequisite `completedQuest(X)` tags, so an NPC only offers a quest once its
+predecessor is finished (the panorama NPC list follows these tags):
+
+| Quest start (giver) | Requires |
+|---|---|
+| Army of Myth (Myaa), Gnomes Come Home (Vincent) | Tranquil Dream |
+| The Usurper (Sagebrush) / Fort Romor (Wyatt) | Army of Myth |
+| Smoldering Dead (Myaa) | Army of Myth **and** The Usurper / Fort Romor |
+| River of Whispers (`q_go_to_az2`: Sagebrush / Wyatt "starts AZ2") | The Usurper / Fort Romor |
+| Devonshire Keep (Myaa) | Smoldering Dead |
+| Cross the Zodiac River (Wallace) | Cross the Zila River |
+| Blood Beneath (Gurtok / Rizzix) | Tamed *(inferred: not offered at the first visit or after Tranquil Dream, offered at the Tamed turn-in visit)* |
+
+No prerequisite: Sea Hag (Kian / Ennis), Tranquil Dream (completes Find the Ambling
+Mesa / Cave-In). Evidence and timestamps: `~/hex-playthroughs/*/QUEST_TIMELINE.md`,
+`AMBLING_MESA.md`.
+
+### Encounter scenes are owned by the editor
+
+`campaign_data/encounter_scenes.json` holds the full definition of every
+encounter scene (336 of them): name, title, gameboard, deck, champion, mods,
+rewards, actions and AI personality. `static.ensure_schema` builds the
+`encounter_scenes` table from it at every start (`campaign_data.apply_encounter_scenes`);
+the Records seed no longer creates scene rows and the old reward "repair" code
+is gone. A blank `ai_deck_personality` means auto (the deck evaluator fills it).
+Every editor save for a scene writes this file. Regenerate or refresh it with
+`python3 tools/campaign_editor/import_encounter_scenes.py` (`--from-records` to
+rebuild from the Records, keeping authored values). Encounter *deck cards* still
+come from the Records.
+
+### Encounter scene mods
+
+`encounter_scenes.mods_json` is a list of `{title, description, mods: [{guid}],
+target?, round?}`. With no `target` it is a scene-wide modifier shown to the
+player (the card GUIDs are the mod cards); with `target` (`AIPlayer` / `Player`)
+the cards go into that side's setup at `round` when the battle is created. The
+scene card's **Mods...** button edits it (card pickers by name or GUID) and saves
+to `campaign_data/encounter_scenes.json`. All 336 Records encounter scenes - including the
+dungeons' - are now in `encounter_scenes`, so every scene can carry rewards,
+actions, mods and an AI personality.
+
+**Card-selector battles.** A mod entry with `"choice": true` lists cards the
+player picks one of before the battle (the client's
+`UICampaignBattleWithCardSelectorDetails`). Each card may carry `when` (tags;
+offered only while they hold) and `pre` / `victory` / `defeat` flag actions
+that run, alongside the scene's own actions, only when it was the card chosen:
+
+```json
+{"title": "Fort defences", "choice": true, "mods": [
+  {"guid": "<Choose Sniper Tower>", "when": ["flag(romor_sniper_tower)"],
+   "victory": ["clear_flag(romor_sniper_tower)"]}]}
+```
+
+When an encounter location is offered (`_offer_mod_choice`), the server
+evaluates the options. With any on offer the location becomes
+`ModChoiceEncounter`, its `modlistId` is `/mod_choice_list` and the offered
+GUIDs go in `PublicState.Data.mod_choice_list` (only the client's
+`UIDungeonZoneViewModel`, used by dungeons and the AREA map, handles it).
+With none on offer it stays a normal `Encounter`. The client sends the pick
+as `start`'s `OParms[0]`. The server keeps it in `ActiveEncounterModChoice`
+only if it was offered, and battle setup applies just that card
+(`campaign_rules.chosen_scene_mods`). The "Choose X" cards are AI-side
+hidden setup cards ("each opposing champion summons ..."), so leave
+`target` blank. In the editor, tick *Player picks one* in **Mods...**; the
+simulator then shows a *Win with X* / *Lose with X* button per offered card.
+
+### Encounter AI personality
+
+`encounter_scenes.ai_deck_personality` (Default, Aggressive, BigThreats,
+BuildArmy, Burn, HandAdvantage, Reanimation) drives the AI's card valuation.
+At startup `ai_deck_strategy.evaluate_deck_strategy` (the Python deck
+evaluator, via `evaluate_fra_deck_personalities.py`) fills every blank scene
+from its deck; it never overwrites a scene that already has a value. The scene
+card's **AI personality** selector shows the evaluator's pick ("Auto - X", with
+its per-strategy scores as a tooltip) and saves an override to
+`campaign_data/encounter_scenes.json` (`ai_deck_personality`), applied at server start
+after the evaluator, so an authored value always wins. Choosing Auto removes
+the override.
+
+### Scene actions
+
+`encounter_scenes.actions_json` (`{"pre": [...], "victory": [...], "defeat": [...]}`,
+edited from a scene card -> *Actions...*, saved to `campaign_data/encounter_scenes.json`)
+holds `set_flag(X)` / `clear_flag(X)` actions run when the battle starts, is won
+or is lost. The flags are stored in the campaign's public data (`flag(X)` tags,
+reward `when` entries and node gates read them); the editor rebuilds them live as
+`scene:<scene8>:<trigger>` rules hooks so the simulator agrees.
+
+`check_tamed()` (victory only) is the taming check: the server looks for a troop
+carrying the persisted `Tamed` marker in the opponent's void
+(`void_tamed_troop`) and, if one is there, sets `tamed:<scene8>` (first 8
+characters of the scene GUID). Taming scenes gate their card reward on
+`when: flag(tamed:<scene8>)`, and the node only completes once that flag is
+set; a win without a tame leaves it retryable. The five AZ1 taming scenes
+(Wild Cub, Cockatwice Chick, Foul Fae, Diamonds Furever, Old Dirty Bustard)
+carry it. In the simulator, "Win (tamed)" stands in for the void check. Army of Myth
+sets `battle:0b1d5244:Diff_0` on its first win, which is what unlocks its
+level-select conversation.
+
+### Quest completion rewards
+
+The AZ1 quest rewards (Find the Ambling Mesa / Cave-In, Cross the Zila River,
+Cross the Zodiac River, Gnomes Come Home) are authored in
+`campaign_data/quests.json`; the server grants a quest's reward when the
+conversation that finishes the quest completes (`_grant_finished_quest_rewards`).
+Encounter-specific cards (Blood Beneath, Army of Myth, Sea Witch, Wormoid Queen,
+Tamed troops) are scene reward entries in `campaign_data/encounter_scenes.json`.
+
+A quest's completion reward lives on the quest (`quest_templates.rewards_json`,
+edited under the editor's **Quests** tab -> *Rewards...*, saved to
+`campaign_data/quests.json`) and is granted once per champion when the quest
+completes. A conversation finishes a quest with the ending action
+`complete_quest(<script>)` and starts one with `start_quest(<script>)`
+(afterwards `questStarted(X)` / `completedQuest(X)` hold). Quest conversations
+(`quest_conversations`) default to these by role - *start* runs `start_quest`,
+*complete* runs `complete_quest` - and the editor's Actions... saves an
+override to `conditions_json.actions`. The generated AZ1 rules no longer carry
+`start:` hooks. The Crayburn quest (`az01_q_dwarf_crayburn`) is
+completed by each race's *Quest End* conversation; its 150 gold / 500 xp / race
+chest now belong to the quest (`chest_guid_by_race`), not to eight conversation
+rows. Reward keys: `gold`, `xp`, `chest_guid`, `chest_guid_by_race`,
+`card_guid_by_race`, `item_guid_by_race`, `cards`, `items`.
 
 ### AREA progress rules
 
@@ -263,21 +472,11 @@ Quest grant and completion are runtime events rather than fields on
 - conversation objective: `conv_done` completes the active objective;
 - collection objective: progress is based on the relevant persisted variable.
 
-Quest-start map changes are metadata-driven. `quest_templates.start_hook` stores
-the name of a whitelisted Python hook in `campaign.py`; when the conversation
-catalog grants that quest, the hook is called and is replayed for active quests
-when the area state is loaded. The current AZ1 gates are seeded as:
-
-| Quest script | `start_hook` | Effect |
-|---|---|---|
-| `az01_tamed` | `az1_tamed_start` | hide/block Node005 (Fonferek Thicket) |
-| `q_seawitch` | `az1_find_horwich_sea_start` | unblock/reveal Node005 |
-| `az01_uw_find_cave_in` | `az1_find_cave_in_start` | reveal/mark Node017 and hide Node034 |
-| `az01_ar_find_ambling_mesa` | `az1_find_ambling_mesa_start` | reveal/mark Node034 and hide Node017 |
-
-Adding another quest-specific map transition therefore requires a named hook
-and a `start_hook` value on the quest row; the quest grant path itself does not
-branch on the quest script or node number.
+Quest-start map changes are editor data: node `visible` / `hidden` /
+`blocked` / `marker` tags in `campaign_rules/AZ1.json` that read
+`questStarted(X)` etc. (see above). `quest_templates.start_hook` can still name
+a whitelisted content hook in `campaign.py` (`_QUEST_START_HOOKS`), but none is
+registered or seeded.
 
 The extracted `m_ConversationEvent` values are empty in the current data, so the
 server currently uses explicit campaign events and GUID mappings.

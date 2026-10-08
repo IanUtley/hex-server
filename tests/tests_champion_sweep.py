@@ -1232,8 +1232,10 @@ def _run_case(db, metadata, path, *, option_check=True):
             raise ChampionSweepFailure(
                 f"{metadata['ability_guid']}: invalid choice path {path!r}")
         state["trace_ability_resolution"] = True
+        # "Target opposing champion chooses one" hands the choice to the
+        # opponent; answer as whoever owns the pending choice.
         tournament_game._pvp_resolve_choice(
-            handler, session, b"", PLAYER_PID,
+            handler, session, b"", int(pending.get("owner_id") or PLAYER_PID),
             typed_payload={"activation_data": {
                 "target_map": {0: [int(selected_uid)]}}})
         if not state.get("resolution_paused"):

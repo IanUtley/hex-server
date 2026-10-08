@@ -76,27 +76,22 @@ def update_fra_deck_personalities(
                 output(f"{deck_name}: {personality} — {score_summary}; "
                        f"gap={result.features.get('strategy_score_gap', 0):.1f}")
 
+        # Encounter scenes: an authored per-scene personality is never
+        # overwritten (blank scenes are filled with the deck's evaluated
+        # profile; ``force`` recomputes every scene).
         scene_decks = db.execute(
-            "SELECT ai_deck_guid, "
-            "MAX(NULLIF(TRIM(ai_deck_personality), '')), MIN(name) "
+            "SELECT ai_deck_guid, MIN(name), "
+            "SUM(CASE WHEN ai_deck_personality IS NULL "
+            "OR TRIM(ai_deck_personality)='' THEN 1 ELSE 0 END) "
             "FROM encounter_scenes WHERE ai_deck_guid IS NOT NULL "
             "AND TRIM(ai_deck_guid)<>'' GROUP BY ai_deck_guid "
             "ORDER BY MIN(name), ai_deck_guid"
         ).fetchall()
-        for deck_guid, current, scene_name in scene_decks:
+        for deck_guid, scene_name, blanks in scene_decks:
+            if not force and not blanks:
+                continue
             key = str(deck_guid).lower()
             personality = profiles.get(key)
-            if personality is None and not force and current:
-                personality = str(current).strip()
-                profiles[key] = personality
-                db.execute(
-                    "UPDATE encounter_scenes SET ai_deck_personality=? "
-                    "WHERE ai_deck_guid=? AND "
-                    "(ai_deck_personality IS NULL OR TRIM(ai_deck_personality)='' "
-                    "OR TRIM(ai_deck_personality)<>?)",
-                    (personality, deck_guid, personality),
-                )
-                continue
             if personality is None:
                 cards = db.execute(
                     "SELECT card_guid, quantity FROM encounter_deck_cards "
@@ -114,13 +109,20 @@ def update_fra_deck_personalities(
                     output(f"{scene_name} [{deck_guid}]: {personality} — "
                            f"{score_summary}; "
                            f"gap={result.features.get('strategy_score_gap', 0):.1f}")
-            db.execute(
-                "UPDATE encounter_scenes SET ai_deck_personality=? "
-                "WHERE ai_deck_guid=? AND "
-                "(ai_deck_personality IS NULL OR TRIM(ai_deck_personality)='' "
-                "OR TRIM(ai_deck_personality)<>?)",
-                (personality, deck_guid, personality),
-            )
+            if force:
+                db.execute(
+                    "UPDATE encounter_scenes SET ai_deck_personality=? "
+                    "WHERE ai_deck_guid=? AND (ai_deck_personality IS NULL "
+                    "OR TRIM(ai_deck_personality)<>?)",
+                    (personality, deck_guid, personality),
+                )
+            else:
+                db.execute(
+                    "UPDATE encounter_scenes SET ai_deck_personality=? "
+                    "WHERE ai_deck_guid=? AND (ai_deck_personality IS NULL "
+                    "OR TRIM(ai_deck_personality)='')",
+                    (personality, deck_guid),
+                )
 
         db.execute(
             "UPDATE fra_challengers "

@@ -1966,6 +1966,31 @@ def charge_point_cost_modifier(db, session_id, battle_state, owner,
     return source_modifier
 
 
+def card_enters_play_exhausted(db, session_id, battle_state, card_uid,
+                               controller_owner, template_guid):
+    """Session.MoveCard: whether a card reaching the Warzone is tapped.
+
+    The card's own ``EntersPlayExhausted`` attribute (printed, or granted to
+    the instance by a CardModifier such as Storm Cloud's "This enters play
+    exhausted") taps any permanent; otherwise an opposing champion's
+    ``Opposing*TroopsEnterPlayExhausted`` flag taps a troop.
+    """
+    from pvp_db import db_card_attribute_rows
+    rows = (db_card_attribute_rows(session_id, [int(card_uid)], conn=db)
+            if card_uid else [])
+    if not rows and template_guid:
+        # A token being created has no game_cards row yet; its printed
+        # template attributes are the whole answer.
+        rows = db.execute(
+            "SELECT attributes FROM card_templates WHERE guid=?",
+            (str(template_guid),)).fetchall()
+    attributes = int(rows[0][0] or 0) if rows else 0
+    if attributes & int(game_engine.ECardAttributes.EntersPlayExhausted):
+        return True
+    return opposing_enters_play_exhausted(
+        battle_state, controller_owner, template_guid)
+
+
 def opposing_enters_play_exhausted(battle_state, controller_owner,
                                    template_guid):
     """Session.MoveCard: an opponent's champion flag taps entering troops.

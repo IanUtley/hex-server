@@ -1,0 +1,75 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-orc",
+ "scene": "AZ0 Orc",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "Xolotl",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "Xolotl": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Orc)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Orc)",
+    "!conversation(Crayburn Castle - Orc - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Orc - Quest End)"
+   ]
+  },
+  "Moqui": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Orc)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Orc Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Orc Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Orc Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "Montecuma": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Orc Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Orc - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Orc - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Orc - Quest End)"
+   ]
+  }
+ },
+ "hooks": []
+}

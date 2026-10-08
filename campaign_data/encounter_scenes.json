@@ -1,0 +1,6191 @@
+{
+ "schema_version": 1,
+ "description": "Encounter scenes (full definitions) - owned by the campaign editor; applied to encounter_scenes at every start",
+ "tables": {
+  "encounter_scenes": [
+   {
+    "guid": "879317e1-8b04-486e-a10a-f2d2f1a080bc",
+    "name": "AZ 1 - NODE - 18 - CORRUPT DRYAD",
+    "title": "Corrupt Dryad",
+    "gameboard": "Forest",
+    "ai_deck_guid": "7c898d31-b51e-47a7-a400-9af5c36eedb9",
+    "ai_champion_guid": "89035517-4af7-4277-937e-35abcb2ff64b",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     },
+     {
+      "description": "When a champion gains a wild threshold, they might also gain a blood threshold.",
+      "mods": [
+       {
+        "guid": "c647b336-2909-48b2-8a4c-a932222b68f7"
+       }
+      ],
+      "title": "Corrupted Woods"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "xp": 250,
+       "one_time": false
+      },
+      {
+       "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+       "one_time": true
+      },
+      {
+       "item_guid_by_race": {
+        "Human": "7b955172-5670-4e89-a9dc-aa6c8867d077",
+        "Elf": "63e87fdf-6650-4861-90e5-7c8c840ec292",
+        "Coyotle": "cd13fdb5-6d6f-4d8e-a413-589176b44935",
+        "Orc": "94ffd65d-8ecb-4bda-91bc-f091ef5461e2",
+        "Dwarf": "e6d194fb-29ec-4abe-b373-91f1e9c3624e",
+        "Necrotic": "a537d34b-ee48-42f2-8a8c-01aa1f927600",
+        "Shin'hare": "f62a13c2-076d-4c90-9da0-66bae2b17cba",
+        "Vennen": "fd359679-6d40-496b-a83d-9d39e2c32dab"
+       },
+       "one_time": true
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e71c7d09-813b-4c51-9b11-8bdb4fc1b7c7",
+    "name": "AZ 1 - NODE 01 - INTO THE WOODS - DIALOG",
+    "title": "Into the Woods",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ed11363f-3dfb-425a-bc63-a1cb0fc250c1",
+    "name": "AZ 1 - NODE 02 - WELCOME - DIALOG",
+    "title": "Welcome!",
+    "gameboard": "Forest",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "150b0ed9-a5e0-4729-81d8-764fa237c4e4",
+    "name": "AZ 1 - NODE 03 - WILD CUB",
+    "title": "Wild Cub",
+    "gameboard": "Forest",
+    "ai_deck_guid": "debc120c-4135-491e-9352-a50cd0e87d98",
+    "ai_champion_guid": "693c3415-426e-49c6-8906-15bd8d5a8216",
+    "mods_json": [
+     {
+      "description": "Use the taming sphere to capture a Dire Toad.",
+      "mods": [
+       {
+        "guid": "a9b5886e-0983-44c4-9e7d-e3dce2102426"
+       }
+      ],
+      "title": "Tame Dire Toad"
+     },
+     {
+      "description": "The Forest Grants Wild Troops Crush.",
+      "mods": [
+       {
+        "guid": "6fd4a391-8f64-4192-8acc-a0bba19d45b7"
+       }
+      ],
+      "title": "Beast Crossing"
+     },
+     {
+      "mods": [
+       {
+        "guid": "a9b5886e-0983-44c4-9e7d-e3dce2102426"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "c0bb008e-17c5-4e73-baf9-5cbd8f3eb6dc",
+       "one_time": true,
+       "quantity": 1,
+       "when": [
+        "flag(tamed:150b0ed9)"
+       ]
+      }
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
+   },
+   {
+    "guid": "4612e93d-4cd1-4cd6-a8cc-5e00c8519023",
+    "name": "AZ 1 - NODE 04 - SHROOM HAUS 1 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "85112245-7aed-4a5b-9de9-3c262f11168a",
+       "name": "Builder Bot"
+      },
+      {
+       "guid": "fa7414ab-01d2-484f-8bab-68a03d9cce96",
+       "name": "Deployment Orders"
+      },
+      {
+       "guid": "5793dc95-b2e3-40d7-8010-5507d07f5328",
+       "name": "Tricerobot"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "1a8673a4-c9e2-430a-bd87-3c891406e599",
+    "name": "AZ 1 - NODE 05 - MANIC MANTIS",
+    "title": "Manic Mantis",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "572a913e-9ec3-4cf1-8d1e-5f8693183a33",
+    "ai_champion_guid": "b4df8a31-0aa3-4f87-b676-306d50ed19b8",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b9bc1f22-1b1e-4e7b-8b3e-0ba73a2df315",
+    "name": "AZ 1 - NODE 06 - THE SEA WITCH UNFETTERED",
+    "title": "The Sea Witch Unfettered",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "81d4fc5a-c7f2-4f9e-91ff-d7f8cfe98f69",
+    "ai_champion_guid": "db9c8bb5-485c-400a-ae05-302c41a02514",
+    "mods_json": [
+     {
+      "description": "Save the transmogrified princess from the evil Sea Witch",
+      "mods": [
+       {
+        "guid": "d715ce7b-d7c4-432d-aab6-3208b23a89bc"
+       },
+       {
+        "guid": "5134fdf5-6fb2-48d0-b847-0cdc22cd14c3"
+       }
+      ],
+      "title": "Daphne in Distress"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "c7bd54c6-59a8-48e0-bc3a-ad54e42a09a4",
+       "one_time": true,
+       "quantity": 1
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "26c9271e-31aa-415d-87e4-342cc69440a1",
+    "name": "AZ 1 - NODE 06 B - SEA WITCH - NO FROG",
+    "title": "Sea Witch",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "3e06f215-8095-490a-9155-71769423322a",
+    "ai_champion_guid": "db9c8bb5-485c-400a-ae05-302c41a02514",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7656fe84-bc7a-4e2d-b8ae-2741164a7a26",
+    "name": "AZ 1 - NODE 07 - GAAL CAMP 1 - DIALOG",
+    "title": "Gaal Camp",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5b6ffc90-a419-46d8-ac9a-69cc70353baf",
+    "name": "AZ 1 - NODE 08 - USURPER - DUNGEON",
+    "title": "Usurper",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ddf8a2da-d397-4c3b-9d32-729f1bc86ade",
+    "name": "AZ 1 - NODE 09 - COCKATWICE CHICK",
+    "title": "Cockatwice Chick",
+    "gameboard": "Forest",
+    "ai_deck_guid": "5c0ac023-71ed-4ace-a430-9b0900aacb5e",
+    "ai_champion_guid": "8eab335f-c53f-4f25-93f9-3385b65990c0",
+    "mods_json": [
+     {
+      "description": "Use the taming sphere to capture a Chickatwice.",
+      "mods": [
+       {
+        "guid": "1e77ac74-6597-46ff-bf31-8cd074766bff"
+       }
+      ],
+      "title": "Tame Chickatwice"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "xp": 100,
+       "one_time": false
+      },
+      {
+       "one_time": true,
+       "card_guid": "8d46a996-b371-460e-97a0-3eeb37f07ce3",
+       "when": [
+        "flag(tamed:ddf8a2da)"
+       ]
+      },
+      {
+       "one_time": true,
+       "card_guid": "3b18b39a-ff4f-4ecf-b7a8-c446f9d89bb0"
+      }
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
+   },
+   {
+    "guid": "6cf253c2-a2e7-4aaf-8ffb-9641a6955120",
+    "name": "AZ 1 - NODE 10 - SQUASHING PUMPKINS",
+    "title": "Squashing Pumpkins",
+    "gameboard": "Forest",
+    "ai_deck_guid": "93665e54-2ffc-4429-a4d5-7ffb52e3c72d",
+    "ai_champion_guid": "de1d9e79-77f5-411e-827e-6431505b491d",
+    "mods_json": [],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "xp": 100,
+       "one_time": false
+      },
+      {
+       "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b",
+       "one_time": true
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4fdae899-9ed2-41a2-922e-f073ac69ffb2",
+    "name": "AZ 1 - NODE 11 - FORT ROMOR - DUNGEON",
+    "title": "Fort Romor",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": "",
+    "actions_json": {
+     "pre": [
+      "clear_flag(romor_*)"
+     ]
+    }
+   },
+   {
+    "guid": "ac13b154-ef07-40c8-91b1-6e6a90ca7ebf",
+    "name": "AZ 1 - NODE 12 - CHURNING BRIDGE - DIALOG",
+    "title": "Churning Bridge",
+    "gameboard": "Forest",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3cf073b0-47fd-4911-953a-d86902890459",
+    "name": "AZ 1 - NODE 13 - GNASH BRIDGES",
+    "title": "Gnash Bridges",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "581306c2-6434-4888-9623-d0f775e14948",
+    "ai_champion_guid": "6a2b61fc-495c-4786-b1b2-6f97a5d8bcf9",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100,
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "xp": 100,
+       "one_time": false
+      },
+      {
+       "card_guid": "c69b5c92-9692-42c9-bfd9-e2d465fc7a26",
+       "quantity": 1,
+       "one_time": true
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ab77df1e-5f13-471b-80e7-b7b4824ca280",
+    "name": "AZ 1 - NODE 14 - SAVAGE LORD",
+    "title": "Savage Lord",
+    "gameboard": "Forest",
+    "ai_deck_guid": "7c41cad3-32f2-471a-b244-9e5b7d2900f1",
+    "ai_champion_guid": "dbdeb4f1-18d2-47a2-ae62-0e7189d58616",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     }
+    ],
+    "rewards_json": {
+     "gold": 300,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6795546a-65b6-4517-810d-1aa0fa15fd79",
+    "name": "AZ 1 - NODE 15 - BRIDGE BRO - DIALOG",
+    "title": "Bridge Bro",
+    "gameboard": "Forest",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8f6b6598-5725-4fec-abbe-5cc1663457c7",
+    "name": "AZ 1 - NODE 16 - GAAL CAMP 2 - DIALOG",
+    "title": "Gaal Camp",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c99b4f8d-e24d-4896-9342-6ac2562a2364",
+    "name": "AZ 1 - NODE 17 - CAVE IN - PANORAMA",
+    "title": "Cave In",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bc3361b6-955a-4a48-bffa-b28b0513a489",
+    "name": "AZ 1 - NODE 19A - HUMAN BLOCKADE",
+    "title": "Human Blockade",
+    "gameboard": "Forest",
+    "ai_deck_guid": "0184fe5f-7ccf-406b-a049-86d314b5096f",
+    "ai_champion_guid": "51d31ed7-0e89-46c1-a259-95b1d20a82b6",
+    "mods_json": [
+     {
+      "description": "This state of the art blockade comes equipped with Turreted Walls standard.",
+      "mods": [
+       {
+        "guid": "31672e91-90d6-489e-a8d8-593a59eb32a8"
+       },
+       {
+        "guid": "31672e91-90d6-489e-a8d8-593a59eb32a8"
+       },
+       {
+        "guid": "31672e91-90d6-489e-a8d8-593a59eb32a8"
+       }
+      ],
+      "title": "Turreted Walls"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(blockade_cleared)"
+     ]
+    }
+   },
+   {
+    "guid": "e59c5cac-be7a-4bc3-a5b5-0c5ca86c73b6",
+    "name": "AZ 1 - NODE 19B - ZOMBIE BLOCKADE",
+    "title": "Zombie Blockade",
+    "gameboard": "Forest",
+    "ai_deck_guid": "31936df8-1009-41a8-aa1a-2297cc12d916",
+    "ai_champion_guid": "0685031b-9696-4d8f-b782-3f5401a7b01f",
+    "mods_json": [
+     {
+      "description": "Undead troops might get Speed.",
+      "mods": [
+       {
+        "guid": "caac7ca4-f6bc-468f-8c14-17898e5f3d08"
+       }
+      ],
+      "title": "Vigor Mortis"
+     },
+     {
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(blockade_cleared)"
+     ]
+    }
+   },
+   {
+    "guid": "751ca760-fcf7-42ca-8d6f-e3d169abb8f0",
+    "name": "AZ 1 - NODE 19B1 - ZOMBIE BLOCKADE",
+    "title": "Zombie Blockade",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "31936df8-1009-41a8-aa1a-2297cc12d916",
+    "ai_champion_guid": "0685031b-9696-4d8f-b782-3f5401a7b01f",
+    "mods_json": [
+     {
+      "description": "Undead troops might get Speed.",
+      "mods": [
+       {
+        "guid": "caac7ca4-f6bc-468f-8c14-17898e5f3d08"
+       }
+      ],
+      "title": "Vigor Mortis"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2cf528d-7334-4bfa-8f3f-076dbb6162c6",
+    "name": "AZ 1 - NODE 19B2 - ZOMBIE BLOCKADE",
+    "title": "Zombie Blockade",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "31936df8-1009-41a8-aa1a-2297cc12d916",
+    "ai_champion_guid": "0685031b-9696-4d8f-b782-3f5401a7b01f",
+    "mods_json": [
+     {
+      "description": "Undead troops might get Speed.",
+      "mods": [
+       {
+        "guid": "caac7ca4-f6bc-468f-8c14-17898e5f3d08"
+       }
+      ],
+      "title": "Vigor Mortis"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c067e50e-2b95-4ea3-be5c-995ae613e914",
+    "name": "AZ 1 - NODE 19B3 - ZOMBIE BLOCKADE",
+    "title": "Zombie Blockade",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "31936df8-1009-41a8-aa1a-2297cc12d916",
+    "ai_champion_guid": "0685031b-9696-4d8f-b782-3f5401a7b01f",
+    "mods_json": [
+     {
+      "description": "Undead troops might get Speed.",
+      "mods": [
+       {
+        "guid": "caac7ca4-f6bc-468f-8c14-17898e5f3d08"
+       }
+      ],
+      "title": "Vigor Mortis"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "07f82b01-6b98-4222-af7d-8bc6cf506007",
+    "name": "AZ 1 - NODE 19C - BLOCKADE - CHOICE OF BATTLES",
+    "title": "Blockade",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bba5dcfa-3e62-4006-ab87-f8d4bc5a82d2",
+    "name": "AZ 1 - NODE 20 - BLACKSMITH 2 - REWARD",
+    "title": "Blacksmith",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9fecb72e-ce7b-4091-8bd8-f3cc8e30a68f",
+    "name": "AZ 1 - NODE 21 - MT GRAVE",
+    "title": "Mountain Graveyard",
+    "gameboard": "Forest",
+    "ai_deck_guid": "e90826c3-937b-40c8-a38a-39fde97c2eb6",
+    "ai_champion_guid": "c29c7cf6-2670-4c19-a0b0-a10d6e84e091",
+    "mods_json": [
+     {
+      "description": "When a troop goes to the crypt it gets +1/+1.",
+      "mods": [
+       {
+        "guid": "3d161da6-620e-4101-9b9f-956f1733c451"
+       }
+      ],
+      "title": "Rigor Mortis"
+     },
+     {
+      "description": "Each turn, you might get a Seed Pod.",
+      "mods": [
+       {
+        "guid": "efaad841-63cd-43bd-a494-37c0864f0a05"
+       }
+      ],
+      "title": "Fertile Soil"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d40742ba-0d9f-4e89-8179-7323453474f6",
+    "name": "AZ 1 - NODE 22 - ZEN DEN",
+    "title": "Zen Den",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "bc007803-6175-4814-a614-96c25e8ef711",
+    "ai_champion_guid": "1605462d-7703-4a73-9192-3672a4609e5e",
+    "mods_json": [
+     {
+      "description": "If two troops enter play on the same turn, their champion gains health.",
+      "mods": [
+       {
+        "guid": "67535ae8-ed76-488d-bbad-adb958f5071a"
+       }
+      ],
+      "title": "Buddy System"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8010c024-ce71-4915-ad72-a921c9864701",
+    "name": "AZ 1 - NODE 23A - HUMANS CHOICE HELP",
+    "title": "Mob Zombie",
+    "gameboard": "Forest",
+    "ai_deck_guid": "a04f4c3e-4d3a-4249-b438-0c22f4372865",
+    "ai_champion_guid": "d2c43ab9-4088-4e4a-a284-049f2e9dedee",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     },
+     {
+      "description": "Two zombies linger from the earlier fight.",
+      "mods": [
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       },
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       }
+      ],
+      "title": "Zombies"
+     },
+     {
+      "description": "A Gemsoul Feeder aids you in this battle.",
+      "mods": [],
+      "title": "Necrotic Aid"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4f835c07-8feb-4463-af14-5c15d78d43d4",
+    "name": "AZ 1 - NODE 23A_2 - HUMANS NO HELP",
+    "title": "Mob Zombie",
+    "gameboard": "Forest",
+    "ai_deck_guid": "a04f4c3e-4d3a-4249-b438-0c22f4372865",
+    "ai_champion_guid": "d2c43ab9-4088-4e4a-a284-049f2e9dedee",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     },
+     {
+      "description": "Two zombies linger from the earlier fight.",
+      "mods": [
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       },
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       }
+      ],
+      "title": "Zombies"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "07769a0e-8473-4584-a996-5dfb7c61a925",
+    "name": "AZ 1 - NODE 23B - NECROTIC CHOICE HELP",
+    "title": "Mob Zombie",
+    "gameboard": "Forest",
+    "ai_deck_guid": "2c6bc2fe-6f5e-409d-bccc-9222d4b33711",
+    "ai_champion_guid": "d2c43ab9-4088-4e4a-a284-049f2e9dedee",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     },
+     {
+      "description": "A Ruby Pyromancer aids you in this battle.",
+      "mods": [],
+      "title": "Human Aid"
+     },
+     {
+      "description": "Two zombies linger from the earlier fight.",
+      "mods": [
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       },
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       }
+      ],
+      "title": "Zombies"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "144d8709-a9fc-4c70-a5f3-8c39996cff19",
+    "name": "AZ 1 - NODE 23B_2 - NECROTIC NO HELP",
+    "title": "Mob Zombie",
+    "gameboard": "Forest",
+    "ai_deck_guid": "2c6bc2fe-6f5e-409d-bccc-9222d4b33711",
+    "ai_champion_guid": "d2c43ab9-4088-4e4a-a284-049f2e9dedee",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     },
+     {
+      "description": "Two zombies linger from the earlier fight.",
+      "mods": [
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       },
+       {
+        "guid": "379e77d0-ef09-42d6-9798-af4d2c244a57"
+       }
+      ],
+      "title": "Zombies"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "1d91ee6d-dd5b-4aaf-af58-7ace873b1a80",
+    "name": "AZ 1 - NODE 24 - SMOLDERING DEAD - DUNGEON",
+    "title": "Smoldering Dead",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9cfba957-1bc0-4d85-b70b-da4f98e452f7",
+    "name": "AZ 1 - NODE 25 - SHROOM HAUS 3 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "85112245-7aed-4a5b-9de9-3c262f11168a",
+       "name": "Builder Bot"
+      },
+      {
+       "guid": "fa7414ab-01d2-484f-8bab-68a03d9cce96",
+       "name": "Deployment Orders"
+      },
+      {
+       "guid": "5793dc95-b2e3-40d7-8010-5507d07f5328",
+       "name": "Tricerobot"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2de5b786-68a7-4f5c-9ba2-a0284f05592e",
+    "name": "AZ 1 - NODE 26 - WAYWARD ORCS",
+    "title": "Wayward Orcs",
+    "gameboard": "Forest",
+    "ai_deck_guid": "729e58db-86d7-4d98-a86e-4db762ccd231",
+    "ai_champion_guid": "b7ab667f-3202-4b3f-9961-aef0d7235f95",
+    "mods_json": [
+     {
+      "description": "Each turn, a troop gets rage 1, and it must attack.",
+      "mods": [
+       {
+        "guid": "152619ed-6a7b-42af-94e5-1d99d2d5a945"
+       }
+      ],
+      "title": "Fae Pranks"
+     },
+     {
+      "description": "Each turn, you might get a Seed Pod.",
+      "mods": [
+       {
+        "guid": "efaad841-63cd-43bd-a494-37c0864f0a05"
+       }
+      ],
+      "title": "Fertile Soil"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "fcf51a17-a23d-495c-bd98-43bf0edbaac2",
+    "name": "AZ 1 - NODE 26B - WAYWARD VENNEN",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "04cd74e0-05be-44b7-9120-cc5113eb8256",
+    "ai_champion_guid": "6c7cdefd-1cff-492c-8b1a-9cbb065ef612",
+    "mods_json": [
+     {
+      "description": "Each turn, a troop gets rage 1, and it must attack.",
+      "mods": [
+       {
+        "guid": "152619ed-6a7b-42af-94e5-1d99d2d5a945"
+       }
+      ],
+      "title": "Fae Pranks"
+     },
+     {
+      "description": "Each turn, you might get a Seed Pod.",
+      "mods": [
+       {
+        "guid": "efaad841-63cd-43bd-a494-37c0864f0a05"
+       }
+      ],
+      "title": "Fertile Soil"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "67307169-0e2a-4c1b-837e-6a25ee550772",
+    "name": "AZ 1 - NODE 27 - DOME - DIALOG",
+    "title": "Dome",
+    "gameboard": "Forest",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "15cb2e03-a2fd-4bc2-b496-f5462de7f452",
+    "name": "AZ 1 - NODE 28 - FRIENDLY PLANTS",
+    "title": "Friendly Plants",
+    "gameboard": "Forest",
+    "ai_deck_guid": "b46dca8a-310a-4630-a9d0-61e47e2920de",
+    "ai_champion_guid": "23c524ff-eee4-41aa-be65-2520f493436d",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f5d170b6-e2e8-4b18-85ab-8ada37367682",
+    "name": "AZ 1 - NODE 29 - SHROOM HAUS 5 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "bc47eb79-bbdf-4252-b09b-ee7c90c5159b",
+       "name": "Feralroot Jaguar"
+      },
+      {
+       "guid": "bf754a7c-1cf9-44d9-b1cc-135c6d90bc3b",
+       "name": "Walking Hive"
+      },
+      {
+       "guid": "a5f50516-06c4-46fe-b8bc-edd3fc9a8a8f",
+       "name": "Thornsprout"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "185c5f24-753e-486b-9eb5-0b8cb5b17324",
+    "name": "AZ 1 - NODE 30 - BRIDGE 2 - DIALOG",
+    "title": "Bridge",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a9e9e040-de92-475a-9970-be039c400cef",
+    "name": "AZ 1 - NODE 31 - WATER ELEMENTAL",
+    "title": "Water Elemental",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "53b0658e-05f2-4346-81a8-d257970d53e1",
+    "ai_champion_guid": "ff4676db-e565-4ea3-b6b1-a642da0625ed",
+    "mods_json": [
+     {
+      "description": "When a champion plays a resource, they draw a card.",
+      "mods": [
+       {
+        "guid": "db6f85e3-3d6c-4a66-9fb0-2962ca3e88ff"
+       }
+      ],
+      "title": "The River of Knowledge"
+     },
+     {
+      "description": "Use the taming sphere to capture a Bubblebee.",
+      "mods": [
+       {
+        "guid": "a71a750d-b3bf-4ded-bf19-a21695ba7db5"
+       }
+      ],
+      "title": "Tame Bubblebee"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f6f3074b-a416-4400-9b74-20d72406a846",
+    "name": "AZ 1 - NODE 32 - FOUL FAE",
+    "title": "Foul Fae",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "66716f16-51a7-40a7-90ee-5996af7c3e74",
+    "ai_champion_guid": "b0ab2400-087b-4e61-acfa-c0bf7e1ecd15",
+    "mods_json": [
+     {
+      "description": "When cards transform, their cost is reduced.",
+      "mods": [
+       {
+        "guid": "90aefb3a-e6e0-46cb-89fe-6b6914115259"
+       }
+      ],
+      "title": "Leyline Convergence"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "6d9f102a-538a-401b-b9ab-1d059f851232",
+       "one_time": true,
+       "quantity": 1,
+       "when": [
+        "flag(tamed:f6f3074b)"
+       ]
+      }
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
+   },
+   {
+    "guid": "1d67638c-6068-465c-9e52-419047853310",
+    "name": "AZ 1 - NODE 33 - WATER ELEMENTAL",
+    "title": "Water Elemental",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "db6f85e3-3d6c-4a66-9fb0-2962ca3e88ff"
+       },
+       {
+        "guid": "a71a750d-b3bf-4ded-bf19-a21695ba7db5"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "11e30dc4-542e-45a9-8b9d-2fddc48700b9",
+    "name": "AZ 1 - NODE 34 - AMBLING MESA - PANORAMA",
+    "title": "Ambling Mesa",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2e43428c-c411-4a27-b8a9-030a5ca54ce4",
+    "name": "AZ 1 - NODE 35 - SHROOM HAUS 6 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "0a6c7b17-81bf-476b-b4a1-a47169733b86",
+       "name": "Elegy of Death"
+      },
+      {
+       "guid": "a28873fd-8443-4c6f-a770-a00d3f7e7a86",
+       "name": "Raving Ghoul"
+      },
+      {
+       "guid": "eaafb589-7eb5-4370-a945-ac9a0ee17404",
+       "name": "Rotting Away"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "449c5818-06c9-4183-9df3-8066ece9552d",
+    "name": "AZ 1 - NODE 37 - BLOOD GATE - DIALOG",
+    "title": "Blood Gate",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "65718b4e-dc12-4942-9ef9-086900e49941",
+    "name": "AZ 1 - NODE 38 - CRANKY GNOME - DIALOG",
+    "title": "Cranky Gnome",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "40cdd2b7-928a-47b8-8595-ed095b1f9e75",
+    "name": "AZ 1 - NODE 39 - DIAMONDS FUREVER",
+    "title": "Diamonds Furvever",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "439e310c-165f-4bd6-8861-661eb9c54a30",
+    "ai_champion_guid": "4f574653-ea2d-4866-8ee3-03dabd264a9a",
+    "mods_json": [
+     {
+      "description": "Use the taming sphere to capture a Fennec Fox",
+      "mods": [
+       {
+        "guid": "846432d0-fa8d-46f1-8765-0a792470aa8f"
+       }
+      ],
+      "title": "Tame Fennec Fox"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "fe258475-c431-4097-bb08-f47db7f981b0",
+       "one_time": true,
+       "quantity": 1,
+       "when": [
+        "flag(tamed:40cdd2b7)"
+       ]
+      }
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
+   },
+   {
+    "guid": "66be7540-866b-496b-bbf5-d33bdfb05ab1",
+    "name": "AZ 1 - NODE 40 - TRANQUIL DREAM - DUNGEON",
+    "title": "Tranquil Dream",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b3ff18c6-7b3e-420d-b729-cbc31a9fc1c4",
+    "name": "AZ 1 - NODE 41 - SUNSOUL PHOENIX",
+    "title": "Sunsoul Phoenix",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "7a9c06b3-4c31-4db0-a865-f1216066d09d",
+    "ai_champion_guid": "ae7a4091-1230-4bbc-82d8-656b082277e7",
+    "mods_json": [
+     {
+      "description": "Champions might get burning 2.",
+      "mods": [
+       {
+        "guid": "2d1c7aaa-fe82-4a12-ac81-6b9474db84ae"
+       }
+      ],
+      "title": "Spontaneous Combustion"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3550e184-7963-43fa-b257-231c195816b2",
+    "name": "AZ 1 - NODE 42 - SHROOM HAUS 2 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "35c69927-8571-46c6-8b1f-5ed03a8f3104",
+       "name": "Morphology"
+      },
+      {
+       "guid": "747a2454-0a93-4b20-b382-b671b9389623",
+       "name": "Chaotic Murmurs"
+      },
+      {
+       "guid": "c7df3f70-536c-49e8-9093-c129a2dafedf",
+       "name": "Heroic Echo"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b4399b95-8722-41e4-b734-8b88e3ea6b4b",
+    "name": "AZ 1 - NODE 44 - SIGNS BY DOME - DIALOG",
+    "title": "Signs by Dome",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6ddaff7d-d44c-4d09-a890-bbbb01c37c53",
+    "name": "AZ 1 - NODE 45A - WOUNDED PETAL SHIN",
+    "title": "Wounded Petal Shin",
+    "gameboard": "Forest",
+    "ai_deck_guid": "24f06cfe-64cf-466d-add4-4b893cb4f77e",
+    "ai_champion_guid": "66302a54-59c0-4a43-b12e-80e814032e76",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3abdd729-b8e6-4c62-b83a-2316555832e5",
+    "name": "AZ 1 - NODE 45B - ELVES",
+    "title": "Elves",
+    "gameboard": "Forest",
+    "ai_deck_guid": "a65b0057-4690-45fa-9c35-a369b2ec6753",
+    "ai_champion_guid": "b3ba0e75-78c9-46c0-90bb-5fdbf3a9f560",
+    "mods_json": [
+     {
+      "description": "Each champion starts with a permanent resource.",
+      "mods": [
+       {
+        "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
+       }
+      ],
+      "title": "Resource Rich"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b49dae70-29bd-4c2b-a441-e92e7d374b60",
+    "name": "AZ 1 - NODE 46 - TANNING DOG",
+    "title": "Training Dog",
+    "gameboard": "Forest",
+    "ai_deck_guid": "00000000-0000-0000-0000-000000000000",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "50ec5d2c-9a07-491c-9f33-f059d659d65f",
+    "name": "AZ 1 - NODE 47 - COYOTLE 1",
+    "title": "Coyotle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "3af66368-d2c6-4fe8-8d6d-823442340100",
+    "ai_champion_guid": "51873611-2b89-4b86-ac14-7b762f190729",
+    "mods_json": [
+     {
+      "description": "When a troop enters play, the next action in your deck grants a charge.",
+      "mods": [
+       {
+        "guid": "9386564e-5f1c-42b0-8939-a5316b04749e"
+       }
+      ],
+      "title": "Heroic Prophecy"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c23f3a20-29e7-4615-8332-422b204c5e20",
+    "name": "AZ 1 - NODE 48 - GAAL CAMP 3 - DIALOG",
+    "title": "Gaal Camp",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2b0f7434-60d2-4ebb-9d01-3861a3697e23",
+    "name": "AZ 1 - NODE 49 - THUNDERFIELD - PANORAMA",
+    "title": "Thunderfield",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "88cb5960-d9f9-4754-a6c0-f0f32f56e472",
+    "name": "AZ 1 - NODE 50 - COYOTLE 2",
+    "title": "Coyotle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "59697bf1-e1f9-439b-8157-372cb02c444f",
+    "ai_champion_guid": "59b341c3-8a07-4254-96ab-a47055696981",
+    "mods_json": [
+     {
+      "description": "When a troop enters play, the next troop in your deck gets +1/+1.",
+      "mods": [
+       {
+        "guid": "d3c238e5-128d-430d-80d8-9d344b07c197"
+       }
+      ],
+      "title": "Prophecy of the Bright Moon"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c662a18e-43ca-4dfb-a5ed-313893eed0e1",
+    "name": "AZ 1 - NODE 51 - HORSE LOVER - DIALOG",
+    "title": "Horse Lover",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "06c14db8-675d-4745-b4e6-f9bc4f919b61",
+    "name": "AZ 1 - NODE 52 - OLD DIRTY BUSTARD",
+    "title": "Old Dirty Bustard",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "ef5a9ab8-edd3-4daf-a15a-992704fa746d",
+    "ai_champion_guid": "52e45ca7-8520-4677-a9cd-45ee11988423",
+    "mods_json": [
+     {
+      "description": "Use the taming sphere to capture a Dust Bustard",
+      "mods": [
+       {
+        "guid": "3add6dbe-b328-4375-8c63-c0698e41ab0a"
+       }
+      ],
+      "title": "Tame Dust Bustard"
+     }
+    ],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "c5a78b39-f0f0-4b6a-a96e-c20b76059612",
+       "one_time": true,
+       "quantity": 1,
+       "when": [
+        "flag(tamed:06c14db8)"
+       ]
+      }
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
+   },
+   {
+    "guid": "7bc61916-c6a7-403a-8881-136a8093861f",
+    "name": "AZ 1 - NODE 53 - GNOMES AT HOME - DIALOG",
+    "title": "Gnomes at Home",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "19ac9d24-f6aa-413b-b098-5ce62e4bffcd",
+    "name": "AZ 1 - NODE 54 - SOUTH DESERT - DIALOG",
+    "title": "South Desert",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ed926c27-289d-4def-ba1d-afb2a55442a8",
+    "name": "AZ 1 - NODE 55 - HARD WURMS",
+    "title": "Hard Wurms",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "dd0ba009-0442-461d-ac05-96e0c9aedc63",
+    "ai_champion_guid": "67b5e119-eb5a-4ed9-a7ab-5afb8ed9b780",
+    "mods_json": [],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "5a9e60b4-713a-430c-bdc6-c714764ceabb",
+       "one_time": true,
+       "quantity": 1
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "049bdcd0-3387-4ee1-b66f-8b4a9b04a7ec",
+    "name": "AZ 1 - NODE 56 - NORTH DESERT - DIALOG",
+    "title": "North Desert",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9b824483-1868-4db3-b5a9-b6ac9ac49a5a",
+    "name": "AZ 1 - NODE 57 - LOST GNOMES - DIALOG",
+    "title": "Lost Gnomes",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "df9a0694-5aba-42c1-9a0b-060309e4a978",
+    "name": "AZ 1 - NODE 58 - EASY WURMS",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "d973d334-276c-4b75-9fa9-7fee5b22e77c",
+    "ai_champion_guid": "09b08344-1f94-40f4-ac62-e30dafc1cc99",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "48a4b527-5f7a-40c8-b7cf-64a6b40561c3",
+    "name": "AZ 1 - NODE 59 - EASY WURMS",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "cd1e31f9-8991-430a-a957-b20e16790616",
+    "ai_champion_guid": "5667a8bc-4a02-48b1-a3f3-cb312876478d",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3897cae8-bbd4-4cd0-b8f4-183b55c46aa5",
+    "name": "AZ 1 - NODE 60 - EASY WURMS",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "386c457e-933c-4f11-938b-d85c36d405b7",
+    "ai_champion_guid": "5b7add84-40a9-4d93-9f22-f451430af62a",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "37780748-362a-4153-82f2-6864496d4af0",
+    "name": "AZ 1 - NODE 61 - NW DESERT - DIALOG",
+    "title": "Northwest Desert",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "959b343e-0cdc-4312-8e86-c5a751acdc6a",
+    "name": "AZ 1 - NODE 62 - ADULT WURMS",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "56e41840-3a14-4f6a-8f5d-810ee6f66c89",
+    "ai_champion_guid": "fffe942f-cd44-4fef-a8fd-9d87ea78f5eb",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "61ad1c64-774b-41eb-abb9-b9f59e63e89d",
+    "name": "AZ 1 - NODE 63 - ADULT WURMS",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "ae3f331e-ae97-49df-b9c4-789ae7377b7f",
+    "ai_champion_guid": "80c953ab-e4d1-4727-b2a1-84b04fbe935f",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "15a69fad-bea2-467e-b68e-b56f1af884d6",
+    "name": "AZ 1 - NODE 64 - DUSTY ROBOTS",
+    "title": "Dusty Robots",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "7678cf4f-93b6-4de7-b898-5e8c5419d8c4",
+    "ai_champion_guid": "25ce3c67-3b47-4f64-a3c0-66eb30486b6f",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "725063b8-cff8-4b96-98f5-03881dc485db",
+    "name": "AZ 1 - NODE 65 - COYOTLE 3",
+    "title": "Coyotle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "dfc46834-eb6f-4772-91e4-af21f6bc7599",
+    "ai_champion_guid": "be586a20-1ef2-4719-9ce9-4b7dc0bb7687",
+    "mods_json": [
+     {
+      "description": "There might be unexpected heat waves.",
+      "mods": [
+       {
+        "guid": "2862d110-c2a4-4578-92cc-158a4138284a"
+       }
+      ],
+      "title": "Hot in Here"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef",
+    "name": "AZ 1 - NODE 66 - ARMY OF MYTH",
+    "title": "Army of Myth",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "e79ce86b-f4f9-4885-b4d7-fc3e79081343",
+    "ai_champion_guid": "3e876bf7-2216-486d-ba74-02e3ff3006ff",
+    "mods_json": [],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "e9ba4268-2617-48b4-9f02-5138aaadd6b5",
+       "one_time": true,
+       "quantity": 1,
+       "when": [
+        "flag(battle:0b1d5244:Diff_6)"
+       ]
+      }
+     ]
+    },
+    "actions_json": {
+     "victory": [
+      "set_flag(battle:0b1d5244:Diff_0)"
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f68e1321-892d-4c3e-b958-05413c84349a",
+    "name": "AZ 1 - NODE 67 - ZOMBIES IGNITED",
+    "title": "Zombies Ignited",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "e60738bf-4255-4e85-9600-a65d9bfdd013",
+    "ai_champion_guid": "cc55abc5-5bcc-4d81-8a24-a1f9135684d3",
+    "mods_json": [
+     {
+      "description": "Champions might catch fire.",
+      "mods": [
+       {
+        "guid": "2d1c7aaa-fe82-4a12-ac81-6b9474db84ae"
+       }
+      ],
+      "title": "Spontaneous Combustion"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a8fb260c-e020-4e5c-87cd-35d0589c3db6",
+    "name": "AZ 1 - NODE 68 - DEVONSHIRE KEEP - DUNGEON",
+    "title": "Devonshire Keep",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4a60ea13-8fb3-4ca6-bcc0-297bd000ec82",
+    "name": "AZ 1 - NODE 69 - MAP MAKER - DIALOG",
+    "title": "Map Maker",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5219939b-ff53-4075-83e8-fbb6577f33f3",
+    "name": "AZ 1 - NODE 70 - CARIBAURS - DIALOG",
+    "title": "Caribaurs",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "55ebbf54-4411-421f-979a-934f41746153",
+    "name": "AZ 1 - NODE 71 - PATH OF THE KILLIPEDE 1",
+    "title": "Path of the Killipede",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "cdde79d5-f835-4e88-b859-427a292cc69b",
+    "ai_champion_guid": "ce314c62-7720-48a0-a104-90f863634daf",
+    "mods_json": [
+     {
+      "description": "Each turn, there might be a heat wave.",
+      "mods": [
+       {
+        "guid": "2862d110-c2a4-4578-92cc-158a4138284a"
+       }
+      ],
+      "title": "Hot in Here"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2bad2105-dd9c-43a6-a1c0-3ea51615ffb0",
+    "name": "AZ 1 - NODE 72 - BLACKSMITH 3 - REWARD",
+    "title": "Blacksmith",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "70a0dda6-6d8f-45c0-a5d8-8b63e4f27e53",
+    "name": "AZ 1 - NODE 73 - SAPPHIRE GATE - DIALOG",
+    "title": "Sapphire Gate",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "69acea9a-45b2-41af-8fae-72ad80550cf8",
+    "name": "AZ 1 - NODE 74 - KILLIPEDE LORE - DIALOG",
+    "title": "Killipede",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ede9fa43-93ea-438e-a0f2-29c57cd1733d",
+    "name": "AZ 1 - NODE 75 A - DWARVEN DIGGERS",
+    "title": "Dwarven Diggers",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "befa4ab7-39c0-4c13-a389-bba55efc60a4",
+    "ai_champion_guid": "6169022c-1691-49fa-bf56-2d7e881cc12a",
+    "mods_json": [
+     {
+      "description": "Champions might catch fire.",
+      "mods": [
+       {
+        "guid": "2d1c7aaa-fe82-4a12-ac81-6b9474db84ae"
+       }
+      ],
+      "title": "Spontaneous Combustion"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e3ef1037-81c2-489d-951b-6db43fbafbac",
+    "name": "AZ 1 - NODE 75 B - COYOTLE DIGGERS",
+    "title": "Coyotle Diggers",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "b802a74a-9c43-4522-b890-8718345ef2b9",
+    "ai_champion_guid": "4a18e109-1a3a-43c1-a8b0-d117ed2d9a88",
+    "mods_json": [
+     {
+      "description": "Champions might catch fire.",
+      "mods": [
+       {
+        "guid": "2d1c7aaa-fe82-4a12-ac81-6b9474db84ae"
+       }
+      ],
+      "title": "Spontaneous Combustion"
+     }
+    ],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "861c21c0-c664-474d-954a-f076b0b5353d",
+    "name": "AZ 1 - NODE 76 - BLACKSMITH 4 - REWARD",
+    "title": "Blacksmith",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "10dba158-1f2c-4beb-99f7-c6ac4dda5cd0",
+    "name": "AZ 1 - NODE 77 - SHROOM HAUS 4 - REWARD",
+    "title": "Shroom Haus",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "card_choice": [
+      {
+       "guid": "56417801-718c-4cae-9bd2-90716aecdb45",
+       "name": "Form Ranks"
+      },
+      {
+       "guid": "7203ae1e-f948-4a1b-ae50-a613a2d7bd4f",
+       "name": "Ethereal Healer"
+      },
+      {
+       "guid": "911c48dc-16ea-4b20-abdc-af558c1e7e81",
+       "name": "Dandelion Faerie"
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5dfef5ea-2481-4a99-9c10-c56629d7c132",
+    "name": "AZ 1 - NODE 78 - KILLIPEDES REVENGE",
+    "title": "Killipede's Revenge",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "9b960615-d94b-4a49-ac53-702b5c6a9612",
+    "ai_champion_guid": "d24d7385-61f8-42a0-9b94-ade359b940a1",
+    "mods_json": [],
+    "rewards_json": {
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "one_time": false,
+       "xp": 100
+      },
+      {
+       "card_guid": "6bd19ef3-869a-42d4-bb2b-f2eed831ef1f",
+       "one_time": true,
+       "quantity": 1
+      }
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2f9a4008-a36b-4a49-805e-d61082c84c08",
+    "name": "AZ 1 - NODE R - MASKED ARMY - DIALOG",
+    "title": "Masked Army",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6e7341f5-202c-458e-96f5-040d9ebe7091",
+    "name": "AZ 1 - NODE X - SHORT CUT - DIALOG",
+    "title": "Short Cut",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6611a36d-4356-463f-8733-c4134abc2a55",
+    "name": "AZ 2 - NODE 1 - River of Whispers - Lurking Crocodile",
+    "title": "",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "77d88bb2-c205-4bf8-a03d-1022a7f3e0d0",
+    "ai_champion_guid": "dd55b107-9991-4b5e-8a93-b12b56da569c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7fb94df9-f4d2-4d3d-b910-4d2cc2f79228",
+    "name": "AZ 2 - NODE 11 - Smuggler's Cove - Hired Horn Picaroon",
+    "title": "Smuggler's Cove",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "7f66242c-1f1e-4eaa-aa49-7e445615245a",
+    "ai_champion_guid": "fcbd5ab7-887b-47e0-8ba0-9180fc7a5cda",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3ffefb7c-4f63-4989-b3c6-b1d9fa129646",
+    "name": "AZ 2 - NODE 13 - Lake Revere - Orchin",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "78186ba5-b66c-433a-a5a5-b0a8e3bb6797",
+    "ai_champion_guid": "cf5dd4c9-9507-4931-9c54-a9f2be5b3192",
+    "mods_json": [
+     {
+      "description": "If you gained health, at the end of your turn, create an Orchin and put it into play. ",
+      "mods": [
+       {
+        "guid": "ca87c135-049f-4f19-afdd-1055833358bd"
+       }
+      ],
+      "title": "Forever's Forest"
+     },
+     {
+      "description": "A random card in each champion's hand gains health equal to its cost when played.",
+      "mods": [
+       {
+        "guid": "a04eee5c-3560-4c77-875c-df378bb7c336"
+       }
+      ],
+      "title": "Gift of Vitality"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5deedd32-d2ea-4225-bd57-5b685e41bca7",
+    "name": "AZ 2 - NODE 14A - Peterson Woods - Princess Victoria (vs. Ardent)",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "d69fabca-b14f-45ac-ad28-c89a0e2919ec",
+    "ai_champion_guid": "c0671e20-f2b8-43ba-97e0-8e4b82944118",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "81d153e6-b10a-4b2b-9920-b671b4d3d015",
+    "name": "AZ 2 - NODE 14B - Peterson Woods - Princess Victoria (vs. Underworld)",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "8ca8ac9d-9e92-4178-a4e5-dd71d6bc8164",
+    "ai_champion_guid": "c0671e20-f2b8-43ba-97e0-8e4b82944118",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "907b258e-4e21-424e-aeb4-466b3e550ac5",
+    "name": "AZ 2 - NODE 15 - Holland Tideflats - Giant Jellyfish",
+    "title": "Holland Tideflats",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "67a52662-aa4a-43b6-a30b-641be8cc1034",
+    "ai_champion_guid": "8f6b0521-7e80-418a-813e-b9e87140aa9e",
+    "mods_json": [
+     {
+      "description": "When a champion plays a resource, they draw a card.",
+      "mods": [
+       {
+        "guid": "db6f85e3-3d6c-4a66-9fb0-2962ca3e88ff"
+       }
+      ],
+      "title": "River of Knowledge"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "123e3fd1-fb38-4c1b-9ed6-de6f5c6b179e",
+    "name": "AZ 2 - NODE 20 - Rieger Ridge - Ayotochi Refugee",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "d73f1324-150d-4507-93fe-c2f614ce1911",
+    "ai_champion_guid": "fabc9d4d-bf53-474a-a71e-6aa4a26be76f",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "90c74694-3770-4053-a681-08906d549c4c",
+    "name": "AZ 2 - NODE 21A - James River Road - Xentoth's Zealot (vs. Ardent)",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "5b26a6c6-c7b3-4529-a2fa-a4c8fa19878c",
+    "ai_champion_guid": "f380d266-eef6-496e-98d3-5ac671ac9f55",
+    "mods_json": [
+     {
+      "description": "The fields summon a Dreadling to your aid for each Underworld troop fighting on your side.",
+      "mods": [
+       {
+        "guid": "69eca5cc-f1f7-4fa9-8013-53e58fc8cdff"
+       }
+      ],
+      "title": "Dreadbreed Field"
+     },
+     {
+      "description": "Deployed Ardent troops bestow a gift of Valor.",
+      "mods": [
+       {
+        "guid": "ef1b6bb3-5771-41f1-9db1-620db77bed43"
+       }
+      ],
+      "title": "Fleeting Inspiration"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "11a4166f-3e7b-4b3f-b2aa-9ec2de432144",
+    "name": "AZ 2 - NODE 21B - James River Road - Lazghar Chul (vs. Underworld)",
+    "title": "",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "65a3f875-27fa-4c48-aa08-acf40e3d1dd5",
+    "ai_champion_guid": "af99c305-546c-47fd-90be-05227c4e6707",
+    "mods_json": [
+     {
+      "description": "Deployed Ardent troops bestow a gift of Valor.",
+      "mods": [
+       {
+        "guid": "ef1b6bb3-5771-41f1-9db1-620db77bed43"
+       }
+      ],
+      "title": "Fleeting Inspiration"
+     },
+     {
+      "description": "The fields summon a Dreadling to your aid for each Underworld troop fighting on your side.",
+      "mods": [
+       {
+        "guid": "69eca5cc-f1f7-4fa9-8013-53e58fc8cdff"
+       }
+      ],
+      "title": "Dreadbreed Field"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "17702ae6-52b0-4ca0-a3c3-b89783972d17",
+    "name": "AZ 2 - NODE 22 - Lebus Pass - Darkspire Scout",
+    "title": "Lebus Pass",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "71da68b3-381a-42bf-b69e-3b9c49d6e58f",
+    "ai_champion_guid": "104ab45a-6354-416c-a40d-bd3fcbfba284",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c97f5c09-0c89-4bb3-8ece-5f8c2cc4c0ad",
+    "name": "AZ 2 - NODE 25 - Eslinger Isthmus - Dire Toad",
+    "title": "Eslinger Isthmus",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "3eaf1839-de7d-44a3-9645-d9599fc0b6b2",
+    "ai_champion_guid": "b01b95f7-427e-4807-90a0-831692d062a3",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2a68104b-7257-4f4c-92fd-a6416366f03b",
+    "name": "AZ 2 - NODE 28 - Cliffs of Nausea - Puke Troll",
+    "title": "Cliffs of Nausea",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "c63c113c-8dfe-4bdf-ab92-d003f1d0060e",
+    "ai_champion_guid": "ccdfebcc-cab2-43c5-83e6-c094319100ed",
+    "mods_json": [
+     {
+      "description": "Champions have <b>Armor 1</b>.",
+      "mods": [
+       {
+        "guid": "fdaa427d-71db-4327-b67f-8af6f8f79876"
+       }
+      ],
+      "title": "Available Cover"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d80c373a-6b77-4e28-bf3b-7931584c2f13",
+    "name": "AZ 2 - NODE 3 - Whisper Delta - Captain Chumspike",
+    "title": "",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "c691b89f-3baa-4755-96b4-58aed3ff8f8f",
+    "ai_champion_guid": "c379023e-cd31-42ef-aceb-af3135039fe0",
+    "mods_json": [
+     {
+      "description": "Chumspike is after you! Survive long enough to make your escape.",
+      "mods": [
+       {
+        "guid": "071c0613-50fd-44e3-88d7-fbd4dae61dda"
+       }
+      ],
+      "title": "Row Faster!"
+     },
+     {
+      "description": "You can't hope to hurt Chumspike in such a tiny ship.",
+      "mods": [],
+      "title": "Need a Bigger Boat"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "537f9890-1d2f-42ed-94c5-cd1f1eef589f",
+    "name": "AZ 2 - NODE 30 - Portabella South - Augustine",
+    "title": "Cliffs of Nore",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "148b2fcd-6d73-4193-a6af-546a1c1fe40b",
+    "ai_champion_guid": "5c94c2d9-7182-40a1-8e06-d66b603db84d",
+    "mods_json": [
+     {
+      "description": "Champions have <b>Armor 1</b>.",
+      "mods": [
+       {
+        "guid": "fdaa427d-71db-4327-b67f-8af6f8f79876"
+       }
+      ],
+      "title": "Armored for Battle"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "605fea67-3127-45a6-8657-c83e67f69eb4",
+    "name": "AZ 2 - NODE 32 - Alachian Flats - Bog Walker",
+    "title": "",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "3ef60c2a-f020-4a09-9f89-e2b55092903e",
+    "ai_champion_guid": "61ca7c34-bc59-4e33-9181-665a0325a036",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b593e738-6cdb-42ec-b74b-308e2d2532fb",
+    "name": "AZ 2 - NODE 37 - Bowles Overlook - Wandering Totem",
+    "title": "Broken Arm Overlook",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "3aea20e6-e370-41ac-86d6-aae3a5052f09",
+    "ai_champion_guid": "b5a55c96-0c86-4039-974f-fb23fc8167ba",
+    "mods_json": [
+     {
+      "description": "When a champion plays an action, each opposing champion buries the top card of their deck.",
+      "mods": [
+       {
+        "guid": "c9962106-f8db-4fde-acda-53f571065be9"
+       }
+      ],
+      "title": "Gale Winds"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5920a18a-71cf-4293-8cf3-55ad9675e141",
+    "name": "AZ 2 - NODE 38 - Isle of Kukatan - Sister of the Herd",
+    "title": "Isle of Kukatan",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "178cd4a5-1b01-4b24-96f0-9dde6b18bd9c",
+    "ai_champion_guid": "26fb6eee-8b1a-4dbd-890f-f4e1458132a4",
+    "mods_json": [
+     {
+      "description": "When a troop is played, the opponent gets a <b>Totem Trap</b>.",
+      "mods": [
+       {
+        "guid": "004bffa6-b6f1-42f4-af03-c33c1d576ccb"
+       }
+      ],
+      "title": "Trap-filled Battlefield"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "419fcb63-2bac-458a-b742-3f70517a26aa",
+    "name": "AZ 2 - NODE 43 - Barbed Spine - Monk of the Six Strikes",
+    "title": "",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "5d3b3a18-fcb2-4a92-8e91-d9e3cd05e017",
+    "ai_champion_guid": "22c44dd6-b907-404c-839d-62c7ed576755",
+    "mods_json": [
+     {
+      "description": "Each resource provides an additional [L1][R1].",
+      "mods": [
+       {
+        "guid": "6609d8fe-f1f4-49b7-9282-64c732659bcb"
+       }
+      ],
+      "title": "Leyline of Abundance"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "96dc1a52-8228-4e3e-b2fb-a0b96d64e041",
+    "name": "AZ 2 - NODE 46 - Mithral River - Constantina",
+    "title": "Mithral River",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "0c9d7c2d-07a0-4ee2-a7ad-d4e41f0386cd",
+    "ai_champion_guid": "92a2e723-dee8-4706-b5b4-5f1b62d9301b",
+    "mods_json": [
+     {
+      "description": "When a mage or elemental troop enters play, that troop's controller gains [L0]/[R1].",
+      "mods": [
+       {
+        "guid": "c00e2fd7-fa27-40eb-aac4-fab061ac5ab4"
+       }
+      ],
+      "title": "Enchanted Wilds"
+     },
+     {
+      "description": "Constantina scouts the nearby area giving her troops Steadfast and the inability to be exhausted by opposing cards and effects.",
+      "mods": [],
+      "title": "Eternal Scout"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3f17acb8-1369-4014-9008-4f3f245b519b",
+    "name": "AZ 2 - NODE 48 - Mithral Falls - Eurig the Robomancer",
+    "title": "Mithral Falls",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "05831534-71c6-4ece-8c95-13b2ed1cc7b7",
+    "ai_champion_guid": "10cafb51-cbcb-45b3-9b7e-496a5b40fbcc",
+    "mods_json": [
+     {
+      "description": "At the start of each champion's turn, a random robot they control is transformed into a random robot with cost +[(1)].",
+      "mods": [
+       {
+        "guid": "b5b7f8cf-e49d-45b1-9360-7cfcb7518342"
+       }
+      ],
+      "title": "Robo-hancement Facility"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "459baf35-a004-4cc0-a0dd-36c00be2cf98",
+    "name": "AZ 2 - NODE 49 - The Gallows - Gallows Ghasts",
+    "title": "",
+    "gameboard": "Forest",
+    "ai_deck_guid": "f5332d6e-418c-4f82-bf53-38d81cd08c3b",
+    "ai_champion_guid": "909bce2b-1e19-42e0-9e83-b6d878f5ed79",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "98e1ac88-61b4-4355-be92-09c8a38b5815",
+    "name": "AZ 2 - NODE 50 - Gobbler's Gulch - Flickering Gobbler",
+    "title": "",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "b0c04ec0-f214-48e3-8fb4-52179e8fe915",
+    "ai_champion_guid": "885db849-81ae-41a0-9996-c8ced143c2db",
+    "mods_json": [
+     {
+      "description": "Troops in each deck get, Deploy - Return an action with equal or less cost from your crypt to your hand.",
+      "mods": [
+       {
+        "guid": "b5c80ead-bcef-4416-8528-4ff0e926facb"
+       }
+      ],
+      "title": "Lair of the Gobblers"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d485883d-b0d4-4040-b76c-44120cdfd7aa",
+    "name": "AZ 2 - NODE 51A - Harp Rock - Mancubus",
+    "title": "Harp Rock",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "e0c8bd3d-061f-482d-95c2-d19af034a6cb",
+    "ai_champion_guid": "8d226353-6566-4cc9-9399-5f8a13d9401e",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d63ce299-affe-4578-80e2-694c9257e917",
+    "name": "AZ 2 - NODE 51B - Harp Rock - Succubus",
+    "title": "Harp Rock",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "4e5e13c7-ee4f-409a-bb28-dbfb65e4952c",
+    "ai_champion_guid": "ee43e87f-37e4-44d7-bb40-8eca8a6f5bbf",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "240f29fa-2e19-4da6-a201-90fcf88f8b21",
+    "name": "AZ 2 - NODE 52 - Obsidian Ridge - Obsidian Cyclops",
+    "title": "",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "4e9e4318-fd37-4ab2-a020-4c64da7f8622",
+    "ai_champion_guid": "b9f50063-fe5c-401f-a17a-cc8af23a7b4d",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7165340b-6ac9-4edd-ac8c-26144f37f954",
+    "name": "AZ 2 - NODE 53 - Mountain of Madness - Mad Aradam",
+    "title": "Mountain of Madness",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "033c3eb8-e789-4b31-b20b-9457551fa167",
+    "ai_champion_guid": "8e7d1de6-535a-472c-b038-21562b9c2b2a",
+    "mods_json": [
+     {
+      "description": "Your cards have +1 cost, and you bury 5 cards at the start of each of her turns. ",
+      "mods": [
+       {
+        "guid": "b662eb51-24ca-439d-a749-b4c8bfe72991"
+       }
+      ],
+      "title": "Savvas' Curse"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "08e728cc-2679-43ed-b9b3-2cad2aac8c1e",
+    "name": "AZ 2 - NODE 54 - Mountain of Conflagration - Savvas",
+    "title": "Mountain of Conflagration",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "2f0700dd-a230-42c7-9c3f-500bec3c0406",
+    "ai_champion_guid": "8f6b105d-f3d5-43a9-abbe-dbfa7030ccef",
+    "mods_json": [
+     {
+      "description": "When a champion draws a card, they also gain a charge.",
+      "mods": [
+       {
+        "guid": "96ab9d7f-0f25-44de-a7dd-7c4a5eaca390"
+       }
+      ],
+      "title": "Knowledge is Power"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ee1b1cd4-5323-4109-86af-e6f130902b36",
+    "name": "AZ 2 - NODE 55 - Bogberg's Cave - Bogberg",
+    "title": "Bogberg's Cave",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "d2196ac0-f5e8-40ea-bfa9-5bf64544e6ec",
+    "ai_champion_guid": "aa72fb3d-4371-4132-abab-c04bfc39f4f7",
+    "mods_json": [
+     {
+      "description": "Troops in your deck get, Deploy - Return an action with equal or less cost from your crypt to your hand.",
+      "mods": [
+       {
+        "guid": "b5c80ead-bcef-4416-8528-4ff0e926facb"
+       }
+      ],
+      "title": "Lair of the Gobblers"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a9ef52ec-0b02-4916-bacc-2a7570029542",
+    "name": "AZ 2 - NODE 56 - Sporeburg - Fungal Monstrosity (Secret)",
+    "title": "Sporeburg",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "69756170-818c-41b6-95ba-d062bc1307bf",
+    "ai_champion_guid": "af65892f-3784-4b8f-b2f1-2161f999e539",
+    "mods_json": [
+     {
+      "description": "A pair of shin'hare jailors aid you.",
+      "mods": [
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       },
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       }
+      ],
+      "title": "Shin'hare Jailors"
+     },
+     {
+      "description": "Spend all your resources each turn to summon another Jailor",
+      "mods": [
+       {
+        "guid": "16b6906a-3287-4696-a6c2-44fec24eb3fe"
+       }
+      ],
+      "title": "Reinforcements"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ef481810-3d9c-442f-acbb-00703a43dc29",
+    "name": "AZ 2 - NODE 56B - Sporeburg - Fungal Monstrosity - U (Secret)",
+    "title": "",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "69756170-818c-41b6-95ba-d062bc1307bf",
+    "ai_champion_guid": "af65892f-3784-4b8f-b2f1-2161f999e539",
+    "mods_json": [
+     {
+      "description": "Five jailors aid you.",
+      "mods": [
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       },
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       },
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       },
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       },
+       {
+        "guid": "535d4705-ac2f-4dce-b7b7-3e8b9c135770"
+       }
+      ],
+      "title": "Shin'hare Jailors"
+     },
+     {
+      "description": "As long as you don't spend all your resources, another Jailor will arrive each turn,",
+      "mods": [
+       {
+        "guid": "6e710d2f-61bc-4294-a19a-368fcdf1b96b"
+       }
+      ],
+      "title": "Summon Reinforcements"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "73fda162-0f33-40d6-ad03-444fe01924a0",
+    "name": "AZ 2 - NODE 6A - Wakuna Ridge - Kagulichu (vs Ardent)",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "7a37dc88-6efd-4381-8a96-b5b1a5393360",
+    "ai_champion_guid": "57aee86c-7e13-48be-b7e8-90492b84a5bc",
+    "mods_json": [
+     {
+      "description": "The fields summon a Dreadling to your aid for each Underworld troop fighting on your side.",
+      "mods": [
+       {
+        "guid": "69eca5cc-f1f7-4fa9-8013-53e58fc8cdff"
+       }
+      ],
+      "title": "Dreadbreed Fields"
+     },
+     {
+      "description": "Deployed Ardent troops bestow a gift of Valor.",
+      "mods": [
+       {
+        "guid": "ef1b6bb3-5771-41f1-9db1-620db77bed43"
+       }
+      ],
+      "title": "Fleeting Inspiration"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2c8cec4b-b523-4df1-bf67-23773982bae5",
+    "name": "AZ 2 - NODE 6B - Wakuna Ridge - Winter Moon (vs. Underworld)",
+    "title": "",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "af69e30e-f278-4d61-ace6-42fb945fad2b",
+    "ai_champion_guid": "13f6cdd1-2e2b-4826-ae67-6eabf78fae54",
+    "mods_json": [
+     {
+      "description": "Deployed Ardent troops bestow a gift of Valor.",
+      "mods": [
+       {
+        "guid": "ef1b6bb3-5771-41f1-9db1-620db77bed43"
+       }
+      ],
+      "title": "Fleeting Inspiration"
+     },
+     {
+      "description": "The fields summon a Dreadling to your aid for each Underworld troop fighting on your side.",
+      "mods": [
+       {
+        "guid": "69eca5cc-f1f7-4fa9-8013-53e58fc8cdff"
+       }
+      ],
+      "title": "Dreadbreed Fields"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e762360c-f3c8-4225-bce6-9b42f80231a7",
+    "name": "AZ 2 - NODE 8 - George Gorge - Flock of Seagulls",
+    "title": "",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "ae3d5326-48ac-48bc-9a1f-acacc1674d5e",
+    "ai_champion_guid": "e675fdcd-28a9-451f-a97a-283353fa28fc",
+    "mods_json": [
+     {
+      "description": "Beware what lurks below",
+      "mods": [
+       {
+        "guid": "95e75393-ece1-4547-9acd-15172ea2fe8e"
+       }
+      ],
+      "title": "Summoning Tentacles"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b4d46c49-02d3-4df1-933d-6a265845124f",
+    "name": "AZ 2 - NODE 9 - Babcock Bluff - Katsuhiro",
+    "title": "Gaaffaa Bluff",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "07640dae-46ac-4f75-85ee-f9c0d7411ba5",
+    "ai_champion_guid": "bdb0b038-4bea-43f2-9dbe-d778adfc543c",
+    "mods_json": [
+     {
+      "description": "Troops with cost [(3)] or less get <b>Speed</b> and <b>Crush</b>",
+      "mods": [
+       {
+        "guid": "5c86933d-4c4a-4d68-9f26-0d9ecbd50082"
+       }
+      ],
+      "title": "Eager for Battle"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9da0e09c-102f-4b44-a378-df71ca12b884",
+    "name": "AZ 2 - NODE B01 - 1st Elementals",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "963cffc0-091e-4e82-90cb-9d4fc4fc18e5",
+    "ai_champion_guid": "e7fd0005-c796-4b0f-a153-e6714aafb32b",
+    "mods_json": [
+     {
+      "description": "When a troop dies, the opposing champion gains a charge.",
+      "mods": [
+       {
+        "guid": "aa889ab5-2b4b-4c45-bb08-f95a3df1a878"
+       },
+       {
+        "guid": "4981253d-e517-4075-9643-013940060e35"
+       }
+      ],
+      "title": "Elemental Sea"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8d510865-d170-4061-aab0-7da2d1853ce1",
+    "name": "AZ 2 - NODE B03 - Lobster Grunt",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "9933191b-121e-4447-a657-9276836060b3",
+    "ai_champion_guid": "a4046b11-0cbd-4151-9f66-834a5cc00c76",
+    "mods_json": [
+     {
+      "description": "Sapphire troops have +1 defense.",
+      "mods": [
+       {
+        "guid": "51729b30-51e9-4f45-b078-a7a8a3b43631"
+       }
+      ],
+      "title": "Waterproof"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c0a7c195-f2a3-4ed9-9ef9-f2eb9b4b496e",
+    "name": "AZ 2 - NODE B04 - Scylla",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "8684aeb0-07d7-4120-b1b0-f1e769577a00",
+    "ai_champion_guid": "073ffaed-b334-4649-8769-5f0fd16b2a8e",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "412de741-d4c3-4f2d-b421-5be1db7de7f6"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "1895828d-6c16-49fd-af69-61c00ddda47c",
+    "name": "AZ 2 - NODE B05- Pirates on the seas",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "fb97b881-a310-4a7c-b8d7-a49e6e87634d",
+    "ai_champion_guid": "de3b7639-0c08-465a-86e4-a9da85bac6fb",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ac6d131f-caa4-4539-abbf-2f035cc010a3",
+    "name": "AZ 2 - NODE B06 - 2nd Elementals",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "88d40a8a-64c3-4f2f-8a05-94e4364d88a1",
+    "ai_champion_guid": "7e7abd46-9165-412a-859b-72d735729c2d",
+    "mods_json": [
+     {
+      "description": "When a troop dies, the opposing champion gains a charge.",
+      "mods": [
+       {
+        "guid": "412de741-d4c3-4f2d-b421-5be1db7de7f6"
+       },
+       {
+        "guid": "aa889ab5-2b4b-4c45-bb08-f95a3df1a878"
+       }
+      ],
+      "title": "Elemental Sea"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "19bf9ca1-cbd5-43b6-af6a-0a1eea0a46a6",
+    "name": "AZ 2 - NODE B08 - Lobster Wizard",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "f91e5c0f-bb4c-4ea2-9bb6-39cf4029a0eb",
+    "ai_champion_guid": "65579bf8-05bf-4df6-ab47-a22b091da8a2",
+    "mods_json": [
+     {
+      "description": "Sapphire troops have +1 defense.",
+      "mods": [
+       {
+        "guid": "51729b30-51e9-4f45-b078-a7a8a3b43631"
+       },
+       {
+        "guid": "412de741-d4c3-4f2d-b421-5be1db7de7f6"
+       }
+      ],
+      "title": "Waterproof"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "440819d5-73f7-496c-8b41-40ebe2508400",
+    "name": "AZ 2 - NODE B09 - Lightning Armada",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "0a51c3f3-a144-49e0-bd76-8d5988c0930c",
+    "ai_champion_guid": "d3208e25-f9fe-4806-b510-b0aa45c2a009",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "412de741-d4c3-4f2d-b421-5be1db7de7f6"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "852e9494-5ad9-4008-a6ab-1410797736dc",
+    "name": "AZ 2 - NODE B10 - Charybdis",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "105ad44e-3830-46a5-8348-387f2e808627",
+    "ai_champion_guid": "9359daf4-4bf4-46fc-93a7-a0ec3df5b1ea",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "412de741-d4c3-4f2d-b421-5be1db7de7f6"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "162d5d67-a6b5-49c0-88d5-31ddea7cf923",
+    "name": "AZ 2 - NODE B13 - 3rd Elemental Battle",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "0196d6b9-3a95-4c16-80d6-60984c81f7db",
+    "ai_champion_guid": "6b88dc04-3a1c-4fc4-afea-311566845e5e",
+    "mods_json": [
+     {
+      "description": "When a troop dies, the opposing champion gains a charge.",
+      "mods": [
+       {
+        "guid": "aa889ab5-2b4b-4c45-bb08-f95a3df1a878"
+       },
+       {
+        "guid": "10831ef3-fd41-4919-b95c-bcd9089da5d0"
+       }
+      ],
+      "title": "Elemental Sea"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c227078a-644f-4aa2-b96d-12fabb3c447e",
+    "name": "AZ 2 - NODE B14 - Sea Outpost",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "68651b6a-5e56-4ad2-b5d6-5de0ae3b5631",
+    "ai_champion_guid": "730a28f5-7d6e-40a2-9918-baa40a0edd74",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "10831ef3-fd41-4919-b95c-bcd9089da5d0"
+       },
+       {
+        "guid": "a8410bf7-58aa-4a33-aefa-c5291a2b7adf"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "86408708-ab75-4c88-a7f9-fecefc97894d",
+    "name": "AZ 2 - NODE B15 - Pirates 2",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "3eb9f172-c40b-40d6-961d-043f56b45fa9",
+    "ai_champion_guid": "e2ac3da5-d91a-4bc3-b618-5ac6829e8da3",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "13ff356b-8de8-4cb2-bc99-19a7787b14d6",
+    "name": "AZ 2 - NODE B16 - Lobster Lord",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "fe5d1186-afe6-4fd0-8080-92953cf09cca",
+    "ai_champion_guid": "c3f9584a-735f-49d7-848e-d85f5b4ae986",
+    "mods_json": [
+     {
+      "description": "Sapphire troops have +1 defense.",
+      "mods": [
+       {
+        "guid": "51729b30-51e9-4f45-b078-a7a8a3b43631"
+       },
+       {
+        "guid": "10831ef3-fd41-4919-b95c-bcd9089da5d0"
+       }
+      ],
+      "title": "Waterproof"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9ea4fc41-702b-4b83-8dd4-84915020a1b2",
+    "name": "AZ 2 - NODE B17 - Pirates 3",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "fecf5948-5531-44d6-8995-210351e892c4",
+    "ai_champion_guid": "2ae98b8f-5a03-44ce-a4f6-56945a602aeb",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "0c5eec21-b9c6-4b47-b36c-aebefcb4295f",
+    "name": "AZ 2 - NODE B18 - Old Man of the Sea",
+    "title": "",
+    "gameboard": "Boat",
+    "ai_deck_guid": "0e059b1b-03e1-4d64-af87-ea8014c74c2b",
+    "ai_champion_guid": "bc3d23e0-82ab-476c-b01a-48ec9ccce79c",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "30aed233-f4cd-4c72-b817-f58d07632071"
+       },
+       {
+        "guid": "653be13d-e9ce-47ec-b963-dcf164c69337"
+       },
+       {
+        "guid": "54831705-b1e7-4435-a9e9-e7e842d29e3c"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "064d32cd-9171-4052-82a2-869eb0017b2a",
+    "name": "AZ0_Coyotle",
+    "title": "Training with Whispering Breeze",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "a94d33f7-53cf-4c54-a101-d8bbbb0d197b",
+    "ai_champion_guid": "b41ca664-789c-4958-8386-8e7b339825c8",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "de641801-55a2-4df8-b298-d2e91c21718d",
+    "name": "AZ0_Dwarf",
+    "title": "Training with Gwendower",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f1654ad9-3860-45fa-b66f-57ad7183903e",
+    "ai_champion_guid": "b43e98a6-040e-4447-a576-e8e5bdd3df11",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e5cd349e-a77d-4175-8cfc-3565395c2eb4",
+    "name": "AZ0_Elf",
+    "title": "Training with Nerissa",
+    "gameboard": "Forest",
+    "ai_deck_guid": "de3d1643-685a-4005-8885-a15d64113778",
+    "ai_champion_guid": "11b18575-fab3-49d1-a1ab-2ef6447c99d1",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5227b1b0-193a-45e8-a1a3-8215f20ac95b",
+    "name": "AZ0_Human",
+    "title": "Training with Gareth Kay",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "05264924-8e1f-4df0-8468-27157aabf484",
+    "ai_champion_guid": "a633844d-bb26-4776-9351-aea16b4c71ba",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7b9a5a0d-727f-4df8-923f-1e5a5b24c522",
+    "name": "AZ0_Necrotic",
+    "title": "Training with Iddi",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "81726f9a-f9b5-474c-ab4a-f661978a5fe7",
+    "ai_champion_guid": "b173e3d2-bdd3-44cb-b554-85d1c56b0cd2",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "84cdd061-93ec-4126-a2f6-530ac5217c96",
+    "name": "AZ0_Orc",
+    "title": "Training with Moqui",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f5c0ebdb-cea8-420f-bb99-1cf806ecf95e",
+    "ai_champion_guid": "cb2e56cd-5502-4e4c-88e0-a9955715569b",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "510ed850-5a3e-437b-875e-7834cacd1865",
+    "name": "AZ0_Shinhare",
+    "title": "Training with Sora",
+    "gameboard": "Forest",
+    "ai_deck_guid": "f0853879-ee9d-4460-afeb-6b4d8acd0f03",
+    "ai_champion_guid": "ddc235eb-c6dc-4384-b567-70eb7498b729",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f56ba80f-af31-4d75-a4bc-640f899ddd32",
+    "name": "AZ0_Vennen",
+    "title": "Training with Zilth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d45a5746-6fdc-4e74-9520-7091908ffd46",
+    "ai_champion_guid": "e7539c3a-0bac-486c-9792-0293db113268",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "one_time": false,
+     "xp": 100
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7c10655d-af47-4ae5-a0ff-f585ddd4eb6a",
+    "name": "AZ2 - NODE 23A - Scamman Rock - Midnight Shepherd (vs. Ardent)",
+    "title": "Shakeclaw Rock",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "c591172d-4562-4026-8190-09474927ef47",
+    "ai_champion_guid": "d4ab96c2-2563-4fdf-822c-f051e0feb508",
+    "mods_json": [
+     {
+      "description": "At the start of the game, each champion creates a <b>Shards of Fate</b> and puts it into their hand.",
+      "mods": [
+       {
+        "guid": "953e7b6e-6d9f-4386-a0a4-54b260bd3eb7"
+       }
+      ],
+      "title": "Splendor of the Crypts"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "fecd0ede-6380-462f-a01e-a10adf476874",
+    "name": "AZ2 - NODE 24 - Deathless Path - Paladin of the Necropolis",
+    "title": "Impane Road",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "349abd73-7806-40ec-90d0-2e9159b969ae",
+    "ai_champion_guid": "4698c53e-9c55-434e-a9cd-6f4bf48075e8",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "eef5bbde-73be-4abd-9d49-1ae88abb2b10",
+    "name": "AZ2 - NODE 34A -Starfire Tributary - Rune Ear Hierophant (vs. Ardent)",
+    "title": "",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "36171e11-fb8a-41b4-a77c-2383906bfae1",
+    "ai_champion_guid": "17499dd2-58f9-4872-8474-f70ba850bd12",
+    "mods_json": [
+     {
+      "description": "Lionel will aid you in rescuing Reginald from the Shin'hare.",
+      "mods": [
+       {
+        "guid": "49911a5b-6e80-439f-bc40-f1ff325d3681"
+       }
+      ],
+      "title": "Lionel to the Rescue!"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bfe9165a-dad5-456c-b862-e9324675af0e",
+    "name": "AZ2 - NODE 34B - Starfire Tributary - Devouring Doomspore (vs. Underworld)",
+    "title": "",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "2724cf22-b784-4c16-aa88-6d9e094ff733",
+    "ai_champion_guid": "7f3c9cfb-5a14-4ebc-80c2-bc6fc367c623",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bc122654-b54e-46e5-8feb-90879030ef8b",
+    "name": "AZ2 - NODE 35A - Pruitt Grove - Shin'hare Abductor (vs. Ardent)",
+    "title": "Shin'hare Encampment",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "ad5df231-827c-4de5-92c3-c14063b72fa7",
+    "ai_champion_guid": "66070a48-788b-4295-ae9f-aef93945d78a",
+    "mods_json": [
+     {
+      "description": "Reginald Lancashire is being held captive deep within the Shin'hare Abductor's deck.  Bury their deck with damage to rescue him. ",
+      "mods": [
+       {
+        "guid": "3f495341-7e67-4312-a853-b84570df5757"
+       }
+      ],
+      "title": "Find Reginald Lancashire"
+     },
+     {
+      "description": "Lionel will aid you in rescuing Reginald from the Shin'hare.",
+      "mods": [
+       {
+        "guid": "49911a5b-6e80-439f-bc40-f1ff325d3681"
+       }
+      ],
+      "title": "Lionel to the Rescue!"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "51c1b7d2-7e5a-4653-b089-5710cab30bfa",
+    "name": "AZ2 - NODE 35B - Pruitt Grove - Greenpaw Emancipator (vs. Underworld)",
+    "title": "",
+    "gameboard": "Jungle",
+    "ai_deck_guid": "fab7b19b-1b5c-480b-8ec3-cd06065a46b9",
+    "ai_champion_guid": "89b6fdce-2331-4a90-b2d5-799deba18f0f",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4fc87ec6-ea0d-4089-bd55-e0183e2f899a",
+    "name": "Ambush - Bypass",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "c22ddc07-78db-4f2b-ac43-2a078a3fbe4b",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3f8ff7e7-cd0b-4ee5-a95a-3082e19ed3d6",
+    "name": "Ambush - Dark Grotto",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "71a5c0ff-7f5f-4487-b5c6-553a20399fbe",
+    "ai_champion_guid": "ac055d68-1a56-4938-9c1c-366ca2e292a6",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "7407caa9-ee0d-4fac-9f1a-222e41cd2d5b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9c5876f7-0d71-49a8-96af-bd689b48dba5",
+    "name": "Ambush - Lair of 1000 Webs",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "6c74dd0f-1d88-4ac1-8bd3-fe24251f0f8a",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "7407caa9-ee0d-4fac-9f1a-222e41cd2d5b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e4e27187-a799-41c3-9e52-f560ed1b4fa3",
+    "name": "Ambush - Light at the End",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "fb54c2bd-1b3f-44eb-ac55-8c0193650e42",
+    "ai_champion_guid": "882bf7a4-a7de-41a8-a06a-16383f39ad9a",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "7407caa9-ee0d-4fac-9f1a-222e41cd2d5b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2ce910f0-5302-4ba8-a516-cc802a17204f",
+    "name": "Ambush - Morlocks",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "f9d8197f-da4a-4920-8411-1bbdf3ad7f7c",
+    "ai_champion_guid": "471c07be-b44b-4555-b76b-22f984fa54ec",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "7407caa9-ee0d-4fac-9f1a-222e41cd2d5b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d39feca6-61bc-44cb-9292-397db3eed286",
+    "name": "Ambush - The Ambush",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "cac0885c-cc2e-4e09-8192-e8508e27005b",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "d790e8b9-a000-475e-8350-d11be117d6bc"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "71b17e66-287b-461a-bea1-b8269d87a169",
+    "name": "Ambush - Underground Trail",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "b117325e-add1-492e-b40e-6ade9963379e",
+    "ai_champion_guid": "23de5b4a-5d43-4e4c-88d7-6520055c8867",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "662ae5cc-69ce-45ee-8c1a-39976ffe19e8"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000005",
+    "name": "Beach",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000007",
+    "name": "BeachShipwreck",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6f01db3c-6f18-49d3-8605-cdb272edd2a8",
+    "name": "Brutecrown Bluff B - Stone Path",
+    "title": "Stone Path",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "568adea6-6e21-4ad0-ac1c-0fcaf50033de",
+    "ai_champion_guid": "b169a0b9-2fb4-4ab7-a47a-87b0fdc34933",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ca238669-032e-47d4-857f-4e1939670e2c",
+    "name": "Brutecrown Bluff C - Kildonan Circle",
+    "title": "Kildonan Circle",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "55c342df-c2ef-4294-b6b9-f8800dde9954",
+    "ai_champion_guid": "ff401f05-40a5-4851-bf73-a683c4c8bb5b",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "768a83c8-0abb-43e3-8dc6-8911ae231506",
+    "name": "Brutecrown Bluff D - Pebble Hollow",
+    "title": "Pebble Hollow",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "8830f067-4086-40cd-bc31-9e084cbcbacd",
+    "ai_champion_guid": "11a69bf7-56b3-433c-a2ba-60328e458b1a",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6aca3608-0ef6-478b-a089-d76e94b13650",
+    "name": "Brutecrown Bluff H-1 - Lair of the Beast",
+    "title": "Lair of the Beast",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "d72fd8dd-747a-4a01-a126-008b64bb6814",
+    "ai_champion_guid": "cc19025a-2de8-465d-951c-1cf8fad7cdc7",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d54214f3-0ede-4196-8c7d-90e1e1a990cf",
+    "name": "Brutecrown Bluff H-2 - Lair of the Beast",
+    "title": "Lair of the Beast",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "d72fd8dd-747a-4a01-a126-008b64bb6814",
+    "ai_champion_guid": "cc19025a-2de8-465d-951c-1cf8fad7cdc7",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c88b339e-d51d-49fc-ac94-9f7ad63ba638",
+    "name": "Brutecrown Bluff H-3 - Lair of the Beast",
+    "title": "Lair of the Beast",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "d72fd8dd-747a-4a01-a126-008b64bb6814",
+    "ai_champion_guid": "cc19025a-2de8-465d-951c-1cf8fad7cdc7",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "0aa33344-47c7-41ef-b9aa-4f7987c142e9",
+    "name": "Brutecrown Bluff J-1 (Helping Vargar) - Castle Ruins",
+    "title": "Castle Ruins",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "7e98f76e-5515-4010-9924-f9cee3acc379",
+    "ai_champion_guid": "02125548-e929-41eb-ae88-93f526519ed3",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c755cec9-59a0-4135-8ba3-88f324bd9bc9",
+    "name": "Brutecrown Bluff J-2 (Helping Burgg) - Castle Ruins",
+    "title": "Castle Ruins",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d7dee2a7-6678-421e-9861-bce910ab0552",
+    "ai_champion_guid": "cac6e84c-2de1-48b1-9f70-80aa00451309",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "aa88bcc3-1f3a-481c-ba5f-3828c676f1ec",
+    "name": "Brutecrown Bluff J-3 (Helping Zagg) - Castle Ruins",
+    "title": "Castle Ruins",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "571a7a7f-f7e2-4a94-9573-55eeb03c595f",
+    "ai_champion_guid": "45c3442f-d2e1-4329-8be7-4fafd1d9b259",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000004",
+    "name": "Cave1",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000006",
+    "name": "Cave2",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d3a1cb6b-e396-4283-8d99-c9d243000467",
+    "name": "Clan Oni Nibblin Nook",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "52b17f55-1f57-4f7a-b50e-1a167c3840bb",
+    "ai_champion_guid": "d181d7df-f5f2-417b-ba93-799512a8a282",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "85907ab6-0a03-470a-824a-64da1e179294",
+    "name": "Clan Oni The Desert",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "06288d36-4b84-42f1-977f-eda8b49d5894",
+    "ai_champion_guid": "d181d7df-f5f2-417b-ba93-799512a8a282",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b5331690-a03a-4189-b0e0-fc26d6ac5935",
+    "name": "Clan Oni The Floating Hoard",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "b0368934-437a-400d-b4a1-2039edb7bfec",
+    "ai_champion_guid": "d181d7df-f5f2-417b-ba93-799512a8a282",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b617bf7b-9551-4471-8605-d63b39c77336",
+    "name": "Clan Oni The Oni Clan",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "9ebd171c-411e-4f9e-aaf4-e9bcadb3c214",
+    "ai_champion_guid": "3f04ec92-a3fe-4692-b255-63af28016920",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6eba98f3-7cd8-449e-bea6-2b35b9f5f124",
+    "name": "Clan Oni The Tundra",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "cf456436-9ff7-4ea9-82c4-8b8b97530c1f",
+    "ai_champion_guid": "d181d7df-f5f2-417b-ba93-799512a8a282",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b9c085b1-1aff-48b9-b1c3-bd89dce6893e",
+    "name": "Corrupted Pool Corpse Woods",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "b9445db1-d04d-46a9-88fd-f19b3ecaad00",
+    "ai_champion_guid": "8e1826a3-af97-4aaa-8c94-856331fba74b",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "529ac589-ed42-4df1-94f8-e01ba1f49b46",
+    "name": "Corrupted Pool Crimson Rain",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "9eceb014-579a-47f0-ad43-6b400d9b2a5a",
+    "ai_champion_guid": "d346a437-c6e3-4b7f-996c-e0236faa80f4",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d5228fff-f851-41b1-a8a7-0744ee21c618",
+    "name": "Corrupted Pool Fear Garden",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "37e3b461-c2f0-4a86-83ff-177cb29f60e7",
+    "ai_champion_guid": "86ebc72c-eef7-4981-9374-89a83e368491",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4d40036c-5a4c-4505-84aa-73439257e66b",
+    "name": "Corrupted Pool Leeching Vines",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "57b31b38-e77d-44a9-8505-b73c71551c6c",
+    "ai_champion_guid": "dba7cc90-9937-48f1-9daa-ed2972e8ed00",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4b257b57-f1f8-483b-8bd0-2d5167c87125",
+    "name": "Corrupted Pool Old Worn Path",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "9c4d5e17-2f7d-48ac-b7d8-61d1633cf989",
+    "ai_champion_guid": "cada84bc-4f75-440a-a076-88df23141cce",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ab0e3de4-3ab7-4e8e-acf4-0af40efb5133",
+    "name": "Corrupted Pool Pool Clearing",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "1e47a3f3-68b2-423b-8f29-31522d64651b",
+    "ai_champion_guid": "964c6926-9c46-4702-b13b-188c42404c1c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "79db20d9-cb59-4b2c-9131-6f2bd8ecf27d",
+    "name": "Corrupted Pool Purple Forest",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "19f5db2e-19fc-4827-9ba2-7082f4f964fa",
+    "ai_champion_guid": "c573eafa-25e6-41a8-9062-7631fc96f6d7",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f9e57bcc-54a0-4eaa-a3d4-8ed8304767e7",
+    "name": "Corrupted Pool Rending Vines",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "2c1364b6-9698-4cd5-90d4-3b85389af894",
+    "ai_champion_guid": "d346a437-c6e3-4b7f-996c-e0236faa80f4",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f3c0ac5b-ff09-488c-ad63-f11ff15acdcd",
+    "name": "Coyotle Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "9ab7e118-71f0-4262-af6d-c2ee4deb0d01",
+    "ai_champion_guid": "ddada3b2-7a69-4040-b1f5-fd5ca2ca4bd6",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2ba61b7b-6864-4582-a634-f9124fb2fdee",
+    "name": "Coyotle Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "87c49d40-a931-48c3-a5b9-067012b601f6",
+    "ai_champion_guid": "9d0cdd24-3672-414e-8c49-07da6f97e784",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5f222319-7b4e-4ba4-b0dc-f9678c000d8b",
+    "name": "Coyotle Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "8e7c6ce0-93a0-477c-a332-ec9ae29f3fc3",
+    "ai_champion_guid": "1d756624-3c6a-445e-8fd1-acba6c9e4ce1",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "df0a6365-7f3a-4c02-8b52-c0c7f681b85b",
+    "name": "Devonshire Keep A",
+    "title": "Devonshire Keep - Gate",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "fbdd68b0-dc23-4750-b22d-2a6b29a4a90a",
+    "ai_champion_guid": "24ec7bba-ac3c-43ae-a83f-57792bb0ac4e",
+    "mods_json": [
+     {
+      "description": "When your turn starts, burning champions get additional Burning 2.",
+      "mods": [
+       {
+        "guid": "5444de5c-a2f8-4872-b0cd-a71502ac7d47"
+       }
+      ],
+      "title": "Rising Flames"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e972c731-91ff-4583-a137-a0437456d8c5",
+    "name": "Devonshire Keep C",
+    "title": "Devonshire Keep - Stable",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "343e4bfc-141c-4ce1-a374-3a7d99e466df",
+    "ai_champion_guid": "b32acee6-2333-4ccf-9249-9619a9186369",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "aa3e97f7-983e-4ce4-b9ca-0c3da85139b4",
+    "name": "Devonshire Keep D",
+    "title": "Devonshire Keep - Chapel",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "5455c1b3-1d47-44b1-ac63-ae64272e97eb",
+    "ai_champion_guid": "2b83c833-ccd5-42fb-b7c1-3eea5768ba0a",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "da3590ba-9d76-4e34-98ac-d873158ca46f",
+    "name": "Devonshire Keep E",
+    "title": "Devonshire Keep - Vestibule",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "da59f5c5-10f9-41eb-af26-ee3830349fb5",
+    "ai_champion_guid": "53cdcdc9-f587-4208-8cfa-344a400c2020",
+    "mods_json": [
+     {
+      "description": "A random card in your hand will burn you at the end of each of your turns.",
+      "mods": [],
+      "title": "Engulfed in Flames"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "87eec255-5c66-4213-9a84-9ef6db5cce85",
+    "name": "Devonshire Keep F",
+    "title": "Devonshire Keep F - Great Hall",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "0f8132c9-866d-4ffc-b0d5-21b15e700360",
+    "ai_champion_guid": "d7e4935d-fc3b-4bb3-b796-fc48bb0746ea",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5291c187-ea47-4d0c-be98-fcd8d644e647",
+    "name": "Devonshire Keep G",
+    "title": "Devonshire Keep - Kitchen",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "fb27f2b1-128e-4d7c-bfa4-42c473ba6c72",
+    "ai_champion_guid": "ba88fd9b-fd0f-455e-86a2-77295b906251",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "83def324-a2cf-4234-95a5-2b473de20796",
+    "name": "Devonshire Keep H1",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "078e301b-f76b-468a-a924-433ed34073c2",
+    "ai_champion_guid": "e9b57e15-a905-49b4-80f4-2f73abce02d2",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3f1bfe1d-5f2e-4136-a31f-f4a3a326da06",
+    "name": "Devonshire Keep H2",
+    "title": "Devonshire Keep - Oratory",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "019420e7-0dc9-4e22-bbc6-b327a0b533ee",
+    "ai_champion_guid": "db68991f-7738-4a60-9758-d1890febff1b",
+    "mods_json": [
+     {
+      "description": "Each turn, choose a champion to draw a card.",
+      "mods": [
+       {
+        "guid": "b97e99ea-9549-498c-8eab-3afe57f2c250"
+       }
+      ],
+      "title": "Burning Mind"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5986765d-d857-4c8b-9197-aa2cd4163a48",
+    "name": "Devonshire Keep I",
+    "title": "Devonshire Keep - Minstrel's Gallery",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "e7166609-e8ff-4668-9c2a-82a04985058d",
+    "ai_champion_guid": "f30bb8ff-971e-4526-bce3-44465b7fff40",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "57200014-89ed-4aff-9d73-a77082ebbf1b",
+    "name": "Devonshire Keep J",
+    "title": "Devonshire Keep - Hall of Scribes",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "13ca72d6-a4d2-480b-a124-a9469abcbd99",
+    "ai_champion_guid": "45cd21ce-c715-4dfb-b8dc-05ae3154704f",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9a273f07-ca47-4d5e-8cde-56102c2a884d",
+    "name": "Devonshire Keep K",
+    "title": "Devonshire Keep - Bower",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "53534b40-c02f-4daf-bbac-901c862c9f38",
+    "ai_champion_guid": "f7899c2f-a6ca-4fd7-b624-51aaef779c14",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5647f825-95ff-46cd-a305-653cf4d346e3",
+    "name": "Devonshire Keep L",
+    "title": "Devonshire Keep - Lord Devonshire's Bedchamber",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "8f586820-ba9a-4848-91e7-f935edac3abe",
+    "ai_champion_guid": "ba128afd-eaf9-487d-ab0d-9e78d32d15ba",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "96225626-52ef-4d18-8972-60200d2042e5",
+    "name": "Dwarf Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "80322af5-ce8f-4f2e-9ac4-b5a20d8f4a68",
+    "ai_champion_guid": "9efbd1c3-1724-4e74-8cc3-06f2c1fc5f22",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8188e093-047c-40d5-ae06-fb99d54530d4",
+    "name": "Dwarf Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "58784daa-f2a9-479e-b7fa-4bf58f8775d5",
+    "ai_champion_guid": "b90abda1-dc37-48b6-8ed2-a9c86b5bfa2d",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d796541f-c6c8-4e4f-8313-10ba37f1814b",
+    "name": "Dwarf Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "fe5d65b3-cbfe-4495-b4ba-2fd7c670b937",
+    "ai_champion_guid": "ce9e4694-0a43-44ba-9e33-3b035aea86c6",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f25f20b1-3cb3-4066-ae91-1c557f0928c2",
+    "name": "Elf Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "699af409-3f96-4f2e-99d5-7d5f94e1104f",
+    "ai_champion_guid": "14241860-ad15-41bd-a63b-27477044d5b0",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "31d6b2aa-bdf1-47ea-a0a5-a62bacdb75fa",
+    "name": "Elf Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "5df27304-ed62-48f4-8a6c-642fb52f1729",
+    "ai_champion_guid": "519737b5-6ec0-4355-9e40-7a0ef0fbb40b",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a5b0cfd3-c85e-4c8f-a4ae-172179ae1450",
+    "name": "Elf Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "e1bd29db-ae63-4c0a-8723-8f190fa1777e",
+    "ai_champion_guid": "259f0138-5a98-424c-ac83-da081d702ec4",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "728ab36c-5738-463b-b90a-604c7e06cf1e",
+    "name": "Fort Romor - Commander Hawthorne",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "4625b8a4-24bc-4f8c-91c9-0bcd5b124160",
+    "ai_champion_guid": "d4799997-606c-4b63-9790-d7c823865bd7",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "xp": 150,
+     "one_time": true
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_castle_walls)"
+     ]
+    }
+   },
+   {
+    "guid": "4e4a1016-9e2c-43ce-a5ec-db2c934645b1",
+    "name": "Fort Romor - Defense of Fort Romor III",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "baaec0e7-b30d-4a3d-a968-8cddbe5eba18",
+    "name": "Fort Romor - Legionnaire of Gawaine",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "1e702163-b80d-4d65-8572-f1db508ad483",
+    "ai_champion_guid": "48b9b3b9-77ff-4394-9faa-f61491c8b0a5",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "xp": 150,
+     "one_time": true
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_hellshot_catapult)"
+     ]
+    }
+   },
+   {
+    "guid": "7182243a-637f-42c5-b470-5e5058db7bf4",
+    "name": "Fort Romor - Lord Adam",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "7b14f4e5-99cd-4a46-a5dd-8b06b9c8226b",
+    "ai_champion_guid": "13a98100-aafb-4df1-a957-3d96a74a88f0",
+    "mods_json": [
+     {
+      "title": "Fort Romor defences",
+      "description": "Choose a defence to help hold the fort.",
+      "choice": true,
+      "mods": [
+       {
+        "guid": "e1039036-fbc8-410b-a16f-372b99bdb1d4",
+        "when": [
+         "flag(romor_sniper_tower)"
+        ],
+        "victory": [
+         "clear_flag(romor_sniper_tower)"
+        ]
+       },
+       {
+        "guid": "ddf2923e-5b21-464e-9709-a8ea992cb818",
+        "when": [
+         "flag(romor_hellshot_catapult)"
+        ],
+        "victory": [
+         "clear_flag(romor_hellshot_catapult)"
+        ]
+       },
+       {
+        "guid": "6ce8a874-1469-43fa-a7f0-7174a985d389",
+        "when": [
+         "flag(romor_castle_walls)"
+        ],
+        "victory": [
+         "clear_flag(romor_castle_walls)"
+        ]
+       }
+      ]
+     }
+    ],
+    "rewards_json": {
+     "gold": 1000,
+     "xp": 1000,
+     "one_time": false,
+     "chest_guid": "faea143f-7193-4ac1-bbb2-f79469d8ad9f",
+     "when": [
+      "flag(completed_fort_romor)"
+     ]
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_adam)"
+     ],
+     "defeat": [
+      "set_flag(romor_lost)"
+     ]
+    }
+   },
+   {
+    "guid": "5a4b8e18-c140-4e1d-aed9-0caeed2e3f9f",
+    "name": "Fort Romor - Lord Alexander",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "62c4ed30-ac35-4c6d-8b79-1594cc4dea9a",
+    "ai_champion_guid": "c7aa7ba7-7187-41f2-8a2d-9ecb0dab1625",
+    "mods_json": [
+     {
+      "title": "Fort Romor defences",
+      "description": "Choose a defence to help hold the fort.",
+      "choice": true,
+      "mods": [
+       {
+        "guid": "e1039036-fbc8-410b-a16f-372b99bdb1d4",
+        "when": [
+         "flag(romor_sniper_tower)"
+        ],
+        "victory": [
+         "clear_flag(romor_sniper_tower)"
+        ]
+       },
+       {
+        "guid": "ddf2923e-5b21-464e-9709-a8ea992cb818",
+        "when": [
+         "flag(romor_hellshot_catapult)"
+        ],
+        "victory": [
+         "clear_flag(romor_hellshot_catapult)"
+        ]
+       },
+       {
+        "guid": "6ce8a874-1469-43fa-a7f0-7174a985d389",
+        "when": [
+         "flag(romor_castle_walls)"
+        ],
+        "victory": [
+         "clear_flag(romor_castle_walls)"
+        ]
+       }
+      ]
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_alexander)"
+     ],
+     "defeat": [
+      "set_flag(romor_lost)"
+     ]
+    }
+   },
+   {
+    "guid": "03ac0e37-5bc7-4d68-a25e-c23a08b97b81",
+    "name": "Fort Romor - Lord Benjamin",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f2faea97-9d93-49f0-a879-fc5b3f1ad17a",
+    "ai_champion_guid": "e82ee6ac-70c3-4b2e-836a-bc4f72e82504",
+    "mods_json": [
+     {
+      "title": "Fort Romor defences",
+      "description": "Choose a defence to help hold the fort.",
+      "choice": true,
+      "mods": [
+       {
+        "guid": "e1039036-fbc8-410b-a16f-372b99bdb1d4",
+        "when": [
+         "flag(romor_sniper_tower)"
+        ],
+        "victory": [
+         "clear_flag(romor_sniper_tower)"
+        ]
+       },
+       {
+        "guid": "ddf2923e-5b21-464e-9709-a8ea992cb818",
+        "when": [
+         "flag(romor_hellshot_catapult)"
+        ],
+        "victory": [
+         "clear_flag(romor_hellshot_catapult)"
+        ]
+       },
+       {
+        "guid": "6ce8a874-1469-43fa-a7f0-7174a985d389",
+        "when": [
+         "flag(romor_castle_walls)"
+        ],
+        "victory": [
+         "clear_flag(romor_castle_walls)"
+        ]
+       }
+      ]
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_benjamin)"
+     ],
+     "defeat": [
+      "set_flag(romor_lost)"
+     ]
+    }
+   },
+   {
+    "guid": "f129c290-db71-42b2-bcaa-5ff16f5e3a14",
+    "name": "Fort Romor - Rhonwen",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "a06f0924-54b2-4181-9150-42642ea1b340",
+    "ai_champion_guid": "4ed811af-3c88-4fae-b0f4-94dacb18956d",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 100,
+     "xp": 150,
+     "one_time": true
+    },
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "set_flag(romor_sniper_tower)"
+     ]
+    }
+   },
+   {
+    "guid": "95bf06a3-b155-4b40-b0a2-2f5f5d31e2dd",
+    "name": "Great Machine Graveyard B - Scraptooth Hills",
+    "title": "Scraptooth Hills",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f2aa9022-cc41-4fc5-8bb2-21bc0c002655",
+    "ai_champion_guid": "e75269da-5791-4a76-ae6d-5ec61386111b",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "ed26892b-6084-4d5c-bdfe-cde293cfc222"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "51cc02f3-6a9b-43ea-b96f-a655518ae6e7",
+    "name": "Great Machine Graveyard C - Barking Caverns",
+    "title": "Barking Caverns",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "9a7c98f2-0bf9-4d27-8fea-d64db9c1e71d",
+    "ai_champion_guid": "bd878b33-b620-450b-8526-d813e3131f00",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a5d0e084-fe0b-42a6-b0de-2bf2e0d5ffd2",
+    "name": "Great Machine Graveyard D - Valley of Rubbish",
+    "title": "Valley of Rubbish",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "331e84b4-bc13-41f9-87f5-4605d41d30c3",
+    "ai_champion_guid": "c4debac0-1b95-43e4-bf07-932dcedc8b6e",
+    "mods_json": [
+     {
+      "description": "Each champion draws two cards and discards two cards at the start of their turn.",
+      "mods": [
+       {
+        "guid": "cbd7e803-324e-419d-bf2d-15d6ef2abc36"
+       }
+      ],
+      "title": "Rummage"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d2801ef5-56af-4703-a171-17d7596799ef",
+    "name": "Great Machine Graveyard E - Snarling Road",
+    "title": "Snarling Road",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "ffef38fd-8738-45ab-aac3-457fd8a22356",
+    "ai_champion_guid": "9696a689-8eb3-4fbe-976e-4a936da6fd3a",
+    "mods_json": [
+     {
+      "description": "If a champion is damaged, their opponent returns an artifact from their crypt at the end of turn.  Each champion begins with scrapyard dynamos in their crypt.  ",
+      "mods": [
+       {
+        "guid": "b179672c-5b76-4bb2-9279-70431bd155e8"
+       },
+       {
+        "guid": "9c0d3987-6827-43d7-866c-73a543cf5ba9"
+       }
+      ],
+      "title": "Scrapyard "
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d3a46afb-3cc3-482b-aecf-63493308f137",
+    "name": "Great Machine Graveyard F - Roundabout",
+    "title": "Roundabout",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f463ed29-e0d0-496b-802b-48627784b8dd",
+    "ai_champion_guid": "0385140e-2bad-417a-9eec-9bc73903227b",
+    "mods_json": [
+     {
+      "description": "Each champion starts with 5 dormant booby traps in thier deck.",
+      "mods": [
+       {
+        "guid": "599863cc-32c3-49d7-8e34-c06c2a88e5cb"
+       }
+      ],
+      "title": "Dormant Explosives"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "11a74e13-1fd8-4a93-8abe-3444d5c6ceb4",
+    "name": "Great Machine Graveyard F 2 - Roundabout (AI goes first)",
+    "title": "Roundabout",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f463ed29-e0d0-496b-802b-48627784b8dd",
+    "ai_champion_guid": "0385140e-2bad-417a-9eec-9bc73903227b",
+    "mods_json": [
+     {
+      "description": "Each champion starts with 5 dormant booby traps in thier deck.",
+      "mods": [
+       {
+        "guid": "599863cc-32c3-49d7-8e34-c06c2a88e5cb"
+       }
+      ],
+      "title": "Dormant Explosives"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c56d7608-8db2-4876-b299-3e09d24db209",
+    "name": "Great Machine Graveyard G - The Great Heap",
+    "title": "The Great Heap",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "f21cab58-4d36-452f-b88d-ebd2ce5aa381",
+    "ai_champion_guid": "962e5553-d4b6-48b9-9d6c-ee67f698b305",
+    "mods_json": [
+     {
+      "description": "Each champion begins with 6 scrapyard dynamos in thier crypt.",
+      "mods": [
+       {
+        "guid": "b179672c-5b76-4bb2-9279-70431bd155e8"
+       }
+      ],
+      "title": "Scrapyard Piles"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "daba7931-7ca4-4005-b310-085bd5afa5b9",
+    "name": "Great Machine Graveyard I - Big Magnet Thing",
+    "title": "Big Magnet Thing",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "9e9c87ad-5e9f-4692-85dc-787bef9f1189",
+    "ai_champion_guid": "0861e3d6-3b3e-46f2-b4e3-6e7af6b5bd6c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "665ae7c6-7e4f-4743-8e50-6cb56e57cb82",
+    "name": "Great Machine Graveyard J - The Crusher",
+    "title": "The Crusher",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "41659cfb-d660-457e-a950-70b3ca430724",
+    "ai_champion_guid": "9391680a-4d79-4e4e-acfd-d4c3c2ec0560",
+    "mods_json": [
+     {
+      "description": "Scraptooth Crusher starts with artifacts in play.",
+      "mods": [
+       {
+        "guid": "2e8769ad-22e7-4e09-a752-8666faf5dad2"
+       }
+      ],
+      "title": "Will it Crush?"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "346fb5fc-3bd8-44bc-80ae-fcf7b41d1758",
+    "name": "Great Machine Graveyard K - Melting Pot",
+    "title": "Melting Pot",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "486d57a9-c2c4-430f-8420-99169cfeb033",
+    "ai_champion_guid": "6bbb0eed-9d49-468e-8876-75bca353e849",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3c5e4169-156d-41e1-9db5-a789e35ad356",
+    "name": "Great Machine Graveyard M1 - Scraptooth Arena - Vargar",
+    "title": "Scraptooth Arena",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "e4647684-eeee-4224-8cc7-0da3bf3b8a32",
+    "ai_champion_guid": "d925d383-0e80-46c1-be9b-3dec5073362d",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f69e7986-1dd7-4afa-aef6-2b3dd48a3631",
+    "name": "Great Machine Graveyard M2 - Scraptooth Arena - Burgg",
+    "title": "Scraptooth Arena",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3000a3ec-c694-4988-9452-e336bf6895dc",
+    "ai_champion_guid": "cc0e51cf-2bde-4792-802d-1fc71c961440",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4194c6ba-8844-4520-ad42-1e4df2726bce",
+    "name": "Great Machine Graveyard M3 - Scraptooth Arena - Zagg",
+    "title": "Scraptooth Arena",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "613468e0-336c-40a7-900f-3317090be317",
+    "ai_champion_guid": "25acda6f-1305-4b0f-bd8b-77a78d3f1a77",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3f4bea6f-93ff-4e06-a186-59263e3d5efb",
+    "name": "Great Machine Graveyard N - Scraptooth Throne Room",
+    "title": "Scraptooth Throne Room",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "16bde696-ab55-4585-b030-9ab4548d357d",
+    "ai_champion_guid": "e1584b33-ea48-438e-904c-ee3121e05b2e",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5919c63a-38f6-487a-9d66-3b13cb12a520",
+    "name": "Human Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "e2e990bc-0f5d-49fd-bdab-15752ee07bc2",
+    "ai_champion_guid": "05499eb5-f6cc-4d82-96ad-54a9071c055e",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "be2c5dd9-6cb5-4cf8-a1ef-f050079b1130",
+    "name": "Human Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "ee356585-77a3-43f5-98f5-e3822a021b34",
+    "ai_champion_guid": "c0c7e1b1-1163-4cc9-96d2-4b15570197c8",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "61ae67b4-1691-4b1f-903c-687c396256a9",
+    "name": "Human Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d4add943-469d-4b08-b2d9-66b3c2c98b15",
+    "ai_champion_guid": "3658be25-2160-4a23-a609-e40d531832d0",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "actions_json": {
+     "victory": [
+      "set_flag(crayburn_complete)"
+     ]
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "22480eaf-457b-4aff-8c5d-c8ca2be6ce00",
+    "name": "Kraken's Gold - Portsmere",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "bf8b9678-ec69-44f0-a02a-2b7f2a791311",
+    "ai_champion_guid": "2f9eb631-f036-4a5e-a61f-7ae079bc8d21",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2fb4f063-8a94-4f10-8de2-0cc6a7029e29",
+    "name": "Kraken's Gold A - Portsmere",
+    "title": "Portsmeare",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "bf8b9678-ec69-44f0-a02a-2b7f2a791311",
+    "ai_champion_guid": "2f9eb631-f036-4a5e-a61f-7ae079bc8d21",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "de38d10e-f42d-446b-8962-5a855f76766b",
+    "name": "Kraken's Gold E - Into the Storm",
+    "title": "Into the Storm",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "486a5ada-b5d4-4fc3-9f5c-693c2cd9c184",
+    "ai_champion_guid": "40b2318b-f2f7-4d51-a571-c4d32feabc74",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6b9843e1-97f7-4a63-adea-a82472fa946a",
+    "name": "Kraken's Gold F - Crustac Ambush",
+    "title": "Crustac Ambush",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "4588c892-a378-40a6-8f6e-0b19b1db1bc6",
+    "ai_champion_guid": "969a6e67-cec9-4664-9fdb-29b8eca2b149",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "58e6ba02-53be-4daa-8b41-43a10d777d53",
+    "name": "Kraken's Gold G - Sea Hag",
+    "title": "Sea Hag",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "c136708a-b5b8-425a-8f7a-de10b77640b4",
+    "ai_champion_guid": "820db63f-fe03-4705-b8d7-4a54d0f56da4",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "466c49d1-411e-4bc6-9667-9e8df60277b0",
+    "name": "Kraken's Gold I - Crustac Warlord",
+    "title": "Crustac Warlord",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "1b06bcd2-6bf6-4a2f-b492-0e81c7877bf7",
+    "ai_champion_guid": "ce58ffa9-4904-4230-a2b6-5e970847749e",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "55dfb457-a470-44ad-9480-8511de2e0246",
+    "name": "Kraken's Gold J - The Siren",
+    "title": "The Siren",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "71fcc4ab-273f-4485-afe5-35f83e29f613",
+    "ai_champion_guid": "40ed3415-ecfb-467a-bb34-16895619cb07",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ed43eb1b-4206-4444-b4b4-6ec8e0fceab3",
+    "name": "Kraken's Gold L - Hag Queen",
+    "title": "Hag Queen",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "9bc62df3-6f21-4b00-b090-b9157ba350cc",
+    "ai_champion_guid": "6b99bde4-37df-4655-ad2a-a390ddc9802a",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8619ead4-da1c-4c7f-9762-c6636ffa8dc7",
+    "name": "Kraken's Gold O - Ship Graveyard",
+    "title": "Ship Graveyard",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "cc4cb54d-8ae3-47ea-b127-9f6c8898160b",
+    "ai_champion_guid": "a93f773f-9296-464b-9ee4-cc0230af8d9c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "dd4aa789-e691-4d86-bb0a-5af519d67eb9",
+    "name": "Kraken's Gold P - The Kraken",
+    "title": "The Kraken",
+    "gameboard": "Boat",
+    "ai_deck_guid": "4531a40e-e0c4-480e-8d50-1632958f4fef",
+    "ai_champion_guid": "57c73507-7095-46fd-bde7-e93ff2863baf",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "69c451b9-4e02-4c66-8943-f0b4769d90d4",
+    "name": "Necrotic Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "2dd7f57c-c8f7-4902-be3c-0b2d937f3fa4",
+    "ai_champion_guid": "9b3ecd51-da74-41a4-adc9-f44b4bfb412b",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a2c5cef6-f76f-46a8-afa0-82558e6ebf46",
+    "name": "Necrotic Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "7b8af1a7-aef3-4943-95fc-a2ef89e4b58b",
+    "ai_champion_guid": "50ab780f-e546-468f-ba79-06a49fb68469",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "607b221d-dbe7-4fe7-8d4f-c7b9774fb187",
+    "name": "Necrotic Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "cc0b10a3-d0ff-449a-aa36-a93eccdaf9a5",
+    "ai_champion_guid": "a0a5ef26-6676-4602-9fa2-e1608120d210",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c3416a13-742d-4bcc-803a-4d28bf348b2e",
+    "name": "New Encounter",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7d20be9c-eff1-4067-8ca9-4c14629f93e2",
+    "name": "Opponent's Deck for Tutorial Section 3",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e288f879-5860-4d29-9c2d-7977ff03f0f6",
+    "name": "Orc Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "408928e5-1fe9-4aa2-a93b-99c44a22644e",
+    "ai_champion_guid": "9a62d370-5029-4356-ad3f-7873792984c6",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b07c8713-b294-46cd-93e4-d067e36f51a7",
+    "name": "Orc Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "6f252295-2fa7-4267-8fad-cddafabc9493",
+    "ai_champion_guid": "b6fe99d4-be07-4741-b072-eae38b6b7247",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6355ca3d-1bab-4251-896c-b82e8877a2f4",
+    "name": "Orc Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "45382dd2-c71d-4501-b622-0aaf7e938a37",
+    "ai_champion_guid": "22e3a199-4028-43b5-9290-7c646535360c",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000000",
+    "name": "Portsmeare",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "23c719f7-b59f-451a-ada3-86c84b5a257d",
+    "name": "Ruins of Kukatan A - Stagnant Pool",
+    "title": "Stagnant Pond",
+    "gameboard": "Forest",
+    "ai_deck_guid": "3b03c5c5-d4dc-441f-ba11-5d7804317725",
+    "ai_champion_guid": "954cf963-44ac-4bbb-aebc-78c985ee6e3c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "38949599-5f36-489f-a407-bb7ab152fe30",
+    "name": "Ruins of Kukatan B - Ramshackle Bridge",
+    "title": "Ramshackle Bridge",
+    "gameboard": "Forest",
+    "ai_deck_guid": "fa499ceb-4f28-4f17-8de1-a93bc2890f06",
+    "ai_champion_guid": "a00997b7-87f3-49ad-9eed-ea1725db762b",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5aae29e7-cde5-49b0-bdd5-b922cccb0ca4",
+    "name": "Ruins of Kukatan C - Kuroko River",
+    "title": "Kuroko River",
+    "gameboard": "Forest",
+    "ai_deck_guid": "44fd01dc-6337-4013-b9a5-32f8962e6613",
+    "ai_champion_guid": "71a11db3-0d64-4a67-84d5-82c91136d009",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6fa179ce-277b-44c6-8798-9e5d6665a313",
+    "name": "Ruins of Kukatan F 01 - Tomb of Lingerers",
+    "title": "Tomb of Lingerers",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "0b879e18-dc96-4b5c-b3ae-0c390ea54c25",
+    "ai_champion_guid": "1277175b-48d2-42f6-b30b-3b05e1ac4445",
+    "mods_json": [
+     {
+      "description": "Non-ranger troops enter play stunned.",
+      "mods": [
+       {
+        "guid": "f603a952-8f56-4d74-bba5-c559f7ffcf8f"
+       }
+      ],
+      "title": "Difficult Terrain"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9182e97b-0444-4c33-83b4-37582d16530f",
+    "name": "Ruins of Kukatan F 02 - Tomb of Lingerers",
+    "title": "Tomb of Lingerers",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3151fdec-1dbc-430a-83b3-5387ed0180f4",
+    "ai_champion_guid": "9d202a40-f656-4526-a23d-896187b41ac9",
+    "mods_json": [
+     {
+      "description": "Non-Ranger troops enter play stunned.",
+      "mods": [
+       {
+        "guid": "f603a952-8f56-4d74-bba5-c559f7ffcf8f"
+       }
+      ],
+      "title": "Difficult Terrain"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "36d713a0-9a16-4770-842c-94a52391ecfd",
+    "name": "Ruins of Kukatan I - Perilous Hallway",
+    "title": "Perilous Hallway",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "347a304c-8061-4941-a3a7-64a2a57f64e6",
+    "ai_champion_guid": "02ec5176-9f8b-4b20-9cf6-304a220a668a",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "47e491c2-16a5-436b-8677-698351fe90e5",
+    "name": "Ruins of Kukatan I-2 - Perilous Hallway (Memory)",
+    "title": "Perilous Hallway",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "ed01cf1c-2b83-4ce6-b8cb-b64c77434b0a",
+    "ai_champion_guid": "6d962199-d0dd-4d02-9071-f7d697e10eb9",
+    "mods_json": [
+     {
+      "description": "Activate the runes in the order they were played to escape the hallway..",
+      "mods": [
+       {
+        "guid": "73eb53fb-7546-4f71-b079-19ba5cdcb2e0"
+       }
+      ],
+      "title": "Player Win Condition"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "71710d32-6d5c-4550-ae41-a2560aa04348",
+    "name": "Ruins of Kukatan J - Etchings of the Lost Ones",
+    "title": "Etchings of the Lost Ones",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "0b86e84e-28ec-492e-9de6-1f5c82c41757",
+    "ai_champion_guid": "ea9ebeb4-83b2-4461-bd90-756df20571b1",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ae883795-e45e-44fb-8c22-489649c5dab8",
+    "name": "Ruins of Kukatan J-2 Etchings of the Lost Ones (Memory",
+    "title": "Etchings of the Lost Ones",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "be697f5b-6e10-42e0-86e6-4f57aba90c12",
+    "ai_champion_guid": "e95035db-5525-426c-8292-aa7888788af3",
+    "mods_json": [
+     {
+      "description": "Activate the runes in the order they were played to escape the hallway.",
+      "mods": [],
+      "title": "Summon Glyphs"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "11cd3133-6e89-469b-aafc-16a10503f37b",
+    "name": "Ruins of Kukatan L - Black Hall",
+    "title": "The Black Hall",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "db4fac2b-c5ad-4a78-b8ed-09e918a59a4a",
+    "ai_champion_guid": "e08ccb02-95db-459d-a924-0e9e2754beff",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "799ab967-b0ac-467b-9447-eff455e5c342",
+    "name": "Ruins of Kukatan M - Rear Entrance",
+    "title": "Rear Entrance",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "72785b45-a385-4011-8d00-38a973a60515",
+    "ai_champion_guid": "f76cf5e8-b5d2-458b-bfe6-2e249b3a2fba",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ca51c688-a9c2-441d-87f1-7bf556cb4306",
+    "name": "Ruins of Kukatan N-1 - Echo Ridge (Lukaz, Laid Low)",
+    "title": "Echo Ridge",
+    "gameboard": "Forest",
+    "ai_deck_guid": "7bacd7c2-4843-467b-84f0-902b9a196a34",
+    "ai_champion_guid": "2a9757ee-7d29-458d-9bd3-7f11eb7332e6",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7a332a46-0629-4833-8137-22377a274569",
+    "name": "Ruins of Kukatan N-2 - Echo Ridge (Lukaz)",
+    "title": "Echo Ridge",
+    "gameboard": "Highlands",
+    "ai_deck_guid": "5cdf397c-ab7f-4cdf-9665-95dd8b3ea96a",
+    "ai_champion_guid": "be4d7806-323a-491c-a379-093959dbed5b",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2c6c42df-d9a4-4c11-b5a1-68d2133b89f9",
+    "name": "Ruins of Kukatan O - The Overgrowth",
+    "title": "The Overgrowth",
+    "gameboard": "Forest",
+    "ai_deck_guid": "e1b78e4b-26cb-4746-8466-d7a01e55571a",
+    "ai_champion_guid": "dff6ecf4-99c3-4e0b-aacb-49db614da812",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "386ab79a-dbba-4471-a040-0dddb5f44210",
+    "name": "Ruins of Kukatan P - Nibblin Ceremony",
+    "title": "Nibblin Ceremony",
+    "gameboard": "Forest",
+    "ai_deck_guid": "54054b6b-178e-4349-9c26-0631009c4a98",
+    "ai_champion_guid": "e8a2352d-c87b-49b2-91aa-79ace9c573d2",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "4f3a404f-b688-4ee8-9b45-b1d7f79f8efc",
+    "name": "Ruins of Kukatan Q - Tomb of Omens",
+    "title": "Tomb of Omens",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "aa886a1d-c0db-4fbc-9612-e9f7bd91421e",
+    "ai_champion_guid": "327c67b7-4aa2-4c01-99ad-0ee38f19c1f5",
+    "mods_json": [
+     {
+      "description": "Activate the runes in the order they were played to escape the hallway.",
+      "mods": [],
+      "title": "Escape the Tombs"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c4b88361-6fcf-4bf5-83db-5d6f14316bdb",
+    "name": "Ruins of Kukatan R - Lumbering Copse",
+    "title": "Lumbering Copse",
+    "gameboard": "Forest",
+    "ai_deck_guid": "de935876-6a9d-49c5-9798-66f0f07a17ca",
+    "ai_champion_guid": "6aa15571-0a99-4dec-b101-3b7746fe9bad",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000003",
+    "name": "SeaHagIsland",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000009",
+    "name": "SeaHagLairThroneRoom",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000008",
+    "name": "SeaHagLiarEntrance",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ed4ff0de-ce9a-4a50-b256-4cdca572e792",
+    "name": "Shin'hare Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3852b537-1baf-4175-87b6-feb4910513b5",
+    "ai_champion_guid": "891cf0c5-3581-4d4e-910f-6cef50840d0e",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c5cbbc95-a4ba-461e-9d42-1c592f120b1a",
+    "name": "Shin'hare Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "caa84d49-0e0a-421e-80ad-2b267c81ab37",
+    "ai_champion_guid": "aa99a0b5-b2b8-40ef-b180-0c0fb5ae4ca6",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "1f29a2cc-ec2d-438b-9c46-296d8d8bf9ec",
+    "name": "Shin'hare Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "5373cb6f-150d-4928-8a3b-9ab472e55241",
+    "ai_champion_guid": "f1f76801-83be-452b-90e0-85731decd72e",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-7c29dea99ec0",
+    "name": "Test Encounter",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f7741fa9-4e79-4e1f-8f27-084d02f859c2",
+    "name": "The Smoldering Dead Burial Vault of King Edmund III",
+    "title": "Burial Vault of King Edmund III",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "806e1d30-70ba-4236-a518-f810fb24636d",
+    "ai_champion_guid": "307bf463-0726-43bf-9890-648938314ae1",
+    "mods_json": [
+     {
+      "description": "The aid your allies will come to you in this battle.",
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       },
+       {
+        "guid": "4830bb70-5cc9-4b9e-a114-3afacbb64c07"
+       }
+      ],
+      "title": "Aid from the Coalition"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f1dd7262-779a-4127-bc3d-057189ba197d",
+    "name": "The Smoldering Dead Crypt of the Thorn Knight",
+    "title": "Crypt of the Thorn Knight",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3133354b-300e-4885-b681-898b481ccf5f",
+    "ai_champion_guid": "57d0ee0b-b821-4b6c-8e5f-534d9a517357",
+    "mods_json": [
+     {
+      "description": "The aid your allies will come to you in this battle.",
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       },
+       {
+        "guid": "4830bb70-5cc9-4b9e-a114-3afacbb64c07"
+       }
+      ],
+      "title": "Aid from the Coalition"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "09752cde-6cde-47a4-92f1-9f5d25b3e1d2",
+    "name": "The Smoldering Dead Entrance (Underworld)",
+    "title": "Entrance",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "e5d0a899-7324-4a0b-8361-e1449efc3d4a",
+    "ai_champion_guid": "45be339a-a5cf-4c8d-94b5-5eba2213c9d5",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3d97ab1f-b517-47a0-895d-dc3ad75c0705",
+    "name": "The Smoldering Dead Entrance to Raqqar (Ardent)",
+    "title": "The Smoldering Dead Entrance to Raqqar",
+    "gameboard": "FrostArena",
+    "ai_deck_guid": "44630e52-5a2f-4ac7-94f5-58cd505810db",
+    "ai_champion_guid": "c495f470-e872-499b-bf6d-5d1d8f62a193",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "fd8c0762-5386-4776-9c3e-059f169353f3",
+    "name": "The Smoldering Dead Hall of Relics",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "352172d8-1022-40a4-9276-a276a7dfc7d2",
+    "ai_champion_guid": "3b41359d-363b-4e93-9c60-9fb03d6bebc7",
+    "mods_json": [
+     {
+      "description": "The aid your allies will come to you in this battle.",
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       },
+       {
+        "guid": "4830bb70-5cc9-4b9e-a114-3afacbb64c07"
+       },
+       {
+        "guid": "031fc873-061d-467b-8893-76b593a5bffc"
+       },
+       {
+        "guid": "39a7f664-480b-4764-bf97-d98c61d414c5"
+       }
+      ],
+      "title": "Aid from the Coalition"
+     },
+     {
+      "description": "Both champions have armed themselves with one of the many nearby artifacts.",
+      "mods": [],
+      "title": "Hall of Relics"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2faea39c-c30f-4504-85bb-35c550e9db2c",
+    "name": "The Smoldering Dead Haunted Hallway",
+    "title": "Haunted Hallway",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "93c95e27-d61c-445e-b1dd-6cd17b1eb100",
+    "ai_champion_guid": "383c6a2d-3294-4807-a6fa-38ffb3f8e861",
+    "mods_json": [
+     {
+      "description": "The aid your allies will come to you in this battle.",
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       },
+       {
+        "guid": "4830bb70-5cc9-4b9e-a114-3afacbb64c07"
+       }
+      ],
+      "title": "Aid from the Coalition"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a93e9e79-a417-421a-99ae-15a2d3682516",
+    "name": "The Smoldering Dead Tomb of the Rose Knights",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "0b54220a-0c4f-4c10-8591-2c8326b359bf",
+    "ai_champion_guid": "effb34aa-8990-4374-8422-c38e00e31ff0",
+    "mods_json": [
+     {
+      "description": "The aid your allies will come to you in this battle.",
+      "mods": [
+       {
+        "guid": "81e506df-f1f1-473d-a9a5-b8f7dd2995c4"
+       },
+       {
+        "guid": "4830bb70-5cc9-4b9e-a114-3afacbb64c07"
+       },
+       {
+        "guid": "47813891-7fb1-4206-925b-f741a4d1e351"
+       },
+       {
+        "guid": "d52fdb53-7155-49cd-9866-3c4cc5e2c0dd"
+       },
+       {
+        "guid": "d52fdb53-7155-49cd-9866-3c4cc5e2c0dd"
+       },
+       {
+        "guid": "d52fdb53-7155-49cd-9866-3c4cc5e2c0dd"
+       },
+       {
+        "guid": "d52fdb53-7155-49cd-9866-3c4cc5e2c0dd"
+       },
+       {
+        "guid": "d52fdb53-7155-49cd-9866-3c4cc5e2c0dd"
+       },
+       {
+        "guid": "92118a11-6523-4452-9b41-c4b30f00ed96"
+       }
+      ],
+      "title": "Aid from the Coalition"
+     },
+     {
+      "description": "A horde of zombies feasts on the dragon guard.",
+      "mods": [],
+      "title": "Ravenous Zombies"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f2b47ba8-c6da-4794-a4ae-000000000010",
+    "name": "TheKraken",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7670b975-130e-45a5-b9dd-9f3e8d8250e9",
+    "ai_champion_guid": "",
+    "mods_json": [
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     },
+     {
+      "mods": [
+       {
+        "guid": "ba40abc0-f096-4483-93e0-d1b271a2310b"
+       }
+      ],
+      "round": 0,
+      "target": "AIPlayer"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7c84df55-538e-47c4-bedd-4c70b7c833e3",
+    "name": "Tranquil Dream Bear Easy",
+    "title": "The Dream Bear",
+    "gameboard": "Forest",
+    "ai_deck_guid": "a6b5780f-a8c2-44a6-9d73-d7fd51933008",
+    "ai_champion_guid": "dadf88bf-0a03-455d-9304-649b6299d33a",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Wild card, they might create a Shroompin.",
+      "mods": [
+       {
+        "guid": "bd0e2eff-b9ac-41d9-b827-2a8319acefd3"
+       }
+      ],
+      "title": "Domain of Wild"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "969c0300-5006-4676-ba0e-f4d1464a4532",
+    "name": "Tranquil Dream Bear Hard",
+    "title": "The Dream Bear",
+    "gameboard": "Forest",
+    "ai_deck_guid": "797c36d4-dae6-4acf-b2e0-d0a56ab21392",
+    "ai_champion_guid": "432a08d4-9253-413b-a7c4-fe717d841b71",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Wild card, they might create a Shroompin.",
+      "mods": [
+       {
+        "guid": "bd0e2eff-b9ac-41d9-b827-2a8319acefd3"
+       }
+      ],
+      "title": "Domain of Wild"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "846af3e0-f563-4fc7-bd37-07621d27b364",
+    "name": "Tranquil Dream Bear Medium",
+    "title": "The Dream Bear",
+    "gameboard": "Forest",
+    "ai_deck_guid": "b86e9167-42fb-43bb-bcd3-fa4452ea4de9",
+    "ai_champion_guid": "95205949-17fe-490d-a2fc-91da9e1a2149",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Wild card, they might create a Shroompin.",
+      "mods": [
+       {
+        "guid": "bd0e2eff-b9ac-41d9-b827-2a8319acefd3"
+       }
+      ],
+      "title": "Domain of Wild"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9a79eb60-cf0b-461b-b149-7dfcae3dea3b",
+    "name": "Tranquil Dream Eagle Easy",
+    "title": "",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "fe356fc5-1024-4777-988f-f1d0a82e0e03",
+    "ai_champion_guid": "4a677079-d6ae-4b0d-abb9-909aede6b350",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Sapphire card, an opposing card exhausts.",
+      "mods": [
+       {
+        "guid": "bc56da14-f7f5-49c3-a338-2ec12f728af2"
+       }
+      ],
+      "title": "Domain of Sapphire"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "98c36d94-70f3-451c-9a35-168197c67cfe",
+    "name": "Tranquil Dream Eagle Hard",
+    "title": "The Dream Eagle",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "0e38a411-0dc2-4083-baba-0218c614b055",
+    "ai_champion_guid": "d36d2a0e-b416-438a-b83d-d9f376cbd45f",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Sapphire card, an opposing card exhausts.",
+      "mods": [
+       {
+        "guid": "bc56da14-f7f5-49c3-a338-2ec12f728af2"
+       }
+      ],
+      "title": "Domain of Sapphire"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "5d310783-3dff-44cc-a58d-b3a013c9507a",
+    "name": "Tranquil Dream Eagle Medium",
+    "title": "The Dream Eagle",
+    "gameboard": "Coastline",
+    "ai_deck_guid": "5cfd2f72-a6d7-41b3-be74-6dd6d0b85ca5",
+    "ai_champion_guid": "ebe3e4b0-ba03-485d-b2c9-f3cbdce4f03c",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Sapphire card, an opposing card exhausts.",
+      "mods": [
+       {
+        "guid": "bc56da14-f7f5-49c3-a338-2ec12f728af2"
+       }
+      ],
+      "title": "Domain of Sapphire"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "46a27ef6-1e4d-41e4-bda3-e41ca89531ee",
+    "name": "Tranquil Dream Sister Midnight Form of Conquest",
+    "title": "Sister Midnight",
+    "gameboard": "Default",
+    "ai_deck_guid": "64f8fc10-8749-43fb-84b7-c3a66bc9b43d",
+    "ai_champion_guid": "852eb988-1f4a-457f-ac72-74dfa111f158",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "43750f88-8b26-4dd8-a41a-36dfcf3f3090",
+    "name": "Tranquil Dream Sister Midnight Form of Cunning",
+    "title": "Sister Midnight",
+    "gameboard": "Default",
+    "ai_deck_guid": "46620c52-1467-4ab3-8ed5-465fc0d1e9b3",
+    "ai_champion_guid": "14eac96a-0498-4653-a8a7-692dfbd260e6",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "31673a21-081d-4f0b-a244-97f097821936",
+    "name": "Tranquil Dream Sister Midnight Form of Instinct",
+    "title": "Sister Midnight",
+    "gameboard": "Default",
+    "ai_deck_guid": "28751e0e-1a11-473b-9eb7-9a2c9b3bb69a",
+    "ai_champion_guid": "608974f7-9f1c-45b5-b824-cc71ce714233",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "31894e83-b59c-48d8-bb91-0ff57445e33a",
+    "name": "Tranquil Dream Sister Midnight Form of Retribution",
+    "title": "Sister Midnight",
+    "gameboard": "Default",
+    "ai_deck_guid": "4ea61690-adae-40cd-945d-c3bdf25ddf91",
+    "ai_champion_guid": "d728b5cb-3464-4e18-b534-2856590c6bce",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "a5f847dd-fab9-45dc-a4cc-0458b72c3efd",
+    "name": "Tranquil Dream Sister Midnight Form of Savagery",
+    "title": "Sister Midnight",
+    "gameboard": "Default",
+    "ai_deck_guid": "cb3e1aa3-66b3-422c-8bc5-4745f3f64987",
+    "ai_champion_guid": "f4de4ede-c4f9-4a8e-ac93-703d93f09d8c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "50f31ead-c117-43d3-9dfe-fe5361a9b213",
+    "name": "Tranquil Dream Skarn Easy",
+    "title": "The Dream Skarn",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "f31311c5-b52a-47e9-872a-6fb52236821e",
+    "ai_champion_guid": "03fdf9f1-2aa5-4a60-aa7f-487d2f74219c",
+    "mods_json": [
+     {
+      "description": "When a champion plays a ruby card, the opponent takes 1 damage.",
+      "mods": [
+       {
+        "guid": "4454f221-88e0-46ff-897e-979d494a2ae4"
+       }
+      ],
+      "title": "Domain of Ruby"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ca923bce-4340-40de-a339-55c676fc7ab2",
+    "name": "Tranquil Dream Skarn Hard",
+    "title": "The Dream Skarn",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "300dfdf9-96a8-4ec5-98c0-32f34c4ea1df",
+    "ai_champion_guid": "026c0465-d4a5-4e9c-8141-b8625986b9e2",
+    "mods_json": [
+     {
+      "description": "When a champion plays a ruby card, the opponent takes 1 damage.",
+      "mods": [
+       {
+        "guid": "4454f221-88e0-46ff-897e-979d494a2ae4"
+       }
+      ],
+      "title": "Domain of Ruby"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "63e3620e-e0c1-4ae9-8e99-208222a3eb37",
+    "name": "Tranquil Dream Skarn Medium",
+    "title": "The Dream Skarn",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "5f632fad-252e-4a47-b94b-7e7438e8de9b",
+    "ai_champion_guid": "49785165-281a-4bb2-9949-8418fff7cd16",
+    "mods_json": [
+     {
+      "description": "When a champion plays a ruby card, the opponent takes 1 damage.",
+      "mods": [
+       {
+        "guid": "4454f221-88e0-46ff-897e-979d494a2ae4"
+       }
+      ],
+      "title": "Domain of Ruby"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9563dc8b-fb88-4d4f-8e85-cfdf3248ecd5",
+    "name": "Tranquil Dream Spider Easy",
+    "title": "The Dream Spider",
+    "gameboard": "Forest",
+    "ai_deck_guid": "2d15d0ef-aa8c-40d4-9653-0d9c72d2f4d0",
+    "ai_champion_guid": "f1730fd6-6765-4bd1-a386-80d1ee53d9a6",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Blood card, put a spiderling egg in the opponents deck.",
+      "mods": [
+       {
+        "guid": "289999e8-ef79-42e0-b468-7c13a73df866"
+       }
+      ],
+      "title": "Domain of Blood"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "89c3bcc7-d95b-413a-b1ed-ced2fa4e368c",
+    "name": "Tranquil Dream Spider Hard",
+    "title": "The Dream Spider",
+    "gameboard": "Forest",
+    "ai_deck_guid": "6eb43205-77f4-4092-a97b-3db4b800244d",
+    "ai_champion_guid": "194aac18-0fe1-4a80-ba2a-c78b435108c4",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Blood card, put a spiderling egg in the opponents deck.",
+      "mods": [
+       {
+        "guid": "289999e8-ef79-42e0-b468-7c13a73df866"
+       }
+      ],
+      "title": "Domain of Blood"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "86046e3d-77f2-42e8-a715-df7f388c8596",
+    "name": "Tranquil Dream Spider Medium",
+    "title": "The Dream Spider",
+    "gameboard": "Forest",
+    "ai_deck_guid": "0b977e36-9611-46fc-baa1-eba8f59c6df5",
+    "ai_champion_guid": "3e29b55e-994d-405f-83cc-a65a92c32954",
+    "mods_json": [
+     {
+      "description": "When a champion plays a Blood card, put a spiderling egg in the opponents deck.",
+      "mods": [
+       {
+        "guid": "289999e8-ef79-42e0-b468-7c13a73df866"
+       }
+      ],
+      "title": "Domain of Blood"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "04c13b89-2b48-43e3-83b2-c359982a1c7a",
+    "name": "Tranquil Dream Turtle Easy",
+    "title": "The Dream Turtle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "741475bf-0e46-45b3-aa2e-abf8fb1f8c2b",
+    "ai_champion_guid": "af89e7ff-6fca-480d-8cf4-7a1d7d5c997e",
+    "mods_json": [
+     {
+      "description": "When a champion plays a diamond card, they gain a health.",
+      "mods": [
+       {
+        "guid": "672ecefb-c4c3-47c5-9b65-9f74809f05fc"
+       }
+      ],
+      "title": "Domain of Diamond"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d2b0d36f-f26e-433f-aa67-5901918e0d52",
+    "name": "Tranquil Dream Turtle Hard",
+    "title": "The Dream Turtle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "0ddef0ea-3dc3-4203-beea-944477310697",
+    "ai_champion_guid": "b56b3a04-4700-47cd-81b6-6d81cd8b1c21",
+    "mods_json": [
+     {
+      "description": "When a champion plays a diamond card, they gain a health.",
+      "mods": [
+       {
+        "guid": "672ecefb-c4c3-47c5-9b65-9f74809f05fc"
+       }
+      ],
+      "title": "Domain of Diamond"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "28239c37-c897-4bb0-b59a-b7e9dcd59be0",
+    "name": "Tranquil Dream Turtle Medium",
+    "title": "The Dream Turtle",
+    "gameboard": "CanyonDesert",
+    "ai_deck_guid": "f50b9bfb-6954-4136-81be-510dda505cd5",
+    "ai_champion_guid": "577c97c4-d188-4f81-a7d8-a1164234c7c8",
+    "mods_json": [
+     {
+      "description": "When a champion plays a diamond card, they gain a health.",
+      "mods": [
+       {
+        "guid": "672ecefb-c4c3-47c5-9b65-9f74809f05fc"
+       }
+      ],
+      "title": "Domain of Diamond"
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "36ae1fb2-7268-43d2-80f1-2d6f1c8fa57c",
+    "name": "Usurper Chamber of Awakening",
+    "title": "Usurper Chamber of Awakening",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "061a97e1-4e9a-4969-9ded-33151fca3a65",
+    "ai_champion_guid": "b6796260-fea9-4598-8f8b-3a7c450d0574",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7f2bd6e3-8e3c-4c51-a165-a992eb2d1e4d",
+    "name": "Usurper Gates Of The Bleak Citadel",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d061ca08-4b14-470d-aa60-67691a738ef4",
+    "ai_champion_guid": "ef489df1-7c5c-4912-8644-160e9e503f5d",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "89c6998a-a656-4f6f-b5fd-8b929a8cdd2f",
+    "name": "Usurper Grimskull Hall",
+    "title": "Usurper Grimskull Hall",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "b6c10636-0905-4330-a52e-082cbe9e0875",
+    "ai_champion_guid": "9f5723ae-f8fc-4f9e-9751-a271f6bdda8e",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "f946d3b4-b16e-4570-ab55-749c34e1dc89",
+    "name": "Usurper Hall of Vermin",
+    "title": "Usurper Hall of Vermin",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3512a741-b4db-4494-9a36-32ef861e5e72",
+    "ai_champion_guid": "8d4942d7-86d9-4560-9265-cb7e6a5df401",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "299d7998-e04b-4916-b196-91429d623a9b",
+    "name": "Usurper Last Rites",
+    "title": "Usurper Last Rites",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d7404f98-271a-43a0-9b87-882e3a685e59",
+    "ai_champion_guid": "e7056cc3-8cad-4abd-9354-5196f3af5d62",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "405f4f7a-4ccd-4c3e-8f0b-15c848d3ac68",
+    "name": "Usurper Shepherd's Rest Both Dead",
+    "title": "Usurper Shepherd's Rest Both Dead",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "487ea5c3-7005-4bc0-9a6c-992a271a7ae1",
+    "ai_champion_guid": "c12e2e30-6fca-4f08-b8e1-4289f4484a00",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "81b80545-e1eb-41ba-a0da-a13701cfc467",
+    "name": "Usurper Shepherd's Rest Ghuuhg Dead",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "487ea5c3-7005-4bc0-9a6c-992a271a7ae1",
+    "ai_champion_guid": "c12e2e30-6fca-4f08-b8e1-4289f4484a00",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "b6688e36-1b65-48c7-b25e-535213df0dc3"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "c1b3ee05-5128-46c8-9147-de135f995ae5",
+    "name": "Usurper Shepherd's Rest Mistism Dead",
+    "title": "",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "487ea5c3-7005-4bc0-9a6c-992a271a7ae1",
+    "ai_champion_guid": "c12e2e30-6fca-4f08-b8e1-4289f4484a00",
+    "mods_json": [
+     {
+      "description": "",
+      "mods": [
+       {
+        "guid": "596eabaf-e0e8-4062-8131-fe9eedb90d43"
+       }
+      ],
+      "title": ""
+     }
+    ],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "98158279-f641-48c1-8439-f1688ef09a9d",
+    "name": "Vennen Tutorial Castle Gatehouse",
+    "title": "Gates of Crayburn",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "d4e1ddb5-3075-4b7a-97f3-8b14c5a31990",
+    "ai_champion_guid": "5e3982aa-9f7e-45f5-8d8f-ef611365053f",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8afdb8ac-d155-4c63-9a73-623f16075ab8",
+    "name": "Vennen Tutorial Tower Gatehouse",
+    "title": "Tower Gatehouse",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "3e42e054-90c1-4f97-a8b1-2a6a949345e2",
+    "ai_champion_guid": "ef67a187-286d-4e4d-94c9-e92159617f3a",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "3c1d4212-f5df-4efa-bfa7-b6b1e51e68b7",
+    "name": "Vennen Tutorial Tower of Penworth",
+    "title": "Tower of Penworth",
+    "gameboard": "CastleExterior",
+    "ai_deck_guid": "4d7ea31e-4b6f-4c6c-a392-58dd90368363",
+    "ai_champion_guid": "0520c385-7e2d-4dc5-9fd0-61c85df69250",
+    "mods_json": [],
+    "rewards_json": {
+     "gold": 200,
+     "one_time": false,
+     "xp": 200
+    },
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bd18a245-54bc-4758-a245-cb1b871e6207",
+    "name": "Wild Heist Fetid Swamp",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "f1fd7f42-23ef-456f-8585-2193e9c0ba59",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e1722b39-a5dd-4d7f-9609-67a1ffa24882",
+    "name": "Wild Heist Genesis Pool",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "5b17f5f1-186e-4809-b6b3-807c563a8d6b",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "948c02fe-084f-4017-a961-23fd0e5e4b76",
+    "name": "Wild Heist Mantodea",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "5e0946ac-f9eb-45a5-bfb3-45a1b1112608",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "d286a4a4-9740-4f80-92e6-b3aaee9f0ef1",
+    "name": "Wild Heist North Slope",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "67a8ce42-e15b-4d08-9f54-176f65eb5f0a",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ca7b7b72-9a5c-47a5-b1ab-faadf46b12ba",
+    "name": "Wild Heist Raptor Den",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "ffbe77c9-1215-4c34-84b1-1df098545021",
+    "ai_champion_guid": "94ccab6a-03c5-4836-80a0-cd7ec9cfac8e",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "bce528f5-51c9-4625-863d-1ac83e72de58",
+    "name": "Wild Heist Rhythmic Valley",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "09bdac5c-ea86-4c17-9687-a4ed56ccd1e8",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9978b416-7a64-4010-be51-62f559ca1037",
+    "name": "Wild Heist Sky'le Griffin",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "e762a6f0-2bff-4ab9-b15c-845c9453168e",
+    "ai_champion_guid": "",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8a2f4d15-1aeb-4a07-aaf6-dd068ed00780",
+    "name": "Wild Heist Timberland Clearing",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "336625f1-663a-4022-a4da-23e2a3135575",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "69c5cd6c-b568-43fc-90d6-a712f0929927",
+    "name": "Wild Heist Tiny Hollow",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "d70125a5-c127-4444-9281-77f81f7c5184",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9861c05e-a9e6-45ff-bcff-e1a7999b3315",
+    "name": "Wooly Bully Dig Site 1",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "a5a398dd-bf12-4364-a3df-1be6022d7d66",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "9226346c-2acc-48f1-8be6-6e60e58388fa",
+    "name": "Wooly Bully Dig Site 2",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "32c134e8-ec99-4258-bbed-54bf11ec9e61",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "b43f6ce6-80fc-41e1-8083-8f8c6c9875dc",
+    "name": "Wooly Bully Dig Site 3",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "aec26caf-d648-4717-8b2e-6c5be0b825b0",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "7c9decba-39d1-4a14-a307-31b3a87d4ac1",
+    "name": "Wooly Bully Dig Site 4",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "4d932015-3673-4402-960e-5de60c19c5b9",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "06c64549-7664-4b60-bb91-86ec63d7dbe9",
+    "name": "Wooly Bully Encampment Center",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "200a8857-d293-4318-a50f-e1b5c682fcbf",
+    "ai_champion_guid": "2a210d03-e269-4b82-bf7f-e5dfb1623ae5",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8c3b950a-9d9d-4ff1-a1d7-b65887d8f93e",
+    "name": "Wooly Bully Excavation Site 1",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "039e2011-c53f-4fd4-bd21-20481887d7e2",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "83d7a604-6fb4-4576-a18b-a368f2bafad2",
+    "name": "Wooly Bully Excavation Site 2",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "32c134e8-ec99-4258-bbed-54bf11ec9e61",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "ac54d233-9b26-4bce-b944-92c8a81d6ecd",
+    "name": "Wooly Bully Excavation Site 3",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "aec26caf-d648-4717-8b2e-6c5be0b825b0",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "946d5211-6b48-4264-9b32-fee8c8eb4082",
+    "name": "Wooly Bully Excavation Site 4",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "b42f58b6-63c3-4550-8a4c-c5e931f94ae6",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "1fb004bb-a468-4a31-ab2a-08726647e386",
+    "name": "Wooly Bully Stone Tunnel",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "463f6691-7a5b-4302-b35b-0ae1d1e6a999",
+    "ai_champion_guid": "6ae7d264-2e0b-4ca4-92d0-658b98fd960c",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "6879e78e-9792-4ba7-9de9-90187afd2396",
+    "name": "Yeti Family Ma's Kitchen",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "833b6085-c9c9-4074-a990-a8de83b6b7db",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "8391bf1b-e1ce-4991-ac9f-be4d744d689a",
+    "name": "Yeti Family Pappy's Boulder Pile",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "b3ba4506-773e-4f42-a984-d3213c4706d3",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "de4f7244-bfdd-4a55-af2d-900e127e7ec5",
+    "name": "Yeti Family Princess' Shanty",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "2d549a4f-644d-4342-b73c-67b4e528ac93",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "2c48fe80-4a18-4800-aab8-83fba9ef1491",
+    "name": "Yeti Family Shootin' Cliffs",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "7ae6360e-e879-4b38-a891-94b0937ebf3a",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   },
+   {
+    "guid": "e4bf39b5-54d1-4da8-b418-936c59095923",
+    "name": "Yeti Family Wrasslin' Pit",
+    "title": "",
+    "gameboard": "Default",
+    "ai_deck_guid": "f88e25b4-b3b4-4b75-ac3b-b6e7dddca820",
+    "ai_champion_guid": "00000000-0000-0000-0000-000000000000",
+    "mods_json": [],
+    "rewards_json": {},
+    "ai_deck_personality": ""
+   }
+  ]
+ }
+}

@@ -1267,8 +1267,23 @@ class EffectContext:
         # fall back to the ability source: the source is what caused the
         # discard, not a card to discard, and the fallback silently discarded
         # nothing (or the wrong card) instead of opening the picker.
+        inherited = target is None
         target = (self.resolved_target(source_fallback=False)
                   if target is None else target)
+        if (inherited and target is not None and
+                not self.bstate.get("pvp")):
+            # A child "discard a card" inherits its parent's resolved target
+            # aliases.  When the parent targeted a champion ("target champion
+            # discards a card", Concubunny Yuka) that champion is who
+            # discards, not the card to discard: it has no game_cards row, so
+            # the leaf silently no-oped instead of asking the champion's
+            # controller.  Only a hand/choosing card is a discard target.
+            # PvP owns its controller prompt in the projection post-step.
+            from pvp_db import db_card_location
+            location = str(db_card_location(
+                self.session.session_id, int(target), conn=self.db) or "")
+            if location.lower() not in ("hand", "choosing"):
+                target = None
         if target is None:
             # A hand-discard effect is an asynchronous target request, not a
             # successful no-op.  The old BOM walker recognized this before
@@ -1969,9 +1984,29 @@ class EffectContext:
 
         if target is None:
             return f"stat mod: {property_name} {amount:+}"
-        this_turn = param.get("duration") in (
-            "EndOfTurn", "BeginningOfOwnersTurn",
-            "AfterCardsReadyOnPlayersTurn")
+        duration = str(param.get("duration") or "")
+        if duration in ("BeginningOfOwnersTurn",
+                        "AfterCardsReadyOnPlayersTurn"):
+            # "Until the start of your next turn" must survive the end-turn
+            # wipe of temporary_buffs (Fiona Honeyfinch's -1 ATK matters on
+            # the opponent's turn).  Apply it as a reversible grant that the
+            # owner's start_turn/prep boundary removes.  BeginningOfOwnersTurn
+            # belongs to the ability's responsible player; the ready-step
+            # duration to the affected card's controller (as for attributes).
+            from .effect_lifetimes import record_temporary_stat
+            resolving_owner = int(
+                self.bstate.get("resolving_owner_id", 0) or 0)
+            expiration_owner = (
+                resolving_owner if duration == "BeginningOfOwnersTurn"
+                else int(self.target_owner(target, default=resolving_owner)
+                         or 0))
+            self.stat_mod(target, attack, defense, this_turn=False)
+            record_temporary_stat(
+                self.bstate, int(target), attack, defense,
+                duration=duration, owner_id=expiration_owner,
+                source_uid=self.bstate.get("resolving_source_uid"))
+            return f"mod {hex(int(target))} {attack:+}/{defense:+} ({duration})"
+        this_turn = duration == "EndOfTurn"
         self.stat_mod(target, attack, defense, this_turn=this_turn)
         return f"mod {hex(int(target))} {attack:+}/{defense:+}"
 
@@ -2311,7 +2346,14 @@ class EffectContext:
         if destination == "warzone":
             # C# MoveCardToZone honors EntersPlayExhausted / EntersPlayAttacking.
             new_state |= game_engine.ECardStates.CameOutThisTurn
-            if self.template_value("m_EntersPlayExhausted", False):
+            from .static_rules import card_enters_play_exhausted
+            card_row = db_card_zone_details(
+                self.session.session_id, target, conn=self.db)
+            if (self.template_value("m_EntersPlayExhausted", False) or
+                    card_enters_play_exhausted(
+                        self.db, self.session.session_id, self.bstate,
+                        target, int(old[0] or 0),
+                        card_row[0] if card_row else None)):
                 new_state |= game_engine.ECardStates.Tapped
             if self.template_value("m_EntersPlayAttacking", False):
                 new_state |= (game_engine.ECardStates.Attacking |

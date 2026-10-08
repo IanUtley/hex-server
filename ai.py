@@ -224,9 +224,10 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
     deaths firing Deathcry). Blocking heuristic, one blocker per attacker:
       - prefer the cheapest blocker that survives the hit (def > attacker atk);
       - else a blocker that trades (dies but takes the attacker down);
-      - else chump-block only a big threat (atk >= 3) to protect the champion.
-    When the unblocked attack would be lethal, preserve the champion first and
-    use legal chump blocks even when the trade is otherwise unfavorable.
+      - else dogpile a big threat (atk >= 3) when the blockers can kill it.
+    When the still-unblocked attack would be lethal, preserve the champion
+    first and chump the largest attackers with the least valuable blockers --
+    only until the remaining unblocked damage no longer kills the champion.
     Returns the (possibly reloaded) battle state."""
     attackers = {int(k): int(v) for k, v in (bstate.get("player_attackers") or {}).items()}
     ai_champ_scid = getattr(handler, "_ai_champ_scid", None) or game_engine.SessionCardId(ai_t)
@@ -324,8 +325,19 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         block_trigger_cache[card_uid] = result
         return result
 
+    def lethal_now():
+        """Is the damage of the still-unblocked attackers lethal?
+
+        Blocked attackers no longer hit the champion, so once enough blocks
+        are assigned the AI is no longer forced to throw cards away.
+        """
+        if ai_health <= 0:
+            return False
+        return sum(max(0, att_stats[k]["atk"]) for k in att_stats
+                   if k not in assignment) >= ai_health
+
     def worth_blocking(a_uid, b_uid):
-        if defending_lethal:
+        if lethal_now():
             return True
         # Trading a blocker for an attacker that has an authored block
         # trigger can be profitable even when the raw card-value comparison
@@ -374,7 +386,7 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         # 2) DOGPILE: no single survivor. If the attacker is a real threat,
         #    trade enough blockers (combined attack >= attacker defense) to kill
         #    it — they take the hit (most die) but bring down the bigger threat.
-        if (a["atk"] >= 3 or defending_lethal) and free and any(
+        if (a["atk"] >= 3 or lethal_now()) and free and any(
                 worth_blocking(u, b["uid"]) for b in free):
             cands = sorted(free, key=lambda b: -b["atk"])
             pile, total = [], 0
@@ -399,11 +411,17 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         # would kill the champion, a chump block is still the correct play.
         # Attackers are processed largest-first, so this protects the most
         # incoming damage with the least valuable available blocker.
-        if defending_lethal and free:
-            # A non-lethal block is damage prevention only.  Sacrifice the
-            # least aggressive legal blocker, preserving the higher-attack
-            # troop for a future turn.
-            pick = min(free, key=lambda b: (b["atk"], b["def"], b["uid"]))
+        if lethal_now() and free:
+            # Chump only while the unblocked attackers would still kill the
+            # champion (attackers go largest first, so this uses the fewest
+            # blocks).  Sacrifice the least valuable legal blocker -- by card
+            # value when available, then the least aggressive -- preserving
+            # the better troops for future turns.
+            def chump_cost(b):
+                card = ai_cards.get(int(b["uid"]))
+                value = ev.get_card_value(card) if (ev and card) else 0.0
+                return (value, b["atk"], b["def"], b["uid"])
+            pick = min(free, key=chump_cost)
             assignment[u] = [pick["uid"]]
             used.add(pick["uid"])
             blocker_dmg[pick["uid"]] += a["atk"]

@@ -377,6 +377,14 @@ class PriorityWindowAction(GameAction):
             return GameActionResult.COMPLETE
         if top is not None and getattr(top, "ignores_chain", False):
             return GameActionResult.COMPLETE
+        # A phase window can remain queued beneath an automatically resolved
+        # trigger. The trigger may clear the stack's priority mirror while
+        # leaving this action's responder queue intact; when the phase window
+        # becomes live again, restore the mirror before accepting another
+        # transaction.
+        if action_stack.priority_player_id != self.priority_player_id:
+            action_stack.priority_player_id = self.priority_player_id
+            session.send_turn_phase_update()
         return (GameActionResult.WAITING_FOR_INPUT if self.priority_player_id
                 is not None else GameActionResult.COMPLETE)
 

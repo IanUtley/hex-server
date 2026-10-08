@@ -189,6 +189,12 @@ does not select troop-summoning hand cards.
 | `encoder.py` | ObjFmt response and binary event encoding |
 | `proxy.py` | HTTP authentication, payment-link compatibility, news, and static proxy endpoints |
 
+The campaign editor's pure rules engine (`campaign_rules.py`) keeps counters
+in each zone's simulation state. Hooks change them with
+`increment_counter: {name, amount}` effects; tags read them with
+`counter(Name)` (at least 1) or `counter(Name,N)` (at least N). Keep dungeon
+counters in that dungeon's rules state so values do not leak between zones.
+
 `practice.py` is not a service: Practice is one client action and follows the
 normal session path. The old `services/practice.py` and replay browser module
 were removed. `auction.py` stays because Auction is a substantial unimplemented
@@ -273,7 +279,18 @@ Manual champion powers are accepted, paid, and queued by the port
 (`MetadataCardTransactionExecutor`), which also gates and spends their
 authored `m_UsesPerGame` and `m_UsesPerTurn`; the legacy HConnect
 champion-ability handler is not the live path, so a rule added only there
-never runs. A phase-entry resolver
+never runs. The PvP payer (`native_activation_cost_payer`) also applies the
+card costs (void/sacrifice/exhaust/discard) at activation, as C# does; the
+executor always queues a `ProjectedChainAbility`, so deferring them to the
+resolver meant they were never paid. Every resolver of a manual-ability item
+must pass the descriptor's `cost_target_map` and `variables` to
+`resolve_port_ability`: `NativeEffectBackend` rebuilds the paid-card lists
+(`ExhaustedCards`, `VoidedCards`, `SacrificedCards`, `DiscardedCards`) from it,
+which "for each troop exhausted this way" (Dread Factory) and "the voided
+troop's [ATK]" (Bun'jitsu) read. A nested "discard a card" prompt goes to the
+controller of the parent ActivateAbility effect's target (`You` → activator;
+"target/each opposing champion" → that champion's controller); see
+`_pvp_discard_prompt_pid`. A phase-entry resolver
 (`set_turn_phase_entry_resolver`) must publish the wire events its projection
 queued: readiness is applied at Prep, and leaving those events queued until
 the drive stops made Unity untap troops when Main began instead.
@@ -599,6 +616,26 @@ only when the filter names no collection: assuming `Deck` made "reveal a
 random card from their hand" look in the deck. A random reveal that enumerates
 through `MatchSecondaryTargetTemplate` must still restrict its sample to the
 previous target's controller's cards.
+
+A card reaching the Warzone decides Tapped through
+`static_rules.card_enters_play_exhausted` (the instance's own
+`EntersPlayExhausted` bit, printed or granted such as Storm Cloud's, then the
+opposing champions' `Opposing*TroopsEnterPlayExhausted` flags). Every entry
+path uses it: cast resolution, MoveCardToZone, Lifebound and summons (which
+also honour `SummonTokenTroop.m_EntersPlayExhausted`). The entering
+`CardUpdated` must carry the persisted state, or Unity renders the troop
+ready.
+
+Effect durations come from the mapping (`effect_lifetimes.mapping_duration`,
+which reads the typed graph effect). A stat or cost `CardModifier` lasting
+"until the start of your next turn" (`BeginningOfOwnersTurn`) or until the
+ready step is applied as a permanent delta plus a `temporary_card_stats` entry
+that the owner's boundary reverses. `temporary_buffs` is wiped at end of turn
+and is only for `EndOfTurn`. The PvP effect view (`pvp_view.to_effect_view`)
+aliases the list-valued lifetime ledgers (`temporary_ability_grants`,
+`temporary_card_int_attrs`, `temporary_champion_int_attrs`,
+`temporary_card_stats`) so a grant recorded while resolving reaches the
+checkpoint that the turn boundary expires.
 
 A resolved trigger is owned by the trigger engine. The death path emits the
 warzone→discard `CardEnteredZoneEvent` and lets trigger discovery resolve the

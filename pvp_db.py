@@ -3340,9 +3340,14 @@ def db_transform_candidate_templates(conn=None):
     no_pvp_expr = "no_pvp" if "no_pvp" in columns else "0"
     equipment_expr = ("equipment_modified" if "equipment_modified" in columns
                       else "0")
+    attack_expr = "attack" if "attack" in columns else "0"
+    defense_expr = "defense" if "defense" in columns else "0"
+    # Columns 9/10 (printed attack/defense) are appended so existing
+    # index-based consumers keep their layout.
     return connection.execute(
         "SELECT guid, name, card_type, cost, " + rarity_expr + ", "
         + threshold_expr + ", subtype, attributes, " + socket_expr
+        + ", " + attack_expr + ", " + defense_expr
         + " FROM card_templates WHERE COALESCE(" + is_pve_expr + ", 0)=0 "
         + "AND COALESCE(" + no_pvp_expr + ", 0)=0 "
         + "AND COALESCE(" + equipment_expr + ", 0)=0 "

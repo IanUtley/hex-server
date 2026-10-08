@@ -18,6 +18,7 @@ Request types:
 """
 
 import json
+import sys
 import time
 import threading
 import uuid
@@ -33,14 +34,16 @@ except ImportError:  # pragma: no cover - deployment fallback
     yaml = None
 
 from encoder import encode_objfmt_response, encode_datawrapper, compress_gzip
+import campaign_rules
 import pve_db
 import pvp_db
-from profile_db import (db_add_collection, db_add_inventory,
+from profile_db import (db_add_stardust, db_add_collection, db_add_inventory,
                         db_inventory_item, db_next_inventory_client_uid,
                         db_upsert_inventory_item, db_reward_card_template,
                         db_grant_card_instance,
                         db_adjust_user_currency, db_champion_reward_profile,
-                        db_update_champion_xp, db_create_treasure_chest)
+                        db_update_champion_xp, db_create_treasure_chest,
+                        db_spend_user_gold)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -132,6 +135,19 @@ def _find_campaign_for_champion(db, champion_id, campaign_type="PANORAMA"):
     if campaign_type == "DUNGEON":
         _ensure_quest_campaign(db, champion_id, "DUNGEON")
     return (row[0], row[1], row[2], existing_state)
+
+
+def restart_champion_campaigns(db, champion_id):
+    """Wipe a champion's campaigns and recreate the AZ0 starter panorama.
+
+    The server's normal transitions then carry the champion through the
+    starter panorama and Castle Crayburn into AZ1.  Returns ``(deleted,
+    new_campaign_id)``.
+    """
+    deleted = pve_db.db_campaign_delete_for_champion(champion_id, conn=db)
+    db.commit()
+    cid = _find_campaign_for_champion(db, champion_id, "PANORAMA")[0]
+    return deleted, cid
 
 
 def _get_existing_campaign_for_champion(db, champion_id, campaign_type):
@@ -1196,9 +1212,13 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
     candidates = {}
     rows = pve_db.db_panorama_quest_rows(node, db)
     for (script, conversation_guid, role, row_faction, npc, priority,
-         start_hook) in rows:
-        if not npc or not conversation_guid or not _quest_row_matches_faction(
-                row_faction, faction):
+         start_hook, raw_conditions) in rows:
+        tags = _quest_row_tags(raw_conditions)
+        if not npc or not conversation_guid:
+            continue
+        # The row's audience: its faction/race tags, else the faction column.
+        if (not _conversation_tags_faction_holds(db, champion_id, tags) if tags
+                else not _quest_row_matches_faction(row_faction, faction)):
             continue
         _quest_id, quest_state = _quest_state_row(
             db, champion_id, script) if script else (None, None)
@@ -1230,6 +1250,12 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
         if active_objective:
             eligible = True
             rank = 0
+        elif tags:
+            # Editor tags say when the row is offered (quest state, faction,
+            # prerequisites), start rows included.
+            eligible = _conversation_tags_hold(
+                db, champion_id, area_state, node, tags)
+            rank = {"complete": 1, "start": 2, "not_complete": 3}.get(role, 9)
         elif role == "start":
             # A missing QUEST row is not enough to make every authored start
             # conversation available.  The catalog contains later AZ1 quest
@@ -1270,7 +1296,7 @@ def _build_az1_panorama_state(db, cid, champion_id, scene_guid, node,
         except (TypeError, ValueError, json.JSONDecodeError):
             trigger = {}
         if (not isinstance(trigger, dict) or
-                str(trigger.get("visit") or "").lower() != "repeat" or
+                not _is_repeat_conversation(trigger) or
                 not _conversation_matches_faction(conversation_name, faction)):
             continue
         npc = _panorama_npc_from_conversation_name(conversation_name)
@@ -1470,6 +1496,290 @@ def _az1_node_conversation_rows(db, node, campaign_template="AZ1"):
     return result
 
 
+# --- editor tags on node conversations -------------------------------------
+# ``trigger_json.tags`` (campaign editor, applied by campaign_data.py) select
+# a conversation only while every tag holds; see campaign_rules.parse_tag.
+# Rows without tags keep the label/visit heuristics below.
+
+def _conversation_tag_state(db, champ_id, state, node, tags, outcome=None):
+    """The campaign_rules progress view that ``tags`` read."""
+    data = ((state or {}).get("PublicState", {}) or {}).get("Data", {}) or {}
+    champ = _get_champion(db, champ_id) if champ_id is not None else None
+    flags = {str(f) for f in data.get("conversation_flags") or ()}
+    # ``flag(X)`` also reads the area's own boolean markers (gaal_fortune ...).
+    flags |= {str(k) for k, v in data.items() if v is True}
+    quests = {}
+    condition = campaign_rules.tags_condition(tags, str(node or ""))
+    for part in campaign_rules._conditions(condition):
+        script = part.get("quest")
+        if not script or script in quests or champ_id is None:
+            continue
+        _quest_id, quest_state = _quest_state_row(db, champ_id, script)
+        if isinstance(quest_state, dict):
+            quest_flags = quest_state.get("Flags") or {}
+            try:
+                step = int(quest_flags.get("_quest_objective_idx", 0) or 0)
+            except (TypeError, ValueError):
+                step = 0
+            quests[script] = {"status": "finished" if quest_state.get(
+                "Finished") else "active", "step": step}
+    visited = {str(v) for v in data.get("visited_nodes") or ()}
+    nodes = {}
+    for loc in (state or {}).get("VisLocs") or ():
+        loc_data = (loc or {}).get("Data") or {}
+        loc_node = loc_data.get("node")
+        if not loc_node:
+            continue
+        names = {str(loc_node), str(loc_data.get("name") or ""),
+                 str(loc_data.get("title") or "")}
+        nodes[loc_node] = {"visits": 1 if names & visited else 0,
+                           "completed": bool(loc_data.get("completed"))}
+    # talkedAt(Node): conversations finished at the node (NodeR == Node00R).
+    for key, count in (data.get("conversation_visits") or {}).items():
+        try:
+            count = int(count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        short = re.fullmatch(r"Node00([A-Z])", str(key))
+        long_ = re.fullmatch(r"Node([A-Z])", str(key))
+        for alias in {str(key), f"Node{short.group(1)}" if short else "",
+                      f"Node00{long_.group(1)}" if long_ else ""} - {""}:
+            entry = nodes.setdefault(alias, {})
+            entry["talks"] = max(int(entry.get("talks", 0)), count)
+    if outcome:
+        nodes.setdefault(str(node), {})["outcome"] = outcome
+    counters = data.get("counters") or {}
+    return {"flags": sorted(flags), "quests": quests, "nodes": nodes,
+            "counters": counters,
+            # cameFrom(Node) / a let_pass() for this visit (campaign_rules).
+            "came_from": str(data.get("came_from") or ""),
+            "pass": str(data.get("pass_node") or ""),
+            "keywords": campaign_rules._keyword_names(
+                data.get("keywords") or data.get("champion_keywords")),
+            "faction": _RACE_FACTIONS.get(champ[2], "") if champ else "",
+            "race": _RACE_NAMES.get(champ[2], "") if champ else "",
+            "current": str(node or "")}
+
+
+def _conversation_tags_hold(db, champ_id, state, node, tags, outcome=None):
+    if not tags:
+        return True
+    try:
+        view = _conversation_tag_state(db, champ_id, state, node, tags, outcome)
+        return campaign_rules.evaluate(tags, view, str(node or ""))
+    except campaign_rules.RulesError as exc:
+        print(f"[campaign] ignoring conversation tags {tags}: {exc}")
+        return False
+
+
+def _quest_row_tags(raw_conditions):
+    """Editor tags on a quest_conversations row (``conditions_json.tags``)."""
+    try:
+        conditions = json.loads(raw_conditions or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return campaign_rules.trigger_tags(conditions if isinstance(conditions, dict) else {})
+
+
+def _conversation_tags_faction_holds(db, champ_id, tags):
+    """Only the faction/race tags of a row: the marker selector's faction
+    filter (its fallback considers every row of the champion's faction)."""
+    flat = [t for group in tags for t in group] if campaign_rules.is_groups(tags) else tags
+    audience = [t for t in flat if re.match(r"!?\s*(faction|ChampionIsRace)\(", t)]
+    return _conversation_tags_hold(db, champ_id, None, "", audience) if audience else True
+
+
+def _conversation_outcome_and_tags(trigger):
+    """``(outcome, selection tags)`` for one node-conversation trigger."""
+    try:
+        outcome, tags = campaign_rules.split_outcome(
+            campaign_rules.trigger_tags(trigger))
+    except campaign_rules.RulesError:
+        return str(trigger.get("outcome") or "").lower(), ["!flag(_bad_tags)"]
+    return outcome or str(trigger.get("outcome") or "").lower(), tags
+
+
+def _select_tagged_rows(db, champ_id, state, node, rows, outcome=None):
+    """``(first tagged match, untagged rows)`` for an ordered row list."""
+    untagged = []
+    for row in rows:
+        _row_outcome, tags = _conversation_outcome_and_tags(row[1])
+        if not tags:
+            untagged.append(row)
+        elif _conversation_tags_hold(db, champ_id, state, node, tags, outcome):
+            return row, untagged
+    return None, untagged
+
+
+# Client-protocol SendEvent names; anything else is an answer's
+# ServerScriptEvent (the only way the client reports a conversation choice).
+_CAMPAIGN_PROTOCOL_EVENTS = frozenset({
+    "accept", "boat_fail_shown", "cancel", "conv_done", "count_choice",
+    "display_done", "empty_done", "enc_cancel", "force_move", "pass_node",
+    "path_reveal_complete", "return_parent", "shroom_choice", "start",
+    "visit_node", "visit_path", "warp_move",
+})
+_conversation_event_lock = threading.RLock()
+
+
+def conversation_event(conversation_guid, scriptEventName):
+    """Extension hook for a conversation's ServerScriptEvent.
+
+    Campaign integrations can replace this no-op with their event handling.
+    Calls are serialized and receive the active conversation GUID and the
+    authored event name.
+    """
+    return None
+
+
+def _active_conversation_guid(state, ctype):
+    """Find the conversation attached to the campaign's active location."""
+    if (state.get("ActiveEncounterGuid") and
+            state.get("ActiveEncounterConversationGuid")):
+        return state["ActiveEncounterConversationGuid"]
+    locations = state.get("VisLocs")
+    if not isinstance(locations, list):
+        return None
+
+    active_node = state.get("ALoc") or state.get("LastNode")
+    if not active_node:
+        return None
+    if str(ctype or "").upper() == "DUNGEON":
+        active_node = _resolve_node(state, active_node)
+
+    for location in locations:
+        data = location.get("Data") or {}
+        if active_node in (data.get("node"), data.get("name"),
+                           data.get("title")):
+            return data.get("conversationId")
+    return None
+
+
+def _note_conversation_choice(state, event_name):
+    """Remember the open conversation's latest ServerScriptEvent."""
+    if event_name and event_name not in _CAMPAIGN_PROTOCOL_EVENTS:
+        state.setdefault("PublicState", {}).setdefault("Data", {})[
+            "conversation_choice"] = str(event_name)
+
+
+def _conversation_name(db, conversation_guid):
+    row = pve_db.db_conversation_name(conversation_guid, db)
+    return str(row or "").strip()
+
+
+def _conversation_ending_actions(db, conversation_guid, ending, holds=None):
+    """Parsed editor ending actions (``set_flag`` / ``start_quest`` ...) that
+    ``ending`` (or any ending: ``*``) of a conversation runs.
+
+    A conditional action (``... if <tags>``) is kept only when ``holds(tags)``
+    says its tags hold for the champion (no ``holds``: never)."""
+    if not conversation_guid:
+        return []
+    parsed, seen = [], set()
+    for table in pve_db.db_conversation_action_tables(conversation_guid, conn=db):
+        for action in campaign_rules.ending_actions(table, str(ending or "")):
+            if action in seen:
+                continue
+            seen.add(action)
+            try:
+                item = campaign_rules.parse_action(action)
+            except campaign_rules.RulesError as exc:
+                print(f"[campaign] ignoring ending action {action!r}: {exc}")
+                continue
+            if item.get("if") and not (holds and holds(item["if"])):
+                continue
+            parsed.append(item)
+    return parsed
+
+
+def _ending_holds(db, champ_id, state):
+    """``holds(tags)`` for conditional ending actions, read at the active node."""
+    node = _resolve_node(state, str(state.get("ALoc") or state.get("LastNode") or ""))
+    return lambda tags: _conversation_tags_hold(db, champ_id, state, node, tags)
+
+
+def _spend_conversation_gold(db, champ_id, conversation_guid, ending, holds=None):
+    """Take the gold an ending's ``spend_gold(N)`` actions charge (a bribe, a
+    fortune reading); returns the AppliedUpdates that refresh the client's
+    gold. The answer's HasCurrency prerequisite already required the gold;
+    a balance that fell short since is not taken below zero."""
+    applied = _empty_applied_updates()
+    cost = sum(action["spend_gold"] for action in
+               _conversation_ending_actions(db, conversation_guid, ending, holds)
+               if action.get("spend_gold"))
+    champ = _get_champion(db, champ_id) if cost else None
+    if not champ:
+        return applied
+    new_gold, platinum = db_spend_user_gold(champ[1], cost, conn=db)
+    applied["Accounts"].append({"Account": {
+        "Gold": new_gold, "Platinum": platinum}})
+    return applied
+
+
+def _record_conversation_flags(db, champ_id, state, ctype, conversation_guid):
+    """Set ``conversation(Name)`` / ``conversation(Name,Ending)`` on conv_done,
+    plus the flags its ``set_flag(X)`` ending actions name.
+
+    The ending is the ServerScriptEvent its final answer fired; the flags
+    live on the champion's AREA campaign (``conversation_flags``) so area,
+    panorama and dungeon conversations share them. Returns the ending.
+    """
+    data = state.setdefault("PublicState", {}).setdefault("Data", {})
+    ending = data.pop("conversation_choice", "") or ""
+    name = _conversation_name(db, conversation_guid) if conversation_guid else ""
+    if re.fullmatch(r"Diff_\d+", str(ending or "")):
+        # A difficulty chosen in a repeat-encounter conversation (Army of
+        # Myth ...): the next won battle reports it as a battle event.
+        data["pending_battle_events"] = [str(ending)]
+    flags = []
+    if name:
+        flags.append(campaign_rules.conversation_flag(name))
+        if ending:
+            flags.append(campaign_rules.conversation_flag(name, ending))
+    actions = _conversation_ending_actions(
+        db, conversation_guid, ending, _ending_holds(db, champ_id, state))
+    flags += [action["set_flag"] for action in actions if action.get("set_flag")]
+    clears = [action["clear_flag"] for action in actions if action.get("clear_flag")]
+    if not flags and not clears:
+        return ending
+    if str(ctype or "").upper() == "AREA":
+        target = data
+    else:
+        area = _get_existing_campaign_for_champion(db, champ_id, "AREA")
+        if not area or not isinstance(area[4], dict):
+            return ending
+        area_state = area[4]
+        target = area_state.setdefault("PublicState", {}).setdefault("Data", {})
+    current = list(target.get("conversation_flags") or ())
+    added = [flag for flag in dict.fromkeys(flags) if flag not in current]
+    removed = _clear_campaign_flags(target, clears)
+    if not added and not removed:
+        return ending
+    target["conversation_flags"] = (
+        list(target.get("conversation_flags") or ()) + added)
+    if target is not data:
+        _save_campaign_state(db, area[0], area_state)
+    return ending
+
+
+def _clear_campaign_flags(data, patterns):
+    """``clear_flag(X)`` / ``clear_flag(prefix*)``: drop matching flags from a
+    campaign's public data (``conversation_flags`` and boolean markers such
+    as ``tamed:...``). Returns whether anything was removed."""
+    removed = False
+    for pattern in patterns or ():
+        flags = list(data.get("conversation_flags") or ())
+        kept = [f for f in flags if not campaign_rules.flag_matches(f, pattern)]
+        if len(kept) != len(flags):
+            data["conversation_flags"] = kept
+            removed = True
+        for key in [k for k, v in data.items()
+                    if v is True and campaign_rules.flag_matches(k, pattern)]:
+            data.pop(key)
+            removed = True
+    return removed
+
+
 def _conversation_matches_faction(conversation_name, faction):
     """Match explicit authored Ardent/Underworld conversation labels."""
     if not faction:
@@ -1544,11 +1854,19 @@ def _az1_node_conversation(db, node, state=None, campaign_template="AZ1",
     rows = _az1_node_conversation_rows(db, node, campaign_template)
     if not rows:
         return None
-    if (str(campaign_template or "").upper() == "AZ1" and
-            str(node or "").lower() in {"noder", "node00r"}):
-        variant = _az1_masked_army_variant(db, champ_id, node=node)
-        if variant:
-            return variant[0]
+    # Battle-result rows belong to _az1_outcome_conversation; here they only
+    # take part as the untagged fallback, as before tags existed.
+    results = [r for r in rows if _conversation_outcome_and_tags(r[1])[0]]
+    tagged, untagged = _select_tagged_rows(
+        db, champ_id, state, node,
+        [r for r in rows if not _conversation_outcome_and_tags(r[1])[0]])
+    if tagged:
+        return tagged[0]
+    keep = {id(r) for r in untagged + results}
+    rows = [r for r in rows if id(r) in keep]
+    if not rows:
+        return None
+    # (Vale of Oberon's Masked Army variants are selected by their tags.)
     faction = _quest_faction_for_champion(db, champ_id) if champ_id else None
     if faction:
         faction_rows = [
@@ -1610,17 +1928,33 @@ def _az1_node_conversation(db, node, state=None, campaign_template="AZ1",
     return fallback
 
 
+def _is_repeat_conversation(trigger):
+    """A repeat-visit conversation: ``visit: repeat`` or its tag form
+    (selected by a positive ``talkedAt(...)``)."""
+    if str(trigger.get("visit") or "").lower() == "repeat":
+        return True
+    tags = campaign_rules.trigger_tags(trigger)
+    flat = [t for group in tags for t in group] if campaign_rules.is_groups(tags) else tags
+    return any(t.startswith("talkedAt(") for t in flat)
+
+
 def _az1_node_is_repeatable(db, node, campaign_template="AZ1"):
-    """Whether authored node conversations include a repeat/state variant."""
-    return any(
-        str(trigger.get("visit") or "").lower() == "repeat" or
-        bool(str(trigger.get("state") or "").strip())
-        for _guid, trigger, _priority, _name in _az1_node_conversation_rows(
-            db, node, campaign_template)
-    )
+    """Whether authored node conversations include a repeat/state variant:
+    ``visit: repeat`` / ``state``, or their tag forms (a conversation
+    selected by ``talkedAt(...)`` or a ``flag(...)``)."""
+    def variant(trigger):
+        if (str(trigger.get("visit") or "").lower() == "repeat" or
+                bool(str(trigger.get("state") or "").strip())):
+            return True
+        tags = campaign_rules.trigger_tags(trigger)
+        flat = [t for group in tags for t in group] if campaign_rules.is_groups(tags) else tags
+        return any(not t.startswith("!") and t.startswith(("talkedAt(", "flag("))
+                   for t in flat)
+    return any(variant(trigger) for _guid, trigger, _priority, _name in
+               _az1_node_conversation_rows(db, node, campaign_template))
 
 
-def _az1_pre_encounter_conversation(db, node, champ_id=None):
+def _az1_pre_encounter_conversation(db, node, champ_id=None, state=None):
     """Select an authored pre-battle conversation for an AZ1 node.
 
     Encounter scenes and their opening narration are authored separately in
@@ -1630,12 +1964,14 @@ def _az1_pre_encounter_conversation(db, node, champ_id=None):
     Outcome and quest-turn-in conversations are deliberately excluded; those
     are selected by their respective result/quest flows.
     """
-    rows = _az1_node_conversation_rows(db, node)
+    rows = [row for row in _az1_node_conversation_rows(db, node)
+            if not _conversation_outcome_and_tags(row[1])[0]]
+    tagged, rows = _select_tagged_rows(db, champ_id, state, node, rows)
+    if tagged:
+        return tagged[0]
     candidates = []
     for guid, trigger, _priority, _name in rows:
         name = str(trigger.get("label") or "").lower()
-        if trigger.get("outcome"):
-            continue
         if any(term in name for term in (
                 "quest start", "quest end", "quest not complete",
                 "quest completed", "completed repeating", "repeat encounter",
@@ -1675,13 +2011,17 @@ def _az1_pre_encounter_conversation(db, node, champ_id=None):
     return scored[0][1]
 
 
-def _az1_outcome_conversation(db, node, won, champ_id=None):
+def _az1_outcome_conversation(db, node, won, champ_id=None, state=None):
     """Select an authored encounter result conversation for an AZ1 node."""
     outcome = "success" if won else "fail"
     rows = [
         row for row in _az1_node_conversation_rows(db, node)
-        if str(row[1].get("outcome") or "").lower() == outcome
+        if _conversation_outcome_and_tags(row[1])[0] == outcome
     ]
+    tagged, rows = _select_tagged_rows(db, champ_id, state, node, rows,
+                                       outcome=outcome)
+    if tagged:
+        return tagged[0]
     if not rows:
         return None
     faction = _quest_faction_for_champion(db, champ_id) if champ_id else None
@@ -1795,6 +2135,17 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
         data = loc.get("Data") or {}
         node = data.get("node") or ""
         scene = _az1_scene_for_node(db, node)
+        if data.get("outcome_conversation") and data.get("conversationId"):
+            continue      # a battle's result conversation is still to play
+        if data.get("action_encounter") and not data.get("completed"):
+            # A conversation ending started this battle (encounter(...)):
+            # keep it until the battle's result is handled.
+            data.update({"type": "Encounter",
+                         "encounter": data["action_encounter"],
+                         "conversationId": None})
+            if state is not None:
+                _offer_mod_choice(db, champ_id, state, data)
+            continue
         if not scene:
             # Not every authored conversation has an accompanying encounter
             # scene.  Vale of Oberon, for example, is a conversation-only
@@ -1835,8 +2186,11 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
                     "quest_variant_terminal": bool(
                         masked_army_variant and masked_army_variant[2] and
                         not data.get("quest_variant_completed")),
+                    # An impassable node stops the token: every arrival
+                    # starts its conversation again.
                     "autostart": (not bool(data.get("completed")) and
-                                  (visit_count <= 0 or is_node_r)),
+                                  (visit_count <= 0 or is_node_r or
+                                   bool(data.get("impassable")))),
                 })
                 # A quest-giver conversation is intentionally left actionable
                 # after the quest is accepted. The client uses the node's
@@ -1982,7 +2336,8 @@ def _hydrate_az1_area_scene_metadata(db, locations, champ_id=None, state=None):
             # battle. The marker lets conv_done promote the same location back
             # to Encounter without a node-specific special case.
             prelude = (None if "PANORAMA" in upper_name else
-                       _az1_pre_encounter_conversation(db, node, champ_id))
+                       _az1_pre_encounter_conversation(db, node, champ_id,
+                                                       state))
             # Once the authored prelude is closed, keep the node as an
             # Encounter so the player can start the battle.  The completion
             # marker prevents hydration/reconnects from reopening the
@@ -2082,6 +2437,94 @@ def _az1_failed_nodes(state):
     }
 
 
+def _apply_ending_movement(db, champ_id, state, data, conversation_guid,
+                           ending):
+    """What a finished map conversation does to the player's position.
+
+    ``encounter(Scene)`` ending actions turn the location into that battle
+    and start it; ``let_pass()`` lets the player leave an impassable node on
+    this visit. Otherwise a conversation that ends on an impassable node
+    (the client cannot leave it) walks the player back to where they came
+    from through ``force_move_dest``.
+    """
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    node = str(data.get("node") or "")
+    actions = _conversation_ending_actions(
+        db, conversation_guid, ending, _ending_holds(db, champ_id, state))
+    battle = next((a["encounter"] for a in actions if a.get("encounter")), None)
+    if battle:
+        data.update({
+            "type": "Encounter", "encounter": battle["scene"],
+            "action_encounter": battle["scene"], "conversationId": None,
+            "completed": False, "outcome_conversation": False,
+            "autostart": True, "enabled": True, "visible": True})
+        _offer_mod_choice(db, champ_id, state, data)
+        if battle.get("conversation_id"):
+            state["ActiveEncounterConversationGuid"] = battle["conversation_id"]
+        state["ALoc"] = data.get("name") or node
+        return
+    if any(a.get("let_pass") for a in actions) and node:
+        pdata["pass_node"] = node
+        data["impassable"] = False
+        data["autostart"] = False
+        return
+    if data.get("impassable") and not data.get("completed"):
+        back = str(pdata.get("came_from") or "")
+        if back and back != node:
+            pdata["force_move_dest"] = back
+            data["autostart"] = False
+
+
+def _az1_route_nodes(state, start, paths):
+    """The nodes a ``visit_path`` route walks through, ``start`` first.
+    Path names are ``Path_<A>_<B>``; the walk crosses each from whichever end
+    it is at."""
+    current = _resolve_node(state, str(start or ""))
+    nodes = [current] if current else []
+    for path in paths or ():
+        parts = str(path).split("_")
+        if len(parts) != 3 or parts[0] != "Path":
+            continue
+        left, right = (_resolve_node(state, part) for part in parts[1:])
+        current = right if current == left else left if current == right else right
+        nodes.append(current)
+    return nodes
+
+
+def _az1_route_stop(db, state, start, paths):
+    """Where the client's token stops on a route (UIDungeonCharacterToken):
+    the first unfinished node that is impassable or auto-starts, else the
+    route's end."""
+    route = _az1_route_nodes(state, start, paths)
+    forks = _az1_path_fork_ids(db)
+    data_of = {(l.get("Data") or {}).get("node"): (l.get("Data") or {})
+               for l in state.get("VisLocs", [])}
+    for node in route[1:]:
+        data = data_of.get(node) or {}
+        if node not in forks and not data.get("completed") and (
+                data.get("impassable") or data.get("autostart")):
+            return node
+    return route[-1] if len(route) > 1 else ""
+
+
+def _az1_note_arrival(db, state, node):
+    """Record where the player arrives from (``came_from``, read by
+    ``cameFrom(Node)`` tags and the impassable walk-back) and end a
+    ``let_pass()`` granted at another node."""
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    previous = _resolve_node(state, str(state.get("LastNode") or ""))
+    route = _az1_route_nodes(state, pdata.get("travel_start"),
+                             pdata.get("travel_paths"))
+    forks = _az1_path_fork_ids(db)
+    if node in route[1:]:
+        before = [n for n in route[:route.index(node, 1)] if n not in forks]
+        previous = before[-1] if before else previous
+    if previous and previous != node:
+        pdata["came_from"] = previous
+    if pdata.get("pass_node") and pdata["pass_node"] != node:
+        pdata.pop("pass_node", None)
+
+
 def _az1_node_opens_neighbors(state, node, failed_nodes=None):
     """Whether an already visited AZ1 node may expose its outgoing paths.
 
@@ -2105,6 +2548,10 @@ def _az1_node_opens_neighbors(state, node, failed_nodes=None):
         return True
     if data.get("completed"):
         return True
+    pdata = (state.get("PublicState") or {}).get("Data") or {}
+    if pdata.get("pass_node") and _resolve_node(
+            state, str(pdata["pass_node"])) == canonical:
+        return True       # let_pass(): the player may leave this node
     # A retryable encounter or a repeatable conversation is left incomplete,
     # but it is no longer auto-starting after its result/conversation closes.
     return bool(data.get("repeatable") and not data.get("autostart"))
@@ -2316,55 +2763,6 @@ def _az1_reveal_neighbors(db, state, current_node=None):
         for node in (pdata.get("quest_hidden_nodes") or [])
         if node
     }
-    # Brink Ridge's opening conversation explains that the northern road is
-    # closed by a blockade.  The authored graph stores those destinations as
-    # Node021, Node023, and Node077; the client map represents Node023 as its
-    # two authored variants, Node023A/Node023B.  Keep the connections hidden
-    # until a successful Brink Ridge encounter explicitly clears the blockade;
-    # merely closing its explanatory conversation is not enough.
-    blockade_data = next(
-        ((loc.get("Data") or {}) for loc in state.get("VisLocs", [])
-         if (loc.get("Data") or {}).get("node") == "Node019"),
-        None,
-    )
-    blockade_cleared = bool(pdata.get("blockade_cleared"))
-    if blockade_data is not None and not blockade_cleared:
-        northbound = {
-            str(node) for node in _az1_neighbors(db, "Node019")
-            if str(node) != "Node016"
-        }
-        blocked.update(northbound)
-        for loc in state.get("VisLocs", []):
-            node = str((loc.get("Data") or {}).get("node") or "")
-            if node in northbound or ("Node023" in northbound and
-                                      node.startswith("Node023")):
-                forced_hidden.add(node)
-                # Persist the concrete client node IDs as well as the
-                # canonical graph ID so stale visit_node requests cannot
-                # bypass the blockade after the conversation closes.
-                if node not in blocked:
-                    blocked.add(node)
-        blocked_values = [str(value) for value in (pdata.get("blocked_nodes") or [])
-                          if value]
-        for node in blocked:
-            if node not in blocked_values:
-                blocked_values.append(node)
-        pdata["blocked_nodes"] = blocked_values
-    elif blockade_data is not None:
-        northbound = {
-            str(node) for node in _az1_neighbors(db, "Node019")
-            if str(node) != "Node016"
-        }
-        blocked = {
-            value for value in blocked
-            if value not in northbound and not (
-                "Node023" in northbound and str(value).startswith("Node023"))
-        }
-        pdata["blocked_nodes"] = [
-            str(value) for value in (pdata.get("blocked_nodes") or [])
-            if str(value) not in northbound and not (
-                "Node023" in northbound and str(value).startswith("Node023"))
-        ]
     path_forks = _az1_path_fork_ids(db)
 
     def _node_set_contains(values, node):
@@ -2413,60 +2811,6 @@ def _az1_set_node_gate(state, node, blocked):
             unlocked.append(node)
     pdata["blocked_nodes"] = values
     pdata["unlocked_nodes"] = unlocked
-
-
-def _az1_set_quest_route(db, state, visible_node, hidden_node):
-    """Expose one faction quest destination and hide its counterpart.
-
-    ``quest_nodes`` is the client-facing map marker.  The separate reveal and
-    hidden lists make the requested visibility survive the normal neighbour
-    recalculation and reconnects without pretending the destination was
-    already visited.
-    """
-    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-    visible_node = str(visible_node)
-    hidden_node = str(hidden_node)
-
-    def _node_list(key):
-        return [str(value) for value in (pdata.get(key) or [])
-                if value and str(value) not in {visible_node, hidden_node}]
-
-    quest_nodes = _node_list("quest_nodes")
-    quest_nodes.append(visible_node)
-    pdata["quest_nodes"] = quest_nodes
-
-    reveal_nodes = _node_list("quest_reveal_nodes")
-    reveal_nodes.append(visible_node)
-    pdata["quest_reveal_nodes"] = reveal_nodes
-
-    hidden_nodes = _node_list("quest_hidden_nodes")
-    hidden_nodes.append(hidden_node)
-    pdata["quest_hidden_nodes"] = hidden_nodes
-
-    blocked_nodes = _node_list("blocked_nodes")
-    blocked_nodes.append(hidden_node)
-    pdata["blocked_nodes"] = blocked_nodes
-
-    unlocked_nodes = [str(value) for value in (pdata.get("unlocked_nodes") or [])
-                      if value and str(value) != hidden_node]
-    if visible_node not in unlocked_nodes:
-        unlocked_nodes.append(visible_node)
-    pdata["unlocked_nodes"] = unlocked_nodes
-
-    _az1_reveal_neighbors(db, state,
-                          state.get("LastNode") or state.get("ALoc"))
-    # The destination is intentionally visible even when it is not adjacent
-    # to the player's current node.  The opposing branch remains hidden even
-    # if it was previously revealed by normal map exploration.
-    for loc in state.get("VisLocs", []):
-        data = loc.get("Data") or {}
-        node = data.get("node")
-        if node == visible_node:
-            data["visible"] = True
-            data["enabled"] = True
-        elif node == hidden_node:
-            data["visible"] = False
-            data["enabled"] = False
 
 
 def _quest_state_row(db, champ_id, quest_script):
@@ -2528,223 +2872,9 @@ def _quest_start_prerequisites_met(db, champ_id, quest_script):
     return True
 
 
-def _quest_hook_az1_tamed_start(db, champ_id, state):
-    """Tamed quest: keep gated branches closed until their quests unlock."""
-    before = json.dumps(state, sort_keys=True)
-    _az1_set_node_gate(state, "Node005", True)
-    # Shadowgrove is the first objective of Cross the Zodiac River. Keep it
-    # hidden until Wallace actually starts that quest.
-    zodiac_rows = pve_db.db_campaign_state_rows(
-        champ_id, "QUEST", db, template_name="az01_q_cross_the_river_part2",
-        require_state=True, newest_first=True)
-    zodiac_row = zodiac_rows[0][1:2] if zodiac_rows else None
-    try:
-        zodiac_active = bool(
-            zodiac_row and not json.loads(zodiac_row[0] or "{}").get("Finished")
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        zodiac_active = False
-    if not zodiac_active:
-        _az1_set_node_gate(state, "Node018", True)
-        _az1_gate_zodiac_west_bridge(db, state, True)
-        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-        hidden = [str(value) for value in (pdata.get("quest_hidden_nodes") or [])
-                  if value and str(value) != "Node018"]
-        hidden.append("Node018")
-        pdata["quest_hidden_nodes"] = hidden
-    # The west half of the Zila bridge is opened only after the Savage Lord
-    # route is resolved; it must not appear on a fresh AZ1 map.
-    _az1_set_node_gate(state, "Node015", True)
-    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-    # A stale save may contain a prior west-bridge visit.  While the gate is
-    # active, purge that visit/path so reconnect hydration cannot resurrect
-    # the node merely because it was once discovered.
-    pdata["visited_nodes"] = [
-        value for value in (pdata.get("visited_nodes") or [])
-        if str(value) not in {"Node015", "Bridge over the Zila - West"}
-    ]
-    pdata["visited_paths"] = [
-        value for value in (pdata.get("visited_paths") or [])
-        if "Node015" not in str(value)
-    ]
-    if isinstance(pdata.get("conversation_visits"), dict):
-        pdata["conversation_visits"].pop("Node015", None)
-    _az1_reveal_neighbors(db, state, state.get("LastNode"))
-    for loc in state.get("VisLocs", []):
-        data = loc.get("Data") or {}
-        if data.get("node") == "Node015" or (
-                data.get("node") == "Node018" and not zodiac_active):
-            data.update({"visible": False, "enabled": False})
-    return json.dumps(state, sort_keys=True) != before
-
-
 def _az1_unlock_west_bridge(state):
     """Open the west Zila bridge after the Savage Lord resolution."""
     _az1_set_node_gate(state, "Node015", False)
-
-
-def _az1_gate_zodiac_west_bridge(db, state, blocked):
-    """Hide or reveal the AZ1 West Zodiac bridge behind Wallace's handoff.
-
-    Node038 is a normal graph neighbour of Node030, so ordinary cumulative
-    neighbour revealing would expose it before the Cross Zodiac quest reaches
-    its Wallace turn-in objective. Keep the gate explicit and remove stale
-    discovery/path state while it is closed.
-    """
-    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-    node_id = "Node038"
-    unlocked = [str(value) for value in (pdata.get("unlocked_nodes") or [])
-                if str(value) != node_id]
-    pdata["unlocked_nodes"] = unlocked
-    _az1_set_node_gate(state, node_id, bool(blocked))
-    hidden = [str(value) for value in (pdata.get("quest_hidden_nodes") or [])
-              if str(value) != node_id]
-    if blocked:
-        hidden.append(node_id)
-        pdata["quest_hidden_nodes"] = hidden
-        pdata["visited_nodes"] = [
-            value for value in (pdata.get("visited_nodes") or [])
-            if str(value) not in {node_id, "Bridge over the Zodiac - West"}
-        ]
-        pdata["visited_paths"] = [
-            value for value in (pdata.get("visited_paths") or [])
-            if node_id not in str(value)
-        ]
-        if isinstance(pdata.get("conversation_visits"), dict):
-            pdata["conversation_visits"].pop(node_id, None)
-    else:
-        pdata["quest_hidden_nodes"] = hidden
-    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
-    if blocked:
-        for loc in state.get("VisLocs", []):
-            data = loc.get("Data") or {}
-            if data.get("node") == node_id:
-                data["visible"] = False
-                data["enabled"] = False
-
-
-def _quest_hook_az1_find_horwich_sea_start(db, champ_id, state):
-    """Find Horwich Sea: open the previously blocked Fonferek branch."""
-    before = json.dumps(state, sort_keys=True)
-    _az1_set_node_gate(state, "Node005", False)
-    _az1_reveal_neighbors(db, state, state.get("LastNode"))
-    return json.dumps(state, sort_keys=True) != before
-
-
-def _quest_hook_az1_cross_the_river_start(db, champ_id, state):
-    """Cross the Zila River: reveal its authored route and objective nodes."""
-    before = json.dumps(state, sort_keys=True)
-    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-    # Fork001 is connective prefab geometry and is always visible.  The quest
-    # reveals only its two authored destinations; the first encounter uses a
-    # zero GUID in source data, so these node IDs cannot be inferred from it.
-    reveal = ("Node013", "Node014")
-    path_forks = _az1_path_fork_ids(db)
-    for key in ("quest_nodes", "quest_reveal_nodes", "unlocked_nodes"):
-        values = [str(value) for value in (pdata.get(key) or []) if value]
-        if key in {"quest_reveal_nodes", "unlocked_nodes"}:
-            values = [value for value in values if value not in path_forks]
-        for node in reveal:
-            if node not in values:
-                values.append(node)
-        pdata[key] = values
-    _az1_reveal_neighbors(db, state, state.get("LastNode"))
-    return json.dumps(state, sort_keys=True) != before
-
-
-def _quest_hook_az1_cross_zodiac_start(db, champ_id, state):
-    """Cross the Zodiac River: open Shadowgrove and mark its encounter."""
-    before = json.dumps(state, sort_keys=True)
-    _quest_id, quest_state = _quest_state_row(
-        db, champ_id, "az01_q_cross_the_river_part2")
-    flags = (quest_state or {}).get("Flags") or {}
-    try:
-        objective_index = int(flags.get("_quest_objective_idx", 0) or 0)
-    except (TypeError, ValueError):
-        objective_index = 0
-    # Step 2 is Wallace's authored "Return to Wallace" conversation. West is
-    # not available until that objective is complete (Step 3 is active).
-    _az1_gate_zodiac_west_bridge(db, state, objective_index < 2)
-    _az1_set_node_gate(state, "Node018", False)
-    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
-    pdata["quest_hidden_nodes"] = [
-        str(value) for value in (pdata.get("quest_hidden_nodes") or [])
-        if str(value) != "Node018"
-    ]
-    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
-    for loc in state.get("VisLocs", []):
-        data = loc.get("Data") or {}
-        if data.get("node") == "Node018":
-            data.update({"visible": True, "enabled": True})
-    return json.dumps(state, sort_keys=True) != before
-
-
-def _quest_hook_az1_smoldering_dead_start(db, champ_id, state):
-    """Make Brink Ridge launch the active Smoldering Dead encounter.
-
-    The source quest records the first objective as a dungeon objective, while
-    the AZ1 map places the encounter behind the Brink Ridge conversation.  At
-    quest start, replace that conversation with the authored encounter scene;
-    the normal area game-end path then completes the location and advances the
-    journal objective.  Once the objective changes to the report conversation,
-    this hook leaves Brink Ridge alone so its normal map conversation is
-    restored by hydration.
-    """
-    before = json.dumps(state, sort_keys=True)
-    _quest_id, quest_state = _quest_state_row(db, champ_id, "q_smoldering_dead")
-    if not quest_state or quest_state.get("Finished"):
-        return False
-    flags = quest_state.get("Flags") or {}
-    objectives = flags.get("_quest_objectives") or []
-    try:
-        index = int(flags.get("_quest_objective_idx", 0) or 0)
-    except (TypeError, ValueError):
-        index = 0
-    if not (0 <= index < len(objectives)):
-        return False
-    objective = objectives[index]
-    if str(objective.get("type") or "").lower() not in {"dungeon", "encounter"}:
-        return False
-    encounter = str(objective.get("encounter") or "")
-    if not encounter:
-        return False
-
-    for loc in state.get("VisLocs", []):
-        data = loc.get("Data") or {}
-        if data.get("node") != "Node019":
-            continue
-        data.update({
-            "type": "Encounter",
-            "encounter": encounter,
-            "conversationId": None,
-            "completed": False,
-            "repeatable": False,
-            "pre_encounter": False,
-            "pre_encounter_completed": False,
-            "outcome_conversation": False,
-            "autostart": True,
-            "enabled": True,
-            "visible": True,
-        })
-        break
-    _az1_reveal_neighbors(db, state, state.get("LastNode") or state.get("ALoc"))
-    return json.dumps(state, sort_keys=True) != before
-
-
-def _quest_hook_az1_find_cave_in_start(db, champ_id, state):
-    """Find the Cave-In: reveal Node017; hide the opposing route and grotto."""
-    before = json.dumps(state, sort_keys=True)
-    _az1_set_node_gate(state, "Node025", True)  # Lena Grotto
-    _az1_set_quest_route(db, state, "Node017", "Node034")
-    return json.dumps(state, sort_keys=True) != before
-
-
-def _quest_hook_az1_find_ambling_mesa_start(db, champ_id, state):
-    """Find Ambling Mesa: reveal Node034; hide the opposing route and grotto."""
-    before = json.dumps(state, sort_keys=True)
-    _az1_set_node_gate(state, "Node025", True)  # Lena Grotto
-    _az1_set_quest_route(db, state, "Node034", "Node017")
-    return json.dumps(state, sort_keys=True) != before
 
 
 def _az1_apply_masked_army_branch(db, champ_id, state):
@@ -2798,17 +2928,10 @@ def _az1_apply_masked_army_branch(db, champ_id, state):
     return json.dumps(state, sort_keys=True) != before
 
 
-_QUEST_START_HOOKS = {
-    "az1_tamed_start": _quest_hook_az1_tamed_start,
-    "az1_cross_the_river_start": _quest_hook_az1_cross_the_river_start,
-    "az1_cross_zodiac_start": _quest_hook_az1_cross_zodiac_start,
-    "az1_smoldering_dead_start": _quest_hook_az1_smoldering_dead_start,
-    "az1_find_horwich_sea_start": _quest_hook_az1_find_horwich_sea_start,
-    "az1_find_cave_in_start": _quest_hook_az1_find_cave_in_start,
-    "az1_find_ambling_mesa_start": _quest_hook_az1_find_ambling_mesa_start,
-    # Backwards-compatible alias for databases seeded by the earlier schema.
-    "az1_sea_witch_start": _quest_hook_az1_find_horwich_sea_start,
-}
+# Named quest-start content hooks (``quest_templates.start_hook``).  Map
+# gates come from campaign_rules via campaign_gates and quest content from
+# the editor data; none are registered now.
+_QUEST_START_HOOKS = {}
 
 
 def _run_quest_start_hook(db, champ_id, hook_name):
@@ -2831,17 +2954,17 @@ def _run_quest_start_hook(db, champ_id, hook_name):
 
 
 def _sync_az1_quest_gates(db, champ_id, state):
-    """Reapply active quest start hooks after reconnects or state rebuilds.
+    """Reapply quest-driven map state after reconnects or state rebuilds.
 
-    The quest script is deliberately not interpreted here.  Each active quest
-    contributes the named function stored in ``quest_templates.start_hook``;
-    hooks are replayed in grant order so a later unlock hook can override an
-    earlier blocking hook while the persisted ``unlocked_nodes`` flag keeps an
-    unlocked path open on future loads.
+    Node visibility gates come from ``campaign_rules/AZ1.json`` (see
+    ``campaign_gates``); active quests still contribute any named content
+    hooks in ``_QUEST_START_HOOKS``.
     """
     if not isinstance(state, dict):
         return False
+    import campaign_gates
     before = json.dumps(state, sort_keys=True)
+    campaign_gates.apply(sys.modules[__name__], db, champ_id, state)
     hooks = pve_db.db_active_quest_hooks(champ_id, conn=db)
     for _quest_id, hook_name in hooks:
         try:
@@ -2859,14 +2982,43 @@ def _sync_az1_quest_gates(db, champ_id, state):
     return json.dumps(state, sort_keys=True) != before
 
 
+def _refresh_area_gates(db, champ_id):
+    """Re-derive the champion's AZ1 area gates now (a quest just started)."""
+    row = pve_db.db_active_area_campaign(champ_id, conn=db)
+    if not row:
+        return False
+    try:
+        state = json.loads(row[1] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    changed = _sync_az1_quest_gates(db, champ_id, state)
+    if changed:
+        _save_campaign_state(db, row[0], state)
+        db.commit()
+    return changed
+
+
 def _grant_quests_for_conversation(db, champ_id, campaign_template,
-                                   conversation_guid):
-    """Grant all eligible quest-start rows for a completed conversation."""
+                                   conversation_guid, ending="", holds=None):
+    """Grant all eligible quest-start rows for a completed conversation,
+    plus every quest its ``start_quest(X)`` ending actions name."""
     if not conversation_guid:
         return [], []
     faction = _quest_faction_for_champion(db, champ_id)
-    rows = pve_db.db_quest_start_rows(
-        conversation_guid, campaign_template, conn=db)
+    rows = list(pve_db.db_quest_start_rows(
+        conversation_guid, campaign_template, conn=db))
+    listed = {row[0] for row in rows}
+    for action in _conversation_ending_actions(db, conversation_guid, ending,
+                                               holds):
+        script = action.get("start_quest")
+        if not script or script in listed:
+            continue
+        template = pve_db.db_quest_template_start(script, conn=db)
+        if template is None:
+            print(f"[campaign] start_quest: unknown quest {script!r}")
+            continue
+        listed.add(script)
+        rows.append((script, template[0], "", template[1]))
     spawned, hooks = [], []
     for script, hook, row_faction, campaign_group in rows:
         if not _quest_row_matches_faction(row_faction, faction):
@@ -2883,6 +3035,8 @@ def _grant_quests_for_conversation(db, champ_id, campaign_template,
                 hooks.append(hook)
     for hook in hooks:
         _run_quest_start_hook(db, champ_id, hook)
+    if spawned:
+        _refresh_area_gates(db, champ_id)
     return spawned, hooks
 
 
@@ -3013,7 +3167,23 @@ def _apply_az1_quest_markers(db, champ_id, state):
         turnin = False
         selected = None
         fallback = None
-        for script, guid, role, row_faction in rows:
+        for script, guid, role, row_faction, raw_conditions in rows:
+            tags = _quest_row_tags(raw_conditions)
+            if tags:
+                holds = _conversation_tags_hold(db, champ_id, state, node, tags)
+                if not _conversation_tags_faction_holds(db, champ_id, tags):
+                    continue
+                if fallback is None:
+                    fallback = guid
+                if role == "start" and holds:
+                    give = True
+                    selected = selected or guid
+                elif role == "complete" and holds:
+                    turnin = True
+                    selected = guid
+                elif role == "not_complete" and holds:
+                    selected = selected or guid
+                continue
             if not _quest_row_matches_faction(row_faction, faction):
                 continue
             if fallback is None:
@@ -3830,6 +4000,11 @@ def _build_initial_gameplay_state(cid, champion_id, campaign_type, champion_race
 
 def _build_input_response(cid, state, success=True, applied=None):
     """Build an InputResponse JSON dict."""
+    if state is not None:
+        import campaign_shadow
+        if campaign_shadow.enabled():
+            import db as _shared_db
+            campaign_shadow.observe(_shared_db._db, cid, state)
     return {
         "Cid": cid,
         "Success": success,
@@ -5009,12 +5184,25 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                    for l in state.setdefault("VisLocs", [])):
             state["VisLocs"].append(loc)
 
+    _note_conversation_choice(state, event_name)
+    if event_name and event_name not in _CAMPAIGN_PROTOCOL_EVENTS:
+        conversation_guid = _active_conversation_guid(state, ctype)
+        if conversation_guid:
+            try:
+                with _conversation_event_lock:
+                    conversation_event(conversation_guid, str(event_name))
+            except Exception as exc:
+                log("    Campaign conversation_event failed: "
+                    f"conversation={conversation_guid} event={event_name!r} "
+                    f"error={exc}")
+
     pending_dungeon = None
     pending_area = None
     pending_panorama = None
     pending_quest_spawns = []
     pending_quest_progress = []
     conversation_applied = _empty_applied_updates()
+    conversation_ending = ""
 
     # Conversation rewards are delivered in the same AppliedUpdates payload
     # as battle/quest loot. Resolve the active map location before the normal
@@ -5031,10 +5219,18 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             {},
         )
         active_conversation = active_data.get("conversationId")
+        conversation_ending = _record_conversation_flags(
+            db, champ_id, state, ctype, active_conversation)
         conversation_applied = _apply_conversation_rewards(
             handler, db, camp_id, state, active_conversation)
+        _merge_applied(conversation_applied, _spend_conversation_gold(
+            db, champ_id, active_conversation, conversation_ending,
+            _ending_holds(db, champ_id, state)))
         pending_quest_progress = _advance_quest_conversation_objectives(
             db, champ_id, active_conversation)
+        _grant_finished_quest_rewards(handler, db, camp_id, state,
+                                      pending_quest_progress,
+                                      conversation_applied)
 
     if (event_name == "conv_done" and
             (ctype or "").upper() == "PANORAMA" and
@@ -5049,10 +5245,18 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
             {},
         )
         active_conversation = current_data.get("conversationId")
+        conversation_ending = _record_conversation_flags(
+            db, champ_id, state, ctype, active_conversation)
         conversation_applied = _apply_conversation_rewards(
             handler, db, camp_id, state, active_conversation)
+        _merge_applied(conversation_applied, _spend_conversation_gold(
+            db, champ_id, active_conversation, conversation_ending,
+            _ending_holds(db, champ_id, state)))
         pending_quest_progress = _advance_quest_conversation_objectives(
             db, champ_id, active_conversation)
+        _grant_finished_quest_rewards(handler, db, camp_id, state,
+                                      pending_quest_progress,
+                                      conversation_applied)
         previous_flags = state.get("Flags")
         if not isinstance(previous_flags, dict):
             previous_flags = {}
@@ -5060,7 +5264,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
         if active_conversation:
             spawned, _hooks = _grant_quests_for_conversation(
                 db, champ_id, str(template_name or "AZ1").upper(),
-                active_conversation)
+                active_conversation, conversation_ending,
+                _ending_holds(db, champ_id, state))
             pending_quest_spawns.extend(spawned)
         if current:
             if current_data.get("repeatable"):
@@ -5132,6 +5337,20 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 new_values.append(path)
         if ((ctype or "").upper() == "AREA" and
                 str(template_name or "").upper() == "AZ1"):
+            # The route the token is about to walk: visit_node reads it for
+            # the node the player arrives from (cameFrom tags, walk-back).
+            pdata["travel_start"] = _resolve_node(
+                state, state.get("LastNode") or state.get("ALoc") or "")
+            pdata["travel_paths"] = [str(path) for path in values if path]
+            # The client only reports visit_node on a first visit, so note
+            # the arrival here, where the token will stop.
+            stop = _az1_route_stop(db, state, pdata["travel_start"],
+                                   pdata["travel_paths"])
+            if stop and stop != pdata["travel_start"]:
+                had_pass = bool(pdata.get("pass_node"))
+                _az1_note_arrival(db, state, stop)
+                if had_pass and not pdata.get("pass_node"):
+                    _sync_az1_quest_gates(db, champ_id, state)
             recovery_node = _resolve_node(
                 state, state.get("ALoc") or state.get("LastNode") or "")
             # The client can retry the same travel animation after a
@@ -5219,6 +5438,7 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                      requested_node in visited_nodes) and
                     requested_node not in blocked_nodes and
                     requested_node not in _az1_path_fork_ids(db)):
+                _az1_note_arrival(db, state, requested_node)
                 state["LastNode"] = requested_node
                 _note_visited(state, requested_node)
                 _az1_reveal_neighbors(db, state, requested_node)
@@ -5235,6 +5455,25 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                         db, champ_id, scene[0], requested_node, state)
                     state["ALoc"] = None
                     state["CurState"] = "EXPLORE"
+    elif (event_name == "force_move" and (ctype or "").upper() == "AREA" and
+          str(template_name or "").upper() in {"AZ1", "AZ2"}):
+        # UIDungeonZoneViewModel acknowledges force_move_dest and walks the
+        # token there (ignoring impassable nodes): params are
+        # [current node, destination]. Clear the order so it is not replayed.
+        pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+        destination = _resolve_node(
+            state, str(o_params[1] if o_params and len(o_params) > 1
+                       else pdata.get("force_move_dest") or ""))
+        pdata.pop("force_move_dest", None)
+        if destination:
+            origin = _resolve_node(
+                state, str(o_params[0] if o_params else state.get("LastNode") or ""))
+            pdata["came_from"] = origin
+            pdata.pop("pass_node", None)
+            state["LastNode"] = destination
+            state["ALoc"] = None
+            _note_visited(state, destination)
+            _az1_reveal_neighbors(db, state, destination)
     elif event_name in ("choice_go", "choice_stay"):
         # The authored AZ0 transition conversation is already hosted by the
         # AZ1 panorama.  The choice is recorded for the client conversation
@@ -5438,22 +5677,26 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                 outcome_convo = bool(current_data.get("outcome_conversation"))
                 pre_encounter_convo = bool(current_data.get("pre_encounter"))
                 quest_turnin_convo = bool(current_data.get("turninquest"))
-                blockade_convo = (
-                    current_template == "AZ1" and
-                    current_data.get("node") == "Node019" and
+                ended_conversation = current_data.get("conversationId")
+                # An impassable node (editor ``impassable`` state: Brink
+                # Ridge's blockade) is not finished by its conversation; only
+                # its battle or a let_pass() moves the player on.
+                held_convo = bool(
+                    current_data.get("impassable") and
                     current_data.get("type") == "Convo" and
                     not outcome_convo and not pre_encounter_convo)
                 if outcome_convo:
                     # A one-shot result dialogue follows a completed battle;
                     # closing it completes the map node even though the
                     # underlying location retains its pre-encounter marker.
-                    _mark_location_completed(state, current)
+                    # A defeat's result leaves the node unfinished.
+                    failed = {str(value) for value in (state.get(
+                        "PublicState", {}).get("Data", {}).get(
+                            "failed_nodes") or ())}
+                    if str(current_data.get("node") or current) not in failed:
+                        _mark_location_completed(state, current)
                     current_data["autostart"] = False
-                elif blockade_convo:
-                    # The first Brink Ridge conversation only explains the
-                    # blockade. It must not complete the node or reveal its
-                    # northern neighbours; the successful encounter sets
-                    # blockade_cleared through the battle result path.
+                elif held_convo:
                     current_data["completed"] = False
                     current_data["autostart"] = False
                 elif quest_turnin_convo:
@@ -5521,7 +5764,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     spawned, _hooks = _grant_quests_for_conversation(
                         db, champ_id, str(template_name).upper(),
                         (outcome_conversation_guid if outcome_convo else
-                         current_data.get("conversationId")))
+                         current_data.get("conversationId")),
+                        conversation_ending, _ending_holds(db, champ_id, state))
                     for quest_id, quest_script, quest_state in spawned:
                         pending_quest_spawns.append(
                             (quest_id, quest_script, quest_state))
@@ -5591,6 +5835,11 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                     state["ALoc"] = None
                 elif not current_data.get("shroomhaus_ready"):
                     state["ALoc"] = None
+                if current_template in {"AZ1", "AZ2"}:
+                    _apply_ending_movement(
+                        db, champ_id, state, current_data,
+                        outcome_conversation_guid if outcome_convo
+                        else ended_conversation, conversation_ending)
                 # Conversation completion can change a repeatable node from
                 # an active prelude into its retryable map state. Recompute
                 # both node and edge visibility now; otherwise the newly
@@ -5631,8 +5880,16 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                  if (loc.get("Data") or {}).get("node") == current),
                 None,
             )
+            # The report conversation completes the Crayburn quest; its
+            # reward is the quest's (quest_templates.rewards_json).  A
+            # conversation-level reward row is still honoured.
             report_applied = _apply_conversation_rewards(
                 handler, db, camp_id, state, report_conv)
+            crayburn_quest = _quest_template(db, campaign_group="DUNGEON")
+            if crayburn_quest:
+                _merge_applied(report_applied, _apply_quest_rewards(
+                    handler, db, camp_id, state,
+                    crayburn_quest["script_name"]))
             _mark_location_completed(state, current)
             transition = _activate_az1_transition(db, champ_id, cfg)
             if transition:
@@ -5945,8 +6202,9 @@ def _apply_gameend(db, camp_id, won):
         # naming individual creatures; a captured win closes the node and
         # advances the matching quest objective when one is active.
         tamed_scene = any(
-            str((record.get("end_of_game_condition") or {}).get("type") or "")
-                .strip().lower() == "void_tamed_troop"
+            record.get("when") or str(
+                (record.get("end_of_game_condition") or {}).get("type") or ""
+            ).strip().lower() == "void_tamed_troop"
             for record in _scene_reward_records(db, active_scene)
         )
         # An authored conditional encounter remains retryable only after a
@@ -5964,6 +6222,7 @@ def _apply_gameend(db, camp_id, won):
                         data.get("node"), data.get("name"), data.get("title")))):
                 data["completed"] = bool(won and not retryable)
                 data["repeatable"] = bool(retryable)
+                data.pop("action_encounter", None)    # its result is handled
                 data["enabled"] = True
                 data["visible"] = True
                 # A result has been handled.  Even a retryable defeat must
@@ -6014,7 +6273,8 @@ def _apply_gameend(db, camp_id, won):
             outcome_conv = None
             if not won or not retryable:
                 outcome_conv = _az1_outcome_conversation(
-                    db, result_node, bool(won), champ_id=champ_id)
+                    db, result_node, bool(won), champ_id=champ_id,
+                    state=state)
             if outcome_conv and matched_index is not None:
                 result_data = state.get("VisLocs", [])[matched_index].get(
                     "Data", {})
@@ -6032,11 +6292,8 @@ def _apply_gameend(db, camp_id, won):
                 state["ALoc"] = (result_data.get("name") or
                                   result_data.get("node") or result_node)
                 outcome_pending = True
-            if (result_node == "Node019" and won and not retryable):
-                state.setdefault("PublicState", {}).setdefault("Data", {})[
-                    "blockade_cleared"
-                ] = True
         state.pop("ActiveEncounterGuid", None)
+        state.pop("ActiveEncounterConversationGuid", None)
 
     # Clear ALoc so the panorama doesn't auto-pop the encounter dialog when
     # the client returns from the battle. Use an empty string (not None) — the
@@ -6269,19 +6526,97 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     campaign state so reconnects or a repeated ``conv_done`` cannot duplicate
     a one-time reward.
     """
-    applied = _empty_applied_updates()
     if not conversation_guid:
-        return applied
+        return _empty_applied_updates()
     row = pve_db.db_conversation_reward(conversation_guid, conn=db)
     if not row or not row[2]:
-        return applied
+        return _empty_applied_updates()
     reward_raw, one_time, _enabled = row
     try:
         reward = json.loads(reward_raw or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         reward = {}
-    if not isinstance(reward, dict):
+    return _apply_reward_dict(
+        handler, db, camp_id, state, reward if isinstance(reward, dict) else {},
+        bool(one_time), str(conversation_guid),
+        f"conversation={conversation_guid}")
+
+
+def _apply_quest_rewards(handler, db, camp_id, state, quest_script):
+    """Grant a quest's authored completion reward (``quest_templates.rewards_json``).
+
+    Called where a quest is marked finished; one-time per champion, keyed
+    ``quest:<script>`` in the same claim table conversations use.
+    """
+    row = pve_db.db_quest_template_reward(quest_script, conn=db)
+    if not row or not row[1]:
+        return _empty_applied_updates()
+    try:
+        reward = json.loads(row[0] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
         reward = {}
+    return _apply_reward_dict(
+        handler, db, camp_id, state, reward if isinstance(reward, dict) else {},
+        True, f"quest:{quest_script}", f"quest={quest_script}")
+
+
+def _merge_applied(base, extra):
+    """Append ``extra``'s AppliedUpdates lists onto ``base`` (in place)."""
+    for key, values in (extra or {}).items():
+        if isinstance(values, list):
+            base.setdefault(key, []).extend(values)
+    return base
+
+
+def _stardust_item_specs(reward):
+    """Item specs for a reward's ``stardust`` entries (rarity/amount/probability).
+
+    Each entry ``{"rarity": "common", "amount": 25, "probability": 50}`` is
+    rolled independently; ``probability`` is a percentage (default 100).  The
+    returned specs carry ``stardust`` so the grant also updates the ledger.
+    """
+    from db import STARDUST_TEMPLATES
+    specs = []
+    for entry in (reward or {}).get("stardust") or ():
+        if not isinstance(entry, dict):
+            continue
+        guid = STARDUST_TEMPLATES.get(str(entry.get("rarity") or "").lower())
+        try:
+            amount = int(entry.get("amount", 0) or 0)
+            probability = float(entry.get("probability", 100))
+        except (TypeError, ValueError):
+            continue
+        if guid and amount > 0 and random.random() * 100 < probability:
+            specs.append({"guid": guid, "quantity": amount,
+                          "stardust": str(entry["rarity"]).lower()})
+    return specs
+
+
+def _grant_finished_quest_rewards(handler, db, camp_id, state, quest_states,
+                                  applied):
+    """Grant ``rewards_json`` for each quest a conversation just finished.
+
+    ``quest_states`` are the QUEST campaign states returned by
+    ``_advance_quest_conversation_objectives``; ``camp_id``/``state`` are the
+    campaign the conversation ran in (it keeps the one-time claims).
+    """
+    for quest_state in quest_states or ():
+        if not isinstance(quest_state, dict) or not quest_state.get("Finished"):
+            continue
+        script = pve_db.db_campaign_template_name(
+            quest_state.get("CampID"), conn=db)
+        if script:
+            _merge_applied(applied, _apply_quest_rewards(
+                handler, db, camp_id, state, script))
+    return applied
+
+
+def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
+                       claim_name, label):
+    """Grant ``reward`` (gold/xp/cards/items/chest) to the campaign's champion."""
+    applied = _empty_applied_updates()
+    if not reward:
+        return applied
     claims = state.setdefault("_conversation_reward_claims", {})
     if not isinstance(claims, dict):
         claims = {}
@@ -6296,8 +6631,8 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     # conversation rewards therefore belong to the champion, not the shared
     # conversation/campaign template.  Accept the legacy unscoped key so a
     # reward already claimed by an older server build is not duplicated.
-    claim_key = f"{champ_id}:{conversation_guid}"
-    if bool(one_time) and (claims.get(claim_key) or claims.get(str(conversation_guid))):
+    claim_key = f"{champ_id}:{claim_name}"
+    if bool(one_time) and (claims.get(claim_key) or claims.get(str(claim_name))):
         return applied
     try:
         gold = max(0, int(reward.get("gold", 0) or 0))
@@ -6402,6 +6737,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
         }]
     if isinstance(item_specs, dict):
         item_specs = [item_specs]
+    item_specs = list(item_specs) + _stardust_item_specs(reward)
     for spec in item_specs:
         if isinstance(spec, str):
             spec = {"guid": spec}
@@ -6415,6 +6751,8 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
             quantity = max(1, int(spec.get("quantity", 1) or 1))
         except (TypeError, ValueError):
             quantity = 1
+        if spec.get("stardust"):
+            db_add_stardust(user_id, spec["stardust"], quantity, conn=db)
         existing = db_inventory_item(user_id, str(template_guid), conn=db)
         if existing:
             item_row_id, old_quantity, item_uid = existing
@@ -6449,7 +6787,8 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     # and return inventory_bits in Applied.Items so the campaign client adds
     # it immediately to InventoryChests and the pack-opening screen.
     chest_guid = (reward.get("chest_guid") or reward.get("chest_template")
-                  or reward.get("pack_guid"))
+                  or reward.get("pack_guid")
+                  or (reward.get("chest_guid_by_race") or {}).get(race_name))
     if chest_guid:
         chest_guid = str(chest_guid)
         chest_id = db_create_treasure_chest(
@@ -6478,7 +6817,7 @@ def _apply_conversation_rewards(handler, db, camp_id, state,
     _save_campaign_state(db, camp_id, state)
     db.commit()
     getattr(handler, "_log_req", print)(
-        f"    Conversation reward: conversation={conversation_guid} "
+        f"    Reward: {label} "
         f"gold={gold} xp={xp} cards={len(applied['Cards'])} "
         f"items={len(applied['Items'])}")
     return applied
@@ -6618,6 +6957,169 @@ def _apply_encounter_end_rewards_legacy(handler, db, session, camp_id, won):
     return granted
 
 
+_SCENE_ACTION = re.compile(r"^\s*(set_flag|clear_flag)\s*\(\s*([^()\s][^()]*?)\s*\)\s*$")
+_SCENE_CHECK_TAMED = re.compile(r"^\s*check_?tamed\s*\(\s*\)\s*$", re.I)
+
+
+def _run_scene_actions(db, state, scene_guid, trigger, battle=None):
+    """Run a scene's ``pre`` / ``victory`` / ``defeat`` actions on ``state``.
+
+    Actions are ``set_flag(X)`` / ``clear_flag(X)``; the flags live in the
+    campaign's public data, where ``flag(X)`` tags and the rules read them.
+    ``check_tamed()`` (victory; ``battle`` is ``(session_id, player_user_id)``)
+    sets ``tamed:<first 8 of the scene GUID>`` when a tamed troop is in the
+    opponent's void. Returns whether anything changed.
+    """
+    if not scene_guid:
+        return False
+    try:
+        table = json.loads(pve_db.db_encounter_scene_actions(
+            scene_guid, conn=db) or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    data = state.setdefault("PublicState", {}).setdefault("Data", {})
+    before = json.dumps(data, sort_keys=True)
+    actions = list((table or {}).get(trigger) or ())
+    # The card picked on the selector panel runs its own flag actions.
+    option = _active_mod_choice_option(db, state, scene_guid)
+    if option:
+        actions += list(option.get(trigger) or ())
+    for action in actions:
+        if _SCENE_CHECK_TAMED.match(str(action)):
+            if (trigger == "victory" and battle and _evaluate_encounter_condition(
+                    db, battle[0], battle[1],
+                    {"type": "void_tamed_troop", "owner": "opponent"})):
+                data[f"tamed:{str(scene_guid).lower()[:8]}"] = True
+            continue
+        match = _SCENE_ACTION.match(str(action))
+        if not match:
+            continue
+        kind, flag = match.group(1), match.group(2)
+        if kind == "set_flag":
+            data[flag] = True
+        else:
+            _clear_campaign_flags(data, [flag])
+    return json.dumps(data, sort_keys=True) != before
+
+
+# PublicState path the ModChoiceEncounter location's ``modlistId`` names:
+# the client's card-selector panel lists these card GUIDs.
+_MOD_CHOICE_LIST = "mod_choice_list"
+
+
+def _scene_mod_options(db, scene_guid):
+    """``campaign_rules.scene_mod_choices`` for a scene's ``mods_json``."""
+    if not scene_guid:
+        return []
+    try:
+        mods = json.loads(pvp_db.db_scene_mods(str(scene_guid), conn=db) or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return campaign_rules.scene_mod_choices(mods)
+
+
+def _active_mod_choice_option(db, state, scene_guid):
+    """The option the player chose for the active battle, if it is this scene's."""
+    chosen = str(state.get("ActiveEncounterModChoice") or "").lower()
+    if not chosen or not scene_guid:
+        return None
+    return next((o for o in _scene_mod_options(db, scene_guid)
+                 if o["guid"] == chosen), None)
+
+
+def _offer_mod_choice(db, champ_id, state, data):
+    """Turn an encounter location into the client's card-selector battle.
+
+    A scene with ``"choice": true`` mods offers the cards whose ``when``
+    tags hold: the location becomes ``ModChoiceEncounter`` and its
+    ``modlistId`` points at the offered GUIDs in PublicState (the client's
+    UIDungeonZoneViewModel builds the selector from that list). With none
+    on offer it stays a normal ``Encounter``.
+    """
+    pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
+    options = _scene_mod_options(db, data.get("encounter"))
+    offered = campaign_rules.offered_mod_choices(
+        options, _ending_holds(db, champ_id, state)) if options else []
+    if offered:
+        data["type"] = "ModChoiceEncounter"
+        data["modlistId"] = f"/{_MOD_CHOICE_LIST}"
+        pdata[_MOD_CHOICE_LIST] = offered
+        return True
+    if data.get("type") == "ModChoiceEncounter":
+        data["type"] = "Encounter"
+    data.pop("modlistId", None)
+    return False
+
+
+def _chosen_mod_card(db, state, active_node, o_params):
+    """The card the selector panel sent with ``start`` (``OParms[0]``),
+    if it is one the active location offered; ``None`` otherwise."""
+    location = next((
+        (loc.get("Data") or {}) for loc in state.get("VisLocs") or ()
+        if (loc.get("Data") or {}).get("node") == active_node or
+        (loc.get("Data") or {}).get("name") == active_node), {})
+    if location.get("type") != "ModChoiceEncounter":
+        return None
+    chosen = str((o_params or [""])[0] or "").strip().lower()
+    offered = ((state.get("PublicState") or {}).get("Data") or {}).get(
+        _MOD_CHOICE_LIST) or ()
+    return chosen if chosen in offered else None
+
+
+def _run_defeat_actions(db, session, camp_id):
+    """A lost / conceded battle: run the scene's ``defeat`` actions and save."""
+    row = pve_db.db_campaign_identity_state(camp_id, db)
+    if not row:
+        return
+    try:
+        state = json.loads(row[1] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    scene_guid = state.get("ActiveEncounterGuid") or _last_encounter_scene.get(
+        session.session_name or "")
+    if _run_scene_actions(db, state, scene_guid, "defeat"):
+        _save_campaign_state(db, camp_id, state)
+        db.commit()
+
+
+def _battle_events(db, session, player_user_id):
+    """Named events a finished battle produced (``tamed_troop`` ...)."""
+    events = []
+    if _evaluate_encounter_condition(
+            db, session.session_id, player_user_id,
+            {"type": "void_tamed_troop", "owner": "opponent"}):
+        events.append("tamed_troop")
+    return events
+
+
+def _record_battle_flags(db, session, player_user_id, state, scene_guid):
+    """Set the flags the AZ1 rules hooks attach to this battle's result.
+
+    A hook ``{"on": {"event": "encounter_victory", "scene": S, "events":
+    "tamed_troop"}, "do": [{"set_flag": F}]}`` sets ``F`` (stored as a
+    boolean in the campaign's public data, where ``flag(F)`` tags read it)
+    when scene ``S`` is won and the battle produced that event.
+    """
+    import campaign_gates
+    rules = campaign_gates.rules_for("AZ1")
+    if not rules or not scene_guid:
+        return
+    events = _battle_events(db, session, player_user_id)
+    data = state.setdefault("PublicState", {}).setdefault("Data", {})
+    events += [str(e) for e in data.pop("pending_battle_events", None) or ()]
+    for hook in rules.get("hooks") or ():
+        on = hook.get("on") or {}
+        if on.get("event") != "encounter_victory":
+            continue
+        if str(on.get("scene") or "").lower() != str(scene_guid).lower():
+            continue
+        if on.get("events") and on["events"] not in events:
+            continue
+        for effect in hook.get("do") or ():
+            if effect.get("set_flag"):
+                data[effect["set_flag"]] = True
+
+
 def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     """Apply authored encounter rewards and return campaign AppliedUpdates.
 
@@ -6628,6 +7130,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
               "items": [], "chests": [], "gold": 0, "xp": 0,
               "condition_met": False, "scene_guid": None}
     if not won:
+        _run_defeat_actions(db, session, camp_id)
         return result
     row = pve_db.db_campaign_identity_state(camp_id, db)
     if not row:
@@ -6639,12 +7142,17 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         state = {}
     scene_guid = state.get("ActiveEncounterGuid") or _last_encounter_scene.get(
         session.session_name or "")
+    champ = _get_champion(db, champion_id)
+    player_user_id = champ[1] if champ else None
+    if _run_scene_actions(db, state, scene_guid, "victory",
+                          battle=(session.session_id, player_user_id)
+                          if player_user_id is not None else None):
+        _save_campaign_state(db, camp_id, state)
+        db.commit()
     records = _scene_reward_records(db, scene_guid)
     if not records:
         return result
     result["scene_guid"] = str(scene_guid) if scene_guid else None
-    champ = _get_champion(db, champion_id)
-    player_user_id = champ[1] if champ else None
     if player_user_id is None:
         return result
     claims = state.setdefault("_encounter_reward_claims", {})
@@ -6668,6 +7176,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     quest_pending = _quest_encounter_is_pending(
         db, champion_id, str(scene_guid) if scene_guid else None)
     retry_without_currency = bool(quest_pending and prior_successes)
+    _record_battle_flags(db, session, player_user_id, state, scene_guid)
     granted, total_gold, total_xp = [], 0, 0
     for record_index, record in enumerate(records):
         reward_obj = record.get("reward")
@@ -6680,6 +7189,13 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                      f"{scene_guid}:{record_index}:{session.session_id}")
         if claims.get(claim_key):
             continue
+        # ``when``: flag tags that must hold (set by the battle's events via
+        # the rules hooks, see _record_battle_flags).
+        when = record.get("when")
+        if when:
+            if not _conversation_tags_hold(db, champion_id, state, "", when):
+                continue
+            result["condition_met"] = True
         condition = record.get("end_of_game_condition")
         context = ({"owner": "player"} if not condition else
                    _evaluate_encounter_condition(
@@ -6742,6 +7258,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         if isinstance(item_specs, dict):
             item_specs = [item_specs]
         if not condition or context:
+            item_specs = list(item_specs) + _stardust_item_specs(reward_obj)
             for spec in item_specs:
                 if isinstance(spec, str):
                     spec = {"guid": spec}
@@ -6755,6 +7272,9 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                     quantity = max(1, int(spec.get("quantity", 1) or 1))
                 except (TypeError, ValueError):
                     quantity = 1
+                if spec.get("stardust"):
+                    db_add_stardust(player_user_id, spec["stardust"], quantity,
+                                    conn=db)
                 existing = db_inventory_item(
                     player_user_id, str(template_guid), conn=db)
                 if existing:
@@ -7013,7 +7533,8 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
 
 
 def _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
-                      deck_uid64, comp, session_id, target, instance, conh, uid):
+                      deck_uid64, comp, session_id, target, instance, conh, uid,
+                      encounter_mod_conversation_guid=None, mod_choice=None):
     """Push a 'gamestarted' notification launching an encounter battle.
 
     Shared by the campaign 'start' SendEvent and the 'camp.encounter' cheat.
@@ -7022,11 +7543,33 @@ def _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
     drives the LoadBalancer session flow (FindSession -> StartEncounter ->
     Join -> battle events).
 
+    ``encounter_guid`` may also be the rules engine's encounter descriptor:
+    ``{"scene": ..., "conversation_id": ...}``. In that form, the optional
+    conversation is queued as an encounter mod when battle setup begins.
+
+    ``mod_choice`` is the card picked on a ModChoiceEncounter's selector
+    panel; battle setup applies it in place of the scene's choice mod, and
+    its option's flag actions run with the scene's.
+
     The battle session itself is NOT created here — StartEncounter (22017)
     allocates the authoritative DB-backed session. The scene GUID is also
      recorded so resolve_encounter can resolve the correct AI deck/name
     when the battle session is later set up.
     """
+    if isinstance(encounter_guid, dict):
+        encounter_action = encounter_guid
+        encounter_guid = encounter_action.get("scene")
+        if encounter_mod_conversation_guid is None:
+            encounter_mod_conversation_guid = encounter_action.get(
+                "conversation_id")
+    if not encounter_guid:
+        raise ValueError("encounter action needs a scene")
+    if encounter_mod_conversation_guid:
+        encounter_mod_conversation_guid = str(
+            encounter_mod_conversation_guid).strip().lower()
+    else:
+        encounter_mod_conversation_guid = None
+
     from encoder import encode_campaign_session_state
     import base64
 
@@ -7051,6 +7594,16 @@ def _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
         except (TypeError, ValueError, json.JSONDecodeError):
             camp_state = {}
         camp_state["ActiveEncounterGuid"] = encounter_guid
+        if encounter_mod_conversation_guid:
+            camp_state["ActiveEncounterConversationGuid"] = (
+                encounter_mod_conversation_guid)
+        else:
+            camp_state.pop("ActiveEncounterConversationGuid", None)
+        if mod_choice:
+            camp_state["ActiveEncounterModChoice"] = str(mod_choice).lower()
+        else:
+            camp_state.pop("ActiveEncounterModChoice", None)
+        _run_scene_actions(db, camp_state, encounter_guid, "pre")
         _save_campaign_state(db, camp_id, camp_state)
         db.commit()
     gs_bytes = encode_campaign_session_state(
@@ -7152,6 +7705,8 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     fortune_guid = None
     fortune_ability_guid = None
     fortune_starting_hand_bonus = 0
+    encounter_mod_conversation_guid = None
+    encounter_mod_choice_guid = None
     if camp_id:
         row = pve_db.db_campaign_battle_profile(camp_id, conn=db)
         if row:
@@ -7162,6 +7717,12 @@ def resolve_battle_config(handler, db, camp_id, session_name):
                 campaign_state = json.loads(row[5] or "{}")
                 is_tutorial = not bool(campaign_state.get(
                     "TutorialDone", False))
+                encounter_mod_conversation_guid = str(
+                    campaign_state.get("ActiveEncounterConversationGuid") or ""
+                ).strip().lower() or None
+                encounter_mod_choice_guid = str(
+                    campaign_state.get("ActiveEncounterModChoice") or ""
+                ).strip().lower() or None
                 data = ((campaign_state.get("PublicState") or {}).get(
                     "Data") or {})
                 fortune_guid = str(data.get("gaal_fortune_guid") or "").lower()
@@ -7236,6 +7797,9 @@ def resolve_battle_config(handler, db, camp_id, session_name):
         "fortune_guid": fortune_guid,
         "fortune_ability_guid": fortune_ability_guid,
         "fortune_starting_hand_bonus": fortune_starting_hand_bonus,
+        "encounter_mod_conversation_guid": encounter_mod_conversation_guid,
+        # The card picked on a ModChoiceEncounter's selector panel.
+        "encounter_mod_choice_guid": encounter_mod_choice_guid,
     }
 
 
@@ -7376,12 +7940,16 @@ def _handle_campaign_start(handler, db, env_json, champ_id, cfg,
     row = campaign_row
     campaign_type = (row[1] or "").upper() if row else ""
     encounter_guid = None
+    mod_choice = None
 
     if campaign_type in ("DUNGEON", "AREA"):
         state = json.loads(row[0]) if row and row[0] else {}
         race_name = _race_name_for_campaign(db, camp_id)
         active_node = _resolve_node(
             state, state.get("ALoc") or state.get("LastNode") or "")
+        # A card-selector battle sends the chosen card as OParms[0].
+        mod_choice = _chosen_mod_card(db, state, active_node,
+                                      env_json.get("OParms"))
         if campaign_type == "DUNGEON" and _normalize_crayburn_encounters(state, race_name):
             _save_campaign_state(db, camp_id, state)
             db.commit()
@@ -7410,14 +7978,15 @@ def _handle_campaign_start(handler, db, env_json, champ_id, cfg,
                 f"(camp={camp_id}, node={active_node})")
             return None
         log(f"    {campaign_type.title()} start: camp={camp_id} node={active_node} "
-            f"encounter={encounter_guid}")
+            f"encounter={encounter_guid}"
+            + (f" mod_choice={mod_choice}" if mod_choice else ""))
     else:
         # The training encounter scene for this race.
         encounter_guid = cfg.get("training_encounter")
 
     return _launch_encounter(handler, db, camp_id, champ_id, encounter_guid,
                              deck_uid64, comp, session_id, target, instance,
-                             conh, uid)
+                             conh, uid, mod_choice=mod_choice)
 
 
 def resolve_encounter(db, camp_id, scene_guid=None):
@@ -7671,7 +8240,8 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                         ((l.get("Data") or {}) for l in state.get("VisLocs", [])
                          if (l.get("Data") or {}).get("node") == node),
                         requested)
-            if not blocked_encounter and previous and previous != node:
+            if (not blocked_encounter and previous and previous != node and
+                    previous_node != requested_node):
                 previous_data = next(
                     ((l.get("Data") or {}) for l in state.get("VisLocs", [])
                      if ((l.get("Data") or {}).get("node") in
@@ -7791,7 +8361,7 @@ def _handle_locaction(handler, db, env_json, comp, session_id,
                             # chosen merely because it sorts first by GUID.
                             data["conversationId"] = (
                                 _az1_pre_encounter_conversation(
-                                    db, node, champ_id))
+                                    db, node, champ_id, state))
                         else:
                             data["conversationId"] = _az1_node_conversation(
                                 db, node, state, champ_id=champ_id)

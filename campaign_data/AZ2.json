@@ -1,0 +1,3437 @@
+{
+ "schema_version": 1,
+ "description": "AZ2 campaign table edits",
+ "tables": {
+  "campaign_node_conversations": [
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1b247ac9-55b3-4fab-8e08-2fc3fa3cf969",
+    "trigger_json": {
+     "label": "Crocodile Success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "59eb55cd-5f7e-4d26-95b5-c961d089559e",
+    "trigger_json": {
+     "label": "Crocodile Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "80aa9b2e-584b-45c7-94f4-8deb978baba8",
+    "trigger_json": {
+     "label": "Crocodile Success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f6d576c8-ef8b-42cd-8165-f27b9ee7cdb6",
+    "trigger_json": {
+     "label": "Crocodile",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a21d3004-ba34-44fa-9baf-d3ba5f1649b8",
+    "trigger_json": {
+     "label": "Seagulls fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c4a6d906-538c-4285-bae1-f6ba2f3adb61",
+    "trigger_json": {
+     "label": "Seagulls",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f6a2c95c-0ff2-433b-97d0-f67b81005a2f",
+    "trigger_json": {
+     "label": "Seagulls success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "05f60371-b0c3-46f2-a3a0-0cac626351a0",
+    "trigger_json": {
+     "label": "Winter Moon dialogue - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "dfa3a46b-66f6-4593-9868-ba884564c201",
+    "trigger_json": {
+     "label": "Kagulichu dialogue - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "38c733fa-e88d-41c0-9159-ce38d6ee568a",
+    "trigger_json": {
+     "label": "Kagulichu fight success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e1225afe-1c03-40c0-af09-597e66fb6e23",
+    "trigger_json": {
+     "label": "Kagulichu fight - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f90c07de-eeca-446b-b6ac-85f472ee3d99",
+    "trigger_json": {
+     "label": "Kagulichu fight fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0e8c7342-21f4-4df5-bd92-87883ef07891",
+    "trigger_json": {
+     "label": "Winter Moon fight success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "87d0cf8c-cf0c-497c-8819-6976c98b6e8f",
+    "trigger_json": {
+     "label": "Winter Moon fight - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e3aee638-7b16-4408-ba19-87c7aa067483",
+    "trigger_json": {
+     "label": "Winter Moon fight fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "05596217-e553-4d40-8059-3f94dd5c4404",
+    "trigger_json": {
+     "label": "Shin'hare mercenary success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "167cceba-d9ad-4aac-9bae-cc94a73c95f4",
+    "trigger_json": {
+     "label": "Shin'hare mercenary fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7b86286f-a6ba-410f-bed1-008995e17f92",
+    "trigger_json": {
+     "label": "Shin'hare mercenary",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b019a338-39db-4656-8ac3-99dc4cddce79",
+    "trigger_json": {
+     "label": "Minotaurs",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "cbe635ab-699e-48f4-bc88-ca3284f80f12",
+    "trigger_json": {
+     "label": "Minotaurs fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f31558cc-167c-4628-8f2a-6fc12365fcfa",
+    "trigger_json": {
+     "label": "Minotaurs success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2f7e309c-d655-402e-bca3-1660e5057a24",
+    "trigger_json": {
+     "label": "Milosh the gaal - First encounter",
+     "source": "conversation_name",
+     "tags": [
+      "!talkedAt(Node012,2)"
+     ],
+     "actions": {
+      "gaal_camp_accept": [
+       "spend_gold(100)"
+      ]
+     }
+    },
+    "priority": 0
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "cdaefb35-88b0-4a48-abfc-4de19dee6e3d",
+    "trigger_json": {
+     "label": "Milosh the gaal - Repeat encounter (no fortune)",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node012)"
+     ],
+     "actions": {
+      "gaal_camp_accept": [
+       "spend_gold(100)"
+      ]
+     }
+    },
+    "priority": 301
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "cf81ef76-6ce7-471f-a6be-e67c2941205b",
+    "trigger_json": {
+     "label": "Milosh the gaal - Repeat encounter (player already has fortune)",
+     "source": "conversation_name",
+     "tags": [
+      "flag(gaal_fortune)",
+      "talkedAt(Node012)"
+     ]
+    },
+    "priority": 102
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "49e1fee3-1e7b-42be-ac42-93db60b287f5",
+    "trigger_json": {
+     "label": "Forever's child success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ac5e93a4-d26e-4f7b-b896-42e119d34507",
+    "trigger_json": {
+     "label": "Forever's child",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c0b5331f-06a4-4b6c-abad-127ea76e86ff",
+    "trigger_json": {
+     "label": "Forever's child fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6366fd05-5f2f-4580-88f8-7b530233881a",
+    "trigger_json": {
+     "label": "Princess Victoria - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c4e5b5e7-b5ca-443f-ae93-ff9296764dd1",
+    "trigger_json": {
+     "label": "Princess Victoria - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f382e274-95ca-4993-973f-e555cdf5fc17",
+    "trigger_json": {
+     "label": "Princess Victoria fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fbdee6c9-bf9e-4a1b-824d-763be8a1f796",
+    "trigger_json": {
+     "label": "Princess Victoria success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "224fef40-e737-48d6-a42f-7c99b9e0c2de",
+    "trigger_json": {
+     "label": "Giant Jellyfish success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5cdd27f2-543c-4138-bc23-9deae24ce6bc",
+    "trigger_json": {
+     "label": "Giant Jellyfish",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6572f347-173d-4af9-9d6e-f20cf4363567",
+    "trigger_json": {
+     "label": "Giant Jellyfish fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5c1da7a7-85d1-4c1c-a608-79e889cdba88",
+    "trigger_json": {
+     "label": "Murkrum - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "bb0183ee-4595-4cdd-b810-2c9145bd5138",
+    "trigger_json": {
+     "label": "Kraken guard - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5754c49b-d664-4bc5-a60c-a6315438af2f",
+    "trigger_json": {
+     "label": "Xentoth's Zealot success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5c359815-70da-4610-83b4-465c62a647e5",
+    "trigger_json": {
+     "label": "Xentoth's Zealot - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "cb01730b-f299-447b-a8e4-d34da1031ea9",
+    "trigger_json": {
+     "label": "Xentoth's Zealot fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "168b8ca5-19ca-46a7-8488-996197c77b77",
+    "trigger_json": {
+     "label": "Lazgar Chul success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "96d08e59-b0d5-47a3-908e-012cec7b79c6",
+    "trigger_json": {
+     "label": "Lazgar Chul - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c569dd76-f30f-4e38-85c3-51f887ffa886",
+    "trigger_json": {
+     "label": "Lazgar Chul fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e6b16f3c-8099-4d41-80ed-1c89cbc1df5a",
+    "trigger_json": {
+     "label": "Darkspire - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "10559827-ca5a-4d66-8a56-f6b04afb3db7",
+    "trigger_json": {
+     "label": "Darkspire - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "4e0f1ba5-17d1-4ce2-af0d-d081b9a8e25c",
+    "trigger_json": {
+     "label": "Darkspire success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d0f8734c-a7ee-423e-92c0-aa41ec649642",
+    "trigger_json": {
+     "label": "Darkspire fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "aedf839e-d93f-4900-a8d6-bb3c22ee9f57",
+    "trigger_json": {
+     "label": "Midnight Shepherd success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "be6729fc-bcc0-44f4-85ca-670f01d03e58",
+    "trigger_json": {
+     "label": "Midnight Shepherd - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "bed80576-2586-47f7-8cde-2db3b4070873",
+    "trigger_json": {
+     "label": "Midnight Shepherd fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "93c18655-eacd-4de1-9639-23f96604ce3e",
+    "trigger_json": {
+     "label": "Midnight Shepherd - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "3a35135a-e37b-478d-ba89-1c4b01cbfd5d",
+    "trigger_json": {
+     "label": "Paladin",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5d49d7f7-f1e2-44a0-b898-65c6b1ef66b1",
+    "trigger_json": {
+     "label": "Paladin success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c2287bd7-07f7-4d6e-bf34-ef46b31d8e5c",
+    "trigger_json": {
+     "label": "Paladin fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "26d47a3a-d4cf-49e3-a28c-5828b589b15d",
+    "trigger_json": {
+     "label": "Dire toad success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "513a7fef-7b86-481e-a5f0-14fd273f8ce5",
+    "trigger_json": {
+     "label": "Dire toad",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e29319e9-a4ba-480a-921f-95cfdaa1b7bc",
+    "trigger_json": {
+     "label": "Dire toad fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "03a7830d-e115-4a77-8636-59870ca14259",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The Kraken Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "03dd1463-5464-45b3-b644-71f370ada29b",
+    "trigger_json": {
+     "label": "Naagaan - Ada - Victoria's Secret Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "145404cd-e329-4566-b998-aed636a2f6c6",
+    "trigger_json": {
+     "label": "Naagaan - Bonewalker - Petulent Picaroons Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "15a8d367-417d-4fe4-9438-f3326cb0fae8",
+    "trigger_json": {
+     "label": "Naagaan - Reese - Great Machine Graveyard Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1bcf1f97-8119-4596-b0b1-a82e4ee03f6c",
+    "trigger_json": {
+     "label": "Naagaan - Sahas - Ruins of Kukatan Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4004
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1f9db6ec-882d-4804-8416-4e9686c16ebc",
+    "trigger_json": {
+     "label": "Naagaan - Takumi - The Alachian Sea Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4005
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2955fea2-e598-477d-a121-2171c13240de",
+    "trigger_json": {
+     "label": "Naagaan - Ada - Victoria's Secret Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4006
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "335f305f-b974-459c-97fb-2e06782e8f1e",
+    "trigger_json": {
+     "label": "Naagaan - Takumi - The Alachian Sea Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 307
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "38d57b9a-30ec-428b-8071-031b1019d5dc",
+    "trigger_json": {
+     "label": "Naagaan - Bonewalker - Petulent Picaroons Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4008
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "409b07eb-d8b4-4f2a-ad52-51f85665c44f",
+    "trigger_json": {
+     "label": "Naagaan - Bonewalker - Petulent Picaroons Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4009
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "4b526f6c-7de9-4e0c-ab74-3696d356d410",
+    "trigger_json": {
+     "label": "Naagaan - Myaa - Ruins of Kukatan Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4010
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5f8fa590-e203-479c-ad34-9ad3722bed80",
+    "trigger_json": {
+     "label": "Naagaan - Ada - Victoria's Secret Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 311
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "620913d6-9d42-48ff-8579-65e254e6328e",
+    "trigger_json": {
+     "label": "Naagaan - Kentigern Slate - Mithril River Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4012
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "67f4c95a-7475-4be0-8029-5e1790cd55ca",
+    "trigger_json": {
+     "label": "Naagaan - Takumi - The Alachian Sea Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4013
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6d8840ce-9e84-4daf-89b0-1a77205e0de8",
+    "trigger_json": {
+     "label": "Naagaan - Malzok - Raiders of the Crossed Dark Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4014
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6ef0d06a-6164-49e1-9bec-ef0265cf04b1",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The Kraken Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4015
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "70d4ebde-76a9-4fa0-98ef-54f770056650",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The New Land Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4016
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7edbc06d-d79f-4589-ac68-ac36c3719df3",
+    "trigger_json": {
+     "label": "Naagaan - Kentigern Slate - Mithril River Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4017
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "83c088d1-b8f9-4a17-a3c3-cf6758d411b7",
+    "trigger_json": {
+     "label": "Naagaan - Reese - Great Machine Graveyard Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 318
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "87d962cb-9049-425f-836b-bf51e1c68431",
+    "trigger_json": {
+     "label": "Naagaan - Malzok - Raiders of the Crossed Dark Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4019
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "9389e785-7ed1-483e-b208-81fc6bc6da49",
+    "trigger_json": {
+     "label": "Naagaan - Kentigern Slate - Mithril River Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4020
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "94a8525b-7f11-4947-bd06-af9c331e0cf7",
+    "trigger_json": {
+     "label": "Naagaan - Myaa - Ruins of Kukatan Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 321
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b34f8b41-4a0f-4466-a61d-8285ca40763e",
+    "trigger_json": {
+     "label": "Naagaan - Kentigern Slate - Mithril River Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 322
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b3a421a1-05b1-420a-922d-ccea74b8300c",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The New Land Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4023
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c776ec52-4e6f-445b-9b7b-0dfa4d9dbabf",
+    "trigger_json": {
+     "label": "Naagaan - Ada - Victoria's Secret Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4024
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c8bbfa1c-a7ed-42b2-a5c0-c3919ee63998",
+    "trigger_json": {
+     "label": "Naagaan - Sahas - Ruins of Kukatan Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4025
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "de8fe7ea-6af6-4957-8e58-a3c66888c548",
+    "trigger_json": {
+     "label": "Naagaan - Malzok - Raiders of the Crossed Dark Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 326
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "defc917c-f898-4233-adc1-9463c22c1965",
+    "trigger_json": {
+     "label": "Naagaan - Malzok - Raiders of the Crossed Dark Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4027
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e790d3e5-94b2-4cc7-a867-44d3f552af94",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The Kraken Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4028
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ea504330-42ef-44b0-bb72-ef0570fcb7cc",
+    "trigger_json": {
+     "label": "Naagaan - Takumi - The Alachian Sea Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4029
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "eec2b61e-22b9-4b26-afa0-1dfe723016a9",
+    "trigger_json": {
+     "label": "Naagaan - Renner - The New Land Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 330
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ff1e46ab-ebea-402f-bd21-cff15c97c12f",
+    "trigger_json": {
+     "label": "Naagaan - Bonewalker - Petulent Picaroons Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node027)"
+     ]
+    },
+    "priority": 331
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "231a8718-0831-4569-bd5d-3de846ecde08",
+    "trigger_json": {
+     "label": "Puke troll fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "3ca40b23-c127-493b-bb73-ab34e419d676",
+    "trigger_json": {
+     "label": "Puke troll success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "59e0723a-0aaa-42d0-93a1-424d9f0d9123",
+    "trigger_json": {
+     "label": "Puke troll",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0917ba37-e798-48b5-ab96-0128748f3524",
+    "trigger_json": {
+     "label": "Human mercenary success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "743bda2f-7f05-4598-ae45-ed7f058dfb4c",
+    "trigger_json": {
+     "label": "Human mercenary fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f1bb74f6-820a-4501-b6a2-3ed0d91c8445",
+    "trigger_json": {
+     "label": "Human mercenary",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0b52671f-c966-4489-955a-831d8e2c5506",
+    "trigger_json": {
+     "label": "Bog Walker",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2090dfa4-447c-459b-8845-5efdb70d87d2",
+    "trigger_json": {
+     "label": "Bog Walker success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f0920e5a-2c0c-45d1-a396-f62f63b899cb",
+    "trigger_json": {
+     "label": "Bog Walker fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c78e505e-2abe-4b2f-b5ce-c0de592ce92e",
+    "trigger_json": {
+     "label": "Lionel Flynn - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fa7982b1-2467-47a4-9cb5-4d33f29448f5",
+    "trigger_json": {
+     "label": "Shin'hare - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2f1bc01b-fc42-40af-9752-8171051d6c63",
+    "trigger_json": {
+     "label": "Rune ear hierophant - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "46976fd8-f71a-4bc0-b295-1e485d44b193",
+    "trigger_json": {
+     "label": "Rune ear hierophant success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "783c5b88-77b8-49cf-89ec-7aa232dc5fb8",
+    "trigger_json": {
+     "label": "Rune ear hierophant fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "28d9ff1d-d97b-40e3-a19e-f97c57a3af3d",
+    "trigger_json": {
+     "label": "Doomspore success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "9cfc66c2-6185-42f5-8b57-27ac279cf591",
+    "trigger_json": {
+     "label": "Doomspore - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e4f71803-2ef8-4280-91d5-ea86175ab2e1",
+    "trigger_json": {
+     "label": "Doomspore fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2ed7e3de-c6cf-4dc1-9d0f-ab4323fbc870",
+    "trigger_json": {
+     "label": "Reginald Lancashire in Combat - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "67d51579-eff1-49db-be7e-f4f609167026",
+    "trigger_json": {
+     "label": "Shin'hare boss fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7bfb38f3-b9e7-4983-9346-b62f4fb1d18b",
+    "trigger_json": {
+     "label": "Shin'hare boss - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "dfc41415-c70b-45a6-8ada-bd616d5a51be",
+    "trigger_json": {
+     "label": "Shin'hare boss success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "222ad41d-f412-42ab-b5bc-9a6978b773df",
+    "trigger_json": {
+     "label": "Greenpaw emancipator - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "9a9ebfa7-f2a7-46c1-ba0c-8bd16aadfc58",
+    "trigger_json": {
+     "label": "Greenpaw emancipator success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b412d467-892c-4cc7-9fd2-4c5fcc2269e2",
+    "trigger_json": {
+     "label": "Greenpaw emancipator fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "91f52c9f-112f-4111-bd7f-fa1a3347131f",
+    "trigger_json": {
+     "label": "Totem",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ab7dcf86-9d9d-4bb5-a8bf-c4e186501e22",
+    "trigger_json": {
+     "label": "Totem fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c94d7147-66da-4461-bec0-22e9bb6338ad",
+    "trigger_json": {
+     "label": "Totem success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1f6b2f82-2f0e-4b3b-a04f-a5c199ae8e66",
+    "trigger_json": {
+     "label": "Sister of the Herd",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c8c2aa71-a4f4-4a44-a21f-4afdb6ba76a8",
+    "trigger_json": {
+     "label": "Sister of the Herd fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f74368de-c66e-4cf8-8004-b0002e9e364a",
+    "trigger_json": {
+     "label": "Sister of the Herd success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6a8ea674-f4f3-42f8-806a-61829d207076",
+    "trigger_json": {
+     "label": "Manti fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ef6c17e0-bccd-4774-bac4-03a17961292e",
+    "trigger_json": {
+     "label": "Manti",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f51a9ec5-c578-48c6-8a9e-b427a06c3235",
+    "trigger_json": {
+     "label": "Manti success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "02c21791-ccdb-4419-911c-7752cc04c573",
+    "trigger_json": {
+     "label": "Constantina - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1c8409e7-b98c-43cc-804e-8d4dc99663b7",
+    "trigger_json": {
+     "label": "Constantina - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "db9b812a-3351-42e6-8df2-71f6a5cefabe",
+    "trigger_json": {
+     "label": "Constantina fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e6470e92-2a68-4b01-9807-fb97edf516a4",
+    "trigger_json": {
+     "label": "Constantina success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "12e91059-2b24-4512-bae6-b78b78389bb4",
+    "trigger_json": {
+     "label": "Eurig the Robomancer - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "3b5f9700-1e1d-430c-9827-82ede4efca78",
+    "trigger_json": {
+     "label": "Eurig the Robomancer - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ba5c728b-5e4f-4572-aca9-04ffe286f9ad",
+    "trigger_json": {
+     "label": "Eurig the Robomancer fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "be8253dc-a668-4721-95b0-8d98149fd351",
+    "trigger_json": {
+     "label": "Eurig the Robomancer success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "51b948a2-3de2-463d-9fe5-f70b900ca719",
+    "trigger_json": {
+     "label": "Gallows ghast fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "552b76fa-8667-4541-a85e-ed78cf8ffa0c",
+    "trigger_json": {
+     "label": "Gallows ghast",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d2fff5b2-b2ee-44e0-93ff-4fe15eaf3490",
+    "trigger_json": {
+     "label": "Gallows ghast success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "64636e0b-cf8a-4060-894d-cac7db1d5a86",
+    "trigger_json": {
+     "label": "Gobblers fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "8135b321-4879-4e75-a9fa-bb728036eda7",
+    "trigger_json": {
+     "label": "Gobblers",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a95d5cc7-6c12-41b5-ae0d-7c16e51965ab",
+    "trigger_json": {
+     "label": "Gobblers success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "194fac8a-4bee-443e-9536-a53cd5736596",
+    "trigger_json": {
+     "label": "Mancubus",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "3f3aba44-c694-473d-8bdd-b0097c6618c1",
+    "trigger_json": {
+     "label": "Succubus fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "600abc62-1446-46e6-8869-cb7fdb2c06c6",
+    "trigger_json": {
+     "label": "Mancubus success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7080c3a9-bf11-46cd-9666-899208943d0f",
+    "trigger_json": {
+     "label": "Succubus",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a00b253b-fa2c-45c1-b6de-75fd5b4506b9",
+    "trigger_json": {
+     "label": "Mancubus fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4004
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f10ee348-e3ff-432c-afc0-354ccc5c4051",
+    "trigger_json": {
+     "label": "Succubus success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4005
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "384fc4b0-9fa2-4cc2-b915-f8c80a219591",
+    "trigger_json": {
+     "label": "Obsidian cyclops fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e82a5e10-f275-405a-8245-10bba54451f1",
+    "trigger_json": {
+     "label": "Obsidian cyclops success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fcebc44e-90ea-4ac4-afd8-164613f0c3bd",
+    "trigger_json": {
+     "label": "Obsidian cyclops",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0e5ede26-a690-43ed-bc91-cd40bf8f94b5",
+    "trigger_json": {
+     "label": "Mad Aradam success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "33783a53-f47f-45b9-9427-bb68b3fce752",
+    "trigger_json": {
+     "label": "Mad Aradam",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7eaa1361-f45d-49c9-ab46-cb3e29b66e43",
+    "trigger_json": {
+     "label": "Mad Aradam fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a050e552-0c8b-434d-81ed-257d427de180",
+    "trigger_json": {
+     "label": "Savvas success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d5037b83-ae6f-4712-9c1b-84cc9d81de82",
+    "trigger_json": {
+     "label": "Savvas",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ec50030a-b144-4d08-8490-cfda6e71c970",
+    "trigger_json": {
+     "label": "Savvas fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "818c8112-45e4-40c8-8017-bfd77b056c50",
+    "trigger_json": {
+     "label": "Bogberg success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "9b347372-7c07-4647-80ee-54e449f8ede2",
+    "trigger_json": {
+     "label": "Bogberg fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f26043a1-9446-4229-b2d5-40b7992caa31",
+    "trigger_json": {
+     "label": "Bogberg",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0633d83b-6271-4a89-9948-e22dbaeb2858",
+    "trigger_json": {
+     "label": "Fungal monstrosity fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "71bc25f5-8d9d-406f-9d0e-24c66ecfa585",
+    "trigger_json": {
+     "label": "Fungal monstrosity - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "aac5fc5a-36cd-4b8b-bdb1-e98746745f0d",
+    "trigger_json": {
+     "label": "Fungal monstrosity success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7bfe5eea-ea49-4ba4-ace7-594407cbabd9",
+    "trigger_json": {
+     "label": "Fungal monstrosity fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7f81c7d7-56f4-406e-b9f9-aa37ec5b43aa",
+    "trigger_json": {
+     "label": "Fungal monstrosity - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c1c79d4a-ab2c-4b75-93f2-ff77e69718bd",
+    "trigger_json": {
+     "label": "Fungal monstrosity success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1da3a9cd-a47d-4070-97b6-366916423709",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Quest End - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "40d0105d-80c5-4789-b689-1ee0a4c2e2f4",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Quest End - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a9d29859-63fa-4031-adaa-1f5c0f8f2811",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Underworld - repeating until dungeon complete",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node057B)",
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 302
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0e71a0bd-5522-4482-b16a-ba89a7e8ec27",
+    "trigger_json": {
+     "label": "Cloud Queen",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "8bddefb0-44fe-4616-a955-840110cf9644",
+    "trigger_json": {
+     "label": "Cloud Queen Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "dae177d3-cb23-4573-8e52-0dd6d015631c",
+    "trigger_json": {
+     "label": "Cloud Queen Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "361b5cd9-996e-42d6-8621-4d0976a9142d",
+    "trigger_json": {
+     "label": "Pre-Charybdis",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c5bdc662-f0f0-49ae-b4cb-2af344b1a124",
+    "trigger_json": {
+     "label": "Charybdis Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d11bab51-f93e-41ad-be3a-118ec61ca250",
+    "trigger_json": {
+     "label": "Charybdis Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d3fb404b-5f31-4f42-948e-1cf77103cd31",
+    "trigger_json": {
+     "label": "Charybdis",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "32b84f1b-85cf-48ee-bfca-83640a5f9816",
+    "trigger_json": {
+     "label": "Storm of the Century",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f8ae449c-a971-477c-8d7a-c6146d948feb",
+    "trigger_json": {
+     "label": "Storm of the Century Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fccd5b36-d486-493a-aa28-8497a4a98d04",
+    "trigger_json": {
+     "label": "Storm of the Century Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "1777005d-afff-4855-a63f-7e823d4b78e8",
+    "trigger_json": {
+     "label": "Kraken guard success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "475f48ff-b81b-440a-8979-97f224f0da1c",
+    "trigger_json": {
+     "label": "Kraken guard",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e315daea-254e-4b46-b85b-792b85fb1a2e",
+    "trigger_json": {
+     "label": "Kraken guard fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "86962e38-9b33-41a5-be8c-516b298e45de",
+    "trigger_json": {
+     "label": "Chumspike Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a0b833ac-7def-489f-9f17-b0edaad2368f",
+    "trigger_json": {
+     "label": "Chumspike",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e6aa7041-73b0-4717-89bc-d7302f541274",
+    "trigger_json": {
+     "label": "Chumspike Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5e9147c3-409b-48eb-8588-6d1bc0246ee5",
+    "trigger_json": {
+     "label": "Hardshell Overseer Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7aa21ddb-3310-4a30-9265-c9b621667f31",
+    "trigger_json": {
+     "label": "Hardshell Overseer",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "8ae7c775-8f9d-4ca9-b2f1-5678356ad362",
+    "trigger_json": {
+     "label": "Hardshell Overseer Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2442ac87-f47b-44ea-9c18-7cf4dd585825",
+    "trigger_json": {
+     "label": "Bloodhorn",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2aace1ff-4ea1-434b-add3-93bbffbdf350",
+    "trigger_json": {
+     "label": "Bloodhorn Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f3b65a9d-a2ba-41b3-b774-9ef36122b404",
+    "trigger_json": {
+     "label": "Bloodhorn Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "24e3dd65-5186-4f07-b569-a45e8719c397",
+    "trigger_json": {
+     "label": "Hexlantis Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "95e5f0a8-a226-4e45-8e74-6caf7b9486ab",
+    "trigger_json": {
+     "label": "Hexlantis",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "cb48fe8c-898f-4861-80cf-a0ae9a05704f",
+    "trigger_json": {
+     "label": "Hexlantis Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2cc8626a-7191-402d-b3c7-90df15403336",
+    "trigger_json": {
+     "label": "Hardshell Deepwalker Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "942fbe17-df77-4679-888b-735f8c35df42",
+    "trigger_json": {
+     "label": "Hardshell Deepwalker Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e0c5dd8b-46ae-4f5a-af27-3bdd8c43d232",
+    "trigger_json": {
+     "label": "Hardshell Deepwalker",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "129ae29c-baaa-4726-bbdc-5436c6d990e6",
+    "trigger_json": {
+     "label": "Pre-Scylla",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "32552930-b651-46f5-bd61-074a4045b420",
+    "trigger_json": {
+     "label": "Scylla Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "73728b1a-3494-4f45-a864-291a3e747970",
+    "trigger_json": {
+     "label": "Scylla",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ba8638db-48d6-4e41-8e1f-7a20d9db6c9c",
+    "trigger_json": {
+     "label": "Scylla Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "794ccfac-b720-45de-ae1a-ef33018cef2b",
+    "trigger_json": {
+     "label": "Hired Horn Scum Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ab34c430-2c5d-428e-bfdc-34bedffa41ae",
+    "trigger_json": {
+     "label": "Hired Horn Scum",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "dcdeb399-25b5-4fd7-964c-dce909c9695e",
+    "trigger_json": {
+     "label": "Hired Horn Scum Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "79c17f93-f88d-4f95-98b8-6abb84e7ec47",
+    "trigger_json": {
+     "label": "Cloud King Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "97d17290-b36d-40d0-8c50-ec5327e3c797",
+    "trigger_json": {
+     "label": "Cloud King",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b9fe7653-1fdd-452f-b58a-97bae9573135",
+    "trigger_json": {
+     "label": "Cloud King Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2dbed410-5abc-4248-8644-d6f8a46190fe",
+    "trigger_json": {
+     "label": "Hardshell Saltmage",
+     "source": "conversation_name"
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5c6ea7ae-d643-4bc9-92b0-152361f1c371",
+    "trigger_json": {
+     "label": "Hardshell Saltmage Fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "a226e4ed-6d5c-4160-94eb-2ec2d92f5241",
+    "trigger_json": {
+     "label": "Hardshell Saltmage Success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "401fc0d2-99c5-457a-886b-d95980f7d0e9",
+    "trigger_json": {
+     "label": "Lightning Armada success",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "be10a38b-0357-44cf-8c8d-7c0fb20fa280",
+    "trigger_json": {
+     "label": "Lightning Armada",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "eb3f8279-03a7-40f5-9819-e52277e79f1a",
+    "trigger_json": {
+     "label": "Lightning Armada fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "31f51580-b950-4dd8-b617-cc3a1505bb49",
+    "trigger_json": {
+     "label": "Chumspike - Player successfully escaped - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "38fce953-c726-455f-9155-1d7d0c2fc8e7",
+    "trigger_json": {
+     "label": "Chumspike - Player wins battle - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "53ba3352-fde4-49d8-ba5a-531440e587fe",
+    "trigger_json": {
+     "label": "First Chumspike attack",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "819b9397-1fa4-44c2-8f25-2ee57be2f753",
+    "trigger_json": {
+     "label": "Chumspike - Player wins battle - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "bf12fc1e-2936-4165-8510-537f13d106ba",
+    "trigger_json": {
+     "label": "First Chumspike attack fail",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail"
+     ]
+    },
+    "priority": 4004
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c572895a-ac12-46f1-9721-b470ff4aa36a",
+    "trigger_json": {
+     "label": "Chumspike - Player successfully escaped - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4005
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d32f2362-ea15-4186-9547-d8b94eec316e",
+    "trigger_json": {
+     "label": "Chumspike - Escape Narration",
+     "source": "conversation_name"
+    },
+    "priority": 4006
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fa2b5a71-4814-4bbd-96ce-8620df78354a",
+    "trigger_json": {
+     "label": "Chumspike - Game Start Narration",
+     "source": "conversation_name"
+    },
+    "priority": 4007
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "075d2dfe-85a4-4145-b72e-df96e0011539",
+    "trigger_json": {
+     "label": "Wakuna - Daughter of Stars - Mithril River Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      [
+       "!talkedAt(Node007)"
+      ],
+      [
+       "talkedAt(Node007)"
+      ]
+     ]
+    },
+    "priority": 300
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0982019f-0cc9-4ad0-ba15-23c2b6a243a5",
+    "trigger_json": {
+     "label": "Wakuna - Belarius - The Alachian Sea Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0b5f2fcf-a64a-492a-9017-9f573a94a017",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The Kraken Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0e5d22ef-c7c6-4858-bf0c-4ae42990044c",
+    "trigger_json": {
+     "label": "Wakuna - Marshal Josephina - Midnight Special Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "15869f17-930d-47e6-9760-fa2c49a60823",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The New Land Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4004
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2f887641-2b8f-4c57-a65d-5685379000b3",
+    "trigger_json": {
+     "label": "Wakuna - Daughter of Stars - Mithril River Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4005
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "2ffb0467-f65d-491f-bb36-dd78590d00f1",
+    "trigger_json": {
+     "label": "Wakuna - Marshal Josephina - Midnight Special Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4006
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "331857c7-e0bd-49d5-ac49-76901c76d086",
+    "trigger_json": {
+     "label": "Wakuna - Marshal Josephina - Midnight Special Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 307
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "4b534cce-dcaf-48e7-b82b-c3f79ba5cf38",
+    "trigger_json": {
+     "label": "Wakuna - Two Tomahawks - Raiders of the Crossed Dark Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4008
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "4d231a77-06fa-4f96-839f-dbce6a1e0f4b",
+    "trigger_json": {
+     "label": "Wakuna - Daughter of Stars - Mithril River Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4009
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5caf1e87-7a0c-404d-abf5-65023dbca93c",
+    "trigger_json": {
+     "label": "Wakuna - Belarius - The Alachian Sea Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 310
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6e4be89c-ce8d-4fa8-abe3-169ed8c02597",
+    "trigger_json": {
+     "label": "Wakuna - Tezozo - Great Machine Graveyard Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4011
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "711f1ab3-cf9b-4974-9cad-8b576b249dfc",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The New Land Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 312
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "7a589175-d745-48a0-b216-e42f95a3df66",
+    "trigger_json": {
+     "label": "Wakuna - Cressida - Ruins of Kukatan Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4013
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "8b36743c-c5a4-47e8-b8c9-f9acfb19bc62",
+    "trigger_json": {
+     "label": "Wakuna - Belarius - The Alachian Sea Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4014
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "8dcfd88c-0ac3-4625-9bd3-2380f66d7b3c",
+    "trigger_json": {
+     "label": "Wakuna - Tezozo - Great Machine Graveyard Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 315
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "92cbea00-5c8c-4357-b29a-4e5c1e4d1bf3",
+    "trigger_json": {
+     "label": "Wakuna - Belarius - The Alachian Sea Quest Not Complete",
+     "source": "conversation_name"
+    },
+    "priority": 4016
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "95023972-37c3-41ff-b24b-7933c6c8414a",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The New Land Not Complete",
+     "source": "conversation_name"
+    },
+    "priority": 4017
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "99cd96d7-44ce-4ffa-8a8f-5280ee982e88",
+    "trigger_json": {
+     "label": "Wakuna - Totem - Petulant Picaroons Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4018
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "9e503d56-59ab-4e4f-a7d6-2b9d876e57f5",
+    "trigger_json": {
+     "label": "Wakuna - Daughter of Stars - Mithril River Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4019
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "b38f6a6f-a9f4-4fb4-adf6-01bab72a3994",
+    "trigger_json": {
+     "label": "Wakuna - Totem - Petulant Picaroons Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 320
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ba9f4544-1744-4bfe-a778-e7c0ce9c074c",
+    "trigger_json": {
+     "label": "Wakuna - Cressida - Ruins of Kukatan Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4021
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "c34dc8c1-c29d-4a11-b60e-f0680f6d861b",
+    "trigger_json": {
+     "label": "Wakuna - Two Tomahawks - Raiders of the Crossed Dark Completed Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 322
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d3ffb745-8c72-4737-b523-ae83e757af2d",
+    "trigger_json": {
+     "label": "Wakuna - Myaa - Ruins of Kukatan Complete Repeating",
+     "source": "conversation_name",
+     "tags": [
+      "talkedAt(Node007)"
+     ]
+    },
+    "priority": 323
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d425b537-d149-486f-8aca-0ba8b795b2dc",
+    "trigger_json": {
+     "label": "Wakuna - Totem - Petulant Picaroons Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4024
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d5ea1127-adfd-4606-8e89-a7acd51cb87b",
+    "trigger_json": {
+     "label": "Wakuna - Two Tomahawks - Raiders of the Crossed Dark Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4025
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e14f4d29-c7f1-4cfa-8592-2ebdb64d9845",
+    "trigger_json": {
+     "label": "Wakuna - Totem - Petulant Picaroons Not Complete",
+     "source": "conversation_name"
+    },
+    "priority": 4026
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "e662ca3f-4a16-4f53-b7ab-851eac5becbf",
+    "trigger_json": {
+     "label": "Wakuna - Myaa - Ruins of Kukatan Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4027
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "eac559a6-f483-45e2-b47e-20e50e043de7",
+    "trigger_json": {
+     "label": "Wakuna - Two Tomahawks - Raiders of the Crossed Dark Quest End",
+     "source": "conversation_name"
+    },
+    "priority": 4028
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "ef24028e-e2fb-43a8-a99a-83c8aa633f99",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The Kraken Quest Start",
+     "source": "conversation_name"
+    },
+    "priority": 4029
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f8fc8b11-2948-40c4-ae6d-95283110172c",
+    "trigger_json": {
+     "label": "Wakuna - Marshal Josephina - Midnight Special Not Completed",
+     "source": "conversation_name"
+    },
+    "priority": 4030
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "fd89b372-6111-4520-998f-2d1e62641ff7",
+    "trigger_json": {
+     "label": "Wakuna - Blue Sparrow - The Kraken Quest Not Complete",
+     "source": "conversation_name"
+    },
+    "priority": 4031
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "111e0ae6-b1e2-4535-bce8-7e528cf9b177",
+    "trigger_json": {
+     "label": "Ayotochi Refugee fail - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail",
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4000
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "4bff993c-cd26-4bc2-95db-b23297a2c5a4",
+    "trigger_json": {
+     "label": "Ayotochi Refugee success - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4001
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "5e3a0339-bcca-49f4-a088-b88e47d19a3e",
+    "trigger_json": {
+     "label": "Ayotochi Refugee - Ardent",
+     "source": "conversation_name"
+    },
+    "priority": 4002
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "6c9064e5-99dd-45db-98e7-5d9461698bb9",
+    "trigger_json": {
+     "label": "Ayotochi Refugee success - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:success",
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4003
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "71e15f3a-8c0f-4d53-a4b9-7a091d875d0a",
+    "trigger_json": {
+     "label": "Ayotochi Refugee fail - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "outcome:fail",
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 4004
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "f42b17ff-a754-4ff0-9a87-7bdf317ef98f",
+    "trigger_json": {
+     "label": "Ayotochi Refugee - Underworld",
+     "source": "conversation_name"
+    },
+    "priority": 4005
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "0d8438b1-089a-4d24-9917-062242f79a3b",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Ardent - repeating until dungeon complete",
+     "source": "conversation_name",
+     "tags": [
+      [
+       "faction(Ardent)",
+       "!talkedAt(Node057A)"
+      ],
+      [
+       "faction(Ardent)",
+       "talkedAt(Node057A)"
+      ]
+     ]
+    },
+    "priority": 300
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "3db1259e-91e1-483b-9ce1-924838cee4b4",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Quest Start - Underworld",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Underworld)"
+     ]
+    },
+    "priority": 3901
+   },
+   {
+    "campaign_template": "AZ2",
+    "conversation_guid": "d396ab8e-c6ff-49e5-8b8e-05c18a556007",
+    "trigger_json": {
+     "label": "Brutecrown Delta - Quest Start - Ardent",
+     "source": "conversation_name",
+     "tags": [
+      "faction(Ardent)"
+     ]
+    },
+    "priority": 4002
+   }
+  ],
+  "quest_conversations": [
+   {
+    "quest_script": "q_alachian_sea",
+    "conversation_guid": "0982019f-0cc9-4ad0-ba15-23c2b6a243a5",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Ardent",
+     "tags": [
+      "!questStarted(q_alachian_sea)",
+      "faction(Ardent)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Belarius",
+    "role": "start",
+    "faction": "Ardent",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Belarius - The Alachian Sea Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_alachian_sea",
+    "conversation_guid": "1f9db6ec-882d-4804-8416-4e9686c16ebc",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Underworld",
+     "tags": [
+      "questActive(q_alachian_sea)",
+      "completedQuest(q_alachian_sea,4)",
+      "faction(Underworld)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Takumi",
+    "role": "complete",
+    "faction": "Underworld",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Takumi - The Alachian Sea Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_alachian_sea",
+    "conversation_guid": "67f4c95a-7475-4be0-8029-5e1790cd55ca",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Underworld",
+     "tags": [
+      "!questStarted(q_alachian_sea)",
+      "faction(Underworld)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Takumi",
+    "role": "start",
+    "faction": "Underworld",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Takumi - The Alachian Sea Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_alachian_sea",
+    "conversation_guid": "8b36743c-c5a4-47e8-b8c9-f9acfb19bc62",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Ardent",
+     "tags": [
+      "questActive(q_alachian_sea)",
+      "completedQuest(q_alachian_sea,4)",
+      "faction(Ardent)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Belarius",
+    "role": "complete",
+    "faction": "Ardent",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Belarius - The Alachian Sea Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_alachian_sea",
+    "conversation_guid": "92cbea00-5c8c-4357-b29a-4e5c1e4d1bf3",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Ardent",
+     "tags": [
+      "questActive(q_alachian_sea)",
+      "faction(Ardent)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Belarius",
+    "role": "not_complete",
+    "faction": "Ardent",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Belarius - The Alachian Sea Quest Not Complete",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ar_midnight_special",
+    "conversation_guid": "0e5d22ef-c7c6-4858-bf0c-4ae42990044c",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_ar_midnight_special)",
+      "completedQuest(q_ar_midnight_special,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Marshal Josephina",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Marshal Josephina - Midnight Special Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ar_midnight_special",
+    "conversation_guid": "2ffb0467-f65d-491f-bb36-dd78590d00f1",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_ar_midnight_special)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Marshal Josephina",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Marshal Josephina - Midnight Special Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_great_machine_graveyard",
+    "conversation_guid": "15a8d367-417d-4fe4-9438-f3326cb0fae8",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_great_machine_graveyard)",
+      "completedQuest(q_great_machine_graveyard,5)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Reese",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Reese - Great Machine Graveyard Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_great_machine_graveyard",
+    "conversation_guid": "6e4be89c-ce8d-4fa8-abe3-169ed8c02597",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_great_machine_graveyard)",
+      "completedQuest(q_great_machine_graveyard,5)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Tezozo",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Tezozo - Great Machine Graveyard Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_kraken",
+    "conversation_guid": "03a7830d-e115-4a77-8636-59870ca14259",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_kraken)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Renner",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Renner - The Kraken Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_kraken",
+    "conversation_guid": "0b5f2fcf-a64a-492a-9017-9f573a94a017",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_kraken)",
+      "completedQuest(q_kraken,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Blue Sparrow",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Blue Sparrow - The Kraken Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_kraken",
+    "conversation_guid": "6ef0d06a-6164-49e1-9bec-ef0265cf04b1",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_kraken)",
+      "completedQuest(q_kraken,1)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Renner",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Renner - The Kraken Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_kraken",
+    "conversation_guid": "ef24028e-e2fb-43a8-a99a-83c8aa633f99",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_kraken)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Blue Sparrow",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Blue Sparrow - The Kraken Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_kraken",
+    "conversation_guid": "fd89b372-6111-4520-998f-2d1e62641ff7",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_kraken)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Blue Sparrow",
+    "role": "not_complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Blue Sparrow - The Kraken Quest Not Complete",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_petulent_picaroons",
+    "conversation_guid": "99cd96d7-44ce-4ffa-8a8f-5280ee982e88",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_petulent_picaroons)",
+      "completedQuest(q_petulent_picaroons,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Totem",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Totem - Petulant Picaroons Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_petulent_picaroons",
+    "conversation_guid": "d425b537-d149-486f-8aca-0ba8b795b2dc",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_petulent_picaroons)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Totem",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Totem - Petulant Picaroons Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_redhand_raiders",
+    "conversation_guid": "6d8840ce-9e84-4daf-89b0-1a77205e0de8",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_redhand_raiders)",
+      "completedQuest(q_redhand_raiders,1)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Malzok",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Malzok - Raiders of the Crossed Dark Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_redhand_raiders",
+    "conversation_guid": "87d962cb-9049-425f-836b-bf51e1c68431",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_redhand_raiders)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Malzok",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Malzok - Raiders of the Crossed Dark Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_redhand_raiders",
+    "conversation_guid": "d5ea1127-adfd-4606-8e89-a7acd51cb87b",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_redhand_raiders)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Two Tomahawks",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Two Tomahawks - Raiders of the Crossed Dark Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_redhand_raiders",
+    "conversation_guid": "eac559a6-f483-45e2-b47e-20e50e043de7",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_redhand_raiders)",
+      "completedQuest(q_redhand_raiders,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Two Tomahawks",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Two Tomahawks - Raiders of the Crossed Dark Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ruins_of_kukatan",
+    "conversation_guid": "1bcf1f97-8119-4596-b0b1-a82e4ee03f6c",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_ruins_of_kukatan)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Sahas",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Sahas - Ruins of Kukatan Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ruins_of_kukatan",
+    "conversation_guid": "4b526f6c-7de9-4e0c-ab74-3696d356d410",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_ruins_of_kukatan)",
+      "completedQuest(q_ruins_of_kukatan,1)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Myaa",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Myaa - Ruins of Kukatan Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ruins_of_kukatan",
+    "conversation_guid": "ba9f4544-1744-4bfe-a778-e7c0ce9c074c",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_ruins_of_kukatan)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Cressida",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Cressida - Ruins of Kukatan Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_ruins_of_kukatan",
+    "conversation_guid": "e662ca3f-4a16-4f53-b7ab-851eac5becbf",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_ruins_of_kukatan)",
+      "completedQuest(q_ruins_of_kukatan,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Myaa",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Myaa - Ruins of Kukatan Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_new_land",
+    "conversation_guid": "15869f17-930d-47e6-9760-fa2c49a60823",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_the_new_land)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Blue Sparrow",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Blue Sparrow - The New Land Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_new_land",
+    "conversation_guid": "b3a421a1-05b1-420a-922d-ccea74b8300c",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_the_new_land)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Renner",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Renner - The New Land Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_uw_victorias_secret",
+    "conversation_guid": "03dd1463-5464-45b3-b644-71f370ada29b",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_uw_victorias_secret)",
+      "completedQuest(q_uw_victorias_secret,1)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Ada the Apparitionist",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Ada - Victoria's Secret Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_uw_victorias_secret",
+    "conversation_guid": "c776ec52-4e6f-445b-9b7b-0dfa4d9dbabf",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_uw_victorias_secret)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Ada the Apparitionist",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Ada - Victoria's Secret Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_brutecrown_bluff",
+    "conversation_guid": "1da3a9cd-a47d-4070-97b6-366916423709",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Ardent",
+     "tags": [
+      "questActive(q_brutecrown_bluff)",
+      "completedQuest(q_brutecrown_bluff,1)",
+      "faction(Ardent)"
+     ]
+    },
+    "node_id": "Node057B",
+    "npc": "Belarius",
+    "role": "complete",
+    "faction": "Ardent",
+    "conversation_name": "AZ2 - Node 57B - Brutecrown Delta - Quest End - Ardent",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_brutecrown_bluff",
+    "conversation_guid": "3db1259e-91e1-483b-9ce1-924838cee4b4",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Underworld",
+     "tags": [
+      "!questStarted(q_brutecrown_bluff)",
+      "faction(Underworld)"
+     ]
+    },
+    "node_id": "Node057A",
+    "npc": "Takumi",
+    "role": "start",
+    "faction": "Underworld",
+    "conversation_name": "AZ2 - Node 57A - Brutecrown Delta - Quest Start - Underworld",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_brutecrown_bluff",
+    "conversation_guid": "40d0105d-80c5-4789-b689-1ee0a4c2e2f4",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Underworld",
+     "tags": [
+      "questActive(q_brutecrown_bluff)",
+      "completedQuest(q_brutecrown_bluff,1)",
+      "faction(Underworld)"
+     ]
+    },
+    "node_id": "Node057B",
+    "npc": "Takumi",
+    "role": "complete",
+    "faction": "Underworld",
+    "conversation_name": "AZ2 - Node 57B - Brutecrown Delta - Quest End - Underworld",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_brutecrown_bluff",
+    "conversation_guid": "d396ab8e-c6ff-49e5-8b8e-05c18a556007",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "faction": "Ardent",
+     "tags": [
+      "!questStarted(q_brutecrown_bluff)",
+      "faction(Ardent)"
+     ]
+    },
+    "node_id": "Node057A",
+    "npc": "Belarius",
+    "role": "start",
+    "faction": "Ardent",
+    "conversation_name": "AZ2 - Node 57A - Brutecrown Delta - Quest Start - Ardent",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_mithral_river",
+    "conversation_guid": "4d231a77-06fa-4f96-839f-dbce6a1e0f4b",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_the_mithral_river)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Daughter of Stars",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Daughter of Stars - Mithril River Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_mithral_river",
+    "conversation_guid": "620913d6-9d42-48ff-8579-65e254e6328e",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_the_mithral_river)",
+      "completedQuest(q_the_mithral_river,1)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Kentigern Slate",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Kentigern Slate - Mithril River Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_mithral_river",
+    "conversation_guid": "7edbc06d-d79f-4589-ac68-ac36c3719df3",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "!questStarted(q_the_mithral_river)"
+     ]
+    },
+    "node_id": "Node027",
+    "npc": "Kentigern Slate",
+    "role": "start",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 27 - Naagaan - Kentigern Slate - Mithril River Quest Start",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   },
+   {
+    "quest_script": "q_the_mithral_river",
+    "conversation_guid": "9e503d56-59ab-4e4f-a7d6-2b9d876e57f5",
+    "campaign_template": "AZ2",
+    "conditions_json": {
+     "tags": [
+      "questActive(q_the_mithral_river)",
+      "completedQuest(q_the_mithral_river,1)"
+     ]
+    },
+    "node_id": "Node007",
+    "npc": "Daughter of Stars",
+    "role": "complete",
+    "faction": "",
+    "conversation_name": "AZ2 - Node 7 - Wakuna - Daughter of Stars - Mithril River Quest End",
+    "start_hook": "",
+    "priority": 0,
+    "enabled": true
+   }
+  ]
+ }
+}

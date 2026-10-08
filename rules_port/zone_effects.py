@@ -131,15 +131,16 @@ def lifebound(context, owner_id):
         "SELECT card_uid FROM game_cards WHERE session_id=? AND user_id=? "
         "AND location='discard'", (session_id, owner)).fetchall()
     moved = []
-    from .static_rules import opposing_enters_play_exhausted
+    from .static_rules import card_enters_play_exhausted
     for (uid,) in discard:
         uid = int(uid)
         if not has_lifebound(context.db, session_id, uid):
             continue
         entering_state = int(game_engine.ECardStates.CameOutThisTurn)
         details = db_card_zone_details(session_id, uid, conn=context.db)
-        if details and opposing_enters_play_exhausted(
-                context.bstate, owner, details[0]):
+        if details and card_enters_play_exhausted(
+                context.db, session_id, context.bstate, uid, owner,
+                details[0]):
             entering_state |= int(game_engine.ECardStates.Tapped)
         db_move_card_for_effect(
             session_id, uid, "warzone", 0, entering_state, clear_dead=True,

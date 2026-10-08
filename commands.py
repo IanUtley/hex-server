@@ -39,6 +39,7 @@ def reload_runtime_modules():
     import pvp_db as pvp_db_module
     import profile_db as profile_db_module
     import pve_db as pve_db_module
+    import campaign_rules as campaign_rules_module
     import chat_db as chat_db_module
     import replay_db as replay_db_module
     import tournament_db as tournament_db_module
@@ -55,7 +56,7 @@ def reload_runtime_modules():
     groups = [
         [dbm],
         [pvp_db_module, profile_db_module, pve_db_module, chat_db_module,
-         replay_db_module, tournament_db_module],
+         replay_db_module, tournament_db_module, campaign_rules_module],
         [game_engine_module, game_session_module, battle_engine_module,
          application_dispatcher, player_transactions, play_plan, campaign],
         [rules_transactions, rules_runtime, rules_wire],
@@ -671,6 +672,33 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
             return _campaign_cleanup_command(handler, parts[1:])
         except Exception as exc:
             return f"Error: {exc}"
+    if action == "campaign-restart":
+        # Destructive: wipes this champion's campaign progress, so require
+        # an explicit "confirm".
+        if "confirm" not in [a.lower() for a in parts[1:]]:
+            return ("This deletes ALL campaign progress for your newest "
+                    "champion and restarts at the AZ0 starter. "
+                    "Run !campaign-restart confirm to proceed.")
+        from profile_db import db_latest_champion_for_user
+        db = hconnect_server._db
+        champ = db_latest_champion_for_user(
+            handler.user_profile["id"], conn=db)
+        if not champ:
+            return "No champion found — create one first"
+        import campaign
+        deleted, cid = campaign.restart_champion_campaigns(db, champ[0])
+        return (f"Deleted {deleted} campaign(s) for champion {champ[0]}; "
+                f"new starter campaign {cid}. Re-select the champion to reload.")
+    if action == "campaign_rules":
+        import campaign_shadow
+        sub = (parts[1].lower() if len(parts) > 1 else "status")
+        if sub in ("on", "off"):
+            campaign_shadow.set_enabled(sub == "on")
+        elif sub == "reset":
+            campaign_shadow.reset()
+        elif sub not in ("status", "diff"):
+            return "Usage: !campaign_rules [on|off|status|diff|reset]"
+        return campaign_shadow.report_text()
     if action == "issue":
         raw_command = cmd.strip()
         title = raw_command[len(parts[0]):].strip() if parts else ""

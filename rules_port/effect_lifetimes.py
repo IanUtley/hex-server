@@ -25,10 +25,22 @@ def mapping_duration(context) -> str:
     """Return the duration on the active AbilityEffectTargetMapping."""
     ability = getattr(context, "ability", None)
     metadata = getattr(ability, "metadata", ability)
-    for effect in getattr(metadata, "effects", ()) or ():
-        guid = str(getattr(effect, "guid", "") or "").lower()
-        if guid == str(getattr(context, "effect_guid", "") or "").lower():
-            return str(getattr(effect, "duration", "Instant") or "Instant")
+    wanted = str(getattr(context, "effect_guid", "") or "").lower()
+    graph = getattr(metadata, "graph", None)
+    # Native AbilityInstances carry the typed graph plus flat effect rows
+    # (``effect_guid``/``effect_duration`` dicts).  Reading only attribute
+    # names on the rows made every native grant "Instant", so "this turn"
+    # granted abilities (Raven Talon) never expired.
+    for effect in (tuple(getattr(graph, "effects", ()) or ()) +
+                   tuple(getattr(metadata, "effects", ()) or ())):
+        if isinstance(effect, dict):
+            guid = effect.get("effect_guid", effect.get("guid"))
+            duration = effect.get("effect_duration", effect.get("duration"))
+        else:
+            guid = getattr(effect, "guid", "")
+            duration = getattr(effect, "duration", None)
+        if wanted and str(guid or "").lower() == wanted:
+            return str(duration or "Instant")
     return "Instant"
 
 
@@ -328,14 +340,20 @@ def expire_temporary_intattrs(db, session_id, state, *, boundary=None,
 
 
 def record_temporary_stat(state, uid, attack, defense, *, duration,
-                          owner_id=0, source_uid=None):
-    """Record a reversible duration-bound stat grant.
+                          owner_id=0, source_uid=None, cost=0,
+                          location=None):
+    """Record a reversible duration-bound stat or cost grant.
 
     Used by the game-rules triggers whose built-in effects are stat modifiers
-    rather than IntAttrs (Momentum's +1/+1 until the owner's next turn).
+    rather than IntAttrs (Momentum's +1/+1 until the owner's next turn), and
+    by CardModifier stat/cost leaves with an "until your next turn" duration
+    (Fiona Honeyfinch, Thk'tatcha).  ``cost`` is the additive ``card_cost_mod``
+    delta that was applied.
     """
     item = {"uid": int(uid), "attack": int(attack or 0),
-            "defense": int(defense or 0), "duration": str(duration),
+            "defense": int(defense or 0), "cost": int(cost or 0),
+            "location": (str(location).lower() if location else None),
+            "duration": str(duration),
             "owner_id": int(owner_id or 0),
             "turn_number": int(state.get("turn_number", 1) or 1),
             "source_uid": (int(source_uid)
@@ -349,6 +367,8 @@ def _stat_expired(item, *, boundary=None, boundary_owner=None):
     owner = int(item.get("owner_id", 0) or 0)
     boundary_owner = int(boundary_owner or 0)
     if boundary == "start_turn" and duration == "BeginningOfOwnersTurn":
+        return owner == boundary_owner
+    if boundary == "prep" and duration == "AfterCardsReadyOnPlayersTurn":
         return owner == boundary_owner
     if boundary == "end_turn" and duration == "EndOfTurn":
         return owner == boundary_owner
@@ -384,6 +404,18 @@ def expire_temporary_stats(db, session_id, state, *, boundary=None,
             continue
         attack = int(item.get("attack", 0) or 0)
         defense = int(item.get("defense", 0) or 0)
+        cost = int(item.get("cost", 0) or 0)
+        if cost:
+            # Only undo the delta while the card is still where it was
+            # applied; a revert or zone change has already reset it.
+            from pvp_db import db_add_card_cost_modifier, db_card_location
+            applied_in = str(item.get("location") or "").lower()
+            now_in = str(db_card_location(session_id, uid, conn=db) or "")
+            if not applied_in or now_in.lower() == applied_in:
+                db_add_card_cost_modifier(session_id, uid, -cost, conn=db)
+        if not attack and not defense:
+            changed.append(uid)
+            continue
         new_atk = int(buffs.get("atk", 0) or 0) - attack
         new_def = int(buffs.get("def", 0) or 0) - defense
         if new_atk:

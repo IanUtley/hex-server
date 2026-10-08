@@ -86,6 +86,43 @@ def _run_defense(db, attacker_attack, attacker_defense, blocker_stats,
     return bstate.get("ai_blockers") or {}
 
 
+def _run_defense_multi(db, attackers, blocker_stats, ai_health):
+    """attackers/blocker_stats are lists of (attack, defense); uids 100+/200+."""
+    for index, (attack, defense) in enumerate(attackers):
+        _add_card(db, 100 + index, 5, _template_with_stats(db, attack, defense))
+    for index, (attack, defense) in enumerate(blocker_stats, start=1):
+        _add_card(db, 200 + index, 0, _template_with_stats(db, attack, defense))
+    db.commit()
+    session = SessionStub()
+    session.session_id = 1
+    handler = HandlerStub(db)
+    game = game_engine.Game(
+        1, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000))
+    bstate = {"player_attackers": {str(100 + i): "0" for i in range(len(attackers))},
+              "ai_health": ai_health}
+    old_db = ai._db
+    ai._db = db
+    try:
+        ai.ai_pass_declare_defense(
+            handler, session, game.player_uid, game.ai_uid, bstate, game)
+    finally:
+        ai._db = old_db
+    return bstate.get("ai_blockers") or {}
+
+
+def test_chump_blocks_stop_once_the_attack_is_no_longer_lethal():
+    """8 life vs 5/3/2 (10 damage): blocking the 5 alone is enough, so only
+    that attacker is chumped -- the 3 and the 2 are taken on the face."""
+    db, path = _database_copy()
+    try:
+        blocks = _run_defense_multi(
+            db, [(5, 5), (3, 3), (2, 2)], [(0, 1), (0, 1), (0, 1)], ai_health=8)
+        assert list(blocks) == ["100"] and len(blocks["100"]) == 1, blocks
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 def test_incomplete_dogpile_is_not_committed():
     db, path = _database_copy()
     try:
@@ -253,6 +290,7 @@ if __name__ == "__main__":
     test_incomplete_dogpile_is_not_committed()
     test_blocker_is_never_assigned_to_two_attackers()
     test_lethal_attack_uses_one_lowest_attack_chump()
+    test_chump_blocks_stop_once_the_attack_is_no_longer_lethal()
     test_ai_block_declaration_queues_the_blocked_attackers_trigger()
     test_ai_turn_pauses_while_a_client_prompt_is_open()
     test_native_attack_declaration_survives_the_next_projection()

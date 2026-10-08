@@ -27,7 +27,7 @@ SAVAGE_LORD = "ab77df1e-5f13-471b-80e7-b7b4824ca280"
 CORRUPT_DRYAD = "879317e1-8b04-486e-a10a-f2d2f1a080bc"
 GNASH_BRIDGES = "3cf073b0-47fd-4911-953a-d86902890459"
 HOWLING_PLAINS_PACK = "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
-RAVENOUS_PIRANHA = "9ed0730b-e469-4c3d-ac7f-7b56c64b42ae"
+PIRANHA_SWARM = "c69b5c92-9692-42c9-bfd9-e2d465fc7a26"
 
 
 def cloned_db():
@@ -222,10 +222,9 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
             (6, "az01_q_cross_the_river", "az01_q_cross_the_river_part2"),
         )
         db.commit()
+        assert campaign._ensure_quest_campaign(db, 6, "AREA", "az01_tamed")
         assert campaign._ensure_quest_campaign(
             db, 6, "AREA", "az01_q_cross_the_river")
-        assert campaign._ensure_quest_campaign(
-            db, 6, "AREA", "az01_q_cross_the_river_part2")
 
         area_id, state = area_state(db)
         pdata = state.setdefault("PublicState", {}).setdefault("Data", {})
@@ -243,8 +242,7 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
         state["ALoc"] = "Bridge over the Zila - East"
 
         # A fresh Tamed quest keeps both later branches hidden.
-        tamed = campaign._quest_hook_az1_tamed_start(db, 6, state)
-        assert tamed
+        assert campaign._sync_az1_quest_gates(db, 6, state)
         for node in ("Node015", "Node018"):
             location = next(x["Data"] for x in state["VisLocs"]
                             if x["Data"].get("node") == node)
@@ -252,7 +250,7 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
             assert location["enabled"] is False
 
         # Starting Cross the Zila River reveals and marks Razortooth Forest.
-        assert campaign._quest_hook_az1_cross_the_river_start(db, 6, state)
+        campaign._sync_az1_quest_gates(db, 6, state)
         campaign._hydrate_az1_area_scene_metadata(
             db, state["VisLocs"], champ_id=6, state=state)
         razortooth = next(x["Data"] for x in state["VisLocs"]
@@ -274,7 +272,9 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
         state["LastNode"] = "Node030"
         state["ALoc"] = "Bridge over the Zodiac - East"
         pdata["visited_nodes"] = ["Node030"]
-        assert campaign._quest_hook_az1_cross_zodiac_start(db, 6, state)
+        assert campaign._ensure_quest_campaign(
+            db, 6, "AREA", "az01_q_cross_the_river_part2")
+        assert campaign._sync_az1_quest_gates(db, 6, state)
         shadowgrove = next(x["Data"] for x in state["VisLocs"]
                            if x["Data"].get("node") == "Node018")
         west_bridge = next(x["Data"] for x in state["VisLocs"]
@@ -289,17 +289,18 @@ def test_cross_zila_and_zodiac_gates_follow_quest_progress():
         db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
                    (json.dumps(quest_state), quest_id))
         db.commit()
-        campaign._quest_hook_az1_cross_zodiac_start(db, 6, state)
+        pdata["visited_nodes"].append("Node033")   # its visible tags need it
+        campaign._sync_az1_quest_gates(db, 6, state)
         assert west_bridge["visible"] is True
         assert west_bridge["enabled"] is True
 
-        # The opening Brink Ridge conversation only explains the blockade;
-        # its northbound destinations remain hidden until the encounter wins.
+        # Brink Ridge's northbound destinations stay hidden (editor gates)
+        # until a blockade battle is won or the player bribes / sneaks past.
         state["LastNode"] = "Node019"
         state["ALoc"] = "Brink Ridge"
         pdata["visited_nodes"] = ["Node019"]
         pdata["blockade_cleared"] = False
-        campaign._az1_reveal_neighbors(db, state, "Node019")
+        campaign._sync_az1_quest_gates(db, 6, state)
         northbound = {
             node for node in campaign._az1_neighbors(db, "Node019")
             if node != "Node016"
@@ -719,7 +720,7 @@ def test_savage_lord_advances_cross_zila_and_node_rewards_are_authored():
             "SELECT rewards_json FROM encounter_scenes WHERE guid=?",
             (GNASH_BRIDGES,)).fetchone()[0])
         assert any(
-            item.get("card_guid") == RAVENOUS_PIRANHA
+            item.get("card_guid") == PIRANHA_SWARM
             for item in gnash_rewards["end_of_game_rewards"]
         )
         dryad_rewards = json.loads(db.execute(
@@ -738,30 +739,26 @@ def test_savage_lord_advances_cross_zila_and_node_rewards_are_authored():
             "63e87fdf-6650-4861-90e5-7c8c840ec292"
             for item in dryad_rewards["end_of_game_rewards"]
         )
-        conversation_rewards = dict(db.execute(
-            "SELECT conversation_guid, reward_json FROM conversation_rewards "
-            "WHERE conversation_guid IN (?, ?, ?, ?, ?)",
+        # The Find / Cross the Zila / Cross the Zodiac packs are quest rewards
+        # now; their old conversation rows are gone so nothing pays twice.
+        quest_rewards = {script: json.loads(rewards) for script, rewards in
+                         db.execute("SELECT script_name, rewards_json FROM quest_templates")}
+        for script in ("az01_q_cross_the_river", "az01_q_cross_the_river_part2",
+                       "az01_ar_find_ambling_mesa", "az01_uw_find_cave_in"):
+            assert quest_rewards[script]["chest_guid"] == HOWLING_PLAINS_PACK, script
+        assert quest_rewards["az01_q_cross_the_river"]["item_guid_by_race"]["Elf"]
+        assert quest_rewards["az01_q_cross_the_river_part2"]["card_guid_by_race"]["Elf"]
+        remaining = {row[0] for row in db.execute(
+            "SELECT conversation_guid FROM conversation_rewards "
+            "WHERE conversation_guid IN (?, ?, ?, ?)",
             ("5e5ec1cd-c869-43e8-82d4-417021954440",
              "08b9b8ab-2100-4f8d-87b0-18369eb4ecb4",
-             "4000c850-c1f7-45e4-b254-3cb1b0e9bf2b",
              "02977c4c-803a-465d-ae0c-b5896c3d4012",
-             "880690b0-0c54-4ab8-a4e2-911b8bf14f64"),
-        ).fetchall())
-        assert json.loads(
-            conversation_rewards["5e5ec1cd-c869-43e8-82d4-417021954440"]
-        )["chest_guid"] == HOWLING_PLAINS_PACK
-        assert json.loads(
-            conversation_rewards["08b9b8ab-2100-4f8d-87b0-18369eb4ecb4"]
-        )["chest_guid"] == HOWLING_PLAINS_PACK
-        for find_guid in (
-            "02977c4c-803a-465d-ae0c-b5896c3d4012",
-            "880690b0-0c54-4ab8-a4e2-911b8bf14f64",
-        ):
-            assert json.loads(conversation_rewards[find_guid])["chest_guid"] \
-                == HOWLING_PLAINS_PACK
-        assert json.loads(
-            conversation_rewards["4000c850-c1f7-45e4-b254-3cb1b0e9bf2b"]
-        ) == {}
+             "880690b0-0c54-4ab8-a4e2-911b8bf14f64"))}
+        assert not remaining, remaining
+        assert json.loads(db.execute(
+            "SELECT reward_json FROM conversation_rewards WHERE conversation_guid=?",
+            ("4000c850-c1f7-45e4-b254-3cb1b0e9bf2b",)).fetchone()[0]) == {}
     finally:
         db.close()
         os.unlink(path)
@@ -902,6 +899,141 @@ def test_az1_opening_uses_the_underworld_route_and_fog_gates():
         os.unlink(path)
 
 
+def test_conversation_ending_actions_start_quests_and_set_flags():
+    """Editor ending actions on a node conversation: several start_quest(X)
+    plus set_flag(X), applied on conv_done for the chosen ending."""
+    db, path = cloned_db()
+    try:
+        guid, trigger = db.execute(
+            "SELECT conversation_guid, trigger_json FROM "
+            "campaign_node_conversations WHERE campaign_template='AZ1' "
+            "LIMIT 1").fetchone()
+        trigger = json.loads(trigger or "{}")
+        trigger["actions"] = {"go": ["start_quest(q_seawitch)",
+                                     "startQuest(q_tranquil_dream)",
+                                     "set_flag(test_gate)", "spend_gold(150)",
+                                     "unflag(old_*)"],
+                              "stay": ["set_flag(wrong)"]}
+        db.execute("UPDATE campaign_node_conversations SET trigger_json=? "
+                   "WHERE conversation_guid=?", (json.dumps(trigger), guid))
+        db.execute("DELETE FROM campaigns WHERE champion_id=? AND "
+                   "(campaign_type='AREA' OR template_name IN (?, ?))",
+                   (4, "q_seawitch", "q_tranquil_dream"))
+        db.commit()
+        _area_id, state = campaign._activate_az1_area(db, 4)
+        state["PublicState"]["Data"]["conversation_choice"] = "go"
+        state["PublicState"]["Data"]["conversation_flags"] = ["old_a", "keep"]
+        state["PublicState"]["Data"]["old_b"] = True
+        ending = campaign._record_conversation_flags(db, 4, state, "AREA", guid)
+        assert ending == "go"
+        flags = state["PublicState"]["Data"]["conversation_flags"]
+        assert "test_gate" in flags and "wrong" not in flags
+        assert "keep" in flags and "old_a" not in flags      # unflag(old_*)
+        assert "old_b" not in state["PublicState"]["Data"]
+        spawned, _hooks = campaign._grant_quests_for_conversation(
+            db, 4, "AZ1", guid, ending)
+        assert {script for _qid, script, _state in spawned} >= {
+            "q_seawitch", "q_tranquil_dream"}
+        user_id = campaign._get_champion(db, 4)[1]
+        db.execute("UPDATE users SET gold=200 WHERE id=?", (user_id,))
+        applied = campaign._spend_conversation_gold(db, 4, guid, ending)
+        assert applied["Accounts"][0]["Account"]["Gold"] == 50
+        campaign._spend_conversation_gold(db, 4, guid, ending)   # never below 0
+        assert db.execute("SELECT gold FROM users WHERE id=?",
+                          (user_id,)).fetchone()[0] == 0
+        assert not campaign._spend_conversation_gold(
+            db, 4, guid, "stay")["Accounts"]
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_brink_ridge_blockade_walks_back_lets_pass_and_fights_by_direction():
+    """Brink Ridge (impassable until a blockade battle is won): a conversation
+    that does not pass walks the player back; a bribe takes 1000 gold and
+    lets them leave once; returning from the north the fight is the zombies."""
+    db, path = cloned_db()
+    original = (campaign._send_response, campaign.push_campspawn,
+                campaign.push_campupdate)
+    campaign._send_response = lambda *a, **k: None
+    campaign.push_campspawn = campaign.push_campupdate = lambda *a, **k: None
+    handler = SimpleNamespace(_log_req=lambda *_a: None, user_profile={"id": 1})
+    try:
+        area_id, state = area_state(db, 6)
+        locs = {l["Data"].get("node"): l["Data"] for l in state["VisLocs"]}
+        locs["Node016"].update({"completed": True, "visible": True, "enabled": True})
+        locs["Node019"].update({"visible": True, "enabled": True, "completed": False})
+        state["PublicState"]["Data"].setdefault("visited_nodes", []).append("Node016")
+        state.update({"LastNode": "Node016", "ALoc": None})
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        user = campaign._get_champion(db, 6)[1]
+        db.execute("UPDATE users SET gold=1500 WHERE id=?", (user,))
+        db.commit()
+
+        def event(name, params=None):
+            campaign._handle_sendevent(handler, db, {
+                "CampID": area_id, "Event": name, "OParms": params},
+                0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        def arrive(paths, first=False):
+            event("visit_path", [paths])
+            if first:
+                event("visit_node", ["Node019"])
+            campaign._handle_locaction(handler, db, {
+                "CampID": area_id, "RAct": 0, "Loc": "Brink Ridge",
+                "Params": []}, 0, "", 0, "ServiceCampaign", "253", 0, 0)
+
+        def current():
+            saved = json.loads(db.execute(
+                "SELECT state_json FROM campaigns WHERE id=?",
+                (area_id,)).fetchone()[0])
+            return saved, saved["PublicState"]["Data"], next(
+                l["Data"] for l in saved["VisLocs"]
+                if l["Data"].get("node") == "Node019")
+
+        arrive(["Path_Node016_Node019"], first=True)
+        saved, pdata, ridge = current()
+        assert ridge["impassable"] is True and pdata["came_from"] == "Node016"
+        event("conv_done")                       # Step 1: no way through
+        saved, pdata, ridge = current()
+        assert pdata["force_move_dest"] == "Node016"
+        assert ridge["completed"] is False
+        event("force_move", ["Node019", "Node016"])
+        assert "force_move_dest" not in current()[1]
+
+        campaign._ensure_quest_campaign(db, 6, "AREA", "q_smoldering_dead")
+        db.commit()
+        arrive(["Path_Node016_Node019"])
+        event("choice_Bribe")
+        event("conv_done")
+        saved, pdata, ridge = current()
+        assert pdata["pass_node"] == "Node019" and ridge["impassable"] is False
+        assert db.execute("SELECT gold FROM users WHERE id=?",
+                          (user,)).fetchone()[0] == 500
+
+        event("visit_path", [["Path_Node019_Node021"]])    # on to the north
+        saved, pdata, ridge = current()
+        assert "pass_node" not in pdata and ridge["impassable"] is True
+        state = saved
+        state["LastNode"] = "Node021"
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+        arrive(["Path_Node019_Node021"])
+        event("choice_fight")
+        event("conv_done")
+        saved, pdata, ridge = current()
+        assert pdata["came_from"] == "Node021"
+        assert ridge["type"] == "Encounter"
+        assert ridge["encounter"].startswith("e59c5cac")   # Zombie Blockade
+    finally:
+        (campaign._send_response, campaign.push_campspawn,
+         campaign.push_campupdate) = original
+        db.close()
+        os.unlink(path)
+
+
 def test_az1_panorama_scene_transitions_out_of_area_on_startloc():
     db, path = cloned_db()
     original_send_response = campaign._send_response
@@ -910,10 +1042,11 @@ def test_az1_panorama_scene_transitions_out_of_area_on_startloc():
         db.execute(
             "DELETE FROM campaigns WHERE champion_id=? AND "
             "(campaign_type IN ('AREA', 'PANORAMA', 'QUEST') OR "
-            "template_name='az01_uw_find_cave_in')", (4,))
+            "template_name IN ('az01_uw_find_cave_in', 'az01_tamed'))", (4,))
         db.commit()
-        campaign._ensure_quest_campaign(
-            db, 4, "AREA", "az01_uw_find_cave_in")
+        # Takumi's welcome grants both (as in play).
+        for script in ("az01_uw_find_cave_in", "az01_tamed"):
+            campaign._ensure_quest_campaign(db, 4, "AREA", script)
         area_id, state = campaign._activate_az1_area(db, 4)
 
         # Put the player at the authored predecessor and expose Node017 as a
@@ -959,9 +1092,10 @@ def test_az1_panorama_scene_transitions_out_of_area_on_startloc():
         panorama_npcs = {
             item["Data"]["name"] for item in panorama_state["VisLocs"]
         }
-        assert {"Ennis", "Takumi"}.issubset(panorama_npcs)
-        assert not ({"Fahrny", "Myaa", "Vincent", "Wyatt", "Rizzix"}
-                    & panorama_npcs)
+        # Ennis offers Sea Witch, Takumi checks on the taming, Fahrny is the
+        # Find the Cave-In objective; later quest givers wait on their chain.
+        assert {"Ennis", "Takumi", "Fahrny"}.issubset(panorama_npcs)
+        assert not ({"Myaa", "Vincent", "Wyatt", "Rizzix"} & panorama_npcs)
         assert panorama_state["ALoc"] is None
         ennis = next(
             item["Data"] for item in panorama_state["VisLocs"]
@@ -1000,8 +1134,10 @@ def test_az1_panorama_uses_authored_repeat_hint_when_taming_is_in_progress():
             item["Data"]["name"]: item["Data"]
             for item in panorama["VisLocs"]
         }
+        # Takumi's "Tamed Quest" is the in-progress check-in (the Underworld
+        # twin of Belarius's "Tamed Quest Not Complete" below).
         assert locations["Takumi"]["conversationId"] == \
-            "5b385410-6ca5-41ca-b4bb-63efc8f0a57d"
+            "fea95059-eda8-4305-81c9-0d6283c28656"
         assert locations["Takumi"]["turninquest"] is False
         assert locations["Takumi"]["repeatable"] is True
         assert locations["Ennis"]["conversationId"] == \
@@ -1606,6 +1742,224 @@ def test_tamed_capture_pushes_the_quest_progress():
         os.unlink(path)
 
 
+def test_tamed_reward_waits_on_its_flag_set_by_the_battle_event():
+    """A Tamed scene's card is gated by ``when: flag(tamed:<scene>)``; the
+    flag comes from the scene's ``check_tamed()`` victory action when the
+    opponent's void holds a tamed troop."""
+    scene = "150b0ed9-a5e0-4729-81d8-764fa237c4e4"
+    dire_toad = "c0bb008e-17c5-4e73-baf9-5cbd8f3eb6dc"
+    db, path = cloned_db()
+    saved = campaign._evaluate_encounter_condition
+    try:
+        area_id, state = area_state(db)
+        state["ActiveEncounterGuid"] = scene
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+        handler = SimpleNamespace(_log_req=lambda *_a: None,
+                                  user_profile={"id": 1})
+        session = SimpleNamespace(session_name=f"camp_{area_id}", session_id=1)
+
+        def run(tamed):
+            campaign._evaluate_encounter_condition = lambda *a, **k: (
+                {"template_guid": "x", "owner": "opponent"} if tamed else None)
+            return campaign._apply_encounter_end_rewards(
+                handler, db, session, area_id, True)
+
+        plain = run(False)
+        assert not plain["condition_met"]
+        assert all(c.get("template") != dire_toad for c in plain["cards"]), plain
+        flagged = run(True)
+        assert flagged["condition_met"]
+        data = json.loads(db.execute(
+            "SELECT state_json FROM campaigns WHERE id=?", (area_id,)
+        ).fetchone()[0])["PublicState"]["Data"]
+        assert data.get("tamed:150b0ed9") is True
+        assert any(dire_toad in json.dumps(c) for c in flagged["cards"]), flagged
+    finally:
+        campaign._evaluate_encounter_condition = saved
+        db.close()
+        os.unlink(path)
+
+
+def test_stardust_reward_rolls_by_probability_and_updates_the_ledger():
+    """``stardust`` entries grant inventory stardust (+ ledger) at their
+    probability: 100% always pays, a vanishing chance never does."""
+    db, path = cloned_db()
+    try:
+        area_id, state = area_state(db)
+        user_id = db.execute(
+            "SELECT user_id FROM champions WHERE id=6").fetchone()[0]
+
+        def ledger():
+            return dict(db.execute(
+                "SELECT rarity, quantity FROM stardust WHERE user_id=?",
+                (user_id,)).fetchall())
+
+        before = ledger()
+        handler = SimpleNamespace(_log_req=lambda *_a: None)
+        applied = campaign._apply_reward_dict(
+            handler, db, area_id, state,
+            {"stardust": [
+                {"rarity": "rare", "amount": 3, "probability": 100},
+                {"rarity": "common", "amount": 9, "probability": 0.0000001}]},
+            False, "stardust-test", "test")
+        after = ledger()
+        assert after.get("rare", 0) == before.get("rare", 0) + 3, (before, after)
+        assert after.get("common", 0) == before.get("common", 0)
+        templates = [i["Item"]["TemplateID"] for i in applied["Items"]]
+        assert templates == ["a2a6129b-978a-40ce-9673-73588e6a40c3"], templates
+    finally:
+        db.close()
+        os.unlink(path)
+
+
+def test_finishing_a_quest_with_its_last_conversation_grants_the_quest_reward_once():
+    """Weston's turn-in finishes Cross the Zila River; the quest's authored
+    reward (Howling Plains pack + race equipment) is granted then, once."""
+    db, path = cloned_db()
+    saved = (campaign._send_response, campaign.push_campupdate,
+             campaign.push_campspawn)
+    try:
+        db.execute("DELETE FROM campaigns WHERE champion_id=? AND campaign_type='QUEST' "
+                   "AND template_name='az01_q_cross_the_river'", (6,))
+        db.commit()
+        assert campaign._ensure_quest_campaign(db, 6, "AREA", "az01_q_cross_the_river")
+        quest_id, quest_state = campaign._quest_state_row(db, 6, "az01_q_cross_the_river")
+        quest_state["Flags"]["_quest_objective_idx"] = 2   # Step3: Weston's turn-in
+        campaign._advance_quest_campaign(db, 6, "az01_q_cross_the_river")  # reveal Step2/3 locs
+        _quest_id, quest_state = campaign._quest_state_row(db, 6, "az01_q_cross_the_river")
+        quest_state["Flags"]["_quest_objective_idx"] = 2
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(quest_state), quest_id))
+        area_id, state = area_state(db)
+        node = next(i["Data"] for i in state["VisLocs"] if i["Data"].get("node") == "Node015")
+        node.update({"type": "Convo", "completed": False, "visible": True, "enabled": True,
+                     "conversationId": "5e5ec1cd-c869-43e8-82d4-417021954440"})
+        state["ALoc"] = "Node015"
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+        user_id = db.execute("SELECT user_id FROM champions WHERE id=6").fetchone()[0]
+        chests = lambda: db.execute(
+            "SELECT COUNT(*) FROM treasure_chests WHERE user_id=?", (user_id,)).fetchone()[0]
+        before = chests()
+        campaign._send_response = lambda *a, **k: None
+        campaign.push_campupdate = lambda *a, **k: None
+        campaign.push_campspawn = lambda *a, **k: None
+        handler = SimpleNamespace(_log_req=lambda *_a: None)
+        campaign._handle_sendevent(
+            handler, db, {"CampID": area_id, "Event": "conv_done", "OParms": None},
+            0, "", 0, "ServiceCampaign", "253", 0, 0)
+        _qid, finished = campaign._quest_state_row(db, 6, "az01_q_cross_the_river")
+        assert finished.get("Finished"), finished.get("Flags")
+        assert chests() == before + 1
+        claims = json.loads(db.execute("SELECT state_json FROM campaigns WHERE id=?",
+                                       (area_id,)).fetchone()[0])["_conversation_reward_claims"]
+        assert any(key.endswith(":quest:az01_q_cross_the_river") for key in claims), claims
+    finally:
+        campaign._send_response, campaign.push_campupdate, campaign.push_campspawn = saved
+        db.close()
+        os.unlink(path)
+
+
+def test_army_of_myth_only_pays_spectral_caller_for_the_level_6_difficulty():
+    """The repeat conversation's Diff_N choice is remembered; only a win after
+    Diff_6 sets flag(battle:0b1d5244:Diff_6) and pays Spectral Caller."""
+    scene = "0b1d5244-e9f6-46ec-bb06-73c36801f5ef"
+    spectral_caller = "e9ba4268-2617-48b4-9f02-5138aaadd6b5"
+    db, path = cloned_db()
+    saved = campaign._evaluate_encounter_condition
+    try:
+        campaign._evaluate_encounter_condition = lambda *a, **k: None
+        handler = SimpleNamespace(_log_req=lambda *_a: None, user_profile={"id": 1})
+        results = {}
+        for level in ("Diff_5", "Diff_6"):
+            area_id, state = area_state(db)
+            state["ActiveEncounterGuid"] = scene
+            state.setdefault("PublicState", {}).setdefault("Data", {}).update(
+                {"pending_battle_events": [level]})
+            state.pop("_encounter_reward_claims", None)
+            db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                       (json.dumps(state), area_id))
+            db.commit()
+            session = SimpleNamespace(session_name=f"camp_{area_id}", session_id=7)
+            results[level] = campaign._apply_encounter_end_rewards(
+                handler, db, session, area_id, True)
+            if level == "Diff_5":      # a fresh claim sheet for the second run
+                db.execute("UPDATE campaigns SET state_json=json_remove(state_json, "
+                           "'$._encounter_reward_claims') WHERE id=?", (area_id,))
+                db.commit()
+        assert not any(spectral_caller in json.dumps(c) for c in results["Diff_5"]["cards"])
+        assert any(spectral_caller in json.dumps(c) for c in results["Diff_6"]["cards"]), results["Diff_6"]
+    finally:
+        campaign._evaluate_encounter_condition = saved
+        db.close()
+        os.unlink(path)
+
+
+def test_scene_actions_set_and_clear_flags_before_victory_and_defeat():
+    """encounter_scenes.actions_json: set_flag / clear_flag run when the battle
+    starts (pre), is won (victory) or lost (defeat); flag(X) tags then see them."""
+    scene = "0b1d5244-e9f6-46ec-bb06-73c36801f5ef"
+    db, path = cloned_db()
+    saved = campaign._evaluate_encounter_condition
+    try:
+        campaign._evaluate_encounter_condition = lambda *a, **k: None
+        db.execute("UPDATE encounter_scenes SET actions_json=? WHERE guid=?",
+                   (json.dumps({"pre": ["set_flag(started_x)"],
+                                "victory": ["set_flag(won_x)", "clear_flag(started_x)"],
+                                "defeat": ["set_flag(lost_x)"]}), scene))
+        db.commit()
+        area_id, state = area_state(db)
+        data = state.setdefault("PublicState", {}).setdefault("Data", {})
+        assert campaign._run_scene_actions(db, state, scene, "pre")
+        assert data["started_x"] is True
+        state["ActiveEncounterGuid"] = scene
+        db.execute("UPDATE campaigns SET state_json=? WHERE id=?",
+                   (json.dumps(state), area_id))
+        db.commit()
+        handler = SimpleNamespace(_log_req=lambda *_a: None, user_profile={"id": 1})
+        session = SimpleNamespace(session_name=f"camp_{area_id}", session_id=9)
+
+        def saved_data():
+            return json.loads(db.execute("SELECT state_json FROM campaigns WHERE id=?",
+                                         (area_id,)).fetchone()[0])["PublicState"]["Data"]
+
+        campaign._apply_encounter_end_rewards(handler, db, session, area_id, False)
+        assert saved_data().get("lost_x") is True and "won_x" not in saved_data()
+        campaign._apply_encounter_end_rewards(handler, db, session, area_id, True)
+        after = saved_data()
+        assert after.get("won_x") is True and "started_x" not in after, after
+        assert campaign._conversation_tags_hold(db, 6, {"PublicState": {"Data": after}}, "", ["flag(won_x)"])
+    finally:
+        campaign._evaluate_encounter_condition = saved
+        db.close()
+        os.unlink(path)
+
+
+def test_encounter_scenes_table_is_built_from_the_editors_file():
+    """encounter_scenes is owned by campaign_data/encounter_scenes.json: a fresh
+    database has exactly those scenes, with the authored rewards/actions."""
+    db, path = cloned_db()
+    try:
+        file_path = os.path.join(os.path.dirname(__file__), "..", "campaign_data",
+                                 "encounter_scenes.json")
+        rows = json.load(open(file_path))["tables"]["encounter_scenes"]
+        assert db.execute("SELECT COUNT(*) FROM encounter_scenes").fetchone()[0] == len(rows)
+        army = db.execute(
+            "SELECT rewards_json, actions_json FROM encounter_scenes WHERE guid=?",
+            ("0b1d5244-e9f6-46ec-bb06-73c36801f5ef",)).fetchone()
+        assert "flag(battle:0b1d5244:Diff_6)" in army[0]
+        assert json.loads(army[1]) == {"victory": ["set_flag(battle:0b1d5244:Diff_0)"]}
+        # Blank (auto) personalities were filled by the deck evaluator.
+        assert db.execute("SELECT COUNT(*) FROM encounter_scenes WHERE ai_deck_guid<>'' "
+                          "AND COALESCE(TRIM(ai_deck_personality),'')=''").fetchone()[0] == 0
+    finally:
+        db.close()
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     tests = [
         test_cross_zila_objective_is_linked_to_savage_lord,
@@ -1637,6 +1991,14 @@ if __name__ == "__main__":
         test_dungeon_win_count_tracks_streak_for_pregame_talents,
         test_post_crayburn_report_opens_the_az1_transition,
         test_tamed_capture_pushes_the_quest_progress,
+        test_tamed_reward_waits_on_its_flag_set_by_the_battle_event,
+        test_stardust_reward_rolls_by_probability_and_updates_the_ledger,
+        test_finishing_a_quest_with_its_last_conversation_grants_the_quest_reward_once,
+        test_army_of_myth_only_pays_spectral_caller_for_the_level_6_difficulty,
+        test_scene_actions_set_and_clear_flags_before_victory_and_defeat,
+        test_encounter_scenes_table_is_built_from_the_editors_file,
+        test_conversation_ending_actions_start_quests_and_set_flags,
+        test_brink_ridge_blockade_walks_back_lets_pass_and_fights_by_direction,
     ]
     for test in tests:
         test()

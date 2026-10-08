@@ -9,6 +9,13 @@ from typing import Any
 import game_engine
 
 
+def _truthy(value):
+    """Records booleans arrive as bool, 0/1, or "True"/"1" strings."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true")
+    return bool(value)
+
+
 def _publish_created_card(context, card_uid, owner_id, card_type):
     """Publish C# creation events and the resolving ability's CreatedCards."""
     if str(card_type or "").lower() != "choice":
@@ -210,8 +217,14 @@ def _matching_template_candidates(context, card_filter, banned_guids=(),
     candidates = []
     owner = (int(player) if player is not None else
              int(context.bstate.get("resolving_owner_id", 0) or 0))
-    active_thresholds = (context.bstate.get(f"thresh_{owner}")
-                         or context.bstate.get("player_threshold") or {})
+    # Raw per-participant thresholds (PvP checkpoint/view, resource
+    # transitions) win; otherwise the owner's own side.  Falling back to
+    # player_threshold handed the AI the human's thresholds.
+    active_thresholds = context.bstate.get(f"thresh_{owner}")
+    if not isinstance(active_thresholds, dict):
+        from .runtime_helpers import participant_side
+        side = participant_side(context.bstate, owner) or "player"
+        active_thresholds = context.bstate.get(f"{side}_threshold") or {}
     if source_uid is None:
         source_uid = context.bstate.get("resolving_source_uid")
     source_row = db_card_zone_details(
@@ -266,6 +279,10 @@ def _matching_template_candidates(context, card_filter, banned_guids=(),
                      "thresholds": candidate_thresholds,
                      "subtype": row[6] or "",
                      "attributes": int(row[7] or 0), "user_id": owner,
+                     # Printed stats for HasAttackValue/HasDefenseValue
+                     # pools (Tashi One-Horn's random 1/1 troop).
+                     "attack": int(row[9] or 0) if len(row) > 9 else 0,
+                     "defense": int(row[10] or 0) if len(row) > 10 else 0,
                      "_card_template_candidate": True}
         if records_filter_matches(candidate, card_filter,
                                   source=source, context=context,
@@ -726,9 +743,15 @@ def summon_token(context, payload=None):
             position = 0
         token_state = 0
         if location == "warzone":
-            from .static_rules import opposing_enters_play_exhausted
-            if opposing_enters_play_exhausted(
-                    context.bstate, owner, create_guid):
+            from .static_rules import card_enters_play_exhausted
+            # SummonTokenTroop.m_EntersPlayExhausted ("summon an exhausted
+            # Abomination") taps the token like the printed attribute does.
+            if (_truthy(context.template_value(
+                    "m_EntersPlayExhausted",
+                    payload.get("exhausted", False))) or
+                    card_enters_play_exhausted(
+                        context.db, context.session.session_id,
+                        context.bstate, 0, owner, create_guid)):
                 token_state = int(game_engine.ECardStates.Tapped)
         db_insert_generated_card(
             context.session.session_id, owner, uid, create_guid, location,
@@ -796,10 +819,15 @@ def summon_token(context, payload=None):
         _tpl, card_type, name, cost, attack, defense, gems = \
             context.handler._card_full_data(context.game, scid, created_guid)
         collection_value = card_collection_for_location(location)
+        from pvp_db import db_card_state_value
         context.game.push_card_updated(
             scid, recipient, collection_value, card_type,
             template_id=created_guid, card_name=name, cost=cost, attack=attack,
-            defense=defense, gems=gems, nulling=location == "deck")
+            defense=defense, gems=gems, nulling=location == "deck",
+            # An exhausted summon must render tapped (CardUpdated defaults
+            # to state None).
+            state=int(db_card_state_value(
+                context.session.session_id, uid, conn=context.db) or 0))
         if conscript_thresholds is not None:
             context._push_modifier_card(
                 int(uid), thresholds=[int(value)

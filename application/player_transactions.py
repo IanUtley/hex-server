@@ -510,6 +510,66 @@ def typed_payload_from_decoded(command, decoded):
                 # the typed shape expected by the RulesPort, including no
                 # attackers.
                 raw_payload["declarations"] = ((target, attackers),)
+        # DefenseDeclaration contains two nested card lists and can stop the
+        # generic ObjFmt walker just like AttackDeclaration. Recover only the
+        # explicitly labeled attacker and blocker IDs so the native ingress
+        # receives the same typed declaration the client submitted.
+        if ((getattr(command, "is_commit_defense", False) or
+             b"CommitTroopsToDefenseTransaction" in raw) and
+                b"m_DefenseDeclarations" in raw):
+            declarations_start = raw.find(b"m_DefenseDeclarations")
+            declarations_end = len(raw)
+            for marker in (b"m_PlayerId", b"m_TransactionId"):
+                marker_pos = raw.find(marker, declarations_start +
+                                      len(b"m_DefenseDeclarations"))
+                if marker_pos >= 0:
+                    declarations_end = min(declarations_end, marker_pos)
+            section = raw[declarations_start:declarations_end]
+            attacker_fields = list(re.finditer(
+                rb"(?:m_)?AttackerId;", section))
+            declarations = []
+            for index, attacker_field in enumerate(attacker_fields):
+                next_attacker = (attacker_fields[index + 1].start()
+                                 if index + 1 < len(attacker_fields)
+                                 else len(section))
+                attacker_segment = section[attacker_field.end():next_attacker]
+                attacker_match = re.search(
+                    rb"m_UID64;[^;]*;[^;]*;[^;]*;([0-9A-Fa-f]{16});",
+                    attacker_segment)
+                if attacker_match is None:
+                    continue
+                try:
+                    attacker_uid = struct.unpack(
+                        "<Q", bytes.fromhex(
+                            attacker_match.group(1).decode("ascii")))[0]
+                except (ValueError, UnicodeDecodeError, struct.error):
+                    continue
+                if (attacker_uid & 0xFF) != 1:
+                    continue
+
+                blockers = []
+                blockers_pos = section.find(
+                    b"DefendingCardIds", attacker_field.end(),
+                    attacker_fields[index + 1].start()
+                    if index + 1 < len(attacker_fields) else len(section))
+                if blockers_pos >= 0:
+                    blockers_segment = section[
+                        blockers_pos + len(b"DefendingCardIds"):next_attacker]
+                    for card_match in re.finditer(
+                            rb"m_UID64;[^;]*;[^;]*;[^;]*;"
+                            rb"([0-9A-Fa-f]{16});", blockers_segment):
+                        try:
+                            blocker_uid = struct.unpack(
+                                "<Q", bytes.fromhex(
+                                    card_match.group(1).decode("ascii")))[0]
+                        except (ValueError, UnicodeDecodeError,
+                                struct.error):
+                            continue
+                        if (blocker_uid & 0xFF) == 1:
+                            blockers.append(int(blocker_uid))
+                declarations.append((int(attacker_uid), tuple(blockers)))
+            # An empty declaration list is a valid no-block transaction.
+            raw_payload["declarations"] = tuple(declarations)
         ability_match = re.search(
             rb"(?:AbilityTemplateId|m_AbilityTemplateId).*?"
             rb"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
