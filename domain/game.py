@@ -1199,13 +1199,16 @@ class Game:
         # A viewer-scoped full update may be followed by a generic hidden-zone
         # placeholder for the same card in one checkpoint. Keep the complete
         # definition and omit only the matching viewer/collection placeholder.
+        # A temporary (Coverflow) reveal is not a lasting view: a later hidden
+        # update for the card, such as its put-back into the deck, must win.
         viewer_revealed_cards = {
             (int(event.session_card_id.uid.uid64), int(event.collection))
             for event in self.events
             if (isinstance(event, CardUpdatedSessionEventArgs)
                 and getattr(event, "_hand_reveal_viewer_uid", None) is not None
-                    and _uid64(player_value) == _uid64(
-                        getattr(event, "_hand_reveal_viewer_uid"))
+                and not getattr(event, "_temporary_reveal", False)
+                and _uid64(player_value) == _uid64(
+                    getattr(event, "_hand_reveal_viewer_uid"))
                 and not bool(getattr(event, "nulling", False))
                 and _has_card_representation(event))
         }

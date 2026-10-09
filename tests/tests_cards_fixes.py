@@ -919,6 +919,76 @@ def test_oakhenge_single_revealed_troop_moves_without_a_picker(db):
     assert not bstate.get("resolution_paused"), bstate
 
 
+def test_revealed_cards_put_back_into_deck_are_hidden_again(db):
+    """A put-back after a temporary reveal leaves the card face down.
+
+    Titania's Majesty reveals the top five to everyone, then puts them back into
+    the deck. The reveal's full update is only a Coverflow; the hidden deck
+    update that follows must win in the packet, or the card stays face up.
+    """
+    import types
+    import uuid
+
+    import domain.game as dgm
+    import hconnect_server as hcs
+    import db as dbmod
+    from rules_port.resolution import resolve_port_played_spell
+
+    OAK = "f42da1e5-159c-41d2-9664-2e64be20257e"
+    OAK_AG = "200337da-9971-cf13-7e98-011a78b9ac64"
+    SHARD = "cd41bd00-7585-4762-a721-6163bdaee3c3"
+    _copy_card(db, OAK)
+    _copy_card(db, SHARD)
+    add_card(db, 371, 0, OAK, loc="CastSpells")
+    for index, uid in enumerate((372, 373, 374, 375, 376)):
+        add_card(db, uid, 0, SHARD, loc="deck")
+        db.execute("UPDATE game_cards SET card_type=?, position=? WHERE card_uid=?",
+                   ("Resource", index, uid))
+    db.commit()
+
+    old_db = dbmod._db
+    old_hcs_db = hcs._db
+    dbmod._db = db
+    hcs._db = db
+    try:
+        import battle_engine
+
+        handler = HandlerStub(db)
+        handler._checkpoint_engine = lambda session: battle_engine
+        handler._send_battle_events = lambda *args, **kwargs: True
+        handler._push_transaction_ack = lambda *args, **kwargs: None
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        bstate = {"resolving_source_uid": 371, "resolving_owner_id": 0,
+                  "player_health": 20, "ai_health": 20, "turn_number": 1}
+        resolve_port_played_spell(
+            game, SessionStub(), db, handler, pl_t, ai_t, bstate, [OAK_AG])
+        for uid in (372, 374, 375, 376):
+            game.push_card_updated(
+                game_engine.SessionCardId(game_engine.UID(uid)), pl_t,
+                game_engine.ECardCollections.Deck,
+                game_engine.ECardTypes.Resource, template_id=SHARD, nulling=True)
+
+        nulled = []
+        original = dgm._null_hidden_card_representation
+
+        def spy(event, **kwargs):
+            nulled.append(int(event.session_card_id.uid.uid64))
+            return original(event, **kwargs)
+        dgm._null_hidden_card_representation = spy
+        try:
+            game.make_network_packet(pl_t)
+        finally:
+            dgm._null_hidden_card_representation = original
+    finally:
+        dbmod._db = old_db
+        hcs._db = old_hcs_db
+
+    for uid in (372, 374, 375, 376):
+        assert uid in nulled, (uid, nulled)
+
+
 def test_revealed_choice_completion_reprojects_native_priority(db):
     """A finished reveal picker must re-project the native priority window.
 
@@ -2816,6 +2886,8 @@ def main():
          test_oakhenge_reveal_opens_one_selectable_picker),
         ("Oakhenge single revealed troop skips the picker",
          test_oakhenge_single_revealed_troop_moves_without_a_picker),
+        ("Titania's Majesty put-back stays hidden",
+         test_revealed_cards_put_back_into_deck_are_hidden_again),
         ("Revealed choice completion re-projects priority",
          test_revealed_choice_completion_reprojects_native_priority),
         ("Discard continuation re-projects native chain window",

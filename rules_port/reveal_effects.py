@@ -252,5 +252,8 @@ def reveal_cards(context):
                   not context.bstate.get("pvp")):
                 context.game.events[-1]._hand_reveal_viewer_uid = \
                     context.player_uid
+            if context.game.events[-1]._hand_reveal_viewer_uid is not None:
+                # Coverflow reveals are temporary (C# Inactive=true).
+                context.game.events[-1]._temporary_reveal = True
         context.game._push(event)
     return f"revealed {len(uids)}"
