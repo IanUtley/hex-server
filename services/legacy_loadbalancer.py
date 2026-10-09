@@ -1254,7 +1254,7 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
             guard += 1
             from rules_port.resolution import resolve_port_trigger
             resolve_port_trigger(
-                handler, game, session, _hc._db._db, pl_uid_t, ai_uid_t,
+                handler, game, session, _hc._db, pl_uid_t, ai_uid_t,
                 state, state["stack"].pop())
         if state.get("stack"):
             raise RuntimeError("setup RulesPort trigger stack did not drain")
@@ -1601,23 +1601,23 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
                 Sprouts' resource grant).
                 """
                 import hconnect_server as _hc
-                card_abilities_json = _hc.db_template_ability_guidsuids(
-                    card_guid, conn=_hc._db._db)
+                card_abilities_json = _hc.db_template_ability_guids(
+                    card_guid, conn=_hc._db)
                 try:
                     ability_guids = _aj.loads(
                         card_abilities_json or "[]")
                 except (TypeError, ValueError):
                     ability_guids = []
                 for ability_guid in ability_guids:
-                    meta = _hc.db_ability_metadatadata(ability_guid, conn=_hc._db._db)
-                    effect_exists = _hc.db_ability_has_effectfect(
-                        ability_guid, conn=_hc._db._db)
+                    meta = _hc.db_ability_metadata(ability_guid, conn=_hc._db)
+                    effect_exists = _hc.db_ability_has_effect(
+                        ability_guid, conn=_hc._db)
                     if (meta and effect_exists and not meta[0] and
                             ("GameStartedEvent" in (meta[1] or "") or
                              not (meta[1] or ""))):
                         return True
-                    for _eg, effect_type, raw_param in _hc.db_ability_effect_rowsrows(
-                            ability_guid, conn=_hc._db._db):
+                    for _eg, effect_type, raw_param in _hc.db_ability_effect_rows(
+                            ability_guid, conn=_hc._db):
                         if effect_type != "GrantAbilityEffectTemplate":
                             continue
                         try:
@@ -1631,8 +1631,8 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
                             else str(raw_param or "").strip())
                         if not granted_guid:
                             continue
-                        trigger_row = _hc.db_ability_metadatadata(
-                            granted_guid, conn=_hc._db._db)
+                        trigger_row = _hc.db_ability_metadata(
+                            granted_guid, conn=_hc._db)
                         if (trigger_row and
                                 "GameStartedEvent" in (trigger_row[1] or "")):
                             return True
