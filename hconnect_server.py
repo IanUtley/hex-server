@@ -83,6 +83,13 @@ from gamemodes.tournament_engine import (
     player_handlers, player_handler_lock, player_decks,
 )
 
+from application.encoding_helpers import encode_inventory_item, encode_card_instance, encode_deck_bits, encode_champion_bits_minimal
+from application.practice_flow import _push_pve_mulligan_start, _push_pve_game_started, _same_uid, _uid_in, _is_practice_chain_follow_up, _target_count_from_text
+from application.records_projection import _records_ability_graph, _records_card_projection, _records_target_spec
+from application.profile_flags import _profile_feature_flags
+from services.reconnect import _reconnect_declined_for_pid, _record_reconnect_decline
+from gamemodes.fra_arena import _fra_arena_setup_values, _fra_arena_session_state_data
+
 DEFAULT_PORT = 9933
 _reload_requested = False
 DB_PATH = os.environ.get(
@@ -90,44 +97,6 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "hconnect.db"),
 )
 _NO_PERSISTED_GEM = object()
-
-
-def _push_pve_mulligan_start(game, player_uid, ai_uid,
-                            play_first_is_player, resolve_ai_mulligan):
-    """Project C#'s active-player mulligan sequence for Practice/PvE.
-
-    If the AI plays first, it resolves its mulligan before priority passes to
-    the human. A human redraw keeps the active phase and is handled by the
-    transaction path without calling this setup transition again.
-    """
-    first_uid = player_uid if play_first_is_player else ai_uid
-    game.push_green_light(first_uid, game_engine.EPriorityContext.Normal)
-    game.push_turn_phase(game_engine.ETurnPhases.Mulligan,
-                         first_uid, first_uid)
-    if play_first_is_player:
-        return False
-    resolve_ai_mulligan()
-    game.push_green_light(player_uid, game_engine.EPriorityContext.Normal)
-    game.push_turn_phase(game_engine.ETurnPhases.Mulligan,
-                         player_uid, player_uid)
-    return True
-
-
-def _push_pve_game_started(game, *, player_name, ai_name,
-                           player_champion_guid, ai_champion_guid,
-                           player_sleeve_guid, ai_sleeve_guid,
-                           coin_winner_is_player):
-    """Publish a normal PvE toss result through the C# GameStarted contract.
-
-    The coin winner is the first UID in class-1 ``TurnOrder``. Class 60 is
-    reserved for a forced first player: Unity's ``OnFirstPlayerDictated`` sets
-    ``m_CoinFlipSkip``, which skips the visible toss animation.
-    """
-    game.push_game_started(
-        champion_names=[player_name, ai_name],
-        champion_template_ids=[player_champion_guid, ai_champion_guid],
-        player_first=coin_winner_is_player,
-        sleeve_template_ids=[player_sleeve_guid, ai_sleeve_guid])
 
 
 def _rules_port_timing(label, started, **fields):
@@ -140,58 +109,6 @@ def _rules_port_timing(label, started, **fields):
             + (f" {suffix}" if suffix else ""))
 
 
-def _same_uid(left, right):
-    """Compare participant IDs across typed-UID and persisted-uint64 forms."""
-    if left is None or right is None:
-        return left is right
-    try:
-        return int(getattr(left, "uid64", left)) == int(
-            getattr(right, "uid64", right))
-    except (TypeError, ValueError):
-        return left == right
-
-
-def _uid_in(value, participants):
-    """Return whether a raw or typed UID belongs to a participant list."""
-    return any(_same_uid(value, participant) for participant in participants)
-
-
-def _is_practice_chain_follow_up(action, client_id, practice_window):
-    """Return whether a server-owned chain response should be auto-passed.
-
-    A completed response can expose the AI's next pass on the same ability
-    chain.  An ordinary phase transition can also expose an AI-owned priority
-    action, notably when DeclareDefensePriorityWindow enters AssignDamage.
-    Only the former belongs to this auto-pass path; phase actions must return
-    to the AI driver so phase-specific work such as combat damage runs first.
-    """
-    from rules_port.kernel import PriorityWindowAction
-    return bool(
-        practice_window and
-        isinstance(action, PriorityWindowAction) and
-        getattr(action, "ability_responding_to", None) is not None and
-        action.priority_player_id is not None and
-        not _same_uid(action.priority_player_id, client_id))
-
-
-def _profile_feature_flags():
-    """Return profile-stream feature strings sent to every authenticated client.
-
-    The historical server always enabled the developer console with
-    ``allowcon``. Keep that behavior when the environment variable is absent;
-    when it is present, its comma/space/semicolon-separated values replace the
-    default list so deployments can choose an explicit feature set.
-    """
-    raw = os.environ.get("HEX_PROFILE_FLAGS")
-    if raw is None:
-        return ("allowcon",)
-    flags = []
-    for flag in re.split(r"[,;\s]+", raw.strip()):
-        if flag and flag not in flags:
-            flags.append(flag)
-    return tuple(flags)
-
-
 PROFILE_FEATURE_FLAGS = _profile_feature_flags()
 
 # How long the AI "thinks" (seconds) before acting on its turn. Each client
@@ -201,15 +118,6 @@ AI_PHASE_DELAY = 1.0  # pause between AI phase pushes so the client renders them
 
 # All talent data (names, abilities, descriptions) is in the talent_data DB table,
 # populated from gamedata during build.
-
-def _target_count_from_text(game_text):
-    """Parse how many targets a "X troops you control" cost/target template
-    needs: "a troop" = 1, "two/three/... troops" = the number. Defaults to 1."""
-    import re as _re
-    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-    m = _re.search(r'\b(one|two|three|four|five|six|seven|eight|nine|ten)\b', (game_text or "").lower())
-    return words[m.group(1)] if m else 1
 
 
 def _talent_ability_guid(talent_guid: str) -> str | None:
@@ -360,71 +268,6 @@ if TYPE_CHECKING:
     from gamedata import AbilityGraph
 
 
-def _records_ability_graph(handler, ability_guid) -> "AbilityGraph | None":
-    """Resolve an ability through the current Records snapshot.
-
-    A few focused tests use small handler doubles rather than a fully
-    initialized HCPHandler.  They may provide the bound helper themselves;
-    production handlers use their cached PlayPlan RecordStore.
-    """
-    resolver = getattr(handler, "_current_ability_graph", None)
-    if callable(resolver):
-        return cast(Any, resolver(ability_guid))
-    from gamedata import DEFAULT_RECORD_STORE, ability_graph
-    store = getattr(handler, "_play_plan_store", None)
-    if store is None:
-        store = DEFAULT_RECORD_STORE
-        try:
-            handler._play_plan_store = store
-        except AttributeError:
-            pass
-    return ability_graph(store, str(ability_guid).lower())
-
-
-@lru_cache(maxsize=8192)
-def _records_card_projection(template_guid):
-    """Return the immutable printed card projection from the Records cache.
-
-    ``card_templates`` is a normalized database projection of the same client
-    CardTemplate records.  CardUpdated is a hot path, so use the indexed,
-    process-wide Records snapshot for static fields and leave SQLite to answer
-    only the mutable game-card state.  A missing record is a normal fallback
-    for champions, generated cards, and older/incomplete Records snapshots.
-    """
-    from gamedata import DEFAULT_RECORD_STORE
-
-    guid = str(template_guid or "").lower()
-    if not guid:
-        return None
-    record = DEFAULT_RECORD_STORE.get("CardTemplate", guid)
-    if record is None:
-        return None
-    return (
-        str(record.guid or guid).lower(),
-        record.card_type,
-        record.name,
-        record.resource_cost,
-        record.base_attack,
-        record.base_defense,
-        record.threshold_shards,
-        tuple(record.ability_guids),
-        record.attributes,
-        record.subtype,
-        record.lethal,
-    )
-
-
-def _records_target_spec(handler, target_guid):
-    resolver = getattr(handler, "_current_target_spec", None)
-    if callable(resolver):
-        return resolver(target_guid)
-    from gamedata import DEFAULT_RECORD_STORE
-    store = (getattr(handler, "_play_plan_store", None)
-             or DEFAULT_RECORD_STORE)
-    target = store.get("AbilityTargetTemplate", str(target_guid).lower())
-    return target.target_spec if target is not None else None
-
-
 import domain.constants as _dc
 _dc.event_logger = _record_session_events
 # Game imported ``event_logger`` by value, so updating domain.constants alone
@@ -433,24 +276,6 @@ _dc.event_logger = _record_session_events
 import domain.game as _domain_game
 _domain_game.event_logger = _record_session_events
 game_engine.event_logger = _record_session_events
-
-def encode_inventory_item(buf, sizes, ft, template_guid, item_id, elem_idx, quantity=1, bound=True):
-    return encoder.encode_inventory_item(buf, sizes, ft, template_guid, item_id, elem_idx, quantity, bound)
-
-
-def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx):
-    return encoder.encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx)
-
-
-def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did, card_guids, idx):
-    return encoder.encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did, card_guids, idx)
-
-
-def encode_champion_bits_minimal(buf, sizes, ft, cu64, cname, cid, lvl, xp, cc, rc, gd, idx,
-                                 last_campaign_id=0, last_deck_id=0, talents=None,
-                                 pet_name=""):
-    return encoder.encode_champion_bits_minimal(buf, sizes, ft, cu64, cname, cid, lvl, xp, cc, rc, gd, idx,
-                                                last_campaign_id, last_deck_id, talents, pet_name)
 
 
 # === DataWrapper ObjFmt parser (simplified, field-by-field extraction) ===
@@ -755,109 +580,6 @@ def _open_client_chests(handler, chest_uids):
                 f"({chest.template_guid or chest.set_guid}): {len(cards)} cards, "
                 f"{len(inventory_rewards)} items, remaining={remaining}")
     return summary
-
-
-def _fra_arena_setup_values(encounter_data):
-    """Normalize the encounter identity needed by the FRA client session."""
-    if not isinstance(encounter_data, dict):
-        return None
-    raw_flags = encounter_data.get("SessionFlags", 0)
-    if isinstance(raw_flags, dict):
-        raw_flags = raw_flags.get("value__", 0)
-    try:
-        flags = int(raw_flags or 0)
-    except (TypeError, ValueError):
-        return None
-    arena_flag = int(game_engine.ESessionFlags.IsPvEArena)
-    if not flags & arena_flag:
-        return None
-
-    def _as_uint64(field):
-        value = encounter_data.get(field, 0)
-        if isinstance(value, dict):
-            value = value.get("value__", value.get("m_UID64", 0))
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    return {
-        "flags": (flags | int(game_engine.ESessionFlags.IsPvE) | arena_flag),
-        "arena_instance": _as_uint64("ArenaInstance"),
-        "arena_owner": _as_uint64("ArenaOwner"),
-    }
-
-
-def _reconnect_declined_for_pid(state, player_id):
-    """Return whether this player dismissed reconnect for this game session."""
-    if not isinstance(state, dict):
-        return False
-    try:
-        player_id = int(player_id)
-    except (TypeError, ValueError):
-        return False
-    if player_id <= 0:
-        return False
-    declined = state.get("reconnect_declined_pids")
-    if isinstance(declined, dict):
-        if str(player_id) in declined or player_id in declined:
-            return True
-    elif isinstance(declined, (list, tuple, set)):
-        try:
-            if player_id in {int(value) for value in declined}:
-                return True
-        except (TypeError, ValueError):
-            pass
-    # Read the older single-player marker written before declines were
-    # tracked independently for each participant.
-    try:
-        return int(state.get("reconnect_declined_pid") or 0) == player_id
-    except (TypeError, ValueError):
-        return False
-
-
-def _record_reconnect_decline(state, player_id):
-    """Persist a per-player dismiss marker in this session's checkpoint."""
-    if not isinstance(state, dict):
-        return False
-    try:
-        player_id = int(player_id)
-    except (TypeError, ValueError):
-        return False
-    if player_id <= 0:
-        return False
-    declined = state.get("reconnect_declined_pids")
-    if isinstance(declined, dict):
-        declined = dict(declined)
-    elif isinstance(declined, (list, tuple, set)):
-        declined = {str(value): 0 for value in declined}
-    else:
-        declined = {}
-    declined_at = int(time.time())
-    declined[str(player_id)] = declined_at
-    state["reconnect_declined_pids"] = declined
-    # Keep writing the legacy fields so checkpoints remain readable by older
-    # server builds; the per-player mapping above is authoritative.
-    state["reconnect_declined_pid"] = player_id
-    state["reconnect_declined_at"] = declined_at
-    return True
-
-
-def _fra_arena_session_state_data(values, flags=None):
-    """Build the FRA EncounterData object used in client setup responses.
-
-    ``flags`` overrides the saved setup flags so the transient StartEncounter
-    session can carry the arena identity without advertising IsPvE/IsPvEArena.
-    """
-    return ("struct", ("Game.Shared.SessionStateEncounterData", [
-        ("SceneTemplateId", "struct", ("Game.Shared.ResourceId", [
-            ("m_Guid", "guid", "00000000-0000-0000-0000-000000000000")])),
-        ("SessionFlags", "enum1", (
-            "Game.Shared.ESessionFlags",
-            values["flags"] if flags is None else int(flags))),
-        ("ArenaInstance", "ulong", values["arena_instance"]),
-        ("ArenaOwner", "ulong", values["arena_owner"]),
-    ]))
 
 
 class HCPHandler(ProfileStreamMixin):
