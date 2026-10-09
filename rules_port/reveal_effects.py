@@ -241,11 +241,16 @@ def reveal_cards(context):
                 scid, card_owner, card_collection, card_type,
                 state=int(row[4] or 0), template_id=row[2], cost=cost,
                 attack=attack, defense=defense, gems=gems, nulling=False)
+            # A deck card is face down to everyone unless a viewer-scoped reveal
+            # says otherwise; without the tag the packet filter nulls the template
+            # id, and the client's coverflow then has no card template to draw.
+            # An AI reveal is shown to everyone (owner 0 above), so the human
+            # player's packet gets the cards.
             if reveal_targets.lower() in ("self", "you", "controller"):
-                # A deck card is face down to everyone unless a viewer-scoped
-                # reveal says otherwise; without the tag the packet filter
-                # nulls the template id, and the client's coverflow then has
-                # no card template to draw.
                 context.game.events[-1]._hand_reveal_viewer_uid = card_owner
+            elif (reveal_targets.lower() == "everyone" and
+                  not context.bstate.get("pvp")):
+                context.game.events[-1]._hand_reveal_viewer_uid = \
+                    context.player_uid
         context.game._push(event)
     return f"revealed {len(uids)}"
