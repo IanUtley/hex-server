@@ -90,6 +90,10 @@ from application.profile_flags import _profile_feature_flags
 from services.reconnect import _reconnect_declined_for_pid, _record_reconnect_decline
 from gamemodes.fra_arena import _fra_arena_setup_values, _fra_arena_session_state_data
 
+from application.champion_defaults import _talent_ability_guid, _RACE_DECK_MAP, _CHAMPION_CLASS_MAP, _CHAMPION_GENDER_MAP, _default_talents_for_champion
+from services.chests import CLIENT_CHEST_UID_BASE, _CHEST_KEEP_COUNTS, ClientChest, _resolve_client_chest, _generate_chest_rewards, _grant_pack_inventory_rewards, _open_client_chests
+from application.rules_port_timing import _rules_port_timing
+
 DEFAULT_PORT = 9933
 _reload_requested = False
 DB_PATH = os.environ.get(
@@ -97,16 +101,6 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "hconnect.db"),
 )
 _NO_PERSISTED_GEM = object()
-
-
-def _rules_port_timing(label, started, **fields):
-    """Emit opt-in timing evidence for a synchronous RulesPort boundary."""
-    if not os.environ.get("HEX_RULES_PORT_TIMING"):
-        return
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    suffix = " ".join(f"{key}={value!r}" for key, value in fields.items())
-    log_req(f"    RulesPort timing {label}: {elapsed_ms:.1f}ms"
-            + (f" {suffix}" if suffix else ""))
 
 
 PROFILE_FEATURE_FLAGS = _profile_feature_flags()
@@ -120,9 +114,6 @@ AI_PHASE_DELAY = 1.0  # pause between AI phase pushes so the client renders them
 # populated from gamedata during build.
 
 
-def _talent_ability_guid(talent_guid: str) -> str | None:
-    """Resolve a champion talent GUID to its actual ability GUID via DB."""
-    return db_talent_data_ability_guid(talent_guid, conn=_db)
 from db import _db, log, log_req, hexdump, set_log_context, card_label
 from debug_runtime import enable_debugpy, trace_rules_port
 from db import (player_id_from_name, player_id_from_steam, display_name_from_identity,
@@ -377,38 +368,6 @@ if os.path.exists(_starter_decks_path):
         _STARTER_DECKS = json.load(f)
     log(f"Loaded {len(_STARTER_DECKS)} starter decks from {_starter_decks_path}")
 
-# ERace enum value -> deck name key
-_RACE_DECK_MAP = {
-    1: "Human", 2: "Elf", 3: "Coyotle", 4: "Orc",
-    5: "Dwarf", 6: "ShinHare", 7: "Vennen", 8: "Necrotic",
-}
-
-_CHAMPION_CLASS_MAP = {
-    1: "Mage", 2: "Warrior", 3: "Cleric", 4: "Rogue",
-    5: "Warlock", 6: "Ranger", 7: "Boat",
-}
-_CHAMPION_GENDER_MAP = {1: "Male", 2: "Female", 3: "Other"}
-
-
-def _default_talents_for_champion(race_val, class_val, gender_val):
-    """Return the authored default talent list for a player template."""
-    race_name = _RACE_DECK_MAP.get(int(race_val))
-    class_name = _CHAMPION_CLASS_MAP.get(int(class_val))
-    gender_name = _CHAMPION_GENDER_MAP.get(int(gender_val))
-    if not race_name or not class_name or not gender_name:
-        return []
-    try:
-        row = db_default_talents(
-            race_name, class_name, gender_name, conn=_db)
-    except sqlite3.Error:
-        return []
-    if not row:
-        return []
-    try:
-        values = json.loads(row[0] or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
-    return [str(value).lower() for value in values] if isinstance(values, list) else []
 
 _PVE_CHAMPION_GUIDS = {
     "Human":    "752ef2e4-8eb3-4e24-93f2-6bf707c0aaff",
@@ -429,157 +388,6 @@ def _dispatch_service(handler, data_type, target, instance, reqid, comp,
         inner_obj, inner_bytes,
         service_uids={"mail": SERVICE_MAIL_UID, "profile": SERVICE_PROFILE_UID},
         log_req=log_req)
-
-
-# The fixed client addresses every treasure chest by the InventoryItem UID the
-# server handed it, which comes from two spaces: ``9000 + treasure_chests.id``
-# for chests delivered as chest_bits / Applied chest rewards, and the
-# ``player_inventory.client_item_uid`` of an InventoryTreasureChest template
-# granted as an item (a store purchase such as the AZ1/Howling Plains campaign
-# booster).  Chest opening must resolve both or the client sees
-# "Invalid Chest ID" for the items it legitimately owns.
-CLIENT_CHEST_UID_BASE = 9000
-_CHEST_KEEP_COUNTS = {"Common": 3, "Uncommon": 2, "Rare": 1,
-                      "Legendary": 0, "Primal": 0}
-
-ClientChest = namedtuple(
-    "ClientChest",
-    "client_uid template_guid set_guid chest_type db_id inventory_row_id")
-
-
-def _resolve_client_chest(user_id, chest_uid):
-    """Resolve a client chest-instance UID to the chest it addresses.
-
-    Returns ``ClientChest`` or ``None`` when the UID is not an unopened chest
-    owned by the player.
-    """
-    try:
-        chest_uid = int(chest_uid)
-    except (TypeError, ValueError):
-        return None
-    if not user_id or chest_uid <= 0:
-        return None
-    # Older store grants derived InventoryItem UIDs from store item IDs.  That
-    # can collide with another inventory instance, so prefer an owned chest
-    # row when resolving a legacy duplicated UID rather than whichever
-    # unrelated row happens to sort first.
-    row = _db.execute(
-        "SELECT i.id, i.template_guid, i.quantity, i.client_item_uid, "
-        "c.set_guid, c.chest_type FROM player_inventory i "
-        "JOIN chest_templates c ON lower(c.guid)=lower(i.template_guid) "
-        "WHERE i.user_id=? AND i.client_item_uid=? AND i.quantity>0 "
-        "ORDER BY i.id LIMIT 1", (user_id, chest_uid)).fetchone()
-    if row:
-        return ClientChest(chest_uid, row[1] or "", row[4] or "",
-                           row[5] or "Promo", None, row[0])
-    if chest_uid >= CLIENT_CHEST_UID_BASE:
-        row = db_get_chest_by_id(
-            chest_uid - CLIENT_CHEST_UID_BASE, user_id, conn=_db)
-        if row:
-            return ClientChest(chest_uid, row[4] or "", row[1] or "",
-                               row[2] or "Common", row[0], None)
-    return None
-
-
-def _generate_chest_rewards(chest, card_templates, rng=None):
-    """Return ``(cards, inventory_rewards)`` for one resolved client chest.
-
-    ``cards`` are ``(guid, name, cost, attack, defense)`` rows and
-    ``inventory_rewards`` are ``(template_guid, kind)`` pairs.  Campaign packs
-    and Crayburn promo chests are authored by template; every other chest falls
-    back to its set booster trimmed to the chest rarity.
-    """
-    rng = rng or random
-    pack_config = CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
-    if pack_config:
-        from gamedata import DEFAULT_RECORD_STORE
-        reward = generate_campaign_pack(
-            card_templates, DEFAULT_RECORD_STORE, rng,
-            pack_config=pack_config)
-        inventory_rewards = [(guid, "equipment")
-                             for guid in reward.equipment_guids]
-        inventory_rewards.extend(
-            (STARDUST_TEMPLATES[rarity.lower()], "stardust")
-            for rarity in reward.stardust_rarities)
-        return list(reward.cards), inventory_rewards
-    cards = _generate_crayburn_chest(card_templates, chest.template_guid)
-    if cards is None:
-        cards = _generate_booster(card_templates, chest.set_guid)
-        keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
-        if len(cards) > keep_count:
-            cards = rng.sample(cards, keep_count)
-    return list(cards), []
-
-
-def _grant_pack_inventory_rewards(handler, inventory_rewards):
-    """Persist and coalesce equipment/Stardust pack rewards.
-
-    Returns ``(template_guid, client_uid, quantity)`` rows to push to the
-    client.  Stardust is additionally recorded in its own ledger.
-    """
-    user_id = handler.user_profile["id"]
-    next_uid = db_next_inventory_client_uid(user_id, conn=_db)
-    updates = {}
-    for template_guid, _kind in inventory_rewards:
-        row = db_inventory_item(user_id, template_guid, conn=_db)
-        candidate_uid = next_uid if not row or not row[2] else 0
-        client_uid = db_upsert_inventory_item(
-            user_id, template_guid, 1, client_item_uid=candidate_uid, conn=_db)
-        if candidate_uid:
-            next_uid += 1
-        if template_guid in STARDUST_TEMPLATES.values():
-            rarity = next(key for key, value in STARDUST_TEMPLATES.items()
-                          if value == template_guid)
-            db_add_stardust(user_id, rarity, 1, conn=_db)
-        updates[template_guid] = (client_uid, int(row[1] or 0) + 1 if row else 1)
-    return [(guid, client_uid, quantity)
-            for guid, (client_uid, quantity) in updates.items()]
-
-
-def _open_client_chests(handler, chest_uids):
-    """Award and consume client-addressed chests without sending packets.
-
-    Returns ``None`` when there is no profile to award.  Otherwise a summary
-    carrying ``cards`` (``card_instance_bits`` tuples), ``card_template_ids``,
-    ``inventory_template_ids``, ``inventory_updates`` as
-    ``(template_guid, client_uid, quantity)``, ``opened`` as
-    ``(template_guid, client_uid, remaining_quantity)`` and ``invalid`` (the
-    UIDs that are unknown, already opened, or not owned by the player).
-    """
-    if not handler.user_profile:
-        return None
-    user_id = handler.user_profile["id"]
-    card_templates = _load_card_templates()
-    summary = {"cards": [], "card_template_ids": [], "inventory_template_ids": [],
-               "inventory_updates": [], "opened": [], "invalid": []}
-    for chest_uid in chest_uids:
-        chest = _resolve_client_chest(user_id, chest_uid)
-        if chest is None:
-            summary["invalid"].append(chest_uid)
-            continue
-        cards, inventory_rewards = _generate_chest_rewards(chest, card_templates)
-        next_id = db_next_card_instance_id(user_id, conn=_db)
-        for offset, (guid, name, cost, atk, def_) in enumerate(cards):
-            instance_id = next_id + offset
-            db_add_card(user_id, guid, conn=_db)
-            db_create_card_instance(user_id, instance_id, guid, conn=_db)
-            summary["card_template_ids"].append(guid)
-            summary["cards"].append((guid, name, cost, atk, def_, instance_id, 0))
-        for guid, item_uid, quantity in _grant_pack_inventory_rewards(
-                handler, inventory_rewards):
-            summary["inventory_template_ids"].append(guid)
-            summary["inventory_updates"].append((guid, item_uid, quantity))
-        if chest.db_id is not None:
-            db_open_chest(chest.db_id, conn=_db)
-            remaining = 0
-        else:
-            remaining = db_consume_inventory_row(
-                chest.inventory_row_id, 1, conn=_db)
-        summary["opened"].append((chest.template_guid, chest_uid, remaining))
-        log_req(f"    Opened chest {chest_uid} "
-                f"({chest.template_guid or chest.set_guid}): {len(cards)} cards, "
-                f"{len(inventory_rewards)} items, remaining={remaining}")
-    return summary
 
 
 class HCPHandler(ProfileStreamMixin):
