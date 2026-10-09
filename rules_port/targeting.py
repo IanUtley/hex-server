@@ -8,7 +8,9 @@ Records filter through the native filter port.
 
 from __future__ import annotations
 
+import copy
 import json
+import threading
 from typing import Any, cast
 
 from rules_port.filters import (records_filter_evaluator,
@@ -404,7 +406,54 @@ def implicit_champion_target(db, session, handler, battle_state, *,
         return None
 
 
+# Projected candidate cards, keyed by (session, card, recursion guard).  Each
+# entry is tagged with the database write version it was projected under and
+# is reused only while no write has happened since (see db.board_write_version).
+# Writes are the only thing that changes the projection inputs we can see;
+# the in-memory battle_state fields that a projection also reads are not
+# covered by that tag, so they must not change without a write.
+_CARD_MEMO = {}
+_CARD_MEMO_LOCK = threading.Lock()
+_CARD_MEMO_LIMIT = 50000
+_PLAIN_SCALARS = (str, int, float, bool, type(None))
+
+
+def _copy_projection(value):
+    """Copy a projected card's JSON-like payload; ``deepcopy`` for anything else.
+
+    ``copy.deepcopy`` on every memo hit cost more than the projection it saved.
+    """
+    if isinstance(value, dict):
+        return {key: _copy_projection(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_projection(item) for item in value]
+    if isinstance(value, _PLAIN_SCALARS):
+        return value
+    return copy.deepcopy(value)
+
+
 def _card(row, battle_state=None, db=None, session_id=None):
+    """Projected candidate card for one row, reused until the next write."""
+    if db is None or session_id is None:
+        return _project_card(row, battle_state, db, session_id)
+    from db import board_write_version
+    version = board_write_version()
+    guarded = bool((battle_state or {}).get(
+        "_rules_port_suppress_card_properties"))
+    key = (int(session_id), int(row[0]), guarded)
+    with _CARD_MEMO_LOCK:
+        entry = _CARD_MEMO.get(key)
+    if entry is not None and entry[0] == version:
+        return _copy_projection(entry[1])
+    card = _project_card(row, battle_state, db, session_id)
+    with _CARD_MEMO_LOCK:
+        if len(_CARD_MEMO) >= _CARD_MEMO_LIMIT:
+            _CARD_MEMO.clear()
+        _CARD_MEMO[key] = (version, _copy_projection(card))
+    return card
+
+
+def _project_card(row, battle_state=None, db=None, session_id=None):
     row_data: Any = tuple(row)
     if len(row_data) >= 19:
         (uid, card_type, location, owner, template_guid, state, attack, defense,

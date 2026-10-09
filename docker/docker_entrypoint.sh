@@ -22,10 +22,17 @@ mkdir -p /tmp
 : > /tmp/proxy_log.txt
 : > /tmp/tournament_log.txt
 : > /tmp/replay_log.txt
+: > /tmp/campaign_editor_log.txt
+
+# The campaign editor is published as a container service. Local restart.sh
+# keeps the same program bound to loopback by default.
+export HEX_CAMPAIGN_EDITOR_HOST="${HEX_CAMPAIGN_EDITOR_HOST:-0.0.0.0}"
+export HEX_CAMPAIGN_EDITOR_PORT="${HEX_CAMPAIGN_EDITOR_PORT:-8765}"
 
 # Validate the gamedata mount and create a persistent database when this is a
-# first deployment. Both services open SQLite only after this has completed.
+# first deployment. Services open SQLite only after this has completed.
 python3 /hex/docker/docker_bootstrap.py
+export HEX_DB_BOOTSTRAPPED=1
 
 echo "[docker] starting Supervisor-managed Hex services"
 exec supervisord -n -c /hex/supervisord.conf

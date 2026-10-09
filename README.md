@@ -89,8 +89,8 @@ You must have HEX: Shards of Fate installed because the server uses the game's
 
 The Docker setup:
 
-  - Runs the game server and web proxy together.
-  - Makes the server available on ports 9933 and 8081.
+  - Runs the game server, web proxy, and campaign editor together.
+  - Makes the server available on ports 9933, 8081, and 8765.
   - Keeps your database and player data in a separate folder so they survive container updates.
   - Allows the server to run on Windows, Linux, or macOS through Docker Desktop.
 
@@ -106,7 +106,7 @@ $HexState = Join-Path $HOME 'HexServer'
 $ClientData = 'C:\Program Files (x86)\Steam\steamapps\common\HEX SHARDS OF FATE\Data'
 New-Item -ItemType Directory -Force $HexState | Out-Null
 docker run --rm `
-  -p 9933:9933 -p 8081:8081 `
+  -p 9933:9933 -p 8081:8081 -p 8765:8765 `
   --user 1001:1001 `
   -v "${HexState}:/hex/state" `
   -v "${ClientData}:/client-data:ro" `
@@ -124,7 +124,7 @@ mkdir -p $HEX_STATE
 chmod 777 -- "$HEX_STATE"
 
 docker run --rm \
-  -p 9933:9933 -p 8081:8081 \
+  -p 9933:9933 -p 8081:8081 -p 8765:8765 \
   --user 1001:1001 \
   -v "${HEX_STATE}:/hex/state" \
   -v "${CLIENT_DATA}:/client-data:ro" \
@@ -132,6 +132,10 @@ docker run --rm \
   -e HEX_GAMEDATA='/client-data/gamedata' \
   ghcr.io/ianutley/hex-server:0.4.3
 ```
+
+The campaign editor is at `http://localhost:8765/` and uses Hex account
+credentials to log in. Admins edit the shared campaign; other accounts can
+simulate it and save progress to their own characters in rules-enabled zones.
 
 You can try using the `latest` tag to be on the bleeding edge.
 
@@ -147,10 +151,11 @@ an image update does not cost you your progress. Watch the container log for:
     — no game data was mounted, so the database kept its old card data. Check
     the `HEX_GAMEDATA` volume before playing.
 
-The first time the data is refreshed, the database is copied once to
-`hconnect.db.preseed.bak` next to it in `$HEX_STATE`, so a bad update can be
-rolled back by replacing `hconnect.db` with that file while the container is
-stopped.
+Before the first client-data refresh that changes the stored snapshot, the
+database is copied once to `hconnect.db.preseed.bak` next to it in `$HEX_STATE`.
+That file is a rollback copy, not startup input; startup never reads it, and
+later refreshes do not overwrite it. To roll back a bad update, replace
+`hconnect.db` with the backup while the container is stopped.
 
 After starting the container, configure the Hex client to connect to the
 computer running the server.
@@ -194,6 +199,9 @@ authentication itself is the behavior under test.
 
 `hconnect_server.py` serves the TCP HConnect protocol on port 9933.
 `proxy.py` serves HTTP compatibility/auth and news endpoints on port 8081.
+`hex-private/campaign/tools/campaign_editor/server.py` serves the campaign
+editor over HTTP on port 8765; publish it with Docker mapping `8765:8765` to
+open `http://localhost:8765/`.
 `db.py` owns the shared SQLite connection while `profile_db.py`, `pve_db.py`,
 `pvp_db.py`, `tournament_db.py`, and `replay_db.py` expose domain persistence
 APIs. `static.py` owns schema creation and server-owned seeds;

@@ -39,7 +39,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RECORDS_DIR = ROOT / "Records"
+DEFAULT_RECORDS_DIR = ROOT / "hex-private" / "Records"
 DEFAULT_DB = ROOT / "hconnect.db"
 ARENA_PREFIX = "Arena_"
 ZERO_GUID = "00000000-0000-0000-0000-000000000000"

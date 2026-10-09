@@ -13,7 +13,7 @@ end, not in a dated work log.
 
 Use the sources in this order:
 
-1. The original client disassembly in `HexClient/` and client `Data/gamedata`
+1. The original client disassembly in `hex-private/HexClient/` and client `Data/gamedata`
    define wire types, event expectations, and metadata when compatibility is
    uncertain.
 2. `RULES.md` defines the server's intended gameplay behavior and records
@@ -28,6 +28,13 @@ Use the sources in this order:
    disagree with a document, fix the implementation and the document together;
    do not silently establish a new rule in code.
 
+The records snapshot and C# disassembly are stored at `hex-private/Records/`
+and `hex-private/HexClient/` in the private `hex-private/` submodule. Clone with
+`--recurse-submodules` or run `git submodule update --init hex-private` before
+using code or tools that read those sources.
+Campaign runtime, authored rules/data, the editor, and its campaign-specific
+asset tools live under `hex-private/campaign/` in the same submodule.
+
 When reverse-engineering a behavior, record the observation, the inferred
 contract, and an acceptance test. A future implementation should be generated
 from the contract rather than from a card-name or endpoint-name guess.
@@ -41,9 +48,16 @@ bash restart.sh
 ```
 
 The server listens on TCP `9933`; the HTTP compatibility/auth proxy listens on
-`8081`. `restart.sh` initializes or upgrades the database, runs one-off
-`migration.py` work when present, compiles the runtime, and starts HConnect,
-the proxy, tournament service, and replay worker.
+`8081`. When the private campaign editor source is present,
+`restart.sh` starts it on `127.0.0.1:8765`. The Docker image runs it on
+container port `8765` when its source is present. `restart.sh` initializes or
+upgrades the database, runs one-off `migration.py` work when present, compiles
+the runtime, and starts HConnect, the proxy, tournament service, replay
+worker, and the available campaign editor.
+The database bootstrap runs the schema and seed pass once before those services
+start; they inherit `HEX_DB_BOOTSTRAPPED=1` and reuse the prepared database.
+Starting a service directly without that marker keeps the schema-initialization
+fallback.
 
 Reload-only modules can be refreshed without restarting HConnect:
 
@@ -51,8 +65,9 @@ Reload-only modules can be refreshed without restarting HConnect:
 kill -USR1 "$(pgrep -f '[h]connect_server.py' | head -n1)"
 ```
 
-Supervisor owns all four long-running processes by default after installing
-the dependencies from `requirements.txt`:
+Supervisor owns the four server processes by default after installing the
+dependencies from `requirements.txt`; `restart.sh` also starts the campaign
+editor under Supervisor when its source is available:
 
 ```bash
 bash restart.sh
@@ -60,10 +75,11 @@ supervisorctl -c supervisord.conf status
 ```
 
 The Docker entrypoint runs the same `supervisord.conf` in the foreground after
-database bootstrap. Supervisor restarts a failed service and writes the
-service logs under `/tmp`; use `supervisorctl` for targeted stop, start, or
-restart operations. Set `HEX_USE_SUPERVISOR=0` when a direct-process restart is
-needed for local troubleshooting.
+database bootstrap. It binds the editor to the container interfaces on port
+`8765`; map that port when launching the container. Supervisor restarts a
+failed service and writes the service logs under `/tmp`; use `supervisorctl`
+for targeted stop, start, or restart operations. Set `HEX_USE_SUPERVISOR=0`
+when a direct-process restart is needed for local troubleshooting.
 
 Use a full restart after changing `hconnect_server.py`, startup wiring,
 encoders, schema initialization, or process configuration. Do not run tests in
@@ -79,31 +95,6 @@ git config core.hooksPath .githooks
 The hook uses the disposable test database created by `tests/run_all.py` and
 does not access the live `hconnect.db`. Run `python3 tests/run_all.py` before
 pushing to `main` for the full suite and golden verification.
-
-The opt-in `tests/tests_card_play_matrix.py` generates one isolated fixture per
-card template and drives its typed cast/trigger path through the native
-resolver. Run `python3 tests/tests_card_play_matrix.py --all --limit 25` for a
-quick sample or `python3 tests/tests_card_play_matrix.py --all` for the full
-catalogue audit. It checks resolution, persisted zones, target handling, and
-wire serialization; it is a smoke/contract matrix, not proof of every
-conditional branch, which still needs focused scenario tests.
-Pass `--contracts` to enable the slower semantic layer, for example
-`python3 tests/tests_card_play_matrix.py --only 'Dread Harvest' --contracts`.
-That mode enables the native per-effect trace, checks typed persisted deltas
-such as zone moves and token creation, and resolves every authored ability
-graph on a fresh metadata-driven fixture. For an authored choice, it resumes
-every choice branch presented by the fixture (including nested choices) on a
-fresh board and reports the branch count. It reports unresolved non-choice
-continuations, unmet conditions, and missing effect postconditions instead of
-treating a no-crash result as proof that the ability worked. Use
-`--ability-text Fateweave` when the mechanic is a keyword rather than a card
-name; this is only a metadata selector, not a rules source. Trigger fixtures
-must use the same typed event payloads as the host projections; for example,
-`GainThresholdEvent` supplies `gain_threshold_color` and the native condition
-layer derives the event TAC expected by authored threshold conditions.
-For a catalogue-wide printed-text/typed-graph triage, run
-`python3 AssetExtraction/audit_card_text.py --json /tmp/card_text_audit.json`;
-that report is a consistency aid, not a replacement for native resolution.
 
 For client-visible failures, read the client log first:
 `/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Hex_Data/output_log.txt`.
@@ -147,7 +138,7 @@ Use hex mcp if installed.
 ```toml
 [mcp_servers.hex]
 command = "/usr/bin/python3"
-args = ["/home/ianutley/Hex/hex_mcp.py"]
+args = ["/location/of/hex_mcp.py"]
 ```
 
 ## 4. Module ownership
@@ -160,6 +151,11 @@ same chooser. The C# CreateCard ability case covers manual troop-summoning
 abilities, while its EndPhase handler passes and its combat QuickAction fallback
 does not select troop-summoning hand cards.
 
+For an authored `CardCostModifier` that reduces cost, the shared Python AI
+targets the eligible hand card with the highest current effective cost. Ties
+retain legal-target order; determine this from ability metadata, not card names
+or display text.
+
 | Module | Owns |
 |---|---|
 | `hconnect_server.py` | TCP framing, connection lifecycle, legacy transaction compatibility, and protocol glue |
@@ -169,12 +165,14 @@ does not select troop-summoning hand cards.
 | `services/auction.py` | retained Auction House API surface; currently an intentional stub |
 | `game_engine.py` | session event types, event construction, and event serialization |
 | `battle_engine.py` | legacy rollback implementation for turn phases, priority, auto-pass, chain state, and phase persistence; normal live gameplay uses `rules_port/` |
-| `rules_port/` | Semantic port of HexClient/Game.Shared rules; owns C#-ordered session/action, phase, priority, chain, combat, transaction, ability, trigger, and target primitives |
+| `rules_port/` | Semantic port of hex-private/HexClient/Game.Shared rules; owns C#-ordered session/action, phase, priority, chain, combat, transaction, ability, trigger, and target primitives |
 | `game_session.py` | session lifecycle and DB-backed session state |
 | `ai.py` | AI turn, card-choice, and combat decisions |
 | `abilities/` | metadata-driven ability parsing, targeting, conditions, effect leaves, and the shared `EffectContext`/`AbilityBuilder` adapters |
 | `ability.py` | compatibility facade for the `abilities/` package |
 | `campaign.py` | campaign protocol and authored campaign state; campaign SQL migration into `pve_db` remains work in progress |
+| `hex-private/campaign/campaign_runtime/` | runs zones whose `hex-private/campaign/campaign_rules/<zone>.json` says `"runtime": "rules"` from the campaign editor's rules (shared rules loader, projection, progress in `campaign_progress`); see `docs/CAMPAIGN.md` "Rules runtime" |
+| `campaign_source.py` | adds the private campaign source root to Python's import path for server modules |
 | `gamemodes/` | mode-specific orchestration (PVP, FRA, tournament) |
 | `static.py` | all schema DDL and server-owned seed/configuration data |
 | `db.py` | one SQLite connection, transactions, and compatibility persistence facade |
@@ -189,7 +187,7 @@ does not select troop-summoning hand cards.
 | `encoder.py` | ObjFmt response and binary event encoding |
 | `proxy.py` | HTTP authentication, payment-link compatibility, news, and static proxy endpoints |
 
-The campaign editor's pure rules engine (`campaign_rules.py`) keeps counters
+The campaign editor's pure rules engine (`hex-private/campaign/campaign_rules.py`) keeps counters
 in each zone's simulation state. Hooks change them with
 `increment_counter: {name, amount}` effects; tags read them with
 `counter(Name)` (at least 1) or `counter(Name,N)` (at least N). Keep dungeon
@@ -529,7 +527,7 @@ cost, target, and transaction identity before mutating state.
   the combat plan renumbers `phase_idx` and strands the client's next pass.
 - Client-derived tables (`card_templates`, `ability_effects`,
   `card_abilities_meta`, `champion_abilities`, encounter scenes/decks, ...) are
-  a projection of `Records/`, and an existing database is never re-seeded:
+  a projection of `hex-private/Records/`, and an existing database is never re-seeded:
   `seed_database` is insert-if-missing and only fresh databases run it. When the
   snapshot moves on, the projection rots silently — a modifier leaf keeps an old
   lossy `param` JSON, a new champion ability never arrives — and a card behaves
@@ -580,7 +578,7 @@ do not duplicate a cache-derived move with an explicit class-50 event.
 
 ## 7. Gamedata and generated data
 
-The original client `Data/gamedata` is the primary source. `Records/` is the
+The original client `Data/gamedata` is the primary source. `hex-private/Records/` is the
 checked-in extraction fallback. The seed pipeline is:
 
 ```text

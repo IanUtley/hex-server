@@ -12,6 +12,10 @@ boundary, rather than a second competing registry.
 
 # fmt: off
 _SERVICE_TABLE = {
+    # Decks
+    2081: ("services.decks", "handle_get_player_decks", {}),
+    2083: ("services.decks", "handle_get_deck_info", {}),
+
     # Mail
     60001: ("services.mail", "handle_send_mail", {}),
     60002: ("services.mail", "handle_receive", {}),

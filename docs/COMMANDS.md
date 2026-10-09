@@ -4,15 +4,14 @@ Commands accept either the historical `!` prefix or `/` prefix. Type in chat
 (any tab works after session room join). `thresholds` is accepted as an alias
 for `threshold`.
 Debug commands require `allowcon` in `HEX_PROFILE_FLAGS`. The public commands
-`!help`/`!commands`, `!version`, `!arena-cleanup`, `!account-cleanup`, and
-`!issue <title>`
-work without it.
+`!help`/`!commands`, `!version`, `!arena-cleanup`, `!account-cleanup`,
+`!collection-fix [apply]`, `!campaign-cleanup`, and `!issue <title>` work without it.
 
 The status column reflects the server command router in `commands.py`.
 “Implemented” means the command is accepted and has a server handler; it may
-still require an active game/session as noted below. Without `allowcon`, `!help`
-and `!commands` list the public commands; with it, they list the full command
-set.
+still require an active game/session as noted below. `!help` and `!commands` are
+never gated: they list only the commands you can use. Developer commands appear
+in that list only when `allowcon` is enabled.
 
 ## Session & Test Controls
 
@@ -122,5 +121,6 @@ Flags can be pipe-separated (`Tapped\|Attacking`) or space-separated. Unknown fl
 | `!version` | `!version` | Implemented | Show the server version; available without `allowcon`. |
 | `!arena-cleanup` | `!arena-cleanup` | Implemented | Clear your Frost Ring Arena run; available without `allowcon`. |
 | `!account-cleanup` | `!account-cleanup` | Implemented | Reset your account to its new-player state; available without `allowcon`. |
+| `!collection-fix` | `!collection-fix [apply]` | Implemented | Report the cards whose collection count differs from your owned card instances; `apply` sets each collection count to its instance count (instances are never changed). Log out and back in afterwards so the client reloads its collection. Available without `allowcon`. |
 | `!issue` | `!issue <title>` | Implemented | Open a prefilled GitHub issue with an active-session snapshot and the newest game-log entries first; duplicate game entries are omitted from the additional player-log context. Lower-priority entries may be omitted to fit the issue link. Available without `allowcon`. |
 | `!commands` | `!commands` | Implemented | Alias for `!help`; command output is sent only to the issuing user. |

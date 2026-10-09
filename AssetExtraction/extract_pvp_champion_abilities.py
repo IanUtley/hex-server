@@ -77,9 +77,9 @@ def _card_modifier_prop(rec):
 
 def main():
     abilities = {_guid_of(r, "m_AbilityTemplateId"): r
-                 for r in _load_jsonl("Records/AbilityTemplate.jsonl")}
+                 for r in _load_jsonl("hex-private/Records/AbilityTemplate.jsonl")}
     effects = {_guid_of(r, "m_TemplateId"): r
-               for r in _load_jsonl("Records/AbilityEffectTemplate.jsonl")}
+               for r in _load_jsonl("hex-private/Records/AbilityEffectTemplate.jsonl")}
 
     db = sqlite3.connect(DB)
     ags = [r[0] for r in db.execute("SELECT ability_guid FROM champion_abilities")]

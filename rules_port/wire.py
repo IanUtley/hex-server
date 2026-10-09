@@ -77,9 +77,15 @@ def normalize_player_transaction(command, player_id, *, current_phase=None,
     """Return one normalized transaction or ``None`` when payload decoding is incomplete."""
     if payload is None:
         payload = getattr(command, "typed_payload", None)
-    phase = _coerce_phase(
-        current_phase if current_phase is not None else
-        getattr(command, "pass_turn_phase", None))
+    pass_turn_phase = getattr(command, "pass_turn_phase", None)
+    if (getattr(command, "is_pass_priority", False) and
+            pass_turn_phase is not None):
+        # Keep the phase the client attached to its pass. Replacing it with
+        # current_phase hides delayed passes that arrive after a phase change.
+        phase = _coerce_phase(pass_turn_phase)
+    else:
+        phase = _coerce_phase(
+            current_phase if current_phase is not None else pass_turn_phase)
     raw = getattr(command, "inner_bytes", b"")
 
     if getattr(command, "is_pass_priority", False):
@@ -243,11 +249,12 @@ def submit_classified_transaction(session, command, player_id, *,
     coerce_player = getattr(session, "coerce_transaction_player_id", None)
     if callable(coerce_player):
         player_id = coerce_player(player_id)
-    # Adopt the durable checkpoint phase before normalization so the intent's
-    # phase matches the phase ``submit_transaction`` will validate against.
+    # Adopt the durable checkpoint phase before normalization. Ordinary
+    # intents inherit it; PassPriority keeps its client-supplied phase so a
+    # delayed pass cannot advance a phase the client has not seen.
     # The AI driver can advance the native port without updating the
-    # compatibility cursor; normalizing against the pre-refresh phase then
-    # rejected a valid pass as a phase mismatch.
+    # compatibility cursor, so refresh first to avoid rejecting valid input
+    # against that stale cursor.
     refresh = getattr(session, "refresh_checkpoint_state", None)
     if callable(refresh):
         refresh()

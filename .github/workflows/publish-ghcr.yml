@@ -47,8 +47,17 @@ jobs:
       packages: write
 
     steps:
+      # The private submodule URL uses `github` as an SSH host alias. Actions
+      # runners need it rewritten to github.com, and the repo needs a
+      # HEX_PRIVATE_DEPLOY_KEY secret with read access to hex-private.
+      - name: Configure private submodule SSH URL
+        run: git config --global url."git@github.com:".insteadOf "git@github:"
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.HEX_PRIVATE_DEPLOY_KEY }}
 
       - name: Read base version
         id: base_version

@@ -1,8 +1,8 @@
 # ABILITIES — Gamedata Ability Fields Reference
 
 This document explains every field in the four `Ability*` record families under
-`Records/`, how those fields map onto the C# classes under
-`HexClient/Assembly-CSharp-firstpass/`, and how the Python ability code under
+`hex-private/Records/`, how those fields map onto the C# classes under
+`hex-private/HexClient/Assembly-CSharp-firstpass/`, and how the Python ability code under
 `abilities/` should read a JSONL entry and implement an ability — its costs,
 its duration, its targets, its conditions — **without hardcoding per-card
 logic**.
@@ -15,7 +15,7 @@ C# file is the authority; this document is a translation aid.
 
 ## 1. File format
 
-Each `Records/Ability*.jsonl` file is a **JSON Lines** file where every record
+Each `hex-private/Records/Ability*.jsonl` file is a **JSON Lines** file where every record
 spans **two physical lines**:
 
 ```
@@ -598,13 +598,13 @@ which the server must reproduce to stay authoritative (§13, §14):
 
 Bootstrap still materializes the extracted data into `hconnect.db` for fast
 runtime indexes and persisted state, but the ability interpreter reads the
-current `Records/` snapshot through `gamedata.RecordStore` at runtime. There is
+current `hex-private/Records/` snapshot through `gamedata.RecordStore` at runtime. There is
 one supported card-data version: Records. The SQLite rows are not a second
 rules implementation. Synthetic fixture abilities are adapted in the tests;
 production resolution rejects an ability absent from Records.
 
 1. **`AssetExtraction/gamedata_seed.py`** reads the client gamedata or
-   `Records/*.jsonl` and inserts the extracted seed rows into a fresh SQLite
+   `hex-private/Records/*.jsonl` and inserts the extracted seed rows into a fresh SQLite
    database. The generated client data is deliberately not copied into
    `static.py`.
 2. **`static.ensure_schema(db)`** seeds the tables when empty:

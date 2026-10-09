@@ -5,7 +5,7 @@ Champion abilities (e.g. Dimmid's "[DIAMOND][DIAMOND]: [BASIC] [2] Target troop
 gets Lifedrain this turn") are not talents, so their effect chains were never
 seeded into ability_effects and resolve_effect returned nothing.  This script
 expands each champion ability's m_AbilityEffectList from
-Records/AbilityTemplate.jsonl + AbilityEffectTemplate.jsonl (same data-driven
+hex-private/Records/AbilityTemplate.jsonl + AbilityEffectTemplate.jsonl (same data-driven
 logic as extract_talents.py) and writes the CHAMPION_ABILITY_EFFECTS block into
 static.py plus upserts ability_effects in the DB.
 
@@ -21,7 +21,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records")
+RECORDS = os.path.join(ROOT, "hex-private", "Records")
 
 BEGIN_MARKER = "### BEGIN CHAMPION ABILITY EFFECT SEED"
 END_MARKER = "### END CHAMPION ABILITY EFFECT SEED"

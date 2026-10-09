@@ -1,4 +1,4 @@
-"""Parity checks for the first direct ``HexClient/Game.Shared`` Python port."""
+"""Parity checks for the first direct ``hex-private/HexClient/Game.Shared`` Python port."""
 
 import os
 import sys

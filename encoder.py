@@ -7,6 +7,8 @@ import json
 import uuid
 from binascii import hexlify
 
+from domain.enums import EGemTypesNew
+
 
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 
@@ -147,13 +149,22 @@ def encode_player_state_coll(buf, sizes, find_type, player_states):
         sizes[eidx] = buf.tell() - f
 
 
+# Client EGemTypesNew.Unknown (1 << 62) is the no-gem value; 0 is not a member.
+GEM_UNKNOWN = EGemTypesNew.Unknown
+
+
 def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx):
-    """Encode one card_instance_bits inline. 6 fields."""
+    """Encode one card_instance_bits inline. 8 DataMember fields.
+
+    CardStats is an empty Dictionary<ECardStatType,int>; SocketedGems is an
+    EGemTypesNew (ulong enum) set to Unknown, the client's no-gem value.
+    Field order follows the client class declaration.
+    """
     f = buf.tell(); sizes.append(0)
     sidx = len(sizes) - 1
     w = lambda s: buf.write(s.encode("utf-8"))
     sep = lambda: buf.write(b";")
-    w(str(idx)); sep(); w(str(sidx)); sep(); w(str(ft("Game.Shared.Domain.card_instance_bits"))); sep(); w("6"); sep()
+    w(str(idx)); sep(); w(str(sidx)); sep(); w(str(ft("Game.Shared.Domain.card_instance_bits"))); sep(); w("8"); sep()
 
     # Id
     f1 = buf.tell(); sizes.append(0)
@@ -170,6 +181,13 @@ def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, i
     sizes[gidx] = buf.tell() - gs
     sizes[tidx] = buf.tell() - f2
 
+    # CardStats: empty Dictionary<ECardStatType,int> (numProps=0, count=0)
+    f3 = buf.tell(); sizes.append(0)
+    w("CardStats"); sep(); w(str(len(sizes)-1)); sep()
+    w(str(ft("System.Collections.Generic.Dictionary`2#Game.Shared.Domain.ECardStatType!System.Int32")))
+    sep(); w("0"); sep(); w("0"); sep()
+    sizes[-1] = buf.tell() - f3
+
     # IsFoil
     f4 = buf.tell(); sizes.append(0)
     w("IsFoil"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
@@ -181,6 +199,17 @@ def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, i
     w("IsExtended"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
     w("0")
     sizes[-1] = buf.tell() - f5
+
+    # SocketedGems: EGemTypesNew enum (ulong) with one value__ child
+    f6 = buf.tell(); sizes.append(0)
+    w("SocketedGems"); sep(); w(str(len(sizes)-1)); sep()
+    w(str(ft("Game.Shared.Mechanics.EGemTypesNew"))); sep(); w("1"); sep()
+    f6v = buf.tell(); sizes.append(0)
+    w("value__"); sep(); w(str(len(sizes)-1)); sep()
+    w(str(ft("System.UInt64"))); sep(); w("0"); sep()
+    w(hexlify(struct.pack("<Q", GEM_UNKNOWN)).decode("ascii")); sep()
+    sizes[-1] = buf.tell() - f6v
+    sizes[-2] = buf.tell() - f6
 
     # IsNotTradeable
     f7 = buf.tell(); sizes.append(0)

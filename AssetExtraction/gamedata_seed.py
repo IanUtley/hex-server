@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - Records parsing still works for JSON
 
 
 DEFAULT_GAMEDATA = "/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Data/gamedata"
-DEFAULT_RECORDS = Path(__file__).resolve().parents[1] / "Records"
+DEFAULT_RECORDS = Path(__file__).resolve().parents[1] / "hex-private" / "Records"
 ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 
 # These AZ1 payouts are not present in SceneData/RewardTemplate records. They
@@ -1036,7 +1036,7 @@ _QUEST_OWNER_FACTIONS = {
     "belarius": "Ardent", "takumi": "Underworld",
 }
 # Quest-start map changes (node visibility) are campaign editor data
-# (campaign_rules/AZ1.json); no quest is seeded with a start hook.
+# (hex-private/campaign/campaign_rules/AZ1.json); no quest is seeded with a start hook.
 _QUEST_START_HOOKS: dict[str, str] = {}
 
 

@@ -13,6 +13,22 @@ import db as _db_layer
 
 RECKONING_FLAG_ARENA_TIER1_PERFECT = "ARENA_TIER1_PERFECT"
 
+CHAT_COMMANDS_MAIL_SUBJECT = "New ! chat commands"
+CHAT_COMMANDS_MAIL_BODY = (
+    "Chat commands\n\n"
+    "Type a command in any chat room, starting with ! (for example !help).\n\n"
+    "!help / !commands — list the commands you can use\n"
+    "!version — show the server version\n"
+    "!arena-cleanup — clear your Frost Ring Arena run\n"
+    "!account-cleanup — reset your account, keeping PvE and alt-art cards\n"
+    "!collection-fix [apply] — report, or with apply correct, collection counts "
+    "that disagree with the cards you own (log out and back in afterwards)\n"
+    "!campaign-cleanup — repair your campaign when a scene has no options\n"
+    "!issue <title> — open a GitHub issue prefilled with diagnostics\n\n"
+    "Developer commands appear in !help only for accounts with the developer "
+    "console enabled."
+)
+
 WELCOME_MAIL_SUBJECT = "Welcome to Hex"
 WELCOME_MAIL_BODY = (
     "Welcome to Hex!\n\n"
@@ -127,6 +143,61 @@ def db_get_or_create_user(name, steam_id=None, conn=None):
     return {"id": uid, "name": name, "gold": new_player.STARTING_GOLD,
             "platinum": new_player.STARTING_PLATINUM, "experience": 0,
             "level": 1, "flags": "{}"}
+
+
+def _collection_count_differences(user_id, conn=None):
+    """Return ``{template_guid: (collection_qty, instance_count)}`` where they differ.
+
+    ``card_instances`` rows are the owned physical cards that decks and the
+    client refer to, so they are the reference; ``collections.quantity`` is
+    the counter the deck builder and the collection view read.
+    """
+    connection = _profile_connection(conn)
+    instances = dict(connection.execute(
+        "SELECT template_guid, COUNT(*) FROM card_instances "
+        "WHERE user_id=? GROUP BY template_guid", (int(user_id),)).fetchall())
+    collected = dict(connection.execute(
+        "SELECT card_template_id, quantity FROM collections WHERE user_id=?",
+        (int(user_id),)).fetchall())
+    differences = {}
+    for guid in set(instances) | set(collected):
+        have = int(collected.get(guid) or 0)
+        owned = int(instances.get(guid) or 0)
+        if have != owned:
+            differences[guid] = (have, owned)
+    return differences
+
+
+def db_collection_count_report(user_id, conn=None):
+    """Return ``(guid, name, collection_qty, instance_count)`` rows that disagree."""
+    connection = _profile_connection(conn)
+    rows = []
+    for guid, (have, owned) in sorted(
+            _collection_count_differences(user_id, conn=connection).items()):
+        name_row = connection.execute(
+            "SELECT name FROM card_templates WHERE guid=?", (guid,)).fetchone()
+        rows.append((guid, name_row[0] if name_row else "", have, owned))
+    return rows
+
+
+def db_fix_collection_counts(user_id, conn=None):
+    """Set each mismatched collection quantity to its instance count.
+
+    Only ``collections`` is written: instance rows are never removed or
+    changed, so no deck loses a card. The caller owns the transaction.
+    Returns the number of templates changed.
+    """
+    connection = _profile_connection(conn)
+    differences = _collection_count_differences(user_id, conn=connection)
+    for guid, (_have, owned) in differences.items():
+        cursor = connection.execute(
+            "UPDATE collections SET quantity=? WHERE user_id=? AND card_template_id=?",
+            (owned, int(user_id), guid))
+        if cursor.rowcount == 0 and owned > 0:
+            connection.execute(
+                "INSERT INTO collections (user_id, card_template_id, quantity) "
+                "VALUES (?, ?, ?)", (int(user_id), guid, owned))
+    return len(differences)
 
 
 def db_reset_account(user_id, conn=None):
@@ -610,6 +681,29 @@ def db_get_inventory(user_id, conn=None):
         (user_id,)).fetchall()]
 
 
+def db_get_inventory_items(user_id):
+    """Return every inventory row with a stable, unique client UID."""
+    items = []
+    with _db_layer.transaction() as connection:
+        rows = connection.execute(
+            "SELECT id, template_guid, quantity, client_item_uid "
+            "FROM player_inventory WHERE user_id=? ORDER BY id",
+            (user_id,)).fetchall()
+        seen_uids = set()
+        for row_id, template_guid, quantity, stored_uid in rows:
+            client_uid = int(stored_uid or 0)
+            if client_uid <= 0 or client_uid in seen_uids:
+                client_uid = db_next_inventory_client_uid(
+                    user_id, conn=connection)
+                connection.execute(
+                    "UPDATE player_inventory SET client_item_uid=? WHERE id=?",
+                    (client_uid, int(row_id)))
+            seen_uids.add(client_uid)
+            items.append((int(row_id), template_guid, int(quantity or 0),
+                          client_uid))
+    return items
+
+
 def db_inventory_item(user_id, template_guid, conn=None):
     """Return one inventory item as ``(id, quantity, client_item_uid)``."""
     return _profile_connection(conn).execute(
@@ -895,6 +989,23 @@ def db_find_user_by_name(name, conn=None):
     return _profile_connection(conn).execute(
         "SELECT id, name FROM users WHERE LOWER(name)=LOWER(?) LIMIT 1",
         (str(name).strip(),)).fetchone()
+
+
+def db_ensure_chat_commands_mail(user_id, conn=None):
+    """Send the chat-commands mail unless this user already has the current text.
+
+    A user who received an older version gets the current one. Returns True
+    when a mail was sent; the caller owns the transaction.
+    """
+    connection = _profile_connection(conn)
+    rows = connection.execute(
+        "SELECT body FROM emails WHERE user_id=? AND subject=?",
+        (int(user_id), CHAT_COMMANDS_MAIL_SUBJECT)).fetchall()
+    if any(row[0] == CHAT_COMMANDS_MAIL_BODY for row in rows):
+        return False
+    db_send_email(int(user_id), CHAT_COMMANDS_MAIL_SUBJECT,
+                  CHAT_COMMANDS_MAIL_BODY, sender="SYSTEM", conn=connection)
+    return True
 
 
 def db_send_email(user_id, subject, body, sender="SYSTEM", gold_delivered=0,

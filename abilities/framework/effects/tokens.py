@@ -158,7 +158,7 @@ def _load_deck_templates():
         return _DECK_TEMPLATES
     _DECK_TEMPLATES = {}
     path = __import__("pathlib").Path(__file__).resolve().parents[3] / \
-        "Records" / "DeckTemplate.jsonl"
+        "hex-private" / "Records" / "DeckTemplate.jsonl"
     if not path.exists():
         return _DECK_TEMPLATES
     try:

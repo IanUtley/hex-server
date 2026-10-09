@@ -1,3 +1,0 @@
-# Extracted client art and layout; rebuild with
-# python3 AssetExtraction/extract_campaign_editor_assets.py
-generated/

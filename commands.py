@@ -2,6 +2,7 @@
 
 All commands receive the handler instance (self) for DB access, event sending, etc.
 """
+import inspect
 import struct as _struct
 import json as _json
 import os as _os
@@ -18,6 +19,19 @@ import campaign
 from encoder import encode_datawrapper, compress_gzip, encode_sync_event
 from db import (get_log_level, latest_session_log_path_for_players,
                 player_log_path, session_log_path)
+
+
+_HANDLER_MIXIN_MODULES = (
+    "application.profile_stream",
+    "application.card_play",
+    "application.card_state",
+    "application.combat",
+    "application.chain",
+    "application.turn_flow",
+    "application.pending_choices",
+    "application.transactions",
+    "gamemodes.fra_battle",
+)
 
 
 def reload_runtime_modules():
@@ -45,25 +59,31 @@ def reload_runtime_modules():
     import tournament_db as tournament_db_module
     import application.dispatcher as application_dispatcher
     import application.player_transactions as player_transactions
-    import gamedata.play_plan as play_plan
     import rules_port.wire as rules_wire
     import rules_port.runtime_adapter as rules_runtime
     import rules_port.transactions as rules_transactions
+    import domain.constants as domain_constants
 
     # Reload foundational modules first, then all already-loaded modules in
     # the application/runtime packages.  Filtering sys.modules avoids
     # importing optional services solely because SIGUSR1 was received.
+    # ``gamedata`` is deliberately not reloaded: the Records store keeps
+    # objects built from the old classes, and reloading the classes under it
+    # mixes the two generations (nested modifier fields stop matching their
+    # dict shape, so heals lose their input variable).  Records changes need
+    # a full restart.
     groups = [
+        [domain_constants],
         [dbm],
         [pvp_db_module, profile_db_module, pve_db_module, chat_db_module,
          replay_db_module, tournament_db_module, campaign_rules_module],
         [game_engine_module, game_session_module, battle_engine_module,
-         application_dispatcher, player_transactions, play_plan, campaign],
+         application_dispatcher, player_transactions, campaign],
         [rules_transactions, rules_runtime, rules_wire],
         [aim, te, ts, tg, sch, arena_service, mail_service, en],
     ]
     prefixes = ("abilities", "rules_port", "application", "services",
-                "gamemodes", "gamedata")
+                "gamemodes", "campaign_runtime")
     loaded = {
         module.__name__: module
         for module in _sys.modules.values()
@@ -101,15 +121,24 @@ def reload_runtime_modules():
     # change methods already copied onto the live handler class. Rebind those
     # methods explicitly so SIGUSR1 fixes profile-stream code without a full
     # socket restart.
-    profile_stream_module = importlib.import_module("application.profile_stream")
+    # The same applies to the HCPHandler mixins (card play, combat, transactions ...)
+    # and to the legacy service table: rebind their functions onto the live handler.
     handler_cls = getattr(hc, "HCPHandler", None)
-    mixin_cls = getattr(profile_stream_module, "ProfileStreamMixin", None)
     rebound = 0
-    if handler_cls is not None and mixin_cls is not None:
-        for name, value in vars(mixin_cls).items():
-            if not name.startswith("__") and callable(value):
-                setattr(handler_cls, name, value)
-                rebound += 1
+    for mixin_module in _HANDLER_MIXIN_MODULES:
+        module = importlib.import_module(mixin_module)
+        for _cls_name, mixin_cls in inspect.getmembers(module, inspect.isclass):
+            if mixin_cls.__module__ != module.__name__ or not _cls_name.endswith("Mixin"):
+                continue
+            if handler_cls is not None:
+                for name, value in vars(mixin_cls).items():
+                    if not name.startswith("__") and callable(value):
+                        setattr(handler_cls, name, value)
+                        rebound += 1
+    legacy_table = importlib.import_module("services.legacy_handlers").LEGACY_HANDLERS
+    live_table = getattr(hc, "LEGACY_HANDLERS", None)
+    if live_table is not None:
+        live_table.update(legacy_table)
     for name, value in {
         "tournament_server": ts,
         "campaign": campaign,
@@ -127,7 +156,7 @@ def reload_runtime_modules():
     }.items():
         setattr(hc, name, value)
     return (f"Reloaded {len(reloaded)} runtime modules + {rebound} "
-            "ProfileStream methods + tournament globals rebound: "
+            "mixin methods + tournament globals rebound: "
             + ", ".join(reloaded))
 
 
@@ -221,6 +250,34 @@ def _account_cleanup_command(handler):
         "gold": 10000, "platinum": 10000, "experience": 0,
         "level": 1, "flags": "{}"})
     return "Account reset (PvE and alt-art cards kept)"
+
+
+_COLLECTION_FIX_REPORT_LIMIT = 20
+
+
+def _collection_fix_command(handler, args=()):
+    """Report, or with ``apply``, realign collection counts to owned instances."""
+    from profile_db import db_collection_count_report, db_fix_collection_counts
+    user_id = int(handler.user_profile["id"])
+    db = hconnect_server._db
+    rows = db_collection_count_report(user_id, conn=db)
+    if not rows:
+        return "Collection counts already match your owned card instances."
+    extra = sum(max(0, have - owned) for _g, _n, have, owned in rows)
+    missing = sum(max(0, owned - have) for _g, _n, have, owned in rows)
+    if not any(str(arg).lower() == "apply" for arg in args):
+        lines = [f"{len(rows)} template(s) disagree: {extra} extra collection "
+                 f"copies, {missing} missing."]
+        for guid, name, have, owned in rows[:_COLLECTION_FIX_REPORT_LIMIT]:
+            lines.append(f"  {name or guid[:8]}: collection {have} -> {owned}")
+        if len(rows) > _COLLECTION_FIX_REPORT_LIMIT:
+            lines.append(f"  ... and {len(rows) - _COLLECTION_FIX_REPORT_LIMIT} more")
+        lines.append("Run !collection-fix apply to correct them.")
+        return "\n".join(lines)
+    changed = db_fix_collection_counts(user_id, conn=db)
+    db.commit()
+    return (f"Corrected {changed} template(s). Log out and back in so the "
+            "client reloads its collection.")
 
 
 _ERROR_LOG_PATHS = (
@@ -610,46 +667,51 @@ def _issue_command(handler, title):
             f"[url={issue_url}]Open GitHub issue[/url]")
 
 
-def _public_help_command():
-    return ("Available commands: !help, !commands, !version, !arena-cleanup, "
-            "!account-cleanup, !campaign-cleanup, !issue <title>")
+_PUBLIC_HELP_LINES = (
+    "!help / !commands — list the commands you can use",
+    "!version — show the server version",
+    "!arena-cleanup — clear your Frost Ring Arena run",
+    "!account-cleanup — reset your account, keeping PvE and alt-art cards",
+    "!collection-fix [apply] — match collection counts to owned card instances",
+    "!campaign-cleanup — repair your campaign when a scene has no options",
+    "!issue <title> — open a prefilled GitHub issue with session diagnostics",
+)
+
+_DEVELOPER_HELP_LINES = (
+    "!game_end victory|defeat — end the campaign battle (test win/loss)",
+    "!encounter <name> — start a named campaign encounter",
+    "!challenge [opponent] — create a duel challenge",
+    "!reload — reload runtime modules",
+    "!hand — list cards in hand (name [id])",
+    "!aihand — reveal the AI hand",
+    "!playable [id|name ...] — set golden outlines (no args = all)",
+    "!gencard <name> — generate a copy of a card template to your hand",
+    "!addcard <name|id> — draw the next copy of that card from your deck",
+    "!threshold[/thresholds] [me|opp] C B R S W D — set 6 threshold counts",
+    "!resource [/resource] [me|opp] <current> <maximum> — set resources",
+    "!charge [me|opp] <N> — set champion charges",
+    "!spellpoints [me|opp] <N> — set champion spell points",
+    "!health [me|opp] <N> — set champion health",
+    "!pass — advance turn phase",
+    "!phase <Name> — jump to phase",
+    "!draw N — draw N cards",
+    "!discard — discard a random card from your hand",
+    "!top <id|name> — put a card from your hand on top of your deck",
+    "!zones — list cards by zone",
+    "!move <id> <zone> — move card to zone",
+    "!state <id> <flags> — set card state (Tapped|Attacking|...)",
+    "!attr/!attributes <id> <flags> — set card attributes (Flight|Speed|...)",
+    "!update <id> — resend CardUpdated for a card",
+)
 
 
-def _full_help_lines():
-    """Return the developer command help without requiring a game session."""
-    return [
-        "=== Commands ===",
-        "!version — show the server version",
-        "!arena-cleanup — clear your Frost Ring Arena run",
-        "!account-cleanup — reset your account, keeping PvE and alt-art cards",
-        "!campaign-cleanup — repair your campaign when a scene has no options",
-        "!issue <title> — open a prefilled GitHub issue with session diagnostics",
-        "!game_end victory|defeat — end the campaign battle (test win/loss)",
-        "!encounter <name> — start a named campaign encounter",
-        "!challenge [opponent] — create a duel challenge",
-        "!reload — reload runtime modules",
-        "!hand — list cards in hand (name [id])",
-        "!aihand — reveal the AI hand",
-        "!playable [id|name ...] — set golden outlines (no args = all)",
-        "!gencard <name> — generate a copy of a card template to your hand",
-        "!addcard <name|id> — draw the next copy of that card from your deck",
-        "!threshold[/thresholds] [me|opp] C B R S W D — set 6 threshold counts",
-        "!resource [/resource] [me|opp] <current> <maximum> — set resources",
-        "!charge [me|opp] <N> — set champion charges",
-        "!spellpoints [me|opp] <N> — set champion spell points",
-        "!health [me|opp] <N> — set champion health",
-        "!pass — advance turn phase",
-        "!phase <Name> — jump to phase",
-        "!draw N — draw N cards",
-        "!discard — discard a random card from your hand",
-        "!top <id|name> — put a card from your hand on top of your deck",
-        "!zones — list cards by zone",
-        "!move <id> <zone> — move card to zone",
-        "!state <id> <flags> — set card state (Tapped|Attacking|...)",
-        "!attr/!attributes <id> <flags> — set card attributes (Flight|Speed|...)",
-        "!update <id> — resend CardUpdated for a card",
-        "!help / !commands — this list",
-    ]
+def _help_lines(developer_enabled):
+    """Return the commands this user can run: public ones always, developer
+    commands only when the ``allowcon`` profile flag is enabled."""
+    lines = ["=== Commands ===", *_PUBLIC_HELP_LINES]
+    if developer_enabled:
+        lines += ["=== Developer commands (allowcon) ===", *_DEVELOPER_HELP_LINES]
+    return lines
 
 
 def handle_command(handler, cmd: str, room: str, username: str) -> str:
@@ -665,6 +727,11 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "account-cleanup":
         try:
             return _account_cleanup_command(handler)
+        except Exception as exc:
+            return f"Error: {exc}"
+    if action == "collection-fix":
+        try:
+            return _collection_fix_command(handler, parts[1:])
         except Exception as exc:
             return f"Error: {exc}"
     if action == "campaign-cleanup":
@@ -689,28 +756,16 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
         deleted, cid = campaign.restart_champion_campaigns(db, champ[0])
         return (f"Deleted {deleted} campaign(s) for champion {champ[0]}; "
                 f"new starter campaign {cid}. Re-select the champion to reload.")
-    if action == "campaign_rules":
-        import campaign_shadow
-        sub = (parts[1].lower() if len(parts) > 1 else "status")
-        if sub in ("on", "off"):
-            campaign_shadow.set_enabled(sub == "on")
-        elif sub == "reset":
-            campaign_shadow.reset()
-        elif sub not in ("status", "diff"):
-            return "Usage: !campaign_rules [on|off|status|diff|reset]"
-        return campaign_shadow.report_text()
     if action == "issue":
         raw_command = cmd.strip()
         title = raw_command[len(parts[0]):].strip() if parts else ""
         return _issue_command(handler, title)
-    if action in ("help", "commands") and "allowcon" not in getattr(
-            hconnect_server, "PROFILE_FEATURE_FLAGS", ()):
-        return _public_help_command()
     # Help is informational and must remain available from chat while the
-    # client is on the panorama.  It should not fall through to the active
-    # game/session gate used by state-mutating debug commands.
+    # client is on the panorama.  It is never gated: it lists only the
+    # commands this user can run.
     if action in ("help", "commands"):
-        return "\n".join(_full_help_lines())
+        developer = "allowcon" in getattr(hconnect_server, "PROFILE_FEATURE_FLAGS", ())
+        return "\n".join(_help_lines(developer))
     # The profile flag controls both the client's console UI and the server
     # endpoint.  Do not rely on the client hiding the backtick console: a
     # client can still submit a chat command directly.
@@ -761,7 +816,7 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
         return "No active game"
 
     pl_t = game_engine.UID.make(244, int(handler.client_reck_id))
-    ai_t = game_engine.UID.make(3, 1000)
+    ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
     # Tournament game_cards are keyed by the ServicePlayer/reckoning id;
     # campaign/practice cards use the local profile id.  Debug commands must
     # use the same owner key as the active game or they can create a phantom
@@ -1072,7 +1127,7 @@ def _push_battle_game_end(handler, session, won):
     the 3055 channel so the client shows the Victory/Defeat screen.
     """
     pl_uid = game_engine.UID.make(244, int(handler.client_reck_id))
-    ai_uid = game_engine.UID.make(3, 1000)
+    ai_uid = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
     if won:
         push_battle_game_end(handler, session, [pl_uid], [ai_uid])
     else:
@@ -1153,7 +1208,7 @@ def _push_card_update(handler, db, session, pl_t, card_id, user_id=None, **overr
                 gem_type = int(gems.get(str(instance_id), 0)) if gems else 0
             except: pass
     scid = game_engine.SessionCardId(game_engine.UID(card_id))
-    ai_t = game_engine.UID.make(3, 1000)
+    ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
     game = game_engine.Game(session.session_id, pl_t, ai_t)
     game.card_defs[scid] = game_engine.CardDef("Card", ct, cost, atk, def_, shards, abilities)
     kwargs = {'attack': atk, 'defense': def_, 'cost': cost, 'template_id': tpl_guid, 'gems': gem_type}
@@ -1633,7 +1688,7 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
         return f"Generated card: {name} ({tpl_guid})"
 
     elif action == "help":
-        lines = _full_help_lines()
+        lines = _help_lines(True)
         for line in lines:
             _send_chat(handler, line, room, username)
         return ""

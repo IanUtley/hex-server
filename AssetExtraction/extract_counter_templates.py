@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Seed card_counter_templates (counter template GUID -> name) from
-Records/CardCounterTemplate.jsonl, data-driven.
+hex-private/Records/CardCounterTemplate.jsonl, data-driven.
 
 The client renders counters from CardUpdated.CounterTemplates (ResourceIds) +
 CounterCounts (ints), keyed by the gamedata CardCounterTemplate — e.g.
@@ -20,7 +20,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "CardCounterTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "CardCounterTemplate.jsonl")
 
 BEGIN_MARKER = "CARD_COUNTER_TEMPLATES = ["
 END_MARKER = "# === END CARD COUNTER TEMPLATE SEED ==="
@@ -54,7 +54,7 @@ def load_rows():
 def main():
     rows = load_rows()
     lines = ["# CardCounterTemplate rows: (template_id, name, description). "
-             "Generated from Records/CardCounterTemplate.jsonl.",
+             "Generated from hex-private/Records/CardCounterTemplate.jsonl.",
              "CARD_COUNTER_TEMPLATES = ["]
     for cid, name, desc in rows:
         lines.append(f"    ({cid!r}, {name!r}, {desc!r}),")

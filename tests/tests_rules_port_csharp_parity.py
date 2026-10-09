@@ -20,12 +20,12 @@ from rules_port import AbilityRegistry, Chain
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLIENT_RNG = os.path.join(ROOT, "HexClient", "Assembly-CSharp-firstpass",
+CLIENT_RNG = os.path.join(ROOT, "hex-private", "HexClient", "Assembly-CSharp-firstpass",
                           "MultiplyWithCarryRng.cs")
 PROBE = os.path.join(os.path.dirname(__file__), "csharp_rules_rng_probe.cs")
 COMBAT_PROBE = os.path.join(os.path.dirname(__file__), "csharp_rules_combat_probe.cs")
 CHAIN_PROBE = os.path.join(os.path.dirname(__file__), "csharp_rules_chain_probe.cs")
-MECHANICS = os.path.join(ROOT, "HexClient", "Assembly-CSharp-firstpass", "Game",
+MECHANICS = os.path.join(ROOT, "hex-private", "HexClient", "Assembly-CSharp-firstpass", "Game",
                            "Shared", "Mechanics")
 CLIENT_COMBAT = os.path.join(MECHANICS, "Combat.cs")
 CLIENT_CHAIN = os.path.join(MECHANICS, "Chain.cs")

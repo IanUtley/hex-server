@@ -4,7 +4,9 @@ import copy
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+CAMPAIGN_ROOT = os.path.join(ROOT, "hex-private", "campaign")
+sys.path[:0] = [ROOT, CAMPAIGN_ROOT]
 
 import campaign_rules as cr
 
@@ -142,7 +144,7 @@ def test_validate_reports_unknown_conditions_and_dangling_flags():
 
 def test_generated_az1_rules_reproduce_the_opening():
     """The importer's AZ1 draft: Belarius grants Tamed and the Ardent route."""
-    path = os.path.join(os.path.dirname(__file__), "..", "campaign_rules", "AZ1.json")
+    path = os.path.join(CAMPAIGN_ROOT, "campaign_rules", "AZ1.json")
     if not os.path.exists(path):
         print("SKIP generated AZ1 rules not present")
         return
@@ -318,8 +320,7 @@ def test_editor_saves_tags_to_campaign_files():
     import sqlite3
     import tempfile
     from pathlib import Path
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "tools", "campaign_editor"))
+    sys.path.insert(0, os.path.join(CAMPAIGN_ROOT, "tools", "campaign_editor"))
     import catalog
     import editing
     db = sqlite3.connect(":memory:")
@@ -375,7 +376,7 @@ def test_or_groups_and_generated_crayburn_rules():
     assert cr.split_outcome([["outcome:fail", "faction(Ardent)"],
                              ["outcome:fail", "faction(Underworld)"]]) == \
         ("fail", [["faction(Ardent)"], ["faction(Underworld)"]])
-    path = os.path.join(os.path.dirname(__file__), "..", "campaign_rules", "crayburn.json")
+    path = os.path.join(CAMPAIGN_ROOT, "campaign_rules", "crayburn.json")
     if not os.path.exists(path):
         print("SKIP generated Crayburn rules not present")
         return

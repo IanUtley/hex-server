@@ -1033,7 +1033,14 @@ def run_ai_turn(handler, session, pl_t, ai_t, battle_state, start_idx=0):
         # carry the human UID in its ``ai_uid`` field after a reconnect; do
         # not let that identity enter the native scheduler as the AI.
         if not (session.session_name or "").startswith("tourney-"):
-            canonical_ai = game_engine.UID.make(3, 1000)
+            ai_uid_types = (game_engine.LEGACY_AI_PLAYER_UID_TYPE,
+                            game_engine.SERVICE_AI_UID_TYPE)
+            canonical_ai = next(
+                (participant for participant in native_port.player_ids
+                 if int(getattr(participant, "uid64", participant)) & 0xFF
+                 in ai_uid_types),
+                game_engine.UID.make(
+                    game_engine.SERVICE_AI_UID_TYPE, 1000))
             if int(getattr(ai_t, "uid64", ai_t)) != int(canonical_ai.uid64):
                 log_req(
                     f"    AI driver corrected stale participant {ai_t!r} "
@@ -2519,7 +2526,8 @@ def ai_choose_attackers(handler, evaluator, eligible, blockers, *,
     # attackers' no-block damage with the opponent's currently legal
     # counterattack. This lets a 2-power troop and a 1-power troop commit
     # together even when neither would be selected by an individual attacker
-    # evaluation.
+    # evaluation. Like the C# combat solver, the set must remain profitable
+    # after legal blockers are assigned and attacker losses are valued.
     race_attackers = [
         card for card in eligible
         if card.effective_attack(in_play=True) > 0 or
@@ -2529,7 +2537,9 @@ def ai_choose_attackers(handler, evaluator, eligible, blockers, *,
         max(0, int(card.effective_attack(in_play=True) or 0))
         for card in race_attackers)
     counterattack = _aieval_ready_counterattack_power(evaluator)
-    if face_damage > counterattack:
+    if (face_damage > counterattack and
+            _aieval_attack_set_value(
+                evaluator, race_attackers, blockers) > 0):
         return [int(card.card_uid) for card in race_attackers], \
             "favorable_damage_race"
 

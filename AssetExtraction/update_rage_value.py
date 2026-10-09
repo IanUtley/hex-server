@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill card_templates.rage_value from Records/CardTemplate.jsonl
+"""Backfill card_templates.rage_value from hex-private/Records/CardTemplate.jsonl
 (m_RageValue) — the card's printed Rage X, used by the statics layer for the
 "when this attacks it gets +X ATK" combat bonus.
 
@@ -19,7 +19,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "CardTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "CardTemplate.jsonl")
 
 BEGIN_MARKER = "CARD_TEMPLATES = ["
 

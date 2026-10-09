@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-CS_ROOT = os.path.join(ROOT, "HexClient", "Assembly-CSharp-firstpass")
+CS_ROOT = os.path.join(ROOT, "hex-private", "HexClient", "Assembly-CSharp-firstpass")
 ABILITY_DIR = os.path.join(CS_ROOT, "Game", "Shared", "Mechanics", "Abilities")
 BASE_FILES = [
     os.path.join(CS_ROOT, "Reckoning", "Game", "AbilityEffectTemplate.cs"),

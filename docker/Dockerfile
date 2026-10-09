@@ -1,8 +1,9 @@
 # Hex TCG private server — container image for AWS Fargate.
 #
-# Runs four processes on one task:
+# Runs the game services and optional campaign editor on one task:
 #   hconnect_server.py  -> TCP 9933  (HConnect game protocol)
 #   proxy.py            -> TCP 8081  (Steam auth / collection HTTP / news)
+#   campaign editor     -> HTTP 8765 (campaign editing UI)
 #   gamemodes/tournament_server.py  (tournament pool/refill scheduler)
 #   replay_server.py                 (replay artifact worker)
 #
@@ -27,7 +28,7 @@ COPY *.py /hex/
 COPY AssetExtraction/ /hex/AssetExtraction/
 COPY abilities/ /hex/abilities/
 COPY application/ /hex/application/
-COPY campaign_chains/ /hex/campaign_chains/
+COPY hex-private/campaign/ /hex/hex-private/campaign/
 COPY domain/ /hex/domain/
 COPY gamedata/ /hex/gamedata/
 COPY gamemodes/ /hex/gamemodes/
@@ -38,6 +39,7 @@ COPY tests/ /hex/tests/
 # tournament scheduler used by the running services.
 COPY docker/docker_bootstrap.py /hex/docker/docker_bootstrap.py
 COPY docker/healthcheck.py /hex/docker/healthcheck.py
+COPY docker/campaign_editor_launcher.sh /hex/docker/campaign_editor_launcher.sh
 COPY supervisord.conf /hex/supervisord.conf
 COPY run_hconnect.sh /hex/run_hconnect.sh
 # hex-private/Records and generated starter-deck data are materialized into
@@ -47,20 +49,27 @@ COPY news/ /hex/news/
 COPY LICENSE /hex/LICENSE
 COPY VERSION /hex/VERSION
 
-# The documented invocation runs the container as UID 1001.  Bootstrap may
-# materialize hex-private/Records and generated starter decks, so those
-# image-local directories must be writable by that runtime identity.
+# Editor art is generated at startup from the client install. Mount the Hex
+# install root (the folder that holds Hex_Data and AssetBundles) at /client-data.
+# The container runs as UID 1001.
+# The documented invocation runs the container as UID 1001. Bootstrap may
+# materialize Records and starter decks, and the editor writes campaign data
+# and rules, so these image-local directories must be writable by that user.
 RUN mkdir -p /hex/hex-private/Records /hex/generated \
-    && chown -R 1001:1001 /hex/hex-private/Records /hex/generated
+        /hex/hex-private/campaign/tools/campaign_editor/generated \
+    && chown -R 1001:1001 /hex/hex-private/Records /hex/generated \
+        /hex/hex-private/campaign/tools/campaign_editor/generated \
+    && chown -R 1001:1001 /hex/hex-private/campaign/campaign_data \
+        /hex/hex-private/campaign/campaign_rules
 
 # Fail the image build early if a copied server, extractor, or test module has
 # a syntax error.
 RUN python3 -m compileall -q /hex
 
-# Ports: 9933 = HConnect game server, 8081 = HTTP proxy.
-EXPOSE 9933 8081
+# Ports: 9933 = HConnect, 8081 = HTTP proxy, 8765 = campaign editor.
+EXPOSE 9933 8081 8765
 
-# Docker/ECS can replace the task when either public service stops accepting
+# Docker/ECS can replace the task when a public service stops accepting
 # connections. Supervisor still handles ordinary process exits internally.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD ["python3", "/hex/docker/healthcheck.py"]

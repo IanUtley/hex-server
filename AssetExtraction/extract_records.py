@@ -1,4 +1,4 @@
-"""Extract EVERY record from the gamedata into Records/ for searchable access.
+"""Extract EVERY record from the gamedata into hex-private/Records/ for searchable access.
 
 The gamedata (Data/gamedata, gzipped) is a single concatenation of sections
 delimited by:
@@ -8,11 +8,11 @@ delimited by:
 We split it into sections, split each section into its records, and write one
 JSON Lines file per section:
 
-    Records/<SectionName>.jsonl
+    hex-private/Records/<SectionName>.jsonl
 
 Each line is `json.dumps(record_text)` — the RAW TDF/JSON-ish record text as a
 JSON string, so every line is valid JSON and grep-able. A companion
-Records/_index.md lists the sections + record counts.
+hex-private/Records/_index.md lists the sections + record counts.
 
 Run from the repo root:
     python3 AssetExtraction/extract_records.py
@@ -28,7 +28,7 @@ GAMEDATA = os.environ.get(
     "GAMEDATA",
     "/mnt/d/SteamLibrary/steamapps/common/HEX SHARDS OF FATE/Data/gamedata",
 )
-RECORDS_DIR = os.environ.get("RECORDS_DIR", "Records")
+RECORDS_DIR = os.environ.get("RECORDS_DIR", "hex-private/Records")
 
 _SECTION = re.compile(
     re.escape("$$$---$$$") + r"\s*([A-Za-z0-9_]+)\s*" + re.escape("$$--$$")

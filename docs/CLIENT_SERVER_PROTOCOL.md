@@ -167,7 +167,7 @@ priority messages on their own.
 ### Live client flow path inventory (U1)
 
 This section joins the server request/event path to the fixed C# client path.
-The wire source files are under `HexClient/Assembly-CSharp-firstpass/` unless
+The wire source files are under `hex-private/HexClient/Assembly-CSharp-firstpass/` unless
 noted otherwise.
 
 **Transport and dispatch path.** The client builds a 3029 request from

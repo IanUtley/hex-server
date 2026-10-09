@@ -306,10 +306,11 @@ AI decisions are server-side. The AI must take legal actions, publish the same
 authoritative state/events as a player, and respect waits that require a human
 transaction. Campaign encounter metadata may select Aggressive, Comfortable,
 or Defensive behavior; it must not be replaced by a card-name guess.
-Attack selection should consider a favorable damage race as a group: when
-eligible attackers' combined unblocked damage exceeds the opponent's legal
-ready-troop attack power, prefer attacking with the positive-power group. The
-client's `MinimumXValue` applies to X-cost card play, not troop attack power.
+Attack selection should score legal blocker assignments for the attacker
+group, including the value of attackers those blockers can kill. A favorable
+no-block damage race may select a group only when its block-aware combat value
+is positive. The client's `MinimumXValue` applies to X-cost card play, not
+troop attack power.
 
 Tournament registration, matching, results, forfeit, and participant-scoped
 history are separate domain operations. Auction remains an unimplemented API

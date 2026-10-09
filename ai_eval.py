@@ -1,5 +1,5 @@
 """Data-driven AI hand evaluator, ported from the client's
-HexClient/Assembly-CSharp-firstpass/Game/Shared/AI/AICardEvaluator.cs +
+hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared/AI/AICardEvaluator.cs +
 AIHints.cs + AIPersonality.cs.
 
 The client AI evaluates every card in hand (playability, value, buff/removal
@@ -16,9 +16,14 @@ how the client's TemplateManager feeds AICardEvaluator.
 import json
 import math
 import random
+from contextvars import ContextVar
 
 from db import _db, log_req
 from domain.enums import ECardAttributes, ECardShards
+
+
+_ACTIVE_TARGET_CANDIDATE_CACHE = ContextVar(
+    "ai_eval_target_candidate_cache", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1138,6 +1143,18 @@ class CardEvaluator:
         """AIPlayableParams: True / NeedsResources / False."""
         if card is None:
             return "False"
+        # Target legality is queried more than once while checking a targeted
+        # action (need-target, has-legal-target, then select-target). Keep a
+        # cache only for this synchronous, read-only eligibility check so a
+        # later board mutation cannot reuse stale candidates. ContextVar keeps
+        # the cache out of shared evaluator and process state.
+        token = _ACTIVE_TARGET_CANDIDATE_CACHE.set({})
+        try:
+            return self._is_playable_in_target_cache_scope(card)
+        finally:
+            _ACTIVE_TARGET_CANDIDATE_CACHE.reset(token)
+
+    def _is_playable_in_target_cache_scope(self, card):
         cost = card.cost
         if card.has_variable_cost and not card.is_troop():
             cost += max(1, card.variable_cost_multiplier)
@@ -1771,6 +1788,7 @@ class CardEvaluator:
         if self.player_champ_uid is not None:
             champions.append((int(self.player_champ_uid), self.player_db_id,
                               "Player", self.player_health))
+        target_cache = _ACTIVE_TARGET_CANDIDATE_CACHE.get()
         slots = []
         for target_index, (template_id, target) in enumerate(
                 zip(template_ids, target_rows)):
@@ -1786,13 +1804,24 @@ class CardEvaluator:
             # turn APIs pass its wire UID (UID(type=3, instance=1000)).
             # Passing that wrapper through makes the filter tree fail when it
             # compares IsControlledBy/IsNotControlledBy ownership.
-            candidates = legal_targets(
-                connection, self.session.session_id, self.ai_owner_id,
-                str(template_id),
-                card.card_uid,
-                both_players=target_uses_both_players(
-                    connection, str(template_id)),
-                champions=champions, battle_state=self.bstate)
+            both_players = target_uses_both_players(
+                connection, str(template_id))
+            cache_key = (
+                id(connection), int(self.session.session_id),
+                int(self.ai_owner_id), str(template_id).lower(),
+                int(card.card_uid), bool(both_players), tuple(champions),
+                id(self.bstate))
+            if target_cache is not None and cache_key in target_cache:
+                candidates = target_cache[cache_key]
+            else:
+                candidates = legal_targets(
+                    connection, self.session.session_id, self.ai_owner_id,
+                    str(template_id), card.card_uid,
+                    both_players=both_players, champions=champions,
+                    battle_state=self.bstate)
+                if target_cache is not None:
+                    candidates = tuple(int(uid) for uid in candidates)
+                    target_cache[cache_key] = candidates
             slots.append({
                 "index": target_index,
                 "template_id": str(template_id),
@@ -1892,8 +1921,11 @@ class CardEvaluator:
                 except (TypeError, ValueError):
                     amount = 0
                 operation = (params.get("operation") or "").lower()
-                if prop in ("damage", "damagehero") or amount < 0 \
-                        or operation in ("remove", "subtract"):
+                if prop == "cardcost" and (
+                        amount < 0 or operation in ("remove", "subtract")):
+                    beneficial = True
+                elif (prop in ("damage", "damagehero") or amount < 0
+                      or operation in ("remove", "subtract")):
                     hostile = True
                 elif prop in ("attack", "defense", "attribute", "heal",
                               "healhero") and (
@@ -1919,6 +1951,30 @@ class CardEvaluator:
         if hints.buff is not None and hints.removal is None:
             return "friendly"
         return None
+
+    def _prefers_highest_cost_hand_target(self, ability_guid, candidates,
+                                          hand_cards):
+        """Whether this ability reduces the cost of a legal card in hand."""
+        hand_costs = [hand_cards[uid].cost for uid in candidates
+                      if uid in hand_cards]
+        if not hand_costs:
+            return False
+        for effect_type, params in self.effects_for(ability_guid):
+            if effect_type != "CardModifierAbilityEffectTemplate":
+                continue
+            if str(params.get("property") or "").lower() != "cardcost":
+                continue
+            try:
+                amount = int(params.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            operation = str(params.get("operation") or "").lower()
+            if amount < 0 or operation in ("remove", "subtract"):
+                return True
+            if (bool(params.get("replaceexistingvalue"))
+                    and any(cost > amount for cost in hand_costs)):
+                return True
+        return False
 
     def _target_side_uids(self):
         friendly = {c.card_uid for c in self.ai_warzone}
@@ -2002,6 +2058,7 @@ class CardEvaluator:
         saw_authoritative_targets = False
         cards = {c.card_uid: c for c in
                  self.ai_warzone + self.player_warzone}
+        hand_cards = {c.card_uid: c for c in self.hand}
         if ability_guids is None:
             ability_ids = card.ability_guids
         elif isinstance(ability_guids, str):
@@ -2023,8 +2080,13 @@ class CardEvaluator:
                     if slot["minimum"] > 0:
                         return {}
                     continue
+                prefers_highest_cost = self._prefers_highest_cost_hand_target(
+                    ag, candidates, hand_cards)
                 side_ids = (opposing_uids if intent == "opponent" else
                             friendly_uids if intent == "friendly" else None)
+                if prefers_highest_cost and intent == "friendly":
+                    side_ids = set(friendly_uids) | {
+                        uid for uid in candidates if uid in hand_cards}
                 preferred_candidates = ([uid for uid in candidates
                                          if uid in side_ids]
                                         if side_ids is not None else candidates)
@@ -2033,18 +2095,32 @@ class CardEvaluator:
                 # filter permits the opposite side.
                 if preferred_candidates:
                     candidates = preferred_candidates
-                available = [cards[uid] for uid in candidates if uid in cards]
-                ordered = [item.card_uid for item in sorted(
-                    available,
-                    key=lambda item: (item.is_troop(),
-                                      # Deprioritize a target that already
-                                      # carries an ability this card would
-                                      # re-grant, so same-name troops spread.
-                                      self.target_score(card, item),
-                                      item.effective_attack(),
-                                      item.effective_defense(), item.card_uid),
-                    reverse=True)]
-                ordered.extend(uid for uid in candidates if uid not in cards)
+                if prefers_highest_cost:
+                    # Hand CardInfo.cost is the current effective cost. Keep
+                    # legal-target order for ties, then preserve the existing
+                    # fallback order for any non-hand candidates.
+                    ordered = sorted(
+                        (uid for uid in candidates if uid in hand_cards),
+                        key=lambda uid: hand_cards[uid].cost,
+                        reverse=True)
+                    ordered.extend(uid for uid in candidates
+                                   if uid not in hand_cards)
+                else:
+                    available = [cards[uid] for uid in candidates
+                                 if uid in cards]
+                    ordered = [item.card_uid for item in sorted(
+                        available,
+                        key=lambda item: (item.is_troop(),
+                                          # Deprioritize a target that already
+                                          # carries an ability this card would
+                                          # re-grant, so same-name troops spread.
+                                          self.target_score(card, item),
+                                          item.effective_attack(),
+                                          item.effective_defense(),
+                                          item.card_uid),
+                        reverse=True)]
+                    ordered.extend(uid for uid in candidates
+                                   if uid not in cards)
                 for uid in reversed(preferred):
                     if uid in ordered:
                         ordered.remove(uid)

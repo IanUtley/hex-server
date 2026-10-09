@@ -783,6 +783,20 @@ def db_campaign_for_champion(champion_id, campaign_type="PANORAMA", conn=None):
     ).fetchone()
 
 
+def db_campaign_for_champion_template(champion_id, template_name, conn=None):
+    """Return the newest campaign matching a champion and template name.
+
+    ``camp.dungeon NAME`` creates one campaign per authored dungeon template;
+    looking up by campaign type alone would accidentally reuse Crayburn.
+    Returns ``(id, camp_uid_lo, is_started, state_json, campaign_type)``.
+    """
+    return _connection(conn).execute(
+        "SELECT id, camp_uid_lo, is_started, state_json, campaign_type "
+        "FROM campaigns WHERE champion_id=? AND lower(template_name)=lower(?) "
+        "ORDER BY id DESC LIMIT 1",
+        (int(champion_id), str(template_name or ""))).fetchone()
+
+
 def db_latest_campaign_for_champion(champion_id, campaign_type, conn=None):
     """Return the newest campaign identity/state without creating one."""
     return _connection(conn).execute(
@@ -837,6 +851,16 @@ def db_campaign_update_state(campaign_id, state_json, conn=None, *, started=None
         "UPDATE campaigns SET " + ", ".join(assignments) + " WHERE id=?",
         params,
     )
+
+
+def db_campaign_set_zone(campaign_id, campaign_type, template_name,
+                         state_json, conn=None, *, is_started=True):
+    """Point a campaign row at another zone (type, template and state)."""
+    _connection(conn).execute(
+        "UPDATE campaigns SET campaign_type=?, template_name=?, is_started=?, "
+        "state_json=? WHERE id=?",
+        (campaign_type, template_name, int(bool(is_started)), state_json,
+         campaign_id))
 
 
 def db_promote_campaign_to_dungeon(campaign_id, state_json, conn=None):
@@ -1195,6 +1219,36 @@ def db_void_tamed_troop_rows(session_id, player_user_id, owner, conn=None):
         "AND LOWER(COALESCE(gc.card_type,'')) LIKE '%troop%' AND " + owner_sql +
         " ORDER BY gc.card_uid", (int(session_id), int(player_user_id))
     ).fetchall()
+
+
+def db_campaign_rows_for_champion(champion_id, conn=None):
+    """``(id, campaign_type, template_name, state_json)`` of every campaign row."""
+    return _connection(conn).execute(
+        "SELECT id, campaign_type, template_name, state_json FROM campaigns "
+        "WHERE champion_id=? ORDER BY id", (int(champion_id),)).fetchall()
+
+
+def db_campaign_progress_rows(champion_id, conn=None):
+    """``{zone: state_json}`` of a champion's rules-driven campaign progress."""
+    return dict(_connection(conn).execute(
+        "SELECT zone, state_json FROM campaign_progress WHERE champion_id=?",
+        (int(champion_id),)).fetchall())
+
+
+def db_campaign_progress_save(champion_id, rows, conn=None):
+    """Upsert ``{zone: state_json}`` progress rows (the caller commits)."""
+    _connection(conn).executemany(
+        "INSERT INTO campaign_progress (champion_id, zone, state_json, updated_at) "
+        "VALUES (?, ?, ?, datetime('now')) ON CONFLICT(champion_id, zone) DO "
+        "UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+        [(int(champion_id), str(zone), state_json)
+         for zone, state_json in rows.items()])
+
+
+def db_campaign_progress_delete(champion_id, conn=None):
+    """Forget a champion's rules progress (campaign restart)."""
+    _connection(conn).execute(
+        "DELETE FROM campaign_progress WHERE champion_id=?", (int(champion_id),))
 
 
 def db_campaign_identity_state(campaign_id, conn=None):

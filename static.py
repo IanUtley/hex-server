@@ -2,7 +2,7 @@
 
 Client-derived rows are loaded into fresh databases by
 ``AssetExtraction.gamedata_seed`` from ``HEX_GAMEDATA`` or the checked-in
-``Records/`` snapshot.  They deliberately do not live in this module; an
+``hex-private/Records/`` snapshot.  They deliberately do not live in this module; an
 existing database keeps whichever snapshot first seeded it, so
 ``refresh_client_seed`` upserts the seed-owned columns when that snapshot
 moves on.
@@ -13,6 +13,9 @@ import hashlib
 import os
 import shutil
 import sqlite3
+from campaign_source import ensure_campaign_path
+
+ensure_campaign_path()
 
 
 CLIENT_SEED_META_TABLE = "client_seed_meta"
@@ -75,6 +78,43 @@ def _client_seed_fingerprint(seed) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _records_signature() -> str:
+    """Cheap identity of the Records snapshot: file names, sizes and mtimes.
+
+    Reading the snapshot to fingerprint it costs a full parse, so an unchanged
+    snapshot is recognized from its files alone. Empty when there is no
+    snapshot to describe, which forces the full comparison.
+    """
+    from AssetExtraction.gamedata_seed import configured_records_path
+    root = configured_records_path()
+    if not root.is_dir():
+        return ""
+    digest = hashlib.sha256()
+    for path in sorted(root.glob("*.jsonl")):
+        info = path.stat()
+        digest.update(f"{path.name}:{info.st_size}:{info.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def _stored_meta(db, key: str) -> str | None:
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    row = db.execute(
+        f"SELECT value FROM {CLIENT_SEED_META_TABLE} WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _store_meta(db, key: str, value: str) -> None:
+    db.execute(
+        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute(
+        f"INSERT INTO {CLIENT_SEED_META_TABLE} (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value))
+
+
 def _store_client_seed_fingerprint(db, fingerprint: str) -> None:
     """Record which snapshot the client-derived projection was built from."""
     db.execute(
@@ -107,15 +147,16 @@ def refresh_client_seed(db) -> int:
     """
     from AssetExtraction.gamedata_seed import TABLE_COLUMNS, extract
 
+    # An unchanged snapshot is recognized from its file signature, before the
+    # costly parse. Only a changed one is parsed and compared by content.
+    signature = _records_signature()
+    if signature and _stored_meta(db, "records_signature") == signature:
+        return 0
     seed = extract()
     fingerprint = _client_seed_fingerprint(seed)
-    db.execute(
-        f"CREATE TABLE IF NOT EXISTS {CLIENT_SEED_META_TABLE} "
-        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    stored = db.execute(
-        f"SELECT value FROM {CLIENT_SEED_META_TABLE} WHERE key=?",
-        ("records_fingerprint",)).fetchone()
-    if stored and stored[0] == fingerprint:
+    if _stored_meta(db, "records_fingerprint") == fingerprint:
+        if signature:
+            _store_meta(db, "records_signature", signature)
         return 0
 
     # The projection is derived, but it is also the only copy of rows the
@@ -160,6 +201,8 @@ def refresh_client_seed(db) -> int:
         if changed:
             refreshed[table] = changed
     _store_client_seed_fingerprint(db, fingerprint)
+    if signature:
+        _store_meta(db, "records_signature", signature)
     print(
         "Refreshed client-derived rows for {}: {}".format(
             seed["source"],
@@ -907,6 +950,30 @@ DDL = [
         created_at  TEXT DEFAULT (datetime('now'))
     )
     """,
+    # campaign rules progress of a rules-driven campaign
+    # (hex-private/campaign/campaign_runtime):
+    # zone '*' is the campaign-wide part (flags, quests, counters ...), every
+    # other row one zone's node progress.
+    """
+    CREATE TABLE IF NOT EXISTS campaign_progress (
+        champion_id INTEGER NOT NULL,
+        zone        TEXT NOT NULL,
+        state_json  TEXT NOT NULL DEFAULT '{}',
+        updated_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (champion_id, zone)
+    )
+    """,
+    # Legacy per-user campaign overlays from an earlier editor mode. Kept for
+    # existing database compatibility; current editor/runtime ignore these.
+    """
+    CREATE TABLE IF NOT EXISTS campaign_user_data (
+        user_id    INTEGER NOT NULL,
+        path       TEXT NOT NULL,
+        doc_json   TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, path)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS campaign_node_edges (
         campaign_template TEXT NOT NULL,
@@ -1362,7 +1429,8 @@ QUEST_OBJECTIVE_ENCOUNTER_LINKS = {
 
 CONVERSATION_REWARD_SEEDS = [
     # The Find / Cross the Zila / Cross the Zodiac rewards are quest rewards
-    # now (quest_templates.rewards_json, authored in campaign_data/quests.json
+    # now (quest_templates.rewards_json, authored in
+    # hex-private/campaign/campaign_data/quests.json
     # and edited on the editor's Quests tab); their old conversation rows are
     # removed in ensure_schema so a quest never pays twice.
     # Shadowgrove's equipment is shown on the encounter reward panel. The
@@ -1388,7 +1456,8 @@ CRAYBURN_QUEST_REWARD = {
         "Vennen": "a7f16a72-2975-464d-8d3a-ff6f5bfd7c3b",
     },
 }
-# Conversations whose reward rows moved to their quest (see campaign_data/quests.json).
+# Conversations whose reward rows moved to their quest (see
+# hex-private/campaign/campaign_data/quests.json).
 AZ1_QUEST_REWARD_CONVERSATIONS = (
     "02977c4c-803a-465d-ae0c-b5896c3d4012",  # Find The Ambling Mesa (Ardent)
     "880690b0-0c54-4ab8-a4e2-911b8bf14f64",  # Find The Cave-In (Underworld)
@@ -1778,7 +1847,7 @@ def ensure_schema(db):
             "WHERE faction='' AND lower(npc)='takumi'"
         )
         # Map-visibility start hooks are now campaign editor data
-        # (campaign_rules/AZ1.json); clear the retired names from existing
+        # (hex-private/campaign/campaign_rules/AZ1.json); clear the retired names from existing
         # databases. Smoldering Dead's battle stays in its dungeon (no hook).
         retired = ("az1_tamed_start", "az1_find_horwich_sea_start",
                    "az1_find_cave_in_start", "az1_find_ambling_mesa_start",
@@ -2004,7 +2073,7 @@ def ensure_schema(db):
 
         # Existing databases were seeded before the client TAC-derived Lethal
         # field was normalized into card_templates. Backfill from the same
-        # Records/gamedata extractor used for fresh databases, keyed by GUID;
+        # hex-private/Records/gamedata extractor used for fresh databases, keyed by GUID;
         # never infer this keyword from display text or card names.
         if (added_lethal or added_equipment_modified or
                 added_variable_cost_double):
@@ -2098,7 +2167,8 @@ def ensure_schema(db):
             db.execute("ALTER TABLE encounter_scenes ADD COLUMN rewards_json TEXT DEFAULT '{}'")
             db.commit()
         # Encounter scenes are owned by the campaign editor: apply its full
-        # definitions (campaign_data/encounter_scenes.json) now, so the deck
+    # definitions (hex-private/campaign/campaign_data/encounter_scenes.json)
+    # now, so the deck
         # evaluator below and everything after it sees the rows.
         import campaign_data
         campaign_data.apply_encounter_scenes(db)
@@ -2501,7 +2571,7 @@ def ensure_schema(db):
     card_fix.apply_fixes(db)
 
     # Campaign table data authored in the campaign editor
-    # (campaign_data/*.json). Applied last so it wins over seed refreshes;
-    # Records/ itself is never modified.
+    # (hex-private/campaign/campaign_data/*.json). Applied last so it wins over seed refreshes;
+    # hex-private/Records/ itself is never modified.
     import campaign_data
     campaign_data.apply_all(db)

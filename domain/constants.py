@@ -17,7 +17,12 @@ SELF_TARGET_TEMPLATE = "eb7e48cd-1c85-813f-6635-d43f50cf7809"
 
 # UID type bytes used by the original Game.Shared wire contracts.
 CARD_UID_TYPE = 1
-AI_UID_TYPE = 3
+# Remote opponents are RemotePlayer instances, so they must use ServiceAI
+# (248) for the current client to recognize them as AI. Type 3 is retained for
+# older rules/session fixtures that used the legacy AIPlayer type.
+LEGACY_AI_PLAYER_UID_TYPE = 3
+AI_UID_TYPE = 248
+SERVICE_AI_UID_TYPE = AI_UID_TYPE
 PLAYER_UID_TYPE = 244
 
 # The ObjFmt UID64 field carries the SessionCardId UID kind in this slot.

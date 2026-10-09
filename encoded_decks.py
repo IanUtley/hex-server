@@ -31,21 +31,26 @@ def write_guid(buf, guid_str):
     buf.write(guid_le)
     buf.write(b[8:16])
 
-def encode_profile_deck_template(buf, name, champ_guid, sleeve_guid, cards, extended_data=None, card_gems=None):
+def encode_profile_deck_template(buf, name, champ_guid, sleeve_guid, cards, extended_data=None):
     """Encode a ProfileDeckTemplate.ToBytes() payload.
-    card_gems: dict of {instance_id: gem_type_int} for per-instance gem data."""
+
+    Each card is (template_guid, count, is_ext, is_foil, is_reserve[, gem]).
+    The optional gem is that card's own EGemTypesNew value; the client applies
+    a descriptor's gems only to the copies that descriptor creates."""
     write_csharp_string(buf, name)
     write_guid(buf, champ_guid)
     write_guid(buf, sleeve_guid)
     write_varint(buf, 0)                    # Equip count
     write_varint(buf, len(cards))
-    for (tguid, count, is_ext, is_foil, is_reserve) in cards:
+    for entry in cards:
+        tguid, count, is_ext, is_foil, is_reserve = entry[:5]
+        gem = entry[5] if len(entry) > 5 else 0
         write_guid(buf, tguid)
         write_varint(buf, count)
         buf.write(b'\x00' if not is_reserve else b'\x01')
         buf.write(b'\x00' if not is_ext else b'\x01')
         buf.write(b'\x00' if not is_foil else b'\x01')
-        gem_types = [int(v) for v in (card_gems or {}).values() if v]
+        gem_types = [int(gem)] if gem else []
         write_varint(buf, len(gem_types))
         for g in gem_types:
             write_varint(buf, g)
@@ -72,6 +77,19 @@ def encode_card_group_id(buf, template_guid, is_extended, card_ids):
         write_varint(buf, delta)
         prev = cid
 
+def _as_instance_id(value):
+    """Return ``value`` as an int instance ID, or None if it is not one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _instance_sort_key(value):
+    instance_id = _as_instance_id(value)
+    return (0, instance_id, "") if instance_id is not None else (1, 0, str(value))
+
+
 def encode_encoded_decks(db_decks, user_id, conn=None):
     """Create the full EncodedDecks binary payload."""
     buf = io.BytesIO()
@@ -91,12 +109,18 @@ def encode_encoded_decks(db_decks, user_id, conn=None):
         except:
             active_gems = {}
         cards = []
-        for cid in card_ids:
+        # The client pairs each descriptor with the instance IDs of its
+        # template group in ascending order, so descriptors must be ascending
+        # too or a gem lands on a different copy of the same card.
+        # Entries that are not instance IDs (template GUIDs in older decks)
+        # sort after the numeric ones and resolve to no row, as before.
+        for cid in sorted(card_ids, key=_instance_sort_key):
             row = db_card_instance_for_encoded_deck(user_id, cid, conn=conn)
             if row:
                 tguid = row[1]
                 is_ext = row[2]
-                cards.append((tguid, 1, bool(is_ext), False, False))
+                gem = active_gems.get(_as_instance_id(cid), 0)
+                cards.append((tguid, 1, bool(is_ext), False, False, gem))
                 key = (tguid, bool(is_ext))
                 if key not in all_cards_by_group:
                     all_cards_by_group[key] = []
@@ -119,7 +143,7 @@ def encode_encoded_decks(db_decks, user_id, conn=None):
     for dk in deck_entries:
         # ProfileDeckTemplate.ToBytes()
         pt_buf = io.BytesIO()
-        encode_profile_deck_template(pt_buf, dk['name'], dk['champ'], dk['sleeve'], dk['cards'], card_gems=dk['active_gems'])
+        encode_profile_deck_template(pt_buf, dk['name'], dk['champ'], dk['sleeve'], dk['cards'])
         pt_bytes = pt_buf.getvalue()
 
         buf.write(struct.pack('<i', len(pt_bytes)))  # template length

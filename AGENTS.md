@@ -19,6 +19,9 @@ Key files:
 - `proxy.py` — HTTP proxy for Steam auth (port 8081)
 - `commands.py` — In-game chat/debug commands (`!` prefix)
 - `campaign.py` — Campaign/adventure service handler (dt=110000)
+- `hex-private/campaign/campaign_runtime/` — Rules-driven campaign runtime
+- `hex-private/campaign/campaign_rules/` and `hex-private/campaign/campaign_data/` — Authored campaign rules and data
+- `hex-private/campaign/tools/campaign_editor/` — Campaign editor and authoring tools
 - `game_engine.py` — Game session event system (60+ SessionEventArgs)
 - `encoder.py` — ObjFmt binary encoder (19 encode functions)
 - `battle_engine.py` — DB-backed turn/priority engine (phase cycle, stops)
@@ -30,8 +33,8 @@ Key files:
 - `migration.py` — run-and-delete one-off migrations (restart.sh)
 - `hconnect.db` — SQLite database
 - `RULES.md` — canonical gameplay rule set (read before changing battle logic)
-- `HexClient` - dissassembly of the Hex client
-- `Records` - An extraction of the gamedata blob zip file.
+- `hex-private/HexClient/` - disassembly of the Hex client
+- `hex-private/Records/` - extraction of the gamedata blob zip file
 
 Convention: all schema DDL lives in `static.py` (`static.ensure_schema`); the
 shared connection and reusable SQL helpers live in `db.py`; no other module
@@ -48,19 +51,44 @@ When fixing a card in either PVP or PVE mode, consider how it should work in the
 Ensure any code blocks/functions implemented are thread-safe.
 
 Use `bash restart.sh` to restart the server after changes to
-`hconnect_server.py`. If changes only touched reloadable modules (e.g.
-`commands.py`, `domain/*.py`, `ability.py`, `battle_engine.py`), send `SIGUSR1`
+`hconnect_server.py`. If changes only touched reloadable modules, send `SIGUSR1`
 to the HConnect process instead; it hot-reloads the runtime modules without a
-full restart:
+full restart. The reloaded set is defined by `reload_runtime_modules()` in
+`commands.py`:
+
+- Explicitly listed: `domain/constants.py`, `db.py`, `pvp_db.py`,
+  `profile_db.py`, `pve_db.py`, `chat_db.py`, `replay_db.py`,
+  `tournament_db.py`, `hex-private/campaign/campaign_rules.py`,
+  `game_engine.py`, `game_session.py`, `battle_engine.py`, `campaign.py`,
+  `application/dispatcher.py`, `application/player_transactions.py`,
+  `rules_port/wire.py`, `rules_port/runtime_adapter.py`,
+  `rules_port/transactions.py`, `ai.py`, `encoder.py`,
+  `gamemodes/tournament_engine.py`, `gamemodes/tournament_server.py`,
+  `services/tournament_game.py`, `services/chat.py`, `services/arena.py`,
+  `services/mail.py`.
+- Prefix match, every already-loaded module under: `abilities/`, `rules_port/`
+  (including `rules_port/static_rules.py`), `application/`, `services/`,
+  `gamemodes/`, `campaign_runtime/`.
+
+Not reloaded: `hconnect_server.py` and `commands.py` (the reload driver itself),
+so changes to them need `bash restart.sh`. Also not reloaded: `ability.py`
+(a facade named `ability`, not under `abilities/`), the `domain/` modules
+other than `domain/constants.py`, and everything under `gamedata/`. The Records
+store keeps objects built from the classes it was loaded with, so reloading
+`gamedata` mixes class generations and drops nested modifier inputs. Records
+or `gamedata/` changes need `bash restart.sh`.
 
 ```bash
 kill -USR1 "$(pgrep -f '[h]connect_server.py' | head -n1)"
 ```
 
+If you add a module to `reload_runtime_modules()`, update this list in the same
+change.
+
 ## Debugging: check the client log FIRST
 The client is a fixed 32 BIT C# Mono binary — so default sizes of ints will be 32bit.
 We cannot amend client code. All fixes must be
-server-side. The disassembled client C# source is available under `HexClient/`
+server-side. The disassembled client C# source is available under `hex-private/HexClient/`
 for reference when investigating client-side behaviour (event handlers, enums,
 UI states, animation triggers). When anything fails (stuck UI, missing events, broken flow),
 check the client log first before changing server code:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import game_engine
-from domain.constants import AI_UID_TYPE
+from domain.constants import LEGACY_AI_PLAYER_UID_TYPE, SERVICE_AI_UID_TYPE
 
 from .session import (AuthoritativeSession, GameEngineEventSink,
                       SQLiteRulesSnapshot)
@@ -33,9 +33,13 @@ def _native_participant_ids(game_session, game: game_engine.Game):
     is_practice = str(
         getattr(game_session, "session_name", "") or "").startswith(
             "Session-")
-    practice_ai = (game_engine.UID.make(
-        AI_UID_TYPE, PRACTICE_AI_INSTANCE_ID)
-        if is_practice else game.ai_uid)
+    game_ai_type = int(getattr(game.ai_uid, "uid64", game.ai_uid)) & 0xFF
+    practice_ai = (
+        game.ai_uid if game_ai_type in (
+            LEGACY_AI_PLAYER_UID_TYPE, SERVICE_AI_UID_TYPE)
+        else game_engine.UID.make(
+            SERVICE_AI_UID_TYPE, PRACTICE_AI_INSTANCE_ID)
+    ) if is_practice else game.ai_uid
     if not stored:
         return tuple(value for value in (game.player_uid, practice_ai)
                      if value is not None)

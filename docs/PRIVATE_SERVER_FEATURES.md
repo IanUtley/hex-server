@@ -16,6 +16,8 @@ Frost Ring Arena implementation details are in
 - [x] HConnect TCP server on port 9933.
 - [x] HTTP proxy on port 8081 for local Steam-auth-compatible login and
   news/status endpoints.
+- [x] Campaign editor web server on port 8765, started when its private source
+  is available (loopback for local restart, container interface in Docker).
 - [x] ObjFmt request/response encoding for profile, store, mail, load-balancer,
   tournament, and related services.
 - [x] Custom binary session-event encoder and typed event dispatch to clients.
@@ -205,8 +207,8 @@ Frost Ring Arena implementation details are in
   focused compilation checks.
 - [x] Debug logging for server requests, proxy traffic, client logs, session
   events, and card/ability resolution.
-- [x] Docker image and single-task deployment documentation for ports 9933 and
-  8081.
+- [x] Docker image and single-task deployment documentation for ports 9933,
+  8081, and 8765.
 - [x] Runtime `gamedata` mount/ENV_VAR support so a fresh image can populate
   client-derived static tables without copying the original blob into the
   repository.
@@ -219,6 +221,6 @@ Frost Ring Arena implementation details are in
 The checked list describes the server's current tested surface, not a claim
 that the original C# client has been replaced line-for-line. The unchecked
 items are the main parity, coverage, and operational gaps. For a new card or
-effect, start with the client records under `Records/`, verify the extracted
+effect, start with the client records under `hex-private/Records/`, verify the extracted
 metadata in the static tables, add or correct the generic resolver, and then
 add a focused test before changing a card-name-specific rule.

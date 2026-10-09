@@ -389,7 +389,7 @@ def gen_session_event_streams():
     from hconnect_server import encode_sync_event
 
     pl = ge.UID.make(244, 1001)     # player
-    ai = ge.UID.make(3, 1000)       # AI champion
+    ai = ge.UID.make(ge.SERVICE_AI_UID_TYPE, 1000)  # AI champion
     troop = ge.SessionCardId(ge.UID.make(1, 5001))
     ai_champ = ge.SessionCardId(ge.UID.make(1, 5000))
 

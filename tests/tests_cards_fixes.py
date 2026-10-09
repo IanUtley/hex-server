@@ -2507,6 +2507,78 @@ def test_ai_spreads_a_reapplied_grant_to_the_clean_same_name_troop(db):
     assert selector.reapply_penalty(spider_nest, clean) == 0
 
 
+def test_ai_target_candidates_are_cached_within_playability_check(db):
+    """A targeted action reuses one legal-target scan during eligibility.
+
+    The cache ends with the check, so a later target selection or new check
+    observes fresh candidates instead of retaining stale results.
+    """
+    from types import SimpleNamespace
+    import ai_eval
+
+    ability_guid = "10000000-0000-0000-0000-000000000010"
+    target_template = "20000000-0000-0000-0000-000000000010"
+    target_row = (target_template, "Choose an opposing troop", 0, 0, 0, 1,
+                  "opponent", "Warzone", 1, 1, "{}", "CardTargetTemplate")
+    db.execute(
+        "INSERT INTO card_abilities_meta VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ability_guid, 0, "", "", "{}", 0, 0, 0, 0, 0,
+         json.dumps([target_template]), 0))
+    db.execute("INSERT INTO target_templates VALUES "
+               "(?,?,?,?,?,?,?,?,?,?,?,?)", target_row)
+
+    target = SimpleNamespace(
+        card_uid=101, is_troop=lambda: True,
+        effective_attack=lambda: 2, effective_defense=lambda: 2)
+    evaluator = object.__new__(ai_eval.CardEvaluator)
+    evaluator._db = db
+    evaluator.handler = SimpleNamespace(
+        _thresholds_met=lambda _required, _available: True,
+        _ai_champ_scid=None)
+    evaluator.session = SimpleNamespace(session_id=1)
+    evaluator.bstate = {}
+    evaluator.ai_owner_id = 0
+    evaluator.player_db_id = 5
+    evaluator.player_champ_uid = None
+    evaluator.ai_health = evaluator.player_health = 20
+    evaluator.resources = 5
+    evaluator.threshold = {}
+    evaluator.ai_warzone = []
+    evaluator.player_warzone = [target]
+    evaluator._target_side_uids = lambda: (set(), {101})
+    evaluator._action_target_intent = lambda _card, _ag: "opponent"
+    evaluator.target_score = lambda _source, _target: 0
+    card = SimpleNamespace(
+        card_uid=900, cost=1, has_variable_cost=False,
+        threshold_json="{}", ability_guids=[ability_guid],
+        is_action=lambda: True, is_troop=lambda: False)
+
+    old_eval_db = ai_eval._db
+    ai_eval._db = db
+    try:
+        with mock.patch(
+                "pvp_db.db_ability_target_template_ids",
+                return_value=json.dumps([target_template])), \
+                mock.patch(
+                    "pvp_db.db_target_template_row",
+                    return_value=target_row), \
+                mock.patch(
+                    "rules_port.targeting.target_uses_both_players",
+                    return_value=True), \
+                mock.patch(
+                    "rules_port.targeting.legal_targets",
+                    side_effect=[[101], [101], []]) as target_scan:
+            assert evaluator.is_playable(card) == "True"
+            assert target_scan.call_count == 1
+            assert evaluator.choose_action_target(card) == 101
+            assert target_scan.call_count == 2
+            assert evaluator.is_playable(card) == "False"
+            assert target_scan.call_count == 3
+    finally:
+        ai_eval._db = old_eval_db
+
+
 def test_evaluator_card_info_reads_instance_abilities(db):
     """CardInfo must expose live grants/attributes, not just the template."""
     from ai_eval import CardInfo
@@ -2699,6 +2771,8 @@ def main():
          test_wind_whisperer_ai_exhausts_best_blocker),
         ("AI action target side and required-target safety",
          test_ai_action_targets_follow_effect_and_require_legal_selection),
+        ("AI target candidates cached per playability check",
+         test_ai_target_candidates_are_cached_within_playability_check),
         ("AI spreads a re-applied grant to the clean twin",
          test_ai_spreads_a_reapplied_grant_to_the_clean_same_name_troop),
         ("Evaluator CardInfo reads instance abilities",

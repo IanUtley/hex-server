@@ -20,7 +20,6 @@ import struct
 import json
 import hashlib
 import re
-from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 from binascii import hexlify
@@ -280,9 +279,6 @@ _SQLITE_LOCK_CODES = {
     getattr(sqlite3, "SQLITE_BUSY_SNAPSHOT", 517),
     getattr(sqlite3, "SQLITE_LOCKED_SHAREDCACHE", 262),
 }
-_sqlite_retry_stats = Counter()
-_sqlite_retry_stats_lock = threading.Lock()
-_SQLITE_RETRY_LOG_MILESTONES = {1, 2, 3, 5, 10, 25, 50, 100}
 
 _named_row_types = {}
 _RetryResult = TypeVar("_RetryResult")
@@ -323,36 +319,6 @@ def _named_row_factory(cursor, values):
         row_type.__name__ = "NamedRow"
         _named_row_types[columns] = row_type
     return row_type(values)
-
-
-def _sqlite_sql_shape(sql):
-    """Return a compact, parameter-free SQL signature for retry metrics."""
-    text = re.sub(r"\s+", " ", str(sql or "")).strip()
-    text = re.sub(r"'(?:''|[^'])*'", "'?'", text)
-    text = re.sub(r"\b\d+\b", "?", text)
-    return text[:240]
-
-
-def _record_sqlite_retry(label):
-    with _sqlite_retry_stats_lock:
-        _sqlite_retry_stats[label] += 1
-        count = _sqlite_retry_stats[label]
-    message = f"[sqlite-retry] count={count} statement={label}"
-    # Keep every retry in the request log so a run can be ranked afterward;
-    # only milestone counts go to stdout to avoid flooding the server console.
-    with log_lock:
-        line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
-        _log_req_file.write(line)
-        _write_bound_logs_locked(line)
-        if count in _SQLITE_RETRY_LOG_MILESTONES:
-            print(message, flush=True)
-
-
-def sqlite_retry_stats():
-    """Return retry counts, highest first, for live lock diagnosis."""
-    with _sqlite_retry_stats_lock:
-        return sorted(_sqlite_retry_stats.items(),
-                      key=lambda item: (-item[1], item[0]))
 
 
 def _is_sqlite_lock_error(exc):
@@ -484,6 +450,34 @@ class _LockedCursor:
         return call
 
 
+# Process-wide count of write statements.  Projections that memoize per card
+# key their entries on this value, so any write made through a connection
+# retires every memo entry.  It is bumped after the statement runs (even if it
+# raised, since a failed statement can still have applied part of its effect)
+# so a reader can never tag a pre-write value with the post-write version.
+_write_version = 0
+_write_version_lock = threading.Lock()
+_WRITE_KEYWORDS = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE",
+                             "CREATE", "DROP", "ALTER"})
+
+
+def board_write_version():
+    """Return the number of write statements run so far in this process."""
+    with _write_version_lock:
+        return _write_version
+
+
+def _note_write():
+    global _write_version
+    with _write_version_lock:
+        _write_version += 1
+
+
+def _is_write_statement(sql):
+    words = str(sql or "").lstrip().split(None, 1)
+    return not words or words[0].upper() in _WRITE_KEYWORDS
+
+
 class RetryingConnection(sqlite3.Connection):
     """SQLite connection that retries only transient lock operations.
 
@@ -498,7 +492,7 @@ class RetryingConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._retry_lock = threading.RLock()
 
-    def _with_retry(self, label: str, operation: Callable[..., _RetryResult],
+    def _with_retry(self, operation: Callable[..., _RetryResult],
                     *args: Any, **kwargs: Any) -> _RetryResult:
         for attempt, delay in enumerate((0.0,) + _SQLITE_RETRY_DELAYS):
             try:
@@ -507,17 +501,17 @@ class RetryingConnection(sqlite3.Connection):
                 if (not _is_sqlite_lock_error(exc)
                         or attempt >= len(_SQLITE_RETRY_DELAYS)):
                     raise
-                _record_sqlite_retry(label)
                 if delay:
                     time.sleep(delay)
         raise RuntimeError("SQLite retry loop exhausted without a result")
 
     def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
         with self._retry_lock:
-            self._last_sql_shape = _sqlite_sql_shape(sql)
-            cursor = self._with_retry(
-                f"execute {_sqlite_sql_shape(sql)}",
-                super().execute, sql, parameters)
+            try:
+                cursor = self._with_retry(super().execute, sql, parameters)
+            finally:
+                if _is_write_statement(sql):
+                    _note_write()
             wrapped = _LockedCursor(self, cursor)
             # A statement with a result set is normally consumed immediately
             # by ``execute(...).fetchone/fetchall``. Hold the lock through that
@@ -530,10 +524,10 @@ class RetryingConnection(sqlite3.Connection):
 
     def executemany(self, sql: str, parameters: Any) -> sqlite3.Cursor:
         with self._retry_lock:
-            self._last_sql_shape = _sqlite_sql_shape(sql)
-            cursor = self._with_retry(
-                f"executemany {_sqlite_sql_shape(sql)}",
-                super().executemany, sql, parameters)
+            try:
+                cursor = self._with_retry(super().executemany, sql, parameters)
+            finally:
+                _note_write()
             wrapped = _LockedCursor(self, cursor)
             if cursor.description is not None:
                 wrapped.hold_lease()
@@ -541,10 +535,10 @@ class RetryingConnection(sqlite3.Connection):
 
     def executescript(self, sql_script: str) -> sqlite3.Cursor:
         with self._retry_lock:
-            self._last_sql_shape = _sqlite_sql_shape(sql_script)
-            cursor = self._with_retry(
-                f"executescript {_sqlite_sql_shape(sql_script)}",
-                super().executescript, sql_script)
+            try:
+                cursor = self._with_retry(super().executescript, sql_script)
+            finally:
+                _note_write()
             wrapped = _LockedCursor(self, cursor)
             if cursor.description is not None:
                 wrapped.hold_lease()
@@ -552,9 +546,7 @@ class RetryingConnection(sqlite3.Connection):
 
     def commit(self) -> None:
         with self._retry_lock:
-            return self._with_retry(
-                f"commit after {getattr(self, '_last_sql_shape', '(unknown)')}",
-                super().commit)
+            return self._with_retry(super().commit)
 
     def rollback(self) -> None:
         with self._retry_lock:
@@ -739,7 +731,7 @@ def db_ensure_resource_grants(db=None):
     try:
         _rec_path = _os.path.join(
             _os.path.dirname(_os.path.abspath(__file__)),
-            "Records", "CardTemplate.jsonl")
+            "hex-private", "Records", "CardTemplate.jsonl")
         if _os.path.exists(_rec_path):
             _grants = {}
             with open(_rec_path) as _fh:
@@ -1027,6 +1019,11 @@ if (os.environ.get("HEX_TEST_DB_READY") == "1"
         _template_db.backup(_db)
     finally:
         _template_db.close()
+elif os.environ.get("HEX_DB_BOOTSTRAPPED") == "1":
+    # restart.sh and the Docker entrypoint run the full schema/seed bootstrap
+    # once before starting services. All service processes inherit this marker;
+    # they open the prepared database without repeating startup seed work.
+    pass
 else:
     static.ensure_schema(_db)
 

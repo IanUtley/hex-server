@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import json
 import game_engine
-from domain.constants import AI_UID_TYPE
+from domain.constants import LEGACY_AI_PLAYER_UID_TYPE, SERVICE_AI_UID_TYPE
 
 
 def _card_owner_ids(player_id):
     """Return persisted owner ids for a native participant.
 
-    Practice/FRA uses the typed native AI participant (type 3, instance
-    1000), while the legacy ``game_cards`` rows retain owner ``0``.  Keep
+    Practice/FRA uses a typed AI participant (legacy type 3 or ServiceAI type
+    248), while the legacy ``game_cards`` rows retain owner ``0``. Keep
     that compatibility mapping at the combat boundary so phase construction
     and attack selection see the same cards without changing PvP identities.
     """
     value = int(getattr(player_id, "uid64", player_id))
     ids = [value]
-    if value & 0xFF == AI_UID_TYPE:
+    if value & 0xFF in (LEGACY_AI_PLAYER_UID_TYPE, SERVICE_AI_UID_TYPE):
         ids.append(0)
     return ids
 

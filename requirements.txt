@@ -1,4 +1,6 @@
 PyYAML==6.0.2
+# Campaign editor art: AssetExtraction reads the client bundles with UnityPy.
+UnityPy==1.25.2
 supervisor==4.2.5
 setuptools<81
 # Optional local debugger for phase/turn investigations.

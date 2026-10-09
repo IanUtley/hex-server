@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Extract socketed-gem data from the extracted Records:
 
-    - Records/InventoryItemData.jsonl  -> GEM_TEMPLATES (gem type -> abilities)
-    - Records/AbilityTemplate.jsonl    -> GEM_ABILITY_META (ability rows)
-    - Records/AbilityEffectTemplate.jsonl -> GEM_ABILITY_EFFECTS (BOM rows
+    - hex-private/Records/InventoryItemData.jsonl  -> GEM_TEMPLATES (gem type -> abilities)
+    - hex-private/Records/AbilityTemplate.jsonl    -> GEM_ABILITY_META (ability rows)
+    - hex-private/Records/AbilityEffectTemplate.jsonl -> GEM_ABILITY_EFFECTS (BOM rows
       carrying the IntAttrModifier gamedata fields, e.g. Rage 1)
 
 The gem's numeric key is the EGemTypesNew enum value (sequential from 1:
@@ -22,7 +22,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records")
+RECORDS = os.path.join(ROOT, "hex-private", "Records")
 
 BEGIN_MARKER = "### BEGIN GEM SEED"
 END_MARKER = "### END GEM SEED"

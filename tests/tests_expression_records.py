@@ -24,7 +24,7 @@ from gamedata.records import deserialize_line
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ABILITY_RECORDS = ROOT / "Records" / "AbilityTemplate.jsonl"
+ABILITY_RECORDS = ROOT / "hex-private" / "Records" / "AbilityTemplate.jsonl"
 
 
 def _expression_variables(value):

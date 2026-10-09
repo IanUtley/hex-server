@@ -71,7 +71,7 @@ below.
 | Command | Description |
 |---|---|
 | `camp.Adventure` | Start adventure zone |
-| `camp.Dungeon` | Start Dungeon |
+| `camp.Dungeon <NAME>` | Start a named dungeon, such as `The Tranquil Dream` |
 | `camp.Pano` | Start Panorama |
 | `camp.Stronghold` | Enter Stronghold |
 | `camp.addxp` | Adjust the current campaign champions' XP |

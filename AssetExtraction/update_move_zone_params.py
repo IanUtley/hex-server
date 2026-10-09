@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Backfill MoveCardToZoneAbilityEffectTemplate params from
-Records/AbilityEffectTemplate.jsonl (data-driven), so the BOM leaf knows the
+hex-private/Records/AbilityEffectTemplate.jsonl (data-driven), so the BOM leaf knows the
 destination zone — e.g. Eternal Youth's Escalation "PutThisIntoYourDeck"
 (m_DestinationCollection "Deck") puts the played spell into the deck.
 
@@ -19,7 +19,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "AbilityEffectTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "AbilityEffectTemplate.jsonl")
 
 
 def load_move_zone_meta():

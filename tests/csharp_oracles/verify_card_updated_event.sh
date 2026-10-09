@@ -10,7 +10,7 @@ if [[ "$#" -ne 1 ]]; then
   exit 2
 fi
 
-client_shared="$repo_root/HexClient/Assembly-CSharp-firstpass/Game/Shared"
+client_shared="$repo_root/hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared"
 mcs -out:"$build_dir/card-updated-oracle.exe" \
   "$repo_root/tests/csharp_oracles/serialization_attribute_stubs.cs" \
   "$repo_root/tests/csharp_oracles/session_event_reader_stubs.cs" \

@@ -249,7 +249,7 @@ class RecordStore:
     def __init__(self, records_dir: str | Path | None = None,
                  *, strict: bool = False):
         self.records_dir = Path(records_dir) if records_dir else (
-            Path(__file__).resolve().parents[1] / "Records")
+            Path(__file__).resolve().parents[1] / "hex-private" / "Records")
         self.strict = strict
         self._cache: dict[str, list[RecordObject]] = {}
         self._index: dict[str, dict[str, RecordObject]] = {}

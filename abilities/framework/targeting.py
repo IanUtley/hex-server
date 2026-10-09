@@ -52,7 +52,7 @@ def template_faction(template_guid):
         return ""
     if _TEMPLATE_FACTIONS is None:
         _TEMPLATE_FACTIONS = {}
-        path = Path(__file__).resolve().parents[2] / "Records" / \
+        path = Path(__file__).resolve().parents[2] / "hex-private" / "Records" / \
             "CardTemplate.jsonl"
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:
@@ -84,7 +84,7 @@ def template_is_mercenary(template_guid):
     values = _RECORD_GUIDS.get("MercenaryTemplate")
     if values is None:
         values = set()
-        path = Path(__file__).resolve().parents[2] / "Records" / \
+        path = Path(__file__).resolve().parents[2] / "hex-private" / "Records" / \
             "MercenaryTemplate.jsonl"
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:
@@ -116,7 +116,7 @@ def template_equipment_match(template_guid, equipment_type="None"):
     if _EQUIPMENT_CARD_INFO is None:
         from .tac import _tac_attr_hash, decode_tac_tree
         _EQUIPMENT_CARD_INFO = {}
-        path = Path(__file__).resolve().parents[2] / "Records" / \
+        path = Path(__file__).resolve().parents[2] / "hex-private" / "Records" / \
             "CardTemplate.jsonl"
         required_hash = _tac_attr_hash("RequiredEquipment")
         guid_hash = _tac_attr_hash("Guid")
@@ -157,7 +157,7 @@ def template_equipment_match(template_guid, equipment_type="None"):
         return True
     if _EQUIPMENT_TYPES is None:
         _EQUIPMENT_TYPES = {}
-        path = Path(__file__).resolve().parents[2] / "Records" / \
+        path = Path(__file__).resolve().parents[2] / "hex-private" / "Records" / \
             "InventoryItemData.jsonl"
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:

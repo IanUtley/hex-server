@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill card_templates.subtype from Records/CardTemplate.jsonl
+"""Backfill card_templates.subtype from hex-private/Records/CardTemplate.jsonl
 (m_CardSubtype, e.g. "Human Cleric") so IsSubType filters can be evaluated.
 
 Usage:
@@ -15,7 +15,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "CardTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "CardTemplate.jsonl")
 
 BEGIN_MARKER = "CARD_TEMPLATES = ["
 

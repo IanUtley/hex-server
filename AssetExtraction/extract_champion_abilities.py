@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Extract PvP champion abilities from Records/*.jsonl and seed champion_abilities table.
+"""Extract PvP champion abilities from hex-private/Records/*.jsonl and seed champion_abilities table.
 
-Reads ChampionTemplate.jsonl + AbilityTemplate.jsonl from Hex/Records/ and
+Reads ChampionTemplate.jsonl + AbilityTemplate.jsonl from Hex/hex-private/Records/ and
 inserts/updates the champion_abilities table in hconnect.db.
 
 Each row: champion_guid, champion_name, ability_guid, ability_name,
@@ -12,7 +12,7 @@ import json, sqlite3, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records")
+RECORDS = os.path.join(ROOT, "hex-private", "Records")
 
 CASTING = {"BasicAction": 8, "QuickAction": 64}
 

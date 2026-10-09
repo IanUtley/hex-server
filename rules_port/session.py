@@ -2774,7 +2774,7 @@ class AuthoritativeSession:
         Reconnects must resume from the last transaction boundary.  We restore
         only values owned by this port; action/ability objects are deliberately
         not fabricated from JSON, so a caller can hydrate those through its
-        normal Records/metadata factory before resuming a waiting action.
+        normal hex-private/Records/metadata factory before resuming a waiting action.
         """
         if not isinstance(saved, Mapping):
             return False

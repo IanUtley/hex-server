@@ -8,7 +8,7 @@ trap 'rm -rf "$build_dir"' EXIT
 # The decompiler emitted C# identifiers containing <>; normalize only those
 # cache names so Mono can compile the checked-in client ObjFmt source.
 sed 's/<>f__mg\$cache/__f__mg_cache/g' \
-  "$repo_root/HexClient/Assembly-CSharp-firstpass/Game/Shared/Network/ObjFmt.cs" \
+  "$repo_root/hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared/Network/ObjFmt.cs" \
   > "$build_dir/ObjFmt.cs"
 
 python3 "$repo_root/tests/csharp_oracles/generate_player_option_fixture.py" \

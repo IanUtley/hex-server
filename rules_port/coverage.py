@@ -211,7 +211,7 @@ def validate_effect_coverage(root=None):
     the result useful as a migration gate instead of requiring dummy leaves
     for abstract client classes.
     """
-    base = Path(root or "HexClient")
+    base = Path(root or "hex-private/HexClient")
     project = base / "Assembly-CSharp-firstpass/Assembly-CSharp-firstpass.csproj"
     if not project.is_file():
         return (), ()
@@ -230,7 +230,7 @@ def validate_effect_coverage(root=None):
 
 def validate_transaction_coverage(root=None):
     """Return (missing, extra) transaction class names for an extraction tree."""
-    base = Path(root or "HexClient") / "Assembly-CSharp-firstpass/Game/Shared/Mechanics/Transactions"
+    base = Path(root or "hex-private/HexClient") / "Assembly-CSharp-firstpass/Game/Shared/Mechanics/Transactions"
     if not base.is_dir():
         return (), ()
     actual = {path.stem for path in base.glob("*.cs") if path.stem != "Transaction"}
@@ -238,7 +238,7 @@ def validate_transaction_coverage(root=None):
     return tuple(sorted(actual - listed)), tuple(sorted(listed - actual))
 
 def validate_filter_coverage(root=None):
-    base = Path(root or "HexClient") / "Assembly-CSharp-firstpass/Game/Shared/Mechanics/Cards/Filters"
+    base = Path(root or "hex-private/HexClient") / "Assembly-CSharp-firstpass/Game/Shared/Mechanics/Cards/Filters"
     if not base.is_dir():
         return (), ()
     actual = {path.stem for path in base.glob("*.cs")}

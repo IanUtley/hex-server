@@ -1,7 +1,7 @@
 """Composable ports of the client ``CardFilter`` primitives.
 
 Filters receive the same context shape as the C# engine but use duck-typed
-runtime cards, keeping Records/metadata outside the rules kernel.
+runtime cards, keeping hex-private/Records/metadata outside the rules kernel.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -2327,7 +2327,7 @@ def template_is_mercenary(template_guid):
         with _MERCENARY_LOCK:
             if _MERCENARY_TEMPLATES is None:
                 values = set()
-                path = (Path(__file__).resolve().parents[1] / "Records" /
+                path = (Path(__file__).resolve().parents[1] / "hex-private" / "Records" /
                         "MercenaryTemplate.jsonl")
                 try:
                     with path.open(encoding="utf-8", errors="replace") as fh:

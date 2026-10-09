@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Backfill card_templates.variable_cost / variable_cost_minimum from
-Records/CardTemplate.jsonl (m_VariableCost / m_VariableCostMinimum).
+hex-private/Records/CardTemplate.jsonl (m_VariableCost / m_VariableCostMinimum).
 
 Variable-X cards ("pay X", e.g. Burn to the Ground "1X" = 1 base + X) are
 detected from the gamedata card fields, NOT by scanning ability text.  This
@@ -20,7 +20,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "CardTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "CardTemplate.jsonl")
 
 BEGIN_MARKER = "CARD_TEMPLATES = ["
 

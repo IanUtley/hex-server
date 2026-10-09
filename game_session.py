@@ -41,6 +41,7 @@ import pvp_db as db_layer
 # UID type codes (must match hconnect_server.py)
 UID_TYPE = {
     "ServicePlayer": 244,
+    "ServiceAI": 248,
     "ServiceMail": 252,
     "ServiceProfile": 245,
     "ServiceGameSession": 246,

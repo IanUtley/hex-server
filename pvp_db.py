@@ -5,13 +5,34 @@ and card tables. This module groups that shared storage boundary; it is not a
 second database file.
 """
 
-import db as _db_layer
+import importlib as _importlib
 import json
 import sqlite3
+import sys as _sys
 import threading
 from collections import OrderedDict
 from domain.constants import DEFAULT_STARTING_HEALTH, PLAYED_CARD_POSITION
 from domain.enums import ECardStates, ECardTypes, ETurnPhases
+
+
+class _LazyDBLayer:
+    """Load the shared DB module only when a helper needs its default DB."""
+
+    def __getattr__(self, name):
+        module = _sys.modules.get("db")
+        if module is None:
+            module = _importlib.import_module("db")
+        return getattr(module, name)
+
+
+_db_layer = _LazyDBLayer()
+
+
+def _shared_db_connection():
+    """Return the process DB connection without importing ``db``."""
+    module = _sys.modules.get("db")
+    return getattr(module, "_db", None) if module is not None else None
+
 
 _CARD_COOLDOWN_LOCK = threading.RLock()
 _CARD_COOLDOWNS_KEY = "__cooldown_counts__"
@@ -41,7 +62,8 @@ EMPTY_SOCKET_GEMS = 1 << 62
 def _cached_static_value(connection, key, loader):
     """Read one immutable metadata value, caching only the shared DB view."""
     global _STATIC_METADATA_DB
-    if connection is not _db_layer._db:
+    shared_connection = _shared_db_connection()
+    if shared_connection is None or connection is not shared_connection:
         return loader()
     with _STATIC_METADATA_LOCK:
         if connection is not _STATIC_METADATA_DB:
@@ -56,7 +78,7 @@ def _cached_static_value(connection, key, loader):
         # A test or reload may have replaced db._db while the query was in
         # flight. Never attach a result from the old connection to the new
         # process-wide cache.
-        if connection is _db_layer._db:
+        if connection is _shared_db_connection():
             if connection is not _STATIC_METADATA_DB:
                 _STATIC_METADATA_DB = connection
                 _STATIC_METADATA_CACHE.clear()
@@ -77,7 +99,10 @@ def _cached_static_rows(connection, key, sql, params):
     value = _cached_static_value(
         connection, key,
         lambda: tuple(connection.execute(sql, params).fetchall()))
-    return value if connection is _db_layer._db else list(value)
+    shared_connection = _shared_db_connection()
+    return (value if shared_connection is not None and
+            connection is shared_connection else list(value))
+
 
 def db_next_session_instance(conn=None):
     """Atomically allocate the next persisted game-session instance."""
@@ -2524,6 +2549,27 @@ def db_card_property_state(session_id, card_uid, conn=None):
         (session_id, int(card_uid))).fetchone()
 
 
+def db_card_static_fields(session_id, card_uid, conn=None):
+    """Return every column the static cost and threshold views read, in one row.
+
+    ``template_guid`` is NULL when the card's template is missing, so callers
+    can tell "no card" from "card with no template" the way the separate
+    inner-join helpers did.  Keep the columns in one query: a cost or
+    threshold projection scans many candidate cards, and one round trip per
+    helper dominated that scan.
+    """
+    return (conn or _db_layer._db).execute(
+        "SELECT gc.user_id AS user_id, gc.permanent_buffs AS permanent_buffs, "
+        "gc.temporary_buffs AS temporary_buffs, "
+        "gc.card_cost_mod AS card_cost_mod, gc.cost_mod_json AS cost_mod_json, "
+        "gc.location AS location, ct.guid AS template_guid, ct.cost AS cost, "
+        "ct.threshold_json AS threshold_json, ct.subtype AS subtype "
+        "FROM game_cards gc LEFT JOIN card_templates ct "
+        "ON ct.guid=gc.template_guid "
+        "WHERE gc.session_id=? AND gc.card_uid=?",
+        (session_id, int(card_uid))).fetchone()
+
+
 def db_card_cost_location_state(session_id, card_uid, conn=None):
     """Return printed/instance cost fields and current zone."""
     return (conn or _db_layer._db).execute(
@@ -3478,7 +3524,7 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
             + assignments + " ELSE position END "
             "WHERE session_id=? AND user_id=? AND card_uid IN (" + marks + ")",
             (*params, session_id, user_id, *ordered))
-        if connection is _db_layer._db:
+        if connection is _shared_db_connection():
             connection.commit()
         return [card_uid]
     selected = [int(row[0]) for row in rows if int(row[0]) in wanted]
@@ -3507,7 +3553,7 @@ def db_randomly_insert_deck_cards(session_id, user_id, card_uids,
         + assignments + " END "
         "WHERE session_id=? AND user_id=? AND location='deck'",
         (*params, session_id, user_id))
-    if connection is _db_layer._db:
+    if connection is _shared_db_connection():
         connection.commit()
     return [card_uid for card_uid in ordered if card_uid in wanted]
 

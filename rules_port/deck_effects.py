@@ -16,7 +16,7 @@ def _deck_templates():
     if _DECK_TEMPLATES is not None:
         return _DECK_TEMPLATES
     result = {}
-    path = pathlib.Path(__file__).resolve().parents[1] / "Records" / "DeckTemplate.jsonl"
+    path = pathlib.Path(__file__).resolve().parents[1] / "hex-private" / "Records" / "DeckTemplate.jsonl"
     if path.exists():
         try:
             for line in path.open(encoding="utf-8", errors="replace"):

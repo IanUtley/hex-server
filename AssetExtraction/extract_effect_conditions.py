@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Seed ability_effect_conditions (condition_id -> condition JSON) from
-Records/AbilityEffectConditionTemplate.jsonl, data-driven.
+hex-private/Records/AbilityEffectConditionTemplate.jsonl, data-driven.
 
 Effect conditions gate individual BOM leaves (e.g. Incantation of Righteousness'
 "if there are five or more incantation counters" = SourceCardHasCounters) and
@@ -18,7 +18,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.environ.get("HEX_DB_PATH", os.path.join(ROOT, "hconnect.db"))
-RECORDS = os.path.join(ROOT, "Records", "AbilityEffectConditionTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "AbilityEffectConditionTemplate.jsonl")
 
 BEGIN_MARKER = "ABILITY_EFFECT_CONDITIONS = ["
 END_MARKER = "# === END ABILITY EFFECT CONDITION SEED ==="
@@ -52,7 +52,7 @@ def load_rows():
 def main():
     rows = load_rows()
     lines = ["# AbilityEffectCondition rows: (condition_id, name, condition_json). "
-             "Generated from Records/AbilityEffectConditionTemplate.jsonl.",
+             "Generated from hex-private/Records/AbilityEffectConditionTemplate.jsonl.",
              "ABILITY_EFFECT_CONDITIONS = ["]
     for cid, name, cond in rows:
         lines.append(f"    ({cid!r}, {name!r}, {cond!r}),")

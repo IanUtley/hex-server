@@ -4,7 +4,7 @@
 Regenerates static.py's CHAMPION_ABILITIES block (appending the two
 gamedata-derived fields to every ability row, while leaving the adjacent
 CHAMPION_TEMPLATES_EXTENDED rows untouched) and upserts champion_abilities in
-the DB.  All values come from Records/AbilityTemplate.jsonl
+the DB.  All values come from hex-private/Records/AbilityTemplate.jsonl
 (m_CastingBehavior and the m_AbilityCondition threshold requirements) — never
 hardcoded per champion.
 
@@ -21,7 +21,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-ABILITIES_JSONL = os.path.join(ROOT, "Records", "AbilityTemplate.jsonl")
+ABILITIES_JSONL = os.path.join(ROOT, "hex-private", "Records", "AbilityTemplate.jsonl")
 
 CASTING = {"BasicAction": 8, "QuickAction": 64}
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}$")

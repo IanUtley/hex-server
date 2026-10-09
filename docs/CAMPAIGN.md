@@ -5,6 +5,63 @@ client-facing Hex campaign protocol. The authoritative server implementation is
 `campaign.py`; the persistent schema is declared in `static.py` and the live
 state is stored in the `campaigns` table.
 
+## Rules runtime (the campaign run by the editor's rules)
+
+A zone whose rules file says `"runtime": "rules"` is run by
+`hex-private/campaign/campaign_runtime/` instead of `campaign.py`'s hand-written
+logic. **On now:** the eight AZ0 starter panoramas, Castle Crayburn, AZ1 and its
+three panoramas, Fort Romor, Devonshire Keep, and Tranquil Dream. **Still
+legacy:** AZ2 and the remaining dungeons. The code that creates a champion's
+campaigns and puts them into their race's starter panorama is unchanged.
+
+- **Rules** come from `campaign_runtime.rules_loader.rules(db, zone)`, which is
+  exactly what the editor simulates. It merges the zone file, the table offers
+  (`hex-private/campaign/campaign_runtime/offers.py`), scene flag-action hooks, card-selector
+  options and the campaign-wide quests in `hex-private/campaign/campaign_rules/quests.json`. Zone
+  metadata is the checked-in `hex-private/campaign/campaign_rules/zones.json`.
+- **Progress** lives in `campaign_progress(champion_id, zone, state_json)`.
+  `zone='*'` holds the campaign-wide flags, quests, counters and keywords;
+  every other row holds one zone's node progress, plus a `_runtime` part (the
+  location the client started, the battle being fought, auto-started
+  conversations already played).
+- **Requests:** `campaign.py`'s getcampstate, startcamp, StartLoc, SendEvent,
+  gameend and the server battle end call `campaign_runtime.runtime` first
+  (`_rules_zone`). Each client event becomes an engine action under a
+  per-champion lock.
+- **Projection:** `campaign_runtime.projection` turns the engine's layout into
+  the row's `GameplayState` (VisLocs/LocNodes/ALoc, `RulesZone`). An
+  `autostart` gate makes the client play a location by itself, once per
+  trigger.
+- **Pre-battle and result conversations:** an encounter entry's `pre`
+  conversation plays first and keeps the player on the node for the battle.
+  Its `victory`/`defeat` conversation plays after the battle.
+- **Teleports:** `teleport(Zone[,Node])` moves the champion to that zone's
+  campaign row (PANORAMA / DUNGEON / AREA) and pushes a transition `cmpupdate`.
+  A zone still on legacy is handed over through its legacy entry point (AZ1:
+  `_activate_az1_area`, with the engine's flags copied into its AREA row).
+- **Journal:** engine quest progress is mirrored into the QUEST rows
+  (`hex-private/campaign/campaign_runtime/quests.py`). A quest's reward is paid when it finishes.
+- **Rewards:** scene rewards are paid after the engine has applied the result,
+  against its (mirrored) flags. The legacy scene/battle flag actions are
+  skipped for these zones.
+- **Old saves** are converted the first time the runtime sees a champion
+  (`hex-private/campaign/campaign_runtime/convert.py`): flags from every row's public data, quests
+  from the QUEST rows, node progress from each row's VisLocs. A completed
+  node's `completed` gate gets the flag that makes it hold.
+- **Shared authored campaign:** admins edit the shared files under
+  `hex-private/campaign/campaign_data/` and
+  `hex-private/campaign/campaign_rules/`. Non-admin editor accounts use those
+  same rules and data read-only; they can simulate, load their own character
+  progress, and save simulator progress to `campaign_progress` for their own
+  champions. Legacy `campaign_user_data` rows are retained but no longer
+  loaded or applied by the editor or live campaign runtime.
+- **Check a change** without the client:
+  `python3 hex-private/campaign/tools/campaign_editor/server_playthrough.py <Race>` plays the
+  starter run through the server's handlers on a copy of the database.
+  `--champion N` continues an existing save (converting it), `--lose-first`
+  takes the retry path, and `--zones a,b` runs zones that are not switched on
+  yet.
+
 ## The four campaign types
 
 `campaigns.campaign_type` is serialized to the client as the `CampType` enum:
@@ -138,17 +195,18 @@ from `conversation_rewards`: the latter records what a completed conversation
 grants, while this table records which conversation can be triggered at a
 node.
 
-`tools/campaign_editor/` is a local read-only viewer for AZ1: the client's node
-layout over the extracted terrain, joined to SceneData, conversations,
-encounter scenes and quests, with a per-champion live-state overlay. See its
-README for how to extract the assets and run it.
-`campaign_rules/AZ1.json` (evaluated by `campaign_rules.py`) is the
-declarative form of the AZ1 node gates, offers, hooks and quest steps that
-`campaign.py` currently implements in code; the editor simulates it. The
-server does not drive the campaign from it yet; the opt-in
-`campaign_shadow.py` (`CAMPAIGN_RULES_SHADOW=1` or `!campaign_rules on|off|diff|reset`)
-only compares the engine's AZ1 AREA map state against what legacy sends
-(visible/completed/repeatable/blocked) and logs differences.
+`hex-private/campaign/tools/campaign_editor/` is a local campaign editor and
+simulator: it shows the client's node layout over extracted terrain, joined to
+SceneData, conversations, encounter scenes and quests. Admins edit shared
+campaign files; other accounts can simulate and save state for their own
+characters. See its README for setup and permissions.
+`hex-private/campaign/campaign_rules/*.json` (evaluated by `hex-private/campaign/campaign_rules.py`) is the declarative
+form of the node gates, offers, hooks and quest steps for AZ0, Crayburn, AZ1
+with its three panoramas, Fort Romor, Devonshire Keep and Tranquil Dream. The
+server plays these zones from the rules through `hex-private/campaign/campaign_runtime/` (a zone
+opts in with `"runtime": "rules"`); the editor simulates the same files. The
+legacy code in `campaign.py` still serves AZ2 and the other dungeons. The old
+shadow comparison (`campaign_shadow.py`, `!campaign_rules`) was removed.
 
 The checked-in `SceneData` records contain node metadata but do not contain the
 map path graph. The `campaign_node_edges` seed is extracted from the client
@@ -162,13 +220,13 @@ would create false routes.
   profile's newest champion and recreates the AZ0 starter panorama; re-select
   the champion. The server's normal transitions then lead through Crayburn
   into AZ1. Without `confirm` it only explains what it would delete.
-- **Editor / engine:** `python3 tools/campaign_editor/playthrough.py [Race]`
+- **Editor / engine:** `python3 hex-private/campaign/tools/campaign_editor/playthrough.py [Race]`
   auto-plays the same run through `campaign_rules` (all 8 races reach AZ1).
 
 ### Quest-driven map gates
 
 Which AZ1 nodes a quest reveals, hides, blocks or marks is data, not code:
-`campaign_rules/AZ1.json` `nodes.<id>.visible|hidden|blocked|marker` (edit them
+`hex-private/campaign/campaign_rules/AZ1.json` `nodes.<id>.visible|hidden|blocked|marker` (edit them
 with the node-state tag editor). `campaign_gates.apply` evaluates them against
 the champion's quest rows and conversation flags and writes the `PublicState`
 lists `_az1_reveal_neighbors` reads; `_sync_az1_quest_gates` runs it on every
@@ -184,7 +242,7 @@ the Tomb of the Rose Knights dungeon). Brink Ridge's blockade nodes
 Node colours on the client map come from `UIDungeonMapNode`: completed is
 green, `impassable` red, repeatable blue, visited yellow, otherwise gray. A
 location's `/impassable` field also stops the character token there until the
-location is completed. The `impassable` node state in `campaign_rules/AZ1.json`
+location is completed. The `impassable` node state in `hex-private/campaign/campaign_rules/AZ1.json`
 drives it (`campaign_gates.apply` writes it to the location). It is not the
 same as `blocked`: a blocked node is hidden and cannot be reached unless already
 visited, while an impassable node is reachable but cannot be passed through.
@@ -194,7 +252,7 @@ northbound neighbours (Node021/023/077) are blocked over the same period.
 ### Scene reward conditions
 
 An encounter scene's reward entry (`encounter_scenes.rewards_json`, edited from
-the node's scene card -> *Rewards...*, saved to `campaign_data/encounter_scenes.json`) is
+the node's scene card -> *Rewards...*, saved to `hex-private/campaign/campaign_data/encounter_scenes.json`) is
 gated only by `when`: `flag(X)` tags. After a won battle the server turns the
 battle's events (currently `tamed_troop`, from the Tamed IntAttr on an opponent
 troop) into flags through the AZ1 rules hooks (`encounter_victory` + `scene` +
@@ -218,11 +276,11 @@ Both reward editors have a Stardust section for these.
 
 ### Item art in the reward editors
 
-`python3 AssetExtraction/extract_item_icons.py` extracts thumbnails of equipment,
+`python3 hex-private/campaign/AssetExtraction/extract_item_icons.py` extracts thumbnails of equipment,
 chests/packs, stardust, gems and mercenaries from the client's
-`AssetBundles/general/icons.ab` into `tools/campaign_editor/generated/items/`
+`AssetBundles/general/icons.ab` into `hex-private/campaign/tools/campaign_editor/generated/items/`
 (git-ignored; keyed by the Records `m_ArtNumber`, with an `index.json` from item
-GUID to art). `python3 AssetExtraction/extract_card_art.py` does the same for
+GUID to art). `python3 hex-private/campaign/AssetExtraction/extract_card_art.py` does the same for
 cards from `AssetBundles/cardsets/*.harc` into `generated/cards/`. The reward
 dialogs show the picked item's picture beside each chest, equipment, stardust
 and card picker, and the quest and scene summaries show a strip of pictures.
@@ -249,14 +307,14 @@ Mesa / Cave-In). Evidence and timestamps: `~/hex-playthroughs/*/QUEST_TIMELINE.m
 
 ### Encounter scenes are owned by the editor
 
-`campaign_data/encounter_scenes.json` holds the full definition of every
+`hex-private/campaign/campaign_data/encounter_scenes.json` holds the full definition of every
 encounter scene (336 of them): name, title, gameboard, deck, champion, mods,
 rewards, actions and AI personality. `static.ensure_schema` builds the
 `encounter_scenes` table from it at every start (`campaign_data.apply_encounter_scenes`);
 the Records seed no longer creates scene rows and the old reward "repair" code
-is gone. A blank `ai_deck_personality` means auto (the deck evaluator fills it).
+is gone. Every deck-backed scene stores its precomputed `ai_deck_personality`; scenes without a deck leave it blank.
 Every editor save for a scene writes this file. Regenerate or refresh it with
-`python3 tools/campaign_editor/import_encounter_scenes.py` (`--from-records` to
+`python3 hex-private/campaign/tools/campaign_editor/import_encounter_scenes.py` (`--from-records` to
 rebuild from the Records, keeping authored values). Encounter *deck cards* still
 come from the Records.
 
@@ -267,7 +325,7 @@ target?, round?}`. With no `target` it is a scene-wide modifier shown to the
 player (the card GUIDs are the mod cards); with `target` (`AIPlayer` / `Player`)
 the cards go into that side's setup at `round` when the battle is created. The
 scene card's **Mods...** button edits it (card pickers by name or GUID) and saves
-to `campaign_data/encounter_scenes.json`. All 336 Records encounter scenes - including the
+to `hex-private/campaign/campaign_data/encounter_scenes.json`. All 336 Records encounter scenes - including the
 dungeons' - are now in `encounter_scenes`, so every scene can carry rewards,
 actions, mods and an AI personality.
 
@@ -298,21 +356,12 @@ simulator then shows a *Win with X* / *Lose with X* button per offered card.
 
 ### Encounter AI personality
 
-`encounter_scenes.ai_deck_personality` (Default, Aggressive, BigThreats,
-BuildArmy, Burn, HandAdvantage, Reanimation) drives the AI's card valuation.
-At startup `ai_deck_strategy.evaluate_deck_strategy` (the Python deck
-evaluator, via `evaluate_fra_deck_personalities.py`) fills every blank scene
-from its deck; it never overwrites a scene that already has a value. The scene
-card's **AI personality** selector shows the evaluator's pick ("Auto - X", with
-its per-strategy scores as a tooltip) and saves an override to
-`campaign_data/encounter_scenes.json` (`ai_deck_personality`), applied at server start
-after the evaluator, so an authored value always wins. Choosing Auto removes
-the override.
+The precomputed value for each encounter deck is stored in `ai_deck_personality` in hex-private/campaign/campaign_data/encounter_scenes.json. The editor's Auto choice uses that value; explicit editor choices are saved separately in `ai_deck_personality_override`. Neither the editor nor the JSON importer evaluates deck cards. The server seeds the effective value into `encounter_scenes.ai_deck_personality` at startup.
 
 ### Scene actions
 
 `encounter_scenes.actions_json` (`{"pre": [...], "victory": [...], "defeat": [...]}`,
-edited from a scene card -> *Actions...*, saved to `campaign_data/encounter_scenes.json`)
+edited from a scene card -> *Actions...*, saved to `hex-private/campaign/campaign_data/encounter_scenes.json`)
 holds `set_flag(X)` / `clear_flag(X)` actions run when the battle starts, is won
 or is lost. The flags are stored in the campaign's public data (`flag(X)` tags,
 reward `when` entries and node gates read them); the editor rebuilds them live as
@@ -333,14 +382,14 @@ level-select conversation.
 
 The AZ1 quest rewards (Find the Ambling Mesa / Cave-In, Cross the Zila River,
 Cross the Zodiac River, Gnomes Come Home) are authored in
-`campaign_data/quests.json`; the server grants a quest's reward when the
+`hex-private/campaign/campaign_data/quests.json`; the server grants a quest's reward when the
 conversation that finishes the quest completes (`_grant_finished_quest_rewards`).
 Encounter-specific cards (Blood Beneath, Army of Myth, Sea Witch, Wormoid Queen,
-Tamed troops) are scene reward entries in `campaign_data/encounter_scenes.json`.
+Tamed troops) are scene reward entries in `hex-private/campaign/campaign_data/encounter_scenes.json`.
 
 A quest's completion reward lives on the quest (`quest_templates.rewards_json`,
 edited under the editor's **Quests** tab -> *Rewards...*, saved to
-`campaign_data/quests.json`) and is granted once per champion when the quest
+`hex-private/campaign/campaign_data/quests.json`) and is granted once per champion when the quest
 completes. A conversation finishes a quest with the ending action
 `complete_quest(<script>)` and starts one with `start_quest(<script>)`
 (afterwards `questStarted(X)` / `completedQuest(X)` hold). Quest conversations
@@ -473,7 +522,7 @@ Quest grant and completion are runtime events rather than fields on
 - collection objective: progress is based on the relevant persisted variable.
 
 Quest-start map changes are editor data: node `visible` / `hidden` /
-`blocked` / `marker` tags in `campaign_rules/AZ1.json` that read
+`blocked` / `marker` tags in `hex-private/campaign/campaign_rules/AZ1.json` that read
 `questStarted(X)` etc. (see above). `quest_templates.start_hook` can still name
 a whitelisted content hook in `campaign.py` (`_QUEST_START_HOOKS`), but none is
 registered or seeded.

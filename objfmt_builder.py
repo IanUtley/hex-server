@@ -18,6 +18,8 @@ Usage:
 
 import io
 import struct
+
+from domain.enums import EGemTypesNew
 from binascii import hexlify
 
 
@@ -213,6 +215,22 @@ class ObjFmtBuilder:
         self._set_size(sub_idx, sub_start)
         self._set_size(idx, start)
 
+    def field_enum_ulong(self, name, enum_type_name, val):
+        """Enum struct format for a ulong-backed enum (value__ is UInt64)."""
+        start = self._buf.tell()
+        idx = self._push_size()
+        t = self._add_type(enum_type_name)
+        self._w(name); self._sep(); self._w(str(idx)); self._sep()
+        self._w(str(t)); self._sep(); self._w("1"); self._sep()
+        sub_start = self._buf.tell()
+        sub_idx = self._push_size()
+        it = self._add_type("System.UInt64")
+        self._w("value__"); self._sep(); self._w(str(sub_idx)); self._sep()
+        self._w(str(it)); self._sep(); self._w("0"); self._sep()
+        self._w(hexlify(struct.pack("<Q", val)).decode("ascii")); self._sep()
+        self._set_size(sub_idx, sub_start)
+        self._set_size(idx, start)
+
     def field_uid(self, name, uid64):
         """Write a UID field with m_UID64 sub-field."""
         start = self._buf.tell()
@@ -359,11 +377,21 @@ class ObjFmtBuilder:
     INVENTORY_PROPS = 6
 
     def card_fields(self, guid, card_id, is_ext=0):
-        """Write 6 card_instance_bits fields inline."""
+        """Write the 8 card_instance_bits DataMember fields inline.
+
+        CardStats is an empty Dictionary<ECardStatType,int>; SocketedGems is
+        EGemTypesNew.Unknown. Order follows the client class declaration.
+        """
         self.field_ulong("Id", card_id)
         self.field_resource_id("TemplateID", guid)
+        self.field_struct_raw(
+            "CardStats",
+            "System.Collections.Generic.Dictionary`2#Game.Shared.Domain.ECardStatType!System.Int32",
+            b"0;")
         self.field_bool("IsFoil", False)
         self.field_bool("IsExtended", bool(is_ext))
+        self.field_enum_ulong("SocketedGems", "Game.Shared.Mechanics.EGemTypesNew",
+                              EGemTypesNew.Unknown)
         self.field_bool("IsNotTradeable", False)
         self.field_str("EscrowStatus", "Clean")
 

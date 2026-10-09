@@ -221,7 +221,8 @@ def _game(handler, session, state, pid):
         _pvp_populate_game_state(game, state, pid, other)
         return game, _owner_uid(pid), _owner_uid(other)
     pl = _ge.UID.make(244, int(handler.client_reck_id))
-    return _ge.Game(int(session.session_id), pl, _ge.UID.make(3, 1000)), pl, _ge.UID.make(3, 1000)
+    ai_uid = _ge.UID.make(_ge.SERVICE_AI_UID_TYPE, 1000)
+    return _ge.Game(int(session.session_id), pl, ai_uid), pl, ai_uid
 
 
 def _send(handler, session, game, player_uid, pvp=False):

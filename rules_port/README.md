@@ -4,7 +4,7 @@ Semantic coverage, source evidence, focused acceptance and remaining gaps are
 tracked in [`docs/RULES_PORT_PARITY.md`](../docs/RULES_PORT_PARITY.md).
 
 `rules_port` is the Python implementation of the behavioral
-contracts extracted from `HexClient/Game.Shared`. It is deliberately isolated
+contracts extracted from `hex-private/HexClient/Game.Shared`. It is deliberately isolated
 from transport and storage:
 
 1. `kernel.py`, `phases.py`, `turn_states.py`, and `combat.py` own ordering,

@@ -54,7 +54,7 @@ class _ProjectionCache:
 
     __slots__ = ("source_cards", "source_abilities", "ability_leaves",
                  "ability_targets", "target_sets", "card_property_sources",
-                 "card_rows", "scanning")
+                 "card_rows", "card_fields", "card_costs", "scanning")
 
     def __init__(self):
         self.source_cards = {}
@@ -64,6 +64,13 @@ class _ProjectionCache:
         self.target_sets = {}
         self.card_property_sources = {}
         self.card_rows = {}
+        self.card_fields = {}
+        # Payable cost per (session, card) computed inside this scan.  Cost
+        # conditions such as "for each card you control" build a fresh
+        # condition context per candidate, and each context asks for every
+        # candidate's cost again; without this memo each ask re-ran the whole
+        # static cost scan and its DB reads.
+        self.card_costs = {}
         # Cards whose static scan is already on the stack.  A "for each ..."
         # variable can re-enter effective_stats for a card inside its own
         # projection; the client treats that self-reference as no further
@@ -72,6 +79,19 @@ class _ProjectionCache:
 
 
 _projection_local = threading.local()
+
+
+def _is_continuous_source_ability(metadata):
+    """Whether ability metadata describes a currently active static source."""
+    if not metadata:
+        return False
+    trigger_event, is_manual, raw_json = metadata
+    if not trigger_event and not is_manual:
+        return True
+    raw = str(raw_json or "")
+    return ("CardCreatedEvent" in str(trigger_event or "") and
+            all(zone in raw for zone in
+                ("Deck", "Hand", "Warzone", "Discard")))
 
 
 @contextmanager
@@ -106,14 +126,7 @@ def _static_abilities(db, session_id, card_uid, cache=None):
     for value in values:
         guid = str(value).lower()
         metadata = db_ability_static_metadata(guid, conn=db)
-        if not metadata:
-            continue
-        if not metadata[0] and not metadata[1]:
-            result.append(guid)
-            continue
-        raw = str(metadata[2] or "")
-        if ("CardCreatedEvent" in str(metadata[0] or "") and
-                all(zone in raw for zone in ("Deck", "Hand", "Warzone", "Discard"))):
+        if _is_continuous_source_ability(metadata):
             result.append(guid)
     result = tuple(result)
     if cache is not None:
@@ -1115,12 +1128,10 @@ def _native_leaf_value(db, session_id, battle_state, source_uid, owner, param,
                 str(param["input_variable"]))
         if value is None:
             return None
-        try:
-            amount = int(param.get("amount") or 0)
-        except (TypeError, ValueError):
-            amount = 0
-        if amount:
-            value = amount * int(value)
+        # NumericModifier.InputValue is the complete operand.  ``amount`` is
+        # only its deprecated fallback when no input field is authored, so
+        # multiplying both double-applies the sign/value (for example M1=-1
+        # with amount=-1 incorrectly becomes +1).
         return str(param.get("property") or "").lower(), int(value)
     literal = _literal_leaf(
         param, extra_properties=("loselife",)
@@ -1316,15 +1327,51 @@ def _owner_static_sources(db, session_id, owner, cache):
     return cached
 
 
-def _all_static_sources(db, session_id, cache):
-    """Return every in-play source whose aura can target either player."""
-    key = (int(session_id or 0), -1)
+def _all_static_sources(db, session_id, cache, battle_state=None):
+    """Return in-play cards and synthetic champions that source auras.
+
+    Champion abilities live in ``champion_abilities`` rather than a
+    ``game_cards`` row.  Include them here with their controller and authored
+    ability list so card projections can evaluate champion passives just like
+    continuous abilities on ordinary cards.
+    """
+    state = battle_state if isinstance(battle_state, dict) else {}
+    champion_map = state.get("champ_map") or {}
+    champion_guids = state.get("champ_guid_map") or {}
+    champion_signature = tuple(sorted(
+        (str(owner), str(uid), str(champion_guids.get(owner) or
+                                  champion_guids.get(str(owner)) or ""))
+        for owner, uid in champion_map.items()))
+    key = (int(session_id or 0), -1, champion_signature)
     cached = cache.source_cards.get(key)
     if cached is None:
-        from pvp_db import db_all_cards_in_zones_with_abilities
-        cached = tuple(int(uid) for uid, _owner, _abilities in
-                       db_all_cards_in_zones_with_abilities(
-                           session_id, ("warzone", "underground"), conn=db))
+        from pvp_db import (db_ability_static_metadata,
+                            db_all_cards_in_zones_with_abilities,
+                            db_get_champion_ability_guids)
+        sources = [
+            (int(uid), int(owner or 0), None)
+            for uid, owner, _abilities in db_all_cards_in_zones_with_abilities(
+                session_id, ("warzone", "underground"), conn=db)]
+        for owner, champion_uid in champion_map.items():
+            try:
+                owner_id = int(owner)
+                source_uid = int(champion_uid)
+            except (TypeError, ValueError):
+                continue
+            champion_guid = (champion_guids.get(owner) or
+                             champion_guids.get(str(owner)))
+            if not champion_guid:
+                continue
+            abilities = tuple(
+                guid for guid in (str(value).lower() for value in
+                                  db_get_champion_ability_guids(
+                                      champion_guid, conn=db))
+                if _is_continuous_source_ability(
+                    db_ability_static_metadata(guid, conn=db)))
+            if abilities:
+                sources.append((source_uid, owner_id, abilities))
+        cached = tuple(sorted(sources, key=lambda source: (
+            source[1], source[0])))
         cache.source_cards[key] = cached
     return cached
 
@@ -1341,7 +1388,19 @@ def _card_location_row(db, session_id, card_uid, cache):
     return cached
 
 
-def _owner_projects_card_properties(db, session_id, owner, cache):
+def _card_fields(db, session_id, card_uid, cache):
+    """The card columns the cost and threshold views read, one query per scan."""
+    key = (int(session_id or 0), int(card_uid))
+    cached = cache.card_fields.get(key, _MISSING)
+    if cached is _MISSING:
+        from pvp_db import db_card_static_fields
+        cached = db_card_static_fields(session_id, int(card_uid), conn=db)
+        cache.card_fields[key] = cached
+    return cached
+
+
+def _owner_projects_card_properties(db, session_id, owner, cache,
+                                    battle_state=None):
     """Whether any source of ``owner`` can change a card's projected view.
 
     Only ``CardThreshold``/``SubType`` leaves feed the threshold/subtype
@@ -1353,10 +1412,14 @@ def _owner_projects_card_properties(db, session_id, owner, cache):
     cached = cache.card_property_sources.get(key)
     if cached is not None:
         return cached
+    sources = _all_static_sources(
+        db, session_id, cache, battle_state=battle_state)
     cached = any(
         str(param.get("property") or "").lower() in _CARD_PROPERTY_LEAVES
-        for source_uid in _all_static_sources(db, session_id, cache)
-        for ability_guid in _static_abilities(db, session_id, source_uid, cache)
+        for source_uid, _source_owner, source_abilities in sources
+        for ability_guid in (
+            source_abilities if source_abilities is not None else
+            _static_abilities(db, session_id, source_uid, cache))
         for param, _raw in _static_leaves(db, ability_guid, cache))
     cache.card_property_sources[key] = cached
     return cached
@@ -1425,18 +1488,16 @@ def _scan_static_deltas(db, session_id, battle_state, card_uid, cache,
         return _empty_deltas(), False
     owner, location, _position = row
     total = _empty_deltas()
-    sources = [(source_uid, None) for source_uid in
-               _all_static_sources(db, session_id, cache)]
-    if int(card_uid) not in {uid for uid, _ in sources}:
-        sources.append((int(card_uid), _self_static_abilities(
+    sources = list(_all_static_sources(
+        db, session_id, cache, battle_state=battle_state))
+    source_uids = {uid for uid, _source_owner, _abilities in sources}
+    if int(card_uid) not in source_uids:
+        sources.append((int(card_uid), int(owner), _self_static_abilities(
             db, session_id, card_uid, location, cache)))
     unsupported = False
-    for source_uid, only_abilities in sources:
-        source_row = _card_location_row(
-            db, session_id, int(source_uid), cache)
-        source_owner = int(source_row[0]) if source_row else int(owner)
-        abilities = (_static_abilities(db, session_id, source_uid, cache)
-                     if only_abilities is None else only_abilities)
+    for source_uid, source_owner, source_abilities in sources:
+        abilities = (source_abilities if source_abilities is not None else
+                     _static_abilities(db, session_id, source_uid, cache))
         for ability_guid in abilities:
             for param, raw in _static_leaves(db, ability_guid, cache):
                 property_name = str(param.get("property") or "").lower()
@@ -1646,8 +1707,9 @@ def effective_card_properties(db, session_id, battle_state, card_uid):
         props = {}
         with _projection_cache() as cache:
             row = _card_location_row(db, session_id, int(card_uid), cache)
+            fields = _card_fields(db, session_id, int(card_uid), cache)
             if row and _owner_projects_card_properties(
-                    db, session_id, row[0], cache):
+                    db, session_id, row[0], cache, battle_state=state):
                 native, _unsupported = _scan_static_deltas(
                     db, session_id, state, int(card_uid), cache,
                     properties={"cardthreshold", "subtype"})
@@ -1658,19 +1720,15 @@ def effective_card_properties(db, session_id, battle_state, card_uid):
             state.pop(marker, None)
         else:
             state[marker] = previous
-    from pvp_db import (db_card_mutation_field,
-                        db_card_template_threshold_subtype)
-    row = db_card_template_threshold_subtype(
-        session_id, int(card_uid), conn=db)
     thresholds = []
     subtype = ""
-    if row:
+    if fields is not None and fields["template_guid"] is not None:
         from .targeting import _shards
-        thresholds = list(_shards(row[0]))
-        subtype = str(row[1] or "")
+        thresholds = list(_shards(fields["threshold_json"]))
+        subtype = str(fields["subtype"] or "")
     try:
-        buffs = json.loads(db_card_mutation_field(
-            session_id, int(card_uid), "permanent_buffs", conn=db) or "{}")
+        buffs = json.loads(
+            (fields["permanent_buffs"] if fields is not None else None) or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         buffs = {}
     if isinstance(buffs, dict):
@@ -1817,11 +1875,12 @@ def _card_play_for_free(db, session_id, battle_state, card_uid):
     """
     if not isinstance(battle_state, dict) or not battle_state:
         return False
-    from pvp_db import db_card_mutation_field, db_card_owner_id
+    with _projection_cache() as cache:
+        fields = _card_fields(db, session_id, int(card_uid), cache)
     for column in ("permanent_buffs", "temporary_buffs"):
         try:
-            data = json.loads(db_card_mutation_field(
-                session_id, int(card_uid), column, conn=db) or "{}")
+            data = json.loads(
+                (fields[column] if fields is not None else None) or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             data = {}
         attrs = data.get("int_attrs") if isinstance(data, dict) else None
@@ -1830,7 +1889,7 @@ def _card_play_for_free(db, session_id, battle_state, card_uid):
                 if (str(name).lower() == "ownercanplayforfree"
                         and int(value or 0) > 0):
                     return True
-    owner = db_card_owner_id(session_id, int(card_uid), conn=db)
+    owner = fields["user_id"] if fields is not None else None
     for name, value in _champion_int_attrs(battle_state, owner).items():
         if (str(name).lower() == "canplaycardsforfree"
                 and int(value or 0) > 0):
@@ -2059,6 +2118,17 @@ def mobilize_payment(db, session_id, owner_id, card_uid, payment, mobilized):
 
 
 def effective_cost(db, session_id, battle_state, card_uid):
+    """Payable cost of one card; the card reads share one scan memo."""
+    with _projection_cache() as cache:
+        key = (int(session_id or 0), int(card_uid))
+        cost = cache.card_costs.get(key)
+        if cost is None:
+            cost = _effective_cost(db, session_id, battle_state, card_uid)
+            cache.card_costs[key] = cost
+        return cost
+
+
+def _effective_cost(db, session_id, battle_state, card_uid):
     native, unsupported = _native_static_deltas(
         db, session_id, battle_state or {}, int(card_uid),
         # Cost reads happen while condition contexts enumerate cards. Scan
@@ -2294,20 +2364,19 @@ def player_int_attributes(db, session_id, battle_state, owner_id, *,
 
 def _cost_from_deltas(db, session_id, card_uid, native):
     """Project an effective cost from an already-computed native delta view."""
-    from pvp_db import db_card_cost_location_state, db_card_mutation_field
-    row = db_card_cost_location_state(session_id, int(card_uid), conn=db)
-    if not row:
+    with _projection_cache() as cache:
+        fields = _card_fields(db, session_id, int(card_uid), cache)
+    if fields is None or fields["template_guid"] is None:
         return 0
-    cost = int(row[0] or 0) + int(row[1] or 0)
-    if row[2]:
+    cost = int(fields["cost"] or 0) + int(fields["card_cost_mod"] or 0)
+    if fields["cost_mod_json"]:
         try:
-            value = json.loads(row[2])
+            value = json.loads(fields["cost_mod_json"])
             cost += int(value.get("cost_mod", 0) or 0) if isinstance(value, dict) else 0
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
     try:
-        buffs = json.loads(db_card_mutation_field(
-            session_id, int(card_uid), "temporary_buffs", conn=db) or "{}")
+        buffs = json.loads(fields["temporary_buffs"] or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         buffs = {}
     if isinstance(buffs, dict):
@@ -2321,6 +2390,13 @@ def _cost_from_deltas(db, session_id, card_uid, native):
 
 
 def effective_option_projection(db, session_id, battle_state, card_uid):
+    """Return ``(attributes, cost)`` for one card; see the helper for details."""
+    with _projection_cache():
+        return _effective_option_projection(db, session_id, battle_state,
+                                            card_uid)
+
+
+def _effective_option_projection(db, session_id, battle_state, card_uid):
     """Return ``(attributes, cost)`` for one hand card from a single scan.
 
     The returned values are the same projections as :func:`effective_attributes`

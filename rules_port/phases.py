@@ -1,7 +1,7 @@
 """Client-derived legal turn-phase graph.
 
 This is a direct transcription of the ``.Permit`` calls in
-``HexClient/.../Game/Shared/Mechanics/*State.cs``.  It validates transitions;
+``hex-private/HexClient/.../Game/Shared/Mechanics/*State.cs``.  It validates transitions;
 phase-entry effects remain the responsibility of a session adapter.
 """
 

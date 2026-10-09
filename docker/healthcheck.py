@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 
 PORTS = {
     "hconnect": 9933,
     "proxy": 8081,
 }
+CAMPAIGN_EDITOR = (Path(__file__).resolve().parents[1] / "hex-private" /
+                   "campaign" / "tools" / "campaign_editor" / "server.py")
+if CAMPAIGN_EDITOR.is_file():
+    PORTS["campaign_editor"] = 8765
 LISTENING_STATE = "0A"
 
 

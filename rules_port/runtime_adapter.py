@@ -475,7 +475,7 @@ class PvpRuntimeFacts:
         Champion SessionCardIds are emitted by the protocol but intentionally
         do not live in ``game_cards``.  The HConnect attach seam supplies the
         concrete player/AI champion IDs; ability existence and authored costs
-        remain Records/SQLite metadata checks.
+        remain hex-private/Records/SQLite metadata checks.
         """
         try:
             source_id = int(getattr(source_card_id, "uid64", source_card_id))

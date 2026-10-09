@@ -3,12 +3,12 @@
 The image intentionally does not contain a database snapshot. A Docker
 deployment can point ``HEX_DB_PATH`` at persistent storage. If that file does
 not exist, this module creates it from the server schema and the mounted
-gamedata blob or a mounted ``Records/`` snapshot. Tests run only after a new
+gamedata blob or a mounted ``hex-private/Records/`` snapshot. Tests run only after a new
 database is created.
 
 An existing database is upgraded in place through ``static.ensure_schema``,
 which also re-syncs its client-derived projection (card, ability, champion and
-encounter rows) from the mounted gamedata or ``Records/`` source whenever that
+encounter rows) from the mounted gamedata or ``hex-private/Records/`` source whenever that
 snapshot has moved on — player progress is never part of that projection.
 
 The Frost Ring Arena encounter and challenge catalogues are maintained by
@@ -18,6 +18,7 @@ or incomplete.  Existing usable FRA data is left untouched.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -98,7 +99,7 @@ def records_path() -> Path:
     value = os.environ.get("HEX_RECORDS")
     if value:
         return Path(os.path.abspath(os.path.expanduser(value)))
-    return ROOT / "Records"
+    return ROOT / "hex-private" / "Records"
 
 
 def validate_data_sources(path: Path | None, records: Path, *, database_missing: bool) -> None:
@@ -115,7 +116,7 @@ def validate_data_sources(path: Path | None, records: Path, *, database_missing:
         raise RuntimeError(
             f"Database does not exist and neither gamedata nor a complete "
             f"Records source was found for {database_path()}. Set HEX_GAMEDATA "
-            "or mount a complete Records/ directory before the first container "
+            "or mount a complete hex-private/Records/ directory before the first container "
             "start."
         )
 
@@ -162,6 +163,73 @@ def create_starter_decks(gamedata: Path | None, records: Path) -> None:
     subprocess.run(command, cwd=str(ROOT), check=True)
 
 
+# The campaign editor's art comes from the client install, not the gamedata.
+# Each extractor writes one index; a missing index means that art is missing.
+EDITOR_GENERATED = ROOT / "hex-private" / "campaign" / "tools" / "campaign_editor" / "generated"
+
+
+def _zone_files_missing() -> bool:
+    """A zone's map (or panorama) file is missing, or the zone list is.
+
+    Those files hold the zone's background tiles, particle emitters and
+    parallax layers, so each one is checked, not just the zone list.
+    """
+    zones_path = EDITOR_GENERATED / "zones.json"
+    if not zones_path.is_file():
+        return True
+    zones = json.loads(zones_path.read_text(encoding="utf-8")).get("zones") or []
+    return any(not (EDITOR_GENERATED / zone["id"] / (
+        "panorama.json" if zone.get("kind") == "panorama" else "map.json")).is_file()
+        for zone in zones)
+
+
+EDITOR_ART_EXTRACTORS = (
+    ("cards/index.json", lambda: not (EDITOR_GENERATED / "cards" / "index.json").is_file(),
+     "extract_card_art.py", ()),
+    ("items/index.json", lambda: not (EDITOR_GENERATED / "items" / "index.json").is_file(),
+     "extract_item_icons.py", ()),
+    ("zones and zone files", _zone_files_missing,
+     "extract_campaign_editor_assets.py", ("--records",)),
+)
+
+
+# The container's client mount is the Hex install root (the folder that holds
+# ``Hex_Data`` and ``AssetBundles``), always at this path.
+CLIENT_ROOT = Path("/client-data")
+
+
+def client_install() -> Path | None:
+    """The Hex install root mounted at ``/client-data``, if it is there."""
+    return CLIENT_ROOT if (CLIENT_ROOT / "Hex_Data" / "resources.assets").is_file() else None
+
+
+def ensure_editor_art(records: Path) -> None:
+    """Generate the campaign editor's missing art from the mounted client.
+
+    The image never bundles this art. A missing index is generated when the
+    client install is mounted; without it the editor runs with less art. A
+    failed extraction is logged and does not stop startup.
+    """
+    client = client_install()
+    scripts = ROOT / "hex-private" / "campaign" / "AssetExtraction"
+    for label, is_missing, script, extra in EDITOR_ART_EXTRACTORS:
+        if not is_missing():
+            continue
+        index = label
+        if client is None:
+            print(f"[docker] editor art {index} skipped: no Hex install mounted "
+                  "at /client-data", flush=True)
+            continue
+        command = [sys.executable, str(scripts / script), "--client-root", str(client)]
+        if "--records" in extra:
+            command.extend(("--records", str(records)))
+        print(f"[docker] generating editor art {index} from {client}", flush=True)
+        try:
+            subprocess.run(command, cwd=str(ROOT), check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"[docker] editor art {index} failed: {exc}", flush=True)
+
+
 def _ensure_database_schema(connection: sqlite3.Connection) -> None:
     """Apply the current DDL and idempotent static seeds to *connection*."""
     # Keep Docker databases consistent with the runtime database connection.
@@ -170,9 +238,42 @@ def _ensure_database_schema(connection: sqlite3.Connection) -> None:
     # short writer collisions resolve instead of failing.
     connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA journal_mode=WAL")
-    import static
+    # static.ensure_schema imports a couple of reusable DML helpers from db.py.
+    # Importing db.py normally initializes its own connection and calls
+    # ensure_schema again. Mark this scoped bootstrap pass so that import only
+    # provides the helpers, without recursively running another seed pass.
+    database_path = next(
+        (row[2] for row in connection.execute("PRAGMA database_list")
+         if row[1] == "main" and row[2]),
+        None,
+    )
+    previous_db_path = os.environ.get("HEX_DB_PATH")
+    previous_bootstrap_marker = os.environ.get("HEX_DB_BOOTSTRAPPED")
+    if database_path:
+        os.environ["HEX_DB_PATH"] = database_path
+    os.environ["HEX_DB_BOOTSTRAPPED"] = "1"
+    try:
+        import static
 
-    static.ensure_schema(connection)
+        static.ensure_schema(connection)
+    finally:
+        # The helper import's connection points at this same file. Close it
+        # before create_database renames a temporary bootstrap database.
+        database_module = sys.modules.get("db")
+        shared_connection = getattr(database_module, "_db", None)
+        if shared_connection is not None and shared_connection is not connection:
+            try:
+                shared_connection.close()
+            except sqlite3.Error:
+                pass
+        if previous_db_path is None:
+            os.environ.pop("HEX_DB_PATH", None)
+        else:
+            os.environ["HEX_DB_PATH"] = previous_db_path
+        if previous_bootstrap_marker is None:
+            os.environ.pop("HEX_DB_BOOTSTRAPPED", None)
+        else:
+            os.environ["HEX_DB_BOOTSTRAPPED"] = previous_bootstrap_marker
 
 
 def create_database(path: Path) -> None:
@@ -272,7 +373,7 @@ def _require_records_files(records: Path, files: tuple[str, ...], catalog: str) 
     joined = ", ".join(missing)
     raise RuntimeError(
         f"FRA {catalog} data is missing ({joined}) under {records}. "
-        "Mount a complete Records/ directory or set HEX_GAMEDATA so the "
+        "Mount a complete hex-private/Records/ directory or set HEX_GAMEDATA so the "
         "bootstrap can regenerate it."
     )
 
@@ -421,6 +522,7 @@ def main() -> int:
         if not records_available(configured_records):
             create_records(configured_gamedata, configured_records)
     create_starter_decks(configured_gamedata, configured_records)
+    ensure_editor_art(configured_records)
     if exists:
         print(f"[docker] using existing database {path}", flush=True)
         # Persistent deployments must receive new columns, indexes, and

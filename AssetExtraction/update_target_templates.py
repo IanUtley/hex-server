@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Add targeting metadata to the TARGET_TEMPLATES seed and target_templates DB
-table, extracted data-driven from Records/AbilityTargetTemplate.jsonl.
+table, extracted data-driven from hex-private/Records/AbilityTargetTemplate.jsonl.
 
 Each target template gains: is_auto_target, is_random_target, optional,
 explicit, player_filter, collection_flags, min/max target count and the raw
@@ -21,7 +21,7 @@ import sqlite3
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(ROOT, "static.py")
 DB = os.path.join(ROOT, "hconnect.db")
-RECORDS = os.path.join(ROOT, "Records", "AbilityTargetTemplate.jsonl")
+RECORDS = os.path.join(ROOT, "hex-private", "Records", "AbilityTargetTemplate.jsonl")
 
 BEGIN_MARKER = "TARGET_TEMPLATES = ["
 

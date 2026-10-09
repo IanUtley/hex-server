@@ -49,9 +49,9 @@ from rules_port.bom_fields import effect_template
 from rules_port.coverage import NATIVE_EFFECTS, STRUCTURAL_EFFECTS
 
 CS_DIRS = (
-    ROOT / "HexClient/Assembly-CSharp-firstpass/Game/Shared/Mechanics/Abilities",
-    ROOT / "HexClient/Assembly-CSharp-firstpass/Game/Shared/Mechanics",
-    ROOT / "HexClient/Assembly-CSharp-firstpass/Reckoning/Game",
+    ROOT / "hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared/Mechanics/Abilities",
+    ROOT / "hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared/Mechanics",
+    ROOT / "hex-private/HexClient/Assembly-CSharp-firstpass/Reckoning/Game",
 )
 
 PRODUCTION_FILES = (
@@ -130,14 +130,14 @@ def _csharp_consumed_intattrs() -> set[str]:
     card-text RulesParser) means the runtime consults it.  A marker only the
     client UI or card-text parser mentions is not a server behavior gap.
     """
-    declaration = (ROOT / "HexClient/Assembly-CSharp-firstpass/Game/Shared/"
+    declaration = (ROOT / "hex-private/HexClient/Assembly-CSharp-firstpass/Game/Shared/"
                    "Mechanics/IntAttrs.cs")
     if not declaration.is_file():
         return set()
     text = declaration.read_text(encoding="utf-8", errors="replace")
     field_to_name = dict(re.findall(
         r"(\w+)\s*=\s*new IntAttrs\(\"([^\"]+)\"", text))
-    game_dir = ROOT / "HexClient/Assembly-CSharp-firstpass/Game"
+    game_dir = ROOT / "hex-private/HexClient/Assembly-CSharp-firstpass/Game"
     consumed: set[str] = set()
     for path in game_dir.rglob("*.cs"):
         if path.name == "IntAttrs.cs" or "AI" in path.parts:

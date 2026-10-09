@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Any
 
-from profile_db import db_get_unopened_chests
+from profile_db import db_get_unopened_chests, db_get_inventory_items
 
 if TYPE_CHECKING:
     # HConnect still binds these legacy protocol and DB names into this
@@ -30,6 +30,15 @@ class ProfileStreamMixin:
     def push_profile_stream(self):
         p = self.user_profile
         username = display_name_from_identity(p["name"])
+        # Give every account the current chat-commands mail once; an older
+        # version the user received is superseded by sending the new text.
+        try:
+            from profile_db import db_ensure_chat_commands_mail
+            if db_ensure_chat_commands_mail(p["id"], conn=_db):
+                _db.commit()
+                log_req("    Sent chat-commands mail")
+        except Exception as exc:
+            log_req(f"    WARN: chat-commands mail failed: {exc}")
         gold = p["gold"]
         platinum = p["platinum"]
         
@@ -90,25 +99,16 @@ class ProfileStreamMixin:
 
         now_str = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
         
-        # Build inventory items from DB (only purchased items, no stardust/chests)
+        # Build persisted inventory items; chests are added separately below.
         inv_items = []
         
-        # Add purchased items from DB
-        purchased = db_get_inventory(p["id"])
-        for tguid, qty in purchased:
-            # The client replaces an inventory row when its UID and template
-            # match.  Keep the UID stable across profile pushes and purchase
-            # responses so ItemQuantity remains an authoritative total.
-            row = db_inventory_item(p["id"], tguid, conn=_db)
-            client_uid = row[2] if row and row[2] else None
-            if not client_uid:
-                client_uid = db_next_inventory_client_uid(p["id"], conn=_db)
-                db_set_inventory_client_uid(
-                    p["id"], tguid, client_uid, conn=_db)
+        # Add every account inventory row from DB.
+        purchased = db_get_inventory_items(p["id"])
+        for _row_id, tguid, qty, client_uid in purchased:
+            # Stardust is counted by the client as inventory instances. Keep
+            # one serialized inventory_bits item per persisted row, each with
+            # its own stable client UID, even when templates match.
             inv_items.append((tguid, client_uid, qty))
-        # Persist any newly allocated client UIDs before later service calls
-        # use them for quantity updates.
-        _db.commit()
 
         # Add unopened chests as inventory items. The client expects the chest
         # to be BOTH a chest_bits entry (m_InventoryChests, via the chest
@@ -191,6 +191,9 @@ class ProfileStreamMixin:
         if self.user_profile:
             card_rows = db_profile_card_instances(
                 self.user_profile["id"], conn=_db)
+            # Every copy in the login push is now known to the client; a later
+            # CardsAdded push must only announce copies granted after this.
+            self._announced_card_ids = {int(r[5]) for r in card_rows}
             profile_cards = [
                 (r[0], r[1] or "", r[5], r[2] or 0, r[3] or 0, r[4] or 0)
                 for r in card_rows
@@ -495,11 +498,20 @@ class ProfileStreamMixin:
                 f"{len(flags)} flags, dw_sz={len(dw)}")
 
     def push_cards_to_client(self):
-        """Push card instances from DB to the client via CardsAdded event (2205), chunked."""
+        """Announce copies the client does not have yet (CardsAdded, 2205), chunked.
+
+        A CardsAdded event for a copy already in a deck makes the client
+        re-template that deck card, which drops its gems, so copies announced
+        by the login push (or an earlier grant) are never sent again.
+        """
         if not self.user_profile:
             return
         p = self.user_profile
         rows = db_profile_card_instances(p["id"], conn=_db)
+        announced = getattr(self, "_announced_card_ids", None)
+        if announced is not None:
+            rows = [r for r in rows if int(r[5]) not in announced]
+            announced.update(int(r[5]) for r in rows)
         if not rows:
             return
         all_cards = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows]

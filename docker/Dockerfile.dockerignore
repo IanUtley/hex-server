@@ -6,6 +6,10 @@
 # into the container image.
 /hex-private/HexClient/
 /hex-private/Records/
+# Campaign editor art is extracted from the client install at startup, so the
+# extracted files are never part of the build context (only the root generated/
+# above is matched by the generic pattern).
+/hex-private/campaign/tools/campaign_editor/generated/
 HexPlugin/
 BepInEx/
 experimental/

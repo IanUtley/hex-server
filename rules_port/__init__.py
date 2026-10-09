@@ -1,4 +1,4 @@
-"""Python implementation of the ``HexClient/Game.Shared`` rules boundary.
+"""Python implementation of the ``hex-private/HexClient/Game.Shared`` rules boundary.
 
 RulesPort owns gameplay decisions, state transitions, ordering, and
 continuations. Runtime adapters project accepted transitions into SQLite and

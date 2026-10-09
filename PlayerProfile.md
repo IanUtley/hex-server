@@ -1,6 +1,6 @@
 # PlayerProfile.cs — Server Integration Reference
 
-**File:** `HexClient/Assembly-CSharp-firstpass/Game/Client/PlayerProfile.cs` (5,130 lines)  
+**File:** `hex-private/HexClient/Assembly-CSharp-firstpass/Game/Client/PlayerProfile.cs` (5,130 lines)
 **Purpose:** Client-side mirror of server state. All server pushes mutate this object.
 
 > Pre-built binary — all fixes must be server-side.
