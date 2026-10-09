@@ -5609,6 +5609,12 @@ def _handle_forfeit(handler, db, env_json, comp, session_id,
                      reqid, target, instance, conh, uid):
     """Forfeit: forfeit a campaign."""
     camp_id = env_json.get("CampID", 0)
+    zone_id = _rules_zone(db, camp_id)
+    if zone_id:
+        from campaign_runtime import runtime
+        return runtime.handle_forfeit(handler, db, zone_id, env_json, comp,
+                                      session_id, reqid, target, instance,
+                                      conh, uid)
     row = pve_db.db_campaign_forfeit_row(camp_id, conn=db)
     if not row:
         resp = _build_input_response(camp_id, None, success=False)
