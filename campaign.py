@@ -4878,6 +4878,7 @@ def _rules_battle_gameend(handler, db, session, camp_id, won, zone_id,
     the result (scene / card-choice flag actions, quest steps, result
     conversation), then the scene's rewards are paid against its flags."""
     from campaign_runtime import runtime
+    from pvp_db import db_delete_game_session
     zone = runtime.handle_battle_end(handler, db, zone_id, session, camp_id, won)
     reward_result = _apply_encounter_end_rewards(
         handler, db, session, camp_id, won, rules_runtime=True)
@@ -4904,6 +4905,7 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
     session lifecycle are service concerns.  FRA persistence remains here as
     the same result path is shared by practice and campaign battles.
     """
+    from pvp_db import db_delete_game_session
     try:
         session_name = session.session_name or ""
         if not session_name.startswith("camp_"):
