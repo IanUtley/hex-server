@@ -226,7 +226,9 @@ def reveal_cards(context):
         # the Coverflow shows the cards temporarily and does not keep them
         # revealed after a follow-up move puts them back into a hidden zone.
         event.inactive = True
-        context.game._push(event)
+        # The client builds the coverflow from the revealed card views the
+        # moment CardsRevealed arrives, and hidden deck cards have no view until
+        # their CardUpdated lands. Send the card updates first.
         for row in rows:
             scid = game_engine.SessionCardId(game_engine.UID(int(row[0])))
             card_owner = owner_uid(row[3], context.player_uid,
@@ -239,4 +241,5 @@ def reveal_cards(context):
                 scid, card_owner, card_collection, card_type,
                 state=int(row[4] or 0), template_id=row[2], cost=cost,
                 attack=attack, defense=defense, gems=gems, nulling=False)
+        context.game._push(event)
     return f"revealed {len(uids)}"

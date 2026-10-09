@@ -901,6 +901,14 @@ def test_oakhenge_single_revealed_troop_moves_without_a_picker(db):
     assert len(reveals) == 1, reveals
     assert [int(card.uid.uid64) for card in reveals[0].session_card_ids] == [
         362, 363, 364, 365, 366]
+    # The client builds the coverflow when CardsRevealed arrives, so every
+    # revealed card's view must already have been sent by a CardUpdated.
+    reveal_at = game.events.index(reveals[0])
+    for uid in (362, 363, 364, 365, 366):
+        updated_at = [index for index, event in enumerate(game.events)
+                      if isinstance(event, game_engine.CardUpdatedSessionEventArgs)
+                      and int(event.session_card_id.uid.uid64) == uid]
+        assert updated_at and updated_at[0] < reveal_at, (uid, updated_at, reveal_at)
     assert not [event for event in game.events if isinstance(
         event, game_engine.PlayerOptionListSessionEventArgs)]
     rows = db.execute(
