@@ -12816,15 +12816,6 @@ class HCPHandler(ProfileStreamMixin):
                         headers, body, consumed = parse_packet(self.buf)
                     except ValueError:
                         break
-                    # TEMPORARY capture for the web PoC: while the flag file exists,
-                    # keep each inbound packet's exact bytes. Remove with the flag.
-                    if os.path.exists("/tmp/hconnect_capture_on"):
-                        try:
-                            os.makedirs("/tmp/hconnect_capture", exist_ok=True)
-                            with open(f"/tmp/hconnect_capture/{time.time_ns()}.hex", "w") as cf:
-                                cf.write(self.buf[:consumed].hex())
-                        except OSError:
-                            pass
                     self.buf = self.buf[consumed:]
                     self.handle_message(headers, body)
         except ConnectionResetError:
