@@ -1646,9 +1646,24 @@ class CardPlayMixin:
             source_location, "CastSpells", previous_state)
         dispatch_card_cast(
             self, session, game, bstate, pl_t, ai_t, card_uid, owner_id)
+        # The cast trigger queued above can put the AI first on the chain. No
+        # client transaction follows for the AI's own response, so consume its
+        # passes here, as the pass handler does for the Practice window.
+        if not (session.session_name or "").startswith("tourney-"):
+            from application.practice_flow import _is_practice_chain_follow_up
+            for _follow_up in range(8):
+                follow_up = native_port.action_stack.peek()
+                follow_priority = getattr(follow_up, "priority_player_id", None)
+                if not _is_practice_chain_follow_up(follow_up, pl_t, True):
+                    break
+                if not native_port.pass_player_priority(follow_priority):
+                    break
+                native_port.drive_until_input(max_steps=64)
         _be.save_state(session, bstate)
+        holder = getattr(native_port.action_stack.peek(), "priority_player_id", None)
         game.push_green_light(
-            ai_t, _hc.game_engine.EPriorityContext.ResolveTopOfChain)
+            pl_t if holder is None or _hc._same_uid(holder, pl_t) else ai_t,
+            _hc.game_engine.EPriorityContext.ResolveTopOfChain)
         if payment:
             event = _hc.game_engine.PlayerCurrentResourcePoolChangedSessionEventArgs()
             event.player_id = pl_t; event.operation = 2
