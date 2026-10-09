@@ -34,20 +34,20 @@ def handle_servicegamesession_replayfetch_160000(handler, target, instance, data
     if isinstance(env_json, dict) and env_json.get("action") == "replayfetch":
         from replay import replay_fetch
         resp_envelope = replay_fetch(env_json)
-        log_req(
+        _hc.log_req(
             f">>> ReplayFetch session={env_json.get('Session', '')} "
             f"offset={env_json.get('Offset', 0)} size={len(resp_envelope)}"
         )
     else:
         resp_envelope = b"\0\0\0\0\0"
-        log_req(">>> ReplayFetch invalid request")
-    resp_inner = encode_objfmt_response(
+        _hc.log_req(">>> ReplayFetch invalid request")
+    resp_inner = _hc.encode_objfmt_response(
         ["Game.Shared.GameReq.GameReq+Response", "System.Byte[]"],
         [("Envelope", "bytes", resp_envelope)],
     )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = (
         f"0.0.0.0.ServiceGameSession.{_hc.SERVICE_GAME_SESSION_UID}."
         f"{instance}.{resp_reqid}"
@@ -57,15 +57,15 @@ def handle_servicegamesession_replayfetch_160000(handler, target, instance, data
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent ReplayFetch response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent ReplayFetch response ({len(dw_bytes)}b)")
 
 
 # GameSession Service — PlayerTransaction (3029)
 def handle_playertransaction_3029(handler, target, instance, data_type, reqid, comp, session_id,
                                   conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    player_uid = make_uid(_hc.UID_TYPE["ServicePlayer"], int(handler.client_reck_id))
-    session = game_session.find_session_by_player(player_uid)
+    player_uid = _hc.make_uid(_hc.UID_TYPE["ServicePlayer"], int(handler.client_reck_id))
+    session = _hc.game_session.find_session_by_player(player_uid)
     sync_packets_before = int(getattr(
         handler, "_game_sync_send_count", 0))
     handler._ai_turn_depth = 0  # reset turn-advance recursion guard
@@ -73,21 +73,21 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
 
     # Decode the raw transaction once at the application boundary;
     # execution below consumes typed flags without reparsing bytes.
-    transaction = classify_player_transaction(inner_bytes)
+    transaction = _hc.classify_player_transaction(inner_bytes)
     # Run labeled recovery even when nested ObjFmt parsing failed,
     # then reclassify with the real command flags so combat and
     # continuation-specific raw recovery rules are available.
-    decoded_payload = typed_payload_from_decoded(
+    decoded_payload = _hc.typed_payload_from_decoded(
         transaction,
         inner_obj if isinstance(inner_obj, dict)
         else {"__raw__": inner_bytes})
     if decoded_payload:
-        transaction = classify_player_transaction(
+        transaction = _hc.classify_player_transaction(
             inner_bytes, typed_payload=decoded_payload)
     txn_info = transaction.fields
     txn_id_str = txn_info.get("m_TransactionId", "?")
     txn_id_int = transaction.transaction_id
-    set_session_transaction_trace_ids(
+    _hc.set_session_transaction_trace_ids(
         transaction_id=txn_id_int,
         session_id=getattr(session, "session_id", None))
     quit_series = txn_info.get("m_QuitEntireSeries", "?")
@@ -188,10 +188,10 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
             "is_encounter_mod_dialog": is_encounter_mod_dialog,
         }
         try:
-            pre_state_json = db_session_state_snapshot(
+            pre_state_json = _hc.db_session_state_snapshot(
                 session.session_id)
-            pre_rules_port_json = db_rules_port_state_snapshot(session)
-            transaction_capture_id = db_record_session_transaction(
+            pre_rules_port_json = _hc.db_rules_port_state_snapshot(session)
+            transaction_capture_id = _hc.db_record_session_transaction(
                 session.session_id, player_uid, reqid, data_type, comp,
                 txn_id_int,
                 inner_obj.get("__type__", "")
@@ -203,13 +203,13 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
                 decoded_intent=decoded_payload or {},
                 pre_state_json=pre_state_json,
                 pre_rules_port_json=pre_rules_port_json)
-            set_session_transaction_trace_ids(
+            _hc.set_session_transaction_trace_ids(
                 transaction_row_id=transaction_capture_id)
         except Exception as capture_error:
             # Diagnostics must never make a live transaction fail.
-            log_req(f"    Transaction capture failed: {capture_error}")
+            _hc.log_req(f"    Transaction capture failed: {capture_error}")
 
-    log_req(f">>> PlayerTransaction (dt=3029) txId={txn_id_str} quit={quit_series} cheat={is_cheat} pass={is_pass_priority}")
+    _hc.log_req(f">>> PlayerTransaction (dt=3029) txId={txn_id_str} quit={quit_series} cheat={is_cheat} pass={is_pass_priority}")
     
     # Handle mulligan keep — push AcceptedStartingHand + phase sequence
     handled = False
@@ -274,7 +274,7 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
                         transaction, "typed_payload", None)))
         except Exception as _pvp_error:
             import traceback
-            log_req(f"    PvP RulesPort adapter exception: {_pvp_error}")
+            _hc.log_req(f"    PvP RulesPort adapter exception: {_pvp_error}")
             traceback.print_exc()
             handled = True
         if (handled and not is_pass_priority and
@@ -291,7 +291,7 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
             _rules_players = [p for p, _position in
                               (getattr(session, "players", ()) or ())]
             _rules_ai = next((p for p in _rules_players
-                              if not _same_uid(p, player_uid)), None)
+                              if not _hc._same_uid(p, player_uid)), None)
             if _rules_ai is None:
                 # Practice persists the human participant twice, so
                 # the session list has no distinct opponent.  Fall
@@ -336,7 +336,7 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
         # reinterpreted under a different phase/priority contract.  A
         # transaction class the client actually sends belongs in
         # classify_player_transaction, not in the legacy engine.
-        log_req("    RulesPort boundary: refusing legacy fallback"
+        _hc.log_req("    RulesPort boundary: refusing legacy fallback"
                 + ("" if native_boundary_intent else
                    " (unclassified transaction)"))
         handler._push_transaction_ack(session)
@@ -353,7 +353,7 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
     if (session and handled and
             int(getattr(handler, "_game_sync_send_count", 0)) ==
             sync_packets_before):
-        log_req("    PlayerTransaction emitted no 3055; "
+        _hc.log_req("    PlayerTransaction emitted no 3055; "
                 "sending empty sync acknowledgement")
         handler._push_transaction_ack(session)
 
@@ -367,17 +367,17 @@ def handle_playertransaction_3029(handler, target, instance, data_type, reqid, c
 
     if transaction_capture_id is not None:
         try:
-            post_state_json = db_session_state_snapshot(
+            post_state_json = _hc.db_session_state_snapshot(
                 session.session_id)
-            post_rules_port_json = db_rules_port_state_snapshot(session)
-            db_complete_session_transaction(
+            post_rules_port_json = _hc.db_rules_port_state_snapshot(session)
+            _hc.db_complete_session_transaction(
                 transaction_capture_id,
                 hashlib.sha256(post_state_json.encode("utf-8")).hexdigest()
                 if post_state_json else "",
                 handled, post_state_json=post_state_json,
                 post_rules_port_json=post_rules_port_json)
         except Exception as capture_error:
-            log_req(f"    Transaction completion capture failed: {capture_error}")
+            _hc.log_req(f"    Transaction completion capture failed: {capture_error}")
 
 
 

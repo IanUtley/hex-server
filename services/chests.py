@@ -42,6 +42,7 @@ def _resolve_client_chest(user_id, chest_uid):
     Returns ``ClientChest`` or ``None`` when the UID is not an unopened chest
     owned by the player.
     """
+    import hconnect_server as _hc
     try:
         chest_uid = int(chest_uid)
     except (TypeError, ValueError):
@@ -52,7 +53,7 @@ def _resolve_client_chest(user_id, chest_uid):
     # can collide with another inventory instance, so prefer an owned chest
     # row when resolving a legacy duplicated UID rather than whichever
     # unrelated row happens to sort first.
-    row = _db.execute(
+    row = _hc._db.execute(
         "SELECT i.id, i.template_guid, i.quantity, i.client_item_uid, "
         "c.set_guid, c.chest_type FROM player_inventory i "
         "JOIN chest_templates c ON lower(c.guid)=lower(i.template_guid) "
@@ -62,8 +63,8 @@ def _resolve_client_chest(user_id, chest_uid):
         return ClientChest(chest_uid, row[1] or "", row[4] or "",
                            row[5] or "Promo", None, row[0])
     if chest_uid >= CLIENT_CHEST_UID_BASE:
-        row = db_get_chest_by_id(
-            chest_uid - CLIENT_CHEST_UID_BASE, user_id, conn=_db)
+        row = _hc.db_get_chest_by_id(
+            chest_uid - CLIENT_CHEST_UID_BASE, user_id, conn=_hc._db)
         if row:
             return ClientChest(chest_uid, row[4] or "", row[1] or "",
                                row[2] or "Common", row[0], None)
@@ -78,22 +79,23 @@ def _generate_chest_rewards(chest, card_templates, rng=None):
     and Crayburn promo chests are authored by template; every other chest falls
     back to its set booster trimmed to the chest rarity.
     """
+    import hconnect_server as _hc
     rng = rng or random
-    pack_config = CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
+    pack_config = _hc.CAMPAIGN_PACK_CONFIGS.get((chest.template_guid or "").lower())
     if pack_config:
         from gamedata import DEFAULT_RECORD_STORE
-        reward = generate_campaign_pack(
+        reward = _hc.generate_campaign_pack(
             card_templates, DEFAULT_RECORD_STORE, rng,
             pack_config=pack_config)
         inventory_rewards = [(guid, "equipment")
                              for guid in reward.equipment_guids]
         inventory_rewards.extend(
-            (STARDUST_TEMPLATES[rarity.lower()], "stardust")
+            (_hc.STARDUST_TEMPLATES[rarity.lower()], "stardust")
             for rarity in reward.stardust_rarities)
         return list(reward.cards), inventory_rewards
-    cards = _generate_crayburn_chest(card_templates, chest.template_guid)
+    cards = _hc._generate_crayburn_chest(card_templates, chest.template_guid)
     if cards is None:
-        cards = _generate_booster(card_templates, chest.set_guid)
+        cards = _hc._generate_booster(card_templates, chest.set_guid)
         keep_count = _CHEST_KEEP_COUNTS.get(chest.chest_type, 3)
         if len(cards) > keep_count:
             cards = rng.sample(cards, keep_count)
@@ -106,20 +108,21 @@ def _grant_pack_inventory_rewards(handler, inventory_rewards):
     Returns ``(template_guid, client_uid, quantity)`` rows to push to the
     client.  Stardust is additionally recorded in its own ledger.
     """
+    import hconnect_server as _hc
     user_id = handler.user_profile["id"]
-    next_uid = db_next_inventory_client_uid(user_id, conn=_db)
+    next_uid = _hc.db_next_inventory_client_uid(user_id, conn=_hc._db)
     updates = {}
     for template_guid, _kind in inventory_rewards:
-        row = db_inventory_item(user_id, template_guid, conn=_db)
+        row = _hc.db_inventory_item(user_id, template_guid, conn=_hc._db)
         candidate_uid = next_uid if not row or not row[2] else 0
-        client_uid = db_upsert_inventory_item(
-            user_id, template_guid, 1, client_item_uid=candidate_uid, conn=_db)
+        client_uid = _hc.db_upsert_inventory_item(
+            user_id, template_guid, 1, client_item_uid=candidate_uid, conn=_hc._db)
         if candidate_uid:
             next_uid += 1
-        if template_guid in STARDUST_TEMPLATES.values():
-            rarity = next(key for key, value in STARDUST_TEMPLATES.items()
+        if template_guid in _hc.STARDUST_TEMPLATES.values():
+            rarity = next(key for key, value in _hc.STARDUST_TEMPLATES.items()
                           if value == template_guid)
-            db_add_stardust(user_id, rarity, 1, conn=_db)
+            _hc.db_add_stardust(user_id, rarity, 1, conn=_hc._db)
         updates[template_guid] = (client_uid, int(row[1] or 0) + 1 if row else 1)
     return [(guid, client_uid, quantity)
             for guid, (client_uid, quantity) in updates.items()]
@@ -135,10 +138,11 @@ def _open_client_chests(handler, chest_uids):
     ``(template_guid, client_uid, remaining_quantity)`` and ``invalid`` (the
     UIDs that are unknown, already opened, or not owned by the player).
     """
+    import hconnect_server as _hc
     if not handler.user_profile:
         return None
     user_id = handler.user_profile["id"]
-    card_templates = _load_card_templates()
+    card_templates = _hc._load_card_templates()
     summary = {"cards": [], "card_template_ids": [], "inventory_template_ids": [],
                "inventory_updates": [], "opened": [], "invalid": []}
     for chest_uid in chest_uids:
@@ -147,11 +151,11 @@ def _open_client_chests(handler, chest_uids):
             summary["invalid"].append(chest_uid)
             continue
         cards, inventory_rewards = _generate_chest_rewards(chest, card_templates)
-        next_id = db_next_card_instance_id(user_id, conn=_db)
+        next_id = _hc.db_next_card_instance_id(user_id, conn=_hc._db)
         for offset, (guid, name, cost, atk, def_) in enumerate(cards):
             instance_id = next_id + offset
-            db_add_card(user_id, guid, conn=_db)
-            db_create_card_instance(user_id, instance_id, guid, conn=_db)
+            _hc.db_add_card(user_id, guid, conn=_hc._db)
+            _hc.db_create_card_instance(user_id, instance_id, guid, conn=_hc._db)
             summary["card_template_ids"].append(guid)
             summary["cards"].append((guid, name, cost, atk, def_, instance_id, 0))
         for guid, item_uid, quantity in _grant_pack_inventory_rewards(
@@ -159,13 +163,13 @@ def _open_client_chests(handler, chest_uids):
             summary["inventory_template_ids"].append(guid)
             summary["inventory_updates"].append((guid, item_uid, quantity))
         if chest.db_id is not None:
-            db_open_chest(chest.db_id, conn=_db)
+            _hc.db_open_chest(chest.db_id, conn=_hc._db)
             remaining = 0
         else:
-            remaining = db_consume_inventory_row(
-                chest.inventory_row_id, 1, conn=_db)
+            remaining = _hc.db_consume_inventory_row(
+                chest.inventory_row_id, 1, conn=_hc._db)
         summary["opened"].append((chest.template_guid, chest_uid, remaining))
-        log_req(f"    Opened chest {chest_uid} "
+        _hc.log_req(f"    Opened chest {chest_uid} "
                 f"({chest.template_guid or chest.set_guid}): {len(cards)} cards, "
                 f"{len(inventory_rewards)} items, remaining={remaining}")
     return summary

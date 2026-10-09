@@ -43,11 +43,11 @@ import struct
 def handle_getstoreitems_6009(handler, target, instance, data_type, reqid, comp, session_id,
                               conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Respond GetStoreItems -> 1 booster pack")
-    resp_inner = encode_get_store_items_response()
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    _hc.log_req(">>> Respond GetStoreItems -> 1 booster pack")
+    resp_inner = _hc.encode_get_store_items_response()
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceEscrow.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
@@ -59,7 +59,7 @@ def handle_getstoreitems_6009(handler, target, instance, data_type, reqid, comp,
         "conh": conh,
         "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent GetStoreItems response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent GetStoreItems response ({len(dw_bytes)}b)")
 
 
 # ServiceEscrow — RedeemCode (6013)
@@ -67,13 +67,13 @@ def handle_redeemcode_6013(handler, target, instance, data_type, reqid, comp, se
                            conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
     redeem_code = inner_obj.get("RedeemCode", "")
-    log_req(f">>> RedeemCode: code='{redeem_code}'")
+    _hc.log_req(f">>> RedeemCode: code='{redeem_code}'")
     
     p = handler.user_profile
-    result = db_redeem_code(redeem_code, p["id"])
+    result = _hc.db_redeem_code(redeem_code, p["id"])
     if not result["redeemed"]:
-        log_req(f"    RedeemCode invalid: {redeem_code}")
-        resp_inner = encode_objfmt_response(
+        _hc.log_req(f"    RedeemCode invalid: {redeem_code}")
+        resp_inner = _hc.encode_objfmt_response(
             ["Game.Client.Network.Escrow.RedeemCodeResponse",
              "System.Collections.Generic.List`1#Game.Shared.ResourceId",
              "Game.Shared.ResourceId",
@@ -90,16 +90,16 @@ def handle_redeemcode_6013(handler, target, instance, data_type, reqid, comp, se
              ("Error", "enum1", ("Game.Shared.Network.Escrow.ERedeemCodeError", 1)),
              ("ErrorMessage", "string", result["error_message"])]
         )
-        resp_body = compress_gzip(resp_inner) if comp else resp_inner
+        resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
         resp_reqid = reqid | 1
-        dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+        dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
         issuer_str = f"0.0.0.0.ServiceEscrow.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
         handler.scnt += 1
         handler.send({
             "issuer": issuer_str, "target": target, "instance": instance,
             "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
         }, dw_bytes)
-        log_req(f"    Sent RedeemCode (invalid) response ({len(dw_bytes)}b)")
+        _hc.log_req(f"    Sent RedeemCode (invalid) response ({len(dw_bytes)}b)")
     else:
         gold_delta = result["gold"]
         plat_delta = result["platinum"]
@@ -107,7 +107,7 @@ def handle_redeemcode_6013(handler, target, instance, data_type, reqid, comp, se
         card_grants = grant_vendor_code_cards(p["id"], redeem_code)
         new_gold = p["gold"] + gold_delta
         new_plat = p["platinum"] + plat_delta
-        db_update_resources(p["id"], gold=new_gold, platinum=new_plat)
+        _hc.db_update_resources(p["id"], gold=new_gold, platinum=new_plat)
         p["gold"] = new_gold
         p["platinum"] = new_plat
     
@@ -120,16 +120,16 @@ def handle_redeemcode_6013(handler, target, instance, data_type, reqid, comp, se
             parts.append(f"{len(card_grants)} PvP card templates x4")
         reward_desc = ", ".join(parts)
     
-        db_send_email(p["id"],
+        _hc.db_send_email(p["id"],
             f"Code Redeemed: {redeem_code}",
             f"You have successfully redeemed the code '{redeem_code}' and received {reward_desc}.\n\nThank you for playing Hex: Shards of Fate!",
             "SYSTEM")
     
-        log_req(f"    RedeemCode success: gold+{gold_delta} plat+{plat_delta}")
+        _hc.log_req(f"    RedeemCode success: gold+{gold_delta} plat+{plat_delta}")
         if card_grants:
             handler.push_cards_to_client()
     
-        resp_inner = encode_objfmt_response(
+        resp_inner = _hc.encode_objfmt_response(
             ["Game.Client.Network.Escrow.RedeemCodeResponse",
              "System.Collections.Generic.List`1#Game.Shared.ResourceId",
              "Game.Shared.ResourceId",
@@ -146,16 +146,16 @@ def handle_redeemcode_6013(handler, target, instance, data_type, reqid, comp, se
              ("Error", "enum1", ("Game.Shared.Network.Escrow.ERedeemCodeError", 0)),
              ("ErrorMessage", "string", "")]
         )
-        resp_body = compress_gzip(resp_inner) if comp else resp_inner
+        resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
         resp_reqid = reqid | 1
-        dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+        dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
         issuer_str = f"0.0.0.0.ServiceEscrow.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
         handler.scnt += 1
         handler.send_and_cache({
             "issuer": issuer_str, "target": target, "instance": instance,
             "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
         }, dw_bytes, data_type, reqid, target, instance)
-        log_req(f"    Sent RedeemCode (ok) response ({len(dw_bytes)}b)")
+        _hc.log_req(f"    Sent RedeemCode (ok) response ({len(dw_bytes)}b)")
 
 
 # OpenCardPack (2127)
@@ -164,7 +164,7 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
     import hconnect_server as _hc
     item_id = inner_obj.get("ItemId", "{}")
     open_amount = inner_obj.get("OpenAmount", 1)
-    log_req(f">>> OpenCardPack: id={item_id} amount={open_amount}")
+    _hc.log_req(f">>> OpenCardPack: id={item_id} amount={open_amount}")
     
     # Extract template guid from client raw bytes
     # ResourceId uses DataMember field "m_Guid" (not "guid")
@@ -188,44 +188,44 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
                                 break
                         except:
                             pass
-    log_req(f">>> OpenCardPack: pack_guid={pack_guid} amount={open_amount}")
+    _hc.log_req(f">>> OpenCardPack: pack_guid={pack_guid} amount={open_amount}")
 
     # Map store item GUID to card set GUID — query pack_set_map table
-    row = db_pack_set_info(pack_guid, conn=_db)
+    row = _hc.db_pack_set_info(pack_guid, conn=_hc._db)
     if row:
         set_guid, is_full_set, is_primal = row
     else:
         set_guid = pack_guid  # fallback: treat pack GUID as set GUID
         is_full_set = 0
         is_primal = 0
-    log_req(f"    pack_guid={pack_guid} → set_guid={set_guid} full={is_full_set} primal={is_primal}")
+    _hc.log_req(f"    pack_guid={pack_guid} → set_guid={set_guid} full={is_full_set} primal={is_primal}")
 
     # Validate player owns this pack
     pack_error = None
     pack_error_code = 0
     if handler.user_profile:
-        existing = db_inventory_item(
-            handler.user_profile["id"], pack_guid, conn=_db)
+        existing = _hc.db_inventory_item(
+            handler.user_profile["id"], pack_guid, conn=_hc._db)
         if not existing or existing[1] < open_amount:
             pack_error = "NotEnoughInventory"
             pack_error_code = 5
-            log_req(f"    Pack not in inventory! (have={existing[1] if existing else 0}, want={open_amount})")
+            _hc.log_req(f"    Pack not in inventory! (have={existing[1] if existing else 0}, want={open_amount})")
     
     # Generate card instances for the pack
-    card_templates = _load_card_templates()
+    card_templates = _hc._load_card_templates()
     all_cards = []
     pack_inventory_rewards = []
     pack_inventory_updates = []
-    campaign_pack_config = CAMPAIGN_PACK_CONFIGS.get(pack_guid.lower())
+    campaign_pack_config = _hc.CAMPAIGN_PACK_CONFIGS.get(pack_guid.lower())
     starter_pack = None
     if not pack_error:
         try:
-            starter_pack = _generate_starter_deck(
+            starter_pack = _hc._generate_starter_deck(
                 card_templates, pack_guid)
         except ValueError as exc:
             pack_error = "CardCreationFailed"
             pack_error_code = 3
-            log_req(f"    Starter deck contents unavailable: {exc}")
+            _hc.log_req(f"    Starter deck contents unavailable: {exc}")
     if not pack_error:
         if campaign_pack_config:
             # Adventure Zone campaign packs are not normal PvP
@@ -234,7 +234,7 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
             # configured set range.
             from gamedata import DEFAULT_RECORD_STORE
             for _ in range(open_amount):
-                reward = generate_campaign_pack(
+                reward = _hc.generate_campaign_pack(
                     card_templates, DEFAULT_RECORD_STORE, random,
                     pack_config=campaign_pack_config)
                 all_cards.extend(reward.cards)
@@ -242,32 +242,32 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
                     (guid, "equipment")
                     for guid in reward.equipment_guids)
                 pack_inventory_rewards.extend(
-                    (STARDUST_TEMPLATES[rarity.lower()], "stardust")
+                    (_hc.STARDUST_TEMPLATES[rarity.lower()], "stardust")
                     for rarity in reward.stardust_rarities)
-                log_req(
+                _hc.log_req(
                     f"    Campaign pack: {len(all_cards)} cards, "
                 f"{sum(kind == 'equipment' for _, kind in pack_inventory_rewards)} "
                 f"equipment, "
                     f"{sum(kind == 'stardust' for _, kind in pack_inventory_rewards)} "
-                    f"stardust (replacement rate={STARDUST_REPLACEMENT_RATE:.0%})")
+                    f"stardust (replacement rate={_hc.STARDUST_REPLACEMENT_RATE:.0%})")
         elif starter_pack:
             for _ in range(open_amount):
                 all_cards.extend(starter_pack["cards"])
-            log_req(
+            _hc.log_req(
                 f"    Starter deck {starter_pack['definition']['name']}: "
                 f"{len(starter_pack['cards'])} cards x {open_amount}")
         elif is_full_set:
             # Grant every PVP card from the set (4x each)
             pool = card_templates.get(set_guid, [])
-            pool = _full_set_pool(pool)
+            pool = _hc._full_set_pool(pool)
             for _ in range(open_amount):
                 for c in pool:
                     for _ in range(4):  # 4x each card
                         all_cards.append((c[0], c[1], c[3], c[4], c[5]))
-            log_req(f"    Full set: {len(pool)} unique cards x4 = {len(all_cards)} total")
+            _hc.log_req(f"    Full set: {len(pool)} unique cards x4 = {len(all_cards)} total")
         else:
             for _ in range(open_amount):
-                all_cards.extend(_generate_booster(card_templates, set_guid))
+                all_cards.extend(_hc._generate_booster(card_templates, set_guid))
     
     # Track instance IDs for response encoding (fallback: 5000+)
     card_instance_ids = [5000 + i for i in range(len(all_cards))]
@@ -277,14 +277,14 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
     # Persist generated cards to user's collection
     if handler.user_profile and not pack_error:
         for guid, _, _, _, _ in all_cards:
-            db_add_card(handler.user_profile["id"], guid)
+            _hc.db_add_card(handler.user_profile["id"], guid)
     
         # Remove the booster pack from inventory
-        consumed = db_consume_inventory(
-            handler.user_profile["id"], pack_guid, open_amount, conn=_db)
+        consumed = _hc.db_consume_inventory(
+            handler.user_profile["id"], pack_guid, open_amount, conn=_hc._db)
         if consumed:
             pack_client_uid, new_qty = consumed
-            log_req(f"    Consumed {open_amount}x pack {pack_guid} from inventory (remaining={max(0, new_qty)})")
+            _hc.log_req(f"    Consumed {open_amount}x pack {pack_guid} from inventory (remaining={max(0, new_qty)})")
             # Push inventory update so client pack count decrements
             if pack_client_uid:
                 handler.push_inventory_to_client(qty=max(0, new_qty), template_guid=pack_guid, item_id=pack_client_uid)
@@ -296,17 +296,17 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
         # INSERT OR IGNORE in ``db_insert_card_instance`` then kept
         # whatever card happened to occupy that ID.  That made the
         # first card in an opened pack appear as an unrelated card.
-        next_id = db_next_card_instance_for_user(
-            handler.user_profile["id"], conn=_db)
+        next_id = _hc.db_next_card_instance_for_user(
+            handler.user_profile["id"], conn=_hc._db)
         new_card_data = []
         for i, (guid, name, cost, atk, def_) in enumerate(all_cards):
             cid = next_id + i
-            db_insert_card_instance(
-                handler.user_profile["id"], cid, guid, conn=_db)
+            _hc.db_insert_card_instance(
+                handler.user_profile["id"], cid, guid, conn=_hc._db)
             new_card_data.append((guid, name, cost, atk, def_, cid, 0))
             card_instance_ids[i] = cid  # Update for response encoding
-        _db.commit()
-        log_req(f"    Created {len(new_card_data)} card_instances IDs {new_card_data[0][5]}-{new_card_data[-1][5]}")
+        _hc._db.commit()
+        _hc.log_req(f"    Created {len(new_card_data)} card_instances IDs {new_card_data[0][5]}-{new_card_data[-1][5]}")
 
         # OpenCardPackResponse.NewCardInstances is the authoritative
         # collection update.  Do not also send these same instances
@@ -321,16 +321,16 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
         # client.  Keeping the rewards in player_inventory also makes
         # them survive a reconnect.
         if pack_inventory_rewards:
-            pack_inventory_updates = _grant_pack_inventory_rewards(
+            pack_inventory_updates = _hc._grant_pack_inventory_rewards(
                 handler, pack_inventory_rewards)
-            _db.commit()
+            _hc._db.commit()
 
         # Generate treasure chest for normal boosters.  Campaign
         # packs already contain their two equipment/Stardust slots;
         # they do not award the standard booster chest.
         import random as _rand
         probs = ([] if campaign_pack_config or starter_pack else
-                 db_chest_probabilities(conn=_db))
+                 _hc.db_chest_probabilities(conn=_hc._db))
         if probs:
             total_weight = sum(p[1] for p in probs)
             roll = _rand.randint(1, total_weight)
@@ -341,10 +341,10 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
                     chest_rarity = rarity
                     break
             if chest_rarity:
-                chest_db_id = db_create_treasure_chest(
+                chest_db_id = _hc.db_create_treasure_chest(
                     handler.user_profile["id"], set_guid, chest_rarity,
-                    conn=_db)
-                log_req(f"    Generated {chest_rarity} chest id={chest_db_id}")
+                    conn=_hc._db)
+                _hc.log_req(f"    Generated {chest_rarity} chest id={chest_db_id}")
     
     # Encode OpenCardPackResponse using builder
     from objfmt_builder import ObjFmtBuilder
@@ -382,9 +382,9 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
     b.field_str("ErrorMessage", error_msg)
 
     resp_inner = b.finish(5)
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceProfile.{_hc.SERVICE_PROFILE_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
@@ -395,7 +395,7 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
         handler.push_inventory_to_client(
             qty=quantity, template_guid=template_guid,
             item_id=item_uid)
-    log_req(f"    Sent OpenCardPack response ({len(all_cards)} cards, {len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent OpenCardPack response ({len(all_cards)} cards, {len(dw_bytes)}b)")
 
 
 # SpinWheelOfFate (2049) — chest spinning
@@ -410,17 +410,17 @@ def handle_chest_spinning_2049(handler, target, instance, data_type, reqid, comp
         chest_uid = int(chest_id_raw)
     except (TypeError, ValueError):
         chest_uid = 0
-    log_req(f">>> SpinWheelOfFate: ChestID={chest_uid}")
+    _hc.log_req(f">>> SpinWheelOfFate: ChestID={chest_uid}")
 
-    chest = (_resolve_client_chest(handler.user_profile["id"], chest_uid)
+    chest = (_hc._resolve_client_chest(handler.user_profile["id"], chest_uid)
              if handler.user_profile else None)
     if chest is None:
-        log_req(f"    Invalid chest or no profile")
+        _hc.log_req(f"    Invalid chest or no profile")
         resp_inner = b""
     else:
-        summary = _open_client_chests(handler, [chest_uid])
+        summary = _hc._open_client_chests(handler, [chest_uid])
         reward_card_bits = summary["cards"]
-        log_req(f"    Spun chest {chest.chest_type} uid={chest_uid}, "
+        _hc.log_req(f"    Spun chest {chest.chest_type} uid={chest_uid}, "
                 f"awarded {len(reward_card_bits)} cards")
 
         # Push reward cards and inventory changes to client
@@ -601,20 +601,20 @@ def handle_chest_spinning_2049(handler, target, instance, data_type, reqid, comp
         resp_inner = rbuf.getvalue()
 
     if not resp_inner:
-        resp_inner = encode_objfmt_response(
+        resp_inner = _hc.encode_objfmt_response(
             ["Game.Client.Network.Profile.SpinWheelOfFateResponse"],
             []
         )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceProfile.{_hc.SERVICE_PROFILE_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent SpinWheelOfFate response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent SpinWheelOfFate response ({len(dw_bytes)}b)")
 
 
 # OpenChest (2129) — direct opening for NoSpin promo chests and for
@@ -640,7 +640,7 @@ def handle_reserved_for_chests_with_a_2129(handler, target, instance, data_type,
             continue
         if chest_uid > 0:
             requested_ids.append(chest_uid)
-    log_req(f">>> OpenChest: ids={requested_ids}")
+    _hc.log_req(f">>> OpenChest: ids={requested_ids}")
 
     error_val = 0
     error_message = ""
@@ -649,7 +649,7 @@ def handle_reserved_for_chests_with_a_2129(handler, target, instance, data_type,
         error_val = 1  # InvalidChestID
         error_message = "Invalid chest ID"
     else:
-        summary = _open_client_chests(handler, requested_ids)
+        summary = _hc._open_client_chests(handler, requested_ids)
         if requested_ids and not summary["opened"]:
             error_val = 1
             error_message = "Invalid chest ID"
@@ -672,9 +672,9 @@ def handle_reserved_for_chests_with_a_2129(handler, target, instance, data_type,
         error_val)
     b.field_str("ErrorMessage", error_message)
     resp_inner = b.finish(7)
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(
+    dw_bytes = _hc.encode_datawrapper(
         resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = (
         f"0.0.0.0.ServiceProfile.{_hc.SERVICE_PROFILE_UID}."
@@ -684,7 +684,7 @@ def handle_reserved_for_chests_with_a_2129(handler, target, instance, data_type,
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(
+    _hc.log_req(
         f"    Sent OpenChest response ({len(card_template_ids)} cards, "
         f"{len(dw_bytes)}b)")
     # OpenChestResponse only drives the reward display.  Collection

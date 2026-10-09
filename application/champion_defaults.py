@@ -9,7 +9,8 @@ from pve_db import db_default_talents, db_talent_data_ability_guid
 
 def _talent_ability_guid(talent_guid: str) -> str | None:
     """Resolve a champion talent GUID to its actual ability GUID via DB."""
-    return db_talent_data_ability_guid(talent_guid, conn=_db)
+    import hconnect_server as _hc
+    return _hc.db_talent_data_ability_guid(talent_guid, conn=_hc._db)
 
 
 # ERace enum value -> deck name key
@@ -30,14 +31,15 @@ _CHAMPION_GENDER_MAP = {1: "Male", 2: "Female", 3: "Other"}
 
 def _default_talents_for_champion(race_val, class_val, gender_val):
     """Return the authored default talent list for a player template."""
+    import hconnect_server as _hc
     race_name = _RACE_DECK_MAP.get(int(race_val))
     class_name = _CHAMPION_CLASS_MAP.get(int(class_val))
     gender_name = _CHAMPION_GENDER_MAP.get(int(gender_val))
     if not race_name or not class_name or not gender_name:
         return []
     try:
-        row = db_default_talents(
-            race_name, class_name, gender_name, conn=_db)
+        row = _hc.db_default_talents(
+            race_name, class_name, gender_name, conn=_hc._db)
     except sqlite3.Error:
         return []
     if not row:

@@ -26,13 +26,13 @@ def handle_getunreadmailcount_60007(handler, target, instance, data_type, reqid,
     # First mail check after login = client is ready
     if handler._inventory_pending and handler.user_profile:
         handler._inventory_pending = False
-        log_req(">>> Client ready (mail check received)")
+        _hc.log_req(">>> Client ready (mail check received)")
     
-    log_req(f">>> Respond GetUnreadMailCount -> {count}")
-    resp_inner = encode_get_unread_mail_count_response(count)
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    _hc.log_req(f">>> Respond GetUnreadMailCount -> {count}")
+    resp_inner = _hc.encode_get_unread_mail_count_response(count)
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
@@ -44,7 +44,7 @@ def handle_getunreadmailcount_60007(handler, target, instance, data_type, reqid,
         "conh": conh,
         "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent GetUnreadMailCount response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent GetUnreadMailCount response ({len(dw_bytes)}b)")
 
 
 # Mail.Receive (60002) — get mail list
@@ -53,7 +53,7 @@ def handle_get_mail_list_60002(handler, target, instance, data_type, reqid, comp
     import hconnect_server as _hc
     from profile_db import db_get_mail_list
     db_emails = db_get_mail_list(handler.user_profile["id"]) if handler.user_profile else []
-    log_req(f">>> Respond Mail.Receive -> {len(db_emails)} emails")
+    _hc.log_req(f">>> Respond Mail.Receive -> {len(db_emails)} emails")
     now = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
     
     # Include envelope type + UID type
@@ -173,23 +173,23 @@ def handle_get_mail_list_60002(handler, target, instance, data_type, reqid, comp
         w(str(s))
     
     resp_inner = buf.getvalue()
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent Mail.Receive response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent Mail.Receive response ({len(dw_bytes)}b)")
 
 
 # Mail.Delivered (60005) — sent mail
 def handle_sent_mail_60005(handler, target, instance, data_type, reqid, comp, session_id,
                            conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Respond Mail.Delivered -> 0 (empty)")
+    _hc.log_req(">>> Respond Mail.Delivered -> 0 (empty)")
     now = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
     type_names = [
         "Game.Shared.Mail.Messages.Mail+Delivered+Response",
@@ -237,70 +237,70 @@ def handle_sent_mail_60005(handler, target, instance, data_type, reqid, comp, se
         if i > 0: w(";")
         w(str(s))
     resp_inner = buf.getvalue()
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent Mail.Delivered response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent Mail.Delivered response ({len(dw_bytes)}b)")
 
 
 # Mail.MarkRead (60004)
 def handle_mail_markread_60004(handler, target, instance, data_type, reqid, comp, session_id,
                                conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Respond Mail.MarkRead")
+    _hc.log_req(">>> Respond Mail.MarkRead")
     from profile_db import db_mark_all_mail_read
     if handler.user_profile:
         db_mark_all_mail_read(handler.user_profile["id"])
-    resp_inner = encode_objfmt_response(
+    resp_inner = _hc.encode_objfmt_response(
         ["Game.Shared.Mail.Messages.Mail+MarkRead+Response"], []
     )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent Mail.MarkRead response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent Mail.MarkRead response ({len(dw_bytes)}b)")
 
 
 # Mail.MarkDelete (60006)
 def handle_mail_markdelete_60006(handler, target, instance, data_type, reqid, comp, session_id,
                                  conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Respond Mail.MarkDelete")
+    _hc.log_req(">>> Respond Mail.MarkDelete")
     # Mark all user's emails as deleted in DB
     from profile_db import db_delete_all_mail
     if handler.user_profile:
         db_delete_all_mail(handler.user_profile["id"])
-    resp_inner = encode_objfmt_response(
+    resp_inner = _hc.encode_objfmt_response(
         ["Game.Shared.Mail.Messages.Mail+MarkDelete+Response"], []
     )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent Mail.MarkDelete response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent Mail.MarkDelete response ({len(dw_bytes)}b)")
 
 
 # Mail.Claim (60003) — claim attachments from a mail
 def handle_claim_attachments_from_a_mail_60003(handler, target, instance, data_type, reqid, comp, session_id,
                                                conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Mail.Claim (dt=60003)")
+    _hc.log_req(">>> Mail.Claim (dt=60003)")
     p = handler.user_profile
     mail_id_obj = inner_obj.get("MailID", {})
     mail_id_64 = 0
@@ -313,21 +313,21 @@ def handle_claim_attachments_from_a_mail_60003(handler, target, instance, data_t
     gold_granted = 0
     plat_granted = 0
     if eid > 0 and p:
-        claim = db_claim_mail_for_user(p["id"], eid)
+        claim = _hc.db_claim_mail_for_user(p["id"], eid)
         if claim is not None:
             gold_granted = claim["gold"]
             plat_granted = claim["platinum"]
             if gold_granted or plat_granted:
                 p["gold"] += gold_granted
                 p["platinum"] += plat_granted
-                log_req(f"    Claimed mail #{eid}: gold+{gold_granted} plat+{plat_granted}")
+                _hc.log_req(f"    Claimed mail #{eid}: gold+{gold_granted} plat+{plat_granted}")
             if claim.get("cards"):
                 handler.push_cards_to_client()
-                log_req(f"    Claimed mail #{eid}: cards+{len(claim['cards'])}")
+                _hc.log_req(f"    Claimed mail #{eid}: cards+{len(claim['cards'])}")
         else:
-            log_req(f"    Mail #{eid} already claimed or not found")
+            _hc.log_req(f"    Mail #{eid} already claimed or not found")
     
-    resp_inner = encode_objfmt_response(
+    resp_inner = _hc.encode_objfmt_response(
         ["Game.Shared.Mail.Messages.Mail+Claim+Response",
          "System.UInt64",
          "System.UInt32",
@@ -339,28 +339,28 @@ def handle_claim_attachments_from_a_mail_60003(handler, target, instance, data_t
          ("Cards", "coll", ("System.Collections.Generic.List`1#Game.Shared.Mail.Messages.Mail+AttachmentCard", 0)),
          ("Inven", "coll", ("System.Collections.Generic.List`1#Game.Shared.Mail.Messages.Mail+AttachmentInventory", 0))]
     )
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send_and_cache({
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes, data_type, reqid, target, instance)
-    log_req(f"    Sent Mail.Claim response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent Mail.Claim response ({len(dw_bytes)}b)")
 
 
 # PingMailServer (9001)
 def handle_pingmailserver_9001(handler, target, instance, data_type, reqid, comp, session_id,
                                conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
-    log_req(">>> Respond PingMailServer (dt=9001)")
+    _hc.log_req(">>> Respond PingMailServer (dt=9001)")
     timestamp = time.strftime("%m/%d/%Y %H:%M:%S", time.gmtime())
-    resp_inner = encode_ping_mail_server_response(timestamp)
-    resp_body = compress_gzip(resp_inner) if comp else resp_inner
+    resp_inner = _hc.encode_ping_mail_server_response(timestamp)
+    resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
-    dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
+    dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
     issuer_str = f"0.0.0.0.ServiceMail.{_hc.SERVICE_MAIL_UID}.ServicePlayer.{handler.client_uid}.{resp_reqid}"
     handler.scnt += 1
     handler.send({
@@ -372,7 +372,7 @@ def handle_pingmailserver_9001(handler, target, instance, data_type, reqid, comp
         "conh": conh,
         "sid": handler.sid,
     }, dw_bytes)
-    log_req(f"    Sent PingMailServer response ({len(dw_bytes)}b)")
+    _hc.log_req(f"    Sent PingMailServer response ({len(dw_bytes)}b)")
 
 
 

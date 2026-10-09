@@ -5,6 +5,7 @@ import game_engine
 
 def _fra_arena_setup_values(encounter_data):
     """Normalize the encounter identity needed by the FRA client session."""
+    import hconnect_server as _hc
     if not isinstance(encounter_data, dict):
         return None
     raw_flags = encounter_data.get("SessionFlags", 0)
@@ -14,7 +15,7 @@ def _fra_arena_setup_values(encounter_data):
         flags = int(raw_flags or 0)
     except (TypeError, ValueError):
         return None
-    arena_flag = int(game_engine.ESessionFlags.IsPvEArena)
+    arena_flag = int(_hc.game_engine.ESessionFlags.IsPvEArena)
     if not flags & arena_flag:
         return None
 
@@ -28,7 +29,7 @@ def _fra_arena_setup_values(encounter_data):
             return 0
 
     return {
-        "flags": (flags | int(game_engine.ESessionFlags.IsPvE) | arena_flag),
+        "flags": (flags | int(_hc.game_engine.ESessionFlags.IsPvE) | arena_flag),
         "arena_instance": _as_uint64("ArenaInstance"),
         "arena_owner": _as_uint64("ArenaOwner"),
     }
