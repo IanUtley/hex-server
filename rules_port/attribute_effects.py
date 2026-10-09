@@ -284,12 +284,19 @@ def apply_attribute_grant(context, target, param):
                     continue
         owner = db_card_owner_id(context.session.session_id, uid, conn=context.db)
         from .runtime_helpers import card_collection_for_location, owner_uid
+        # Keep the card's combat/tap state (Tapped, Attacking, Blocking ...):
+        # an update that omits it resets the client's copy, which untaps an
+        # attacking troop until the next tap arrives.
+        state_row = context.db.execute(
+            "SELECT card_state FROM game_cards WHERE session_id=? AND card_uid=?",
+            (context.session.session_id, int(uid))).fetchone()
+        card_state = int((state_row[0] if state_row else 0) or 0)
         context.game.push_card_updated(
             scid, owner_uid(owner or 0, context.player_uid, context.ai_uid,
                             context.bstate),
             card_collection_for_location(row[2]), card_type,
             template_id=row[0], attack=attack, defense=defense, cost=cost,
-            gems=gems, attributes=projected_attributes,
+            gems=gems, state=card_state, attributes=projected_attributes,
             int_attrs=projected_int_attrs,
             nulling=str(row[2]).lower() == "deck")
     return int((boon or 0) if int_attr else granted_bits)
