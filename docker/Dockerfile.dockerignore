@@ -2,9 +2,10 @@
 .git/**
 .codex
 .agents
-HexClient
-# Records are generated at startup from HEX_GAMEDATA when needed.
-Records/
+# Private source snapshots are mounted or materialized at startup, not baked
+# into the container image.
+/hex-private/HexClient/
+/hex-private/Records/
 HexPlugin/
 BepInEx/
 experimental/

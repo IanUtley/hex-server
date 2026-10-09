@@ -46,12 +46,13 @@ import game_engine
 import encoder
 import campaign
 from domain.constants import (
-    PLAYER_TRANSACTION_DATA_TYPE, PLAYER_UID_TYPE,
+    LEGACY_AI_PLAYER_UID_TYPE, PLAYER_TRANSACTION_DATA_TYPE, PLAYER_UID_TYPE,
+    SERVICE_AI_UID_TYPE,
     SERVICE_GAME_SESSION_UID_TYPE, SERVICE_PLAYER_UID_TYPE,
     PROFILE_BANNED_CARD_LIST_EVENT, ICONOCLAST_SET_FORMAT,
     ICONOCLAST_PLAY_FORMAT,
 )
-from domain.enums import ETournamentFormats
+from domain.enums import ETournamentFormats, EGemTypesNew
 from application import ApplicationCommandDispatcher
 from application.commands import (JoinSessionCommand, RemoveSessionCommand,
                                   ServiceRequestCommand,
@@ -477,6 +478,7 @@ from services.card_pools import (
 )
 UID_TYPE = {
     "ServicePlayer": SERVICE_PLAYER_UID_TYPE,
+    "ServiceAI": SERVICE_AI_UID_TYPE,
     "ServiceMail": 252,
     "ServiceProfile": 245,
     "ServiceGameSession": SERVICE_GAME_SESSION_UID_TYPE,
@@ -1185,7 +1187,9 @@ class HCPHandler(ProfileStreamMixin):
             native_players = tuple(getattr(port, "player_ids", ()) or ())
             ai_participants = tuple(
                 participant for participant in native_players
-                if int(cast(Any, getattr(participant, "uid64", participant))) & 0xFF == 3)
+                if (int(cast(Any, getattr(participant, "uid64", participant)))
+                    & 0xFF) in (LEGACY_AI_PLAYER_UID_TYPE,
+                                SERVICE_AI_UID_TYPE))
             active_is_ai = (native_active is not None and
                             _uid_in(native_active, ai_participants))
             from rules_port.persistence import current_phase as _checkpoint_phase
@@ -1405,7 +1409,7 @@ class HCPHandler(ProfileStreamMixin):
                 if next_side == _lifecycle.PLAYER:
                     selected = game.player_uid
                 else:
-                    selected = game_engine.UID.make(3, 1000)
+                    selected = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                 selected = _port.coerce_transaction_player_id(selected)
                 _save_state(_session, current_state)
                 log_req(
@@ -1866,7 +1870,7 @@ class HCPHandler(ProfileStreamMixin):
                     return False
                 try:
                     pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-                    ai_t = game_engine.UID.make(3, 1000)
+                    ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                     handled = bool(self._resolve_pending_choice(
                         session, pl_t, ai_t, original.inner_bytes,
                         typed_payload=getattr(original, "typed_payload", None)))
@@ -1943,7 +1947,7 @@ class HCPHandler(ProfileStreamMixin):
                     # forward game.ai_uid/game.player_uid directly here.
                     player_wire_uid = game_engine.UID.make(
                         244, int(self.client_reck_id))
-                    ai_wire_uid = game_engine.UID.make(3, 1000)
+                    ai_wire_uid = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                     self._finish_battle_gameend(
                         session, False,
                         winners=[ai_wire_uid], losers=[player_wire_uid])
@@ -2072,7 +2076,7 @@ class HCPHandler(ProfileStreamMixin):
                         # the card still in Hand and no resolver checkpoint.
                         if phase_window:
                             client_id = transaction.player_id
-                            ai_id = game_engine.UID.make(3, 1000)
+                            ai_id = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                             response_phases = {
                                 game_engine.ETurnPhases.DeclareAttackPriorityWindow,
                                 game_engine.ETurnPhases.DeclareDefensePriorityWindow,
@@ -2166,7 +2170,7 @@ class HCPHandler(ProfileStreamMixin):
                                     response_game = game
                                     ai_acted = bool(ai_respond_to_priority(
                                         self, response_game, session,
-                                        game_engine.UID.make(3, 1000),
+                                        game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000),
                                         game.player_uid, response_state))
                                     if ai_acted:
                                         event_sink = getattr(
@@ -2248,7 +2252,7 @@ class HCPHandler(ProfileStreamMixin):
                         # the server AI has one canonical typed identity;
                         # never infer it from that transient Game object.
                         ai_id = (None if (session.session_name or "").startswith(
-                            "tourney-") else game_engine.UID.make(3, 1000))
+                            "tourney-") else game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000))
                         from rules_port.persistence import load_state as _load_rules_state
                         native_state = _load_rules_state(session)
                         log_req(
@@ -2975,13 +2979,17 @@ class HCPHandler(ProfileStreamMixin):
                                     other_uid)
                                 _pvp_populate_game_state(
                                     window, live_pvp, target_pid, other_pid)
+                                # UIBattle checks its local HasPriority bit
+                                # when TurnPhaseUpdated arrives. Send the
+                                # matching GreenLight first so a phase update
+                                # cannot trigger a stale priority resync.
+                                window.push_green_light(
+                                    game_engine.UID.make(244, priority_pid),
+                                    game_engine.EPriorityContext.ResolveTopOfChain)
                                 window.push_turn_phase(
                                     phase,
                                     game_engine.UID.make(244, turn_pid),
                                     game_engine.UID.make(244, priority_pid))
-                                window.push_green_light(
-                                    game_engine.UID.make(244, priority_pid),
-                                    game_engine.EPriorityContext.ResolveTopOfChain)
                                 _send_pvp_packet(
                                     target_h, session, window, target_uid,
                                     "rules-port-ability-priority")
@@ -3281,11 +3289,11 @@ class HCPHandler(ProfileStreamMixin):
         current_state = getattr(self, "_current_bstate", {}) or {}
         project_visible_hands(
             _db, session, self, game, pl_t,
-            getattr(game, "ai_uid", game_engine.UID.make(3, 1000)),
+            getattr(game, "ai_uid", game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)),
             current_state)
         project_visible_top_decks(
             _db, session, self, game, pl_t,
-            getattr(game, "ai_uid", game_engine.UID.make(3, 1000)),
+            getattr(game, "ai_uid", game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)),
             current_state)
         # Placing the champions on the client's board is a one-shot projection
         # at game start; re-announce it in the first packet the client receives
@@ -4555,7 +4563,8 @@ class HCPHandler(ProfileStreamMixin):
                     return False
         return True
 
-    def _push_main_phase_options(self, session, pl_t, ai_t, game=None):
+    def _push_main_phase_options(self, session, pl_t, ai_t, game=None,
+                                 refresh_warzone=True):
         """Push the playable-card options (golden outlines) for a main phase.
 
         Computes which cards in the player's hand are affordable from the
@@ -4592,7 +4601,9 @@ class HCPHandler(ProfileStreamMixin):
         if chain_pending:
             # Ordinary cards are illegal until the chain empties. Replace any
             # stale main-phase list with the current priority-window options.
-            self._push_phase_options_empty(session, pl_t, ai_t)
+            self._push_phase_options_empty(
+                session, pl_t, ai_t,
+                refresh_warzone=refresh_warzone)
             return
         if (port is not None and
                 getattr(port, "action_stack", None) is not None and
@@ -4714,7 +4725,8 @@ class HCPHandler(ProfileStreamMixin):
         # 0, wiping the UI).
         game2.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
         game2.push_player_updated(ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
-        self._push_warzone_card_updates(game2, session, pl_t, ai_t)
+        if refresh_warzone:
+            self._push_warzone_card_updates(game2, session, pl_t, ai_t)
         # Options are sometimes delivered as the packet immediately after a
         # choice continuation. Repeat the authoritative priority event in the
         # same packet so the client's one-request UI state cannot remain
@@ -4777,7 +4789,7 @@ class HCPHandler(ProfileStreamMixin):
                 bstate, "player", limit=resource_limit):
             return False
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         from domain.constants import PLAYED_CARD_POSITION
         from rules_port.zone_effects import move_card_to_zone
         from pvp_db import db_card_owner_zone_state
@@ -4983,7 +4995,7 @@ class HCPHandler(ProfileStreamMixin):
         bstate = _be.load_state(session)
         self._current_bstate = bstate
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         game = self._fresh_game(session, pl_t, ai_t, bstate)
         scid = game_engine.SessionCardId(game_engine.UID(card_uid))
         _tpl, _ct, _name, cost, attack, defense, gem = self._card_full_data(
@@ -6278,7 +6290,7 @@ class HCPHandler(ProfileStreamMixin):
             return True
 
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         pending_state.pop("pending_conversation", None)
         pending_state.pop("resolution_paused", None)
         game = self._fresh_game(session, pl_t, ai_t, pending_state)
@@ -7155,7 +7167,7 @@ class HCPHandler(ProfileStreamMixin):
                 inner_bytes = (getattr(original, "inner_bytes", b"")
                                if original is not None else b"")
                 pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-                ai_t = game_engine.UID.make(3, 1000)
+                ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                 handled = bool(self._resolve_pending_deck_search(
                     session, pl_t, ai_t, inner_bytes))
                 if handled:
@@ -7208,7 +7220,7 @@ class HCPHandler(ProfileStreamMixin):
                 state.pop("pending_trigger", None)
                 _be.save_state(session, state)
                 pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-                ai_t = game_engine.UID.make(3, 1000)
+                ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                 game = self._fresh_game(session, pl_t, ai_t, state)
                 # This RulesPort bridge handles Practice/PvE prompts, where
                 # pending.owner_id is the raw game_cards.user_id, not the
@@ -7292,7 +7304,7 @@ class HCPHandler(ProfileStreamMixin):
             pending["selected_uid"] = found[-1]
             _be.save_state(session, state)
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         handled = self._resolve_pending_trigger_target(
             session, pl_t, ai_t, b"",
             ability_guid=pending.get("ability_guid"))
@@ -7410,7 +7422,7 @@ class HCPHandler(ProfileStreamMixin):
                 parent.get("resume_effect_order", 0) or 0)
             _be.save_state(session, state)
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             game = self._fresh_game(session, pl_t, ai_t, state)
             result = resolve_port_ability(
                 self, game, session, _db, pl_t, ai_t, state, guid,
@@ -8376,7 +8388,7 @@ class HCPHandler(ProfileStreamMixin):
             return True
 
     def _push_phase_options_empty(self, session, pl_t, ai_t, game=None,
-                                  send=True):
+                                  send=True, refresh_warzone=True):
         """Push a PlayerOptionList with champion abilities + playable hand
         QuickActions (instant-speed — castable in ANY priority window).
 
@@ -8453,7 +8465,8 @@ class HCPHandler(ProfileStreamMixin):
                                              bstate)
         game.push_player_updated(pl_t, champ_id=getattr(self, "_player_champ_scid", None))
         game.push_player_updated(ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
-        self._push_warzone_card_updates(game, session, pl_t, ai_t)
+        if refresh_warzone:
+            self._push_warzone_card_updates(game, session, pl_t, ai_t)
         if send:
             self._send_battle_events(session, game, pl_t)
         log_req(f"    Phase options (priority window): {len(playable)} playable "
@@ -8473,7 +8486,7 @@ class HCPHandler(ProfileStreamMixin):
         later Basic Action unplayable).
         """
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         priority = port.action_stack.priority_player_id
         if not _same_uid(priority, pl_t):
             return False
@@ -8481,12 +8494,15 @@ class HCPHandler(ProfileStreamMixin):
         from rules_port.persistence import load_state as _load_state
         chain_game = self._fresh_game(
             session, pl_t, ai_t, _load_state(session, default=lambda: {}))
+        # OnTurnPhaseUpdated checks the client's current HasPriority bit. Send
+        # GreenLight first so a client that just lost priority to the AI does
+        # not request a main-phase resync before this response window arrives.
+        chain_game.push_green_light(
+            pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
         chain_game.push_turn_phase(
             port.current_turn_phase,
             pl_t if _same_uid(port.active_player_id, pl_t) else ai_t,
             pl_t)
-        chain_game.push_green_light(
-            pl_t, game_engine.EPriorityContext.ResolveTopOfChain)
         self._send_battle_events(session, chain_game, pl_t)
         log_req("    RulesPort Practice ability priority window: "
                 f"phase={port.current_turn_phase} priority=player")
@@ -9057,7 +9073,7 @@ class HCPHandler(ProfileStreamMixin):
         """
         try:
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            game = game_engine.Game(session.session_id, pl_t, game_engine.UID.make(3, 1000))
+            game = game_engine.Game(session.session_id, pl_t, game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000))
             pkt = game.make_network_packet(pl_t)  # no events -> empty packet
             dw = encode_datawrapper(0, 3055, compress_gzip(encode_sync_event(pkt)), 1,
                                     "00000000-0000-0000-0000-000000000000")
@@ -10026,7 +10042,7 @@ class HCPHandler(ProfileStreamMixin):
             return False
 
         player_uid = game_engine.UID.make(244, player_pid)
-        ai_uid = game_engine.UID.make(3, 1000)
+        ai_uid = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         player_champ_scid = game_engine.SessionCardId(
             game_engine.UID(player_champ_uid))
         ai_champ_scid = game_engine.SessionCardId(
@@ -11284,19 +11300,25 @@ class HCPHandler(ProfileStreamMixin):
             pl_t, champ_id=getattr(self, "_player_champ_scid", None))
         game.push_player_updated(
             ai_t, champ_id=getattr(self, "_ai_champ_scid", None))
-        self._push_warzone_card_updates(game, session, pl_t, ai_t)
+        # The attack options packet applies force attackers and their triggers,
+        # then includes the authoritative board refresh. Avoid projecting the
+        # pre-declaration board here; it would immediately be rebuilt.
+        if phase != game_engine.ETurnPhases.DeclareAttack:
+            self._push_warzone_card_updates(game, session, pl_t, ai_t)
         self._send_battle_events(session, game, pl_t)
         trace_rules_port(log_req, "project-human", port, bstate)
         if phase in (game_engine.ETurnPhases.FirstMainPhase,
                      game_engine.ETurnPhases.SecondMainPhase):
-            self._push_main_phase_options(session, pl_t, ai_t)
+            self._push_main_phase_options(
+                session, pl_t, ai_t, refresh_warzone=False)
         elif phase == game_engine.ETurnPhases.DeclareAttack:
             self._push_attack_options(session, pl_t, ai_t)
         elif phase in (game_engine.ETurnPhases.AssignDamage,
                        game_engine.ETurnPhases.AssignFirstStrikeDamage):
             self._push_combat_listing_phase(session, pl_t, ai_t, bstate)
         else:
-            self._push_phase_options_empty(session, pl_t, ai_t)
+            self._push_phase_options_empty(
+                session, pl_t, ai_t, refresh_warzone=False)
         return True
 
     def _advance_rules_port_to_priority(self, session, pl_t, ai_t, bstate):
@@ -12633,7 +12655,7 @@ class HCPHandler(ProfileStreamMixin):
                     if opponent_id is not None else game_engine.UID.make(244, owner_id))
             draw_pl_t = game_engine.UID.make(244, owner_id)
         else:
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             draw_pl_t = pl_t
         if bstate.get("_rules_port_attached"):
             from rules_port.context import EffectContext
@@ -12794,6 +12816,15 @@ class HCPHandler(ProfileStreamMixin):
                         headers, body, consumed = parse_packet(self.buf)
                     except ValueError:
                         break
+                    # TEMPORARY capture for the web PoC: while the flag file exists,
+                    # keep each inbound packet's exact bytes. Remove with the flag.
+                    if os.path.exists("/tmp/hconnect_capture_on"):
+                        try:
+                            os.makedirs("/tmp/hconnect_capture", exist_ok=True)
+                            with open(f"/tmp/hconnect_capture/{time.time_ns()}.hex", "w") as cf:
+                                cf.write(self.buf[:consumed].hex())
+                        except OSError:
+                            pass
                     self.buf = self.buf[consumed:]
                     self.handle_message(headers, body)
         except ConnectionResetError:
@@ -13024,8 +13055,10 @@ class HCPHandler(ProfileStreamMixin):
                                 conn=_db)
                     _db.commit()
                     log_req(f">>> Pushed {len(purchased)} inventory items on first request")
-                    # Push existing cards (no "New" banner)
-                    self.push_cards_to_client()
+                    # Existing cards are not re-announced here: the login push
+                    # already delivers the collection, and a CardsAdded event
+                    # for a copy already in a deck makes the client re-template
+                    # that deck card, which drops its socketed gems.
 
             # On first routed message, push social data (friend list etc.)
             if getattr(self, '_social_pending', False) and self.user_profile:
@@ -13205,10 +13238,107 @@ class HCPHandler(ProfileStreamMixin):
         log_req(f"    Sent LeaveSession response ({len(dw_bytes)}b)")
         return result
 
+    def _push_rules_port_chain_priority_sync(self, session, port):
+        """Restore native chain priority after the client requests a resync.
+
+        The legacy checkpoint can still describe a main phase while RulesPort
+        owns a pending chain item. Replaying its ordinary phase GreenLight
+        replaces the client's ResolveTopOfChain button context.
+        """
+        chain = getattr(port, "chain", None)
+        if chain is None or chain.is_empty:
+            return None
+
+        priority = getattr(
+            getattr(port, "action_stack", None), "priority_player_id", None)
+        if priority is None:
+            log_req("    RequestPrioritySync: native chain has no priority owner")
+            return False
+
+        if (session.session_name or "").startswith("tourney-"):
+            from services.tournament_game import (
+                _pvp_populate_game_state, _send_pvp_packet,
+                player_handlers, pvp_load_state,
+            )
+            state = pvp_load_state(session) or {}
+            pids = [int(value) for value in (state.get("pids") or ())]
+            my_pid = int(self.client_reck_id)
+            if len(pids) != 2 or my_pid not in pids:
+                log_req(
+                    "    RequestPrioritySync: no PvP participants for native chain")
+                return False
+            priority_pid = next((pid for pid in pids if _same_uid(
+                priority, game_engine.UID.make(244, pid))), None)
+            if priority_pid is None:
+                log_req(
+                    "    RequestPrioritySync: unknown PvP native chain owner")
+                return False
+
+            other_pid = next(pid for pid in pids if pid != my_pid)
+            target_uid = game_engine.UID.make(244, my_pid)
+            other_uid = game_engine.UID.make(244, other_pid)
+            priority_uid = game_engine.UID.make(244, priority_pid)
+            turn_pid = int(state.get("turn_pid") or priority_pid)
+            turn_uid = game_engine.UID.make(244, turn_pid)
+            phase = port.current_turn_phase
+            window = game_engine.Game(
+                int(session.session_id), target_uid, other_uid)
+            _pvp_populate_game_state(window, state, my_pid, other_pid)
+            window.push_green_light(
+                priority_uid,
+                game_engine.EPriorityContext.ResolveTopOfChain)
+            window.push_turn_phase(phase, turn_uid, priority_uid)
+            target_handler = player_handlers.get(my_pid) or self
+            _send_pvp_packet(
+                target_handler, session, window, target_uid,
+                "rules-port-chain-priority-sync")
+            log_req(
+                "    RequestPrioritySync: restored PvP native chain window "
+                f"priority={priority_pid} phase={phase}")
+            return True
+
+        player_uid = game_engine.UID.make(244, int(self.client_reck_id))
+        ai_uid = game_engine.UID.make(
+            game_engine.SERVICE_AI_UID_TYPE, 1000)
+        priority_uid = (player_uid if _same_uid(priority, player_uid)
+                        else ai_uid if _same_uid(priority, ai_uid) else None)
+        if priority_uid is None:
+            log_req(
+                "    RequestPrioritySync: unknown Practice native chain owner")
+            return False
+        checkpoint = self._checkpoint_engine(session).load_state(session)
+        self._current_bstate = checkpoint
+        game = self._fresh_game(session, player_uid, ai_uid, checkpoint)
+        active_owner = getattr(port, "active_player_id", None)
+        active_uid = (player_uid if _same_uid(active_owner, player_uid)
+                      else ai_uid if _same_uid(active_owner, ai_uid)
+                      else player_uid)
+        if _same_uid(priority_uid, player_uid):
+            # The human is the response player; restore the legal quick actions
+            # and champion powers alongside the ResolveTopOfChain button.
+            self._push_phase_options_empty(session, player_uid, ai_uid)
+        game.push_green_light(
+            priority_uid, game_engine.EPriorityContext.ResolveTopOfChain)
+        game.push_turn_phase(port.current_turn_phase, active_uid, priority_uid)
+        self._send_battle_events(session, game, player_uid)
+        log_req(
+            "    RequestPrioritySync: restored Practice native chain window "
+            f"priority={priority_uid!r} phase={port.current_turn_phase}")
+        return True
+
     def _handle_priority_sync_transaction(self, session, transaction):
         """Reconcile a client's lost priority state without changing game state."""
         if not session:
             return False
+
+        port = getattr(session, "_rules_port_session", None)
+        if port is not None:
+            chain_sync = self._push_rules_port_chain_priority_sync(
+                session, port)
+            if chain_sync is not None:
+                if not chain_sync:
+                    self._push_transaction_ack(session)
+                return True
 
         # PvP tournament path.
         if (session.session_name or "").startswith("tourney-"):
@@ -13294,7 +13424,7 @@ class HCPHandler(ProfileStreamMixin):
 
         _be = self._checkpoint_engine(session)
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         try:
             bstate = _be.load_state(session)
             self._current_bstate = bstate
@@ -13548,7 +13678,7 @@ class HCPHandler(ProfileStreamMixin):
             session.encounter_data = encounter_data
             session._persist()
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             game = game_engine.Game(session.session_id, pl_t, ai_t)
             # Draw the opening hands NOW — like PvP, PreGame and
             # PickGoesFirst show empty hands; each player draws after the
@@ -13694,7 +13824,7 @@ class HCPHandler(ProfileStreamMixin):
             return True
         else:
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             # The selected Fortune is consumed when the human finishes the
             # opening-hand decision.  ReadyToStartGame has its own local
             # campaign-id variable, so derive it again here rather than
@@ -13992,7 +14122,7 @@ class HCPHandler(ProfileStreamMixin):
                 self._push_transaction_ack(session)
                 return True
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         if getattr(session, "_rules_port_session", None) is not None:
             from rules_port import lifecycle as _be
         else:
@@ -14137,7 +14267,7 @@ class HCPHandler(ProfileStreamMixin):
             handled = True
         if not handled:
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             import random as _random
             import json as _redraw_json
             game2 = game_engine.Game(session.session_id, pl_t, ai_t)
@@ -14372,7 +14502,7 @@ class HCPHandler(ProfileStreamMixin):
             bstate = _be.load_state(session)
             self._current_bstate = bstate
             pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_t = game_engine.UID.make(3, 1000)
+            ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             charge_delta = 0
             if is_resource_play:
                 from rules_port.resources import resource_play_count
@@ -14919,7 +15049,7 @@ class HCPHandler(ProfileStreamMixin):
             log_req(f"    === PlayerTransaction — ending game ===")
             self._finish_battle_gameend(
                 session, False,
-                [game_engine.UID.make(3, 1000)],   # AI wins
+                [game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)],   # AI wins
                 [game_engine.UID(player_uid)])     # player loses
             log_req(f"    Pushed GameEnded (3055) — marked as loss")
         return True
@@ -14950,7 +15080,7 @@ class HCPHandler(ProfileStreamMixin):
         """Resolve target data supplied for a pending ability prompt."""
         inner_bytes = transaction.inner_bytes
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         _be = self._checkpoint_engine(session)
         bstate = _be.load_state(session)
         self._current_bstate = bstate
@@ -15061,7 +15191,7 @@ class HCPHandler(ProfileStreamMixin):
         is_ability_activate = transaction.is_ability_activate
         handled = False
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         # Extract AbilityTemplateId (GUID) from the transaction
         ability_guid = extract_ability_guid(inner_bytes)
         log_req(f"    Ability activation: guid={ability_guid}")
@@ -15488,7 +15618,7 @@ class HCPHandler(ProfileStreamMixin):
             load_checkpoint = _be.load_state
             save_checkpoint = _be.save_state
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         bstate = load_checkpoint(session)
         self._current_bstate = bstate
         attackers = {int(k): int(v) for k, v in (bstate.get("ai_attackers") or {}).items()}
@@ -15632,7 +15762,7 @@ class HCPHandler(ProfileStreamMixin):
             save_checkpoint = _be.save_state
             advance_checkpoint = _be.advance_phase
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         bstate = load_checkpoint(session)
         self._current_bstate = bstate
         # Extract the attacking card UIDs: every Card-type SessionCardId
@@ -15823,7 +15953,7 @@ class HCPHandler(ProfileStreamMixin):
             current_checkpoint_phase = _be.current_phase
             advance_checkpoint = _be.advance_phase
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         bstate = load_checkpoint(session)
         self._current_bstate = bstate
         cur_phase = current_checkpoint_phase(bstate)
@@ -15953,7 +16083,7 @@ class HCPHandler(ProfileStreamMixin):
         import re
         handled = False
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         # Tournament PvP has its own persisted two-player priority
         # state.  Do not feed its SetAutoPass through battle_engine:
         # that is the PvE/AI state machine and can advance a stale
@@ -15998,7 +16128,7 @@ class HCPHandler(ProfileStreamMixin):
             import battle_engine as _be
         handled = False
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         if (session.session_name or "").startswith("tourney-"):
             try:
                 from services.tournament_game import pvp_load_state, pvp_save_state
@@ -16055,7 +16185,7 @@ class HCPHandler(ProfileStreamMixin):
                         _bse.save_state(session, bstate)
                         log_req(f"    Stops updated — phase {paused_phase} no longer a stop; resuming AI turn")
                         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-                        ai_t = game_engine.UID.make(3, 1000)
+                        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                         self._run_ai_turn(session, pl_t, ai_t, bstate, start_idx=start_idx)
             elif (session.session_name or "").startswith("tourney-"):
                 # PvP: persist each player's stops into the PvP state,
@@ -16096,7 +16226,7 @@ class HCPHandler(ProfileStreamMixin):
         else:
             import battle_engine as _be
         pl_t = game_engine.UID.make(244, int(self.client_reck_id))
-        ai_t = game_engine.UID.make(3, 1000)
+        ai_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
         # A pass arriving during setup (PreGame/PickGoesFirst/Mulligan,
         # before the player has kept their opening hand) has no turn-cycle
         # battle state yet — session.turn_order is still the default [].
@@ -17286,7 +17416,7 @@ class HCPHandler(ProfileStreamMixin):
         elif data_type == 22027:
             log_req(">>> ReadyForGameSetup (dt=22027)")
             player_uid = make_uid(UID_TYPE["ServicePlayer"], int(self.client_reck_id))
-            ai_uid = make_uid(3, 1000)
+            ai_uid = make_uid(SERVICE_AI_UID_TYPE, 1000)
             session = self._application.execute(SetSessionStateCommand(
                 player_uid=player_uid,
                 state="setup",
@@ -17485,7 +17615,7 @@ class HCPHandler(ProfileStreamMixin):
             rfg_w(""); rfg_sp(); rfg_w("0"); rfg_sp(); rfg_w(str(rfg_ft(rfg_types[0]))); rfg_sp(); rfg_w("9"); rfg_sp()
             # Fields in alphabetical order: DeckId, DeckTemplateId, OpponentsInfo, SessionState, TurnOrder, seedW, seedZ, Error, ErrorMessage
             pl_uid_val = (int(self.client_reck_id) << 8) | 244  # ServicePlayer type
-            ai_uid_val = (1000 << 8) | 3  # AIPlayer
+            ai_uid_val = (1000 << 8) | SERVICE_AI_UID_TYPE  # ServiceAI
             
             # DeckId (UID.Invalid — client keeps its selected deck)
             fd = rfg_buf.tell(); rfg_sz.append(0)
@@ -17680,7 +17810,7 @@ class HCPHandler(ProfileStreamMixin):
             # battle scene to stall after joining the encounter.
             gs_inner = encoder.encode_game_started_response(
                 int(player_uid),
-                [int(player_uid), game_engine.UID.make(3, 1000).uid64],
+                [int(player_uid), game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000).uid64],
                 seed_w=0xABCDEF0102030405,
                 seed_z=0x1234567890ABCDEF,
                 success=True)
@@ -17697,9 +17827,9 @@ class HCPHandler(ProfileStreamMixin):
             # Push 3055 game events AFTER 22027
             import struct as _struct
             pl_uid_t = game_engine.UID.make(244, int(self.client_reck_id))
-            ai_uid_t = game_engine.UID.make(3, 1000)
+            ai_uid_t = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
             pl_uid_val = (int(self.client_reck_id) << 8) | 244
-            ai_uid_val = (1000 << 8) | 3
+            ai_uid_val = (1000 << 8) | SERVICE_AI_UID_TYPE
             sess_tutorial = game_engine.UID(session.session_id)
             player_name = self.user_profile["name"] if self.user_profile else "TestPlayer"
             log_req(f"    SESS: raw={session.session_id:#x}, tut={sess_tutorial.uid64:#x}")
@@ -18279,6 +18409,7 @@ class HCPHandler(ProfileStreamMixin):
                 # Taming Dire Toad's Taming Sphere) before the opening hand
                 # is dealt so their GameStarted abilities can resolve.
                 if is_campaign and scene_guid:
+                    # All players use the shared authored scene modifiers.
                     scene_mods_json = db_scene_mods(scene_guid, conn=_db)
                     try:
                         scene_mods = _aj.loads(scene_mods_json or "[]")
@@ -19573,87 +19704,6 @@ class HCPHandler(ProfileStreamMixin):
             }, dw_bytes)
             log_req(f"    Sent CreateNewDeckFromTemplate response ({len(dw_bytes)}b)")
 
-        # GetPlayerDecks (2081) — return deck IDs and names
-        elif data_type == 2081:
-            log_req(">>> GetPlayerDecks (dt=2081)")
-            decks = []
-            if self.user_profile:
-                decks = db_get_decks(self.user_profile["id"])
-            log_req(f"    Returning {len(decks)} decks")
-            
-            # Manual encoding: GetPlayerDecksResponse { PlayerDeckIDs, PlayerDeckNames, Error, ErrorMessage }
-            tn = ["Game.Client.Network.Profile.GetPlayerDecksResponse",
-                  "System.Collections.Generic.List`1#Game.Shared.UID",
-                  "Game.Shared.UID", "System.UInt64",
-                  "System.Collections.Generic.List`1#System.String",
-                  "System.String",
-                  "Game.Shared.Network.Profile.EGetPlayerDecksError",
-                  "System.Int32"]
-            def _profile_type_index(x):
-                if x not in tn: tn.append(x)
-                return tn.index(x)
-            sz = []; buf = io.BytesIO()
-            W = lambda s: buf.write(s.encode("utf-8"))
-            S = lambda: buf.write(b";")
-
-            sz.append(0)
-            W(""); S(); W("0"); S(); W(str(_profile_type_index(tn[0]))); S(); W("4"); S()
-
-            # PlayerDeckIDs: List<UID>
-            fc1 = buf.tell(); sz.append(0); list1_idx = len(sz)-1
-            W("PlayerDeckIDs"); S(); W(str(list1_idx)); S(); W(str(_profile_type_index(tn[1]))); S(); W("0"); S()
-            W(str(len(decks))); S()
-            for i, dk in enumerate(decks):
-                fe = buf.tell(); sz.append(0); eidx = len(sz)-1
-                deck_uid64 = (dk["id"] << 8) | 17
-                W(str(i)); S(); W(str(eidx)); S(); W(str(_profile_type_index(tn[2]))); S(); W("1"); S()
-                f1 = buf.tell(); sz.append(0)
-                W("m_UID64"); S(); W(str(len(sz)-1)); S(); W(str(_profile_type_index("System.UInt64"))); S(); W("0"); S()
-                W(hexlify(struct.pack("<Q", deck_uid64)).decode("ascii")); S()
-                sz[-1] = buf.tell() - f1
-                sz[eidx] = buf.tell() - fe
-            sz[list1_idx] = buf.tell() - fc1
-
-            # PlayerDeckNames: List<string>
-            fc2 = buf.tell(); sz.append(0); list2_idx = len(sz)-1
-            W("PlayerDeckNames"); S(); W(str(list2_idx)); S(); W(str(_profile_type_index(tn[4]))); S(); W("0"); S()
-            W(str(len(decks))); S()
-            for i, dk in enumerate(decks):
-                fe = buf.tell(); sz.append(0); eidx = len(sz)-1
-                W(str(i)); S(); W(str(eidx)); S(); W(str(_profile_type_index(tn[5]))); S(); W("0"); S()
-                enc = dk["name"].encode("utf-8")
-                W(str(len(enc))); S(); buf.write(enc)
-                sz[eidx] = buf.tell() - fe
-            sz[list2_idx] = buf.tell() - fc2
-
-            # Error (enum)
-            f3 = buf.tell(); sz.append(0)
-            W("Error"); S(); W(str(len(sz)-1)); S(); W(str(_profile_type_index(tn[6]))); S(); W("1"); S()
-            f3v = buf.tell(); sz.append(0)
-            W("value__"); S(); W(str(len(sz)-1)); S(); W(str(_profile_type_index("System.Int32"))); S(); W("0"); S()
-            W(hexlify(struct.pack("<i", 0)).decode("ascii")); S()
-            sz[-1] = buf.tell() - f3v; sz[-2] = buf.tell() - f3
-
-            # ErrorMessage
-            f4 = buf.tell(); sz.append(0)
-            W("ErrorMessage"); S(); W(str(len(sz)-1)); S(); W(str(_profile_type_index("System.String"))); S(); W("0"); S()
-            W("0"); S()
-            sz[-1] = buf.tell() - f4
-
-            sz[0] = buf.tell()
-            W(";".join(tn)); buf.write(b"\n")
-            for i, s in enumerate(sz):
-                if i > 0: S()
-                W(str(s))
-            resp_inner = buf.getvalue()
-            resp_body = compress_gzip(resp_inner) if comp else resp_inner
-            resp_reqid = reqid | 1
-            dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
-            issuer_str = f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer.{self.client_uid}.{resp_reqid}"
-            self.scnt += 1
-            self.send({"issuer": issuer_str, "target": target, "instance": instance,
-                "reqid": resp_reqid, "c": comp, "conh": conh, "sid": self.sid}, dw_bytes)
-            log_req(f"    Sent GetPlayerDecks ({len(decks)} decks, {len(dw_bytes)}b)")
 
         # AddNewDeck (2089)
         elif data_type == 2089:
@@ -20124,87 +20174,6 @@ class HCPHandler(ProfileStreamMixin):
             log_req(f"    Sent Cluster pick response ({len(dw_bytes)}b)")
 
         # GetDeckInfo (2083)
-        elif data_type == 2083:
-            log_req(">>> GetDeckInfo (dt=2083)")
-            # Extract deck ID from request raw bytes (UID encoded with m_UID64)
-            deck_id_val = 0
-            deck_id = 0
-            if isinstance(inner_bytes, bytes) and b"DeckID" in inner_bytes:
-                pos = inner_bytes.find(b"DeckID")
-                if pos >= 0:
-                    rest = inner_bytes[pos:]
-                    # Find m_UID64 sub-field within the DeckID UID
-                    uid_pos = rest.find(b"m_UID64")
-                    if uid_pos >= 0:
-                        rest2 = rest[uid_pos:]
-                        parts = rest2.split(b";", 5)
-                        if len(parts) >= 5:
-                            try:
-                                deck_id_val = struct.unpack("<Q", unhexlify(parts[4]))[0]
-                                # deck_id_val is the combined UID: (deck_db_id << 8) | 17
-                                deck_id = deck_id_val >> 8
-                            except:
-                                pass
-            log_req(f"    deck_id={deck_id}")
-            # Look up deck from DB
-            deck_name = ""
-            db_deck = None
-            if self.user_profile and deck_id > 0:
-                db_decks = db_get_decks(self.user_profile["id"])
-                for dk in db_decks:
-                    if dk["id"] == deck_id:
-                        db_deck = dk
-                        deck_name = dk.get("name", "")
-                        break
-            if not db_deck:
-                # Return error response
-                from objfmt_builder import ObjFmtBuilder
-                b = ObjFmtBuilder("Game.Client.Network.Profile.GetDeckInfoResponse")
-                b.field_enum("Error", "Game.Shared.Network.Profile.EGetDeckInfoError", 2)  # no_such_deck
-                b.field_str("ErrorMessage", "Deck not found")
-                resp_inner = b.finish(2)
-            else:
-                from objfmt_builder import ObjFmtBuilder
-                b = ObjFmtBuilder("Game.Client.Network.Profile.GetDeckInfoResponse")
-                b.field_str("DeckName", deck_name)
-                b.field_uid("DeckID", deck_id_val)
-                b.field_uid("PvEChampionId", int(db_deck.get("pve_champion_id") or 0))
-                b.field_resource_id("PvPChampionId", db_deck.get("pvp_champion_guid") or "00000000-0000-0000-0000-000000000000")
-                # Parse card IDs from DB
-                card_ids = []
-                try:
-                    card_ids = json.loads(db_deck.get("cards", "[]")) if db_deck.get("cards") else []
-                except: pass
-                b.begin_list("DeckCardIDs", "System.Collections.Generic.List`1#System.UInt64", len(card_ids))
-                for ci, cid in enumerate(card_ids):
-                    b.add_list_item_uint64(ci, cid)
-                b.begin_list("SideboardCardIDs", "System.Collections.Generic.List`1#System.UInt64", 0)
-                b.begin_list("EquipmentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
-                b.begin_list("TalentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
-                b.field_resource_id("DeckSleeveId", db_deck.get("deck_sleeve_guid") or "00000000-0000-0000-0000-000000000000")
-                b.field_resource_id("GameboardId", db_deck.get("gameboard_guid") or "00000000-0000-0000-0000-000000000000")
-                b.field_resource_id("CoinId", db_deck.get("coin_guid") or "00000000-0000-0000-0000-000000000000")
-                # ActiveGems
-                active_gems = {}
-                try:
-                    ag_raw = db_deck.get("active_gems", "{}")
-                    active_gems = json.loads(ag_raw) if ag_raw else {}
-                except: pass
-                b.begin_list("ActiveGems", "System.Collections.Generic.Dictionary`2#System.UInt64!Game.Shared.Mechanics.EGemTypesNew", len(active_gems))
-                for gi, (k_str, v_val) in enumerate(active_gems.items()):
-                    b.add_dict_entry_gem(gi, int(k_str), int(v_val))
-                b.field_enum("Persona", "Game.Shared.Mechanics.EDeckPersonality", 0)
-                b.field_enum("Error", "Game.Shared.Network.Profile.EGetDeckInfoError", 0)
-                b.field_str("ErrorMessage", "")
-                resp_inner = b.finish(15)
-            resp_body = compress_gzip(resp_inner) if comp else resp_inner
-            resp_reqid = reqid | 1
-            dw_bytes = encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
-            issuer_str = f"0.0.0.0.ServiceProfile.{SERVICE_PROFILE_UID}.ServicePlayer.{self.client_uid}.{resp_reqid}"
-            self.scnt += 1
-            self.send({"issuer": issuer_str, "target": target, "instance": instance,
-                "reqid": resp_reqid, "c": comp, "conh": conh, "sid": self.sid}, dw_bytes)
-            log_req(f"    Sent GetDeckInfo response ({len(dw_bytes)}b)")
 
         # GetPlayerCardIDList (2043)
         elif data_type == 2043:
@@ -20212,7 +20181,7 @@ class HCPHandler(ProfileStreamMixin):
             p = self.user_profile
             db_cards = []
             if p:
-                db_cards = list(db_collection_card_list(p["id"], conn=_db))
+                db_cards = list(db_profile_card_instances(p["id"], conn=_db))
             ctype_names = [
                 "Game.Client.Network.Profile.GetPlayerCardIDListResponse",
                 "System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits",
@@ -20224,44 +20193,58 @@ class HCPHandler(ProfileStreamMixin):
                 return ctype_names.index(tn)
             csizes = []; cbuf = io.BytesIO(); w = lambda s: cbuf.write(s.encode("utf-8")); sep = lambda: cbuf.write(b";"); lf = lambda: cbuf.write(b"\n")
             csizes.append(0)
-            total_cards = sum(q for _, _, _, _, _, _, q in db_cards)
+            total_cards = len(db_cards)
             w(""); sep(); w("0"); sep(); w(str(ft(ctype_names[0]))); sep(); w("1"); sep()
             fc = cbuf.tell(); csizes.append(0)
             w("CardDetails"); sep(); w("1"); sep(); w(str(ft(ctype_names[1]))); sep(); w("0"); sep()
             w(str(total_cards)); sep()
             card_idx = 0
-            for guid, name, cost, atk, def_, qty in db_cards:
-                for _ in range(qty):
-                    fe = cbuf.tell(); csizes.append(0); eidx = len(csizes)-1
-                    w(str(card_idx)); sep(); w(str(eidx)); sep(); w(str(ft(ctype_names[2]))); sep(); w("6"); sep()
-                    f1 = cbuf.tell(); csizes.append(0)
-                    w("Id"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
-                    # card_instance_bits.Id is the raw instance number.  The
-                    # client wraps it as CardId(UID.Type.Card, Id); putting a
-                    # UID type byte into this field changes the instance id
-                    # and makes collection entries fail to match.
-                    w(hexlify(struct.pack("<Q", 6000 + card_idx)).decode("ascii")); sep()
-                    csizes[-1] = cbuf.tell() - f1
-                    f2 = cbuf.tell(); csizes.append(0); tidx = len(csizes)-1
-                    w("TemplateID"); sep(); w(str(tidx)); sep(); w(str(ft("Game.Shared.ResourceId"))); sep(); w("1"); sep()
-                    gs = cbuf.tell(); csizes.append(0); gidx = len(csizes)-1
-                    w("guid"); sep(); w(str(gidx)); sep(); w(str(ft("System.Guid"))); sep(); w("0"); sep()
-                    w("36"); sep(); cbuf.write(guid.encode())
-                    csizes[gidx] = cbuf.tell() - gs; csizes[tidx] = cbuf.tell() - f2
-                    f4 = cbuf.tell(); csizes.append(0)
-                    w("IsFoil"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
-                    w("0"); csizes[-1] = cbuf.tell() - f4
-                    f5 = cbuf.tell(); csizes.append(0)
-                    w("IsExtended"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
-                    w("0"); csizes[-1] = cbuf.tell() - f5
-                    f7 = cbuf.tell(); csizes.append(0)
-                    w("IsNotTradeable"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
-                    w("0"); csizes[-1] = cbuf.tell() - f7
-                    f8 = cbuf.tell(); csizes.append(0)
-                    w("EscrowStatus"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.String"))); sep(); w("0"); sep()
-                    enc = b"Clean"; w(str(len(enc))); sep(); cbuf.write(enc)
-                    csizes[-1] = cbuf.tell() - f8; csizes[eidx] = cbuf.tell() - fe
-                    card_idx += 1
+            for guid, name, cost, atk, def_, instance_id, is_ext in db_cards:
+                fe = cbuf.tell(); csizes.append(0); eidx = len(csizes)-1
+                w(str(card_idx)); sep(); w(str(eidx)); sep(); w(str(ft(ctype_names[2]))); sep(); w("8"); sep()
+                f1 = cbuf.tell(); csizes.append(0)
+                w("Id"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.UInt64"))); sep(); w("0"); sep()
+                # card_instance_bits.Id is the raw instance number.  The
+                # client wraps it as CardId(UID.Type.Card, Id); putting a
+                # UID type byte into this field changes the instance id
+                # and makes collection entries fail to match.
+                w(hexlify(struct.pack("<Q", instance_id)).decode("ascii")); sep()
+                csizes[-1] = cbuf.tell() - f1
+                f2 = cbuf.tell(); csizes.append(0); tidx = len(csizes)-1
+                w("TemplateID"); sep(); w(str(tidx)); sep(); w(str(ft("Game.Shared.ResourceId"))); sep(); w("1"); sep()
+                gs = cbuf.tell(); csizes.append(0); gidx = len(csizes)-1
+                w("guid"); sep(); w(str(gidx)); sep(); w(str(ft("System.Guid"))); sep(); w("0"); sep()
+                w("36"); sep(); cbuf.write(guid.encode())
+                csizes[gidx] = cbuf.tell() - gs; csizes[tidx] = cbuf.tell() - f2
+                # CardStats: empty Dictionary<ECardStatType,int> (numProps=0, count=0)
+                f3 = cbuf.tell(); csizes.append(0)
+                w("CardStats"); sep(); w(str(len(csizes)-1)); sep()
+                w(str(ft("System.Collections.Generic.Dictionary`2#Game.Shared.Domain.ECardStatType!System.Int32")))
+                sep(); w("0"); sep(); w("0"); sep()
+                csizes[-1] = cbuf.tell() - f3
+                f4 = cbuf.tell(); csizes.append(0)
+                w("IsFoil"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
+                w("0"); csizes[-1] = cbuf.tell() - f4
+                f5 = cbuf.tell(); csizes.append(0)
+                w("IsExtended"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
+                w("1" if is_ext else "0"); csizes[-1] = cbuf.tell() - f5
+                # SocketedGems: EGemTypesNew (ulong enum) = Unknown, with value__ child
+                f6 = cbuf.tell(); csizes.append(0)
+                w("SocketedGems"); sep(); w(str(len(csizes)-1)); sep()
+                w(str(ft("Game.Shared.Mechanics.EGemTypesNew"))); sep(); w("1"); sep()
+                f6v = cbuf.tell(); csizes.append(0)
+                w("value__"); sep(); w(str(len(csizes)-1)); sep()
+                w(str(ft("System.UInt64"))); sep(); w("0"); sep()
+                w(hexlify(struct.pack("<Q", EGemTypesNew.Unknown)).decode("ascii")); sep()
+                csizes[-1] = cbuf.tell() - f6v; csizes[-2] = cbuf.tell() - f6
+                f7 = cbuf.tell(); csizes.append(0)
+                w("IsNotTradeable"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
+                w("0"); csizes[-1] = cbuf.tell() - f7
+                f8 = cbuf.tell(); csizes.append(0)
+                w("EscrowStatus"); sep(); w(str(len(csizes)-1)); sep(); w(str(ft("System.String"))); sep(); w("0"); sep()
+                enc = b"Clean"; w(str(len(enc))); sep(); cbuf.write(enc)
+                csizes[-1] = cbuf.tell() - f8; csizes[eidx] = cbuf.tell() - fe
+                card_idx += 1
             csizes[1] = cbuf.tell() - fc; csizes[0] = cbuf.tell()
             w(";".join(ctype_names)); lf()
             for i, s in enumerate(csizes):
@@ -20633,9 +20616,12 @@ class HCPHandler(ProfileStreamMixin):
                                 self.user_profile["id"], card_guid, count,
                                 conn=_db)
                             cards_granted += count
-                        # Create card_instances for each individual card
-                        cid = max(5000, db_next_card_instance_for_user(
-                            self.user_profile["id"], conn=_db) - 1)
+                        # Create card_instances for each individual card. Start
+                        # at the first unused ID: the current maximum is already
+                        # taken, and INSERT OR IGNORE would silently drop that
+                        # card while its collection copy was still counted.
+                        cid = db_next_card_instance_for_user(
+                            self.user_profile["id"], conn=_db)
                         for card_guid, count in deck["cards"]:
                             for _ in range(count):
                                 db_insert_card_instance(
@@ -21302,7 +21288,7 @@ class HCPHandler(ProfileStreamMixin):
                         # every RulesPort closure derived from it reported the
                         # human as the AI, projecting opponent cards onto the
                         # local side.
-                        _rules_ai = game_engine.UID.make(3, 1000)
+                        _rules_ai = game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000)
                     self._fresh_game(session, player_uid, _rules_ai,
                                      _rules_state)
                 handled = self._dispatch_rules_port_transaction(

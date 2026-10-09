@@ -40,18 +40,18 @@ COPY docker/docker_bootstrap.py /hex/docker/docker_bootstrap.py
 COPY docker/healthcheck.py /hex/docker/healthcheck.py
 COPY supervisord.conf /hex/supervisord.conf
 COPY run_hconnect.sh /hex/run_hconnect.sh
-# Records and generated starter-deck data are materialized into the writable
-# container filesystem at startup when a mounted HEX_GAMEDATA file is
-# available. They are intentionally not copied into the image.
+# hex-private/Records and generated starter-deck data are materialized into
+# the writable container filesystem at startup when a mounted HEX_GAMEDATA
+# file is available. They are intentionally not copied into the image.
 COPY news/ /hex/news/
 COPY LICENSE /hex/LICENSE
 COPY VERSION /hex/VERSION
 
 # The documented invocation runs the container as UID 1001.  Bootstrap may
-# materialize Records and generated starter decks, so those image-local
-# directories must be writable by that runtime identity.
-RUN mkdir -p /hex/Records /hex/generated \
-    && chown -R 1001:1001 /hex/Records /hex/generated
+# materialize hex-private/Records and generated starter decks, so those
+# image-local directories must be writable by that runtime identity.
+RUN mkdir -p /hex/hex-private/Records /hex/generated \
+    && chown -R 1001:1001 /hex/hex-private/Records /hex/generated
 
 # Fail the image build early if a copied server, extractor, or test module has
 # a syntax error.

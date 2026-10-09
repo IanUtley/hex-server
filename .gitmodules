@@ -1,0 +1,3 @@
+[submodule "hex-private"]
+	path = hex-private
+	url = git@github:IanUtley/hex-private.git
