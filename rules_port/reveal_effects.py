@@ -241,5 +241,11 @@ def reveal_cards(context):
                 scid, card_owner, card_collection, card_type,
                 state=int(row[4] or 0), template_id=row[2], cost=cost,
                 attack=attack, defense=defense, gems=gems, nulling=False)
+            if reveal_targets.lower() in ("self", "you", "controller"):
+                # A deck card is face down to everyone unless a viewer-scoped
+                # reveal says otherwise; without the tag the packet filter
+                # nulls the template id, and the client's coverflow then has
+                # no card template to draw.
+                context.game.events[-1]._hand_reveal_viewer_uid = card_owner
         context.game._push(event)
     return f"revealed {len(uids)}"
