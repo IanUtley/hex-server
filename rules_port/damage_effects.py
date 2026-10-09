@@ -764,6 +764,12 @@ def deal_damage(context, target, amount, *, outcome=None, only_minimum=False):
                 if target not in marked:
                     marked.append(target)
             return "survives"
-        context.destroy(target)
-        return "killed"
+        # Effect damage is checked by the state-based sweep once the resolving
+        # effects have finished (rules: deaths are not checked mid-resolution).
+        # A later effect of the same spell can still grant a would-die
+        # replacement (Pyre Strike's "if this would die, void it instead").
+        marked = context.bstate.setdefault("_lethal_damage_uids", [])
+        if target not in marked:
+            marked.append(target)
+        return "dying"
     return "survives"

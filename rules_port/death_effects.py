@@ -38,7 +38,13 @@ def kill_troop(context, target, *, cause="effect"):
     template_guid, owner, attrs = row[0], int(row[1] or 0), int(row[2] or 0)
     if attrs & int(game_engine.ECardAttributes.Immortal) and cause in ("damage", "effect"):
         return "immortal survives"
-    if context._emit_trigger("CardWouldEnterZoneEvent", target, owner):
+    # The would-enter event carries the zone the troop is about to enter, so a
+    # "would die -> void it instead" replacement (Pyre Strike) can match its
+    # destination; the card itself still sits in the warzone at this point.
+    if context._emit_trigger(
+            "CardWouldEnterZoneEvent", target, owner,
+            event_source_collection="warzone",
+            event_destination_collection="discard"):
         return "death replaced"
     db_kill_card_to_discard(
         context.session.session_id, target,
