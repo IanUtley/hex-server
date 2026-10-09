@@ -74,117 +74,19 @@ class HandlerStub:
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
-    src = sqlite3.connect(SRC)
-    db.execute("""CREATE TABLE game_cards (
-        session_id INTEGER, user_id INTEGER, card_uid INTEGER,
-        template_guid TEXT, card_template_id TEXT, location TEXT,
-        position INTEGER, card_state INTEGER, card_abilities TEXT,
-        card_type TEXT, card_attributes INTEGER, temporary_attributes INTEGER DEFAULT 0, card_attack_mod INTEGER,
-        card_defense_mod INTEGER, card_damage INTEGER,
-        permanent_buffs TEXT, temporary_buffs TEXT, card_uses TEXT)""")
-    db.execute("""CREATE TABLE card_abilities_meta (
-        ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
-        game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
-        is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
-        uses_per_turn INTEGER, target_template_ids TEXT)""")
-    # The AI target chooser inspects the ability BOM to distinguish a normal
-    # target from a battle target.  Keep this focused fixture faithful to the
-    # production schema instead of letting that lookup fail with
-    # "no such table: ability_effects".
-    db.execute("""CREATE TABLE ability_effects (
-        ability_guid TEXT NOT NULL, effect_guid TEXT NOT NULL,
-        effect_order INTEGER NOT NULL DEFAULT 0,
-        effect_type TEXT DEFAULT '', param TEXT DEFAULT '',
-        effect_group_id INTEGER DEFAULT 0, condition_id TEXT DEFAULT '',
-        target_index INTEGER DEFAULT -1, effect_instance_id INTEGER DEFAULT -1,
-        contingent_effect_instance_id INTEGER DEFAULT -1,
-        secondary_target_index INTEGER DEFAULT -1,
-        recalculate_targets INTEGER DEFAULT -1,
-        is_optional INTEGER DEFAULT 0, effect_duration TEXT DEFAULT 'Instant',
-        output_variables TEXT DEFAULT '{}',
-        PRIMARY KEY (ability_guid, effect_guid, effect_order))""")
-    db.execute("""CREATE TABLE target_templates (
-        template_id TEXT PRIMARY KEY, game_text TEXT,
-        is_auto_target INTEGER, is_random_target INTEGER, optional INTEGER,
-        explicit INTEGER, player_filter TEXT, collection_flags TEXT,
-        min_target_count INTEGER, max_target_count INTEGER, filter_json TEXT)""")
-    db.execute("ALTER TABLE target_templates ADD COLUMN target_kind TEXT DEFAULT ''")
-    db.execute("""CREATE TABLE card_templates (
-        guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
-        defense INTEGER, attributes INTEGER, abilities_json TEXT,
-        threshold_json TEXT, subtype TEXT)""")
-    for tid in (EXILE_TARGET, PRAIRIE_TARGET, CHAMP_TARGET, BLOCKING_TARGET):
-        for row in src.execute(
-                "SELECT * FROM target_templates WHERE template_id=?", (tid,)):
-            db.execute("INSERT INTO target_templates VALUES "
-                       "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
-    for ag in (EXILE_DEPLOY, EXILE_LEAVE):
-        for row in src.execute(
-                "SELECT ability_guid, is_triggered, trigger_event_type, game_text, "
-                "raw_json, casting_behavior, is_manual, activation_cost, "
-                "uses_per_game, uses_per_turn, target_template_ids "
-                "FROM card_abilities_meta WHERE ability_guid=?", (ag,)):
-            db.execute(
-                "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
-        for row in src.execute(
-                """SELECT ability_guid, effect_guid, effect_order, effect_type,
-                        param, effect_group_id, condition_id, target_index,
-                        effect_instance_id, contingent_effect_instance_id,
-                        secondary_target_index, recalculate_targets,
-                        is_optional, effect_duration, output_variables
-                   FROM ability_effects WHERE ability_guid=?
-                  ORDER BY effect_order""", (ag,)):
-            db.execute("INSERT INTO ability_effects VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       row)
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (EXILE_TPL, "Solitary Exile", "Constant", 3, 0, 0, 0,
-         f'["{EXILE_DEPLOY}", "{EXILE_LEAVE}"]', "[]", ""))
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (PLAIN_TPL, "Plain Troop", "Troop", 1, 1, 1, 0, "[]", "[]", ""))
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (RESOURCE_TPL, "Wild Shard", "Resource", 0, 0, 0, 0, "[]", "[]", ""))
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (PET_TPL, "#PET_SPIRIT_STAG#", "Troop", 0, 1, 1, 0, "[]", "[]", ""))
-    db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (PET_TARGET, "<b>#PET_SPIRIT_STAG#</b>", 1, 0, 0, 0,
-         "MultiplePlayers", "Warzone", 1, 1,
-         json.dumps({"_t": "Game.Shared.Mechanics.Cards.Filters.IsCardName",
-                     "m_CardName": "#PET_SPIRIT_STAG#"}),
-         "AbilityTargetTemplate"))
-    db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (TOPN_TARGET, "Top troop", 1, 0, 0, 0, "MultiplePlayers",
-         "Deck|Hand|Champions|Warzone|Discard|Void|CastSpells|Underground|Choosing",
-         1, 1, json.dumps({
-             "_t": "Game.Shared.Mechanics.Cards.Filters.TopNOfDeck",
-             "m_Amount": 1,
-             "m_Filter": {
-                 "_t": "Game.Shared.Mechanics.Cards.Filters.AndCardFilter",
-                 "m_TargetFilters": [
-                     {"_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"},
-                     {"_t": "Game.Shared.Mechanics.Cards.Filters.IsControlledBy",
-                      "m_TestAgainstActivePlayer": 0},
-                 ],
-             },
-         }), "AbilityTargetTemplate"))
-    src.close()
-    db.commit()
-    return db
-
+    """The combat fixture schema: it matches the production game_cards columns."""
+    from tests_combat import make_db as combat_make_db
+    return combat_make_db()
 
 def add_card(db, uid, owner, tpl, location, abilities="[]", position=0):
     ctype = ("Troop" if tpl == PLAIN_TPL else
              "Resource" if tpl == RESOURCE_TPL else "Constant")
     db.execute(
-        "INSERT INTO game_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'{}','{}','{}')",
+        "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+        "card_template_id, location, position, card_state, card_abilities, "
+        "card_type, card_attributes, temporary_attributes, card_attack_mod, "
+        "card_defense_mod, card_damage, permanent_buffs, temporary_buffs, card_uses) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'{}','{}','{}')",
         (1, owner, uid, tpl, tpl, location, position, 0, abilities, ctype, 0))
     db.commit()
 

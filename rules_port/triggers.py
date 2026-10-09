@@ -512,8 +512,14 @@ class NativeTriggerBackend:
                     logs.append(f"{event_name} {key[1][:8]} -> chance failed ({chance}%)")
                     continue
                 target = event.target_card_id or event.source_card_id
+                # A player-owned trigger with no event target (e.g. Moonmonk's
+                # Deploy) asks for its input target even when the template is not
+                # marked explicit; otherwise the source card became its own target.
+                ask_player_input = (source_card_owner != 0 and
+                                    event.target_card_id is None)
                 explicit = [index for index, spec in enumerate(graph.targets)
-                            if spec.requires_input and spec.explicit]
+                            if spec.requires_input and
+                            (spec.explicit or ask_player_input)]
                 # Only a player-input target consumes the trigger target.  An
                 # ability whose targets are all auto (Corinth's end-of-turn
                 # "your hand"/"your crypt") must NOT receive the event source

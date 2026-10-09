@@ -2081,14 +2081,21 @@ class TurnFlowMixin:
             return False
 
         game = self._fresh_game(session, pl_t, ai_t, bstate)
-        game.push_turn_phase(
-            phase,
-            pl_t if _hc._same_uid(port.active_player_id, pl_t) else ai_t,
-            pl_t)
-        priority_context = self._priority_context_for(phase, bstate)
         native_chain = getattr(port, "chain", None)
-        if (native_chain is not None and
-                not getattr(native_chain, "is_empty", True)):
+        chain_open = (native_chain is not None and
+                      not getattr(native_chain, "is_empty", True))
+        # A chain that opened during declare-attacks (e.g. a CardAttacked trigger)
+        # is a chain window, not a declaration: sending DeclareAttack here makes
+        # the client show the attacker picker mid-chain.
+        in_chain_declare = (chain_open and
+                            phase == _hc.game_engine.ETurnPhases.DeclareAttack)
+        if not in_chain_declare:
+            game.push_turn_phase(
+                phase,
+                pl_t if _hc._same_uid(port.active_player_id, pl_t) else ai_t,
+                pl_t)
+        priority_context = self._priority_context_for(phase, bstate)
+        if chain_open:
             priority_context = _hc.game_engine.EPriorityContext.ResolveTopOfChain
         game.push_green_light(pl_t, priority_context)
         game.push_player_updated(
@@ -2106,7 +2113,8 @@ class TurnFlowMixin:
                      _hc.game_engine.ETurnPhases.SecondMainPhase):
             self._push_main_phase_options(
                 session, pl_t, ai_t, refresh_warzone=False)
-        elif phase == _hc.game_engine.ETurnPhases.DeclareAttack:
+        elif (phase == _hc.game_engine.ETurnPhases.DeclareAttack and
+              not in_chain_declare):
             self._push_attack_options(session, pl_t, ai_t)
         elif phase in (_hc.game_engine.ETurnPhases.AssignDamage,
                        _hc.game_engine.ETurnPhases.AssignFirstStrikeDamage):
