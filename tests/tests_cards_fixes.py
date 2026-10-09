@@ -834,6 +834,83 @@ def test_oakhenge_reveal_opens_one_selectable_picker(db):
     assert bstate.pop("completed_chain_instance_id", None) == 6, bstate
 
 
+def test_oakhenge_single_revealed_troop_moves_without_a_picker(db):
+    """A single revealed troop is the only legal pick: no one-target picker.
+
+    The client's single-target path (AutoTargetCoverflow) needs card views for
+    the target, but CombineRevealAndChoose drops the informational Coverflow
+    that would create them, so a one-target PlayerOptionList crashed the
+    client.  The reveal still shows the five cards, and the troop goes to hand.
+    """
+    import types
+
+    import hconnect_server as hcs
+    import db as dbmod
+    from rules_port.resolution import resolve_port_played_spell
+
+    OAK = "f42da1e5-159c-41d2-9664-2e64be20257e"
+    OAK_AG = "200337da-9971-cf13-7e98-011a78b9ac64"
+    TROOP = "4a6efc34-4789-48e1-a660-4153ca6321e8"   # Howling Brave
+    SHARD = "cd41bd00-7585-4762-a721-6163bdaee3c3"   # Wild Shard
+    for guid in (OAK, TROOP, SHARD):
+        _copy_card(db, guid)
+
+    add_card(db, 361, 5, OAK, loc="CastSpells")
+    layout = ((362, SHARD, "Resource"), (363, TROOP, "Troop"),
+              (364, SHARD, "Resource"), (365, SHARD, "Resource"),
+              (366, SHARD, "Resource"))
+    for index, (uid, tpl, ctype) in enumerate(layout):
+        add_card(db, uid, 5, tpl, loc="deck")
+        db.execute(
+            "UPDATE game_cards SET card_type=?, position=? WHERE card_uid=?",
+            (ctype, index, uid))
+    db.commit()
+
+    old_db = dbmod._db
+    old_hcs_db = hcs._db
+    dbmod._db = db
+    hcs._db = db
+    try:
+        import battle_engine
+
+        handler = HandlerStub(db)
+        handler._checkpoint_engine = lambda session: battle_engine
+        handler._hide_candidates_to_deck = types.MethodType(
+            hcs.HCPHandler._hide_candidates_to_deck, handler)
+        handler._resolve_pending_revealed_choice = types.MethodType(
+            hcs.HCPHandler._resolve_pending_revealed_choice, handler)
+        handler._send_battle_events = lambda *args, **kwargs: True
+        handler._push_transaction_ack = lambda *args, **kwargs: None
+        handler._prompt_revealed_choice = types.MethodType(
+            hcs.HCPHandler._prompt_revealed_choice, handler)
+
+        pl_t = game_engine.UID.make(244, 5)
+        ai_t = game_engine.UID.make(3, 1000)
+        game = game_engine.Game(1, pl_t, ai_t)
+        session = SessionStub()
+        bstate = {"resolving_source_uid": 361, "resolving_owner_id": 5,
+                  "player_health": 20, "ai_health": 20, "turn_number": 1}
+        resolve_port_played_spell(
+            game, session, db, handler, pl_t, ai_t, bstate, [OAK_AG])
+    finally:
+        dbmod._db = old_db
+        hcs._db = old_hcs_db
+
+    reveals = [event for event in game.events if isinstance(
+        event, game_engine.CardsRevealedSessionEventArgs)]
+    assert len(reveals) == 1, reveals
+    assert [int(card.uid.uid64) for card in reveals[0].session_card_ids] == [
+        362, 363, 364, 365, 366]
+    assert not [event for event in game.events if isinstance(
+        event, game_engine.PlayerOptionListSessionEventArgs)]
+    rows = db.execute(
+        "SELECT card_uid, location FROM game_cards "
+        "WHERE card_uid BETWEEN 362 AND 366 ORDER BY card_uid").fetchall()
+    assert rows == [(362, "deck"), (363, "hand"), (364, "deck"),
+                    (365, "deck"), (366, "deck")], rows
+    assert not bstate.get("resolution_paused"), bstate
+
+
 def test_revealed_choice_completion_reprojects_native_priority(db):
     """A finished reveal picker must re-project the native priority window.
 
@@ -2729,6 +2806,8 @@ def main():
          test_oakhenge_moves_revealed_troop_to_hand_with_its_template),
         ("Oakhenge reveal opens one selectable picker",
          test_oakhenge_reveal_opens_one_selectable_picker),
+        ("Oakhenge single revealed troop skips the picker",
+         test_oakhenge_single_revealed_troop_moves_without_a_picker),
         ("Revealed choice completion re-projects priority",
          test_revealed_choice_completion_reprojects_native_priority),
         ("Discard continuation re-projects native chain window",

@@ -1111,7 +1111,16 @@ class NativeEffectBackend:
                             # the player to pick twice and re-moved the chosen
                             # card, and the extra pause left the spell on the
                             # chain without priority.
+                            # A single non-optional candidate is not a choice:
+                            # the client's single-target path (AutoTargetCoverflow)
+                            # needs card views the combined reveal never created,
+                            # so resolve it directly instead of sending a picker
+                            # with one target.
+                            single_forced = (len(candidates) == 1 and not (
+                                target_spec.optional or
+                                int(target_spec.minimum or 0) == 0))
                             if (candidates and target_spec.requires_input
+                                    and not single_forced
                                     and int(ability.responsible_player_id or 0) != 0):
                                 prompt = getattr(handler, "_prompt_revealed_choice", None)
                                 if callable(prompt):
