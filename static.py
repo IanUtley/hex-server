@@ -1884,41 +1884,6 @@ def ensure_schema(db):
              "AZ1 - Node 30 - Wallace - Step 3 player has beaten Dryad",
              "", "{}", 0, 1),
         )
-        # An earlier migration used a look-alike GUID that is not present in
-        # the authored ConversationTemplate. Repair it in existing databases
-        # as well as using the correct ID for fresh installs.
-        old_wallace_guid = "1e9d1bd0-0967-4fe3-be79-d0cb068f973e"
-        wallace_guid = "1e9d1bd0-0967-4fe8-be79-d0cb068f973e"
-        # Merge rather than blindly UPDATE: a partially applied earlier
-        # migration may already contain both rows under a unique key.
-        db.execute(
-            "DELETE FROM campaign_node_conversations "
-            "WHERE campaign_template='AZ1' AND node_id='Node030' "
-            "AND conversation_guid=? AND EXISTS (SELECT 1 FROM "
-            "campaign_node_conversations WHERE campaign_template='AZ1' "
-            "AND node_id='Node030' AND conversation_guid=?)",
-            (old_wallace_guid, wallace_guid),
-        )
-        db.execute(
-            "UPDATE campaign_node_conversations SET conversation_guid=? "
-            "WHERE campaign_template='AZ1' AND node_id='Node030' "
-            "AND conversation_guid=?",
-            (wallace_guid, old_wallace_guid),
-        )
-        db.execute(
-            "DELETE FROM quest_conversations "
-            "WHERE quest_script='az01_q_cross_the_river_part2' "
-            "AND conversation_guid=? AND EXISTS (SELECT 1 FROM "
-            "quest_conversations WHERE quest_script='az01_q_cross_the_river_part2' "
-            "AND conversation_guid=?)",
-            (old_wallace_guid, wallace_guid),
-        )
-        db.execute(
-            "UPDATE quest_conversations SET conversation_guid=? "
-            "WHERE quest_script='az01_q_cross_the_river_part2' "
-            "AND conversation_guid=?",
-            (wallace_guid, old_wallace_guid),
-        )
         # The extracted Cross Zodiac River template historically stored
         # Warren's ChampionTemplate GUID in its final conversation objective.
         # Replace it with the authored Warren Step 1a conversation so newly
@@ -1962,37 +1927,6 @@ def ensure_schema(db):
                     "WHERE script_name=?",
                     (json.dumps(objectives, sort_keys=True), quest_script),
                 )
-        # Add state qualifiers to existing node-conversation rows when a
-        # database was seeded before the extractor recorded them.  The
-        # conversation name is authored metadata; this is only an idempotent
-        # schema/data migration, not runtime conversation selection logic.
-        for row in db.execute(
-                "SELECT campaign_template, node_id, conversation_guid, "
-                "conversation_name, trigger_json FROM campaign_node_conversations").fetchall():
-            campaign_template, node_id, conversation_guid, name, raw = row
-            try:
-                trigger = json.loads(raw or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                trigger = {}
-            if not isinstance(trigger, dict):
-                trigger = {}
-            lower_name = str(name or "").lower()
-            changed = False
-            if "player already has fortune" in lower_name and trigger.get("state") != "fortune":
-                trigger["state"] = "fortune"
-                changed = True
-            elif "first encounter" in lower_name and trigger.get("visit") != "first":
-                trigger["visit"] = "first"
-                changed = True
-            elif "repeat" in lower_name and trigger.get("visit") != "repeat":
-                trigger["visit"] = "repeat"
-                changed = True
-            if changed:
-                db.execute(
-                    "UPDATE campaign_node_conversations SET trigger_json=? "
-                    "WHERE campaign_template=? AND node_id=? AND conversation_guid=?",
-                    (json.dumps(trigger), campaign_template, node_id,
-                     conversation_guid))
         db.commit()
         print(
             "Seeded quest metadata: templates={} conversation_links={}".format(
