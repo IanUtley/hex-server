@@ -1998,7 +1998,6 @@ def db_move_debug_card(session_id, card_uid, location, conn=None):
     return (conn or _db_layer._db).execute(
         "UPDATE game_cards SET location=? WHERE session_id=? AND card_uid=?",
         (str(location), session_id, int(card_uid)))
-    return row[0] if row else None
 
 
 def db_card_positions(session_id, card_uids, conn=None):
@@ -3453,9 +3452,19 @@ def db_copy_template_payload(template_guid, conn=None, talent_guids=None):
     """Return typed fields needed to materialize a generated copy."""
     resolved = db_resolve_talent_modified_template(
         template_guid, talent_guids, conn=conn)
-    return (conn or _db_layer._db).execute(
+    connection = conn or _db_layer._db
+    row = connection.execute(
         "SELECT card_type, abilities_json, attributes FROM card_templates "
         "WHERE guid=?", (resolved,)).fetchone()
+    if row is None:
+        # A champion template (the target of a champion transform) has no card
+        # row; its payload is its ability list, as the champion was built from.
+        abilities = [str(value[0]).lower() for value in connection.execute(
+            "SELECT ability_guid FROM champion_abilities WHERE champion_guid=? "
+            "ORDER BY ability_guid", (str(resolved).lower(),)).fetchall()]
+        if abilities:
+            return ("Champion", json.dumps(abilities), 0)
+    return row
 
 
 def db_next_game_card_row_id(session_id, conn=None):
