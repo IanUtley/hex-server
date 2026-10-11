@@ -1020,6 +1020,7 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
 
     campaign_encounter_conversation_guid = None
     campaign_mod_choice_guid = None
+    campaign_player_deck_json = None
     if is_campaign:
         camp_id = int((session.session_name or "camp_0").split("_")[-1] or 0)
         cfg = _hc.campaign.resolve_battle_config(
@@ -1044,6 +1045,7 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
         player_starting_health = cfg["player_starting_health"]
         is_tutorial = cfg["is_tutorial"]
         player_champ_guid = cfg["player_champ_guid"]
+        campaign_player_deck_json = cfg.get("player_deck_cards_json")
         handler._campaign_fortune_guid = cfg.get("fortune_guid")
         handler._campaign_fortune_ability_guid = cfg.get(
             "fortune_ability_guid")
@@ -1315,7 +1317,10 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
     import json as _json
     _hc.db_clear_session_cards(session.session_id)
     deck_rows = None
-    if deck_db_id and handler.user_profile:
+    if campaign_player_deck_json:
+        # The scene fixes the player's deck: its encounter-deck cards.
+        deck_rows = (campaign_player_deck_json,)
+    elif deck_db_id and handler.user_profile:
         deck_cards_json = _hc.db_deck_cards_json(
             deck_db_id, handler.user_profile["id"], conn=_hc._db)
         deck_rows = (deck_cards_json,) if deck_cards_json is not None else None

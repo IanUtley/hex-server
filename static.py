@@ -444,7 +444,9 @@ DDL = [
         ai_deck_personality TEXT DEFAULT NULL,
         mods_json TEXT DEFAULT '[]',
         rewards_json TEXT DEFAULT '{}',
-        actions_json TEXT DEFAULT '{}'
+        actions_json TEXT DEFAULT '{}',
+        player_champion_guid TEXT DEFAULT '',
+        player_deck_guid TEXT DEFAULT ''
     )
     """,
     """
@@ -2093,6 +2095,10 @@ def ensure_schema(db):
                        "TEXT DEFAULT NULL")
         _ensure_column(db, "encounter_scenes", "mods_json",
                        "TEXT DEFAULT '[]'")
+        _ensure_column(db, "encounter_scenes", "player_champion_guid",
+                       "TEXT DEFAULT ''")
+        _ensure_column(db, "encounter_scenes", "player_deck_guid",
+                       "TEXT DEFAULT ''")
         _ensure_column(db, "encounter_scenes", "actions_json",
                        "TEXT DEFAULT '{}'")
         ecols = {r[1] for r in db.execute(

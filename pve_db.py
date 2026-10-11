@@ -1418,6 +1418,15 @@ def db_encounter_scene_runtime(scene_guid, conn=None):
         "WHERE guid=?", (str(scene_guid),)).fetchone()
 
 
+def db_encounter_scene_player_override(scene_guid, conn=None):
+    """``(player_champion_guid, player_deck_guid)`` for a scene; blank means
+    the player keeps their own champion and deck."""
+    row = _connection(conn).execute(
+        "SELECT COALESCE(player_champion_guid, ''), COALESCE(player_deck_guid, '') "
+        "FROM encounter_scenes WHERE guid=?", (str(scene_guid),)).fetchone()
+    return (row[0] or None, row[1] or None) if row else (None, None)
+
+
 def db_campaign_template_name(campaign_id, conn=None):
     """Return a campaign's template/script name."""
     row = _connection(conn).execute(
