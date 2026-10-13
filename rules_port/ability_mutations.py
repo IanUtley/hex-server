@@ -15,6 +15,25 @@ def _abilities(value):
     return [str(guid).lower() for guid in parsed] if isinstance(parsed, list) else []
 
 
+def _granted_attribute_bits(db, ability_guid) -> int:
+    """Attribute bits an ability adds through its authored CardModifiers."""
+    from pvp_db import db_ability_effect_rows
+    from .attribute_effects import attribute_bits_from_flags
+    bits = 0
+    for _guid, effect_type, param in db_ability_effect_rows(ability_guid, conn=db):
+        if effect_type != "CardModifierAbilityEffectTemplate":
+            continue
+        try:
+            data = json.loads(param or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (isinstance(data, dict) and
+                str(data.get("property", "")).lower() == "attribute" and
+                str(data.get("operation", "Add")).lower() == "add"):
+            bits |= attribute_bits_from_flags(data.get("attribute_flags"))
+    return bits
+
+
 def revoke_base_abilities(context, target: int) -> str:
     """Remove authored base abilities and project the resulting card state."""
     from pvp_db import db_card_ability_state, db_set_card_abilities
@@ -39,7 +58,8 @@ def revoke_base_abilities(context, target: int) -> str:
 def shift_ability(context, source: int, target: int, ability_guid: str) -> str:
     """Move one ability between card instances using only native projections."""
     from pvp_db import (db_card_ability_payload, db_card_mutation_info,
-                        db_card_state_value, db_set_card_abilities_and_attributes,
+                        db_card_state_value, db_card_template_attrs_joined,
+                        db_set_card_abilities_and_attributes,
                         db_template_attributes)
     from .card_projection import push_card_state
     from .triggers import dispatch_native_trigger
@@ -62,10 +82,21 @@ def shift_ability(context, source: int, target: int, ability_guid: str) -> str:
     if ability_guid not in target_abilities:
         target_abilities.append(ability_guid)
 
+    # The shifted power's keywords (Lifedrain -> SpiritDrain) are projected
+    # from the card's CURRENT ability list by rules_port.static_rules, so the
+    # target needs no persisted bit.  Keep every other instance attribute
+    # (earlier grants) on both cards; only strip the shifted power's own bits
+    # from the source when an older path persisted them there.
+    shifted_bits = _granted_attribute_bits(context.db, ability_guid)
     for row, uid, abilities in (
             (source_row, source, source_abilities),
             (target_row, target, target_abilities)):
-        attributes = int(db_template_attributes(row[0], conn=context.db) or 0)
+        joined = db_card_template_attrs_joined(
+            context.session.session_id, uid, conn=context.db)
+        template_bits = int(db_template_attributes(row[0], conn=context.db) or 0)
+        attributes = int((joined[2] if joined else None) or template_bits)
+        if uid == source:
+            attributes &= ~(shifted_bits & ~template_bits)
         db_set_card_abilities_and_attributes(
             context.session.session_id, uid, json.dumps(abilities), attributes,
             conn=context.db)

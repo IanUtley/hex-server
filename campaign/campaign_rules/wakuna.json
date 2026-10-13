@@ -1,0 +1,27 @@
+{
+ "schema_version": 1,
+ "campaign": "wakuna",
+ "scene": "Wakuna",
+ "runtime": "rules",
+ "generated_by": "campaign/tools/campaign_editor/import_az1_panoramas.py",
+ "start": {
+  "node": "Belarius",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "nodes": {
+  "Belarius": {},
+  "BlueSparrow": {},
+  "MarshalJosephina": {},
+  "TwoTomahawks": {},
+  "Totem": {},
+  "Cressida": {},
+  "DaughterOfStars": {},
+  "Myaa@wakuna": {},
+  "Tezozo": {}
+ },
+ "hooks": []
+}

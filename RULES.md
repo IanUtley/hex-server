@@ -295,6 +295,19 @@ snapshot; they do not prove every event path or Unity projection. A new gap
 should be fixed in its shared metadata or event layer and covered by a focused
 acceptance scenario.
 
+Encounter setup cards (scene mods with a start-of-game grant, or targeted at
+the AI) are hidden battleboard cards in the `mod` collection. A card that an
+encounter mod's granted ability creates for a hand keeps its authored Hand
+destination, so the player can play it: Canyon Heat Wave's "Each champion gets
+... 5% chance you create a Heat Wave and put it into your hand. It gets cost
+-2" puts a playable Heat Wave in the owner's hand. The mod card itself is not
+materialized in the `mod` zone for a plain (untargeted) scene mod; its granted
+ability is applied as a scene-wide passive. Any client refresh of a card in
+the `mod` zone is published in the hidden `ECardCollections.Mod` collection
+(`card_collection_for_location`), never Warzone, so the card never shows on the
+board. Implemented in `services/legacy_loadbalancer.py` (scene setup) and
+`rules_port/token_effects.py` (summon); PvP has no scene mods.
+
 ## PVE, PVP, AI, and tournaments
 
 PVE encounters, FRA, tournament games, and ordinary PVP share session/card

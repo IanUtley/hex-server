@@ -1008,14 +1008,40 @@ class EffectContext:
         except (TypeError, ValueError):
             return None
 
-    def _push_champion_intattrs(self, owner, champion_uid):
+    def _push_champion_intattrs(self, owner, champion_uid, cleared=()):
         """Refresh champion context fields without a Champions zone move."""
         import game_engine
 
         attrs = dict((self.bstate.get("champion_int_attrs") or {}).get(
             str(int(champion_uid)), {}) or {})
         scid = game_engine.SessionCardId(game_engine.UID(int(champion_uid)))
-        card_def = getattr(self.game, "card_defs", {}).get(scid)
+        card_defs = getattr(self.game, "card_defs", None)
+
+        def _champion_def():
+            # SessionCardId hashes by identity, so match the raw UID.
+            if not isinstance(card_defs, dict):
+                return None, scid
+            for key, value in card_defs.items():
+                try:
+                    if int(key.uid.uid64) == int(champion_uid):
+                        return value, key
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            return None, scid
+
+        card_def, scid = _champion_def()
+        if card_def is None and isinstance(card_defs, dict):
+            # A fresh per-packet Game has no champion CardDef yet.  Rebuild
+            # it (abilities, counters, spell-point mods, int attrs) before
+            # the CardUpdated below, which replaces every cached field.
+            warm = getattr(self.handler, "_push_champions_warm", None)
+            if callable(warm) and not self.bstate.get("pvp"):
+                try:
+                    warm(self.session, self.player_uid, self.ai_uid,
+                         self.bstate, self.game)
+                except Exception:  # pragma: no cover - projection only
+                    pass
+                card_def, scid = _champion_def()
         if card_def is not None:
             current = dict(getattr(card_def, "int_attrs", {}) or {})
             for key, value in attrs.items():
@@ -1023,11 +1049,51 @@ class EffectContext:
                     current.pop(key, None)
                 else:
                     current[key] = int(value)
+            # An attribute removed from the runtime map (Set to 0, Remove)
+            # must leave the client cache as well.
+            for key in cleared or ():
+                if key not in attrs:
+                    current.pop(key, None)
             card_def.int_attrs = current
         from .runtime_helpers import owner_uid
         recipient = owner_uid(int(owner), self.player_uid, self.ai_uid,
                               self.bstate)
+        if card_def is not None:
+            # Unity's champion HUD (GoChampionEffects.SetEffectsFromChampionCard)
+            # derives its IntAttr state icons (Toxified) from the cached
+            # champion CardRepresentation, which only a CardUpdated stores;
+            # PlayerUpdated never touches it.  Keep the collection the client
+            # already has (None) so it is neither suppressed nor read as a
+            # card move -- the same projection champion counters use.
+            template = self._champion_template_guid(int(champion_uid))
+            health = getattr(card_def, "defense", None)
+            _side, health_key = self._side_keys(int(owner))
+            try:
+                health = int(self.bstate.get(
+                    health_key, getattr(self.game, health_key, health)))
+            except (TypeError, ValueError):
+                pass
+            kwargs = {"int_attrs": card_def.int_attrs}
+            if template:
+                kwargs["template_id"] = template
+            if health is not None:
+                kwargs["defense"] = health
+            self.game.push_card_updated(
+                scid, recipient, game_engine.ECardCollections.None_,
+                game_engine.ECardTypes.Champion, **kwargs)
         self.game.push_player_updated(recipient, champ_id=scid)
+
+    def _champion_template_guid(self, champion_uid: int):
+        """Return the champion template GUID for a champion card UID."""
+        for scid_attr, guid_attr in (("_player_champ_scid", "_player_champ_guid"),
+                                     ("_ai_champ_scid", "_ai_champ_guid")):
+            scid = getattr(self.handler, scid_attr, None)
+            try:
+                if scid is not None and int(scid.uid.uid64) == int(champion_uid):
+                    return getattr(self.handler, guid_attr, None)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return None
 
     def emit_champion_healed(self, owner: int, old_value: int,
                              new_value: int) -> None:
@@ -4444,11 +4510,19 @@ class EffectContext:
             return revoke_base_abilities(self, int(target))
 
         if function == "ShiftAbility":
-            source = self.bstate.get("player_shift_source")
-            destination = self.bstate.get("player_shift_target") or target
+            # The shifted power leaves the Shift ability's own source card and
+            # goes to the effect's typed target.  A chain-resolved activation
+            # (the RulesPort transaction path) never sets the legacy
+            # ``player_shift_*`` aliases, so they are only a fallback.
+            source = (self.bstate.get("resolving_source_uid") or
+                      self.bstate.get("player_shift_source"))
+            destination = (self.resolved_target(source_fallback=False) or
+                           self.bstate.get("player_shift_target"))
             guid = tac_guid(serialized)
             if not source or not destination or not guid:
                 return "shift: missing source/target/ability"
+            if int(source) == int(destination):
+                return "shift: target is the source card"
             from rules_port.ability_mutations import shift_ability
             return shift_ability(self, int(source), int(destination), guid)
 

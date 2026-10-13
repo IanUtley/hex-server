@@ -142,9 +142,9 @@ def queue_surfaces(context, owner_id):
             context.session.session_id, owner_id, conn=context.db):
         if not chain.empty(context.bstate):
             break
-        threshold = tunneling_value(
-            context.db, template_guid,
-            _saved_int_attrs(context.db, context.session.session_id, card_uid))
+        saved_attrs = _saved_int_attrs(
+            context.db, context.session.session_id, card_uid)
+        threshold = tunneling_value(context.db, template_guid, saved_attrs)
         try:
             payload = json.loads(db_card_mutation_field(
                 context.session.session_id, int(card_uid),
@@ -153,7 +153,13 @@ def queue_surfaces(context, owner_id):
                 "tunneling", 0) or 0) if isinstance(payload, dict) else 0
         except (TypeError, ValueError, json.JSONDecodeError):
             count = 0
-        if threshold <= 0 or count < threshold:
+        # C# DetectStateBasedTriggers surfaces when counters >= Tunneling.
+        # A card whose instance Tunneling was reduced to 0 or below (Tectonic
+        # Megahulk with many Robots) therefore surfaces; a card with no
+        # Tunneling at all keeps the existing skip.
+        reduced = threshold <= 0 and any(
+            str(key).lower() == "tunneling" for key in saved_attrs)
+        if (threshold <= 0 and not reduced) or count < threshold:
             continue
         change_counter(context, int(card_uid), "tunneling",
                        TUNNELING_COUNTER_GUID, 0, "set")

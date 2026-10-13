@@ -39,6 +39,10 @@ _LISTS = {_tac_attr_hash(name) for name in (
     "SpellPointCostModifiers", "StoredTargets", "TamedCards", "VoidedCards",
     "ExtraCombatsThisTurn")}
 _STRINGS = {_tac_attr_hash(name) for name in (
+    # BaseVersionGuid heads alternate-art CardTemplate TACs (Tectonic
+    # Megahulk 0c7a4e38); read as an int it desynchronised the rest of the
+    # template's IntAttrs (its Tunneling 15 was lost).
+    "BaseVersionGuid",
     "Guid", "FunctionName", "ListName", "Where", "SourceCardGuid",
     "GainedCounterType", "RemovedCounterType", "CompareWith", "Name")}
 

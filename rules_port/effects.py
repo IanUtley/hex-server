@@ -986,7 +986,9 @@ def _int_attribute(context, target, param):
                 target_owner_id=champion_owner,
                 source_uid=context.bstate.get("resolving_source_uid"),
                 expiration_owner_id=expiration_owner)
-        context._push_champion_intattrs(champion_owner, int(target))
+        context._push_champion_intattrs(
+            champion_owner, int(target),
+            cleared=() if value else (attr,))
         context.emit_int_attribute_gained(target, attr, previous, value)
         return f"intattr {attr}={value} champion={hex(int(target))}"
 
@@ -1005,10 +1007,26 @@ def _int_attribute(context, target, param):
         buffs = {}
     attrs = buffs.setdefault("int_attrs", {})
     old = int(attrs.get(attr, 0) or 0)
+    # A persisted Tunneling IntAttr is the card's current absolute value
+    # (rules_port.tunneling.tunneling_value), so a modifier on a card that
+    # has none yet applies to the printed CardTemplate value: Tectonic
+    # Megahulk's "Tunneling -1 for each Robot" is 15 -> 14, not 0 -> -1.
+    # Keep an explicit 0 as well, or the threshold would revert to print.
+    keep_zero = False
+    if attr.lower() == "tunneling" and not temporary:
+        from pvp_db import db_card_basic
+        from .tunneling import tunneling_value
+        basic = db_card_basic(
+            context.session.session_id, int(target), conn=context.db)
+        printed = tunneling_value(context.db, basic[0], {}) if basic else 0
+        if attr not in attrs:
+            old = printed
+        keep_zero = printed > 0 and operation not in (
+            "remove", "removeall", "clear")
     value = apply_operation(old)
     if value is None:
         return f"intattr: unsupported operation {operation} on {attr}"
-    if value:
+    if value or keep_zero:
         attrs[attr] = value
     else:
         attrs.pop(attr, None)

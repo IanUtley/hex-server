@@ -91,7 +91,7 @@ from services.reconnect import _reconnect_declined_for_pid, _record_reconnect_de
 from gamemodes.fra_arena import _fra_arena_setup_values, _fra_arena_session_state_data
 
 from application.champion_defaults import _talent_ability_guid, _RACE_DECK_MAP, _CHAMPION_CLASS_MAP, _CHAMPION_GENDER_MAP, _default_talents_for_champion
-from services.chests import CLIENT_CHEST_UID_BASE, _CHEST_KEEP_COUNTS, ClientChest, _resolve_client_chest, _generate_chest_rewards, _grant_pack_inventory_rewards, _open_client_chests
+from services.chests import CLIENT_CHEST_UID_BASE, _CHEST_KEEP_COUNTS, ClientChest, _resolve_client_chest, _generate_chest_rewards, _grant_pack_inventory_rewards, _open_client_chests, _roll_pack_chest_rarities, _grant_reward_cards, _spin_client_chest, _encode_spin_response
 from application.rules_port_timing import _rules_port_timing
 
 from services.legacy_handlers import LEGACY_HANDLERS
@@ -2237,6 +2237,11 @@ class HCPHandler(ProfileStreamMixin, CardPlayMixin, CardStateMixin, CombatMixin,
             from services.chat import handle_chat_message
             self._refresh_log_session_context()
             handle_chat_message(self, body)
+
+        elif target == "Session" and instance == "whsp":
+            from services.chat import handle_whisper_message
+            self._refresh_log_session_context()
+            handle_whisper_message(self, body)
 
         # === ROUTED SERVICE MESSAGES ===
         elif instance and instance != "ping":

@@ -19,6 +19,10 @@ in that list only when `allowcon` is enabled.
 |---------|-------|--------|-------------|
 | `!game_end` | `!game_end victory\|defeat` | Implemented | End the campaign battle with a test win or loss; available outside an active game. |
 | `!encounter` | `!encounter <name>` | Implemented | Start a named campaign encounter; available outside an active game. |
+| `!additem` | `!additem <item name> [xN]` | Implemented | Add an inventory item (mercenary, equipment, chest, sleeve); names ignore case and punctuation. |
+| `!partycap` | `!partycap <0-4>` | Implemented | Set the mercenary party slots (`CAMP_PARTYCAP`); applies after relog. |
+| `!addchest` | `!addchest <rarity> [set] [xN]` | Implemented | Add booster treasure chests (set number or name, default Set 1); applies after relog. |
+| `!addgold` | `!addgold <amount>` | Implemented | Add gold, e.g. to spin the Wheels of Fate; pushes the new balance. |
 | `!challenge` | `!challenge [opponent]` | Implemented | Create a duel challenge. |
 | `!reload` | `!reload` | Implemented | Reload runtime modules. |
 

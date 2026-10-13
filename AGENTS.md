@@ -19,9 +19,9 @@ Key files:
 - `proxy.py` — HTTP proxy for Steam auth (port 8081)
 - `commands.py` — In-game chat/debug commands (`!` prefix)
 - `campaign.py` — Campaign/adventure service handler (dt=110000)
-- `hex-private/campaign/campaign_runtime/` — Rules-driven campaign runtime
-- `hex-private/campaign/campaign_rules/` and `hex-private/campaign/campaign_data/` — Authored campaign rules and data
-- `hex-private/campaign/tools/campaign_editor/` — Campaign editor and authoring tools
+- `campaign/campaign_runtime/` — Rules-driven campaign runtime
+- `campaign/campaign_rules/` and `campaign/campaign_data/` — Authored campaign rules and data
+- `campaign_editor/` — Campaign editor and authoring tools (edits `campaign`; see `campaign_editor/paths.py`)
 - `game_engine.py` — Game session event system (60+ SessionEventArgs)
 - `encoder.py` — ObjFmt binary encoder (19 encode functions)
 - `battle_engine.py` — DB-backed turn/priority engine (phase cycle, stops)
@@ -58,8 +58,8 @@ full restart. The reloaded set is defined by `reload_runtime_modules()` in
 
 - Explicitly listed: `domain/constants.py`, `db.py`, `pvp_db.py`,
   `profile_db.py`, `pve_db.py`, `chat_db.py`, `replay_db.py`,
-  `tournament_db.py`, `hex-private/campaign/campaign_rules.py`,
-  `game_engine.py`, `game_session.py`, `battle_engine.py`, `campaign.py`,
+  `tournament_db.py`, `campaign/campaign_rules.py`,
+  `campaign_playtest.py`, `game_engine.py`, `game_session.py`, `battle_engine.py`, `campaign.py`,
   `application/dispatcher.py`, `application/player_transactions.py`,
   `rules_port/wire.py`, `rules_port/runtime_adapter.py`,
   `rules_port/transactions.py`, `ai.py`, `encoder.py`,

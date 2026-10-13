@@ -1740,15 +1740,27 @@ def resume_ability_continuation_parents(
         port_session = getattr(session, "_rules_port_session", None)
         pending_activation = getattr(port_session, "pending_activation", None)
         if port_session is not None and isinstance(pending_activation, dict):
+            # The slot names whichever ability level stored the pause last:
+            # for an invoked picker (Giant Corpse Fly's Deploy invoking
+            # DiscardACard) that is the suspended ActivateAbility PARENT, not
+            # the child continuation.  Match any level of the resumed chain,
+            # or the stale slot keeps ``_push_main_phase_options`` treating
+            # the player as mid-prompt for the rest of the game.
+            resumed_ids = set()
+            cursor = continuation
+            while isinstance(cursor, dict):
+                try:
+                    resumed_ids.add(int(cursor.get(
+                        "ability_instance_id", cursor.get("instance_id"))))
+                except (TypeError, ValueError):
+                    pass
+                cursor = cursor.get("parent")
             try:
                 pending_id = int(pending_activation.get(
                     "ability_instance_id", -1))
-                continuation_id = int((continuation or {}).get(
-                    "ability_instance_id",
-                    (continuation or {}).get("instance_id", -2)))
             except (TypeError, ValueError):
-                pending_id = continuation_id = -1
-            if pending_id == continuation_id:
+                pending_id = None
+            if pending_id is not None and pending_id in resumed_ids:
                 port_session.pending_activation = None
                 port_session.persist()
     return result

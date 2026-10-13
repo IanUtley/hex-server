@@ -50,6 +50,27 @@ Frost Ring Arena implementation details are in
 - [x] Immediate client inventory removal for direct chest/pack opening using
   the client-compatible `InventoryUpdated` event; other inventory paths still
   need broader auditing.
+- [x] Booster treasure chests: one chest per opened pack (a Legendary chest
+  per Primal Pack). Opening a chest rolls the retail prize kinds by chest
+  rarity (`services/chest_loot.py`: 1/1/1/2/3 rolls; equipment, Stardust,
+  AA and PvE cards, chest mercenaries, sleeves, booster packs). Equipment
+  comes from the chest set's pool, built at runtime from each item's design
+  note ("Set N Chest Loot", "Scars Chest", "Frostheart Chest Loot", bare
+  "Chest" = the item's own set) and cached per process
+  (`services/equipment.py`); there is no equipment table.
+- [x] Wheels of Fate (`services/wheel_of_fate.py`): a spin costs gold by
+  chest rarity, can upgrade the chest, award re-spins, prizes and gold, and
+  leaves the chest unopened (`treasure_chests.wof_spun`/`wof_status`).
+- [x] Deck equipment: `UpdateDeck` stores owned items (one per equipment
+  type) in `decks.equipment`; GetDeckInfo, deck_bits and EncodedDecks return
+  them, and a PvE battle replaces each card with the client's
+  equipment-modified variant for the equipped items. Scene-fixed and
+  mercenary decks carry no equipment.
+- [x] Mercenary parties: `partysave`/`partyload`, saved profile deck
+  templates (`pdecktsave`/`pdeckdel`), login push of templates and parties,
+  and campaign battles fought as the chosen mercenary (its template, health
+  and party deck, no talents). The party cap is the `CAMP_PARTYCAP`
+  Reckoning flag.
 - [ ] Auction House protocol and persistence.
 
 ## Mail and notifications

@@ -69,6 +69,7 @@ RECORD_SECTIONS = (
     "DeckTemplate",
     "EncounterDeck",
     "InventoryItemData",
+    "MercenaryTemplate",
     "QuestTemplate",
     "SceneData",
     "ConversationTemplate",
@@ -593,7 +594,8 @@ def _extract_gems(data: str) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...
     return sorted(gem_rows), sorted(meta_rows), gem_bom
 
 
-def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
+def _extract_champions(data: str, sections=("ChampionTemplate", "MercenaryTemplate")
+                       ) -> dict[str, list[tuple[Any, ...]]]:
     helpers = _card_helpers()
     ability_records = {}
     for _, record in records(data, "AbilityTemplate")[0]:
@@ -603,7 +605,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
     extended_rows = []
     ability_rows = []
     ability_guids: set[str] = set()
-    for _, record in records(data, "ChampionTemplate")[0]:
+    champion_records = [record for section in sections
+                        for _, record in records(data, section)[0]]
+    for record in champion_records:
         champion_guid = nested_guid(record, "m_Id")
         if not champion_guid:
             continue
@@ -619,7 +623,9 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
                     1,
                 )
             )
-        if champion_type != "PvPChampion":
+        # Mercenaries are fixed-stat champions like PvP champions: a starting
+        # health, champion abilities, and no talents.
+        if champion_type not in ("PvPChampion", "Mercenary"):
             continue
         extended_rows.append(
             (
@@ -636,6 +642,10 @@ def _extract_champions(data: str) -> dict[str, list[tuple[Any, ...]]]:
         for entry in record.get("m_ChampionAbilities") or []:
             ability_guid = guid(entry.get("m_CardAbilityId")) if isinstance(entry, dict) else ""
             if not ability_guid:
+                continue
+            # Some unreleased mercenaries (e.g. Andres the Supremo) reference
+            # abilities that are absent from the client's AbilityTemplates.
+            if champion_type == "Mercenary" and ability_guid not in ability_records:
                 continue
             ability_guids.add(ability_guid)
             ability = ability_records.get(ability_guid) or {}
@@ -1036,7 +1046,7 @@ _QUEST_OWNER_FACTIONS = {
     "belarius": "Ardent", "takumi": "Underworld",
 }
 # Quest-start map changes (node visibility) are campaign editor data
-# (hex-private/campaign/campaign_rules/AZ1.json); no quest is seeded with a start hook.
+# (campaign/campaign_rules/AZ1.json); no quest is seeded with a start hook.
 _QUEST_START_HOOKS: dict[str, str] = {}
 
 
@@ -1198,6 +1208,15 @@ def extract_quest_conversations(path: str | None = None) -> list[tuple[Any, ...]
     return _extract_quest_conversations(load_records_text(configured_records_path()))
 
 
+def extract_mercenary_champions(path: str | None = None) -> dict[str, list[tuple[Any, ...]]]:
+    """Extract champion tables for MercenaryTemplate records only."""
+    if path or configured_path():
+        data = load_text(path)
+    else:
+        data = load_records_text(configured_records_path())
+    return _extract_champions(data, sections=("MercenaryTemplate",))
+
+
 def _extract_chests(data: str) -> list[tuple[Any, ...]]:
     rows = []
     for _, record in records(data, "InventoryItemData")[0]:
@@ -1216,6 +1235,37 @@ def _extract_chests(data: str) -> list[tuple[Any, ...]]:
     return sorted(set(row for row in rows if row[0]))
 
 
+# Inventory item types kept in ``inventory_item_templates``: the cosmetic
+# items a saved deck template refers to (ProfileDeckTemplate.Sleeve and its
+# "gboard" extended data).  ``item_type`` is the record's ``m_Type``.
+INVENTORY_ITEM_TEMPLATE_TYPES = ("DeckSleeve", "Gameboard")
+
+
+def _extract_inventory_item_templates(data: str) -> list[tuple[Any, ...]]:
+    """Rows ``(guid, name, description, item_type)`` for sleeves and gameboards.
+
+    ``m_Name`` and ``m_Description`` are plain English text in the Records
+    (not localisation keys), stored as-is.
+    """
+    rows = []
+    for _, record in records(data, "InventoryItemData")[0]:
+        item_type = str(record.get("m_Type") or "")
+        if item_type not in INVENTORY_ITEM_TEMPLATE_TYPES:
+            continue
+        rows.append((nested_guid(record, "m_Id"), str(record.get("m_Name") or ""),
+                     str(record.get("m_Description") or ""), item_type))
+    return sorted(set(row for row in rows if row[0]))
+
+
+def extract_inventory_item_templates(path: str | None = None) -> list[tuple[Any, ...]]:
+    """Sleeve and gameboard rows without parsing the whole snapshot."""
+    if path or configured_path():
+        data = load_text(path)
+    else:
+        data = load_records_text(configured_records_path())
+    return _extract_inventory_item_templates(data)
+
+
 def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
     rows = []
     for _, record in records(data, "InventoryItemData")[0]:
@@ -1231,7 +1281,7 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
-_EXTRACT_CACHE_VERSION = 5   # 5: no quest start hooks (editor data owns map gates)
+_EXTRACT_CACHE_VERSION = 7   # 7: inventory_item_templates
 
 
 def _extract_cache_file(cache_key: str) -> str:
@@ -1335,6 +1385,7 @@ def extract(path: str | None = None) -> dict[str, Any]:
             "quest_templates": quest_templates,
             "quest_conversations": quest_conversations,
             "chest_templates": _extract_chests(data),
+            "inventory_item_templates": _extract_inventory_item_templates(data),
             "pack_set_map": _extract_pack_map(data),
         },
     }
@@ -1376,6 +1427,7 @@ TABLE_COLUMNS = {
     "quest_templates": ("script_name", "name", "title", "objectives_json", "campaign_group", "start_hook", "enabled"),
     "quest_conversations": ("quest_script", "conversation_guid", "campaign_template", "node_id", "npc", "role", "faction", "conversation_name", "start_hook", "conditions_json", "priority", "enabled"),
     "chest_templates": ("guid", "name", "set_guid", "chest_type", "spin_type", "promotional_id"),
+    "inventory_item_templates": ("guid", "name", "description", "item_type"),
     "pack_set_map": ("pack_guid", "set_guid", "is_full_set", "is_primal"),
 }
 

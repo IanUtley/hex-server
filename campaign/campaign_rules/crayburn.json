@@ -1,0 +1,93 @@
+{
+ "schema_version": 1,
+ "campaign": "crayburn",
+ "scene": "Castle Crayburn",
+ "runtime": "rules",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "WatchTower",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_CastleGate_Drawbridge",
+    "from": "CastleGate",
+    "to": "Drawbridge"
+   },
+   {
+    "id": "Path_CastleGate_InnerBailey",
+    "from": "CastleGate",
+    "to": "InnerBailey"
+   },
+   {
+    "id": "Path_Drawbridge_WatchTower",
+    "from": "Drawbridge",
+    "to": "WatchTower"
+   },
+   {
+    "id": "Path_InnerBailey_TowerGate",
+    "from": "InnerBailey",
+    "to": "TowerGate"
+   },
+   {
+    "id": "Path_PenworthTower_TowerGate",
+    "from": "PenworthTower",
+    "to": "TowerGate"
+   }
+  ]
+ },
+ "quests": {},
+ "nodes": {
+  "CastleGate": {
+   "blocked": [
+    "!completed(Drawbridge)"
+   ]
+  },
+  "Drawbridge": {
+   "blocked": [
+    "!completed(WatchTower)"
+   ]
+  },
+  "InnerBailey": {
+   "blocked": [
+    "!completed(CastleGate)"
+   ]
+  },
+  "PenworthTower": {
+   "blocked": [
+    "!completed(TowerGate)"
+   ]
+  },
+  "TowerGate": {
+   "blocked": [
+    "!completed(InnerBailey)"
+   ]
+  },
+  "WatchTower": {
+   "autostart": [
+    "!completed(WatchTower)"
+   ]
+  }
+ },
+ "hooks": [
+  {
+   "id": "crayburn_complete",
+   "on": {
+    "event": "encounter_victory",
+    "node": "PenworthTower"
+   },
+   "do": [
+    {
+     "set_flag": "crayburn_complete"
+    }
+   ]
+  }
+ ],
+ "edited_states": {
+  "WatchTower": [
+   "autostart"
+  ]
+ }
+}

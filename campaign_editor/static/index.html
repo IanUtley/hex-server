@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Campaign Editor</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="toolbar">
+  <button id="back" type="button" hidden>← Back</button>
+  <label class="field">Zone <select id="zone"></select></label>
+  <label class="field" title="Show only what a champion of this race sees">Race <select id="race"></select></label>
+  <label class="field" id="campaign-field"><span id="campaign-label">State</span>
+    <select id="campaign">
+      <option value="">Shared campaign</option>
+    </select>
+  </label>
+  <input id="search" type="search" placeholder="Find node (id or title)" autocomplete="off">
+  <label class="toggle" title="Show only what this champion's client would draw"><input type="checkbox" id="player-view" disabled> Player view</label>
+  <label class="toggle"><input type="checkbox" id="show-bg" checked> Background</label>
+  <label class="toggle"><input type="checkbox" id="show-labels" checked> Labels</label>
+  <label class="toggle" title="Particles, animated materials and lightning (as in the client)"><input type="checkbox" id="show-fx" checked> Effects</label>
+  <button id="fit" type="button">Fit</button>
+  <span id="status" class="status">Loading…</span>
+  <span id="account" class="account" hidden>
+    <span id="account-name"></span>
+    <span id="admin-tools" hidden>
+      <button id="export" type="button" title="Download the shared campaign as a file">Export</button>
+      <button id="import" type="button" title="Load a campaign file into the shared campaign">Import</button>
+      <input id="import-file" type="file" accept=".json,application/json" hidden>
+    </span>
+    <button id="logout" type="button">Log out</button>
+  </span>
+</header>
+<main>
+  <section class="map-wrap">
+    <canvas id="map"></canvas>
+    <canvas id="pano" hidden></canvas>
+    <div id="npc-layer" class="npc-layer" hidden></div>
+    <div id="flash" class="flash"></div>
+    <div id="tooltip" class="tooltip" hidden></div>
+    <div id="legend" class="legend"></div>
+    <div id="quest-log" class="quest-log" hidden></div>
+  </section>
+  <aside class="panel">
+    <nav class="tabs" role="tablist">
+      <button data-tab="node" class="active" type="button">Node</button>
+      <button data-tab="sim" type="button">Simulate</button>
+      <button data-tab="quests" type="button">Quests</button>
+      <button data-tab="issues" type="button">Issues</button>
+    </nav>
+    <div id="tab-node" class="tab-body"><p class="muted">Select a node on the map.</p></div>
+    <div id="tab-sim" class="tab-body" hidden></div>
+    <div id="tab-quests" class="tab-body" hidden></div>
+    <div id="tab-issues" class="tab-body" hidden></div>
+  </aside>
+</main>
+<dialog id="login">
+  <form id="login-form">
+    <h2>Campaign editor</h2>
+    <p class="muted small-text">Log in with your Hex account. Admins edit the shared campaign.
+      Other accounts can simulate and save progress to their own characters.</p>
+    <label class="field">Account <input id="login-name" autocomplete="username" required></label>
+    <label class="field">Password <input id="login-password" type="password" autocomplete="current-password" required></label>
+    <div id="login-error" class="issue" hidden></div>
+    <div class="actions"><button type="submit" class="primary">Log in</button></div>
+  </form>
+</dialog>
+<dialog id="conversation"><div id="conversation-body"></div>
+  <form method="dialog"><button type="submit">Close</button></form></dialog>
+<dialog id="tags"><div id="tags-body"></div></dialog>
+<dialog id="rewards"><div id="rewards-body"></div></dialog>
+<dialog id="scene-mods"><div id="scene-mods-body"></div></dialog>
+<dialog id="scene-actions"><div id="scene-actions-body"></div></dialog>
+<dialog id="scene-rewards"><div id="scene-rewards-body"></div></dialog>
+<dialog id="play"><div id="play-body"></div></dialog>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="/static/effects.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

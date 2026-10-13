@@ -1514,6 +1514,14 @@ class TurnFlowMixin:
         game.ai_health = bstate.get("ai_health", 10)
         game.player_health = bstate.get("player_health", 20)
         champion_counters = bstate.get("champion_counters") or {}
+        champion_attrs = bstate.get("champion_int_attrs") or {}
+
+        def _champion_int_attrs(scid):
+            # Runtime champion IntAttrs (Toxified, ...) ride on the champion
+            # CardUpdated; Unity's champion HUD derives its state icons from
+            # them, so a re-pushed champion must keep them.
+            attrs = champion_attrs.get(str(int(scid.uid.uid64))) or {}
+            return {str(k): int(v) for k, v in attrs.items() if v}
         ai_champ = getattr(self, "_ai_champ_scid", None)
         if ai_champ:
             ai_cdef = _hc.game_engine.CardDef(
@@ -1522,6 +1530,7 @@ class TurnFlowMixin:
                 [], [_hc.game_engine.ResourceId.from_str(g) for g in getattr(self, "_ai_champ_ability_guids", [])])
             ai_cdef.counters = dict(champion_counters.get(
                 str(int(ai_champ.uid.uid64)), {}) or {})
+            ai_cdef.int_attrs = _champion_int_attrs(ai_champ)
             game.card_defs[ai_champ] = ai_cdef
         pl_champ = getattr(self, "_player_champ_scid", None)
         if pl_champ:
@@ -1532,6 +1541,7 @@ class TurnFlowMixin:
                 [], list(pl_abilities))
             cdef.counters = dict(champion_counters.get(
                 str(int(pl_champ.uid.uid64)), {}) or {})
+            cdef.int_attrs = _champion_int_attrs(pl_champ)
             # Carry the persisted spell-power escalation (player_sp_uses) onto
             # the champion CardDef so the client's button shows the INCREASED
             # SP cost (e.g. Soothsaying 4->5 after one use) — a re-pushed

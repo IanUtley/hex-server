@@ -1422,7 +1422,7 @@ def db_get_unopened_chests_full(user_id, conn=None):
     """Return unopened chest fields needed by the login profile stream."""
     connection = conn or _db
     return connection.execute(
-        "SELECT id, set_guid, chest_rarity, template_guid "
+        "SELECT id, set_guid, chest_rarity, template_guid, wof_status, wof_spun "
         "FROM treasure_chests WHERE user_id=? AND opened=0", (user_id,)
     ).fetchall()
 

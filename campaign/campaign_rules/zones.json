@@ -1,0 +1,372 @@
+{
+ "schema_version": 1,
+ "note": "Campaign zones: extracted by AssetExtraction/campaign/AssetExtraction/extract_campaign_editor_assets.py (which keeps keys added here by hand); read by campaign_runtime.catalog_data.zones().",
+ "zones": [
+  {
+   "id": "AZ1",
+   "kind": "overworld",
+   "title": "Howling Plains",
+   "records": "Howling Plains",
+   "server_template": "AZ1",
+   "scene_prefix": "AZ 1 - NODE"
+  },
+  {
+   "id": "AZ2",
+   "kind": "overworld",
+   "title": "The Alachian Sea",
+   "records": "The Alachian Sea",
+   "server_template": "AZ2",
+   "scene_prefix": "AZ 2 - NODE"
+  },
+  {
+   "id": "crayburn",
+   "kind": "dungeon",
+   "title": "Castle Crayburn",
+   "records": "Castle Crayburn",
+   "server_template": "Crayburn Castle",
+   "scene_regex": "^(?P<race>.+?) Tutorial (?P<node>.+)$",
+   "race_parents": {
+    "Human": "az0-human",
+    "Elf": "az0-elf",
+    "Coyotle": "az0-coyotle",
+    "Orc": "az0-orc",
+    "Dwarf": "az0-dwarf",
+    "Shin'hare": "az0-shinhare",
+    "Vennen": "az0-vennen",
+    "Necrotic": "az0-necrotic"
+   },
+   "prefab_root": "campaign/az01/crayburncastle",
+   "campaign_template_id": "5bcba43a-95c7-44b4-ba09-a3555a5edf05"
+  },
+  {
+   "id": "devonshirekeep",
+   "kind": "dungeon",
+   "title": "Devonshire Keep",
+   "records": "Devonshire Keep",
+   "parent": "AZ1",
+   "parent_node": "Node068",
+   "server_template": "Devonshire Keep",
+   "scene_match": "items",
+   "prefab_root": "campaign/az01/devonshirekeep",
+   "campaign_template_id": "f380cf2b-99b9-4971-886c-f5f9bf3b310c"
+  },
+  {
+   "id": "fortromor",
+   "kind": "dungeon",
+   "title": "Fort Romor",
+   "records": "Fort Romor",
+   "parent": "AZ1",
+   "parent_node": "Node011",
+   "server_template": "Fort Romor",
+   "scene_match": "items_with_event_fallback",
+   "prefab_root": "campaign/az01/fortromor",
+   "campaign_template_id": "d1461f76-6483-4514-b24b-a499fb65a209",
+   "replay": {
+    "when_flag": "completed_fort_romor",
+    "keep_flags": [
+     "completed_fort_romor"
+    ],
+    "clear_flags": [
+     "romor_*",
+     "conversation(Fort Romor*"
+    ]
+   }
+  },
+  {
+   "id": "smolderingdead",
+   "kind": "dungeon",
+   "title": "The Smoldering Dead",
+   "records": "The Smoldering Dead",
+   "parent": "AZ1",
+   "parent_node": "Node024",
+   "server_template": "The Smoldering Dead",
+   "scene_match": "items"
+  },
+  {
+   "id": "theusurper",
+   "kind": "dungeon",
+   "title": "The Usurper",
+   "records": "The Usurper",
+   "parent": "AZ1",
+   "parent_node": "Node008",
+   "server_template": "The Usurper",
+   "scene_match": "items"
+  },
+  {
+   "id": "tranquildream",
+   "kind": "dungeon",
+   "title": "The Tranquil Dream",
+   "records": "The Tranquil Dream",
+   "parent": "AZ1",
+   "parent_node": "Node040",
+   "server_template": "The Tranquil Dream",
+   "scene_match": "items",
+   "prefab_root": "campaign/az01/tranquildream",
+   "campaign_template_id": "d657fcad-9dbe-4acc-bb62-2495fd4a4628"
+  },
+  {
+   "id": "brutecrownbluff",
+   "kind": "dungeon",
+   "title": "Brutecrown Bluff",
+   "records": "Brutecrown Bluff",
+   "parent": "AZ2",
+   "parent_node": "Node002",
+   "server_template": "Brutecrown Bluff",
+   "scene_match": "items"
+  },
+  {
+   "id": "greatmachinegraveyard",
+   "kind": "dungeon",
+   "title": "Great Machine Graveyard",
+   "records": "Great Machine Graveyard",
+   "parent": "AZ2",
+   "parent_node": "Node044",
+   "server_template": "Great Machine Graveyard",
+   "scene_match": "items"
+  },
+  {
+   "id": "kraken",
+   "kind": "dungeon",
+   "title": "The Kraken",
+   "records": "The Kraken",
+   "parent": "AZ2",
+   "parent_node": "Node019B",
+   "server_template": "The Kraken",
+   "scene_match": "items"
+  },
+  {
+   "id": "ruinsofkukatan",
+   "kind": "dungeon",
+   "title": "Ruins of Kukatan",
+   "records": "Ruins of Kukatan",
+   "parent": "AZ2",
+   "parent_node": "Node040",
+   "server_template": "Ruins of Kukatan",
+   "scene_match": "items"
+  },
+  {
+   "id": "cavein",
+   "kind": "panorama",
+   "title": "The Cave-In",
+   "records": "The Cave-In",
+   "bundle": "adventurezone01/p_dwrf_cavein",
+   "parent": "AZ1",
+   "parent_node": "Node017",
+   "faction": "Underworld",
+   "server_template": "AZ1",
+   "npcs": [
+    "Rizzix",
+    "Myaa@cavein",
+    "Fahrny",
+    "Wyatt",
+    "Ennis",
+    "VB25351",
+    "Takumi",
+    "Vincent"
+   ],
+   "scene_guid": "c99b4f8d-e24d-4896-9342-6ac2562a2364",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "amblingmesa",
+   "kind": "panorama",
+   "title": "Ambling Mesa",
+   "records": "Ambling Mesa",
+   "bundle": "adventurezone01/p_cytl_amblingmesa",
+   "parent": "AZ1",
+   "parent_node": "Node034",
+   "faction": "Ardent",
+   "server_template": "AZ1",
+   "npcs": [
+    "Sagebrush",
+    "FeatherDrifting",
+    "GrinningFox",
+    "Caribard",
+    "Belarius",
+    "Myaa@amblingmesa",
+    "Gurtok",
+    "Gnathan"
+   ],
+   "scene_guid": "11e30dc4-542e-45a9-8b9d-2fddc48700b9",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "thunderfield",
+   "kind": "panorama",
+   "title": "Thunderfield",
+   "records": "Thunderfield",
+   "bundle": "adventurezone01/p_cytl_thunderfield",
+   "parent": "AZ1",
+   "parent_node": "Node049",
+   "server_template": "AZ1",
+   "npcs": [
+    "Alawa",
+    "DuskDaughter",
+    "ShortBuffalo",
+    "WhisperingBreeze"
+   ],
+   "scene_guid": "2b0f7434-60d2-4ebb-9d01-3861a3697e23",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "necropolis",
+   "kind": "panorama",
+   "title": "The Necropolis",
+   "records": "The Necropolis",
+   "bundle": "adventurezone01/p_ncrtc_necropolis",
+   "parent": "AZ2",
+   "parent_node": "Node026",
+   "server_template": "AZ2",
+   "npcs": [
+    "Margugram",
+    "Drokkord",
+    "Annonna",
+    "Iddi"
+   ],
+   "scene_guid": "",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "wakuna",
+   "kind": "panorama",
+   "title": "Wakuna",
+   "records": null,
+   "bundle": "adventurezone02/p_cytl_wakuna",
+   "parent": "AZ2",
+   "parent_node": "Node007",
+   "server_template": "AZ2",
+   "npcs": [
+    "Belarius",
+    "BlueSparrow",
+    "MarshalJosephina",
+    "TwoTomahawks",
+    "Totem",
+    "Cressida",
+    "DaughterOfStars",
+    "Myaa@wakuna",
+    "Tezozo"
+   ],
+   "scene_guid": "",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "naagaan",
+   "kind": "panorama",
+   "title": "Naagaan",
+   "records": null,
+   "bundle": "adventurezone02/p_ncrtc_naagaan",
+   "parent": "AZ2",
+   "parent_node": "Node027",
+   "server_template": "AZ2",
+   "npcs": [
+    "Myaa@naagaan",
+    "Takumi",
+    "Renner",
+    "Ada",
+    "Malzok",
+    "Bonewalker",
+    "SharpshoooterSahas",
+    "KentigernSlate",
+    "Reese"
+   ],
+   "scene_guid": "",
+   "campaign_group": "AREA"
+  },
+  {
+   "id": "az0-human",
+   "kind": "panorama",
+   "title": "AZ0 Human: Wren's Citadel",
+   "records": "Wren's Citadel",
+   "bundle": "adventurezone01/p_hmm_wrenscastle",
+   "race": "Human",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-elf",
+   "kind": "panorama",
+   "title": "AZ0 Elf: Satyr's Roost",
+   "records": "Satyr's Roost",
+   "bundle": "adventurezone01/p_elf_satyrsroost",
+   "race": "Elf",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-coyotle",
+   "kind": "panorama",
+   "title": "AZ0 Coyotle: Thunderfield",
+   "records": "Thunderfield",
+   "bundle": "adventurezone01/p_cytl_thunderfield",
+   "race": "Coyotle",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-orc",
+   "kind": "panorama",
+   "title": "AZ0 Orc: Xamahuac",
+   "records": "Xamahuac",
+   "bundle": "adventurezone01/p_orc_xamahuac",
+   "race": "Orc",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-dwarf",
+   "kind": "panorama",
+   "title": "AZ0 Dwarf: The Quarry",
+   "records": "The Quarry",
+   "bundle": "adventurezone01/p_dwrf_thequarry",
+   "race": "Dwarf",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-shinhare",
+   "kind": "panorama",
+   "title": "AZ0 Shin'hare: Jinguru",
+   "records": "Jinguru",
+   "bundle": "adventurezone01/p_shnhr_jinguru",
+   "race": "Shin'hare",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-vennen",
+   "kind": "panorama",
+   "title": "AZ0 Vennen: The Hatchery",
+   "records": "The Hatchery",
+   "bundle": "adventurezone01/p_vnnn_thehatchery",
+   "race": "Vennen",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  },
+  {
+   "id": "az0-necrotic",
+   "kind": "panorama",
+   "title": "AZ0 Necrotic: The Necropolis",
+   "records": "The Necropolis",
+   "bundle": "adventurezone01/p_ncrtc_necropolis",
+   "race": "Necrotic",
+   "server_template": "AZ0",
+   "children": [
+    "crayburn"
+   ]
+  }
+ ]
+}

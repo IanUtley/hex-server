@@ -28,12 +28,23 @@ def handle_serviceprofile_80000(handler, target, instance, data_type, reqid, com
         env_json = json.loads(envelope.decode("utf-8"))
     except (TypeError, ValueError, UnicodeDecodeError):
         env_json = {}
+    template_envelope = None
+    if (isinstance(env_json, dict) and handler.user_profile
+            and env_json.get("action") in ("pdecktsave", "pdeckdel")):
+        # Profile deck templates (mercenary party decks).
+        from services.deck_templates import handle_profile_action
+        template_envelope = handle_profile_action(
+            _hc._db, handler.user_profile["id"], env_json)
     if isinstance(env_json, dict) and env_json.get("action") == "qreplaylst":
         from replay import replay_list
         resp_envelope = json.dumps(
             replay_list(env_json), separators=(",", ":")
         ).encode("utf-8")
         _hc.log_req("    Replay list returned from game_replays")
+    elif template_envelope is not None:
+        resp_envelope = template_envelope
+        _hc.log_req(f"    Deck template {env_json.get('action')} handled "
+                    f"({len(resp_envelope)}b)")
     else:
         resp_envelope = b"{}"
     resp_inner = _hc.encode_profile_response(resp_envelope)

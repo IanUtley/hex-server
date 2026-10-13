@@ -1,12 +1,16 @@
 #!/bin/sh
-# Start the optional campaign editor when its private submodule source exists.
+# Start the optional campaign editor (campaign_editor/ at the project root)
+# when the campaign it edits (campaign/ at the project root, or
+# HEX_CAMPAIGN_ROOT) is present.
 set -eu
 
 BASE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-EDITOR_SCRIPT="$BASE_DIR/hex-private/campaign/tools/campaign_editor/server.py"
+EDITOR_SCRIPT="$BASE_DIR/campaign_editor/server.py"
 
-if [ ! -f "$EDITOR_SCRIPT" ]; then
-    echo "[campaign_editor] source not found; skipping"
+CAMPAIGN_DATA=${HEX_CAMPAIGN_ROOT:-$BASE_DIR/campaign}
+
+if [ ! -f "$EDITOR_SCRIPT" ] || [ ! -d "$CAMPAIGN_DATA/campaign_runtime" ]; then
+    echo "[campaign_editor] editor or campaign source not found; skipping"
     exit 0
 fi
 

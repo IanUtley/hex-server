@@ -533,7 +533,7 @@ _AZ0_RACE_CONFIG = {
 
 def _crayburn_quest_end_conv(db, race_name):
     """GUID of the race's "Crayburn Castle - <Race> - Quest End" report
-    conversation (authored in hex-private/campaign/campaign_data), or None."""
+    conversation (authored in campaign/campaign_data), or None."""
     row = db.execute(
         "SELECT conversation_guid FROM campaign_node_conversations "
         "WHERE conversation_name=? LIMIT 1",
@@ -580,7 +580,7 @@ def _az0_config(champion_race):
 
 # --- editor tags on node conversations -------------------------------------
 # ``trigger_json.tags`` (campaign editor, applied by
-# hex-private/campaign/campaign_data.py) select
+# campaign/campaign_data.py) select
 # a conversation only while every tag holds; see campaign_rules.parse_tag.
 # Rows without tags keep the label/visit heuristics below.
 
@@ -782,7 +782,7 @@ _AZ1_QUEST_START_PREREQUISITES = {
 
 
 # Named quest-start content hooks (``quest_templates.start_hook``).  Map
-# gates come from hex-private/campaign/campaign_rules via campaign_gates and quest content from
+# gates come from campaign/campaign_rules via campaign_gates and quest content from
 # the editor data; none are registered now.
 _QUEST_START_HOOKS = {}
 
@@ -977,6 +977,36 @@ _AZ1_PANORAMA_BUNDLE_MAP = {
 # correct AI deck/name (resolve_encounter uses this to override
 # the race's training encounter with the actual launched scene).
 _last_encounter_scene = {}
+# camp_id -> (champion_id, InventoryMercenaryData GUID) chosen in the latest
+# 'start' event ("merc=<guid>" in OParms); read by resolve_battle_config.
+_active_mercenary = {}
+_active_mercenary_lock = threading.Lock()
+
+
+def _remember_mercenary_choice(handler, db, camp_id, oparms):
+    """Record the party member chosen for an encounter.
+
+    The party selector sends the chosen mercenary as "merc=<item guid>"; the
+    zero GUID (or no parameter) means the champion fights with their own
+    deck.
+    """
+    try:
+        camp_id = int(camp_id or 0)
+    except (TypeError, ValueError):
+        return
+    merc_guid = next((str(p)[5:] for p in oparms or []
+                      if str(p).startswith("merc=")), "")
+    with _active_mercenary_lock:
+        if not (merc_guid and merc_guid.strip("0-")):
+            _active_mercenary.pop(camp_id, None)
+            return
+    row = pve_db.db_campaign_protocol_row(camp_id, conn=db)
+    if not row:
+        return
+    with _active_mercenary_lock:
+        _active_mercenary[camp_id] = (row[0], merc_guid.lower())
+    getattr(handler, "_log_req", print)(
+        f"    Campaign start with mercenary {merc_guid} (camp={camp_id})")
 
 # Race-specific Castle Crayburn EncounterScene IDs from the client data.
 # The shared dungeon template supplies the map, but these scenes supply the
@@ -1275,9 +1305,47 @@ def handle_campaign_request(handler, _db, inner_obj, comp, session_id, reqid,
     elif req_type == "cheat":
         return _handle_cheat(handler, _db, env_json, comp, session_id,
                               reqid, target, instance, conh, uid)
+    elif req_type == "partysave":
+        return _handle_partysave(handler, _db, env_json, comp, session_id,
+                                 reqid, target, instance, conh, uid)
+    elif req_type == "partyload":
+        return _handle_partyload(handler, _db, env_json, comp, session_id,
+                                 reqid, target, instance, conh, uid)
     else:
-        log(f"    Unhandled campaign request: {req_type}")
+        log(f"    Unhandled campaign request: {req_type} "
+            f"{json.dumps(env_json, default=str)[:4000]}")
         return
+
+
+def _handle_partysave(handler, db, env_json, comp, session_id,
+                      reqid, target, instance, conh, uid):
+    """Party.SaveRequest: persist the champion's mercenary party.
+
+    The client deserializes the response envelope as the saved
+    CampSysGeneral+Party+ChampionParty and hands it to its callback.
+    """
+    from services import mercenaries
+    log = getattr(handler, "_log_req", print)
+    log(f"    partysave {json.dumps(env_json, default=str)[:2000]}")
+    user_id = handler.user_profile["id"] if handler.user_profile else 0
+    party = mercenaries.save_party(db, user_id, env_json.get("Party") or {})
+    db.commit()
+    return _send_response(handler, json.dumps(party), comp, session_id,
+                          reqid, target, instance, conh, uid)
+
+
+def _handle_partyload(handler, db, env_json, comp, session_id,
+                      reqid, target, instance, conh, uid):
+    """Party.LoadRequest: return the requested champions' parties."""
+    from services import mercenaries
+    log = getattr(handler, "_log_req", print)
+    log(f"    partyload {json.dumps(env_json, default=str)[:2000]}")
+    user_id = handler.user_profile["id"] if handler.user_profile else 0
+    wanted = {int(c) for c in env_json.get("Champs") or []}
+    parties = [party for party in mercenaries.get_parties(db, user_id)
+               if not wanted or party["ChampionID"] in wanted]
+    return _send_response(handler, json.dumps(parties), comp, session_id,
+                          reqid, target, instance, conh, uid)
 
 
 def _handle_qcur4champ(handler, db, env_json, comp, session_id,
@@ -1541,6 +1609,8 @@ def _handle_sendevent(handler, db, env_json, comp, session_id,
                        reqid, target, instance, conh, uid):
     """SendEvent: handle events sent to the campaign logic engine."""
     camp_id = env_json.get("CampID", 0)
+    if str(env_json.get("Event", "") or "") == "start":
+        _remember_mercenary_choice(handler, db, camp_id, env_json.get("OParms"))
     zone_id = _rules_zone(db, camp_id)
     if zone_id:
         from campaign_runtime import runtime
@@ -1709,6 +1779,24 @@ def _resolve_reward_template(template, condition_context):
     return (condition_context or {}).get(key)
 
 
+def _grant_reward_deck(handler, db, user_id, deck_guid):
+    """Give the player a copy of a DeckTemplate: its cards join the collection
+    and a saved deck is created from them.  Returns True when a deck was made.
+
+    Used for reward ``deck_guid`` (e.g. a mercenary's authored deck).  The
+    cards and deck persist in the caller's transaction.
+    """
+    from services.store import deck_template_definition, _grant_deck_to_player
+    definition = deck_template_definition(deck_guid)
+    if definition is None:
+        return False
+    _grant_deck_to_player(user_id, definition["cards"],
+                          definition["name"] or "Reward Deck", conn=db)
+    if hasattr(handler, "push_cards_to_client"):
+        handler.push_cards_to_client()
+    return True
+
+
 def _grant_card_reward(handler, db, user_id, template_guid, quantity=1,
                        emit=True):
     """Add card copies to a collection and optionally emit client rewards.
@@ -1802,6 +1890,26 @@ def _merge_applied(base, extra):
         if isinstance(values, list):
             base.setdefault(key, []).extend(values)
     return base
+
+
+def _inventory_reward_specs(reward):
+    """Inventory specs for a reward's ``mercenaries`` and ``sleeves`` entries.
+
+    The editor's Rewards tab saves ``mercenaries`` (InventoryMercenaryData
+    GUIDs) and ``sleeves`` (DeckSleeve InventoryItemData GUIDs), each as
+    ``[{"guid", "quantity"}]``.  Both are account inventory items, so they are
+    granted through the same ``player_inventory`` path as equipment.
+    """
+    specs = []
+    for key in ("mercenaries", "sleeves"):
+        for entry in (reward or {}).get(key) or ():
+            if isinstance(entry, str):
+                entry = {"guid": entry}
+            if not isinstance(entry, dict) or not entry.get("guid"):
+                continue
+            # One copy each: mercenaries and sleeves are never stacked.
+            specs.append({"guid": str(entry["guid"]).lower(), "quantity": 1})
+    return specs
 
 
 def _stardust_item_specs(reward):
@@ -1954,7 +2062,8 @@ def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
         }]
     if isinstance(item_specs, dict):
         item_specs = [item_specs]
-    item_specs = list(item_specs) + _stardust_item_specs(reward)
+    item_specs = (list(item_specs) + _stardust_item_specs(reward) +
+                  _inventory_reward_specs(reward))
     for spec in item_specs:
         if isinstance(spec, str):
             spec = {"guid": spec}
@@ -2055,6 +2164,11 @@ _MOD_CHOICE_LIST = "mod_choice_list"
 
 
 
+# Battle events that depend on a card being in the opponent's warzone at the
+# end of the battle: event name -> card template GUID (Node 006's Princess Daphne).
+WARZONE_CARD_EVENTS = {"saved_daphne": "686ab5d7-3635-4cb2-91b5-2f933ccc7cb2"}
+
+
 def _battle_events(db, session, player_user_id):
     """Named events a finished battle produced (``tamed_troop`` ...)."""
     events = []
@@ -2062,6 +2176,10 @@ def _battle_events(db, session, player_user_id):
             db, session.session_id, player_user_id,
             {"type": "void_tamed_troop", "owner": "opponent"}):
         events.append("tamed_troop")
+    for event, template_guid in WARZONE_CARD_EVENTS.items():
+        if pve_db.db_card_in_warzone(session.session_id, player_user_id,
+                                     template_guid, "opponent", db):
+            events.append(event)
     return events
 
 
@@ -2200,7 +2318,8 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         if isinstance(item_specs, dict):
             item_specs = [item_specs]
         if not condition or context:
-            item_specs = list(item_specs) + _stardust_item_specs(reward_obj)
+            item_specs = (list(item_specs) + _stardust_item_specs(reward_obj) +
+                          _inventory_reward_specs(reward_obj))
             for spec in item_specs:
                 if isinstance(spec, str):
                     spec = {"guid": spec}
@@ -2237,7 +2356,13 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                         client_item_uid=item_uid, conn=db)
                 items.append({"id": item_uid, "template": str(template_guid),
                               "quantity": new_quantity, "granted": quantity})
-        if not cards and not gold and not xp and not chest and not items:
+        deck_granted = False
+        deck_guid = reward_obj.get("deck_guid")
+        if deck_guid and (not condition or context):
+            deck_granted = _grant_reward_deck(
+                handler, db, player_user_id, str(deck_guid).lower())
+        if (not cards and not gold and not xp and not chest and not items and
+                not deck_granted):
             continue
         granted.extend(cards)
         total_gold += gold
@@ -2346,6 +2471,126 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     return result
 
 
+def _playtest_tag_view(db, session, scene_guid, user_id, request, race_name):
+    """The rules state an editor Play battle's reward ``when`` tags read: the
+    editor's simulated state with this victory applied by the rules engine
+    (in memory only), else an empty state for the champion's race."""
+    state = request.get("sim_state")
+    if not isinstance(state, dict) or not isinstance(state.get("flags"), list):
+        return {"flags": [], "quests": {}, "nodes": {}, "counters": {},
+                "keywords": [], "race": race_name,
+                "faction": next((f for r, f in _RACE_FACTIONS.items()
+                                 if _RACE_NAMES.get(r) == race_name), ""),
+                "current": ""}
+    zone_id, node = request.get("zone"), request.get("node")
+    if zone_id and node:
+        try:
+            from campaign_runtime import rules_loader
+            loaded, _problems = rules_loader.rules(db, str(zone_id))
+            if loaded:
+                state, _log = campaign_rules.apply(loaded, state, {
+                    "type": "encounter_result", "node": str(node),
+                    "scene": scene_guid, "victory": True,
+                    "events": _battle_events(db, session, user_id)})
+        except Exception as exc:     # not offered there: read the state as is
+            print(f"[campaign] playtest reward view: {exc}")
+    return state
+
+
+def preview_encounter_rewards(db, session, scene_guid, user_id, request):
+    """What ``_apply_encounter_end_rewards`` pays for a first win of
+    ``scene_guid``, without granting anything (an editor Play battle).
+
+    Returns ``{"display": [...], "lines": [...]}``: ``display`` entries feed
+    the display-only ``push_display_rewards`` popup (gold, cards, items,
+    chests; the popup has no XP entry), ``lines`` describe every reward for
+    the editor. ``when`` tags read the editor's simulated state
+    (``_playtest_tag_view``); one-time claims and the quest-retry currency
+    rule are not applied because the playtest has no campaign state."""
+    out = {"display": [], "lines": []}
+    records = _scene_reward_records(db, scene_guid)
+    if not records:
+        return out
+    battle = request.get("battle") or {}
+    champ = (_get_champion(db, battle["champion_id"])
+             if battle.get("champion_id") else None)
+    race_name = _RACE_NAMES.get(champ[2], "") if champ else ""
+    view = _playtest_tag_view(db, session, scene_guid, user_id, request, race_name)
+
+    def show(kind, template, quantity, label):
+        out["display"].append({"id": "playtest", "template": str(template or ""),
+                               "quantity": int(quantity), "type": kind,
+                               "ledger_id": 0, "boa": True})
+        out["lines"].append(f"{label} x{int(quantity)}")
+
+    for record in records:
+        reward_obj = record.get("reward")
+        reward_obj = reward_obj if isinstance(reward_obj, dict) else record
+        when = record.get("when")
+        if when:
+            try:
+                if not campaign_rules.evaluate(when, view, ""):
+                    continue
+            except campaign_rules.RulesError:
+                continue
+        condition = record.get("end_of_game_condition")
+        context = ({"owner": "player"} if not condition else
+                   _evaluate_encounter_condition(
+                       db, session.session_id, user_id, condition))
+        met = not condition or bool(context)
+        try:
+            gold = max(0, int(reward_obj.get("gold", 0) or 0))
+            xp = max(0, int(reward_obj.get("xp", 0) or 0))
+            quantity = max(1, int(reward_obj.get("quantity", 1) or 1))
+        except (TypeError, ValueError):
+            gold, xp, quantity = 0, 0, 1
+        if gold:
+            show("GOLD", "", gold, "gold")
+        if xp:
+            out["lines"].append(f"xp x{xp}")
+        template = reward_obj.get("card_guid") or reward_obj.get("template")
+        card_guid = _resolve_reward_template(template, context) if met else None
+        if card_guid:
+            card = db_reward_card_template(str(card_guid), conn=db)
+            show("CARD", card_guid, quantity, f"card {card[0] if card else card_guid}")
+        chest_guid = (reward_obj.get("chest_guid") or
+                      reward_obj.get("chest_template") or reward_obj.get("pack_guid"))
+        if chest_guid and met:
+            show("CHEST", chest_guid, 1, f"chest {chest_guid}")
+        if not met:
+            continue
+        item_specs = reward_obj.get("items") or []
+        if isinstance(item_specs, dict):
+            item_specs = [item_specs]
+        item_specs = list(item_specs)
+        race_item = (reward_obj.get("item_guid_by_race") or {}).get(race_name)
+        if race_item:
+            item_specs.append({"guid": race_item, "quantity": quantity})
+        if reward_obj.get("item_guid"):
+            item_specs.append({"guid": reward_obj["item_guid"], "quantity": quantity})
+        for spec in (item_specs + _stardust_item_specs(reward_obj) +
+                     _inventory_reward_specs(reward_obj)):
+            spec = {"guid": spec} if isinstance(spec, str) else spec
+            if not isinstance(spec, dict):
+                continue
+            guid = spec.get("guid") or spec.get("template") or spec.get("item_guid")
+            if not guid:
+                continue
+            try:
+                count = max(1, int(spec.get("quantity", 1) or 1))
+            except (TypeError, ValueError):
+                count = 1
+            label = (f"stardust {spec['stardust']}" if spec.get("stardust")
+                     else f"item {guid}")
+            show("INVENTORY", guid, count, label)
+        if reward_obj.get("deck_guid"):
+            from services.store import deck_template_definition
+            deck = deck_template_definition(str(reward_obj["deck_guid"]).lower())
+            out["lines"].append(
+                f"deck {deck['name'] if deck else reward_obj['deck_guid']}")
+    return out
+
+
 def prepare_fra_battle_gameend(handler, db, session, won):
     """Persist and clean up a non-campaign FRA/PvE battle result.
 
@@ -2447,6 +2692,11 @@ def handle_battle_gameend(handler, db, session, won, service_mail_uid,
                 return bool(prepared.get("handled"))
             return False
         camp_id = int(session_name[5:])
+        import campaign_playtest
+        if campaign_playtest.is_playtest_campaign(camp_id):
+            # An editor Play battle: show its rewards, change no campaign.
+            return campaign_playtest.finish_battle(
+                handler, db, session, camp_id, won)
         zone_id = _rules_zone(db, camp_id)
         if zone_id:
             return _rules_battle_gameend(handler, db, session, camp_id, won,
@@ -2621,9 +2871,22 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     of campaign tables while allowing the campaign service to own this logic.
     """
     scene_override = _last_encounter_scene.pop(session_name, None)
+    # An editor Play battle: no campaign row; its claimed request names the
+    # scene, the account's champion and deck (campaign_playtest).
+    import campaign_playtest
+    playtest = campaign_playtest.active(camp_id)
+    playtest_battle = (playtest or {}).get("battle") or {}
+    playtest_profile = None
+    if playtest is not None:
+        scene_override = playtest_battle.get("scene") or scene_override
+        if playtest_battle.get("champion_id"):
+            playtest_profile = pve_db.db_champion_battle_profile(
+                playtest_battle["champion_id"], conn=db)
     scene_guid, ai_deck_guid, ai_champ_guid, ai_name, ai_charge_power, \
         ai_personality, ai_deck_personality = resolve_encounter(
-            db, camp_id, scene_override)
+            db, camp_id, scene_override,
+            race=(int(playtest_profile[2] or 0) if playtest_profile else 0)
+            if playtest is not None else None)
     # A scene may fix the player's champion and deck (blank: the player's own).
     player_champ_override, player_deck_override = (
         pve_db.db_encounter_scene_player_override(scene_guid, conn=db)
@@ -2647,7 +2910,15 @@ def resolve_battle_config(handler, db, camp_id, session_name):
     fortune_starting_hand_bonus = 0
     encounter_mod_conversation_guid = None
     encounter_mod_choice_guid = None
-    if camp_id:
+    if playtest is not None:
+        # No campaign state: not a tutorial, no fortune, no opening mod.
+        if playtest_profile:
+            player_champ_name, deck_db_id = playtest_profile[0], playtest_profile[1]
+            race_num, cls_num, gnd_num = (playtest_profile[2], playtest_profile[3],
+                                          playtest_profile[4])
+            player_talents_json = playtest_profile[5] or "[]"
+        deck_db_id = playtest_battle.get("deck_id") or deck_db_id
+    elif camp_id:
         row = pve_db.db_campaign_battle_profile(camp_id, conn=db)
         if row:
             player_champ_name, deck_db_id = row[0], row[1]
@@ -2713,6 +2984,23 @@ def resolve_battle_config(handler, db, camp_id, session_name):
             db, talent_guids)
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
+    # A mercenary chosen for this encounter replaces the champion: its own
+    # template, health and saved party deck, and no champion talents.  A
+    # scene that fixes the player's champion and deck takes precedence.
+    mercenary = None
+    with _active_mercenary_lock:
+        chosen = _active_mercenary.get(camp_id)
+    if (chosen and profile and playtest is None
+            and not (player_champ_override or player_deck_override)):
+        from services.mercenaries import battle_mercenary
+        merc_champ_id, merc_guid = chosen
+        mercenary = battle_mercenary(db, profile.get("id"), merc_champ_id,
+                                     merc_guid)
+    if mercenary:
+        player_champ_guid = mercenary["champion_guid"]
+        player_champ_name = mercenary["name"] or player_champ_name
+        player_starting_health = mercenary["starting_health"]
+        player_talents_json = "[]"
     # The scene's AI personality comes from shared authored campaign data.
     return {
         "scene_guid": scene_guid,
@@ -2742,6 +3030,7 @@ def resolve_battle_config(handler, db, camp_id, session_name):
         "encounter_mod_conversation_guid": encounter_mod_conversation_guid,
         # The card picked on a ModChoiceEncounter's selector panel.
         "encounter_mod_choice_guid": encounter_mod_choice_guid,
+        "mercenary_deck_cards": mercenary["deck_cards"] if mercenary else None,
     }
 
 
@@ -2861,23 +3150,29 @@ def apply_starting_hand_talents(handler, db, session, game, pl_t, effects):
     return changed
 
 
-def resolve_encounter(db, camp_id, scene_guid=None):
+def resolve_encounter(db, camp_id, scene_guid=None, race=None):
     """Resolve a campaign's encounter data.
 
     The AI deck, champion and personality come from the scene's
     ``encounter_scenes`` row; ``_az0_config`` supplies the tutorial's. Returns (scene_guid,
     ai_deck_guid, ai_champ_guid, ai_name, ai_charge_power, ai_personality,
     ai_deck_personality) or (None,)*7 if unresolved.
+
+    ``race`` (an editor Play battle, which has no campaign row) supplies the
+    champion race instead of reading it from the campaign.
     """
-    champion_id = pve_db.db_campaign_identity_state(camp_id, conn=db)
-    if not champion_id:
-        return None, None, None, None, None, None, None
-    race = pve_db.db_campaign_champion_race(camp_id, conn=db)
     if race is None:
-        return None, None, None, None, None, None, None
-    cfg = _az0_config(race)
-    if not cfg:
-        return None, None, None, None, None, None, None
+        champion_id = pve_db.db_campaign_identity_state(camp_id, conn=db)
+        if not champion_id:
+            return None, None, None, None, None, None, None
+        race = pve_db.db_campaign_champion_race(camp_id, conn=db)
+        if race is None:
+            return None, None, None, None, None, None, None
+        cfg = _az0_config(race)
+        if not cfg:
+            return None, None, None, None, None, None, None
+    else:
+        cfg = _az0_config(race) or {}
     if scene_guid:
         scene = pve_db.db_encounter_scene_runtime(scene_guid, conn=db)
         ai_deck_guid = scene[4] if scene else None

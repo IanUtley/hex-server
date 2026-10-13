@@ -1,0 +1,36 @@
+{
+ "schema_version": 1,
+ "campaign": "amblingmesa",
+ "scene": "Ambling Mesa",
+ "generated_by": "tools/campaign_editor/import_az1_panoramas.py",
+ "start": {
+  "node": "Sagebrush",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "nodes": {
+  "Belarius": {},
+  "Caribard": {},
+  "FeatherDrifting": {},
+  "Gnathan": {},
+  "GrinningFox": {},
+  "Gurtok": {},
+  "Myaa": {
+   "hidden": [
+    "!questStarted(q_find_myaa)"
+   ]
+  },
+  "Myaa@amblingmesa": {},
+  "Sagebrush": {}
+ },
+ "hooks": [],
+ "runtime": "rules",
+ "edited_states": {
+  "Myaa": [
+   "hidden"
+  ]
+ }
+}

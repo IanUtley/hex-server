@@ -1221,6 +1221,16 @@ def db_void_tamed_troop_rows(session_id, player_user_id, owner, conn=None):
     ).fetchall()
 
 
+def db_card_in_warzone(session_id, player_user_id, template_guid, owner="opponent", conn=None):
+    """True while a card of ``template_guid`` is in the owner's warzone."""
+    owner_sql = "gc.user_id=?" if str(owner).lower() in {
+        "player", "self", "champion"} else "gc.user_id<>?"
+    return _connection(conn).execute(
+        "SELECT 1 FROM game_cards gc WHERE gc.session_id=? AND LOWER(COALESCE(gc.location,''))='warzone' "
+        "AND LOWER(gc.template_guid)=? AND " + owner_sql + " LIMIT 1",
+        (int(session_id), str(template_guid).lower(), int(player_user_id))).fetchone() is not None
+
+
 def db_campaign_rows_for_champion(champion_id, conn=None):
     """``(id, campaign_type, template_name, state_json)`` of every campaign row."""
     return _connection(conn).execute(
@@ -1294,6 +1304,14 @@ def db_campaign_battle_profile(campaign_id, conn=None):
         "ch.champion_class, ch.gender, c.state_json, ch.talents "
         "FROM campaigns c JOIN champions ch ON ch.id=c.champion_id "
         "WHERE c.id=?", (campaign_id,)).fetchone()
+
+
+def db_champion_battle_profile(champion_id, conn=None):
+    """``(name, last_deck_id, race, class, gender, talents)`` of a champion,
+    for a battle with no campaign row (the campaign editor's Play)."""
+    return _connection(conn).execute(
+        "SELECT champion_name, last_deck_id, race, champion_class, gender, "
+        "talents FROM champions WHERE id=?", (champion_id,)).fetchone()
 
 
 def db_first_deck_id_for_user(user_id, conn=None):

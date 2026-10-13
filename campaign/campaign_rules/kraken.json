@@ -1,0 +1,120 @@
+{
+ "schema_version": 1,
+ "campaign": "The Kraken",
+ "scene": "The Kraken",
+ "runtime": "rules",
+ "description": "Node map from the authored layout. Offers come from the campaign node-conversation table.",
+ "start": {
+  "node": "Node000",
+  "node_completed": false,
+  "flags": [],
+  "counters": {
+   "lives": 3,
+   "run_streak": 0
+  }
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_Node000_NodeA",
+    "from": "Node000",
+    "to": "NodeA"
+   },
+   {
+    "id": "Path_NodeA_NodeB",
+    "from": "NodeA",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_NodeA_NodeD",
+    "from": "NodeA",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_NodeD_NodeE",
+    "from": "NodeD",
+    "to": "NodeE"
+   },
+   {
+    "id": "Path_NodeE_NodeF",
+    "from": "NodeE",
+    "to": "NodeF"
+   },
+   {
+    "id": "Path_NodeF_NodeG",
+    "from": "NodeF",
+    "to": "NodeG"
+   },
+   {
+    "id": "Path_NodeG_NodeJ",
+    "from": "NodeG",
+    "to": "NodeJ"
+   },
+   {
+    "id": "Path_NodeG_NodeH",
+    "from": "NodeG",
+    "to": "NodeH"
+   },
+   {
+    "id": "Path_NodeF_NodeI",
+    "from": "NodeF",
+    "to": "NodeI"
+   },
+   {
+    "id": "Path_NodeI_NodeJ",
+    "from": "NodeI",
+    "to": "NodeJ"
+   },
+   {
+    "id": "Path_NodeJ_NodeK",
+    "from": "NodeJ",
+    "to": "NodeK"
+   },
+   {
+    "id": "Path_NodeK_NodeL",
+    "from": "NodeK",
+    "to": "NodeL"
+   },
+   {
+    "id": "Path_NodeL_NodeM",
+    "from": "NodeL",
+    "to": "NodeM"
+   },
+   {
+    "id": "Path_NodeL_NodeN",
+    "from": "NodeL",
+    "to": "NodeN"
+   },
+   {
+    "id": "Path_NodeN_NodeO",
+    "from": "NodeN",
+    "to": "NodeO"
+   },
+   {
+    "id": "Path_NodeO_NodeP",
+    "from": "NodeO",
+    "to": "NodeP"
+   }
+  ]
+ },
+ "nodes": {
+  "Node000": {},
+  "NodeA": {},
+  "NodeB": {},
+  "NodeD": {},
+  "NodeE": {},
+  "NodeF": {},
+  "NodeG": {},
+  "NodeH": {},
+  "NodeI": {},
+  "NodeJ": {},
+  "NodeK": {},
+  "NodeL": {},
+  "NodeM": {},
+  "NodeN": {},
+  "NodeO": {},
+  "NodeP": {}
+ },
+ "hooks": [],
+ "edited_states": {}
+}

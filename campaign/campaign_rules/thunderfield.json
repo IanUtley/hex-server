@@ -1,0 +1,38 @@
+{
+ "schema_version": 1,
+ "campaign": "thunderfield",
+ "scene": "Thunderfield",
+ "generated_by": "tools/campaign_editor/import_az1_panoramas.py",
+ "start": {
+  "node": "Alawa",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "nodes": {
+  "Alawa": {},
+  "DuskDaughter": {},
+  "ShortBuffalo": {
+   "visible": [
+    "questActive(q_army_of_myth)"
+   ]
+  },
+  "WhisperingBreeze": {
+   "visible": [
+    "completedQuest(q_find_myaa)"
+   ]
+  }
+ },
+ "hooks": [],
+ "runtime": "rules",
+ "edited_states": {
+  "ShortBuffalo": [
+   "visible"
+  ],
+  "WhisperingBreeze": [
+   "visible"
+  ]
+ }
+}

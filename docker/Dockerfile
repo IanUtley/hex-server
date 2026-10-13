@@ -28,7 +28,10 @@ COPY *.py /hex/
 COPY AssetExtraction/ /hex/AssetExtraction/
 COPY abilities/ /hex/abilities/
 COPY application/ /hex/application/
-COPY hex-private/campaign/ /hex/hex-private/campaign/
+COPY campaign/ /hex/campaign/
+# The campaign editor lives at the project root; it reads and writes the
+# campaign above through campaign_editor/paths.py (HEX_CAMPAIGN_ROOT overrides).
+COPY campaign_editor/ /hex/campaign_editor/
 COPY domain/ /hex/domain/
 COPY gamedata/ /hex/gamedata/
 COPY gamemodes/ /hex/gamemodes/
@@ -56,11 +59,11 @@ COPY VERSION /hex/VERSION
 # materialize Records and starter decks, and the editor writes campaign data
 # and rules, so these image-local directories must be writable by that user.
 RUN mkdir -p /hex/hex-private/Records /hex/generated \
-        /hex/hex-private/campaign/tools/campaign_editor/generated \
+        /hex/campaign_editor/generated \
     && chown -R 1001:1001 /hex/hex-private/Records /hex/generated \
-        /hex/hex-private/campaign/tools/campaign_editor/generated \
-    && chown -R 1001:1001 /hex/hex-private/campaign/campaign_data \
-        /hex/hex-private/campaign/campaign_rules
+        /hex/campaign_editor/generated \
+    && chown -R 1001:1001 /hex/campaign/campaign_data \
+        /hex/campaign/campaign_rules
 
 # Fail the image build early if a copied server, extractor, or test module has
 # a syntax error.

@@ -26,6 +26,11 @@ def card_collection_for_location(location):
         "playedresources": game_engine.ECardCollections.PlayedResources,
         "underground": game_engine.ECardCollections.Underground,
         "choosing": game_engine.ECardCollections.Choosing,
+        # Encounter setup cards (scene mods with a start-of-game grant) live in
+        # the hidden Mod collection.  Unity has no zone view for it (the card
+        # view is hidden) and the wire projection nulls it; the Warzone
+        # fallback below would put such a card on the battlefield on refresh.
+        "mod": game_engine.ECardCollections.Mod,
     }.get(str(location or "").lower(), game_engine.ECardCollections.Warzone)
 
 

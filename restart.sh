@@ -23,7 +23,7 @@ LOG_DIR="/tmp"
 SERVER_PORT=9933
 PROXY_PORT=8081
 CAMPAIGN_EDITOR_PORT=8765
-CAMPAIGN_EDITOR_SCRIPT="$BASE_DIR/hex-private/campaign/tools/campaign_editor/server.py"
+CAMPAIGN_EDITOR_SCRIPT="$BASE_DIR/campaign_editor/server.py"
 
 echo ------------------------------------------------------------------------
 echo For development purposes only. Please use Docker version for deployment.
@@ -52,8 +52,11 @@ case "$ACTION" in
     *) die "unknown action '$ACTION' (use 'restart' or 'stop')" ;;
 esac
 
+# The editor lives at the project root, and so does the campaign it edits
+# (campaign/, or HEX_CAMPAIGN_ROOT).
+CAMPAIGN_EDITOR_DATA="${HEX_CAMPAIGN_ROOT:-$BASE_DIR/campaign}"
 CAMPAIGN_EDITOR_AVAILABLE=0
-if [[ -f "$CAMPAIGN_EDITOR_SCRIPT" ]]; then
+if [[ -f "$CAMPAIGN_EDITOR_SCRIPT" && -d "$CAMPAIGN_EDITOR_DATA/campaign_runtime" ]]; then
     CAMPAIGN_EDITOR_AVAILABLE=1
 fi
 export HEX_CAMPAIGN_EDITOR_HOST="${HEX_CAMPAIGN_EDITOR_HOST:-127.0.0.1}"
@@ -75,7 +78,7 @@ stop_services() {
     # Also catch plain command-line forms (e.g. launched from another CWD).
     pkill -9 -f "hconnect_server.py" 2>/dev/null || true
     pkill -9 -f "proxy.py 8081" 2>/dev/null || true
-    pkill -9 -f "tools/campaign_editor/server.py" 2>/dev/null || true
+    pkill -9 -f "campaign_editor/server.py" 2>/dev/null || true
     pkill -9 -f "tournament_server.py" 2>/dev/null || true
     pkill -9 -f "replay_server.py" 2>/dev/null || true
 

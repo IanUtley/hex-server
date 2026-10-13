@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -10,9 +11,11 @@ PORTS = {
     "hconnect": 9933,
     "proxy": 8081,
 }
-CAMPAIGN_EDITOR = (Path(__file__).resolve().parents[1] / "hex-private" /
-                   "campaign" / "tools" / "campaign_editor" / "server.py")
-if CAMPAIGN_EDITOR.is_file():
+ROOT = Path(__file__).resolve().parents[1]
+CAMPAIGN_EDITOR = ROOT / "campaign_editor" / "server.py"
+CAMPAIGN_SOURCE = Path(os.environ.get("HEX_CAMPAIGN_ROOT")
+                       or ROOT / "campaign")
+if CAMPAIGN_EDITOR.is_file() and (CAMPAIGN_SOURCE / "campaign_runtime").is_dir():
     PORTS["campaign_editor"] = 8765
 LISTENING_STATE = "0A"
 

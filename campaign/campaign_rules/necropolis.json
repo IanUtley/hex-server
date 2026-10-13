@@ -1,0 +1,22 @@
+{
+ "schema_version": 1,
+ "campaign": "necropolis",
+ "scene": "The Necropolis",
+ "runtime": "rules",
+ "generated_by": "campaign/tools/campaign_editor/import_az1_panoramas.py",
+ "start": {
+  "node": "Margugram",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "nodes": {
+  "Margugram": {},
+  "Drokkord": {},
+  "Annonna": {},
+  "Iddi": {}
+ },
+ "hooks": []
+}

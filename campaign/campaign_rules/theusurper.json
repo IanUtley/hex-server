@@ -1,0 +1,84 @@
+{
+ "schema_version": 1,
+ "campaign": "The Usurper",
+ "scene": "The Usurper",
+ "runtime": "rules",
+ "description": "Node map from the authored layout. Offers come from the campaign node-conversation table.",
+ "start": {
+  "node": "Entrance",
+  "node_completed": false,
+  "flags": [],
+  "counters": {
+   "lives": 3,
+   "run_streak": 0
+  }
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_Entrance_NodeA",
+    "from": "Entrance",
+    "to": "NodeA"
+   },
+   {
+    "id": "Path_NodeA_NodeB",
+    "from": "NodeA",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_NodeB_Fork1",
+    "from": "NodeB",
+    "to": "Fork1"
+   },
+   {
+    "id": "Path_Fork1_NodeC",
+    "from": "Fork1",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_Fork1_NodeD",
+    "from": "Fork1",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_NodeC_Fork2",
+    "from": "NodeC",
+    "to": "Fork2"
+   },
+   {
+    "id": "Path_NodeD_Fork2",
+    "from": "NodeD",
+    "to": "Fork2"
+   },
+   {
+    "id": "Path_Fork2_NodeE",
+    "from": "Fork2",
+    "to": "NodeE"
+   },
+   {
+    "id": "Path_NodeE_NodeF",
+    "from": "NodeE",
+    "to": "NodeF"
+   },
+   {
+    "id": "Path_NodeF_NodeG",
+    "from": "NodeF",
+    "to": "NodeG"
+   }
+  ]
+ },
+ "nodes": {
+  "Entrance": {},
+  "NodeA": {},
+  "NodeB": {},
+  "NodeC": {},
+  "NodeD": {},
+  "NodeE": {},
+  "NodeF": {},
+  "Fork1": {},
+  "Fork2": {},
+  "NodeG": {}
+ },
+ "hooks": [],
+ "edited_states": {}
+}

@@ -1802,6 +1802,28 @@ class IntAttrFilter:
                       default=None)
             if isinstance(tree, dict):
                 lhs = _tac_path_value(tree, parts)
+        if lhs is None and parts:
+            # C# Card.Get reads the card's own context, which starts from the
+            # CardTemplate TAC (printed IntAttrs such as Tunneling 15).  An
+            # instance with no modifier yet must still report that value, or
+            # "if that troop does not have Tunneling" passes for a card that
+            # does (Excavation Bot gave Tectonic Megahulk Tunneling 4).
+            template_guid = _v(target, "template_guid", default=None)
+            if template_guid:
+                try:
+                    from gamedata import DEFAULT_RECORD_STORE
+                    from .tac import decode_tac_tree
+                    record = DEFAULT_RECORD_STORE.get(
+                        "CardTemplate", str(template_guid).lower())
+                    serialized = (record.field("m_SerializedTAC") or {}
+                                  if record is not None else {})
+                    data = (serialized.get("data", "")
+                            if isinstance(serialized, dict) else serialized)
+                    lhs = _tac_path_value(decode_tac_tree(data), parts)
+                except (ImportError, AttributeError, TypeError, ValueError):
+                    lhs = None
+                if not isinstance(lhs, int) or isinstance(lhs, bool):
+                    lhs = None
         # Runtime card TAC is kept in the session statistics projection rather
         # than on the persisted card row.  C# IntAttrFilter reads this path
         # directly from Card.Get(...), so preserve the same behavior for card

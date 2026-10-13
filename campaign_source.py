@@ -1,18 +1,17 @@
-"""Resolve the campaign source tree kept in the private submodule."""
+"""Resolve the campaign source tree kept at the project root (``campaign/``)."""
 
 from pathlib import Path
 import sys
 
 
-CAMPAIGN_ROOT = Path(__file__).resolve().parent / "hex-private" / "campaign"
+CAMPAIGN_ROOT = Path(__file__).resolve().parent / "campaign"
 
 
 def ensure_campaign_path() -> Path:
-    """Make the private campaign modules importable and return their root."""
+    """Make the campaign modules importable and return their root."""
     if not CAMPAIGN_ROOT.is_dir():
         raise RuntimeError(
-            "Campaign sources are missing; run "
-            "`git submodule update --init hex-private`.")
+            f"Campaign sources are missing at {CAMPAIGN_ROOT}.")
     path = str(CAMPAIGN_ROOT)
     if path not in sys.path:
         sys.path.insert(0, path)

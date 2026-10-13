@@ -80,7 +80,11 @@ def test_conditional_encounter_stays_retryable_until_its_event():
     assert tamed["quests"]["tame"] == {"status": "active", "step": 1}
     lost, _ = cr.apply(RULES, state, {"type": "encounter_result", "node": "C",
                                       "victory": False})
-    assert lost["nodes"]["C"]["failed"] and lost["nodes"]["C"]["retryable"]
+    assert lost["nodes"]["C"]["failed"] and not lost["nodes"]["C"]["retryable"]
+    assert not cr.layout(RULES, lost)["nodes"]["C"]["completed"]
+    relost, _ = cr.apply(RULES, won, {"type": "encounter_result", "node": "C",
+                                      "victory": False})
+    assert relost["nodes"]["C"]["failed"] and relost["nodes"]["C"]["retryable"]
 
 
 def test_same_node_offers_state_dependent_content_and_gates_follow_quests():
@@ -320,7 +324,7 @@ def test_editor_saves_tags_to_campaign_files():
     import sqlite3
     import tempfile
     from pathlib import Path
-    sys.path.insert(0, os.path.join(CAMPAIGN_ROOT, "tools", "campaign_editor"))
+    sys.path.insert(0, os.path.join(ROOT, "campaign_editor"))
     import catalog
     import editing
     db = sqlite3.connect(":memory:")

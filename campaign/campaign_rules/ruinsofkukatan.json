@@ -1,0 +1,204 @@
+{
+ "schema_version": 1,
+ "campaign": "Ruins of Kukatan",
+ "scene": "Ruins of Kukatan",
+ "runtime": "rules",
+ "description": "Node map from the authored layout (generated/ruinsofkukatan/map.json). Offers come from the campaign node-conversation table.",
+ "start": {
+  "node": "Node001",
+  "node_completed": false,
+  "flags": [],
+  "counters": {
+   "lives": 3,
+   "run_streak": 0
+  }
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_ForkD_NodeD",
+    "from": "ForkD",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_ForkD_NodeH",
+    "from": "ForkD",
+    "to": "NodeH"
+   },
+   {
+    "id": "Path_ForkD_NodeO",
+    "from": "ForkD",
+    "to": "NodeO"
+   },
+   {
+    "id": "Path_ForkO1_ForkO2",
+    "from": "ForkO1",
+    "to": "ForkO2"
+   },
+   {
+    "id": "Path_ForkO1_NodeO",
+    "from": "ForkO1",
+    "to": "NodeO"
+   },
+   {
+    "id": "Path_ForkO1_NodeR",
+    "from": "ForkO1",
+    "to": "NodeR"
+   },
+   {
+    "id": "Path_ForkO2_NodeP",
+    "from": "ForkO2",
+    "to": "NodeP"
+   },
+   {
+    "id": "Path_ForkO2_NodeR",
+    "from": "ForkO2",
+    "to": "NodeR"
+   },
+   {
+    "id": "Path_ForkP1_NodeK",
+    "from": "ForkP1",
+    "to": "NodeK"
+   },
+   {
+    "id": "Path_ForkP1_NodeM",
+    "from": "ForkP1",
+    "to": "NodeM"
+   },
+   {
+    "id": "Path_ForkP1_NodeP",
+    "from": "ForkP1",
+    "to": "NodeP"
+   },
+   {
+    "id": "Path_ForkP1_NodeQ",
+    "from": "ForkP1",
+    "to": "NodeQ"
+   },
+   {
+    "id": "Path_Node001_NodeA",
+    "from": "Node001",
+    "to": "NodeA"
+   },
+   {
+    "id": "Path_NodeA_NodeB",
+    "from": "NodeA",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_NodeA_NodeC",
+    "from": "NodeA",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_NodeA_NodeT",
+    "from": "NodeA",
+    "to": "NodeT"
+   },
+   {
+    "id": "Path_NodeB_NodeC",
+    "from": "NodeB",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_NodeB_NodeD",
+    "from": "NodeB",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_NodeC_NodeD",
+    "from": "NodeC",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_NodeD_NodeE",
+    "from": "NodeD",
+    "to": "NodeE"
+   },
+   {
+    "id": "Path_NodeE_NodeF",
+    "from": "NodeE",
+    "to": "NodeF"
+   },
+   {
+    "id": "Path_NodeF_NodeG",
+    "from": "NodeF",
+    "to": "NodeG"
+   },
+   {
+    "id": "Path_NodeH_NodeI",
+    "from": "NodeH",
+    "to": "NodeI"
+   },
+   {
+    "id": "Path_NodeI_NodeJ",
+    "from": "NodeI",
+    "to": "NodeJ"
+   },
+   {
+    "id": "Path_NodeJ_NodeK",
+    "from": "NodeJ",
+    "to": "NodeK"
+   },
+   {
+    "id": "Path_NodeK_NodeL",
+    "from": "NodeK",
+    "to": "NodeL"
+   },
+   {
+    "id": "Path_NodeK_NodeM",
+    "from": "NodeK",
+    "to": "NodeM"
+   },
+   {
+    "id": "Path_NodeL_NodeM",
+    "from": "NodeL",
+    "to": "NodeM"
+   },
+   {
+    "id": "Path_NodeM_NodeN",
+    "from": "NodeM",
+    "to": "NodeN"
+   },
+   {
+    "id": "Path_NodeM_NodeQ",
+    "from": "NodeM",
+    "to": "NodeQ"
+   },
+   {
+    "id": "Path_NodeR_NodeS",
+    "from": "NodeR",
+    "to": "NodeS"
+   }
+  ]
+ },
+ "nodes": {
+  "ForkD": {},
+  "ForkO1": {},
+  "ForkO2": {},
+  "ForkP1": {},
+  "Node001": {},
+  "NodeA": {},
+  "NodeB": {},
+  "NodeC": {},
+  "NodeD": {},
+  "NodeE": {},
+  "NodeF": {},
+  "NodeG": {},
+  "NodeH": {},
+  "NodeI": {},
+  "NodeJ": {},
+  "NodeK": {},
+  "NodeL": {},
+  "NodeM": {},
+  "NodeN": {},
+  "NodeO": {},
+  "NodeP": {},
+  "NodeQ": {},
+  "NodeR": {},
+  "NodeS": {},
+  "NodeT": {}
+ },
+ "hooks": [],
+ "edited_states": {}
+}

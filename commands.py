@@ -63,6 +63,7 @@ def reload_runtime_modules():
     import rules_port.runtime_adapter as rules_runtime
     import rules_port.transactions as rules_transactions
     import domain.constants as domain_constants
+    import campaign_playtest as campaign_playtest_module
 
     # Reload foundational modules first, then all already-loaded modules in
     # the application/runtime packages.  Filtering sys.modules avoids
@@ -78,7 +79,8 @@ def reload_runtime_modules():
         [pvp_db_module, profile_db_module, pve_db_module, chat_db_module,
          replay_db_module, tournament_db_module, campaign_rules_module],
         [game_engine_module, game_session_module, battle_engine_module,
-         application_dispatcher, player_transactions, campaign],
+         application_dispatcher, player_transactions, campaign,
+         campaign_playtest_module],
         [rules_transactions, rules_runtime, rules_wire],
         [aim, te, ts, tg, sch, arena_service, mail_service, en],
     ]
@@ -675,11 +677,16 @@ _PUBLIC_HELP_LINES = (
     "!collection-fix [apply] — match collection counts to owned card instances",
     "!campaign-cleanup — repair your campaign when a scene has no options",
     "!issue <title> — open a prefilled GitHub issue with session diagnostics",
+    "!playtest <token> — start a campaign editor Play battle (nothing is saved)",
 )
 
 _DEVELOPER_HELP_LINES = (
     "!game_end victory|defeat — end the campaign battle (test win/loss)",
     "!encounter <name> — start a named campaign encounter",
+    "!additem <item name> [xN] — add an inventory item (mercenary, equipment, chest...)",
+    "!partycap <0-4> — set mercenary party slots (applies after relog)",
+    "!addchest <rarity> [set] [xN] — add booster treasure chests (applies after relog)",
+    "!addgold <amount> — add gold, e.g. to spin the Wheels of Fate",
     "!challenge [opponent] — create a duel challenge",
     "!reload — reload runtime modules",
     "!hand — list cards in hand (name [id])",
@@ -756,6 +763,15 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
         deleted, cid = campaign.restart_champion_campaigns(db, champ[0])
         return (f"Deleted {deleted} campaign(s) for champion {champ[0]}; "
                 f"new starter campaign {cid}. Re-select the champion to reload.")
+    if action == "playtest":
+        # Campaign editor Play: not gated by allowcon; the token is bound to
+        # the editor account and must match this player's account.
+        try:
+            return _playtest_command(handler, parts[1:])
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return f"Playtest error: {exc}"
     if action == "issue":
         raw_command = cmd.strip()
         title = raw_command[len(parts[0]):].strip() if parts else ""
@@ -798,6 +814,15 @@ def handle_command(handler, cmd: str, room: str, username: str) -> str:
     if action == "encounter":
         try:
             return _cmd_encounter(handler, args)
+        except Exception as e:
+            return f"Error: {e}"
+    profile_commands = {"partycap": _cmd_partycap, "additem": _cmd_additem,
+                        "addchest": _cmd_addchest, "addgold": _cmd_addgold}
+    if action in profile_commands:
+        if not getattr(handler, "user_profile", None):
+            return "No profile"
+        try:
+            return profile_commands[action](handler, args)
         except Exception as e:
             return f"Error: {e}"
     if action == "challenge":
@@ -883,6 +908,184 @@ def _send_game_events(handler, game, session, pl_t):
 def _refresh_pvp_debug_options(tournament_game, session, state):
     """Rebuild the current PvP option projection after a debug state change."""
     tournament_game.pvp_push_current_phase_options(session, state)
+
+
+def _has_live_battle(player_uid):
+    """True when this player is in a battle that is still running. Sessions
+    the client abandoned stay 'joined' in game_sessions, so only a recent
+    'joined' session counts (battles do not last hours)."""
+    import json as _json
+    raw = int(player_uid) >> 8 if (int(player_uid) & 0xff) == hconnect_server.UID_TYPE["ServicePlayer"] else int(player_uid)
+    ids = {raw, encoder.make_uid(hconnect_server.UID_TYPE["ServicePlayer"], raw)}
+    import campaign_playtest
+    rows = hconnect_server._db.execute(
+        "SELECT session_name, players_json FROM game_sessions WHERE state='joined' "
+        "AND created_at > datetime('now','-3 hours')").fetchall()
+    for session_name, players_json in rows:
+        # An abandoned playtest battle (camp id above the playtest base) is not
+        # a live battle; a new playtest must be able to start.
+        name = str(session_name or "")
+        if name.startswith("camp_") and name[5:].isdigit() and \
+                int(name[5:]) >= campaign_playtest.PLAYTEST_CAMPAIGN_BASE:
+            continue
+        try:
+            players = _json.loads(players_json or "[]")
+        except (TypeError, ValueError):
+            continue
+        if any(isinstance(p, (list, tuple)) and p and int(p[0]) in ids for p in players):
+            return True
+    return False
+
+
+def _playtest_command(handler, args):
+    """``!playtest <token>``: start a campaign-editor Play battle on this
+    connection (see campaign_playtest)."""
+    if getattr(handler, "client_reck_id", None):
+        player_uid = encoder.make_uid(hconnect_server.UID_TYPE["ServicePlayer"],
+                                      int(handler.client_reck_id))
+        if _has_live_battle(player_uid):
+            return "Playtest: finish or leave your current battle first."
+    import campaign_playtest
+    return campaign_playtest.run_command(
+        handler, hconnect_server._db, args,
+        hconnect_server.UID_TYPE["ServiceCampaign"],
+        hconnect_server.SERVICE_MAIL_UID)
+
+
+def _item_name_key(name):
+    """Lowercase alphanumerics only, so "bebo" matches "B.E.B.O."."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _cmd_additem(handler, args):
+    """Grant an inventory item by name: !additem <item name> [xN].
+
+    Works for any InventoryItemData (mercenaries, equipment, chests,
+    sleeves, ...).  Names ignore case and punctuation; an exact name wins,
+    then a unique partial match, then spelling suggestions.
+    """
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(99, int(args[-1][1:])))
+        args = args[:-1]
+    wanted_text = " ".join(args).strip()
+    wanted = _item_name_key(wanted_text)
+    if not wanted:
+        return "Usage: !additem <item name> [xN]"
+    from gamedata import DEFAULT_RECORD_STORE
+    items = [record for record in DEFAULT_RECORD_STORE.load("InventoryItemData")
+             if record.field("m_Name")]
+    matches = [r for r in items if _item_name_key(r.field("m_Name")) == wanted]
+    if not matches:
+        matches = [r for r in items if wanted in _item_name_key(r.field("m_Name"))]
+    names = sorted({r.field("m_Name") for r in matches})
+    if not matches:
+        import difflib
+        by_key = {_item_name_key(r.field("m_Name")): r.field("m_Name") for r in items}
+        close = difflib.get_close_matches(wanted, list(by_key), n=5, cutoff=0.7)
+        if close:
+            return (f"No item named '{wanted_text}'. Did you mean: "
+                    + ", ".join(by_key[key] for key in close) + "?")
+        from profile_db import db_card_template_named
+        if db_card_template_named(wanted_text, conn=hconnect_server._db):
+            return f"'{wanted_text}' is a card, not an inventory item"
+        return f"No item named '{wanted_text}'"
+    if len(names) > 1:
+        return (f"{len(names)} items match: " + ", ".join(names[:8])
+                + (" ..." if len(names) > 8 else ""))
+    item = matches[0]
+    kind = str(item.field("m_Type") or "item").lower()
+    updates = hconnect_server._grant_pack_inventory_rewards(
+        handler, [(item.guid, kind)] * quantity)
+    hconnect_server._db.commit()
+    for template_guid, item_uid, total in updates:
+        handler.push_inventory_to_client(
+            qty=total, template_guid=template_guid, item_id=item_uid)
+    total = updates[-1][2] if updates else quantity
+    return f"Added {quantity}x {names[0]} ({item.field('m_Type')}); you now have {total}"
+
+
+# Booster sets in release order, so "!addchest rare 2" means Shattered Destiny.
+BOOSTER_SETS = (
+    ("Shards of Fate", "0382f729-7710-432b-b761-13677982dcd2"),
+    ("Shattered Destiny", "b05e69d2-299a-4eed-ac31-3f1b4fa36470"),
+    ("Armies of Myth", "fce480eb-15f9-4096-8d12-6beee9118652"),
+    ("Primal Dawn", "2d05262c-d7a0-408f-a280-36d206a29344"),
+    ("Herofall", "ecdbc188-5750-48ef-acac-05e2bcbcc46f"),
+    ("Scars of War", "fbbac856-2264-4d31-97b0-0d8a646b9597"),
+    ("Frostheart", "326602fa-e183-4dfe-8300-55cc0c7c4ce8"),
+    ("Dead of Winter", "9a824393-cd11-4273-a05e-41e35eb50dbe"),
+    ("Doombringer", "54f14f51-2afe-4a26-be28-d251b06a9cc4"),
+)
+CHEST_RARITIES = ("Common", "Uncommon", "Rare", "Legendary", "Primal")
+
+
+def _cmd_addchest(handler, args):
+    """Add booster treasure chests: !addchest <rarity> [set] [xN].
+
+    ``set`` is a set number (1 = Shards of Fate) or name and defaults to
+    Set 1.  The client builds its chest list from the login profile stream,
+    so the chests appear after the next login.
+    """
+    from profile_db import db_create_treasure_chest
+    usage = ("Usage: !addchest <common|uncommon|rare|legendary|primal> "
+             "[set number or name] [xN]  (then log out and back in)")
+    quantity = 1
+    if args and args[-1].lower().startswith("x") and args[-1][1:].isdigit():
+        quantity = max(1, min(50, int(args[-1][1:])))
+        args = args[:-1]
+    if not args:
+        return usage
+    rarity = next((r for r in CHEST_RARITIES if r.lower() == args[0].lower()), None)
+    if rarity is None:
+        return usage
+    wanted = _item_name_key(" ".join(args[1:]).removeprefix("set"))
+    if not wanted:
+        set_name, set_guid = BOOSTER_SETS[0]
+    elif wanted.isdigit() and 1 <= int(wanted) <= len(BOOSTER_SETS):
+        set_name, set_guid = BOOSTER_SETS[int(wanted) - 1]
+    else:
+        matches = [s for s in BOOSTER_SETS if wanted in _item_name_key(s[0])]
+        if len(matches) != 1:
+            return ("Unknown set. Sets: " + ", ".join(
+                f"{i} {name}" for i, (name, _) in enumerate(BOOSTER_SETS, 1)))
+        set_name, set_guid = matches[0]
+    for _ in range(quantity):
+        db_create_treasure_chest(handler.user_profile["id"], set_guid, rarity,
+                                 conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    return (f"Added {quantity}x {rarity} {set_name} chest; "
+            "log out and back in to see it")
+
+
+def _cmd_addgold(handler, args):
+    """Add gold: !addgold <amount>."""
+    from profile_db import db_adjust_user_currency
+    amount = args[0].replace(",", "") if args else ""
+    if not amount.isdigit() or not 0 < int(amount) <= 10_000_000:
+        return "Usage: !addgold <amount up to 10,000,000>"
+    gold, _platinum = db_adjust_user_currency(
+        handler.user_profile["id"], gold_delta=int(amount), conn=hconnect_server._db)
+    hconnect_server._db.commit()
+    if hasattr(handler, "push_balance_to_client"):
+        handler.push_balance_to_client()
+    return f"Added {int(amount):,} gold; you now have {gold:,}"
+
+
+def _cmd_partycap(handler, args):
+    """Set the mercenary party-slot flag: !partycap <0-4>.
+
+    The client reads CAMP_PARTYCAP from the login profile stream, so the new
+    value applies after the next login.
+    """
+    from services import mercenaries
+    if not args or not args[0].isdigit():
+        return "Usage: !partycap <0-4>  (then log out and back in)"
+    slots = max(0, min(4, int(args[0])))
+    mercenaries.set_flag(hconnect_server._db, handler.user_profile["id"],
+                         mercenaries.PARTY_CAP_FLAG, slots, 4)
+    hconnect_server._db.commit()
+    return f"Mercenary party slots set to {slots}; log out and back in to apply"
 
 
 def _cmd_encounter(handler, args):

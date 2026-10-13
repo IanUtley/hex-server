@@ -1,0 +1,81 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-elf",
+ "scene": "AZ0 Elf",
+ "runtime": "rules",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "Emilia",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "Emilia": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Elf)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Elf)",
+    "!conversation(Crayburn Castle - Elf - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Elf - Quest End)"
+   ]
+  },
+  "Nerissa": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Elf)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Elf Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Elf Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Elf Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "Balthasar": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Elf Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Elf - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Elf - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Elf - Quest End)"
+   ]
+  }
+ },
+ "hooks": [],
+ "edited_states": {
+  "Balthasar": [
+   "givequest"
+  ]
+ }
+}

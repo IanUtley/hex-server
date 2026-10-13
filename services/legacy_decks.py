@@ -454,6 +454,10 @@ def handle_updatedeck_2095(handler, target, instance, data_type, reqid, comp, se
                             elif fname == b'CoinId': coin_guid = val
                         except: pass
     _hc.log_req(f"    Parsed: id={deck_id}, name={deck_name}, cards={len(card_ids) if card_ids else 0}, gems={len(active_gems)}, sleeve={deck_sleeve_guid}")
+    from services.equipment import (parse_request_equipment_ids,
+                                    sanitize_deck_equipment)
+    # None: the request has no EquipmentIDs field, so keep the saved items.
+    equipment_ids = parse_request_equipment_ids(inner_bytes)
 
     success = False
     owner_id = None
@@ -476,11 +480,19 @@ def handle_updatedeck_2095(handler, target, instance, data_type, reqid, comp, se
         ag_json = json.dumps(active_gems)
         gem_abilities = handler._resolve_gem_abilities(active_gems)
         ga_json = json.dumps(gem_abilities)
+        equipment_json = None
+        if equipment_ids is not None:
+            kept_equipment = sanitize_deck_equipment(
+                _hc._db, owner_id, equipment_ids)
+            equipment_json = json.dumps(kept_equipment)
+            _hc.log_req(f"    Equipment: requested={len(equipment_ids)} "
+                        f"kept={kept_equipment}")
         success = _hc.db_update_deck(deck_id, owner_id,
             deck_name=deck_name, cards_json=cards_json,
             pve_champion_id=pve_champion_id, pvp_champion_guid=pvp_champion_guid,
             active_gems_json=ag_json, gem_abilities_json=ga_json,
-            deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid)
+            deck_sleeve_guid=deck_sleeve_guid, gameboard_guid=gameboard_guid, coin_guid=coin_guid,
+            equipment_json=equipment_json)
         _hc.log_req(f"    DB update: {'OK' if success else 'FAILED'} "
                 f"(owner={owner_id})")
         # Link this deck as the champion's last used deck (pve_champion_id

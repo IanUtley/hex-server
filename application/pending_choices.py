@@ -1588,8 +1588,19 @@ class PendingChoicesMixin:
                 state.pop("ai_turn_phase_idx", None)
                 _be.save_state(session, state)
                 _hc.log_req(f"    Discard answered — resuming AI turn at idx {ai_idx}")
-                self._run_ai_turn(session, pl_t, ai_t, state,
-                                  start_idx=int(ai_idx))
+                if getattr(session, "_rules_port_session", None) is not None:
+                    # The continuation resolved the chain item directly, so
+                    # its ResolveTopOfChainAction is still the native stack
+                    # top.  The AI driver only runs from a native phase
+                    # window ("phase N was not entered by RulesPort"), so
+                    # tick the scheduler back to that window first; the
+                    # projection then resumes the AI (or hands a newly
+                    # queued trigger's window to the client).
+                    self._advance_rules_port_to_priority(
+                        session, pl_t, ai_t, state)
+                else:
+                    self._run_ai_turn(session, pl_t, ai_t, state,
+                                      start_idx=int(ai_idx))
                 return True
             # A picker continuation that finishes its chain item can expose
             # the next native chain item (a trigger the draw/discard raised,

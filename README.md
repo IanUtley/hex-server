@@ -99,25 +99,28 @@ to use equivalent paths and shell commands for their systems.
 
 ## Starting the server
 Once Docker Desktop is installed, open PowerShell and run the following
-commands. Update `$ClientData` if the game is installed somewhere else.
+commands. Update `$ClientRoot` if the game is installed somewhere else. It
+should point to the Hex install folder that contains `Data` and `Hex_Data`.
 
 ```powershell
 $HexState = Join-Path $HOME 'HexServer'
-$ClientData = 'C:\Program Files (x86)\Steam\steamapps\common\HEX SHARDS OF FATE\Data'
+$ClientRoot = 'C:\Program Files (x86)\Steam\steamapps\common\HEX SHARDS OF FATE'
 New-Item -ItemType Directory -Force $HexState | Out-Null
 docker run --rm `
   -p 9933:9933 -p 8081:8081 -p 8765:8765 `
   --user 1001:1001 `
   -v "${HexState}:/hex/state" `
-  -v "${ClientData}:/client-data:ro" `
+  -v "${ClientRoot}:/client-data:ro" `
   -e HEX_DB_PATH='/hex/state/hconnect.db' `
-  -e HEX_GAMEDATA='/client-data/gamedata' `
+  -e HEX_CLIENT_ROOT='/client-data' `
+  -e HEX_GAMEDATA='/client-data/Data/gamedata' `
+  -e HEX_CAMPAIGN_EDITOR_PORT='8765' `
   ghcr.io/ianutley/hex-server:0.4.3
 ```
 
 ```bash
 HEX_STATE=$HOME/HexServer
-CLIENT_DATA='location of Hex Client Data directory'
+CLIENT_ROOT='location of Hex install root (contains Data and Hex_Data)'
 
 mkdir -p $HEX_STATE
 # The container runs as UID 1001 and must be able to traverse and write here.
@@ -127,9 +130,11 @@ docker run --rm \
   -p 9933:9933 -p 8081:8081 -p 8765:8765 \
   --user 1001:1001 \
   -v "${HEX_STATE}:/hex/state" \
-  -v "${CLIENT_DATA}:/client-data:ro" \
+  -v "${CLIENT_ROOT}:/client-data:ro" \
   -e HEX_DB_PATH='/hex/state/hconnect.db' \
-  -e HEX_GAMEDATA='/client-data/gamedata' \
+  -e HEX_CLIENT_ROOT='/client-data' \
+  -e HEX_GAMEDATA='/client-data/Data/gamedata' \
+  -e HEX_CAMPAIGN_EDITOR_PORT='8765' \
   ghcr.io/ianutley/hex-server:0.4.3
 ```
 
@@ -199,7 +204,7 @@ authentication itself is the behavior under test.
 
 `hconnect_server.py` serves the TCP HConnect protocol on port 9933.
 `proxy.py` serves HTTP compatibility/auth and news endpoints on port 8081.
-`hex-private/campaign/tools/campaign_editor/server.py` serves the campaign
+`campaign_editor/server.py` serves the campaign
 editor over HTTP on port 8765; publish it with Docker mapping `8765:8765` to
 open `http://localhost:8765/`.
 `db.py` owns the shared SQLite connection while `profile_db.py`, `pve_db.py`,

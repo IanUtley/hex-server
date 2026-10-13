@@ -153,7 +153,11 @@ def handle_get_deck_info(handler, target, instance, reqid, comp, session_id, con
         for ci, cid in enumerate(card_ids):
             b.add_list_item_uint64(ci, cid)
         b.begin_list("SideboardCardIDs", "System.Collections.Generic.List`1#System.UInt64", 0)
-        b.begin_list("EquipmentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
+        try:
+            deck_equipment = json.loads(db_deck.get("equipment") or "[]")
+        except (TypeError, ValueError):
+            deck_equipment = []
+        b.field_resource_id_list("EquipmentIDs", deck_equipment)
         b.begin_list("TalentIDs", "System.Collections.Generic.List`1#Game.Shared.ResourceId", 0)
         b.field_resource_id("DeckSleeveId", db_deck.get("deck_sleeve_guid") or "00000000-0000-0000-0000-000000000000")
         b.field_resource_id("GameboardId", db_deck.get("gameboard_guid") or "00000000-0000-0000-0000-000000000000")

@@ -1046,12 +1046,19 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
         is_tutorial = cfg["is_tutorial"]
         player_champ_guid = cfg["player_champ_guid"]
         campaign_player_deck_json = cfg.get("player_deck_cards_json")
+        # A mercenary fights with its saved party deck (template GUIDs,
+        # like a starter deck); deck equipment does not apply to it.
+        mercenary_deck_cards = cfg.get("mercenary_deck_cards")
+        if mercenary_deck_cards:
+            import json as _merc_json
+            campaign_player_deck_json = _merc_json.dumps(mercenary_deck_cards)
         handler._campaign_fortune_guid = cfg.get("fortune_guid")
         handler._campaign_fortune_ability_guid = cfg.get(
             "fortune_ability_guid")
         handler._campaign_fortune_starting_hand_bonus = int(
             cfg.get("fortune_starting_hand_bonus", 0) or 0)
-        _hc.log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}")
+        _hc.log_req(f"    Campaign battle: player_deck={deck_db_id} player={player_champ_name} ai={ai_name} ai_deck={ai_deck_guid} scene={scene_guid} player_champ={player_champ_guid}"
+                    + (f" mercenary_deck={len(mercenary_deck_cards)} cards" if mercenary_deck_cards else ""))
     else:
         # Get player champion from the selected deck. Practice uses
         # this same deck as the AI's mirror; FRA uses it only as the
@@ -1350,6 +1357,16 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
     player_ref_cache = {}
     player_card_data = []
     player_insert_rows = []
+    # Equipped items replace their cards with the equipment-modified
+    # templates the client data provides for each combination.  Only the
+    # player's own saved deck carries equipment: a scene-fixed or mercenary
+    # deck does not.
+    from profile_db import db_deck_equipment
+    from services.equipment import equipped_variant
+    deck_equipment = (db_deck_equipment(deck_db_id, conn=_hc._db)
+                      if deck_db_id and not campaign_player_deck_json else [])
+    if deck_equipment:
+        _hc.log_req(f"    Deck equipment: {deck_equipment}")
     if deck_rows and deck_rows[0]:
         card_ids = _json.loads(deck_rows[0])
         random.shuffle(card_ids)
@@ -1367,8 +1384,17 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
                        if isinstance(card_tpl_id, str)
                        else ("instance", card_tpl_id))
             if ref_key not in player_ref_cache:
-                player_ref_cache[ref_key] = handler._resolve_card_ref(
+                resolved = handler._resolve_card_ref(
                     card_tpl_id, handler.user_profile["id"])
+                variant = equipped_variant(resolved[0], deck_equipment)
+                if variant:
+                    upgraded = handler._resolve_card_ref(
+                        variant, handler.user_profile["id"])
+                    if upgraded[0]:
+                        _hc.log_req(f"    Equipped {resolved[2]}: "
+                                    f"{resolved[0]} -> {variant}")
+                        resolved = upgraded
+                player_ref_cache[ref_key] = resolved
             _tpl, ctype, _n, _c, _a, _d = player_ref_cache[ref_key]
             player_resolved_tpl_ids.append(_tpl)
             setup_data = handler._battle_setup_template_data(

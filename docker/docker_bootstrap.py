@@ -63,6 +63,7 @@ REQUIRED_STATIC_TABLES = (
     "quest_templates",
     "quest_conversations",
     "chest_templates",
+    "inventory_item_templates",
     "pack_set_map",
     "store_items",
     "tournament_types",
@@ -165,7 +166,7 @@ def create_starter_decks(gamedata: Path | None, records: Path) -> None:
 
 # The campaign editor's art comes from the client install, not the gamedata.
 # Each extractor writes one index; a missing index means that art is missing.
-EDITOR_GENERATED = ROOT / "hex-private" / "campaign" / "tools" / "campaign_editor" / "generated"
+EDITOR_GENERATED = ROOT / "campaign_editor" / "generated"
 
 
 def _zone_files_missing() -> bool:
@@ -211,7 +212,7 @@ def ensure_editor_art(records: Path) -> None:
     failed extraction is logged and does not stop startup.
     """
     client = client_install()
-    scripts = ROOT / "hex-private" / "campaign" / "AssetExtraction"
+    scripts = ROOT / "campaign" / "AssetExtraction"
     for label, is_missing, script, extra in EDITOR_ART_EXTRACTORS:
         if not is_missing():
             continue

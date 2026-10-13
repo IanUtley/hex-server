@@ -1,0 +1,124 @@
+{
+ "schema_version": 1,
+ "campaign": "Brutecrown Bluff",
+ "scene": "Brutecrown Bluff",
+ "runtime": "rules",
+ "description": "Node map from the authored layout. Offers come from the campaign node-conversation table.",
+ "start": {
+  "node": "NodeA",
+  "node_completed": false,
+  "flags": [],
+  "counters": {
+   "lives": 3,
+   "run_streak": 0
+  }
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_NodeA_NodeB",
+    "from": "NodeA",
+    "to": "NodeB"
+   },
+   {
+    "id": "Path_NodeB_NodeC",
+    "from": "NodeB",
+    "to": "NodeC"
+   },
+   {
+    "id": "Path_NodeC_ForkCDEFG",
+    "from": "NodeC",
+    "to": "ForkCDEFG"
+   },
+   {
+    "id": "Path_ForkCDEFG_NodeD",
+    "from": "ForkCDEFG",
+    "to": "NodeD"
+   },
+   {
+    "id": "Path_ForkCDEFG_NodeE",
+    "from": "ForkCDEFG",
+    "to": "NodeE"
+   },
+   {
+    "id": "Path_ForkCDEFG_NodeF",
+    "from": "ForkCDEFG",
+    "to": "NodeF"
+   },
+   {
+    "id": "Path_ForkCDEFG_NodeG",
+    "from": "ForkCDEFG",
+    "to": "NodeG"
+   },
+   {
+    "id": "Path_NodeE_NodeH",
+    "from": "NodeE",
+    "to": "NodeH"
+   },
+   {
+    "id": "Path_NodeF_NodeH",
+    "from": "NodeF",
+    "to": "NodeH"
+   },
+   {
+    "id": "Path_NodeG_NodeH",
+    "from": "NodeG",
+    "to": "NodeH"
+   },
+   {
+    "id": "Path_NodeH_NodeI",
+    "from": "NodeH",
+    "to": "NodeI"
+   },
+   {
+    "id": "Path_NodeI_NodeJ",
+    "from": "NodeI",
+    "to": "NodeJ"
+   }
+  ]
+ },
+ "nodes": {
+  "ForkCDEFG": {},
+  "NodeA": {},
+  "NodeB": {},
+  "NodeC": {},
+  "NodeD": {},
+  "NodeE": {
+   "completed": [
+    "flag(brutecrown_chose_*)"
+   ]
+  },
+  "NodeF": {
+   "completed": [
+    "flag(brutecrown_chose_*)"
+   ]
+  },
+  "NodeG": {
+   "completed": [
+    "flag(brutecrown_chose_*)"
+   ]
+  },
+  "NodeH": {
+   "visible": [
+    "flag(brutecrown_chose_*)"
+   ]
+  },
+  "NodeI": {},
+  "NodeJ": {}
+ },
+ "hooks": [],
+ "edited_states": {
+  "NodeE": [
+   "completed"
+  ],
+  "NodeG": [
+   "completed"
+  ],
+  "NodeF": [
+   "completed"
+  ],
+  "NodeH": [
+   "visible"
+  ]
+ }
+}

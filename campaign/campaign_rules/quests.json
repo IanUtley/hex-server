@@ -1,0 +1,909 @@
+{
+ "schema_version": 1,
+ "note": "Campaign-wide quest steps: every zone's rules see these, so a quest started in one zone can finish in another. Written by tools/campaign_editor/import_az1_rules.py; edit steps here.",
+ "quests": {
+  "az01_ar_find_ambling_mesa": {
+   "title": "Find The Ambling Mesa",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Talk to Feather Drifting in Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "az01_q_cross_the_river": {
+   "title": "Cross the Zila River",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Recover a dinosaur specimen from Razortooth Forest",
+     "type": "encounter",
+     "review": "objective has no GUID; set done_when",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "0211e909-2945-4f84-b8c6-1e5d33169d6e"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Winston",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "6e93572f-99f2-43fc-a80b-6c82b164ae8a"
+     }
+    },
+    {
+     "id": "Step3",
+     "title": "Talk to Weston",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "5e5ec1cd-c869-43e8-82d4-417021954440"
+     }
+    }
+   ]
+  },
+  "az01_q_cross_the_river_part2": {
+   "title": "Cross the Zodiac River",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Talk to the fae in the Shadowgrove",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "879317e1-8b04-486e-a10a-f2d2f1a080bc"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Wallace",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "1e9d1bd0-0967-4fe8-be79-d0cb068f973e"
+     }
+    },
+    {
+     "id": "Step3",
+     "title": "Talk to Warren",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "de519b67-1e3c-4fd1-96a1-909d2b6b3c67"
+     }
+    }
+   ]
+  },
+  "az01_q_dwarf_crayburn": {
+   "title": "Crayburn Castle",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the fallen shard",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "node": "PenworthTower"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Report your success",
+     "type": "convo"
+    }
+   ]
+  },
+  "az01_q_fort_romor": {
+   "title": "Fort Romor",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Recapture Fort Romor before the humans arrive",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "7182243a-637f-42c5-b470-5e5058db7bf4"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Wyatt at the Cave-In",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "cfb42bca-0ba3-4f51-9f25-5d1f8b17bc48"
+     }
+    }
+   ]
+  },
+  "az01_q_usurper": {
+   "title": "The Usurper",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the Bleak Citadel and kill Verrev",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "299d7998-e04b-4916-b196-91429d623a9b"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Sagebrush in Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "az01_tamed": {
+   "title": "Tamed",
+   "steps": [
+    {
+     "id": "Tame1",
+     "title": "Tame Dire Toad and win match",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "150b0ed9-a5e0-4729-81d8-764fa237c4e4",
+      "events": "tamed_troop"
+     }
+    },
+    {
+     "id": "Tame2",
+     "title": "Tame Chickatwice and win match",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "ddf8a2da-d397-4c3b-9d32-729f1bc86ade",
+      "events": "tamed_troop"
+     }
+    },
+    {
+     "id": "Tame3",
+     "title": "Tame Bubblebee and win match",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "f6f3074b-a416-4400-9b74-20d72406a846",
+      "events": "tamed_troop"
+     }
+    },
+    {
+     "id": "Tame4",
+     "title": "Tame Fennec Fox and win match",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "40cdd2b7-928a-47b8-8595-ed095b1f9e75",
+      "events": "tamed_troop"
+     }
+    },
+    {
+     "id": "Tame5",
+     "title": "Tame Dust Bustard and win match",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "06c14db8-675d-4745-b4e6-f9bc4f919b61",
+      "events": "tamed_troop"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Talk to Belarius at Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "az01_three_braves": {
+   "title": "Three Braves",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the sapphire conduit in the Indigo Plains",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "50ec5d2c-9a07-491c-9f33-f059d659d65f"
+     }
+    },
+    {
+     "id": "Step1B",
+     "title": "Return to the robot in Barking Forest",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step1C",
+     "title": "Sapphire conduit returned",
+     "type": "convo"
+    },
+    {
+     "id": "Step2",
+     "title": "Find the ruby mainline in the Crescent Mesa",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "88cb5960-d9f9-4754-a6c0-f0f32f56e472"
+     }
+    },
+    {
+     "id": "Step2B",
+     "title": "Return to the robot in Barking Forest",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step2C",
+     "title": "Ruby mainline installed",
+     "type": "convo"
+    },
+    {
+     "id": "Step3",
+     "title": "Find the regulator in the Sky'le Tepui",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "725063b8-cff8-4b96-98f5-03881dc485db"
+     }
+    },
+    {
+     "id": "Step3B",
+     "title": "Return to the robot in Barking Forest",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step3C",
+     "title": "Choice made",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step6",
+     "title": "Tell Bluejay your choice",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "az01_uw_find_cave_in": {
+   "title": "Find The Cave-In",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Talk to Fahrny at the Cave-In",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "880690b0-0c54-4ab8-a4e2-911b8bf14f64"
+     }
+    }
+   ]
+  },
+  "q_alachian_sea": {
+   "title": "The Alachian Sea",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Defeat the Flock of Seagulls",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "e762360c-f3c8-4225-bce6-9b42f80231a7"
+     }
+    },
+    {
+     "id": "Fight2",
+     "title": "Defeat the Giant Jellyfish",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "907b258e-4e21-424e-aeb4-466b3e550ac5"
+     }
+    },
+    {
+     "id": "Fight3",
+     "title": "Defeat the Dire Toad",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "c97f5c09-0c89-4bb3-8ece-5f8c2cc4c0ad"
+     }
+    },
+    {
+     "id": "Fight4",
+     "title": "Defeat the Bog Walker",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "605fea67-3127-45a6-8657-c83e67f69eb4"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Return to Belarius in Wakuna",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_ar_midnight_special": {
+   "title": "Midnight Special",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Find and defeat the Midnight Shepherd",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "7c10655d-af47-4ae5-a0ff-f585ddd4eb6a"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Return to Marshal Josephina in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "0e5d22ef-c7c6-4858-bf0c-4ae42990044c"
+     }
+    }
+   ]
+  },
+  "q_army_of_myth": {
+   "title": "Army Of Myth",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find and defeat the Army Of Myth",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Talk to Myaa in Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_blood_beneath": {
+   "title": "Blood Beneath",
+   "steps": [
+    {
+     "id": "Step0",
+     "title": "Find Gurtok",
+     "type": "convo"
+    },
+    {
+     "id": "Step1",
+     "title": "Go to the Skittering Ridge and find the blood vial",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "5dfef5ea-2481-4a99-9c10-c56629d7c132"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Rizzix at the Cave-In",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "f730a712-4671-4325-8972-d902c887e125"
+     }
+    }
+   ]
+  },
+  "q_boat_elementals": {
+   "title": "Stormwatch",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Defeat the Cloud Queen",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "9da0e09c-102f-4b44-a378-df71ca12b884"
+     }
+    },
+    {
+     "id": "Fight2",
+     "title": "Defeat the Cloud King",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "ac6d131f-caa4-4539-abbf-2f035cc010a3"
+     }
+    },
+    {
+     "id": "Fight3",
+     "title": "Defeat the Storm of the Century",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "162d5d67-a6b5-49c0-88d5-31ddea7cf923"
+     }
+    },
+    {
+     "id": "Desc1",
+     "title": "Must defeat all 3 in one voyage",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "TurnIn",
+     "title": "Return to the Harbor Master",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "q_boat_lobsters": {
+   "title": "Lobster Tale",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Defeat Hardshell Deepwalker",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "8d510865-d170-4061-aab0-7da2d1853ce1"
+     }
+    },
+    {
+     "id": "Fight2",
+     "title": "Defeat Hardshell Saltmage",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "19bf9ca1-cbd5-43b6-af6a-0a1eea0a46a6"
+     }
+    },
+    {
+     "id": "Fight3",
+     "title": "Defeat Hardshell Overseer",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "13ff356b-8de8-4cb2-bc99-19a7787b14d6"
+     }
+    },
+    {
+     "id": "Desc1",
+     "title": "Must defeat all 3 in one voyage",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "TurnIn",
+     "title": "Return to the Harbor Master",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "q_boat_pirates": {
+   "title": "Pirates of the Alachian",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Defeat Hired Horn Scum",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "1895828d-6c16-49fd-af69-61c00ddda47c"
+     }
+    },
+    {
+     "id": "Fight2",
+     "title": "Defeat Chumspike",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "86408708-ab75-4c88-a7f9-fecefc97894d"
+     }
+    },
+    {
+     "id": "Fight3",
+     "title": "Defeat Bloodhorn",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "9ea4fc41-702b-4b83-8dd4-84915020a1b2"
+     }
+    },
+    {
+     "id": "Desc1",
+     "title": "Must defeat all 3 in one voyage",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "TurnIn",
+     "title": "Return to the Harbor Master",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "q_brutecrown_bluff": {
+   "title": "Brutecrown Bluff",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Create an alliance with the Brutecrown gnolls",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": [
+       "0aa33344-47c7-41ef-b9aa-4f7987c142e9",
+       "c755cec9-59a0-4135-8ba3-88f324bd9bc9",
+       "aa88bcc3-1f3a-481c-ba5f-3828c676f1ec"
+      ]
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Belarius",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_devonshire_keep": {
+   "title": "Devonshire Keep",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Go to Devonshire Keep and investigate",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "57200014-89ed-4aff-9d73-a77082ebbf1b"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Myaa at Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_find_myaa": {
+   "title": "Find Myaa",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find Myaa in Ambling Mesa",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "q_gnomes_come_home": {
+   "title": "Gnomes Come Home",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the lost gnomes in the northern desert",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "5c8c1188-cde5-4a0f-81bf-2316771b68ae"
+     }
+    },
+    {
+     "id": "Step2_INFO",
+     "title": "Current gnomes",
+     "type": "collect",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step2",
+     "title": "Get all gnomes safely back to the south camp",
+     "type": "collect",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step3",
+     "title": "Return to Vincent in Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_go_to_az2": {
+   "title": "River of Whispers",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the River of Whispers in the west and board the boat",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "3de2eacb-5545-4f7d-be0f-81488f55cea1"
+     }
+    }
+   ]
+  },
+  "q_great_machine_graveyard": {
+   "title": "Great Machine Graveyard",
+   "steps": [
+    {
+     "id": "Repair",
+     "title": "Repair the junkyard robot",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Opt_Shield",
+     "title": "(Optional) Acquire the Magnet Shield",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Opt_Bopper",
+     "title": "(Optional) Acquire the Big Bopper",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Opt_Cannon",
+     "title": "(Optional) Acquire the Slag Cannon",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Kill_Boss",
+     "title": "Kill Scutt",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "3f4bea6f-93ff-4e06-a186-59263e3d5efb"
+     }
+    },
+    {
+     "id": "TurnIn",
+     "title": "Return to Tezozo in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "6e4be89c-ce8d-4fa8-abe3-169ed8c02597"
+     }
+    }
+   ]
+  },
+  "q_kraken": {
+   "title": "Kraken",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Defeat the Kraken",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "node": "NodeP"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Blue Sparrow in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "0b5f2fcf-a64a-492a-9017-9f573a94a017"
+     }
+    }
+   ]
+  },
+  "q_petulent_picaroons": {
+   "title": "Petulant Picaroons",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Find the pirate cove",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "7fb94df9-f4d2-4d3d-b910-4d2cc2f79228"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Return to the totem in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "99cd96d7-44ce-4ffa-8a8f-5280ee982e88"
+     }
+    }
+   ]
+  },
+  "q_redhand_raiders": {
+   "title": "Raiders of the Crossed Dark",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Find and defeat the raiders",
+     "type": "encounter",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step1",
+     "title": "Return to Two Tomahawks in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "eac559a6-f483-45e2-b47e-20e50e043de7"
+     }
+    }
+   ]
+  },
+  "q_ruins_of_kukatan": {
+   "title": "Ruins of Kukatan",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Explore the Ruins of Kukatan",
+     "type": "dungeon",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Myaa in Wakuna",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "e662ca3f-4a16-4f53-b7ab-851eac5becbf"
+     }
+    }
+   ]
+  },
+  "q_seawitch": {
+   "title": "Defeat the Sea Hag",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the Horwich Sea",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "1a8673a4-c9e2-430a-bd87-3c891406e599"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Kill the Sea Hag",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "b9bc1f22-1b1e-4e7b-8b3e-0ba73a2df315"
+     }
+    },
+    {
+     "id": "Step3",
+     "title": "Return to Ennis at the Cave-In",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_smoldering_dead": {
+   "title": "Smoldering Dead",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the source of the zombie invasion",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "f7741fa9-4e79-4e1f-8f27-084d02f859c2"
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Myaa at Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_the_mithral_river": {
+   "title": "The Mithral River",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Find the elves interfering with the robot factory",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "96dc1a52-8228-4e3e-b2fb-a0b96d64e041"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Return to Kentigern Slate in Naagaan",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "620913d6-9d42-48ff-8579-65e254e6328e"
+     }
+    }
+   ]
+  },
+  "q_the_new_land": {
+   "title": "The New Land",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Go to Portsmeare harbor",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step2",
+     "title": "Sail to the new land",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    },
+    {
+     "id": "Step3",
+     "title": "Disembark from your boat",
+     "type": "convo",
+     "review": "objective has no GUID; set done_when"
+    }
+   ]
+  },
+  "q_tranquil_dream": {
+   "title": "Tranquil Dream",
+   "steps": [
+    {
+     "id": "Step1",
+     "title": "Find the coyotle elder",
+     "type": "dungeon",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": [
+       "46a27ef6-1e4d-41e4-bda3-e41ca89531ee",
+       "43750f88-8b26-4dd8-a41a-36dfcf3f3090",
+       "31673a21-081d-4f0b-a244-97f097821936",
+       "31894e83-b59c-48d8-bb91-0ff57445e33a",
+       "a5f847dd-fab9-45dc-a4cc-0458b72c3efd"
+      ]
+     }
+    },
+    {
+     "id": "Step2",
+     "title": "Return to Feather Drifting at Ambling Mesa",
+     "type": "convo"
+    }
+   ]
+  },
+  "q_uw_victorias_secret": {
+   "title": "Victoria's Secret",
+   "steps": [
+    {
+     "id": "Fight1",
+     "title": "Find and defeat Princess Victoria",
+     "type": "encounter",
+     "done_when": {
+      "event": "encounter_victory",
+      "scene": "81d153e6-b10a-4b2b-9920-b671b4d3d015"
+     }
+    },
+    {
+     "id": "Step1",
+     "title": "Return to Ada in Naagaan",
+     "type": "convo",
+     "done_when": {
+      "event": "conversation_end",
+      "conversation": "03dd1463-5464-45b3-b644-71f370ada29b"
+     }
+    }
+   ]
+  }
+ }
+}

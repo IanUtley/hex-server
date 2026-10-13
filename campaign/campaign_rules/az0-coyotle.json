@@ -1,0 +1,76 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-coyotle",
+ "scene": "AZ0 Coyotle",
+ "runtime": "rules",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "ShortBuffalo",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "ShortBuffalo": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Coyotle)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Coyotle)",
+    "!conversation(Crayburn Castle - Coyotle - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Coyotle - Quest End)"
+   ]
+  },
+  "WhisperingBreeze": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Coyotle)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Coyotle Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Coyotle Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Coyotle Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "DuskDaughter": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Coyotle Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Coyotle - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Coyotle - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Coyotle - Quest End)"
+   ]
+  }
+ },
+ "hooks": []
+}

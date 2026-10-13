@@ -134,9 +134,24 @@ def store_deck_definition(template_guid):
     if inventory_item is None or inventory_item.short_type != "InventoryStarterPack":
         return None
     deck_guid = reference_guid(inventory_item.field("m_DeckTemplateId"))
+    definition = deck_template_definition(deck_guid)
+    if definition is not None and not definition["name"]:
+        definition["name"] = str(inventory_item.field("m_Name", "") or "Starter Deck")
+    return definition
+
+
+def deck_template_definition(deck_guid):
+    """Return a DeckTemplate record's cards, name and champion (or None).
+
+    Shared by store starter packs and reward decks (a mercenary's authored
+    deck): the same DeckTemplate record yields the same card list.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    from gamedata.records import reference_guid
+
     if not deck_guid or deck_guid == "00000000-0000-0000-0000-000000000000":
         return None
-    deck = DEFAULT_RECORD_STORE.get("DeckTemplate", deck_guid)
+    deck = DEFAULT_RECORD_STORE.get("DeckTemplate", str(deck_guid).lower())
     if deck is None:
         return None
 
@@ -156,8 +171,7 @@ def store_deck_definition(template_guid):
     champion_guid = reference_guid(deck.field("m_ChampionId"))
     return {
         "deck_template_guid": deck.guid,
-        "name": str(deck.field("m_DeckName", "") or
-                     inventory_item.field("m_Name", "") or "Starter Deck"),
+        "name": str(deck.field("m_DeckName", "") or ""),
         "champion_guid": champion_guid,
         "cards": tuple(cards),
     }

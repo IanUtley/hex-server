@@ -6,7 +6,7 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CAMPAIGN_ROOT = os.path.join(ROOT, "hex-private", "campaign")
 sys.path[:0] = [ROOT, CAMPAIGN_ROOT,
-                os.path.join(CAMPAIGN_ROOT, "tools", "campaign_editor")]
+                os.path.join(ROOT, "campaign_editor")]
 
 import server_playthrough  # noqa: E402
 

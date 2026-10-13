@@ -328,16 +328,6 @@ DDL = [
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS deck_template_cards (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        deck_template_guid TEXT NOT NULL,
-        deck_name TEXT NOT NULL,
-        card_template_guid TEXT NOT NULL,
-        count INTEGER NOT NULL DEFAULT 1,
-        UNIQUE(deck_template_guid, card_template_guid)
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS starter_decks (
         guid TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -404,7 +394,9 @@ DDL = [
         chest_rarity TEXT NOT NULL,
         opened INTEGER DEFAULT 0,
         template_guid TEXT DEFAULT '',
-        created_at TEXT
+        created_at TEXT,
+        wof_spun INTEGER DEFAULT 0,
+        wof_status INTEGER DEFAULT 0
     )
     """,
     """
@@ -422,6 +414,57 @@ DDL = [
         chest_type TEXT NOT NULL DEFAULT 'Common',
         spin_type TEXT NOT NULL DEFAULT 'NoSpin',
         promotional_id INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # Sleeves and gameboards (InventoryItemData m_Type DeckSleeve/Gameboard),
+    # seeded from the Records; name/description are plain text, not
+    # localisation keys.
+    """
+    CREATE TABLE IF NOT EXISTS inventory_item_templates (
+        guid        TEXT PRIMARY KEY,
+        name        TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        item_type   TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    # A player's saved ProfileDeckTemplate (mercenary decks).  The client's
+    # bytes are regenerated from these columns (services/deck_templates.py).
+    # equipment_json: {"Head": guid, ...} keyed by EEquipmentType name.
+    # gameboard_guid / personality: the "gboard" / "personality" extended
+    # data, '' when the client did not send the key.
+    """
+    CREATE TABLE IF NOT EXISTS player_deck_templates (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL REFERENCES users(id),
+        name           TEXT NOT NULL DEFAULT '',
+        champion_guid  TEXT NOT NULL DEFAULT '',
+        sleeve_guid    TEXT NOT NULL DEFAULT '',
+        gameboard_guid TEXT NOT NULL DEFAULT '',
+        personality    TEXT NOT NULL DEFAULT '',
+        equipment_json TEXT NOT NULL DEFAULT '{}',
+        updated_at     TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    # The cards of a template, mirroring encounter_deck_cards.
+    # gem_types_list_json: '[]' when no copy is gemmed, else one EGemTypesNew
+    # list per copy (length = quantity).  flags_json: {"extended", "reserves",
+    # "foil"} of every copy, plus "copies" (one flag object per copy) when the
+    # copies differ.
+    """
+    CREATE TABLE IF NOT EXISTS player_deck_template_cards (
+        template_id         INTEGER NOT NULL REFERENCES player_deck_templates(id) ON DELETE CASCADE,
+        card_guid           TEXT NOT NULL,
+        quantity            INTEGER NOT NULL DEFAULT 1,
+        gem_types_list_json TEXT NOT NULL DEFAULT '[]',
+        flags_json          TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (template_id, card_guid)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS champion_parties (
+        champion_id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        party_json TEXT NOT NULL DEFAULT '{}'
     )
     """,
     """
@@ -446,7 +489,8 @@ DDL = [
         rewards_json TEXT DEFAULT '{}',
         actions_json TEXT DEFAULT '{}',
         player_champion_guid TEXT DEFAULT '',
-        player_deck_guid TEXT DEFAULT ''
+        player_deck_guid TEXT DEFAULT '',
+        origin TEXT NOT NULL DEFAULT 'seed'
     )
     """,
     """
@@ -930,7 +974,8 @@ DDL = [
         deck_sleeve_guid TEXT DEFAULT NULL,
         gameboard_guid TEXT DEFAULT NULL,
         coin_guid TEXT DEFAULT NULL,
-        last_saved TEXT DEFAULT ''
+        last_saved TEXT DEFAULT '',
+        equipment TEXT DEFAULT '[]'
     )
     """,
     """
@@ -953,7 +998,7 @@ DDL = [
     )
     """,
     # campaign rules progress of a rules-driven campaign
-    # (hex-private/campaign/campaign_runtime):
+    # (campaign/campaign_runtime):
     # zone '*' is the campaign-wide part (flags, quests, counters ...), every
     # other row one zone's node progress.
     """
@@ -998,6 +1043,7 @@ DDL = [
         trigger_json TEXT NOT NULL DEFAULT '{}',
         priority INTEGER NOT NULL DEFAULT 0,
         enabled INTEGER NOT NULL DEFAULT 1,
+        origin TEXT NOT NULL DEFAULT 'seed',
         PRIMARY KEY (campaign_template, node_id, conversation_guid)
     )
     """,
@@ -1031,6 +1077,7 @@ DDL = [
         conditions_json TEXT NOT NULL DEFAULT '{}',
         priority INTEGER NOT NULL DEFAULT 0,
         enabled INTEGER NOT NULL DEFAULT 1,
+        origin TEXT NOT NULL DEFAULT 'seed',
         PRIMARY KEY (quest_script, conversation_guid)
     )
     """,
@@ -1044,7 +1091,8 @@ DDL = [
         reward_json TEXT NOT NULL DEFAULT '{}',
         one_time INTEGER NOT NULL DEFAULT 1,
         enabled INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT DEFAULT (datetime('now'))
+        created_at TEXT DEFAULT (datetime('now')),
+        origin TEXT NOT NULL DEFAULT 'seed'
     )
     """,
 
@@ -1432,7 +1480,7 @@ QUEST_OBJECTIVE_ENCOUNTER_LINKS = {
 CONVERSATION_REWARD_SEEDS = [
     # The Find / Cross the Zila / Cross the Zodiac rewards are quest rewards
     # now (quest_templates.rewards_json, authored in
-    # hex-private/campaign/campaign_data/quests.json
+    # campaign/campaign_data/quests.json
     # and edited on the editor's Quests tab); their old conversation rows are
     # removed in ensure_schema so a quest never pays twice.
     # Shadowgrove's equipment is shown on the encounter reward panel. The
@@ -1459,7 +1507,7 @@ CRAYBURN_QUEST_REWARD = {
     },
 }
 # Conversations whose reward rows moved to their quest (see
-# hex-private/campaign/campaign_data/quests.json).
+# campaign/campaign_data/quests.json).
 AZ1_QUEST_REWARD_CONVERSATIONS = (
     "02977c4c-803a-465d-ae0c-b5896c3d4012",  # Find The Ambling Mesa (Ardent)
     "880690b0-0c54-4ab8-a4e2-911b8bf14f64",  # Find The Cave-In (Underworld)
@@ -1680,6 +1728,10 @@ def _migrate_short_tournament_ids(db):
     db.commit()
 
 
+CAMPAIGN_ORIGIN_TABLES = ("encounter_scenes", "campaign_node_conversations",
+                          "quest_conversations", "conversation_rewards")
+
+
 def ensure_schema(db):
     """Create all tables and (re)seed static reference data.
 
@@ -1709,6 +1761,12 @@ def ensure_schema(db):
                    "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(db, "session_packets", "sent_body", "BLOB")
     _ensure_column(db, "session_packets", "sent_at", "TEXT")
+    # Who created a campaign table row: 'seed' (this module's Records/static
+    # seeds) or 'data' (inserted from campaign/campaign_data/*.json).
+    # campaign_data.apply_all deletes 'data' rows no data file lists any more;
+    # 'seed' rows are never deleted. Existing rows default to 'seed' (kept).
+    for table in CAMPAIGN_ORIGIN_TABLES:
+        _ensure_column(db, table, "origin", "TEXT NOT NULL DEFAULT 'seed'")
     template_columns = {row[1] for row in db.execute(
         "PRAGMA table_info(card_templates)")}
     added_variable_cost_double = "variable_cost_double" not in template_columns
@@ -1798,8 +1856,8 @@ def ensure_schema(db):
             db.executemany(
                 "INSERT OR IGNORE INTO campaign_node_conversations "
                 "(campaign_template,node_id,conversation_guid,"
-                "conversation_name,trigger_json,priority,enabled) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "conversation_name,trigger_json,priority,enabled,origin) "
+                "VALUES (?,?,?,?,?,?,?,'seed')",
                 conversation_rows,
             )
             db.commit()
@@ -1809,6 +1867,30 @@ def ensure_schema(db):
             )
     except Exception as exc:
         print(f"Campaign node conversation seed skipped: {exc}")
+
+    # Mercenary champions (health, champion abilities, ability effects) were
+    # added to the champion catalog after databases already existed.  Fresh
+    # databases receive them from the full client seed, so only backfill an
+    # already-seeded catalog.  B.E.B.O. is a MercenaryTemplate in every
+    # client build, so use it as the marker.
+    try:
+        if (db.execute("SELECT 1 FROM champion_templates_extended LIMIT 1").fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM champion_templates_extended WHERE guid=?",
+                    ("8a336fec-d970-4613-9308-c0afd41b62eb",)).fetchone()):
+            from AssetExtraction.gamedata_seed import (
+                extract_mercenary_champions, seed_database)
+            mercs = extract_mercenary_champions()
+            inserted = seed_database(db, {"tables": {
+                "champion_templates_extended": mercs["champion_templates_extended"],
+                "champion_template_data": mercs["champion_template_data"],
+                "champion_abilities": mercs["champion_abilities"],
+                "ability_effects": mercs["champion_ability_effects"],
+                "card_abilities_meta": mercs["champion_ability_meta"],
+            }})
+            print(f"Seeded mercenary champions: {inserted}")
+    except Exception as exc:
+        print(f"Mercenary champion seed skipped: {exc}")
 
     # QuestTemplate records provide the objective definitions while authored
     # conversation names identify the NPC/node and quest stage.  Keep both in
@@ -1835,7 +1917,7 @@ def ensure_schema(db):
                 "INSERT OR IGNORE INTO quest_conversations "
                 "(quest_script,conversation_guid,campaign_template,node_id,npc,"
                 "role,faction,conversation_name,start_hook,conditions_json,"
-                "priority,enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "priority,enabled,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'seed')",
                 quest_conversation_rows,
             )
         # Backfill faction metadata for generic Tamed conversations whose
@@ -1849,7 +1931,7 @@ def ensure_schema(db):
             "WHERE faction='' AND lower(npc)='takumi'"
         )
         # Map-visibility start hooks are now campaign editor data
-        # (hex-private/campaign/campaign_rules/AZ1.json); clear the retired names from existing
+        # (campaign/campaign_rules/AZ1.json); clear the retired names from existing
         # databases. Smoldering Dead's battle stays in its dungeon (no hook).
         retired = ("az1_tamed_start", "az1_find_horwich_sea_start",
                    "az1_find_cave_in_start", "az1_find_ambling_mesa_start",
@@ -1871,20 +1953,6 @@ def ensure_schema(db):
              '"encounter": "1d91ee6d-dd5b-4aaf-af58-7ace873b1a80", '
              '"id": "Step1"',
              "q_smoldering_dead"),
-        )
-        # Wallace's authored post-Dryad conversation starts Cross the Zodiac
-        # River. The extracted quest conversation catalog does not carry this
-        # handoff, so seed the metadata link idempotently for existing saves.
-        db.execute(
-            "INSERT OR IGNORE INTO quest_conversations "
-            "(quest_script,conversation_guid,campaign_template,node_id,npc,"
-            "role,faction,conversation_name,start_hook,conditions_json,priority,enabled) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("az01_q_cross_the_river_part2",
-             "1e9d1bd0-0967-4fe8-be79-d0cb068f973e", "AZ1", "Node030",
-             "Wallace", "start", "",
-             "AZ1 - Node 30 - Wallace - Step 3 player has beaten Dryad",
-             "", "{}", 0, 1),
         )
         # The extracted Cross Zodiac River template historically stored
         # Warren's ChampionTemplate GUID in its final conversation objective.
@@ -1947,6 +2015,12 @@ def ensure_schema(db):
         if "template_guid" not in chest_cols:
             db.execute("ALTER TABLE treasure_chests ADD COLUMN template_guid TEXT DEFAULT ''")
             db.commit()
+        # Wheels of Fate state: whether the chest was spun and the re-spin
+        # (EChestSpinStatus) it holds.
+        for column in ("wof_spun", "wof_status"):
+            if column not in chest_cols:
+                db.execute(f"ALTER TABLE treasure_chests ADD COLUMN {column} INTEGER DEFAULT 0")
+        db.commit()
     except Exception:
         pass
 
@@ -1969,6 +2043,9 @@ def ensure_schema(db):
             db.execute("ALTER TABLE card_templates ADD COLUMN equipment_modified INTEGER DEFAULT 0")
         if "gem_abilities" not in dcols:
             db.execute("ALTER TABLE decks ADD COLUMN gem_abilities TEXT DEFAULT '{}'")
+        # Deck equipment: the equipped InventoryEquipmentData GUIDs.
+        if "equipment" not in dcols:
+            db.execute("ALTER TABLE decks ADD COLUMN equipment TEXT DEFAULT '[]'")
         if "effect_group_id" not in ecols:
             db.execute("ALTER TABLE ability_effects ADD COLUMN effect_group_id INTEGER DEFAULT 0")
         if "condition_id" not in ecols:
@@ -2067,6 +2144,23 @@ def ensure_schema(db):
                 f"Client-derived row refresh skipped ({exc}); keeping the "
                 "existing client data")
 
+    # Sleeves and gameboards were added to the client-derived projection
+    # after databases already existed; backfill an empty table cheaply from
+    # InventoryItemData only.
+    try:
+        if not db.execute(
+                "SELECT 1 FROM inventory_item_templates LIMIT 1").fetchone():
+            from AssetExtraction.gamedata_seed import (
+                extract_inventory_item_templates)
+            rows = extract_inventory_item_templates()
+            db.executemany(
+                "INSERT OR IGNORE INTO inventory_item_templates "
+                "(guid, name, description, item_type) VALUES (?,?,?,?)", rows)
+            db.commit()
+            print(f"Seeded inventory item templates: {len(rows)}")
+    except Exception as exc:
+        print(f"Inventory item template seed skipped: {exc}")
+
     # Existing databases predate the race-specific Crayburn encounter seed.
     # Add only the missing client-derived encounter rows; do not reseed or
     # replace runtime card/profile data.  Without this incremental repair the
@@ -2107,7 +2201,7 @@ def ensure_schema(db):
             db.execute("ALTER TABLE encounter_scenes ADD COLUMN rewards_json TEXT DEFAULT '{}'")
             db.commit()
         # Encounter scenes are owned by the campaign editor: apply its full
-    # definitions (hex-private/campaign/campaign_data/encounter_scenes.json)
+    # definitions (campaign/campaign_data/encounter_scenes.json)
     # now, so the deck
         # evaluator below and everything after it sees the rows.
         import campaign_data
@@ -2383,7 +2477,7 @@ def ensure_schema(db):
 
     db.executemany(
         "INSERT OR IGNORE INTO conversation_rewards "
-        "(conversation_guid, reward_json, one_time) VALUES (?,?,?)",
+        "(conversation_guid, reward_json, one_time, origin) VALUES (?,?,?,'seed')",
         CONVERSATION_REWARD_SEEDS)
 
     # Upgrade the initial placeholder values seeded by the first version of
@@ -2511,7 +2605,7 @@ def ensure_schema(db):
     card_fix.apply_fixes(db)
 
     # Campaign table data authored in the campaign editor
-    # (hex-private/campaign/campaign_data/*.json). Applied last so it wins over seed refreshes;
+    # (campaign/campaign_data/*.json). Applied last so it wins over seed refreshes;
     # hex-private/Records/ itself is never modified.
     import campaign_data
     campaign_data.apply_all(db)

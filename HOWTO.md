@@ -32,8 +32,8 @@ The records snapshot and C# disassembly are stored at `hex-private/Records/`
 and `hex-private/HexClient/` in the private `hex-private/` submodule. Clone with
 `--recurse-submodules` or run `git submodule update --init hex-private` before
 using code or tools that read those sources.
-Campaign runtime, authored rules/data, the editor, and its campaign-specific
-asset tools live under `hex-private/campaign/` in the same submodule.
+Campaign runtime, authored rules/data, and the campaign-specific asset tools
+live under `campaign/` at the project root, not in the submodule.
 
 When reverse-engineering a behavior, record the observation, the inferred
 contract, and an acceptance test. A future implementation should be generated
@@ -48,9 +48,10 @@ bash restart.sh
 ```
 
 The server listens on TCP `9933`; the HTTP compatibility/auth proxy listens on
-`8081`. When the private campaign editor source is present,
-`restart.sh` starts it on `127.0.0.1:8765`. The Docker image runs it on
-container port `8765` when its source is present. `restart.sh` initializes or
+`8081`. The campaign editor (`campaign_editor/`) edits the campaign source in
+`campaign/` (override with `HEX_CAMPAIGN_ROOT`); when that
+source is present, `restart.sh` starts it on `127.0.0.1:8765`. The Docker image
+runs it on container port `8765` when that source is present. `restart.sh` initializes or
 upgrades the database, runs one-off `migration.py` work when present, compiles
 the runtime, and starts HConnect, the proxy, tournament service, replay
 worker, and the available campaign editor.
@@ -171,8 +172,8 @@ or display text.
 | `abilities/` | metadata-driven ability parsing, targeting, conditions, effect leaves, and the shared `EffectContext`/`AbilityBuilder` adapters |
 | `ability.py` | compatibility facade for the `abilities/` package |
 | `campaign.py` | campaign protocol and authored campaign state; campaign SQL migration into `pve_db` remains work in progress |
-| `hex-private/campaign/campaign_runtime/` | runs zones whose `hex-private/campaign/campaign_rules/<zone>.json` says `"runtime": "rules"` from the campaign editor's rules (shared rules loader, projection, progress in `campaign_progress`); see `docs/CAMPAIGN.md` "Rules runtime" |
-| `campaign_source.py` | adds the private campaign source root to Python's import path for server modules |
+| `campaign/campaign_runtime/` | runs zones whose `campaign/campaign_rules/<zone>.json` says `"runtime": "rules"` from the campaign editor's rules (shared rules loader, projection, progress in `campaign_progress`); see `docs/CAMPAIGN.md` "Rules runtime" |
+| `campaign_source.py` | adds the `campaign/` source root to Python's import path for server modules |
 | `gamemodes/` | mode-specific orchestration (PVP, FRA, tournament) |
 | `static.py` | all schema DDL and server-owned seed/configuration data |
 | `db.py` | one SQLite connection, transactions, and compatibility persistence facade |
@@ -187,7 +188,7 @@ or display text.
 | `encoder.py` | ObjFmt response and binary event encoding |
 | `proxy.py` | HTTP authentication, payment-link compatibility, news, and static proxy endpoints |
 
-The campaign editor's pure rules engine (`hex-private/campaign/campaign_rules.py`) keeps counters
+The campaign editor's pure rules engine (`campaign/campaign_rules.py`) keeps counters
 in each zone's simulation state. Hooks change them with
 `increment_counter: {name, amount}` effects; tags read them with
 `counter(Name)` (at least 1) or `counter(Name,N)` (at least N). Keep dungeon
@@ -298,7 +299,14 @@ carrying `counters`, with the collection the champion already sits in
 Dazed, Vulnerable) from the cached `CardRepresentation` counters, and only a
 `CardUpdated` stores them. `ECardCollections.Champions` is both suppressed by
 `push_card_updated` and read as a card move, so `CardCountersChanged` alone
-never reaches the portrait.
+never reaches the portrait. Champion IntAttrs (`battle_state["champion_int_attrs"]`)
+follow the same rule: `GoChampionEffects` maps the `Toxified` IntAttr (not a
+counter; Records has no Toxic counter template) to the Toxify HUD icon, so
+`EffectContext._push_champion_intattrs` publishes a champion `CardUpdated`
+carrying `int_attrs`, and `_push_champions_warm` copies them onto the rebuilt
+champion CardDefs so later champion re-pushes keep them. `SessionCardId`
+hashes by identity: look up a champion CardDef by its raw UID, not by a
+freshly built `SessionCardId`.
 
 When an `ActivateAbility` child waits on a picker, the authored `InZone` card
 filter selects which one: `Choosing` opens the built-in ChooseAndPlay picker,

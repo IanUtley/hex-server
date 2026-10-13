@@ -56,6 +56,8 @@ def push_card_state(game, session, db, handler, player_uid, ai_uid, card_uid,
         "discard": game_engine.ECardCollections.Discard,
         "void": game_engine.ECardCollections.Void,
         "playedresources": game_engine.ECardCollections.PlayedResources,
+        # Hidden encounter-mod collection: never project it as Warzone.
+        "mod": game_engine.ECardCollections.Mod,
     }
     collection = collections.get(str(location or "").lower(),
                                  game_engine.ECardCollections.Warzone)

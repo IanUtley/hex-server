@@ -1,0 +1,76 @@
+{
+ "schema_version": 1,
+ "campaign": "az0-dwarf",
+ "scene": "AZ0 Dwarf",
+ "runtime": "rules",
+ "generated_by": "tools/campaign_editor/import_crayburn.py",
+ "start": {
+  "node": "NodeA",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": []
+ },
+ "quests": {},
+ "nodes": {
+  "NodeA": {
+   "visible": [],
+   "autostart": [
+    "!conversation(AZ0 - Intro Story Sequence - Dwarf)"
+   ],
+   "completed": [
+    "conversation(AZ0 - Intro Story Sequence - Dwarf)",
+    "!conversation(Crayburn Castle - Dwarf - Quest End)"
+   ],
+   "givequest": [
+    "conversation(Crayburn Castle - Dwarf - Quest End)"
+   ]
+  },
+  "NodeB": {
+   "visible": [
+    "conversation(AZ0 - Intro Story Sequence - Dwarf)"
+   ],
+   "completed": [
+    "conversation(AZ0 - First Card Battle - Dwarf Success)"
+   ],
+   "givequest": [
+    "!conversation(AZ0 - First Card Battle - Dwarf Success)"
+   ],
+   "autostart": [
+    [
+     "outcome:success",
+     "!conversation(AZ0 - First Card Battle - Dwarf Success)"
+    ],
+    [
+     "outcome:fail"
+    ]
+   ],
+   "retryable": [
+    "outcome:fail"
+   ]
+  },
+  "NodeC": {
+   "visible": [
+    "conversation(AZ0 - First Card Battle - Dwarf Success)"
+   ],
+   "completed": [
+    [
+     "conversation(Crayburn Castle - Dwarf - Quest Start)",
+     "!flag(crayburn_complete)"
+    ],
+    [
+     "conversation(Crayburn Castle - Dwarf - Quest End)"
+    ]
+   ],
+   "givequest": [
+    "!flag(crayburn_complete)"
+   ],
+   "turninquest": [
+    "flag(crayburn_complete)",
+    "!conversation(Crayburn Castle - Dwarf - Quest End)"
+   ]
+  }
+ },
+ "hooks": []
+}

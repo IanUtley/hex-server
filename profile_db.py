@@ -5,8 +5,10 @@ the legacy ``db`` facade for now so callers can migrate without a flag day;
 new profile/economy code should import this module directly.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import threading
 
 import db as _db_layer
 
@@ -590,8 +592,8 @@ def db_create_treasure_chest(user_id, set_guid, rarity, conn=None,
 
 def db_get_unopened_chests_full(user_id, conn=None):
     return _profile_connection(conn).execute(
-        "SELECT id, set_guid, chest_rarity, template_guid FROM treasure_chests "
-        "WHERE user_id=? AND opened=0", (user_id,)).fetchall()
+        "SELECT id, set_guid, chest_rarity, template_guid, wof_status, wof_spun "
+        "FROM treasure_chests WHERE user_id=? AND opened=0", (user_id,)).fetchall()
 
 
 def db_get_chest_by_id(chest_db_id, user_id, conn=None):
@@ -949,12 +951,13 @@ def db_get_decks(user_id, conn=None):
     """Return saved decks in the profile projection used by the client."""
     rows = _profile_connection(conn).execute(
         "SELECT id, deck_name, cards, pve_champion_id, pvp_champion_guid, "
-        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid "
+        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid, equipment "
         "FROM decks WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
     return [{"id": row[0], "name": row[1], "cards": row[2],
              "pve_champion_id": row[3], "pvp_champion_guid": row[4],
              "active_gems": row[5], "deck_sleeve_guid": row[6],
-             "gameboard_guid": row[7], "coin_guid": row[8]}
+             "gameboard_guid": row[7], "coin_guid": row[8],
+             "equipment": row[9]}
             for row in rows]
 
 
@@ -1380,14 +1383,15 @@ def db_update_deck(deck_id, user_id, deck_name=None, cards_json=None,
                    pve_champion_id=None, pvp_champion_guid=None,
                    active_gems_json=None, gem_abilities_json=None,
                    deck_sleeve_guid=None, gameboard_guid=None, coin_guid=None,
-                   conn=None):
+                   equipment_json=None, conn=None):
     values = (("deck_name", deck_name), ("cards", cards_json),
               ("pve_champion_id", pve_champion_id),
               ("pvp_champion_guid", pvp_champion_guid),
               ("active_gems", active_gems_json),
               ("gem_abilities", gem_abilities_json),
               ("deck_sleeve_guid", deck_sleeve_guid),
-              ("gameboard_guid", gameboard_guid), ("coin_guid", coin_guid))
+              ("gameboard_guid", gameboard_guid), ("coin_guid", coin_guid),
+              ("equipment", equipment_json))
     selected = [(column, value) for column, value in values if value is not None]
     if not selected:
         return False
@@ -1405,15 +1409,190 @@ def db_update_deck(deck_id, user_id, deck_name=None, cards_json=None,
 def db_get_deck_by_id(deck_id, conn=None):
     row = _profile_connection(conn).execute(
         "SELECT id, deck_name, cards, pve_champion_id, pvp_champion_guid, "
-        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid "
+        "active_gems, deck_sleeve_guid, gameboard_guid, coin_guid, equipment "
         "FROM decks WHERE id=?", (deck_id,)).fetchone()
     if not row:
         return None
     fields = ("id", "deck_name", "cards", "pve_champion_id",
               "pvp_champion_guid", "active_gems", "deck_sleeve_guid",
-              "gameboard_guid", "coin_guid")
+              "gameboard_guid", "coin_guid", "equipment")
     return {field: _row_value(row, field, index)
             for index, field in enumerate(fields)}
+
+
+def db_deck_equipment(deck_id, conn=None):
+    """Return a deck's equipped item GUIDs."""
+    row = _profile_connection(conn).execute(
+        "SELECT equipment FROM decks WHERE id=?", (int(deck_id),)).fetchone()
+    try:
+        value = json.loads(_row_value(row, "equipment", 0) or "[]") if row else []
+    except (TypeError, ValueError):
+        return []
+    return [str(guid).lower() for guid in value] if isinstance(value, list) else []
+
+
+# ── Wheels of Fate chest state ────────────────────────────────────────
+
+def db_chest_spin_state(chest_db_id, conn=None):
+    """Return ``(wof_spun, wof_status)`` of a treasure chest row."""
+    row = _profile_connection(conn).execute(
+        "SELECT wof_spun, wof_status FROM treasure_chests WHERE id=?",
+        (int(chest_db_id),)).fetchone()
+    if not row:
+        return 0, 0
+    return (int(_row_value(row, "wof_spun", 0) or 0),
+            int(_row_value(row, "wof_status", 1) or 0))
+
+
+def db_save_chest_spin(chest_db_id, spin_status, chest_rarity, conn=None):
+    """Record a Wheels of Fate spin: the re-spin it left and the new rarity."""
+    _profile_connection(conn).execute(
+        "UPDATE treasure_chests SET wof_spun=1, wof_status=?, chest_rarity=? "
+        "WHERE id=?", (int(spin_status), chest_rarity, int(chest_db_id)))
+
+
+def db_booster_packs_for_set(set_guid, conn=None):
+    """The set's standard booster pack GUIDs (not full-set or Primal packs)."""
+    return [_row_value(row, "pack_guid", 0) for row in _profile_connection(conn).execute(
+        "SELECT pack_guid FROM pack_set_map WHERE set_guid=? "
+        "AND is_full_set=0 AND is_primal=0 ORDER BY pack_guid",
+        (set_guid,)).fetchall()]
+
+
+# ── Mercenary parties and profile deck templates ──────────────────────
+
+def db_champion_party_rows(user_id, conn=None):
+    """Return the stored ChampionParty JSON strings of a player."""
+    return [_row_value(row, "party_json", 0) for row in _profile_connection(conn).execute(
+        "SELECT party_json FROM champion_parties WHERE user_id=? "
+        "ORDER BY champion_id", (user_id,)).fetchall()]
+
+
+def db_save_champion_party(champion_id, user_id, party_json, conn=None):
+    _profile_connection(conn).execute(
+        "INSERT INTO champion_parties (champion_id, user_id, party_json) "
+        "VALUES (?,?,?) ON CONFLICT(champion_id) DO UPDATE SET "
+        "user_id=excluded.user_id, party_json=excluded.party_json",
+        (int(champion_id), user_id, party_json))
+
+
+_DECK_TEMPLATE_COLUMNS = ("id", "name", "champion_guid", "sleeve_guid",
+                          "gameboard_guid", "personality", "equipment_json",
+                          "updated_at")
+_DECK_TEMPLATE_CARD_COLUMNS = ("card_guid", "quantity", "gem_types_list_json",
+                               "flags_json")
+_DECK_TEMPLATE_LOCK = threading.RLock()
+
+
+@contextmanager
+def _deck_template_transaction(conn=None):
+    """Serialize a template write on the shared connection and commit it atomically."""
+    connection = _profile_connection(conn)
+    lock = getattr(connection, "_retry_lock", _DECK_TEMPLATE_LOCK)
+    with lock:
+        owns_transaction = not getattr(connection, "in_transaction", False)
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+            if owns_transaction:
+                connection.commit()
+        except BaseException:
+            if owns_transaction:
+                connection.rollback()
+            raise
+
+
+def _deck_template_cards(connection, template_id):
+    return [{column: _row_value(row, column, index)
+             for index, column in enumerate(_DECK_TEMPLATE_CARD_COLUMNS)}
+            for row in connection.execute(
+                "SELECT card_guid, quantity, gem_types_list_json, flags_json "
+                "FROM player_deck_template_cards WHERE template_id=? "
+                "ORDER BY rowid", (int(template_id),)).fetchall()]
+
+
+def _deck_template_row(connection, row):
+    template = {column: _row_value(row, column, index)
+                for index, column in enumerate(_DECK_TEMPLATE_COLUMNS)}
+    template["cards"] = _deck_template_cards(connection, template["id"])
+    return template
+
+
+def db_profile_deck_templates(user_id, conn=None):
+    """Return a player's deck templates: column dicts, each with ``cards``
+    (``card_guid, quantity, gem_types_list_json, flags_json`` dicts)."""
+    connection = _profile_connection(conn)
+    rows = connection.execute(
+        f"SELECT {', '.join(_DECK_TEMPLATE_COLUMNS)} FROM player_deck_templates "
+        "WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
+    return [_deck_template_row(connection, row) for row in rows]
+
+
+def db_profile_deck_template(user_id, template_id, conn=None):
+    """Return one of a player's deck templates (as above) or None."""
+    connection = _profile_connection(conn)
+    row = connection.execute(
+        f"SELECT {', '.join(_DECK_TEMPLATE_COLUMNS)} FROM player_deck_templates "
+        "WHERE id=? AND user_id=?", (int(template_id or 0), user_id)).fetchone()
+    return _deck_template_row(connection, row) if row else None
+
+
+def db_save_profile_deck_template(user_id, template_id, columns, card_rows,
+                                  conn=None):
+    """Insert or update a deck template and replace its cards atomically.
+
+    ``columns`` holds name, champion_guid, sleeve_guid, gameboard_guid,
+    personality and equipment_json; ``card_rows`` are ``(card_guid, quantity,
+    gem_types_list_json, flags_json)``.  Returns the template id.
+    """
+    names = ("name", "champion_guid", "sleeve_guid", "gameboard_guid",
+             "personality", "equipment_json")
+    values = tuple(columns.get(name, "{}" if name == "equipment_json" else "")
+                   for name in names)
+    with _deck_template_transaction(conn) as connection:
+        existing = template_id and connection.execute(
+            "SELECT 1 FROM player_deck_templates WHERE id=? AND user_id=?",
+            (int(template_id), user_id)).fetchone()
+        if existing:
+            template_id = int(template_id)
+            connection.execute(
+                f"UPDATE player_deck_templates SET "
+                f"{', '.join(f'{name}=?' for name in names)}, "
+                "updated_at=datetime('now') WHERE id=?",
+                values + (template_id,))
+            connection.execute(
+                "DELETE FROM player_deck_template_cards WHERE template_id=?",
+                (template_id,))
+        else:
+            template_id = connection.execute(
+                f"INSERT INTO player_deck_templates (user_id, {', '.join(names)}) "
+                f"VALUES (?{',?' * len(names)})", (user_id,) + values).lastrowid
+        connection.executemany(
+            "INSERT INTO player_deck_template_cards (template_id, card_guid, "
+            "quantity, gem_types_list_json, flags_json) VALUES (?,?,?,?,?)",
+            [(template_id,) + tuple(row) for row in card_rows])
+    return template_id
+
+
+def db_delete_profile_deck_template(user_id, template_id, conn=None):
+    with _deck_template_transaction(conn) as connection:
+        if connection.execute(
+                "SELECT 1 FROM player_deck_templates WHERE id=? AND user_id=?",
+                (int(template_id or 0), user_id)).fetchone():
+            connection.execute(
+                "DELETE FROM player_deck_template_cards WHERE template_id=?",
+                (int(template_id),))
+            connection.execute(
+                "DELETE FROM player_deck_templates WHERE id=?",
+                (int(template_id),))
+
+
+def db_card_template_named(name, conn=None):
+    """True when a card template has this name (case-insensitive)."""
+    return _profile_connection(conn).execute(
+        "SELECT 1 FROM card_templates WHERE lower(name)=lower(?) LIMIT 1",
+        (str(name),)).fetchone() is not None
 
 
 def db_find_deck_owner(deck_id, conn=None):

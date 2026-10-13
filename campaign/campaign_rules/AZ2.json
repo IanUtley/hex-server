@@ -1,0 +1,641 @@
+{
+ "schema_version": 1,
+ "campaign": "AZ2",
+ "scene": "The Alachian Sea",
+ "generated_by": "campaign/tools/campaign_editor/import_az2_rules.py",
+ "runtime": "rules",
+ "start": {
+  "node": "Node099",
+  "node_completed": false,
+  "flags": []
+ },
+ "map": {
+  "paths": [
+   {
+    "id": "Path_Node001_Node003",
+    "from": "Node001",
+    "to": "Node003"
+   },
+   {
+    "id": "Path_Node001_Node005",
+    "from": "Node001",
+    "to": "Node005"
+   },
+   {
+    "id": "Path_Node001_Node057",
+    "from": "Node001",
+    "to": "Node057"
+   },
+   {
+    "id": "Path_Node001_Node099",
+    "from": "Node001",
+    "to": "Node099"
+   },
+   {
+    "id": "Path_Node002_Node057",
+    "from": "Node002",
+    "to": "Node057"
+   },
+   {
+    "id": "Path_Node003_Node057",
+    "from": "Node003",
+    "to": "Node057"
+   },
+   {
+    "id": "Path_Node004_Node008",
+    "from": "Node004",
+    "to": "Node008"
+   },
+   {
+    "id": "Path_Node004_Node009",
+    "from": "Node004",
+    "to": "Node009"
+   },
+   {
+    "id": "Path_Node005_Node006",
+    "from": "Node005",
+    "to": "Node006"
+   },
+   {
+    "id": "Path_Node005_Node008",
+    "from": "Node005",
+    "to": "Node008"
+   },
+   {
+    "id": "Path_Node006_Node007",
+    "from": "Node006",
+    "to": "Node007"
+   },
+   {
+    "id": "Path_Node009_Node010",
+    "from": "Node009",
+    "to": "Node010"
+   },
+   {
+    "id": "Path_Node00B_NodeB01",
+    "from": "Node00B",
+    "to": "NodeB01"
+   },
+   {
+    "id": "Path_Node00B_NodeB02",
+    "from": "Node00B",
+    "to": "NodeB02"
+   },
+   {
+    "id": "Path_Node00B_NodeB03",
+    "from": "Node00B",
+    "to": "NodeB03"
+   },
+   {
+    "id": "Path_Node00Z_Node099",
+    "from": "Node00Z",
+    "to": "Node099"
+   },
+   {
+    "id": "Path_Node010_Node011",
+    "from": "Node010",
+    "to": "Node011"
+   },
+   {
+    "id": "Path_Node011_Node012",
+    "from": "Node011",
+    "to": "Node012"
+   },
+   {
+    "id": "Path_Node012_Node013",
+    "from": "Node012",
+    "to": "Node013"
+   },
+   {
+    "id": "Path_Node012_Node014",
+    "from": "Node012",
+    "to": "Node014"
+   },
+   {
+    "id": "Path_Node013_Node017",
+    "from": "Node013",
+    "to": "Node017"
+   },
+   {
+    "id": "Path_Node014_Node015",
+    "from": "Node014",
+    "to": "Node015"
+   },
+   {
+    "id": "Path_Node015_Node016",
+    "from": "Node015",
+    "to": "Node016"
+   },
+   {
+    "id": "Path_Node016_Node017",
+    "from": "Node016",
+    "to": "Node017"
+   },
+   {
+    "id": "Path_Node016_Node023",
+    "from": "Node016",
+    "to": "Node023"
+   },
+   {
+    "id": "Path_Node017_Node023",
+    "from": "Node017",
+    "to": "Node023"
+   },
+   {
+    "id": "Path_Node018_Node022",
+    "from": "Node018",
+    "to": "Node022"
+   },
+   {
+    "id": "Path_Node018_Node024",
+    "from": "Node018",
+    "to": "Node024"
+   },
+   {
+    "id": "Path_Node018_Node027",
+    "from": "Node018",
+    "to": "Node027"
+   },
+   {
+    "id": "Path_Node018_Node028",
+    "from": "Node018",
+    "to": "Node028"
+   },
+   {
+    "id": "Path_Node019_Node019B",
+    "from": "Node019",
+    "to": "Node019B"
+   },
+   {
+    "id": "Path_Node019_Node023",
+    "from": "Node019",
+    "to": "Node023"
+   },
+   {
+    "id": "Path_Node020_Node021",
+    "from": "Node020",
+    "to": "Node021"
+   },
+   {
+    "id": "Path_Node020_Node023",
+    "from": "Node020",
+    "to": "Node023"
+   },
+   {
+    "id": "Path_Node021_Node022",
+    "from": "Node021",
+    "to": "Node022"
+   },
+   {
+    "id": "Path_Node023_Node025",
+    "from": "Node023",
+    "to": "Node025"
+   },
+   {
+    "id": "Path_Node024_Node025",
+    "from": "Node024",
+    "to": "Node025"
+   },
+   {
+    "id": "Path_Node024_Node026",
+    "from": "Node024",
+    "to": "Node026"
+   },
+   {
+    "id": "Path_Node028_Node029",
+    "from": "Node028",
+    "to": "Node029"
+   },
+   {
+    "id": "Path_Node029_Node030",
+    "from": "Node029",
+    "to": "Node030"
+   },
+   {
+    "id": "Path_Node030_Node031",
+    "from": "Node030",
+    "to": "Node031"
+   },
+   {
+    "id": "Path_Node031_Node032",
+    "from": "Node031",
+    "to": "Node032"
+   },
+   {
+    "id": "Path_Node031_Node033",
+    "from": "Node031",
+    "to": "Node033"
+   },
+   {
+    "id": "Path_Node032_Node057",
+    "from": "Node032",
+    "to": "Node057"
+   },
+   {
+    "id": "Path_Node033_Node034",
+    "from": "Node033",
+    "to": "Node034"
+   },
+   {
+    "id": "Path_Node033_Node042",
+    "from": "Node033",
+    "to": "Node042"
+   },
+   {
+    "id": "Path_Node034_Node035",
+    "from": "Node034",
+    "to": "Node035"
+   },
+   {
+    "id": "Path_Node035_Node036",
+    "from": "Node035",
+    "to": "Node036"
+   },
+   {
+    "id": "Path_Node035_Node056",
+    "from": "Node035",
+    "to": "Node056"
+   },
+   {
+    "id": "Path_Node036_Node037",
+    "from": "Node036",
+    "to": "Node037"
+   },
+   {
+    "id": "Path_Node037_Node038",
+    "from": "Node037",
+    "to": "Node038"
+   },
+   {
+    "id": "Path_Node038_Node039",
+    "from": "Node038",
+    "to": "Node039"
+   },
+   {
+    "id": "Path_Node039_Node040",
+    "from": "Node039",
+    "to": "Node040"
+   },
+   {
+    "id": "Path_Node040_Node041",
+    "from": "Node040",
+    "to": "Node041"
+   },
+   {
+    "id": "Path_Node042_Node043",
+    "from": "Node042",
+    "to": "Node043"
+   },
+   {
+    "id": "Path_Node042_Node049",
+    "from": "Node042",
+    "to": "Node049"
+   },
+   {
+    "id": "Path_Node043_Node044",
+    "from": "Node043",
+    "to": "Node044"
+   },
+   {
+    "id": "Path_Node044_Node045",
+    "from": "Node044",
+    "to": "Node045"
+   },
+   {
+    "id": "Path_Node045_Node046",
+    "from": "Node045",
+    "to": "Node046"
+   },
+   {
+    "id": "Path_Node046_Node047",
+    "from": "Node046",
+    "to": "Node047"
+   },
+   {
+    "id": "Path_Node047_Node048",
+    "from": "Node047",
+    "to": "Node048"
+   },
+   {
+    "id": "Path_Node049_Node050",
+    "from": "Node049",
+    "to": "Node050"
+   },
+   {
+    "id": "Path_Node050_Node051",
+    "from": "Node050",
+    "to": "Node051"
+   },
+   {
+    "id": "Path_Node050_Node052",
+    "from": "Node050",
+    "to": "Node052"
+   },
+   {
+    "id": "Path_Node050_Node055",
+    "from": "Node050",
+    "to": "Node055"
+   },
+   {
+    "id": "Path_Node051_Node054",
+    "from": "Node051",
+    "to": "Node054"
+   },
+   {
+    "id": "Path_Node052_Node053",
+    "from": "Node052",
+    "to": "Node053"
+   },
+   {
+    "id": "Path_NodeB01_NodeB02",
+    "from": "NodeB01",
+    "to": "NodeB02"
+   },
+   {
+    "id": "Path_NodeB01_NodeB04",
+    "from": "NodeB01",
+    "to": "NodeB04"
+   },
+   {
+    "id": "Path_NodeB02_NodeB03",
+    "from": "NodeB02",
+    "to": "NodeB03"
+   },
+   {
+    "id": "Path_NodeB02_NodeB05",
+    "from": "NodeB02",
+    "to": "NodeB05"
+   },
+   {
+    "id": "Path_NodeB03_NodeB06",
+    "from": "NodeB03",
+    "to": "NodeB06"
+   },
+   {
+    "id": "Path_NodeB03_NodeB07",
+    "from": "NodeB03",
+    "to": "NodeB07"
+   },
+   {
+    "id": "Path_NodeB04_NodeB08",
+    "from": "NodeB04",
+    "to": "NodeB08"
+   },
+   {
+    "id": "Path_NodeB04_NodeB09",
+    "from": "NodeB04",
+    "to": "NodeB09"
+   },
+   {
+    "id": "Path_NodeB04_NodeB18",
+    "from": "NodeB04",
+    "to": "NodeB18"
+   },
+   {
+    "id": "Path_NodeB05_NodeB06",
+    "from": "NodeB05",
+    "to": "NodeB06"
+   },
+   {
+    "id": "Path_NodeB05_NodeB10",
+    "from": "NodeB05",
+    "to": "NodeB10"
+   },
+   {
+    "id": "Path_NodeB05_NodeB13",
+    "from": "NodeB05",
+    "to": "NodeB13"
+   },
+   {
+    "id": "Path_NodeB06_NodeB07",
+    "from": "NodeB06",
+    "to": "NodeB07"
+   },
+   {
+    "id": "Path_NodeB06_NodeB14",
+    "from": "NodeB06",
+    "to": "NodeB14"
+   },
+   {
+    "id": "Path_NodeB08_NodeB11",
+    "from": "NodeB08",
+    "to": "NodeB11"
+   },
+   {
+    "id": "Path_NodeB09_NodeB10",
+    "from": "NodeB09",
+    "to": "NodeB10"
+   },
+   {
+    "id": "Path_NodeB09_NodeB11",
+    "from": "NodeB09",
+    "to": "NodeB11"
+   },
+   {
+    "id": "Path_NodeB09_NodeB12",
+    "from": "NodeB09",
+    "to": "NodeB12"
+   },
+   {
+    "id": "Path_NodeB0X_NodeB17",
+    "from": "NodeB0X",
+    "to": "NodeB17"
+   },
+   {
+    "id": "Path_NodeB10_NodeB18",
+    "from": "NodeB10",
+    "to": "NodeB18"
+   },
+   {
+    "id": "Path_NodeB11_NodeB15",
+    "from": "NodeB11",
+    "to": "NodeB15"
+   },
+   {
+    "id": "Path_NodeB12_NodeB15",
+    "from": "NodeB12",
+    "to": "NodeB15"
+   },
+   {
+    "id": "Path_NodeB13_NodeB14",
+    "from": "NodeB13",
+    "to": "NodeB14"
+   },
+   {
+    "id": "Path_NodeB13_NodeB15",
+    "from": "NodeB13",
+    "to": "NodeB15"
+   },
+   {
+    "id": "Path_NodeB13_NodeB16",
+    "from": "NodeB13",
+    "to": "NodeB16"
+   },
+   {
+    "id": "Path_NodeB14_NodeB17",
+    "from": "NodeB14",
+    "to": "NodeB17"
+   },
+   {
+    "id": "Path_NodeB16_NodeB17",
+    "from": "NodeB16",
+    "to": "NodeB17"
+   }
+  ]
+ },
+ "nodes": {
+  "Node003": {
+   "completed": {
+    "flag": "tamed:150b0ed9"
+   }
+  },
+  "Node009": {
+   "completed": {
+    "flag": "tamed:ddf8a2da"
+   }
+  },
+  "Node032": {
+   "completed": {
+    "flag": "tamed:f6f3074b"
+   }
+  },
+  "Node039": {
+   "completed": {
+    "flag": "tamed:40cdd2b7"
+   }
+  },
+  "Node052": {
+   "completed": {
+    "flag": "tamed:06c14db8"
+   }
+  }
+ },
+ "hooks": [
+  {
+   "id": "battle:0b1d5244:Diff_6",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef",
+    "events": "Diff_6"
+   },
+   "do": [
+    {
+     "set_flag": "battle:0b1d5244:Diff_6"
+    }
+   ]
+  },
+  {
+   "id": "tamed:150b0ed9",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "150b0ed9-a5e0-4729-81d8-764fa237c4e4",
+    "events": "tamed_troop"
+   },
+   "do": [
+    {
+     "set_flag": "tamed:150b0ed9"
+    }
+   ]
+  },
+  {
+   "id": "tamed:ddf8a2da",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "ddf8a2da-d397-4c3b-9d32-729f1bc86ade",
+    "events": "tamed_troop"
+   },
+   "do": [
+    {
+     "set_flag": "tamed:ddf8a2da"
+    }
+   ]
+  },
+  {
+   "id": "scene:4fdae899:pre",
+   "on": {
+    "event": "encounter_start",
+    "scene": "4fdae899-9ed2-41a2-922e-f073ac69ffb2"
+   },
+   "do": [
+    {
+     "clear_flag": "romor_*"
+    }
+   ]
+  },
+  {
+   "id": "scene:bc3361b6:victory",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "bc3361b6-955a-4a48-bffa-b28b0513a489"
+   },
+   "do": [
+    {
+     "set_flag": "blockade_cleared"
+    }
+   ]
+  },
+  {
+   "id": "scene:e59c5cac:victory",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "e59c5cac-be7a-4bc3-a5b5-0c5ca86c73b6"
+   },
+   "do": [
+    {
+     "set_flag": "blockade_cleared"
+    }
+   ]
+  },
+  {
+   "id": "tamed:f6f3074b",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "f6f3074b-a416-4400-9b74-20d72406a846",
+    "events": "tamed_troop"
+   },
+   "do": [
+    {
+     "set_flag": "tamed:f6f3074b"
+    }
+   ]
+  },
+  {
+   "id": "tamed:40cdd2b7",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "40cdd2b7-928a-47b8-8595-ed095b1f9e75",
+    "events": "tamed_troop"
+   },
+   "do": [
+    {
+     "set_flag": "tamed:40cdd2b7"
+    }
+   ]
+  },
+  {
+   "id": "tamed:06c14db8",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "06c14db8-675d-4745-b4e6-f9bc4f919b61",
+    "events": "tamed_troop"
+   },
+   "do": [
+    {
+     "set_flag": "tamed:06c14db8"
+    }
+   ]
+  },
+  {
+   "id": "scene:0b1d5244:victory",
+   "on": {
+    "event": "encounter_victory",
+    "scene": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef"
+   },
+   "do": [
+    {
+     "set_flag": "battle:0b1d5244:Diff_0"
+    }
+   ]
+  }
+ ]
+}
