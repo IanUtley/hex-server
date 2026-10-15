@@ -168,8 +168,12 @@ class EditorHandler(BaseHTTPRequestHandler):
                 # The campaign row and last-campaign pointer follow so the
                 # client opens in this zone when the character next loads.
                 runtime.activate_zone(db, champ_id, zone_id)
+                # The QUEST rows are not part of the zone row: bring them level
+                # with the imported quests so the journal matches the engine.
+                from campaign_runtime import quests
+                journal = quests.reproject(db, champ_id, campaign_part.get("quests") or {})
                 db.commit()
-        return {"saved": True, "champion": champ_id, "zone": zone_id}
+        return {"saved": True, "champion": champ_id, "zone": zone_id, "journal": journal}
 
     def _me(self):
         if not self.session:
@@ -402,19 +406,24 @@ class EditorHandler(BaseHTTPRequestHandler):
                 self._json({"personality": personality})
                 return
             if url.path == "/api/edit/scene-player":
-                chosen = self._with_db(lambda db: editing.save_scene_player(
-                    db, str(body["scene"]), body.get("champion") or None,
-                    body.get("deck") or None))
+                # These saves UPDATE the database row too, so they need the
+                # writable connection (the request connection is read-only).
+                with closing(self._writable()) as db:
+                    chosen = editing.save_scene_player(
+                        db, str(body["scene"]), body.get("champion") or None,
+                        body.get("deck") or None)
                 self._json(chosen)
                 return
             if url.path == "/api/edit/scene-gameboard":
-                gameboard = self._with_db(lambda db: editing.save_scene_gameboard(
-                    db, str(body["scene"]), body.get("gameboard")))
+                with closing(self._writable()) as db:
+                    gameboard = editing.save_scene_gameboard(
+                        db, str(body["scene"]), body.get("gameboard"))
                 self._json({"gameboard": gameboard})
                 return
             if url.path == "/api/edit/scene-mods":
-                mods = self._with_db(lambda db: editing.save_scene_mods(
-                    db, str(body["scene"]), body.get("mods") or []))
+                with closing(self._writable()) as db:
+                    mods = editing.save_scene_mods(
+                        db, str(body["scene"]), body.get("mods") or [])
                 self._json({"mods": mods})
                 return
             if url.path == "/api/edit/quest-rewards":

@@ -259,6 +259,7 @@ h4 { margin: 10px 0 2px; font-size: 12px; color: var(--muted); text-transform: u
 .account { display: inline-flex; gap: 6px; align-items: center; margin-left: auto; }
 .account #account-name { font-size: 12px; opacity: 0.85; }
 #login form { display: flex; flex-direction: column; gap: 8px; min-width: 300px; }
+#login .field { flex-direction: column; align-items: flex-start; text-align: left; }
 
 /* Non-admin accounts can inspect shared content and simulate character state,
    but campaign-authorship controls are not part of their UI. */

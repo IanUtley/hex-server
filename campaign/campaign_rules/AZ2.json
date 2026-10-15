@@ -484,158 +484,17 @@
   ]
  },
  "nodes": {
-  "Node003": {
-   "completed": {
-    "flag": "tamed:150b0ed9"
-   }
-  },
-  "Node009": {
-   "completed": {
-    "flag": "tamed:ddf8a2da"
-   }
-  },
   "Node032": {
-   "completed": {
-    "flag": "tamed:f6f3074b"
-   }
-  },
-  "Node039": {
-   "completed": {
-    "flag": "tamed:40cdd2b7"
-   }
-  },
-  "Node052": {
-   "completed": {
-    "flag": "tamed:06c14db8"
-   }
+   "visible": [
+    "completedQuest(q_brutecrown_bluff)"
+   ]
   }
  },
- "hooks": [
-  {
-   "id": "battle:0b1d5244:Diff_6",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef",
-    "events": "Diff_6"
-   },
-   "do": [
-    {
-     "set_flag": "battle:0b1d5244:Diff_6"
-    }
-   ]
-  },
-  {
-   "id": "tamed:150b0ed9",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "150b0ed9-a5e0-4729-81d8-764fa237c4e4",
-    "events": "tamed_troop"
-   },
-   "do": [
-    {
-     "set_flag": "tamed:150b0ed9"
-    }
-   ]
-  },
-  {
-   "id": "tamed:ddf8a2da",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "ddf8a2da-d397-4c3b-9d32-729f1bc86ade",
-    "events": "tamed_troop"
-   },
-   "do": [
-    {
-     "set_flag": "tamed:ddf8a2da"
-    }
-   ]
-  },
-  {
-   "id": "scene:4fdae899:pre",
-   "on": {
-    "event": "encounter_start",
-    "scene": "4fdae899-9ed2-41a2-922e-f073ac69ffb2"
-   },
-   "do": [
-    {
-     "clear_flag": "romor_*"
-    }
-   ]
-  },
-  {
-   "id": "scene:bc3361b6:victory",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "bc3361b6-955a-4a48-bffa-b28b0513a489"
-   },
-   "do": [
-    {
-     "set_flag": "blockade_cleared"
-    }
-   ]
-  },
-  {
-   "id": "scene:e59c5cac:victory",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "e59c5cac-be7a-4bc3-a5b5-0c5ca86c73b6"
-   },
-   "do": [
-    {
-     "set_flag": "blockade_cleared"
-    }
-   ]
-  },
-  {
-   "id": "tamed:f6f3074b",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "f6f3074b-a416-4400-9b74-20d72406a846",
-    "events": "tamed_troop"
-   },
-   "do": [
-    {
-     "set_flag": "tamed:f6f3074b"
-    }
-   ]
-  },
-  {
-   "id": "tamed:40cdd2b7",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "40cdd2b7-928a-47b8-8595-ed095b1f9e75",
-    "events": "tamed_troop"
-   },
-   "do": [
-    {
-     "set_flag": "tamed:40cdd2b7"
-    }
-   ]
-  },
-  {
-   "id": "tamed:06c14db8",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "06c14db8-675d-4745-b4e6-f9bc4f919b61",
-    "events": "tamed_troop"
-   },
-   "do": [
-    {
-     "set_flag": "tamed:06c14db8"
-    }
-   ]
-  },
-  {
-   "id": "scene:0b1d5244:victory",
-   "on": {
-    "event": "encounter_victory",
-    "scene": "0b1d5244-e9f6-46ec-bb06-73c36801f5ef"
-   },
-   "do": [
-    {
-     "set_flag": "battle:0b1d5244:Diff_0"
-    }
-   ]
-  }
- ]
+ "hooks": [],
+ "edited_states": {
+  "Node032": [
+   "visible",
+   "completed"
+  ]
+ }
 }

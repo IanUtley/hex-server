@@ -160,7 +160,10 @@ def test_spell_finish_uses_the_effective_post_resolution_type(db):
     uid = 907001
     original_action = "f0000000-0000-0000-0000-000000000001"
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype, "
+        "variable_cost, variable_cost_minimum, rage_value) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (original_action, "Generated Action", "BasicAction", 1, 0, 0, 0,
          "[]", "[]", "", 0, 0, 0))
     add_card(
@@ -339,11 +342,18 @@ def test_brood_creeper_does_not_fire_on_own_champion(db):
     pl_t, ai_t = _pl_ai()
     game = game_engine.Game(1, pl_t, ai_t)
     handler = HandlerStub(db)
-    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
     ai_champ_uid = int(handler._ai_champ_scid.uid.uid64)
-    resolve_triggers(db, handler, game, SessionStub(), pl_t, ai_t, bstate,
-                     "CardDealtDamageEvent", 101, 0,
-                     extra_target=ai_champ_uid)
+    # The controller gate needs each champion's owner, as in a live battle.
+    bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+              "champ_map": {"0": ai_champ_uid,
+                            "5": int(handler._player_champ_scid.uid.uid64)}}
+    from rules_port.triggers import dispatch_native_trigger
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=SessionStub(),
+        player_uid=pl_t, ai_uid=ai_t, battle_state=bstate,
+        event_type="CardDealtDamageEvent", source_card_id=101,
+        source_player_id=0, target_card_id=ai_champ_uid,
+        target_player_id=0)  # the damaged champion's owner (the AI)
     assert not (bstate.get("stack") or []), "own-champion hit must not fire"
 
 
@@ -729,7 +739,6 @@ def test_countermagic_offered_in_ai_chain_window(db):
     import db as dbmod
     _copy_card(db, TPL_COUNTERMAGIC)
     _copy_card(db, TPL_SPAWN)
-    db.execute("ALTER TABLE card_templates ADD COLUMN sacrifice_target TEXT DEFAULT ''")
     db.commit()
     add_card(db, 101, 5, TPL_COUNTERMAGIC, loc="hand")
     add_card(db, 202, 0, TPL_SPAWN, loc="CastSpells")  # AI troop on the chain
@@ -1311,18 +1320,20 @@ def test_champion_power_offer_requires_its_authored_cost_and_target(db):
                 "filter_json, target_kind FROM target_templates "
                 "WHERE template_id=?", (tid,)).fetchone()
             assert row, tid
-            db.execute("INSERT INTO target_templates VALUES "
+            db.execute("INSERT OR REPLACE INTO target_templates VALUES "
                        "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
     finally:
         src.close()
-    db.execute("CREATE TABLE talent_abilities (ability_guid TEXT, "
+    db.execute("CREATE TABLE IF NOT EXISTS talent_abilities (ability_guid TEXT, "
                "charge_cost INTEGER, spell_cost INTEGER, "
                "activatable_phases INTEGER, casting_behavior INTEGER)")
-    db.execute("CREATE TABLE champion_abilities (ability_guid TEXT, "
+    db.execute("CREATE TABLE IF NOT EXISTS champion_abilities (ability_guid TEXT, "
                "charge_cost INTEGER, spell_cost INTEGER, "
                "casting_behavior INTEGER, thresholds_json TEXT)")
-    db.execute("INSERT INTO champion_abilities VALUES (?,?,?,?,?)",
-               (ability_guid, 3, 0, game_engine.ECardTypes.BasicAction,
+    db.execute("INSERT OR REPLACE INTO champion_abilities (champion_guid, "
+               "champion_name, ability_guid, charge_cost, spell_cost, "
+               "casting_behavior, thresholds_json) VALUES (?,?,?,?,?,?,?)",
+               ("", "", ability_guid, 3, 0, game_engine.ECardTypes.BasicAction,
                 json.dumps([{"color": "Blood", "quantity": 1}])))
     add_card(db, 501, 5, TPL_GLADIATOR, loc="underground")
     add_card(db, 601, 0, TPL_GLADIATOR, loc="warzone")
@@ -1461,7 +1472,7 @@ def test_summon_zero_count_does_not_crash(db):
     from tests.tests_cards_fixes import _copy_card
     _copy_card(db, "a9ebe40e-ef30-4c9e-b4dd-1b414dc35d0c")  # Spiderspawn
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, is_triggered, "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, "
         "trigger_event_type, game_text, raw_json, casting_behavior, is_manual, "
         "activation_cost, uses_per_game, uses_per_turn, target_template_ids, "
         "exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1777,7 +1788,6 @@ def test_void_leaf_publishes_the_voided_troops_stats(db):
     hopper = "fe2472ed-4ff8-455b-8b18-b7e0033cd896"      # Battle Hopper 0/1
     # The focused fixture predates the combat columns the static card reader
     # needs (same workaround as the Lethal test in tests_combat).
-    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
     _copy_card(db, hopper)
     _copy_ability(db, charge_power)
     add_card(db, 901, 5, hopper, loc="discard")          # a troop in a crypt
@@ -1978,11 +1988,11 @@ def test_pvp_champion_trigger_discovery_uses_raw_participant_id(db):
         "thresholds_json TEXT DEFAULT '[]', "
         "target_template_ids TEXT DEFAULT '[]')")
     db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "INSERT OR REPLACE INTO champion_abilities (champion_guid, champion_name, "
         "ability_guid) VALUES (?,?,?)",
         (champion_guid, "Corinth the Iconoclast", ability_guid))
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, trigger_event_type) "
         "VALUES (?,?)",
         (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
     add_card(db, 9001, 1001, champion_guid, loc="warzone")
@@ -2024,11 +2034,11 @@ def test_pvp_champion_trigger_condition_uses_raw_participant_owner(db):
         "thresholds_json TEXT DEFAULT '[]', "
         "target_template_ids TEXT DEFAULT '[]')")
     db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "INSERT OR REPLACE INTO champion_abilities (champion_guid, champion_name, "
         "ability_guid) VALUES (?,?,?)",
         (champion_guid, "Corinth the Iconoclast", ability_guid))
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, trigger_event_type) "
         "VALUES (?,?)",
         (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
     add_card(db, 9001, 1001, champion_guid, loc="champion")
@@ -2091,11 +2101,11 @@ def test_shifted_paradigm_never_moves_champion_when_crypt_empty(db):
         "thresholds_json TEXT DEFAULT '[]', "
         "target_template_ids TEXT DEFAULT '[]')")
     db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "INSERT OR REPLACE INTO champion_abilities (champion_guid, champion_name, "
         "ability_guid) VALUES (?,?,?)",
         (champion_guid, "Corinth the Iconoclast", ability_guid))
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, trigger_event_type) "
         "VALUES (?,?)",
         (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
     add_card(db, 9001, 1001, champion_guid, loc="champion")
@@ -2164,11 +2174,11 @@ def test_corinth_end_of_turn_ability_resolves_inline(db):
         "thresholds_json TEXT DEFAULT '[]', "
         "target_template_ids TEXT DEFAULT '[]')")
     db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "INSERT OR REPLACE INTO champion_abilities (champion_guid, champion_name, "
         "ability_guid) VALUES (?,?,?)",
         (champion_guid, "Corinth the Iconoclast", ability_guid))
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, trigger_event_type) "
         "VALUES (?,?)",
         (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
     add_card(db, 9001, 1001, champion_guid, loc="champion")
@@ -2241,11 +2251,11 @@ def test_native_chain_resolves_trigger_without_legacy_fallback(db):
         "thresholds_json TEXT DEFAULT '[]', "
         "target_template_ids TEXT DEFAULT '[]')")
     db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
+        "INSERT OR REPLACE INTO champion_abilities (champion_guid, champion_name, "
         "ability_guid) VALUES (?,?,?)",
         (champion_guid, "Corinth the Iconoclast", ability_guid))
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, trigger_event_type) "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, trigger_event_type) "
         "VALUES (?,?)",
         (ability_guid, "Game.Shared.Mechanics.TurnEndedEvent"))
     add_card(db, 9001, 1001, champion_guid, loc="champion")
@@ -2402,7 +2412,7 @@ def test_triggered_chance_branch_stores_the_entering_troop(db):
     add_card(db, troop, 5, TPL_GLADIATOR)
     condition = DEFAULT_RECORD_STORE.get(
         "AbilityEffectConditionTemplate", COND_PSYCHOTIC_CHANCE)
-    db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+    db.execute("INSERT OR REPLACE INTO ability_effect_conditions VALUES (?,?,?)",
                (COND_PSYCHOTIC_CHANCE, condition.field("m_Name"),
                 json.dumps(condition.field("m_Condition").to_dict())))
     db.commit()
@@ -2461,7 +2471,7 @@ def test_triggered_attribute_grant_persists_the_speed_bit(db):
     add_card(db, troop, 5, TPL_GLADIATOR)
     condition = DEFAULT_RECORD_STORE.get(
         "AbilityEffectConditionTemplate", COND_PSYCHOTIC_CHANCE)
-    db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+    db.execute("INSERT OR REPLACE INTO ability_effect_conditions VALUES (?,?,?)",
                (COND_PSYCHOTIC_CHANCE, condition.field("m_Name"),
                 json.dumps(condition.field("m_Condition").to_dict())))
     db.commit()
@@ -2942,9 +2952,14 @@ def test_damage_marks_the_troop_damaged_this_turn(db):
     state = db.execute(
         "SELECT card_state FROM game_cards WHERE card_uid=201").fetchone()[0]
     assert state & int(game_engine.ECardStates.Damaged), state
+    # Writes through a plain sqlite3 connection do not bump the projection's
+    # write counter (the server's wrapped connection does), so drop the memo.
+    from rules_port import targeting as _targeting
+    _targeting._CARD_MEMO.clear()
     assert damaged_targets() == {201}
     db_clear_warzone_damage(1, conn=db)
     db.commit()
+    _targeting._CARD_MEMO.clear()
     assert damaged_targets() == set()
 
 
@@ -3338,7 +3353,9 @@ def test_hand_card_shows_its_current_cost(db):
     """The client shows the cost the server last pushed for a hand card;
     board-dependent static costs (Pterobot) must be re-pushed."""
     import hconnect_server as hcs
-    live = hcs._db
+    # The cards and the queries that read them must share the test database.
+    hcs._db = db
+    live = db
     session_id = 97531
     ptero, bot = "bef4c375-71cd-4cd7-a8b6-8f7ef6cf6bad", "02ed9695-207a-4c23-a3f8-13c7b001203d"
     live.execute("DELETE FROM game_cards WHERE session_id=?", (session_id,))

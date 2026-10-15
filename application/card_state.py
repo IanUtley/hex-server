@@ -278,6 +278,9 @@ class CardStateMixin:
         gem_type = _hc.HCPHandler._card_gem_type(
             self, game, scid, gem_instance_id, persisted_gem=persisted_gem)
         display_gems = int(gem_type or 0)
+        _hc.log_req(f"    TEMP-DIAG gems tpl={str(template_guid)[:8]} "  # TEMP-DIAG gems
+                    f"instance={gem_instance_id} persisted={persisted_gem} "
+                    f"resolved={gem_type} display={display_gems}")
         if (display_gems > 0x3FF and
                 not (display_gems & _hc.EMPTY_SOCKET_GEMS)):
             # Older deck saves lost the packed-format flag but retained the

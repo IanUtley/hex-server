@@ -36,125 +36,19 @@ AG_DEATHCRY = "9853659b-89f4-1e16-f940-67bdb37f5729"
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
-    db.execute("""CREATE TABLE game_cards (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id INTEGER, user_id INTEGER, card_uid INTEGER,
-        template_guid TEXT, card_template_id TEXT, location TEXT,
-        position INTEGER, card_state INTEGER, card_abilities TEXT,
-        card_type TEXT, card_attributes INTEGER, is_champion INTEGER DEFAULT 0,
-        temporary_attributes INTEGER DEFAULT 0,
-        card_attack_mod INTEGER, card_defense_mod INTEGER, card_cost_mod INTEGER,
-        cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER,
-        permanent_buffs TEXT DEFAULT '{}', temporary_buffs TEXT DEFAULT '{}',
-        card_uses TEXT DEFAULT '{}', resolved_at INTEGER DEFAULT 0,
-        original_template_guid TEXT DEFAULT '', gems INTEGER DEFAULT 0,
-        original_gems INTEGER)""")
-    db.execute("""CREATE TABLE card_templates (
-        guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
-        defense INTEGER, attributes INTEGER, abilities_json TEXT,
-        threshold_json TEXT, subtype TEXT, variable_cost INTEGER DEFAULT 0,
-        variable_cost_minimum INTEGER DEFAULT 0, rage_value INTEGER DEFAULT 0)""")
-    db.execute("""CREATE TABLE card_counter_templates (
-        template_id TEXT PRIMARY KEY, name TEXT, description TEXT)""")
+    """A disposable copy of the metadata baseline (production schema)."""
     src = sqlite3.connect(SRC)
-    for row in src.execute("SELECT * FROM card_counter_templates"):
-        db.execute(
-            "INSERT OR IGNORE INTO card_counter_templates VALUES (?,?,?)",
-            row)
+    db = sqlite3.connect(":memory:")
+    src.backup(db)
     src.close()
-    db.execute("""CREATE TABLE card_abilities_meta (
-        ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
-        game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
-        is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
-        uses_per_turn INTEGER, target_template_ids TEXT,
-        exhausts_on_use INTEGER DEFAULT 0)""")
-    db.execute("""CREATE TABLE ability_effects (
-        ability_guid TEXT, effect_guid TEXT, effect_order INTEGER,
-        effect_type TEXT, param TEXT, effect_group_id INTEGER DEFAULT 0,
-        condition_id TEXT DEFAULT '', target_index INTEGER DEFAULT -1,
-        effect_instance_id INTEGER DEFAULT -1,
-        contingent_effect_instance_id INTEGER DEFAULT -1,
-        secondary_target_index INTEGER DEFAULT -1,
-        recalculate_targets INTEGER DEFAULT -1,
-        is_optional INTEGER DEFAULT 0,
-        effect_duration TEXT DEFAULT 'Instant',
-        output_variables TEXT DEFAULT '{}')""")
-    db.execute("""CREATE TABLE ability_effect_conditions (
-        condition_id TEXT PRIMARY KEY, name TEXT, condition_json TEXT)""")
-    db.execute("""CREATE TABLE gem_templates (
-        gem_type INTEGER PRIMARY KEY, gem_type_name TEXT, name TEXT,
-        abilities_json TEXT DEFAULT '[]')""")
-    db.execute("""CREATE TABLE target_templates (
-        template_id TEXT PRIMARY KEY, game_text TEXT DEFAULT '',
-        is_auto_target INTEGER DEFAULT 0, is_random_target INTEGER DEFAULT 0,
-        optional INTEGER DEFAULT 0, explicit INTEGER DEFAULT 0,
-        player_filter TEXT DEFAULT '', collection_flags TEXT DEFAULT '',
-        min_target_count INTEGER DEFAULT 1, max_target_count INTEGER DEFAULT 1,
-        filter_json TEXT DEFAULT '{}', target_kind TEXT DEFAULT '')""")
-    src = sqlite3.connect(SRC)
-    for trow in src.execute(
-            "SELECT template_id, game_text, is_auto_target, is_random_target, "
-            "optional, explicit, player_filter, collection_flags, "
-            "min_target_count, max_target_count, filter_json, target_kind "
-            "FROM target_templates WHERE template_id IN "
-            "('eb7e48cd-1c85-813f-6635-d43f50cf7809', "
-            "'0ad94887-419c-9e99-7946-74c4f72cdd2e', "
-            "'c35dd13a-71e2-b244-847a-d887a0666210', "
-            "'190a4d8c-7c2c-10d0-6429-99c5aeb0791f', "
-            # Corinth Shifted Paradigm auto-targets: your hand / your crypt.
-            "'8d16143b-2216-3f1d-5fc9-397f15c9bbb2', "
-            "'b02ed2f0-4f09-6139-ee99-40c6239e2df9')").fetchall():
-        db.execute("INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                   trow)
-    for tpl, name, atk, deff, abjson in (
-            (TPL_GLADIATOR, "Shamed Gladiator", 2, 2,
-             json.dumps([AG_DEPLOY])),
-            (TPL_PRIESTESS, "Darkspire Priestess", 2, 1,
-             json.dumps([AG_DEATHCRY])),
-            (TPL_ENFORCER, "Darkspire Enforcer", 3, 2, "[]")):
-        db.execute(
-            "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (tpl, name, "Troop", 2, atk, deff, 0, abjson, "[]", "", 0, 0, 0))
-    # Copy the gamedata for the two abilities + the deathcry BOM chain from the
-    # live DB so the fixtures are data-driven (not hand-written).
-    bom_abilities = [AG_DEATHCRY,
-                     "7361162f-ed16-fc00-16dd-22517295282b",
-                     "79e4a481-fc29-14c0-4524-5db861bd6f0b",
-                     "cb21843f-2eae-6bd0-e47d-d13b6006e4af",
-                     "37955055-a070-b24e-ada8-ad94e04c1e39"]
-    src_meta = src.execute(
-        "SELECT ability_guid, is_triggered, trigger_event_type, game_text, "
-        "raw_json, casting_behavior, is_manual, activation_cost, "
-        "uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use "
-        "FROM card_abilities_meta WHERE ability_guid IN (%s)"
-        % ",".join("?" * (1 + len(bom_abilities))),
-        [AG_DEPLOY] + bom_abilities).fetchall()
-    for row in src_meta:
-        db.execute(
-            "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            row)
-    marks = ",".join("?" * len(bom_abilities))
-    for row in src.execute(
-            "SELECT ability_guid, effect_guid, effect_order, effect_type, "
-            "param, effect_group_id, condition_id, target_index, "
-            "effect_instance_id, contingent_effect_instance_id, "
-            "secondary_target_index, recalculate_targets, is_optional, "
-            "effect_duration, output_variables "
-            "FROM ability_effects WHERE ability_guid IN (%s) "
-            "ORDER BY ability_guid, effect_order" % marks,
-            bom_abilities).fetchall():
-        db.execute("INSERT INTO ability_effects VALUES "
-                   "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
-    for row in src.execute(
-            "SELECT condition_id, name, condition_json "
-            "FROM ability_effect_conditions WHERE condition_id IN "
-            "('55b776fe-3814-5024-7188-f5a2365379d1', "
-            "'efa80b85-6c74-65d5-ce38-96e0ad626901')").fetchall():
-        db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
-    src.close()
+    db.execute("DELETE FROM game_cards")
+    # The fixture Troop (1 cost, 1/1) that the shared test helpers refer to.
+    db.execute(
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("11111111-1111-1111-1111-111111111111", "Plain Troop", "Troop", 1, 1,
+         1, 0, "[]", "[]", ""))
     db.commit()
     return db
 
@@ -384,9 +278,15 @@ def run_combat(db, player_deck_has_enforcer=False):
     def _capture(game, pl_t2, ai_t2, bstate2):
         captured["game"] = game
 
+    old_ai_db = ai._db
     ai._db = db
-    _capture(resolve_native_combat(handler, SessionStub(), pl_t, ai_t, bstate,
-                                   attackers, blockers), pl_t, ai_t, bstate)
+    try:
+        _capture(resolve_native_combat(handler, SessionStub(), pl_t, ai_t,
+                                       bstate, attackers, blockers),
+                 pl_t, ai_t, bstate)
+    finally:
+        # Restore the module binding: later tests must not read this test's DB.
+        ai._db = old_ai_db
     loc_a = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=101").fetchone()[0]
     loc_b = db.execute(
@@ -838,7 +738,8 @@ def test_ai_turn_chain_pass_resolves_before_resuming_ai(db):
 
     handler._resolve_stack_item.assert_called_once()
     handler._run_ai_turn.assert_called_once_with(
-        session, game_engine.UID.make(244, 5), game_engine.UID.make(3, 1000),
+        session, game_engine.UID.make(244, 5),
+        game_engine.UID.make(game_engine.SERVICE_AI_UID_TYPE, 1000),
         bstate, start_idx=phase_idx + 1)
     assert be.stack_empty(bstate)
     assert "ai_turn_phase_idx" not in bstate
@@ -916,7 +817,7 @@ def test_priestess_deathcry_human_picker(db):
     add_card(db, 102, 5, TPL_ENFORCER, loc="deck")
     add_card(db, 103, 5, TPL_ENFORCER, loc="deck")
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("4dc8bff7-17b3-4497-8bec-3d8537a30260", "Poca, The Conflagrater",
          "Troop", 3, 3, 3, 4, "[]", "[]", ""))
     db.execute(
@@ -958,16 +859,16 @@ def test_poca_summons_blaze_elemental(db):
     so resolving_ability must reach it."""
     import abilities
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("4bc00b6f-1baf-4962-85e8-e2de9e204037", "Blaze Elemental",
          "Troop", 3, 3, 1, 4, "[]", "[]", ""))
     db.execute(
-        "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         ("3687a2ea-baf1-2dfe-25ca-b51cb1a95c28", 0, "", "[RUBY][RUBY]: [BASIC] "
          "[4] [ARROWR] Summon a <b>Blaze Elemental</b>.", "", 0, 0, 0, 0, 0,
          "[]", 0))
     db.execute(
-        "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
         ("3687a2ea-baf1-2dfe-25ca-b51cb1a95c28",
          "1cc228e3-9222-7d6b-2334-6eb8366030f3", 0,
          "SummonTokenTroopAbilityEffectTemplate", ""))
@@ -1007,12 +908,12 @@ def test_speed_troop_can_attack_same_turn(db):
     captured = []
     try:
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (TPL_SPEED := "77777777-7777-7777-7777-777777777777",
              "Blaze Elemental", "Troop", 3, 3, 1,
              int(game_engine.ECardAttributes.Speed), "[]", "[]", ""))
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (TPL_SICK := "66666666-6666-6666-6666-666666666666",
              "Summoning Sick", "Troop", 2, 2, 2, 0, "[]", "[]", ""))
         # Speed token that just entered play (CameOutThisTurn, no
@@ -1066,14 +967,14 @@ def test_ragefire_escalation_damage(db):
             "uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use "
             "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
         db.execute(
-            "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             meta)
         target_guids.update(json.loads(meta[10] or "[]"))
         for eff in src.execute(
                 "SELECT ability_guid, effect_guid, effect_order, effect_type, "
                 "param FROM ability_effects WHERE ability_guid=?", (ag,)).fetchall():
             db.execute(
-                "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)", eff)
+                "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)", eff)
     for target_guid in target_guids:
         target_row = src.execute(
             "SELECT template_id, game_text, is_auto_target, is_random_target, "
@@ -1176,15 +1077,15 @@ def test_x_cost_detection_and_damage(db):
             ("58f59723-1a20-b17c-a5db-013e249d4970",)).fetchone()
         src.close()
         db.execute(
-            "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             meta)
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype, variable_cost, variable_cost_minimum) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype, variable_cost, variable_cost_minimum) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             ("0fe0fcf5-1054-463c-ab01-a1b5743d66b9", "Burn to the Ground",
              "BasicAction", 1, 0, 0, 0,
              json.dumps(["58f59723-1a20-b17c-a5db-013e249d4970"]), "[]", "", 1, 0))
         db.execute(
-            "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
             ("58f59723-1a20-b17c-a5db-013e249d4970",
              "b7767275-3b18-b063-b6e8-4c29628ea377", 0,
              "CardModifierAbilityEffectTemplate",
@@ -1267,7 +1168,7 @@ def test_first_main_refresh_opens_combat_for_a_troop_played_this_turn(db):
     try:
         tpl = "aaaaaaaa-1111-2222-3333-444444444444"
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
             "defense, attributes, abilities_json, threshold_json, subtype, "
             "variable_cost, variable_cost_minimum) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1334,7 +1235,7 @@ def test_deck_search_prompt_target_id(db):
                 "target_template_ids, exhausts_on_use "
                 "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
             db.execute(
-                "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 meta)
         src.close()
         add_card(db, 102, 5, TPL_ENFORCER, loc="deck")
@@ -1390,12 +1291,11 @@ def test_deck_search_prompt_target_id(db):
                          "CardUpdatedSessionEventArgs",
                          "CardMovedSessionEventArgs")
                      and ev.collection == game_engine.ECardCollections.Choosing]
-        assert len(presented) == 4, len(presented)  # 2 candidates x move+update
-        moved_uids = {int(ev.session_card_id.uid.uid64)
-                      for ev in game.events
-                      if ev.__class__.__name__ == "CardMovedSessionEventArgs"
-                      and ev.collection == game_engine.ECardCollections.Choosing}
-        assert moved_uids == {102, 103}, moved_uids
+        # Candidates are shown by a CardUpdated per candidate; the database
+        # rows stay in the deck, so no CardMoved is emitted for the picker.
+        assert len(presented) == 2, len(presented)
+        presented_uids = {int(ev.session_card_id.uid.uid64) for ev in presented}
+        assert presented_uids == {102, 103}, presented_uids
     finally:
         hcs._db = old
 
@@ -1409,11 +1309,11 @@ def test_gem_abilities_resolved(db):
     hcs._db = db
     try:
         db.execute(
-            "INSERT INTO gem_templates VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO gem_templates (gem_type, gem_type_name, name, abilities_json) VALUES (?,?,?,?)",
             (5, "Blood_Minor_1", "Minor Blood Orb of Hatred",
              json.dumps(["ddb205d9-03e0-0a63-adee-d52035ab5b0c"])))
         db.execute(
-            "INSERT INTO gem_templates VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO gem_templates (gem_type, gem_type_name, name, abilities_json) VALUES (?,?,?,?)",
             (34, "Herofall_Blood_Minor_2", "Minor Blood Orb of Frenzy",
              json.dumps(["a0806fbd-b6d8-e49f-145f-89833e2d7c49"])))
         h = object.__new__(hcs.HCPHandler)
@@ -1450,11 +1350,9 @@ def test_gem_rage_applies_as_static(db):
             "param FROM ability_effects WHERE ability_guid=?",
             ("ddb205d9-03e0-0a63-adee-d52035ab5b0c",)).fetchone()
         src.close()
-        db.execute(
-            "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            meta)
-        db.execute(
-            "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)", eff)
+        # The baseline already holds this ability's metadata and effect rows
+        # (copied above from the production seed); re-inserting partial rows
+        # shadowed the full effect definition.
         # Shamed Gladiator with the gem ability in its ability list (the
         # deck-save bake) + the corrected base RageValue 0 from the template.
         # make_db already seeds TPL_GLADIATOR — add the gem ability and keep
@@ -1472,7 +1370,10 @@ def test_gem_rage_applies_as_static(db):
             (json.dumps([AG_DEPLOY,
                          "ddb205d9-03e0-0a63-adee-d52035ab5b0c"]),))
         db.commit()
-        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1}
+        # The authored Rage effect is conditioned on the controller holding a
+        # Blood threshold (production data), so give the player one.
+        bstate = {"player_health": 20, "ai_health": 20, "turn_number": 1,
+                  "player_threshold": {4: 1}}
         _a, _d, _attrs, _flags, rage = effective_stats(db, 1, bstate, 101)
         assert rage == 1, rage  # gem Rage 1 + base RageValue 0
         assert _attrs & game_engine.ECardAttributes.Rage, hex(_attrs)
@@ -1581,17 +1482,17 @@ def test_ai_x_kills_target(db):
     hcs._db = db
     try:
         db.execute(
-            "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             ("58f59723-1a20-b17c-a5db-013e249d4970", 0, "",
              "Deal X damage to target champion or troop.", "", 0, 0, 0, 0, 0,
              "[]", 0))
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype, variable_cost, variable_cost_minimum) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype, variable_cost, variable_cost_minimum) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             ("0fe0fcf5-1054-463c-ab01-a1b5743d66b9", "Burn to the Ground",
              "BasicAction", 1, 0, 0, 0,
              json.dumps(["58f59723-1a20-b17c-a5db-013e249d4970"]), "[]", "", 1, 0))
         db.execute(
-            "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
             ("58f59723-1a20-b17c-a5db-013e249d4970",
              "b7767275-3b18-b063-b6e8-4c29628ea377", 0,
              "CardModifierAbilityEffectTemplate",
@@ -1653,12 +1554,12 @@ def test_swiftstrike_kills_before_normal_damage(db):
     the 3/2, so the normal step has no blocker left to deal its 3 — Emberspire
     survives undamaged instead of trading."""
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (TPL_WITCH := "ecc1fc8b-a86c-4330-908a-e15ba445f2f0",
          "Emberspire Witch", "Troop", 2, 2, 2,
          int(game_engine.ECardAttributes.FirstStrike), "[]", "[]", ""))
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (TPL_BIG := "55555555-5555-5555-5555-555555555555",
          "Big Troop", "Troop", 3, 3, 2, 0, "[]", "[]", ""))
     add_card(db, 101, 0, TPL_WITCH)
@@ -1837,7 +1738,7 @@ def test_spiritdrain_heals_actual_blocker_damage(db):
              int(game_engine.ECardAttributes.SpiritDrain)),
             (blocker_tpl, "Small Blocker", 2, 2, 0)):
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
             "defense, attributes, abilities_json, threshold_json, subtype) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (tpl, name, "Troop", 2, atk, defense, attrs, "[]", "[]", ""))
@@ -1870,7 +1771,7 @@ def test_simultaneous_combat_damage_cannot_be_undone_by_lifelink(db):
 
     blocker_tpl = "ffffffff-0000-0000-0000-00000000b001"
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         (blocker_tpl, "Lifedrain Blocker", "Troop", 4, 4, 4,
@@ -1878,7 +1779,7 @@ def test_simultaneous_combat_damage_cannot_be_undone_by_lifelink(db):
     for index, (attack, defense) in enumerate(((4, 4), (4, 4), (3, 3), (3, 3))):
         template = "ffffffff-0000-0000-0000-00000000b1%02d" % index
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
             "defense, attributes, abilities_json, threshold_json, subtype) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (template, f"Attacker {index}", "Troop", 2, attack, defense, 0,
@@ -1908,14 +1809,13 @@ def test_lethal_kills_high_defense_blocker(db):
     less than that blocker's remaining defense."""
     lethal_tpl = "ffffffff-0000-0000-0000-00000000a003"
     blocker_tpl = "ffffffff-0000-0000-0000-00000000a004"
-    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (lethal_tpl, "Lethal Attacker", "Troop", 1, 1, 3, 0, "[]", "[]", "", 1))
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (blocker_tpl, "Large Blocker", "Troop", 4, 2, 5, 0, "[]", "[]", "", 0))
@@ -1950,16 +1850,15 @@ def test_lethal_attacker_native_kills_high_defense_blocker(db):
     from rules_port.combat_damage import resolve as resolve_native
     from rules_port.context import EffectContext
 
-    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
     lethal_tpl = "ffffffff-0000-0000-0000-00000000c001"
     wall_tpl = "ffffffff-0000-0000-0000-00000000c002"
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (lethal_tpl, "Lethal Attacker", "Troop", 1, 1, 3, 0, "[]", "[]", "", 1))
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (wall_tpl, "Stonewall", "Troop", 4, 2, 6, 0, "[]", "[]", "", 0))
@@ -1999,16 +1898,15 @@ def test_lethal_blocker_native_kills_high_defense_attacker(db):
     from rules_port.combat_damage import resolve as resolve_native
     from rules_port.context import EffectContext
 
-    db.execute("ALTER TABLE card_templates ADD COLUMN lethal INTEGER DEFAULT 0")
     attacker_tpl = "ffffffff-0000-0000-0000-00000000c003"
     lethal_tpl = "ffffffff-0000-0000-0000-00000000c004"
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (attacker_tpl, "Big Attacker", "Troop", 5, 1, 6, 0, "[]", "[]", "", 0))
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, lethal) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (lethal_tpl, "Lethal Blocker", "Troop", 1, 1, 2, 0, "[]", "[]", "", 1))
@@ -2063,7 +1961,7 @@ def test_kog_tepetl_thirst_kills_zero_defense_blocker_before_priority(db):
     _copy_card(db, kog_tpl)
     _copy_card(db, mosquito_tpl)
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, "
         "variable_cost, variable_cost_minimum, rage_value) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -2157,7 +2055,7 @@ def test_ai_attacks_zero_attack_rage_troop_when_unblocked(db):
     empty opposing warzone so its Rage trigger can apply."""
     tpl = "88888888-8888-8888-8888-888888888888"
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, "
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, "
         "defense, attributes, abilities_json, threshold_json, subtype, "
         "rage_value) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (tpl, "Mazat Spearman", "Troop", 1, 0, 1, 0, "[]", "[]",
@@ -2193,13 +2091,13 @@ def test_player_can_block_excludes_cantblock(db):
     hcs._db = db
     try:
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
             ("99999999-9999-9999-9999-999999999999", "Pile of Bones",
              "Troop", 2, 0, 1,
              int(game_engine.ECardAttributes.CantAttack |
                  game_engine.ECardAttributes.CantBlock), "[]", "[]", ""))
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
             ("88888888-8888-8888-8888-888888888888", "Bone Warrior",
              "Troop", 2, 1, 2, 0, "[]", "[]", ""))
         h = object.__new__(hcs.HCPHandler)
@@ -2269,14 +2167,14 @@ def test_transform_bom_applies_bone_warrior(db):
     import db as dbmod
     from rules_port.resolution import resolve_port_ability
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (TPL_PILE := "c72e6441-6717-4bbf-91f1-3fd6707d165d", "Pile of Bones",
          "Troop", 2, 0, 1,
          int(game_engine.ECardAttributes.CantAttack |
              game_engine.ECardAttributes.CantBlock),
          json.dumps(["4d7b43dd-0a42-be5b-b998-ce8030501e6c"]), "[]", ""))
     db.execute(
-        "INSERT INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (TPL_BONE := "f4822b71-b1f5-448d-a7e6-b7caf5f11374", "Bone Warrior",
          "Troop", 2, 1, 2, 0, "[]", "[]", ""))
     src = sqlite3.connect(SRC)
@@ -2288,10 +2186,10 @@ def test_transform_bom_applies_bone_warrior(db):
         ("4d7b43dd-0a42-be5b-b998-ce8030501e6c",)).fetchone()
     src.close()
     db.execute(
-        "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, is_manual, activation_cost, uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         meta)
     db.execute(
-        "INSERT INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, effect_order, effect_type, param) VALUES (?,?,?,?,?)",
         ("4d7b43dd-0a42-be5b-b998-ce8030501e6c",
          "4003a91f-ef1c-fc54-b93c-e359f7199be9", 0,
          "TransformCardAbilityEffectTemplate", ""))

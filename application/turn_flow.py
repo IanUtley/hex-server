@@ -1309,6 +1309,17 @@ class TurnFlowMixin:
             game, session, _hc._db, self, pl_t, ai_t, bstate,
             "", ability=None)
         active_champion_uid = context.champion_card_uid(active_owner)
+        # Campaign scene mods with a round apply on that side's Nth turn
+        # (see rules_port.scene_round_mods).  This assumes the start-turn
+        # projection runs once per side turn; confirm in-game that the
+        # counts match the turns played.
+        from rules_port.scene_round_mods import (
+            apply_due_round_mods, count_turn_start)
+        round_side = "ai" if bstate.get("turn_player") == _be.AI else "player"
+        round_turn = count_turn_start(bstate, round_side)
+        apply_due_round_mods(
+            _hc._db, projection_game, session, bstate, round_side,
+            round_turn, pl_t, ai_t)
         changes = advance(context, active_owner)
         # Mark the lifecycle phase while TurnStarted triggers resolve so
         # temporary current-resource gains (e.g. Lithe Lyricist's +1) are

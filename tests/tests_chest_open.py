@@ -19,7 +19,8 @@ SRC = fresh_database()   # bind this process's database before ``db`` is importe
 
 import db
 import hconnect_server
-from az1_pack import (AZ1_CAMPAIGN_PACK_GUID, AZ2_CAMPAIGN_PACK_GUID,
+from az1_pack import (AZ1_CAMPAIGN_PACK_GUID, AZ1_CARD_SET_GUID,
+                      AZ2_CAMPAIGN_PACK_GUID,
                       AZ2_PVE_CARD_SET_GUIDS, AZ2_PVP_COMMON_SET_GUIDS,
                       PVE_CARD_SET_GUIDS, PVP_COMMON_SET_GUIDS)
 from profile_db import (db_create_treasure_chest, db_get_chest_by_id,
@@ -242,13 +243,15 @@ def test_promo_packs_use_their_own_authored_contents():
     az2_cards, az2_items = hconnect_server._generate_chest_rewards(
         _promo_chest(AZ2_CAMPAIGN_PACK_GUID), templates, random.Random(7))
 
-    # AZ1 draws Set 1-3; AZ2 draws Set 4-6.  Both are 2 PvP commons + 1 PvE
-    # card + 2 equipment/Stardust slots.
+    # AZ1 draws Set 1-3 commons and its AZ1-only card set for the PvE card;
+    # AZ2 draws Set 4-6.  Both are 2 PvP commons + 1 PvE card + 2
+    # equipment/Stardust slots.
     az1_pvp, az1_pve = _split_campaign_cards(az1_cards, templates)
     az2_pvp, az2_pve = _split_campaign_cards(az2_cards, templates)
     assert all(set_guid in PVP_COMMON_SET_GUIDS and rarity == "Common"
                for set_guid, rarity in az1_pvp)
-    assert all(set_guid in PVE_CARD_SET_GUIDS for set_guid, _ in az1_pve)
+    assert all(set_guid in (*PVE_CARD_SET_GUIDS, AZ1_CARD_SET_GUID)
+               for set_guid, _ in az1_pve)
     assert all(set_guid in AZ2_PVP_COMMON_SET_GUIDS and rarity == "Common"
                for set_guid, rarity in az2_pvp)
     assert all(set_guid in AZ2_PVE_CARD_SET_GUIDS for set_guid, _ in az2_pve)

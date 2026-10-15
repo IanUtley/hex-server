@@ -36,6 +36,13 @@ from tests.tests_combat import (
     make_db, add_card, HandlerStub, SessionStub, TPL_ENFORCER, TPL_GLADIATOR,
 )
 
+
+def _ensure_column(db, table, column, kind):
+    """Add a column only when the (production) table does not have it yet."""
+    existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+
 def resolve_ability(handler, game, session, db, pl_t, ai_t, bstate,
                     ability_guid, source_uid, owner_id, target_map=None):
     """Legacy-shaped adapter retained until these fixtures migrate.
@@ -81,7 +88,10 @@ def _copy_ability(db, ag):
         "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
     if m:
         db.execute(
-            "INSERT OR REPLACE INTO card_abilities_meta VALUES "
+            "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, "
+            "is_triggered, trigger_event_type, game_text, raw_json, "
+            "casting_behavior, is_manual, activation_cost, uses_per_game, "
+            "uses_per_turn, target_template_ids, exhausts_on_use) VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?)", m)
         target_ids = set(json.loads(m[10] or "[]"))
         # Card cost targets (for example Bun'jitsu's m_VoidTarget) are not
@@ -604,6 +614,13 @@ def test_crazed_squirrel_titan_ai_battles_a_legal_opposing_troop(db):
     handler.chain_send = lambda *_args: None
     handler.chain_push_empty = lambda _port, state, _item, pending: (
         not pending and not state.get("stack"))
+    # Lethal damage is applied by the chain's state-based step; use the real
+    # production method so the troop that took lethal damage actually dies.
+    import hconnect_server as _hcs
+    _hcs._db = db  # the state-based step reads the server's database
+    handler.chain_state_based = (
+        lambda session, state, game_, p, a:
+        _hcs.HCPHandler.chain_state_based(handler, session, state, game_, p, a))
     ability = SimpleNamespace(descriptor=descriptor, instance_id=17,
                               ignores_chain=False)
     result = resolve_chain_item(handler, None, SessionStub(), db, ability,
@@ -1164,8 +1181,6 @@ def test_cosmic_transmogrifier_preserves_type_and_cost(db):
     effect_guid = "453fd3fe-cb93-b839-2cc4-e46f5b7d1de8"
     # The shared combat fixture predates the two template columns used by the
     # random-template pool; add them with their production defaults locally.
-    db.execute("ALTER TABLE card_templates ADD COLUMN rarity TEXT DEFAULT ''")
-    db.execute("ALTER TABLE card_templates ADD COLUMN is_pve INTEGER DEFAULT 0")
     db.commit()
     _copy_card(db, cosmic_tpl)
     src = sqlite3.connect(SRC)
@@ -1326,7 +1341,7 @@ def test_primordial_caves_adds_entering_cost_secretly_and_chains_threshold(db):
     # exercised rather than falling back to the fixture's reduced schema.
     for column, kind in (("rarity", "TEXT"), ("socket_count", "INTEGER"),
                          ("is_pve", "INTEGER"), ("no_pvp", "INTEGER")):
-        db.execute(f"ALTER TABLE card_templates ADD COLUMN {column} {kind}")
+        _ensure_column(db, "card_templates", column, kind)
     _copy_card(db, caves_tpl)
     _copy_card(db, tyrannosaurus_tpl)
     for uid in (9300, 9301):
@@ -1568,10 +1583,13 @@ def test_fertility_magic_talent_triggers_on_shinhare_play(db):
     hopper_tpl = "fe2472ed-4ff8-455b-8b18-b7e0033cd896"
     shinhare_tpl = "11111111-1111-1111-1111-111111111111"
 
-    db.execute("""CREATE TABLE champion_abilities (
+    db.execute("""CREATE TABLE IF NOT EXISTS champion_abilities (
         champion_guid TEXT, ability_guid TEXT)""")
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype, "
+        "variable_cost, variable_cost_minimum, rage_value) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (shinhare_tpl, "Shin'hare Test Troop", "Troop", 1, 1, 1, 0,
          "[]", "[]", "Shin'hare", 0, 0, 0))
     _copy_card(db, hopper_tpl)
@@ -1880,7 +1898,7 @@ def test_shard_of_cunning_ai_plays_choice_and_gains_threshold(db):
     _copy_card(db, "defcf1c9-b06d-4a33-91cd-b7242c6b9f42")  # Choose Blood
     _copy_card(db, "8cd3251f-2d73-44f1-8874-84d88fea809a")  # Choose Sapphire
     for column in ("current_resources_granted", "max_resources_granted"):
-        db.execute(f"ALTER TABLE card_templates ADD COLUMN {column} INTEGER DEFAULT 0")
+        _ensure_column(db, "card_templates", column, "INTEGER DEFAULT 0")
     db.execute(
         "UPDATE card_templates SET current_resources_granted=0, "
         "max_resources_granted=1 WHERE guid=?",
@@ -1947,8 +1965,7 @@ def test_primal_shard_grants_the_thresholds_the_hand_needs(db):
     primal = "4b0e888e-ea2b-4674-acc8-a0292ad3b9ed"
     _copy_card(db, primal)
     for column in ("current_resources_granted", "max_resources_granted"):
-        db.execute(
-            f"ALTER TABLE card_templates ADD COLUMN {column} INTEGER DEFAULT 0")
+        _ensure_column(db, "card_templates", column, "INTEGER DEFAULT 0")
     db.execute(
         "UPDATE card_templates SET current_resources_granted=1, "
         "max_resources_granted=1 WHERE guid=?", (primal,))
@@ -1963,7 +1980,7 @@ def test_primal_shard_grants_the_thresholds_the_hand_needs(db):
     }
     for uid, (tpl, requirements) in hand.items():
         db.execute(
-            "INSERT INTO card_templates (guid, name, card_type, cost, "
+            "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
             "threshold_json) VALUES (?,?,?,?,?)",
             (tpl, f"Threshold {uid}", "Troop", 1,
              json.dumps({"list": requirements})))
@@ -2044,9 +2061,7 @@ def test_woeful_webbing_summons_a_random_spider(db):
 
     webbing = "15bacb06-c91d-5c4e-7e6f-cdfad5c6325d"
     vennen = "24bbc1cc-bf14-4d81-948d-1689c40e7794"   # Runeweb Spellweaver
-    spiders = ("048a5bc7-ab7c-42f3-87c1-c00f9243b7e8",  # Winter Widow
-               "5d49bc7d-9bfe-4789-b32a-f40ae44c6935")  # Giant Spiderspawn
-    for guid in (webbing, vennen) + spiders:
+    for guid in (webbing, vennen):
         _copy_card(db, guid)
     add_card(db, 501, 0, TPL_GLADIATOR, loc="warzone")   # stun target
     add_card(db, 502, 5, vennen, loc="warzone")           # one Underworld race
@@ -2075,7 +2090,11 @@ def test_woeful_webbing_summons_a_random_spider(db):
         "SELECT template_guid, user_id, location FROM game_cards "
         "WHERE card_uid > 503").fetchall()
     assert len(created) == 1, created
-    assert created[0][0] in spiders, created
+    # "Summon a random Spider" draws from every Spider troop, not a fixed pair.
+    subtype, card_type = db.execute(
+        "SELECT subtype, card_type FROM card_templates WHERE guid=?",
+        (created[0][0],)).fetchone()
+    assert "Spider" in (subtype or "") and "Troop" in card_type, created
     assert created[0][1:] == (5, "warzone"), created
     # The resolution scope key must not leak into the checkpoint.
     assert "session_id" not in bstate, bstate
@@ -2417,7 +2436,7 @@ def test_blood_cauldron_ai_pays_sacrifice_cost(db):
     ability_guid = "6249cb76-e4ce-45f2-c9fd-5bbe87159112"
     sacrifice_template = "38e37324-0d8f-69ec-60f1-f4695087e5c4"
     src = sqlite3.connect(SRC)
-    db.execute("""CREATE TABLE champion_abilities (
+    db.execute("""CREATE TABLE IF NOT EXISTS champion_abilities (
         champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
         ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
         threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
@@ -2427,7 +2446,7 @@ def test_blood_cauldron_ai_pays_sacrifice_cost(db):
         "SELECT * FROM champion_abilities WHERE ability_guid=?",
         (ability_guid,)).fetchone()
     src.close()
-    db.execute("INSERT INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT OR REPLACE INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                champion_row)
     _copy_ability(db, ability_guid)
     _copy_card(db, TPL_ENFORCER)
@@ -2478,13 +2497,13 @@ def test_wind_whisperer_ai_exhausts_best_blocker(db):
     _copy_card(db, wind_whisperer)
     _copy_ability(db, ability_guid)
     src = sqlite3.connect(SRC)
-    db.execute("""CREATE TABLE champion_abilities (
+    db.execute("""CREATE TABLE IF NOT EXISTS champion_abilities (
         champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
         ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
         threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
         thresholds_json TEXT, target_template_ids TEXT)""")
     db.execute(
-        "INSERT INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO champion_abilities VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         src.execute(
             "SELECT * FROM champion_abilities WHERE ability_guid=?",
             (ability_guid,)).fetchone())
@@ -2535,6 +2554,8 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
     import ai_eval
 
     selector = object.__new__(ai_eval.CardEvaluator)
+
+    selector.hand = []  # no hand cards: these checks read the warzone
     selector.ai_warzone = [
         SimpleNamespace(card_uid=101, value=20, is_troop=lambda: True,
                         effective_attack=lambda: 2,
@@ -2577,15 +2598,17 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
             (required_ability, required_template),
             (optional_ability, optional_template)):
         db.execute(
-            "INSERT INTO card_abilities_meta VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, "
+            "is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, "
+            "is_manual, activation_cost, uses_per_game, uses_per_turn, "
+            "target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (ability, 0, "", "", "{}", 0, 0, 0, 0, 0,
              json.dumps([target_template]), 0))
-    db.execute("INSERT INTO target_templates VALUES "
+    db.execute("INSERT OR REPLACE INTO target_templates VALUES "
                "(?,?,?,?,?,?,?,?,?,?,?,?)",
                (required_template, "Choose a troop", 0, 0, 0, 1, "", "",
                 1, 1, "{}", "CardTargetTemplate"))
-    db.execute("INSERT INTO target_templates VALUES "
+    db.execute("INSERT OR REPLACE INTO target_templates VALUES "
                "(?,?,?,?,?,?,?,?,?,?,?,?)",
                (optional_template, "May choose a troop", 0, 0, 1, 1, "", "",
                 1, 1, "{}", "CardTargetTemplate"))
@@ -2594,6 +2617,8 @@ def test_ai_action_targets_follow_effect_and_require_legal_selection(db):
     optional_card = SimpleNamespace(ability_guids=[optional_ability])
 
     guard_evaluator = object.__new__(ai_eval.CardEvaluator)
+
+    guard_evaluator.hand = []  # no hand cards: these checks read the warzone
     guard_evaluator.choose_action_target = lambda _card: None
     guard_evaluator.choose_action_targets = lambda _card: []
     old_ai_db, old_eval_db = ai._db, ai_eval._db
@@ -2638,6 +2663,8 @@ def test_ai_spreads_a_reapplied_grant_to_the_clean_same_name_troop(db):
     clean = troop(0xe01, ())
 
     selector = object.__new__(ai_eval.CardEvaluator)
+
+    selector.hand = []  # no hand cards: these checks read the warzone
     selector.player_warzone = [cursed, clean]
     selector.ai_warzone = []
     selector.player_champ_uid = None
@@ -2676,17 +2703,20 @@ def test_ai_target_candidates_are_cached_within_playability_check(db):
     target_row = (target_template, "Choose an opposing troop", 0, 0, 0, 1,
                   "opponent", "Warzone", 1, 1, "{}", "CardTargetTemplate")
     db.execute(
-        "INSERT INTO card_abilities_meta VALUES "
-        "(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, "
+        "is_triggered, trigger_event_type, game_text, raw_json, casting_behavior, "
+        "is_manual, activation_cost, uses_per_game, uses_per_turn, "
+        "target_template_ids, exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (ability_guid, 0, "", "", "{}", 0, 0, 0, 0, 0,
          json.dumps([target_template]), 0))
-    db.execute("INSERT INTO target_templates VALUES "
+    db.execute("INSERT OR REPLACE INTO target_templates VALUES "
                "(?,?,?,?,?,?,?,?,?,?,?,?)", target_row)
 
     target = SimpleNamespace(
         card_uid=101, is_troop=lambda: True,
         effective_attack=lambda: 2, effective_defense=lambda: 2)
     evaluator = object.__new__(ai_eval.CardEvaluator)
+    evaluator.hand = []  # no hand cards: these checks read the warzone
     evaluator._db = db
     evaluator.handler = SimpleNamespace(
         _thresholds_met=lambda _required, _available: True,

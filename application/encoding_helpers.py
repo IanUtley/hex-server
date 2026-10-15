@@ -8,9 +8,11 @@ def encode_inventory_item(buf, sizes, ft, template_guid, item_id, elem_idx, quan
     return _hc.encoder.encode_inventory_item(buf, sizes, ft, template_guid, item_id, elem_idx, quantity, bound)
 
 
-def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx):
+def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx,
+                         is_extended=False):
     import hconnect_server as _hc
-    return _hc.encoder.encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx)
+    return _hc.encoder.encode_card_instance(
+        buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx, is_extended)
 
 
 def encode_deck_bits(buf, sizes, ft, did, dname, did_val, champ_did, card_guids, idx):

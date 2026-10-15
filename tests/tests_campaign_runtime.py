@@ -4,7 +4,7 @@ import os
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CAMPAIGN_ROOT = os.path.join(ROOT, "hex-private", "campaign")
+CAMPAIGN_ROOT = os.path.join(ROOT, "campaign")
 sys.path[:0] = [ROOT, CAMPAIGN_ROOT,
                 os.path.join(ROOT, "campaign_editor")]
 
@@ -12,6 +12,17 @@ import server_playthrough  # noqa: E402
 
 
 def test_starter_run_reaches_az1_through_the_server_runtime():
+    import db as shared
+    previous = shared._db
+    try:
+        _run_starter_route()
+    finally:
+        # The runtime connection the playthrough binds is a copy of the live
+        # database; restore the previous binding so later tests never inherit it.
+        shared._db = previous
+
+
+def _run_starter_route():
     # AZ0 panorama -> training battle (lost once, retried) -> Crayburn ->
     # report -> AZ1, through campaign.py's protocol handlers on a DB copy.
     ok, route = server_playthrough.run("Dwarf", set(), lose_first=True)

@@ -80,8 +80,9 @@ def engine_state(campaign, db, rules, champ_id, state):
         for index, step in enumerate((rules["quests"][script]).get("steps") or ()):
             if progress["status"] == "finished" or index < progress["step"]:
                 scene = (step.get("done_when") or {}).get("scene")
-                if scene:
-                    done_scenes.add(str(scene).lower())
+                for value in (scene if isinstance(scene, list) else [scene]):
+                    if value:
+                        done_scenes.add(str(value).lower())
     for hook in rules.get("hooks") or ():
         on = hook.get("on") or {}
         fired = False

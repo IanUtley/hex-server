@@ -626,7 +626,22 @@ def save_quest_rewards(db: sqlite3.Connection, quest_script: str,
 SCENE_ENTRY_KEYS = {"gold", "xp", "one_time", "chest_guid", "card_guid", "quantity",
                     "items", "mercenaries", "sleeves", "item_guid", "item_guid_by_race",
                     "deck_guid", "when", "stardust"}
-_FLAG_TAG = re.compile(r"^flag\([^()\s][^()]*\)$")
+_FLAG_TAG = re.compile(r"^!?flag\([^()\s][^()]*\)$")
+
+
+def clean_when(when: Any) -> list[Any]:
+    """A reward's condition: a list of ``flag(X)`` / ``!flag(X)`` tags that must
+    all hold, or a list of such lists (any group may hold)."""
+    grouped = isinstance(when, list) and bool(when) and all(
+        isinstance(group, list) for group in when)
+    groups = when if grouped else [when]
+    if not isinstance(when, list) or any(
+            not isinstance(group, list) or not group or any(
+                not _FLAG_TAG.match(str(tag).strip()) for tag in group)
+            for group in groups):
+        raise ValueError("when must be flag(X) / !flag(X) tags, optionally as groups")
+    cleaned = [[str(tag).strip() for tag in group] for group in groups]
+    return cleaned if grouped else cleaned[0]
 
 
 def clean_scene_rewards(rewards: Any) -> dict[str, Any]:
@@ -634,7 +649,7 @@ def clean_scene_rewards(rewards: Any) -> dict[str, Any]:
 
     Either one flat entry, or ``end_of_game_rewards`` (a list of entries);
     other top-level keys (``card_choice`` ...) are kept untouched. An entry's
-    only condition is ``when``: ``flag(X)`` tags that must all hold.
+    only condition is ``when``: ``flag(X)`` / ``!flag(X)`` tags that must all hold.
     """
     if not isinstance(rewards, dict):
         raise ValueError("rewards must be an object")
@@ -687,11 +702,7 @@ def clean_scene_rewards(rewards: Any) -> dict[str, Any]:
         if raw.get("stardust"):
             out["stardust"] = clean_stardust(raw["stardust"])
         if raw.get("when"):
-            tags = raw["when"]
-            if not isinstance(tags, list) or any(
-                    not _FLAG_TAG.match(str(tag).strip()) for tag in tags):
-                raise ValueError("when must be a list of flag(X) tags")
-            out["when"] = [str(tag).strip() for tag in tags]
+            out["when"] = clean_when(raw["when"])
         return out
 
     clean = {k: v for k, v in rewards.items()
@@ -1047,4 +1058,9 @@ def save_scene_mods(db: sqlite3.Connection, scene_guid: str,
         if problems:
             raise ValueError("; ".join(problems[:5]))
         _write_json(path, data)
+        # Battle setup reads mods_json from the database, so write the row
+        # as well; otherwise the change waits for the next server start.
+        db.execute("UPDATE encounter_scenes SET mods_json=? WHERE LOWER(guid)=?",
+                   (json.dumps(mods), str(scene_guid).lower()))
+        db.commit()
     return mods

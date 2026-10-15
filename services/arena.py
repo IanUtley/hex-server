@@ -441,10 +441,41 @@ def _assign_deck(handler, target, instance, reqid, comp, session_id, conh,
                           conh, service_uid, log_prefix="refresh")
 
 
+def _grant_arena_chests(handler, user_id, chest_count):
+    """Roll each earned Frost Ring Arena chest and grant its contents directly.
+
+    Each chest is one PvE card (added to the collection) and one equipment
+    item (pushed to the client like a pack's equipment slot).
+    """
+    if chest_count <= 0:
+        return
+    import hconnect_server as _hc
+    from gamedata import DEFAULT_RECORD_STORE
+    from az1_pack import generate_arena_chest
+    from services.chests import _grant_pack_inventory_rewards, _grant_reward_cards
+    card_templates = _hc._load_card_templates()
+    cards = []
+    equipment = []
+    for _ in range(chest_count):
+        reward = generate_arena_chest(card_templates, DEFAULT_RECORD_STORE, random)
+        cards.append(reward.card)
+        equipment.append((reward.equipment_guid, "equipment"))
+    _grant_reward_cards(user_id, cards)
+    updates = _grant_pack_inventory_rewards(handler, equipment)
+    _hc._db.commit()
+    for guid, client_uid, quantity in updates:
+        handler.push_inventory_to_client(
+            qty=quantity, template_guid=guid, item_id=client_uid)
+    _log_req(f"    Arena chests granted: {chest_count} "
+             f"(cards={len(cards)}, equipment={len(equipment)})")
+
+
 def _cash_out(handler, target, instance, reqid, comp, session_id, conh,
               service_uid):
     user_id = handler.user_profile["id"]
     result = db_claim_arena_rewards(user_id)
+    if result.get("success"):
+        _grant_arena_chests(handler, user_id, int(result.get("chests", 0) or 0))
     gold = int(result.get("gold", 0) or 0)
     _log_req(f">>> DoArenaCashOut (dt=10011): gold={gold}, "
              f"loot={len(result.get('loot', []))}, "

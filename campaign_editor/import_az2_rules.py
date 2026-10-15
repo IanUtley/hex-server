@@ -69,8 +69,14 @@ def build_quests(data: dict) -> dict:
     return quests
 
 
+def zone_data(db) -> dict:
+    # AZ2's own scenes only: the default prefix is AZ1's ("AZ 1 - NODE"), which
+    # would pull AZ1's battles and taming gates onto AZ2 nodes of the same number.
+    return catalog.server_catalog(db, ZONE, catalog.zone(ZONE)["scene_prefix"])
+
+
 def build(db) -> dict:
-    data = catalog.server_catalog(db, ZONE)
+    data = zone_data(db)
     quests = build_quests(data)
     _entries, _starts = offers.build_offers(ZONE, data, quests)
     nodes: dict[str, dict] = {}
@@ -131,7 +137,7 @@ def main():
     db = catalog.connect(args.db)
     try:
         rules = build(db)
-        quests = build_quests(catalog.server_catalog(db, ZONE))
+        quests = build_quests(zone_data(db))
     finally:
         db.close()
     rules = merge_previous(rules, args.output)

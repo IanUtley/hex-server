@@ -521,3 +521,30 @@ def expire_zone_bound_modifiers(db, session_id, state):
     if changed:
         db.commit()
     return changed
+
+
+GAMESTART_RESOLVED_KEY = "gamestart_grants_resolved"
+
+
+def mark_gamestart_grant(battle_state, champion_uid: int, guid: str) -> bool:
+    """Record that a GameStarted grant was resolved for this setup.
+
+    Returns True the first time a champion/ability pair is marked.  The grant
+    resolves directly when it is granted during setup, and the normal
+    GameStarted discovery must then skip it; a repeated grant pass must not
+    resolve it again.
+    """
+    if battle_state is None:
+        return True
+    marks = battle_state.setdefault(GAMESTART_RESOLVED_KEY, [])
+    key = f"{int(champion_uid)}:{str(guid).lower()}"
+    if key in marks:
+        return False
+    marks.append(key)
+    return True
+
+
+def gamestart_grant_resolved(battle_state, champion_uid: int, guid: str) -> bool:
+    marks = (battle_state or {}).get(GAMESTART_RESOLVED_KEY) or ()
+    return f"{int(champion_uid)}:{str(guid).lower()}" in marks
+

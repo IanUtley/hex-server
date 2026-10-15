@@ -37,6 +37,7 @@ in that list only when `allowcon` is enabled.
 | `!draw` | `!draw [N]` | Implemented | Draw up to N cards from your deck; defaults to one card. |
 | `!gencard` | `!gencard <name>` | Implemented | Generate a copy of a card template into hand. |
 | `!addcard` | `!addcard <name\|id>` | Implemented | Draw the next matching copy from the deck to hand. |
+| `!give` | `!give [me\|opp] <troop name>` | Implemented | Put a troop with an exact, case-insensitive template name directly into the selected player's Warzone; defaults to `me`. In tournament PvP, `opp` selects the other player; in Practice/campaign, it selects the AI. The troop enters summoning sick. This bypasses normal play: no cost is paid and Deploy triggers do not fire. Requires an active game and `allowcon`. |
 | `!top` | `!top <id\|name>` | Implemented | Move a card from hand to the top of the deck. |
 | `!discard` | `!discard` | Implemented | Discard a random card from hand. |
 | `!move` | `!move <card_id> <zone>` | Implemented | Move card: `deck`, `hand`, `warzone`, `discard`, `void`, `playedresources`, `underground` |

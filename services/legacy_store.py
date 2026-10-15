@@ -230,8 +230,8 @@ def handle_opencardpack_2127(handler, target, instance, data_type, reqid, comp, 
         if campaign_pack_config:
             # Adventure Zone campaign packs are not normal PvP
             # boosters.  Each has two common PvP cards, one weighted
-            # PvE card, and two equipment/Stardust slots from its
-            # configured set range.
+            # PvE card, and two equipment slots from its configured set
+            # range.  They award no Stardust (allow_stardust is off).
             from gamedata import DEFAULT_RECORD_STORE
             for _ in range(open_amount):
                 reward = _hc.generate_campaign_pack(

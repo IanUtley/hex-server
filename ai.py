@@ -356,75 +356,21 @@ def ai_pass_declare_defense(handler, session, pl_t, ai_t, bstate, game):
         # A valuable attacker trading with a cheap blocker is fine; a cheap
         # attacker eating a valuable blocker is not.
         return a_val >= b_val * 2.0
+    # The client's block solver (AICombat.SolveBlock, ai_combat.py): the AI
+    # chooses blockers by searching the attacker/blocker assignments, with
+    # dogpiles, the combat-buff search and the single-block value gate.
+    from ai_combat import Hint, solve_block
     assignment = {}                      # attacker_uid -> [blocker_uids]
-    used = set()                         # blockers already assigned anywhere
-    blocker_dmg = {b["uid"]: 0 for b in avail}  # damage each blocker has taken
-    for u in sorted(att_stats, key=lambda k: -att_stats[k]["atk"]):
-        a = att_stats[u]
-
-        def can_face(b):
-            return (b["def"] - blocker_dmg[b["uid"]]) > a["atk"]
-
-        # A Flight attacker can only be blocked by Flight/SkyGuard blockers;
-        # "can't be blocked except..." attackers only by qualifying blockers.
-        def flight_ok(b):
-            return can_block(_db, session.session_id, bstate, u, b["uid"])
-
-        # 1) A single unused blocker that survives the hit.
-        free = [b for b in avail if b["uid"] not in used and flight_ok(b)]
-        survivors = [b for b in free if can_face(b)]
-        if survivors:
-            # Prefer the cheapest survivor that is NOT worth more than the
-            # attacker (a 5/5 eating a 2/2 is a bad trade even if it lives).
-            good = [b for b in survivors if worth_blocking(u, b["uid"])]
-            pool = good or survivors
-            pick = min(pool, key=lambda b: b["def"])
-            assignment[u] = [pick["uid"]]
-            used.add(pick["uid"])
-            blocker_dmg[pick["uid"]] += a["atk"]
-            continue
-        # 2) DOGPILE: no single survivor. If the attacker is a real threat,
-        #    trade enough blockers (combined attack >= attacker defense) to kill
-        #    it — they take the hit (most die) but bring down the bigger threat.
-        if (a["atk"] >= 3 or lethal_now()) and free and any(
-                worth_blocking(u, b["uid"]) for b in free):
-            cands = sorted(free, key=lambda b: -b["atk"])
-            pile, total = [], 0
-            for b in cands:
-                if not worth_blocking(u, b["uid"]):
-                    continue
-                pile.append(b["uid"])
-                total += b["atk"]
-                if total >= a["def"]:
-                    break
-            # Do not commit an incomplete dogpile.  If the combined attack
-            # cannot kill the attacker, spending multiple blockers only gives
-            # away card advantage; the lethal-block fallback below may still
-            # choose one chump when the incoming attack would kill the AI.
-            if pile and total >= a["def"]:
-                assignment[u] = pile
-                for bid in pile:
-                    used.add(bid)
-                    blocker_dmg[bid] += a["atk"]
-                continue
-        # If this attack cannot be profitably traded but the overall attack
-        # would kill the champion, a chump block is still the correct play.
-        # Attackers are processed largest-first, so this protects the most
-        # incoming damage with the least valuable available blocker.
-        if lethal_now() and free:
-            # Chump only while the unblocked attackers would still kill the
-            # champion (attackers go largest first, so this uses the fewest
-            # blocks).  Sacrifice the least valuable legal blocker -- by card
-            # value when available, then the least aggressive -- preserving
-            # the better troops for future turns.
-            def chump_cost(b):
-                card = ai_cards.get(int(b["uid"]))
-                value = ev.get_card_value(card) if (ev and card) else 0.0
-                return (value, b["atk"], b["def"], b["uid"])
-            pick = min(free, key=chump_cost)
-            assignment[u] = [pick["uid"]]
-            used.add(pick["uid"])
-            blocker_dmg[pick["uid"]] += a["atk"]
+    if ev is not None:
+        player_cards = {int(c.card_uid): c for c in ev.player_warzone}
+        atk_hints = [Hint(player_cards[u], ev) for u in attackers
+                     if u in player_cards]
+        blk_hints = [Hint(ai_cards[b["uid"]], ev) for b in avail
+                     if b["uid"] in ai_cards]
+        if atk_hints and blk_hints:
+            solved = solve_block(atk_hints, blk_hints, ai_health, ev)
+            assignment = {int(k): [int(x) for x in v]
+                          for k, v in solved.items() if v}
     if assignment:
         bstate["ai_blockers"] = {str(k): [str(b) for b in v]
                                  for k, v in assignment.items()}
@@ -936,17 +882,65 @@ def _aieval_ready_counterattack_power(ev):
         power += max(0, int(card.effective_attack(in_play=True) or 0))
     return power
 
+def ai_choose_damage_orders(handler, session, pl_t, ai_t, bstate):
+    """Set the damage order for each AI attack that has several blockers.
+
+    The attacking AI assigns its combat damage through the player's blockers
+    in the order that gives it the best combat value (ai_combat's
+    best_damage_order), instead of the order the defender declared.  The
+    order is written to ``player_damage_order``, which the native resolver
+    reads before the declared order.
+    """
+    blocks = bstate.get("ai_blockers") or {}
+    multi = {int(a): [int(b) for b in v] for a, v in blocks.items()
+             if len(v) > 1}
+    if not multi:
+        return
+    import ai_eval as _aieval
+    from ai_combat import Hint, best_damage_order
+    try:
+        ev = _aieval.build_evaluator(handler, session, bstate, ai_t, pl_t)
+    except Exception as exc:
+        log_req(f"    AI damage order: evaluator unavailable ({exc!r})")
+        return
+    ai_cards = {int(c.card_uid): c for c in ev.ai_warzone}
+    player_cards = {int(c.card_uid): c for c in ev.player_warzone}
+    defender_defense = int(bstate.get("player_health", 20) or 20)
+    orders = dict(bstate.get("player_damage_order") or {})
+    for attacker_uid, blocker_uids in multi.items():
+        attacker = ai_cards.get(attacker_uid)
+        blockers = [Hint(player_cards[b], ev) for b in blocker_uids
+                    if b in player_cards]
+        if attacker is None or len(blockers) < 2:
+            continue
+        ordered = best_damage_order(
+            Hint(attacker, ev), blockers, ev,
+            defender_defense=defender_defense)
+        orders[str(attacker_uid)] = [str(h.uid) for h in ordered]
+    bstate["player_damage_order"] = orders
+
+
 def resolve_ai_combat_damage(handler, session, pl_t, ai_t, bstate,
                              first_strike=False):
     """Resolve AI combat damage (the AI attacks the player) natively."""
     from rules_port.combat_damage import resolve as resolve_native
     from rules_port.context import EffectContext
+    prior_order = bstate.get("player_damage_order")
+    ai_choose_damage_orders(handler, session, pl_t, ai_t, bstate)
     game = handler._fresh_game(session, pl_t, ai_t, bstate)
     context = EffectContext.from_rules_port(
         game, session, _db, handler, pl_t, ai_t, bstate, "", ability=None)
-    result = resolve_native(
-        context, first_strike=first_strike,
-        attacker_key="ai_attackers", blocker_key="ai_blockers")
+    try:
+        result = resolve_native(
+            context, first_strike=first_strike,
+            attacker_key="ai_attackers", blocker_key="ai_blockers")
+    finally:
+        # The AI's orders apply to this attack only, never to a later player
+        # attack that reads the same key.
+        if prior_order is None:
+            bstate.pop("player_damage_order", None)
+        else:
+            bstate["player_damage_order"] = prior_order
     if game.events:
         handler._send_battle_events(session, game, pl_t)
     # Simultaneous combat damage is fully applied before the champion's defeat
@@ -2543,21 +2537,24 @@ def ai_choose_attackers(handler, evaluator, eligible, blockers, *,
         return [int(card.card_uid) for card in race_attackers], \
             "favorable_damage_race"
 
-    chosen = []
+    # The client's attack solver (AICombat.DetermineBestAttack, ai_combat.py):
+    # unblockable troops always attack; flyers and ground troops are solved
+    # against the blockers that can stop them, by combat value.
+    if not eligible:
+        return [], "no_eligible_attackers"
+    from ai_combat import Hint, determine_best_attack
+    attack_hints = [Hint(card, evaluator) for card in eligible
+                    if card.effective_attack(in_play=True) > 0 or
+                    card.has_attribute(game_engine.ECardAttributes.ForceAttack)]
+    block_hints = [Hint(card, evaluator) for card in blockers]
+    solved = determine_best_attack(
+        attack_hints, block_hints, int(evaluator.player_health), evaluator)
+    chosen = [int(h.uid) for h in solved]
     for card in eligible:
-        if card.has_attribute(game_engine.ECardAttributes.ForceAttack):
+        if card.has_attribute(game_engine.ECardAttributes.ForceAttack) and \
+                int(card.card_uid) not in chosen:
             chosen.append(int(card.card_uid))
-            continue
-        attack = card.effective_attack(in_play=True)
-        if attack <= 0:
-            continue
-        _damage, value = _aieval_best_attack_value(
-            evaluator, card, blockers)
-        if value > 0:
-            chosen.append(int(card.card_uid))
-    reason = ("positive_individual_combat_value" if chosen else
-              "nonpositive_individual_combat_value" if eligible else
-              "no_eligible_attackers")
+    reason = "combat_solver" if chosen else "combat_solver_held_back"
     return chosen, reason
 
 

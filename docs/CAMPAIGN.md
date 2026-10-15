@@ -49,7 +49,9 @@ their race's starter panorama is unchanged.
   (`campaign/campaign_runtime/quests.py`). A quest's reward is paid when it finishes.
 - **Rewards:** scene rewards are paid after the engine has applied the result,
   against its (mirrored) flags. The legacy scene/battle flag actions are
-  skipped for these zones.
+  skipped for these zones. Granting a campaign mercenary raises the account's
+  `CAMP_PARTYCAP` flag to at least 1; the returned `AccountFlags` update also
+  makes the unlocked slot visible to the client immediately.
 - **Old saves** were converted once by `migration.py` (run by `restart.sh`,
   then deleted): flags from every row's public data, quests from the QUEST
   rows, node progress from each row's VisLocs, and `RulesZone` written into

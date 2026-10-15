@@ -3530,7 +3530,7 @@ def test_pvp_state_save_keeps_native_snapshot_on_same_state_root():
     new = {"pvp": True, "phase": game_engine.ETurnPhases.FirstMainPhase,
            "turn_pid": 2}
     session = SimpleNamespace(
-        _rules_port_battle_state=old, turn_order=old,
+        session_id=1, _rules_port_battle_state=old, turn_order=old,
         _persist=lambda **_kwargs: None)
     tournament_game.pvp_save_state(session, new)
     assert session._rules_port_battle_state is new
@@ -4239,7 +4239,7 @@ def test_native_effect_backend_reuses_one_auto_target_mapping():
 
     target = SimpleNamespace(
         guid="random-deck-card", target_kind="AbilityTargetTemplate",
-        is_auto=True, is_random=True, player_filter="self",
+        is_auto=True, is_random=True, player_filter="self", requires_input=False,
         resolved_maximum=lambda _variables: 1)
     effects = tuple(SimpleNamespace(
         guid=f"effect-{index}", concrete_type="CapturedEffect",

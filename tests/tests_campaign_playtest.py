@@ -12,16 +12,14 @@ import sys
 import tempfile
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CAMPAIGN_ROOT = os.path.join(ROOT, "hex-private", "campaign")
+CAMPAIGN_ROOT = os.path.join(ROOT, "campaign")
+sys.path.insert(0, ROOT)
+# Bind this process's disposable database before any server module imports
+# ``db``.  The test never touches the live hconnect.db: a copy of the metadata
+# baseline plays that role, so the runtime connection can't leak into other files.
+from tests.test_db import fresh_database  # noqa: E402
+SRC = fresh_database()
 _TMP = tempfile.mkdtemp(prefix="hex_playtest_test_")
-_COPY = os.path.join(_TMP, "hconnect.db")
-# Copy the database before any server module opens its shared connection.
-_src = sqlite3.connect(f"file:{os.path.join(ROOT, 'hconnect.db')}?mode=ro", uri=True)
-_dst = sqlite3.connect(_COPY)
-_src.backup(_dst)
-_src.close()
-_dst.close()
-os.environ["HEX_DB_PATH"] = _COPY
 os.environ["HEX_PLAYTEST_DIR"] = os.path.join(_TMP, "spool")
 sys.path[:0] = [ROOT, CAMPAIGN_ROOT]
 
@@ -84,10 +82,23 @@ def _snapshot(conn):
 
 
 def _player():
-    row = db._db.execute(
-        "SELECT ch.user_id, ch.id, ch.last_deck_id FROM champions ch "
-        "JOIN campaigns c ON c.champion_id = ch.id WHERE ch.is_deleted=0 "
-        "ORDER BY ch.id DESC LIMIT 1").fetchone()
+    conn = db._db
+    query = ("SELECT ch.user_id, ch.id, ch.last_deck_id FROM champions ch "
+             "JOIN campaigns c ON c.champion_id = ch.id WHERE ch.is_deleted=0 "
+             "ORDER BY ch.id DESC LIMIT 1")
+    row = conn.execute(query).fetchone()
+    if row is None:
+        # The disposable baseline has no players: seed one champion with its
+        # campaign so the playtest token can be issued to it.
+        conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (1, 'playtest')")
+        cur = conn.execute(
+            "INSERT INTO champions (user_id, champion_name, race, champion_class) "
+            "VALUES (1, 'Playtest', 3, 3)")
+        conn.execute(
+            "INSERT INTO campaigns (champion_id, user_id, champion_name) "
+            "VALUES (?, 1, 'Playtest')", (cur.lastrowid,))
+        conn.commit()
+        row = conn.execute(query).fetchone()
     return int(row[0]), int(row[1]), row[2]
 
 

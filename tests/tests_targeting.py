@@ -376,7 +376,7 @@ def test_optional_trigger_prompt_has_opt_in_without_fake_target(db):
     ]
 
 
-def test_optional_trigger_decline_serializes_canonical_player_uid():
+def test_optional_trigger_decline_serializes_canonical_player_uid(*_args):
     """Declining a Practice trigger serializes its protocol player UID."""
     import hconnect_server as hcs
 
@@ -639,7 +639,7 @@ def test_pending_trigger_prompt_survives_priority_projection(db):
         session, pl_t, ai_t, bstate) is False
 
 
-def test_pending_trigger_stops_native_scheduler(_db):
+def test_pending_trigger_stops_native_scheduler(*_args):
     """A trigger prompt must not advance an empty native action stack."""
     from rules_port.session import AuthoritativeSession
 

@@ -737,11 +737,14 @@ class TransactionsMixin:
             # "At the start of the game" triggers for both players'
             # opening-hand / warzone cards (e.g. Princess Victoria).
             game_started_event_start = len(game.events)
-            for gs_owner in (self.user_profile["id"], 0):
-                self._dispatch_native_trigger(
-                    game, session, pl_t, ai_t, bstate,
-                    "GameStartedEvent", None, gs_owner,
-                    zones=("hand", "warzone"))
+            # One dispatch: trigger discovery already scans both sides, so
+            # dispatching once per owner ran every start-of-game ability twice
+            # (Zuba's Expendable Lives granted its Deathcry twice, and Early
+            # Sprouts' resources were applied twice).
+            self._dispatch_native_trigger(
+                game, session, pl_t, ai_t, bstate,
+                "GameStartedEvent", None, self.user_profile["id"],
+                zones=("hand", "warzone"))
             # GameStarted triggers are mandatory setup work, not a priority
             # window.  Drain their normal chain in LIFO order before the
             # StartGame packet is sent; otherwise _advance_to_priority leaves

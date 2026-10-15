@@ -2295,11 +2295,13 @@ def _grant_ability_legacy(game, session, db, handler, pl_t, ai_t, bstate,
             if added and (bstate or {}).get("event_type") == "GameStartedEvent":
                 from .fields import ability_record
                 from .triggers import _resolve_ability_bom
+                from rules_port.effect_lifetimes import mark_gamestart_grant
                 for granted_guid in added:
                     child = ability_record(db, granted_guid)
                     child_event = str((child.get("m_TriggerEventType") or {}).get(
                         "m_InternalType") or "")
-                    if child_event.endswith("GameStartedEvent"):
+                    if (child_event.endswith("GameStartedEvent") and
+                            mark_gamestart_grant(bstate, int(target_uid), granted_guid)):
                         _resolve_ability_bom(
                             db, handler, game, session, pl_t, ai_t, bstate,
                             granted_guid, int(target_uid), "", target_uid=None,

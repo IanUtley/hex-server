@@ -66,3 +66,46 @@ def sync(handler, db, camp_id: int, champion_id: int, client_state: dict,
             campaign._merge_applied(out["applied"], campaign._apply_quest_rewards(
                 handler, db, camp_id, client_state, script))
     return out
+
+
+def reproject(db, champion_id: int, engine_quests: dict[str, Any]) -> dict[str, list]:
+    """Rebuild the champion's QUEST rows from the engine's quests, silently.
+
+    Used after an editor import: the engine's ``quests`` are authoritative, so a
+    row for a quest that is not started is removed, a missing row for an active
+    or finished quest is created, and each row is advanced to the engine's step.
+    Unlike ``sync`` nothing is paid or pushed. A row already past the engine's
+    step is left as it is and reported in ``ahead``.
+    """
+    import campaign
+    report: dict[str, list] = {"created": [], "advanced": [], "removed": [], "ahead": []}
+    for script, quest in (engine_quests or {}).items():
+        status = (quest or {}).get("status")
+        if status not in ("active", "finished"):
+            qid = pve_db.db_quest_campaign_id(champion_id, script, db)
+            if qid:
+                db.execute("DELETE FROM campaigns WHERE id=?", (qid,))
+                report["removed"].append(script)
+            continue
+        index, state = _journal_index(db, champion_id, script)
+        if state is None:
+            qid = campaign._ensure_quest_campaign(db, champion_id, None, script)
+            if not qid:
+                continue           # no QuestTemplate: an engine-only quest
+            report["created"].append(script)
+            index, state = _journal_index(db, champion_id, script)
+        target = int(quest.get("step", 0) or 0)
+        objectives = len((state.get("Flags") or {}).get("_quest_objectives") or ())
+        if status == "finished":
+            target = max(target, objectives)
+        if index is not None and index > target:
+            report["ahead"].append(script)
+            continue
+        while index is not None and index < target and not state.get("Finished"):
+            if campaign._advance_quest_campaign(db, champion_id, script) is None:
+                break
+            index, state = _journal_index(db, champion_id, script)
+        if index is not None and index < target:
+            report["ahead"].append(script)
+    db.commit()
+    return report

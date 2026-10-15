@@ -61,11 +61,12 @@ def test_help_lists_only_public_commands_without_debug_console():
     old_flags = commands.hconnect_server.PROFILE_FEATURE_FLAGS
     commands.hconnect_server.PROFILE_FEATURE_FLAGS = ()
     try:
-        expected = (
-            "Available commands: !help, !commands, !version, !arena-cleanup, "
-            "!account-cleanup, !issue <title>")
-        assert commands.handle_command(HandlerStub(), "!help", "", "") == expected
-        assert commands.handle_command(HandlerStub(), "!commands", "", "") == expected
+        # The public listing is always shown; the developer section is not.
+        for name in ("!help", "!commands"):
+            text = commands.handle_command(HandlerStub(), name, "", "")
+            assert text.startswith("=== Commands ==="), text
+            assert "!issue <title>" in text, text
+            assert "Developer commands" not in text, text
     finally:
         commands.hconnect_server.PROFILE_FEATURE_FLAGS = old_flags
 
@@ -214,14 +215,14 @@ class BattleSessionStub(SessionStub):
 def test_top_moves_named_hand_card_to_deck_position_zero():
     db = sqlite3.connect(":memory:")
     db.executescript("""
-        CREATE TABLE card_templates (
+        CREATE TABLE IF NOT EXISTS card_templates (
             guid TEXT PRIMARY KEY, name TEXT, card_type TEXT);
         CREATE TABLE game_cards (
             session_id INTEGER, user_id INTEGER, card_uid INTEGER,
             template_guid TEXT, card_template_id TEXT, location TEXT,
             position INTEGER, card_state INTEGER);
     """)
-    db.executemany("INSERT INTO card_templates VALUES (?, ?, ?)", [
+    db.executemany("INSERT OR REPLACE INTO card_templates VALUES (?, ?, ?)", [
         ("00000000-0000-0000-0000-000000000101", "Chosen Card", "Troop"),
         ("00000000-0000-0000-0000-000000000102", "Deck A", "Troop"),
         ("00000000-0000-0000-0000-000000000103", "Deck B", "Troop"),

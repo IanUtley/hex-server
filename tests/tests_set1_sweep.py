@@ -222,10 +222,10 @@ def _resolve_one(db, handler, game, session, pl_t, ai_t, bstate, ability_guid,
 
 
 def _run_sweep(all_cards=False):
-    fd, sandbox_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    shutil.copy(SRC, sandbox_path)
-    db = sqlite3.connect(sandbox_path)
+    _src = sqlite3.connect(SRC)
+    db = sqlite3.connect(":memory:")
+    _src.backup(db)
+    _src.close()
     handler = HandlerStub(db)
     session = SessionStub()
     pl_t = game_engine.UID.make(244, 5)

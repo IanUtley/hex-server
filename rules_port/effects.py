@@ -13,6 +13,7 @@ from typing import Any, cast
 import game_engine
 
 
+
 # Effect templates whose C# Apply(AbilityEffectInstance) runs once for the
 # mapping and handles any target set itself.  The resolver's per-target loop
 # must not invoke them once per member card.
@@ -369,6 +370,9 @@ def grant_ability(context):
                     (str(graph.trigger_event_type or "").rsplit(
                         ".", 1)[-1] == "GameStartedEvent" or
                      continuous_card_modifier)):
+                    from .effect_lifetimes import mark_gamestart_grant
+                    if not mark_gamestart_grant(context.bstate, champion_uid, guid):
+                        continue
                     resolve_port_ability(
                         context.handler, context.game, context.session,
                         context.db, context.player_uid, context.ai_uid,

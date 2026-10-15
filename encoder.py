@@ -153,7 +153,8 @@ def encode_player_state_coll(buf, sizes, find_type, player_states):
 GEM_UNKNOWN = EGemTypesNew.Unknown
 
 
-def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx):
+def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, idx,
+                        is_extended=False):
     """Encode one card_instance_bits inline. 8 DataMember fields.
 
     CardStats is an empty Dictionary<ECardStatType,int>; SocketedGems is an
@@ -197,7 +198,7 @@ def encode_card_instance(buf, sizes, ft, guid, name, card_id, cost, atk, def_, i
     # IsExtended
     f5 = buf.tell(); sizes.append(0)
     w("IsExtended"); sep(); w(str(len(sizes)-1)); sep(); w(str(ft("System.Boolean"))); sep(); w("0"); sep()
-    w("0")
+    w("1" if is_extended else "0")
     sizes[-1] = buf.tell() - f5
 
     # SocketedGems: EGemTypesNew enum (ulong) with one value__ child
@@ -303,13 +304,15 @@ def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
     for i, entry in enumerate(deck_cards):
         encode_card_instance(buf, sizes, ft, entry[0], entry[1],
                              int(entry[2]), int(entry[3]), int(entry[4]),
-                             int(entry[5]), i)
+                             int(entry[5]), i,
+                             bool(entry[6]) if len(entry) > 6 else False)
     sizes[-1] = buf.tell() - f_cd
     # 17. CardsInSideboard.  Tournament construction uses this list as the
     # player's limited pool.  Entries are optional six-tuples accepted by
     # encode_card_instance: (template_guid, name, instance_id, cost, atk,
-    # defense).  Ordinary profile deck encodings still pass GUID strings and
-    # therefore retain the historical empty sideboard.
+    # defense), with an optional seventh IsExtended flag. Ordinary profile
+    # deck encodings still pass GUID strings and retain the historical empty
+    # sideboard.
     f_cs = buf.tell(); sizes.append(0)
     w("CardsInSideboard"); sep(); w(str(len(sizes)-1)); sep()
     w(str(ft("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits"))); sep(); w("0"); sep()
@@ -320,7 +323,8 @@ def encode_deck_bits_fields(buf, sizes, ft, did, dname, did_val, champ_did,
     for i, entry in enumerate(pool):
         encode_card_instance(buf, sizes, ft, entry[0], entry[1],
                              int(entry[2]), int(entry[3]), int(entry[4]),
-                             int(entry[5]), i)
+                             int(entry[5]), i,
+                             bool(entry[6]) if len(entry) > 6 else False)
     sizes[-1] = buf.tell() - f_cs
     # 18. ActiveGems — Dictionary<ulong, EGemTypesNew> (empty)
     f_ag = buf.tell(); sizes.append(0)
@@ -653,8 +657,11 @@ def encode_objfmt_response(type_names, fields, *, uppercase_hex=False):
         elif tcode == "cardlist":
             w(str(ecount))
             sep()
-            for i, (guid, name, card_id, cost, atk, def_) in enumerate(card_data):
-                encode_card_instance(buf, sizes, find_type, guid, name, card_id, cost, atk, def_, i)
+            for i, card in enumerate(card_data):
+                guid, name, card_id, cost, atk, def_ = card[:6]
+                is_extended = bool(card[6]) if len(card) > 6 else False
+                encode_card_instance(buf, sizes, find_type, guid, name,
+                                     card_id, cost, atk, def_, i, is_extended)
         elif tcode == "decklist":
             w(str(ecount))
             sep()

@@ -37,14 +37,14 @@ def _insert_ability(db, ag, tids, effects):
     order, type, param, group, condition, target_index, instance_id,
     contingent_instance_id."""
     db.execute(
-        "INSERT INTO card_abilities_meta (ability_guid, is_triggered, "
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, "
         "trigger_event_type, game_text, raw_json, casting_behavior, is_manual, "
         "activation_cost, uses_per_game, uses_per_turn, target_template_ids, "
         "exhausts_on_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (ag, 0, "", "", "", 0, 0, 0, 0, 0, json.dumps(tids), 0))
     for e in effects:
         db.execute(
-            "INSERT INTO ability_effects (ability_guid, effect_guid, "
+            "INSERT OR REPLACE INTO ability_effects (ability_guid, effect_guid, "
             "effect_order, effect_type, param, effect_group_id, condition_id, "
             "target_index, effect_instance_id, contingent_effect_instance_id, "
             "secondary_target_index, recalculate_targets, is_optional, "
@@ -92,7 +92,7 @@ def _fixture_target_template_ids(db, ability_guid):
 
 def _condition(db, cid, lhs, rhs):
     db.execute(
-        "INSERT INTO ability_effect_conditions (condition_id, name, condition_json) "
+        "INSERT OR REPLACE INTO ability_effect_conditions (condition_id, name, condition_json) "
         "VALUES (?,?,?)",
         (cid, f"{lhs}Equals{rhs}",
          json.dumps({"_t": "Game.Shared.Mechanics.Abilities.Conditions."
@@ -210,7 +210,7 @@ def test_empty_revealed_troop_target_does_not_move_stale_card(db):
     TROOP = _ag("oakhenge-revealed-troop-target")
     REMAINING = _ag("oakhenge-revealed-remaining-target")
     db.executemany(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+        "INSERT OR REPLACE INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
             (TROOP, "a revealed troop", 0, 0, 0, 1, "", "", 1, 1,
              '{"_t": "Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
              "SourceRevealedTargetTemplate"),
@@ -371,7 +371,7 @@ def test_empty_sacrifice_target_does_not_sacrifice_source(db):
     ability = _ag("empty-sacrifice")
     target = _ag("optional-troop")
     db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (target, "a troop you control", 0, 0, 0, 0, "Self", "Warzone",
          1, 1, '{"_t":"Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
          "AbilityTargetTemplate"))
@@ -407,7 +407,7 @@ def test_ai_sacrifice_target_excludes_source(db):
     ability = _ag("ai-sacrifice-target")
     target = _ag("ai-optional-troop")
     db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (target, "a troop you control", 0, 0, 0, 0, "Self", "Warzone",
          1, 1, '{"_t":"Game.Shared.Mechanics.Cards.Filters.IsTroop"}',
          "AbilityTargetTemplate"))
@@ -442,7 +442,7 @@ def test_double_choice_creates_random_choices_and_clears_before_second(db):
     choice_guids = [_ag(f"choice-{i}") for i in range(6)]
     for guid in choice_guids:
         db.execute(
-            "INSERT INTO card_templates "
+            "INSERT OR REPLACE INTO card_templates "
             "(guid,name,card_type,cost,attack,defense,attributes,"
             "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (guid, f"Choice {guid[-4:]}", "Choice", 0, 0, 0, 0, "[]",
@@ -506,7 +506,7 @@ def test_summon_choosing_collection_stays_out_of_warzone(db):
 
     choice = _ag("choosing-token")
     db.execute(
-        "INSERT INTO card_templates "
+        "INSERT OR REPLACE INTO card_templates "
         "(guid,name,card_type,cost,attack,defense,attributes,"
         "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (choice, "A Choice", "Choice", 0, 0, 0, 0, "[]", "[]", ""))
@@ -546,7 +546,7 @@ def test_summon_none_collection_waits_for_authored_zone_move(db):
 
     token = _ag("none-collection-token")
     db.execute(
-        "INSERT INTO card_templates "
+        "INSERT OR REPLACE INTO card_templates "
         "(guid,name,card_type,cost,attack,defense,attributes,"
         "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (token, "Detached Token", "Troop", 0, 1, 1, 0, "[]", "[]", ""))
@@ -637,7 +637,7 @@ def test_hand_discard_child_asks_the_controller_and_discards_on_resume(db):
     discard_child = "06570445-27e3-fc87-2e17-a7b5e1de693d"  # "Discard a card"
     hand_card = 401
     db.execute(
-        "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         ("84e4acf1-1f2e-abac-069d-8c6eb18b2b12", "a card from your hand",
          0, 0, 0, 0, "MultiplePlayers",
          # The authored template advertises every collection in its
@@ -905,12 +905,12 @@ def test_choice_ability_transforms_real_parent(db):
     choice_ability = _ag("choice-transform")
     effect_guid = _ag("choice-transform-effect")
     db.execute(
-        "INSERT INTO card_templates "
+        "INSERT OR REPLACE INTO card_templates "
         "(guid,name,card_type,cost,attack,defense,attributes,"
         "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (output_tpl, "Choice Output", "Troop", 3, 4, 4, 0, "[]", "[]", ""))
     db.execute(
-        "INSERT INTO card_templates "
+        "INSERT OR REPLACE INTO card_templates "
         "(guid,name,card_type,cost,attack,defense,attributes,"
         "abilities_json,threshold_json,subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (choice_tpl, "Choose Output", "Choice", 0, 0, 0, 0,
@@ -921,8 +921,20 @@ def test_choice_ability_transforms_real_parent(db):
             effect_guid, "TransformCardAbilityEffectTemplate",
             text=f"Transform this into <a data={output_tpl}>Choice Output</a>.",
             m_CardTemplateId={"m_Guid": output_tpl})
+        # A Choice card's "this" target is overridden to the card that created
+        # it (m_ChoiceOverride), so the transform lands on the parent.
+        parent_target = rec.target(
+            _ag("choice-parent-target"), kind="AbilitySourceCardTargetTemplate",
+            choice_override=True)
+        db.execute(
+            "INSERT OR REPLACE INTO target_templates (template_id, game_text, "
+            "is_auto_target, is_random_target, optional, explicit, player_filter, "
+            "collection_flags, min_target_count, max_target_count, filter_json, "
+            "target_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (parent_target, "", 1, 0, 0, 0, "MultiplePlayers", "Warzone", 1, 1,
+             "{}", "AbilitySourceCardTargetTemplate"))
         rec.ability(choice_ability, effects=[rec.mapping(transform)],
-                    targets=["190a4d8c-7c2c-10d0-6429-99c5aeb0791f"])
+                    targets=[parent_target])
         db.commit()
         add_card(db, source_uid, 5, source_tpl)
         session = SessionStub()
@@ -963,7 +975,7 @@ def test_records_target_filter_dict_is_parsed_for_choice_prompt(db):
         resolution._parse_param(filter_data), "Choosing")
 
 
-def test_attached_session_rejects_legacy_walker_even_with_native_dispatch(_db):
+def test_attached_session_rejects_legacy_walker_even_with_native_dispatch(*_args):
     """Passing a native leaf callback must not re-enable the legacy walker."""
     from abilities.framework.resolution import resolve_ability
 

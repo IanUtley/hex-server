@@ -88,16 +88,21 @@ def resolve_zone_name(name: str, *, kind: str | None = None
     return matches[0] if len(matches) == 1 else None
 
 
-_NODE_IN_SCENE = re.compile(r"\bNODE\s*-?\s*([0-9]+|[A-Z])([A-Z])?\b", re.I)
+_NODE_IN_SCENE = re.compile(r"\bNODE\s*-?\s*([A-Z]?[0-9]+|[A-Z])([A-Z])?\b", re.I)
 
 
 def scene_node_id(scene_name: str) -> str | None:
-    """``AZ 1 - NODE 23B - ...`` -> ``Node023`` (variant letter dropped)."""
+    """``AZ 1 - NODE 23B - ...`` -> ``Node023`` (variant letter dropped);
+    ``AZ 2 - NODE B18 - ...`` -> ``NodeB18`` (lettered sea nodes)."""
     match = _NODE_IN_SCENE.search(scene_name or "")
     if not match:
         return None
     token = match.group(1).upper()
-    return f"Node{int(token):03d}" if token.isdigit() else f"Node00{token}"
+    if token.isdigit():
+        return f"Node{int(token):03d}"
+    if token[1:].isdigit():
+        return f"Node{token[0]}{int(token[1:]):02d}"
+    return f"Node00{token}"
 
 
 def _battle_tags_of(value):
@@ -230,11 +235,19 @@ def match_item(name: str, items: dict[str, str], prefixes: list[str]
     return node, lowered[at + len(key):].strip(" -:()")
 
 
+def _prefix_re(scene_prefix: str) -> re.Pattern[str]:
+    """Matches a zone's scene prefix with any spacing: ``AZ 2 - NODE`` also
+    matches the ``AZ2 - NODE 34A`` spelling some Records scenes use."""
+    return re.compile(r"^\s*" + r"\s*".join(
+        re.escape(part) for part in scene_prefix.split()), re.I)
+
+
 def _scene_node(name: str, scene_prefix: str, scene_regex: str | None,
                 item_names: dict[str, str]) -> tuple[str | None, str]:
     """``(node, race)`` for an encounter scene name in this zone."""
     if not scene_regex:
-        return (scene_node_id(name) if name.startswith(scene_prefix) else None), ""
+        return (scene_node_id(name) if _prefix_re(scene_prefix).match(name or "")
+                else None), ""
     match = re.match(scene_regex, name or "")
     if not match:
         return None, ""
@@ -393,7 +406,7 @@ def server_catalog(db: sqlite3.Connection, template: str = AREA_TEMPLATE,
             "player_champion_guid, player_deck_guid, gameboard "
             "FROM encounter_scenes "
             "WHERE name LIKE ? ORDER BY name",
-            ("%" if scene_regex or scene_match else f"{scene_prefix}%",)):
+            ("%",)):    # the prefix is matched in _scene_node (any spacing)
         variant = ""
         if item_scene_match:
             # Dungeon scenes are named after their node (+ a difficulty/form).

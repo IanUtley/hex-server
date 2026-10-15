@@ -429,14 +429,17 @@
  },
  "nodes": {
   "Node003": {
-   "retryable": []
+   "retryable": [],
+   "completed": [
+    "flag(tamed:150b0ed9)"
+   ]
   },
   "Node005": {
-   "blocked": [
-    "!questStarted(q_seawitch)"
-   ],
    "visible": [
     "questStarted(q_seawitch)"
+   ],
+   "blocked": [
+    "!questStarted(q_seawitch)"
    ]
   },
   "Node006": {
@@ -616,14 +619,6 @@
    ]
   },
   "Node021": {
-   "blocked": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
-   "hidden": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
    "visible": [
     "flag(blockade_passed)"
    ]
@@ -634,14 +629,6 @@
    ]
   },
   "Node023": {
-   "blocked": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
-   "hidden": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
    "visible": [
     "flag(blockade_passed)"
    ],
@@ -701,14 +688,27 @@
    ]
   },
   "Node030": {
-   "completed": [
+   "retryable": [
     "completedQuest(az01_q_cross_the_river_part2)"
+   ]
+  },
+  "Node031": {
+   "visible": [
+    "visited(Node030)"
+   ],
+   "completed": [
+    "flag(tamed:a9e9e040)"
    ]
   },
   "Node032": {
    "completed": {
     "flag": "tamed:f6f3074b"
    }
+  },
+  "Node033": {
+   "completed": [
+    "flag(tamed:1d67638c)"
+   ]
   },
   "Node034": {
    "visible": [
@@ -847,16 +847,13 @@
    "retryable": []
   },
   "Node077": {
-   "blocked": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
-   "hidden": [
-    "!flag(blockade_cleared)",
-    "!flag(blockade_passed)"
-   ],
    "visible": [
-    "flag(blockade_passed)"
+    [
+     "flag(blockade_passed)"
+    ],
+    [
+     "faction(blockade_cleared)"
+    ]
    ]
   },
   "Node078": {
@@ -1039,16 +1036,20 @@
    "blocked"
   ],
   "Node031": [
-   "blocked"
+   "blocked",
+   "visible",
+   "completed"
   ],
   "Node00Y": [
    "visible"
   ],
   "Node033": [
-   "blocked"
+   "blocked",
+   "completed"
   ],
   "Node030": [
-   "completed"
+   "completed",
+   "retryable"
   ],
   "Node012": [
    "completed"
@@ -1116,6 +1117,9 @@
   ],
   "Node022": [
    "hidden"
+  ],
+  "Node003": [
+   "completed"
   ]
  },
  "runtime": "rules",
@@ -1137,6 +1141,13 @@
    "conv:6eec3154",
    "tagged:437e23f2",
    "conv:0f01d5bb"
+  ],
+  "Node026": [
+   "battle:2de5b786:Underworld",
+   "tagged:a6a15556",
+   "tagged:d0d800e5",
+   "battle:2de5b786:Ardent",
+   "battle:fcf51a17"
   ]
  }
 }

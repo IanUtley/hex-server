@@ -18,6 +18,7 @@ Request types:
 """
 
 from domain.enums import EGemTypesNew
+import base64
 import json
 import time
 import threading
@@ -1064,7 +1065,32 @@ _CRAYBURN_ENCOUNTER_NODES = ("CastleGate", "TowerGate", "PenworthTower")
 
 
 
-def _build_camp_summary(cid, inst_id, campaign_type="PANORAMA", template_name="AZ1", champion_race=None):
+def _az1_panorama_bundle(state_json):
+    """The AssetBundle of the AZ1 panorama a campaign row is standing in.
+
+    The row's ``RulesZone`` names the panorama (Cave-In, Ambling Mesa, ...);
+    its catalog bundle is the one the client must load, not the race's AZ0
+    starter panorama.  Returns ``(bundle, prefab)`` or None.
+    """
+    try:
+        zone_id = (json.loads(state_json or "{}") or {}).get("RulesZone")
+    except (TypeError, ValueError):
+        return None
+    if not zone_id:
+        return None
+    from campaign_runtime import catalog_data
+    try:
+        entry = catalog_data.zone(zone_id)
+    except LookupError:
+        return None
+    if (entry.get("kind") != "panorama" or entry.get("server_template") != "AZ1"
+            or not entry.get("bundle")):
+        return None
+    return entry["bundle"], entry["bundle"].rsplit("/", 1)[-1]
+
+
+def _build_camp_summary(cid, inst_id, campaign_type="PANORAMA", template_name="AZ1", champion_race=None,
+                        state_json=None):
     """Build a CampSummary JSON dict."""
     bundle, prefab = "", ""
     cfg = _az0_config(champion_race)
@@ -1072,6 +1098,10 @@ def _build_camp_summary(cid, inst_id, campaign_type="PANORAMA", template_name="A
         bundle, prefab = cfg["bundle"], cfg["prefab"]
     elif champion_race and champion_race in _RACE_BUNDLE_MAP:
         bundle, prefab = _RACE_BUNDLE_MAP[champion_race]
+    if (campaign_type or "PANORAMA").upper() == "PANORAMA":
+        zone_bundle = _az1_panorama_bundle(state_json)
+        if zone_bundle:
+            bundle, prefab = zone_bundle
 
     is_panorama = (campaign_type or "PANORAMA").upper() == "PANORAMA"
     if is_panorama:
@@ -1599,7 +1629,7 @@ def _handle_getcampsum(handler, db, env_json, comp, session_id,
         if row:
             summaries.append(_build_camp_summary(
                 cid, row[0], row[1] or "DUNGEON",
-                row[2] or "Crayburn Castle", row[3]))
+                row[2] or "Crayburn Castle", row[3], state_json=row[4]))
 
     return _send_response(handler, json.dumps(summaries), comp, session_id,
                           reqid, target, instance, conh, uid)
@@ -1908,8 +1938,20 @@ def _inventory_reward_specs(reward):
             if not isinstance(entry, dict) or not entry.get("guid"):
                 continue
             # One copy each: mercenaries and sleeves are never stacked.
-            specs.append({"guid": str(entry["guid"]).lower(), "quantity": 1})
+            specs.append({"guid": str(entry["guid"]).lower(), "quantity": 1,
+                          "_campaign_mercenary": key == "mercenaries"})
     return specs
+
+
+def _unlock_party_slot_for_mercenary(db, user_id, applied):
+    """Raise CAMP_PARTYCAP to one and publish the account-flag update once."""
+    from services import mercenaries
+    flag = mercenaries.unlock_first_party_slot(db, user_id)
+    if flag:
+        applied.setdefault("AccountFlags", []).append({"Info": {
+            "Name": flag["name"], "Progress": flag["progress"],
+            "Maximum": flag["maximum"], "Completed": flag["completed"],
+        }})
 
 
 def _stardust_item_specs(reward):
@@ -1934,6 +1976,133 @@ def _stardust_item_specs(reward):
             specs.append({"guid": guid, "quantity": amount,
                           "stardust": str(entry["rarity"]).lower()})
     return specs
+
+
+# Champion XP needed to reach each level (level = index + 1); the last entry
+# is the level cap.
+CHAMPION_XP_THRESHOLDS = (0, 1000, 2800, 5000, 8000, 12000, 17500,
+                          25000, 40000, 50000, 60000, 70000, 80000,
+                          92000, 110000)
+
+
+def _champion_level_for_xp(xp):
+    return max(1, min(len(CHAMPION_XP_THRESHOLDS),
+                      1 + sum(xp >= n for n in CHAMPION_XP_THRESHOLDS[1:])))
+
+
+def _champion_reward_talents(db, champion_id, mercenary=False):
+    """GUIDs of the champion talents whose reward effects apply.
+
+    A mercenary fights without champion talents, so none apply to its battle.
+    """
+    if mercenary:
+        return []
+    row = pve_db.db_champion_battle_profile(champion_id, conn=db)
+    try:
+        guids = json.loads((row[5] if row else None) or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(guids, list):
+        return []
+    return [str(guid).lower() for guid in guids if guid]
+
+
+def _talent_on_event(talent_guid):
+    """A talent's ``on_event`` table, decoded from ``ChampionTalentData.m_Eval``.
+
+    The script is base64 of a JSON-like table.  Numbers may omit the leading
+    zero (``.05``), which strict JSON rejects, so those are normalised first.
+    """
+    from gamedata import DEFAULT_RECORD_STORE
+    record = DEFAULT_RECORD_STORE.get(
+        "ChampionTalentData", str(talent_guid).lower())
+    raw = record.field("m_Eval") if record else ""
+    if not raw:
+        return {}
+    try:
+        text = base64.b64decode(raw).decode("utf-8")
+        script = json.loads(re.sub(r"(?<=[\s\[,:])\.(\d)", r"0.\1", text))
+    except (TypeError, ValueError):
+        return {}
+    events = script.get("on_event") if isinstance(script, dict) else None
+    return events if isinstance(events, dict) else {}
+
+
+def _event_amount(entries, key):
+    """Sum of the amounts of the ``[key, amount]`` entries of an event list."""
+    total = 0.0
+    for entry in entries or ():
+        if isinstance(entry, list) and len(entry) >= 2 and entry[0] == key:
+            total += float(entry[1])
+    return total
+
+
+def _talent_reward_multipliers(talent_guids, level):
+    """``(xp, gold)`` multipliers from the talents' ``bonusxp`` and
+    ``bonusgold`` entries.  Gold bonuses count only at the level cap."""
+    xp_bonus = gold_bonus = 0.0
+    at_cap = level >= len(CHAMPION_XP_THRESHOLDS)
+    for guid in talent_guids:
+        events = _talent_on_event(guid)
+        xp_bonus += _event_amount(events.get("on_xp"), "bonusxp")
+        if at_cap:
+            gold_bonus += _event_amount(
+                events.get("on_gold_at_max_level"), "bonusgold")
+    return 1 + xp_bonus, 1 + gold_bonus
+
+
+def _scale_reward(amount, multiplier):
+    """A reward after a talent bonus, rounded down to whole units."""
+    return int(round(amount * multiplier, 6))
+
+
+def _talent_dungeon_reward_specs(talent_guids):
+    """Item specs from talents' ``dungeon_complete`` weighted picks (Artistic).
+
+    Each pick is rolled once per dungeon win.  Stardust picks carry their
+    rarity so the grant also updates the stardust ledger.
+    """
+    from db import STARDUST_TEMPLATES
+    rarity_by_guid = {guid: rarity for rarity, guid in STARDUST_TEMPLATES.items()}
+    specs = []
+    for guid in talent_guids:
+        for step in _talent_on_event(guid).get("dungeon_complete") or ():
+            if not (isinstance(step, list) and len(step) == 2 and
+                    step[0] == "weightpick"):
+                continue
+            outcomes = [o for o in step[1]
+                        if isinstance(o, list) and len(o) == 3]
+            weights = [float(o[0]) for o in outcomes]
+            if not outcomes or sum(weights) <= 0:
+                continue
+            _weight, items, _label = random.choices(
+                outcomes, weights=weights)[0]
+            for item in items:
+                if not (isinstance(item, list) and len(item) == 3 and
+                        item[0] == "item"):
+                    continue
+                key = str(item[1]).lower()
+                spec = {"guid": key, "quantity": max(1, int(item[2]))}
+                if key in rarity_by_guid:
+                    spec["stardust"] = rarity_by_guid[key]
+                specs.append(spec)
+    return specs
+
+
+def _battle_uses_mercenary(db, camp_id, user_id):
+    """True when this campaign battle is fought as its chosen mercenary."""
+    from services.mercenaries import battle_mercenary
+    with _active_mercenary_lock:
+        chosen = _active_mercenary.get(camp_id)
+    if not chosen or user_id is None:
+        return False
+    return battle_mercenary(db, user_id, chosen[0], chosen[1]) is not None
+
+
+def _zone_is_dungeon(zone_id):
+    from campaign_runtime import catalog_data
+    entry = catalog_data.zone(zone_id)
+    return bool(entry and entry.get("kind") == "dungeon")
 
 
 def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
@@ -1967,6 +2136,10 @@ def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
         xp = max(0, int(reward.get("xp", 0) or 0))
     except (TypeError, ValueError):
         xp = 0
+    talents = _champion_reward_talents(db, champ_id)
+    xp_mult, gold_mult = _talent_reward_multipliers(talents, int(champ[4] or 0))
+    gold = _scale_reward(gold, gold_mult)
+    xp = _scale_reward(xp, xp_mult)
 
     if gold:
         new_gold, platinum = db_adjust_user_currency(
@@ -1983,11 +2156,7 @@ def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
         crow = db_champion_reward_profile(champ_id, conn=db)
         if crow:
             new_xp = int(crow[3] or 0) + xp
-            thresholds = (0, 1000, 2800, 5000, 8000, 12000, 17500,
-                          25000, 40000, 50000, 60000, 70000, 80000,
-                          92000, 110000)
-            new_level = max(1, min(len(thresholds),
-                                   1 + sum(new_xp >= n for n in thresholds[1:])))
+            new_level = _champion_level_for_xp(new_xp)
             db_update_champion_xp(champ_id, new_xp, new_level, conn=db)
             applied["Champions"].append({"Champ": {
                 "Id": int(crow[0]), "Name": crow[1] or "",
@@ -2107,6 +2276,8 @@ def _apply_reward_dict(handler, db, camp_id, state, reward, one_time,
             "ItemAction": "GRANT", "ItemTemplate": str(template_guid),
             "RCode": "ITEM",
         })
+        if spec.get("_campaign_mercenary"):
+            _unlock_party_slot_for_mercenary(db, user_id, applied)
 
     # Promotional Crayburn rewards are real treasure chests, not merely a
     # display-only loot entry.  Persist the chest so it survives reconnects,
@@ -2185,7 +2356,8 @@ def _battle_events(db, session, player_user_id):
 
 
 
-def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
+def _apply_encounter_end_rewards(handler, db, session, camp_id, won,
+                                 in_dungeon=False):
     """Apply authored encounter rewards and return campaign AppliedUpdates.
 
     Campaign clients build their loot window from ``gameendnotify.Applied``;
@@ -2210,7 +2382,17 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         session.session_name or "")
     champ = _get_champion(db, champion_id)
     player_user_id = champ[1] if champ else None
-    records = _scene_reward_records(db, scene_guid)
+    records = list(_scene_reward_records(db, scene_guid) or ())
+    talents = []
+    if player_user_id is not None:
+        talents = _champion_reward_talents(
+            db, champion_id,
+            mercenary=_battle_uses_mercenary(db, camp_id, player_user_id))
+        if in_dungeon:
+            talent_items = _talent_dungeon_reward_specs(talents)
+            if talent_items:
+                records.append({"reward": {"items": talent_items},
+                                "one_time": False})
     if not records:
         return result
     result["scene_guid"] = str(scene_guid) if scene_guid else None
@@ -2237,6 +2419,8 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
     quest_pending = _quest_encounter_is_pending(
         db, champion_id, str(scene_guid) if scene_guid else None)
     retry_without_currency = bool(quest_pending and prior_successes)
+    champ_level = int(champ[4] or 0) if champ else 0
+    xp_mult, gold_mult = _talent_reward_multipliers(talents, champ_level)
     granted, total_gold, total_xp = [], 0, 0
     for record_index, record in enumerate(records):
         reward_obj = record.get("reward")
@@ -2273,6 +2457,8 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         if retry_without_currency:
             gold = 0
             xp = 0
+        gold = _scale_reward(gold, gold_mult)
+        xp = _scale_reward(xp, xp_mult)
         # Tamed scenes have unconditional completion currency alongside a
         # conditional capture card. Only the card template is gated by
         # end_of_game_condition, so an uncaptured win can be retried without
@@ -2356,6 +2542,9 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
                         client_item_uid=item_uid, conn=db)
                 items.append({"id": item_uid, "template": str(template_guid),
                               "quantity": new_quantity, "granted": quantity})
+                if spec.get("_campaign_mercenary"):
+                    _unlock_party_slot_for_mercenary(
+                        db, player_user_id, result["applied"])
         deck_granted = False
         deck_guid = reward_obj.get("deck_guid")
         if deck_guid and (not condition or context):
@@ -2385,11 +2574,7 @@ def _apply_encounter_end_rewards(handler, db, session, camp_id, won):
         crow = db_champion_reward_profile(champion_id, conn=db)
         if crow:
             new_xp = int(crow[3] or 0) + total_xp
-            thresholds = (0, 1000, 2800, 5000, 8000, 12000, 17500,
-                          25000, 40000, 50000, 60000, 70000, 80000,
-                          92000, 110000)
-            new_level = max(1, min(len(thresholds),
-                                   1 + sum(new_xp >= n for n in thresholds[1:])))
+            new_level = _champion_level_for_xp(new_xp)
             db_update_champion_xp(champion_id, new_xp, new_level, conn=db)
             champion_bits = {
                 "Id": int(crow[0]), "Name": crow[1] or "",
@@ -2655,7 +2840,8 @@ def _rules_battle_gameend(handler, db, session, camp_id, won, zone_id,
     from pvp_db import db_delete_game_session
     zone = runtime.handle_battle_end(handler, db, zone_id, session, camp_id, won)
     reward_result = _apply_encounter_end_rewards(
-        handler, db, session, camp_id, won)
+        handler, db, session, camp_id, won,
+        in_dungeon=_zone_is_dungeon(zone_id))
     applied = _merge_applied(reward_result.get("applied") or
                              _empty_applied_updates(), zone.applied)
     service = ("00000000-0000-0000-0000-000000000000", "ServiceCampaign",

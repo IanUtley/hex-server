@@ -735,13 +735,17 @@ class ChainMixin:
         active_uid = (player_uid if _hc._same_uid(active_owner, player_uid)
                       else ai_uid if _hc._same_uid(active_owner, ai_uid)
                       else player_uid)
-        if _hc._same_uid(priority_uid, player_uid):
-            # The human is the response player; restore the legal quick actions
-            # and champion powers alongside the ResolveTopOfChain button.
-            self._push_phase_options_empty(session, player_uid, ai_uid)
         game.push_green_light(
             priority_uid, _hc.game_engine.EPriorityContext.ResolveTopOfChain)
         game.push_turn_phase(port.current_turn_phase, active_uid, priority_uid)
+        if _hc._same_uid(priority_uid, player_uid):
+            # The human is the response player; restore the legal quick actions
+            # and champion powers alongside the ResolveTopOfChain button.  They
+            # go after the green light in the same packet: sent before it, the
+            # client dropped them when the chain window opened.
+            self._push_phase_options_empty(
+                session, player_uid, ai_uid, game=game, send=False,
+                refresh_warzone=False)
         self._send_battle_events(session, game, player_uid)
         _hc.log_req(
             "    RequestPrioritySync: restored Practice native chain window "

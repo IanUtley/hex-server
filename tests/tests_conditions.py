@@ -43,59 +43,26 @@ class SessionStub:
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
+    """A disposable copy of the metadata baseline (production schema)."""
     src = sqlite3.connect(SRC)
-    db.execute("""CREATE TABLE game_cards (
-        session_id INTEGER, user_id INTEGER, card_uid INTEGER,
-        template_guid TEXT, card_template_id TEXT, location TEXT,
-        position INTEGER, card_state INTEGER, card_abilities TEXT,
-        card_type TEXT, card_attributes INTEGER, temporary_attributes INTEGER DEFAULT 0, card_attack_mod INTEGER,
-        card_defense_mod INTEGER, card_damage INTEGER,
-        permanent_buffs TEXT, temporary_buffs TEXT, card_uses TEXT,
-        resolved_at INTEGER)""")
-    db.execute("""CREATE TABLE card_abilities_meta (
-        ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
-        game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
-        is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
-        uses_per_turn INTEGER, target_template_ids TEXT)""")
-    db.execute("""CREATE TABLE card_templates (
-        guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
-        defense INTEGER, attributes INTEGER, abilities_json TEXT,
-        threshold_json TEXT, subtype TEXT)""")
-    db.execute("""CREATE TABLE ability_effect_conditions (
-        condition_id TEXT PRIMARY KEY, name TEXT, condition_json TEXT)""")
-    db.execute("""CREATE TABLE card_counter_templates (
-        template_id TEXT PRIMARY KEY, name TEXT, description TEXT)""")
-    for ag in (SCRIVENER, ANGEL, INCANTATION, DROO, VILEFANG,
-               RIDGE_RAIDER_DEATH):
-        for row in src.execute(
-                "SELECT ability_guid, is_triggered, trigger_event_type, game_text, "
-                "raw_json, casting_behavior, is_manual, activation_cost, "
-                "uses_per_game, uses_per_turn, target_template_ids "
-                "FROM card_abilities_meta WHERE ability_guid=?", (ag,)):
-            db.execute(
-                "INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
-    for row in src.execute(
-        "SELECT * FROM ability_effect_conditions WHERE condition_id=?", (INC_COND,)):
-        db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
-    for row in src.execute(
-        "SELECT * FROM ability_effect_conditions WHERE condition_id=?",
-        (GORTEZUMA_COND,)):
-        db.execute("INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
-    for row in src.execute(
-            "SELECT * FROM card_counter_templates WHERE template_id=?", (INC_COUNTER,)):
-        db.execute("INSERT INTO card_counter_templates VALUES (?,?,?)", row)
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("11111111-1111-1111-1111-111111111111", "Troop", "Troop", 1, 1, 1, 0,
-         "[]", "[]", ""))
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("22222222-2222-2222-2222-222222222222", "Artifact", "Artifact", 1, 1, 1,
-         0, "[]", "[]", ""))
+    db = sqlite3.connect(":memory:")
+    src.backup(db)
     src.close()
+    db.execute("DELETE FROM game_cards")
+    # Fixture templates the cards below refer to: a 1-cost, 1/1 Troop and a
+    # 1-cost Artifact.  The base values are what the assertions expect.
+    db.execute(
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("11111111-1111-1111-1111-111111111111", "Fixture Troop", "Troop",
+         1, 1, 1, 0, "[]", "[]", ""))
+    db.execute(
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("22222222-2222-2222-2222-222222222222", "Fixture Artifact", "Artifact",
+         1, 0, 0, 0, "[]", "[]", ""))
     db.commit()
     return db
 
@@ -108,7 +75,10 @@ def add_card(db, uid, owner, ctype, counters=None, loc="warzone", state=0):
                      "counter_guids": {"incantation": INC_COUNTER}
                      if counters and "incantation" in counters else {}})
     db.execute(
-        "INSERT INTO game_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?,0)",
+        "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+        "card_template_id, location, position, card_state, card_abilities, "
+        "card_type, card_attributes, permanent_buffs, temporary_buffs, card_uses) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (1, owner, uid, tpl, tpl, loc, 0, state, "[]", ctype, 0, pb, "{}", "{}"))
     db.commit()
 
@@ -200,7 +170,7 @@ def test_native_source_counter_condition_allows_zero(db):
     condition_id = "native-zero-counter-condition"
     counter_guid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     db.execute(
-        "INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+        "INSERT OR REPLACE INTO ability_effect_conditions VALUES (?,?,?)",
         (condition_id, "NoCounter", json.dumps({
             "_t": "Game.Shared.Mechanics.Abilities.Conditions."
                    "SourceCardHasCounters",
@@ -237,7 +207,7 @@ def test_ability_variable_condition_accepts_variable_rhs(db):
     """AbilityVariableCondition can compare two ability variables."""
     condition_id = "condition-variable-rhs"
     db.execute(
-        "INSERT INTO ability_effect_conditions VALUES (?,?,?)",
+        "INSERT OR REPLACE INTO ability_effect_conditions VALUES (?,?,?)",
         (condition_id, "SacrificeWasMade", json.dumps({
             "_t": "Game.Shared.Mechanics.Abilities.Conditions."
                    "AbilityVariableCondition",
@@ -284,8 +254,11 @@ def test_vilefang_spider_trigger_fails_closed_for_unknown_hand_card(db):
     entering Warzone.  Missing card-template metadata must not turn the
     metadata condition into an unconditional Vilefang damage trigger."""
     db.execute(
-        "INSERT INTO game_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,?,?,?,0)",
-        (1, 0, 400, None, None, "hand", 0, 0, "[]", "Troop", 0,
+        "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+        "card_template_id, location, position, card_state, card_abilities, "
+        "card_type, card_attributes, permanent_buffs, temporary_buffs, card_uses) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (1, 0, 400, None, "", "hand", 0, 0, "[]", "Troop", 0,
          "{}", "{}", "{}"))
     db.commit()
     c = ctx(db, event_type="CardEnteredZoneEvent",
@@ -375,8 +348,6 @@ def test_native_trigger_uses_effective_resource_cost(db):
 
     add_card(db, 800, 5, "Troop")
     add_card(db, 801, 5, "Troop")
-    db.execute("ALTER TABLE game_cards ADD COLUMN card_cost_mod INTEGER DEFAULT 0")
-    db.execute("ALTER TABLE game_cards ADD COLUMN cost_mod_json TEXT DEFAULT '[]'")
     db.execute("UPDATE game_cards SET card_cost_mod=1 WHERE card_uid IN (800, 801)")
     db.commit()
     condition = {

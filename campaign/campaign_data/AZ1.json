@@ -1566,7 +1566,15 @@
     "conversation_guid": "298b4460-53b6-4b00-98ed-95cc62eb12a5",
     "trigger_json": {
      "label": "Zombies - UNDERWORLD",
-     "source": "conversation_name"
+     "source": "conversation_name",
+     "actions": {
+      "choice_NoHelp": [
+       "encounter(07769a0e-8473-4584-a996-5dfb7c61a925)"
+      ],
+      "choice_Help": [
+       "encounter(8010c024-ce71-4915-ad72-a921c9864701)"
+      ]
+     }
     },
     "priority": 4001
    },
@@ -1578,7 +1586,8 @@
      "source": "conversation_name",
      "tags": [
       "outcome:success",
-      "faction(Ardent)"
+      "faction(Ardent)",
+      "conversation(AZ1 - Node 23 - Zombies - ARDENT,choice_NoHelp)"
      ]
     },
     "priority": 4002
@@ -1591,7 +1600,8 @@
      "source": "conversation_name",
      "tags": [
       "outcome:success",
-      "faction(Underworld)"
+      "faction(Underworld)",
+      "conversation(AZ1 - Node 23 - Zombies - UNDERWORLD,choice_NoHelp)"
      ]
     },
     "priority": 4003
@@ -1604,7 +1614,8 @@
      "source": "conversation_name",
      "tags": [
       "outcome:success",
-      "faction(Underworld)"
+      "faction(Underworld)",
+      "conversation(AZ1 - Node 23 - Zombies - UNDERWORLD,choice_Help)"
      ]
     },
     "priority": 4004
@@ -1614,7 +1625,15 @@
     "conversation_guid": "e1f73d43-1f36-4b02-bbcd-e5ffc685c491",
     "trigger_json": {
      "label": "Zombies - ARDENT",
-     "source": "conversation_name"
+     "source": "conversation_name",
+     "actions": {
+      "choice_Help": [
+       "encounter(07769a0e-8473-4584-a996-5dfb7c61a925)"
+      ],
+      "choice_NoHelp": [
+       "encounter(8010c024-ce71-4915-ad72-a921c9864701)"
+      ]
+     }
     },
     "priority": 4005
    },
@@ -1626,7 +1645,8 @@
      "source": "conversation_name",
      "tags": [
       "outcome:success",
-      "faction(Ardent)"
+      "faction(Ardent)",
+      "conversation(AZ1 - Node 23 - Zombies - ARDENT,choice_Help)"
      ]
     },
     "priority": 4006
@@ -1686,18 +1706,24 @@
    {
     "campaign_template": "AZ1",
     "conversation_guid": "a6a15556-fb44-4c0b-920d-96d7d8bf4276",
+    "priority": 4004,
     "trigger_json": {
      "label": "Bog - Ardent player",
-     "source": "conversation_name"
-    },
-    "priority": 4004
+     "source": "conversation_name",
+     "tags": [
+      "faction(Ardent)"
+     ]
+    }
    },
    {
     "campaign_template": "AZ1",
     "conversation_guid": "d0d800e5-f641-458b-88d9-3ef0d5f8f875",
     "trigger_json": {
      "label": "Bog - Underworld player",
-     "source": "conversation_name"
+     "source": "conversation_name",
+     "tags": [
+      "faction(Underworld)"
+     ]
     },
     "priority": 4005
    },
@@ -3203,7 +3229,8 @@
      "faction": "Underworld",
      "tags": [
       "!questStarted(q_army_of_myth)",
-      "faction(Underworld)"
+      "faction(Underworld)",
+      "questStarted(q_find_myaa)"
      ],
      "actions": {
       "*": [
@@ -3251,7 +3278,7 @@
      "tags": [
       "!questStarted(q_army_of_myth)",
       "faction(Ardent)",
-      "completedQuest(q_tranquil_dream)"
+      "questActive(q_find_myaa)"
      ],
      "actions": {
       "*": [

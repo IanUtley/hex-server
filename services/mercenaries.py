@@ -235,6 +235,18 @@ def set_flag(db, user_id, name, progress, maximum=0, completed=False):
                           conn=db)
 
 
+def unlock_first_party_slot(db, user_id):
+    """Unlock the first mercenary slot once a campaign mercenary is earned.
+
+    Returns the changed profile flag for the campaign AppliedUpdates payload,
+    or None when the player already has at least one slot.
+    """
+    from profile_db import db_ensure_reckoning_flag_minimum
+    flag, changed = db_ensure_reckoning_flag_minimum(
+        user_id, PARTY_CAP_FLAG, 1, default_maximum=4, conn=db)
+    return flag if changed else None
+
+
 def get_parties(db, user_id):
     from profile_db import db_champion_party_rows
     parties = []

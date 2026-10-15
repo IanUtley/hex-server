@@ -16,7 +16,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CAMPAIGN_ROOT = os.path.join(ROOT, "hex-private", "campaign")
+CAMPAIGN_ROOT = os.path.join(ROOT, "campaign")
 EDITOR = os.path.join(ROOT, "campaign_editor")
 sys.path[:0] = [ROOT, CAMPAIGN_ROOT, EDITOR]
 

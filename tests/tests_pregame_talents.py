@@ -31,13 +31,11 @@ EXPENDABLE_GRANT = "89285cf9-97ba-5b40-3a91-ba14ecfccd2a"
 
 
 def _database_copy():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
     source = sqlite3.connect(SRC)
-    target = sqlite3.connect(path)
+    target = sqlite3.connect(":memory:")
     source.backup(target)
     source.close()
-    return target, path
+    return target, None
 
 
 def test_skylak_uses_original_deck_size_for_both_talents():
@@ -95,7 +93,7 @@ def test_skylak_uses_original_deck_size_for_both_talents():
                        for name, _ in rows), rows
     finally:
         db.close()
-        os.unlink(path)
+        pass  # in-memory database: nothing to remove
 
 
 def test_expendable_lives_grants_and_resolves_one_shot_deathcry():
@@ -158,7 +156,7 @@ def test_expendable_lives_grants_and_resolves_one_shot_deathcry():
         assert EXPENDABLE_GRANT not in json.loads(current), current
     finally:
         db.close()
-        os.unlink(path)
+        pass  # in-memory database: nothing to remove
 
 
 def test_devoted_cost_talent_applies_once_via_trigger():
@@ -213,7 +211,7 @@ def test_devoted_cost_talent_applies_once_via_trigger():
         assert mod == -1, mod
     finally:
         db.close()
-        os.unlink(path)
+        pass  # in-memory database: nothing to remove
 
 
 def test_starting_charges_survive_reattach_and_resource_plays():
@@ -360,7 +358,7 @@ def test_ai_owned_reattach_builds_combat_phase_facts():
         hcs._db = old_hcs_db
         ai._db = old_ai_db
         db.close()
-        os.unlink(path)
+        pass  # in-memory database: nothing to remove
 
 
 if __name__ == "__main__":

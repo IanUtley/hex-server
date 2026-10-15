@@ -706,6 +706,7 @@ _DEVELOPER_HELP_LINES = (
     "!top <id|name> — put a card from your hand on top of your deck",
     "!zones — list cards by zone",
     "!move <id> <zone> — move card to zone",
+    "!give [me|opp] <troop name> — put a troop in your or the opponent's warzone, as if played this turn",
     "!state <id> <flags> — set card state (Tapped|Attacking|...)",
     "!attr/!attributes <id> <flags> — set card attributes (Flight|Speed|...)",
     "!update <id> — resend CardUpdated for a card",
@@ -1889,6 +1890,55 @@ def _dispatch(handler, action, args, session, pl_t, ai_t, room, username):
                                 template_id=tpl_guid)
         _send_game_events(handler, game, session, pl_t)
         return f"Generated card: {name} ({tpl_guid})"
+
+    elif action == "give":
+        # Put a troop straight into a warzone.  A newly placed troop has no
+        # StartedATurnOnYourSide state, so it is summoning sick, the same as a
+        # troop played this turn.  No cost is paid and no Deploy triggers.
+        if args and args[0].lower() in ("me", "opp"):
+            target, name_parts = args[0].lower(), args[1:]
+        else:
+            target, name_parts = "me", args
+        name = " ".join(name_parts).strip().lower()
+        if not name:
+            return "Usage: give [me|opp] <troop name>"
+        row = db.execute(
+            "SELECT guid, card_type FROM card_templates "
+            "WHERE LOWER(name)=? AND card_type LIKE '%Troop%' "
+            "ORDER BY COALESCE(equipment_modified,0), guid LIMIT 1",
+            (name,)).fetchone()
+        if not row:
+            return f"No troop named '{name}'"
+        if is_tourney:
+            from pvp_db import db_game_session_pids
+            mine = int(handler.client_reck_id)
+            if target == "me":
+                owner = mine
+            else:
+                owner = next((int(pid) for pid in db_game_session_pids(session.session_id)
+                              if int(pid) != mine), None)
+                if owner is None:
+                    return "No opponent in this session"
+        else:
+            owner = command_owner_id if target == "me" else 0
+        from pvp_db import (db_next_card_uid, db_insert_debug_card,
+                            db_set_card_abilities)
+        card_uid = db_next_card_uid(session.session_id, conn=db)
+        card_uid, _template = db_insert_debug_card(
+            session.session_id, owner, card_uid, row, "warzone", conn=db)
+        # The debug insert carries no ability list, so a troop given this way
+        # lost its authored triggers (e.g. Nameless Citizen's bury-on-block).
+        # Copy the template's own abilities, as a deck-built card has them.
+        template_abilities = db.execute(
+            "SELECT abilities_json FROM card_templates WHERE guid=?",
+            (row[0],)).fetchone()
+        db_set_card_abilities(session.session_id, card_uid,
+                              (template_abilities[0] if template_abilities
+                               else None) or "[]", conn=db)
+        db.commit()
+        _push_card_update(handler, db, session, pl_t, card_uid, user_id=owner,
+                          collection_override=game_engine.ECardCollections.Warzone)
+        return f"Gave {name} to {target} warzone (card {card_uid}, summoning sick)"
 
     elif action == "help":
         lines = _help_lines(True)

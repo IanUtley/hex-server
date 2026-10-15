@@ -1605,6 +1605,13 @@ def handle_readytostartgame_22031(handler, target, instance, data_type, reqid, c
             import campaign_rules as _campaign_rules
             scene_mods = _campaign_rules.chosen_scene_mods(
                 scene_mods, campaign_mod_choice_guid)
+            # Targeted entries with a round are not placed now; they are
+            # applied when their side reaches that turn (see
+            # rules_port.scene_round_mods).
+            from rules_port.scene_round_mods import (
+                PENDING_KEY as _ROUND_KEY, split_round_mods)
+            scene_mods, _round_pending = split_round_mods(scene_mods)
+            setup_bstate[_ROUND_KEY] = _round_pending
             # A card attached to a concrete encounter player is a
             # hidden battleboard controller, not a scene-wide grant.
             # The scene metadata can also repeat that card in a

@@ -1491,10 +1491,17 @@ def layout(rules: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     impassable = {n for n in node_rules if impassable_now(rules, state, n)}
     # Paths out of a node are drawn only once it no longer gates travel.
     revealed = set(visited)
+
+    def reveal_allowed(node_id):
+        # A neighbour opened by a finished node still needs its own authored
+        # ``visible`` condition to hold; a node without one is always allowed.
+        return "visible" not in (node_rules.get(node_id) or {}) or gate(node_id, "visible")
+
     for node_id in visited:
         if _opens_neighbours(rules, state, node_id):
             revealed |= {n for n in neighbours.get(node_id, ())
-                         if not (n in blocked and n not in visited)}
+                         if not (n in blocked and n not in visited)
+                         and (n in visited or reveal_allowed(n))}
     all_nodes = set(neighbours) | set(node_rules)
     nodes = {}
     for node_id in sorted(all_nodes):
@@ -1546,11 +1553,10 @@ def layout(rules: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     paths = []
     for path in (rules.get("map") or {}).get("paths") or ():
         a, b = nodes.get(path["from"], {}), nodes.get(path["to"], {})
+        # A path is drawn once both ends are visible and either end has been
+        # visited, even while the visited node's own action is unfinished.
         locked = bool(a.get("visible") and b.get("visible") and not (
-            (path["from"] in visited and _opens_neighbours(
-                rules, state, path["from"])) or
-            (path["to"] in visited and _opens_neighbours(
-                rules, state, path["to"])) or
+            path["from"] in visited or path["to"] in visited or
             path["from"] in forks or path["to"] in forks))
         paths.append({
             "id": path["id"],

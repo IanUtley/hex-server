@@ -70,37 +70,29 @@ class HandlerStub:
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
-    db.execute("""CREATE TABLE game_cards (
-        session_id INTEGER, user_id INTEGER, card_uid INTEGER,
-        template_guid TEXT, card_template_id TEXT, location TEXT,
-        position INTEGER, card_state INTEGER, card_abilities TEXT,
-        card_type TEXT, card_attributes INTEGER, temporary_attributes INTEGER DEFAULT 0, card_attack_mod INTEGER,
-        card_defense_mod INTEGER, card_cost_mod INTEGER, card_damage INTEGER,
-        permanent_buffs TEXT, temporary_buffs TEXT, card_uses TEXT,
-        resolved_at INTEGER, cost_mod_json TEXT DEFAULT '[]')""")
-    db.execute("""CREATE TABLE card_abilities_meta (
-        ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
-        game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
-        is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
-        uses_per_turn INTEGER, target_template_ids TEXT)""")
-    db.execute("""CREATE TABLE card_templates (
-        guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
-        defense INTEGER, attributes INTEGER, abilities_json TEXT,
-        threshold_json TEXT, subtype TEXT)""")
+    """A disposable copy of the metadata baseline (production schema)."""
+    src = sqlite3.connect(SRC)
+    db = sqlite3.connect(":memory:")
+    src.backup(db)
+    src.close()
+    db.execute("DELETE FROM game_cards")
+    # The fixture Troop every card here refers to: 1 cost, 1/1.
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("11111111-1111-1111-1111-111111111111", "Troop", "Troop", 1, 1, 1,
-         0, "[]", "[]", ""))
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("11111111-1111-1111-1111-111111111111", "Troop", "Troop", 1, 1, 1, 0,
+         "[]", "[]", ""))
     db.commit()
     return db
 
 
 def add_card(db, uid, owner, loc="warzone", state=0):
     db.execute(
-        "INSERT INTO game_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,0,'{}','{}','{}',0,'[]')",
+        "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+        "card_template_id, location, position, card_state, card_abilities, "
+        "card_type, card_attributes, permanent_buffs, temporary_buffs, card_uses) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,'{}','{}','{}')",
         (1, owner, uid, "11111111-1111-1111-1111-111111111111",
          "11111111-1111-1111-1111-111111111111", loc, 0, state, "[]", "Troop", 0))
     db.commit()
@@ -176,16 +168,20 @@ def test_discard_moves_target_and_emits_events(db):
              state=game_engine.ECardStates.Tapped)
     pl_t, ai_t, game, bstate = new_game(db)
     bstate["player_spell_target"] = 100
-    result = _LEAFS["DiscardCardAbilityEffectTemplate"](
-        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
-    assert result == "discarded 0x64", result
+    # The native RulesPort leaf: the live path emits the discard events.
+    result = _native_dispatch("DiscardCardAbilityEffectTemplate", game,
+                              SessionStub(), db, HandlerStub(), pl_t, ai_t,
+                              bstate)
+    assert "discard" in str(result).lower() and "100" in str(result) or \
+        "0x64" in str(result), result
     row = db.execute(
         "SELECT location, card_state, card_damage, temporary_buffs "
         "FROM game_cards WHERE card_uid=100").fetchone()
     assert row == ("discard", 0, 0, "{}"), row
     assert any(isinstance(ev, game_engine.CardDiscardedSessionEventArgs)
                for ev in game.events)
-    assert any(isinstance(ev, game_engine.CardMovedSessionEventArgs)
+    # The client derives the discard move from the CardUpdated into Discard.
+    assert any(isinstance(ev, game_engine.CardUpdatedSessionEventArgs)
                and ev.collection == game_engine.ECardCollections.Discard
                for ev in game.events)
 
@@ -254,8 +250,11 @@ def test_reveal(db):
     bstate["resolving_owner_id"] = 5
     bstate["_rules_port_native_effect"] = True
     db.execute(
-        "INSERT INTO card_abilities_meta VALUES ('test-ability',0,'','look at two "
-        "random cards from your deck.','{}',0,0,0,0,0,'[]')")
+        "INSERT OR REPLACE INTO card_abilities_meta (ability_guid, is_triggered, "
+        "trigger_event_type, game_text, raw_json, casting_behavior, is_manual, "
+        "activation_cost, uses_per_game, uses_per_turn, target_template_ids, "
+        "exhausts_on_use) VALUES ('test-ability',0,'','look at two "
+        "random cards from your deck.','{}',0,0,0,0,0,'[]',0)")
     db.commit()
     graph = SimpleNamespace(
         targets=(), effects=())
@@ -362,13 +361,22 @@ def test_battle_damage(db):
     bstate["resolving_source_uid"] = 100
     bstate["player_spell_target"] = 200
     bstate["_rules_port_native_effect"] = True
-    _LEAFS["Battle2CardsAbilityEffectTemplate"](
-        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", None)
+    bstate["resolving_target_uid"] = 200
+    # The Records effect row (secondary_target_index names the attacker), as
+    # the live dispatcher receives it.
+    from rules_port import effects as native_effects
+    from rules_port.context import EffectContext
+    bstate["_rules_port_native_effect"] = True
+    context = EffectContext.from_rules_port(
+        game, SessionStub(), db, HandlerStub(), pl_t, ai_t, bstate, "e", "")
+    native_effects.dispatch(
+        "Battle2CardsAbilityEffectTemplate", context,
+        {"param": "", "target_index": 1, "secondary_target_index": 0})
     row = db.execute(
         "SELECT location, card_damage FROM game_cards WHERE card_uid=200").fetchone()
-    # 1 ATK vs 1 DEF -> dead (discard); damage is cleared on death per the
-    # client's DeactivateCard -> ResetCardDamage (GY shows full stats).
-    assert row[0] == "discard" and row[1] == 0, row
+    # 1 ATK vs 1 DEF: the battle deals 1 damage.  The lethal death is applied
+    # afterwards by the state-based step (covered by its own tests).
+    assert row == ("warzone", 1), row
 
 
 def test_sacrifice(db):
@@ -494,11 +502,11 @@ def test_dynamic_cost_formula(db):
     assert "Warzone" in formula["zones"], formula
     # Pterobot (Robot Dinosaur) counts itself + two Dwarf troops -> -3.
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("33333333-3333-3333-3333-333333333333", "Dwarf Grunt", "Troop", 2,
          2, 2, 0, "[]", "[]", "Dwarf"))
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, attack, defense, attributes, abilities_json, threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("44444444-4444-4444-4444-444444444444", "Pterobot", "Troop", 4,
          2, 2, 0, "[]", "[]", "Robot Dinosaur"))
     fjson = '[' + __import__("json").dumps(formula) + ']'

@@ -193,6 +193,12 @@ class RecordsTriggerDiscovery:
                 if graph is None:
                     continue
                 if graph.trigger_event_type:
+                    if str(graph.trigger_event_type).endswith("GameStartedEvent"):
+                        from .effect_lifetimes import gamestart_grant_resolved
+                        if gamestart_grant_resolved(
+                                self.battle_state, int(champion_uid), key):
+                            # Already resolved when it was granted during setup.
+                            continue
                     abilities.append(key)
                     continue
                 # A granted permanent CardModifier is a continuous aura, not
@@ -291,8 +297,11 @@ class RecordsTriggerDiscovery:
 
     @staticmethod
     def _freeze(candidates: dict[int, list[str]]):
+        # A card's ability fires at most once per event; the same card can be
+        # reported by more than one zone or side scan, so drop repeats here.
         return tuple(
-            TriggerCandidate(int(uid), tuple(str(g).lower() for g in abilities))
+            TriggerCandidate(int(uid), tuple(dict.fromkeys(
+                str(g).lower() for g in abilities)))
             for uid, abilities in candidates.items() if abilities)
 
 

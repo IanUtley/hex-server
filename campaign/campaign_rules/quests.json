@@ -168,7 +168,10 @@
      "type": "encounter",
      "done_when": {
       "event": "encounter_victory",
-      "scene": "f6f3074b-a416-4400-9b74-20d72406a846",
+      "scene": [
+       "a9e9e040-de92-475a-9970-be039c400cef",
+       "1d67638c-6068-465c-9e52-419047853310"
+      ],
       "events": "tamed_troop"
      }
     },

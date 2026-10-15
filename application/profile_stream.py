@@ -205,7 +205,8 @@ class ProfileStreamMixin:
             # CardsAdded push must only announce copies granted after this.
             self._announced_card_ids = {int(r[5]) for r in card_rows}
             profile_cards = [
-                (r[0], r[1] or "", r[5], r[2] or 0, r[3] or 0, r[4] or 0)
+                (r[0], r[1] or "", r[5], r[2] or 0, r[3] or 0,
+                 r[4] or 0, bool(r[6]))
                 for r in card_rows
             ]
         log(f">>> Profile push: {len(profile_cards)} card instances from DB")

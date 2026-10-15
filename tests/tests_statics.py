@@ -57,9 +57,7 @@ TPL_BLOOD = "77777777-7777-7777-7777-777777777777"
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(":memory:")
     src = sqlite3.connect(SRC)
     for ddl in (
         """CREATE TABLE game_cards (
@@ -71,27 +69,27 @@ def make_db():
             cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER,
             permanent_buffs TEXT, temporary_buffs TEXT, card_uses TEXT,
             resolved_at INTEGER)""",
-        """CREATE TABLE card_templates (
+        """CREATE TABLE IF NOT EXISTS card_templates (
             guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
             defense INTEGER, attributes INTEGER, abilities_json TEXT,
             threshold_json TEXT, subtype TEXT)""",
-        """CREATE TABLE card_abilities_meta (
+        """CREATE TABLE IF NOT EXISTS card_abilities_meta (
             ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
             game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
             is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
             uses_per_turn INTEGER, target_template_ids TEXT)""",
-        """CREATE TABLE ability_effects (
+        """CREATE TABLE IF NOT EXISTS ability_effects (
             ability_guid TEXT, effect_guid TEXT, effect_order INTEGER,
             effect_type TEXT, param TEXT)""",
-        """CREATE TABLE ability_effect_conditions (
+        """CREATE TABLE IF NOT EXISTS ability_effect_conditions (
             condition_id TEXT PRIMARY KEY, name TEXT, condition_json TEXT)""",
-        """CREATE TABLE target_templates (
+        """CREATE TABLE IF NOT EXISTS target_templates (
             template_id TEXT PRIMARY KEY, game_text TEXT, is_auto_target INTEGER,
             is_random_target INTEGER, optional INTEGER, explicit INTEGER,
             player_filter TEXT, collection_flags TEXT, min_target_count INTEGER,
             max_target_count INTEGER, filter_json TEXT)""",
         "ALTER TABLE target_templates ADD COLUMN target_kind TEXT DEFAULT ''",
-        """CREATE TABLE champion_abilities (
+        """CREATE TABLE IF NOT EXISTS champion_abilities (
             champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
             ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
             threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
@@ -103,7 +101,7 @@ def make_db():
             "SELECT * FROM champion_abilities WHERE champion_guid=?",
             (FOREMAN,)):
         db.execute(
-            "INSERT INTO champion_abilities VALUES (%s)"
+            "INSERT OR REPLACE INTO champion_abilities VALUES (%s)"
             % ",".join("?" * len(row)), tuple(row))
 
     def copy_ability(ag):
@@ -112,11 +110,11 @@ def make_db():
             "raw_json, casting_behavior, is_manual, activation_cost, "
             "uses_per_game, uses_per_turn, target_template_ids "
             "FROM card_abilities_meta WHERE ability_guid=?", (ag,)).fetchone()
-        db.execute("INSERT INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", m)
+        db.execute("INSERT OR REPLACE INTO card_abilities_meta VALUES (?,?,?,?,?,?,?,?,?,?,?)", m)
         for e in src.execute(
                 "SELECT ability_guid, effect_guid, effect_order, effect_type, "
                 "param FROM ability_effects WHERE ability_guid=?", (ag,)):
-            db.execute("INSERT INTO ability_effects VALUES (?,?,?,?,?)", e)
+            db.execute("INSERT OR REPLACE INTO ability_effects VALUES (?,?,?,?,?)", e)
         for tid in json.loads(m[10] or "[]") or []:
             for r in src.execute(
                     "SELECT * FROM target_templates WHERE template_id=?", (tid,)):
@@ -138,7 +136,7 @@ def make_db():
 
     def tpl(guid, name, ctype, cost, atk, de, attrs, ab, thresh="[]",
             subtype=""):
-        db.execute("INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        db.execute("INSERT OR REPLACE INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (guid, name, ctype, cost, atk, de, attrs,
                     json.dumps(ab), thresh, subtype))
 
@@ -483,7 +481,7 @@ def test_electroid_combat_threshold_is_continuous(db):
     for uid, subtype in ((102, "Dwarf"), (103, "Dwarf"), (104, "Robot")):
         guid = f"11111111-1111-1111-1111-{uid:012x}"
         db.execute(
-            "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
             (guid, f"Qualifying {uid}", "Troop", 1, 1, 1, 0,
              "[]", "[]", subtype))
         card(db, uid, 5, guid, "warzone")
@@ -866,10 +864,10 @@ def test_client_seed_refresh_repairs_the_typed_modifier_projection(db):
     stale_param = ('{"property": "intattr", "attribute": "", "operation": '
                    '"Add", "amount": 0, "duration": "Permanent", '
                    '"text": "<b>Swiftstrike</b>"}')
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    shutil.copy2(SRC, path)
-    db = sqlite3.connect(path)
+    _src = sqlite3.connect(SRC)
+    db = sqlite3.connect(":memory:")
+    _src.backup(db)
+    _src.close()
     try:
         # Emulate a database seeded before the snapshot gained typed modifier
         # fields and the snapshot fingerprint.
@@ -898,7 +896,7 @@ def test_client_seed_refresh_repairs_the_typed_modifier_projection(db):
         assert static.refresh_client_seed(db) == 0
     finally:
         db.close()
-        os.unlink(path)
+        pass  # in-memory database: nothing to remove
 
 
 if __name__ == "__main__":

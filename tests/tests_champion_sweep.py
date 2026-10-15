@@ -1293,10 +1293,10 @@ _activation_context = {"guid": "", "selected": []}
 
 def _run_sweep(limit=None, only=None):
     _SWEEP_STATS.clear()
-    fd, sandbox_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    shutil.copy(SRC, sandbox_path)
-    db = sqlite3.connect(sandbox_path)
+    _src = sqlite3.connect(SRC)
+    db = sqlite3.connect(":memory:")
+    _src.backup(db)
+    _src.close()
     attachments = _champion_attachments(db)
     if only:
         wanted = str(only).lower()

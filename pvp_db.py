@@ -2557,7 +2557,7 @@ def db_card_static_fields(session_id, card_uid, conn=None):
     threshold projection scans many candidate cards, and one round trip per
     helper dominated that scan.
     """
-    return (conn or _db_layer._db).execute(
+    cursor = (conn or _db_layer._db).execute(
         "SELECT gc.user_id AS user_id, gc.permanent_buffs AS permanent_buffs, "
         "gc.temporary_buffs AS temporary_buffs, "
         "gc.card_cost_mod AS card_cost_mod, gc.cost_mod_json AS cost_mod_json, "
@@ -2566,7 +2566,12 @@ def db_card_static_fields(session_id, card_uid, conn=None):
         "FROM game_cards gc LEFT JOIN card_templates ct "
         "ON ct.guid=gc.template_guid "
         "WHERE gc.session_id=? AND gc.card_uid=?",
-        (session_id, int(card_uid))).fetchone()
+        (session_id, int(card_uid)))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    # Named access on any connection (plain tuples have no column names).
+    return dict(zip([column[0] for column in cursor.description], row))
 
 
 def db_card_cost_location_state(session_id, card_uid, conn=None):

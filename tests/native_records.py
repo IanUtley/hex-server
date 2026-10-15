@@ -31,7 +31,7 @@ class RecordsInstaller:
     def target(self, guid, kind="AbilityTargetTemplate", *, is_auto=1,
                is_random=0, player_filter="Self", collection_flags="Warzone",
                minimum=1, maximum=1, optional=0, explicit=0, card_filter=None,
-               game_text=""):
+               game_text="", choice_override=False):
         self._install(_TARGET_SECTION, {
             "_t": f"{_TARGET_TYPES}.{kind}",
             "m_TemplateId": {"m_Guid": guid},
@@ -47,6 +47,7 @@ class RecordsInstaller:
             "m_Explicit": int(bool(explicit)),
             "m_CardFilter": card_filter or {},
             "m_AllowBestEffortMinimumTargetCount": 0,
+            "m_ChoiceOverride": int(bool(choice_override)),
         })
         return guid
 

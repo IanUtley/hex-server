@@ -234,7 +234,7 @@ def _shared_name_cost_rejects_mixed_groups(db):
                "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
     other_tpl = "77777777-7777-7777-7777-777777777777"
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
         (other_tpl, "Other Troop", "Troop", 1, 1, 1, 0, "[]", "[]", ""))
     for uid in range(401, 405):
         add_card(db, uid, 51, PLAIN_TPL, "hand", position=uid - 401)

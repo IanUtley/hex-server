@@ -7258,10 +7258,10 @@ def run_matrix(*, all_cards=False, set_guid=None, only=None, ability_text=None,
             not rarities):
         raise ValueError(
             "pass --all, --set-guid, --only, --ability-text, or --rarity")
-    fd, sandbox_path = tempfile.mkstemp(prefix="hex-card-matrix-", suffix=".db")
-    os.close(fd)
-    shutil.copy2(SRC, sandbox_path)
-    db = sqlite3.connect(sandbox_path)
+    _src = sqlite3.connect(SRC)
+    db = sqlite3.connect(":memory:")
+    _src.backup(db)
+    _src.close()
     failures = []
     passed = 0
     contract_cards = 0

@@ -156,7 +156,7 @@ class _SummonContext:
 def _conscript_is_filtered_repeatable_and_publishes_faction_in_both_modes(db):
     candidate_guid = "f0000000-0000-0000-0000-000000000001"
     db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (candidate_guid, "Aria Troop", "Troop", 1, 1, 1, 0, "[]", "[]",
          "", 0, 0, 0))
     for pvp, source_owner, target_owner in ((False, 5, 0), (True, 51, 52)):

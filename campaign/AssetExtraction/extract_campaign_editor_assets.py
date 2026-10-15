@@ -636,6 +636,19 @@ def extract_panorama(bundle_path: Path, zone_id: str, out_dir: Path,
                     "positions": [round(c, 4) for v in used for c in points[v]],
                     "uvs": [round(c, 5) for v in used for c in uvs[v]],
                     "indices": [remap[v] for tri in triangles for v in tri]}
+                if info.get("scroll") and not info.get("grad"):
+                    # A flow surface scrolls along its longer side: a tall
+                    # column of falling lava runs down, a pool runs across.
+                    xs = [points[v][0] for v in used]
+                    ys = [points[v][1] for v in used]
+                    speed = info["scroll"][0] + info["scroll"][1]
+                    entry["scroll"] = ([0, speed] if max(ys) - min(ys) > max(xs) - min(xs)
+                                       else [speed, 0])
+                if info.get("grad") and "fog" in name.lower():
+                    # Fog planes store no usable time multiplier (0 plays at full
+                    # speed in the viewer), so their scroll is slowed here.
+                    entry["grad"] = dict(info["grad"], scroll=[
+                        round(c * 0.01, 6) for c in info["grad"]["scroll"]])
                 if anim:
                     mine = dict(anim, materials=[a for a in anim["materials"]
                                                  if a["index"] == index])

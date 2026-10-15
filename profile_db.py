@@ -293,6 +293,35 @@ def db_set_reckoning_flag(user_id, name, progress=0, maximum=0,
     return bool(cursor.rowcount)
 
 
+def db_ensure_reckoning_flag_minimum(user_id, name, minimum_progress,
+                                    default_maximum=0, conn=None):
+    """Raise a Reckoning flag to a minimum without lowering concurrent values.
+
+    The UPSERT makes the monotonic update atomic for profile rewards that may
+    resolve on different campaign champions at the same time. Returns the
+    resulting flag and whether this call changed it.
+    """
+    connection = _profile_connection(conn)
+    cursor = connection.execute(
+        "INSERT INTO reckoning_flags "
+        "(user_id, name, progress, maximum, completed) VALUES (?,?,?,?,0) "
+        "ON CONFLICT(user_id, name) DO UPDATE SET "
+        "progress=excluded.progress "
+        "WHERE reckoning_flags.progress < excluded.progress",
+        (int(user_id), str(name), int(minimum_progress),
+         int(default_maximum)))
+    row = connection.execute(
+        "SELECT name, progress, maximum, completed FROM reckoning_flags "
+        "WHERE user_id=? AND name=?", (int(user_id), str(name))).fetchone()
+    if conn is None:
+        connection.commit()
+    if row is None:
+        return None, bool(cursor.rowcount)
+    return ({"name": row[0], "progress": int(row[1] or 0),
+             "maximum": int(row[2] or 0), "completed": bool(row[3])},
+            bool(cursor.rowcount))
+
+
 # --- Social persistence ----------------------------------------------------
 
 def db_get_friends(user_id, conn=None):

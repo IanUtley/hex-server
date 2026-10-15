@@ -12,22 +12,22 @@
     "ai_champion_guid": "89035517-4af7-4277-937e-35abcb2ff64b",
     "mods_json": [
      {
+      "title": "Resource Rich",
       "description": "Each champion starts with a permanent resource.",
       "mods": [
        {
         "guid": "1bbcc90a-0046-4d64-911b-b1ea69ee5b1c"
        }
-      ],
-      "title": "Resource Rich"
+      ]
      },
      {
+      "title": "Corrupted Woods",
       "description": "When a champion gains a wild threshold, they might also gain a blood threshold.",
       "mods": [
        {
         "guid": "c647b336-2909-48b2-8a4c-a932222b68f7"
        }
-      ],
-      "title": "Corrupted Woods"
+      ]
      }
     ],
     "rewards_json": {
@@ -829,9 +829,17 @@
      }
     ],
     "rewards_json": {
-     "gold": 100,
-     "one_time": false,
-     "xp": 100
+     "end_of_game_rewards": [
+      {
+       "gold": 250,
+       "xp": 250,
+       "one_time": false
+      },
+      {
+       "one_time": true,
+       "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
+      }
+     ]
     },
     "ai_deck_personality": "Default"
    },
@@ -937,11 +945,14 @@
      }
     ],
     "rewards_json": {
-     "gold": 100,
-     "one_time": false,
-     "xp": 100
+     "gold": 450,
+     "xp": 250,
+     "one_time": false
     },
-    "ai_deck_personality": "Burn"
+    "ai_deck_personality": "Burn",
+    "scene_tags": [
+     "faction(Underworld)"
+    ]
    },
    {
     "guid": "fcf51a17-a23d-495c-bd98-43bf0edbaac2",
@@ -975,7 +986,10 @@
      "xp": 250,
      "one_time": false
     },
-    "ai_deck_personality": "Default"
+    "ai_deck_personality": "Default",
+    "scene_tags": [
+     "faction(Ardent)"
+    ]
    },
    {
     "guid": "67307169-0e2a-4c1b-837e-6a25ee550772",
@@ -1080,11 +1094,28 @@
      }
     ],
     "rewards_json": {
-     "gold": 400,
-     "xp": 200,
-     "one_time": false
+     "end_of_game_rewards": [
+      {
+       "gold": 400,
+       "xp": 200,
+       "one_time": false
+      },
+      {
+       "one_time": true,
+       "card_guid": "6d9f102a-538a-401b-b9ab-1d059f851232",
+       "when": [
+        "flag(tamed:a9e9e040)",
+        "!flag(tamed:1d67638c)"
+       ]
+      }
+     ]
     },
-    "ai_deck_personality": "Aggressive"
+    "ai_deck_personality": "Aggressive",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
    },
    {
     "guid": "f6f3074b-a416-4400-9b74-20d72406a846",
@@ -1113,14 +1144,6 @@
       {
        "one_time": true,
        "chest_guid": "7b8390fd-7d3d-44d4-b285-1aeae3aef98b"
-      },
-      {
-       "quantity": 1,
-       "one_time": true,
-       "card_guid": "6d9f102a-538a-401b-b9ab-1d059f851232",
-       "when": [
-        "flag(tamed:f6f3074b)"
-       ]
       }
      ]
     },
@@ -1153,11 +1176,28 @@
      }
     ],
     "rewards_json": {
-     "gold": 100,
-     "one_time": false,
-     "xp": 100
+     "end_of_game_rewards": [
+      {
+       "gold": 100,
+       "xp": 100,
+       "one_time": false
+      },
+      {
+       "one_time": true,
+       "card_guid": "6d9f102a-538a-401b-b9ab-1d059f851232",
+       "when": [
+        "flag(tamed:1d67638c)",
+        "!flag(tamed:a9e9e040)"
+       ]
+      }
+     ]
     },
-    "ai_deck_personality": ""
+    "ai_deck_personality": "",
+    "actions_json": {
+     "victory": [
+      "check_tamed()"
+     ]
+    }
    },
    {
     "guid": "11e30dc4-542e-45a9-8b9d-2fddc48700b9",

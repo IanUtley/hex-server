@@ -166,137 +166,23 @@ class HandlerStub:
 
 
 def make_db():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    db = sqlite3.connect(path)
+    """A disposable copy of the metadata baseline (production schema).
+
+    Hand-built tables drifted from ``static.py``; copying the baseline keeps
+    every column and table the engine reads.
+    """
     src = sqlite3.connect(SRC)
-    db.execute("""CREATE TABLE game_cards (
-        session_id INTEGER, user_id INTEGER, card_uid INTEGER,
-        template_guid TEXT, card_template_id TEXT, location TEXT,
-        position INTEGER, card_state INTEGER, card_abilities TEXT,
-        card_type TEXT, card_attributes INTEGER, temporary_attributes INTEGER DEFAULT 0, card_attack_mod INTEGER,
-        card_defense_mod INTEGER, card_cost_mod INTEGER DEFAULT 0,
-        cost_mod_json TEXT DEFAULT '[]', card_damage INTEGER,
-        permanent_buffs TEXT, temporary_buffs TEXT, card_uses TEXT,
-        resolved_at INTEGER, original_template_guid TEXT DEFAULT '')""")
-    db.execute("""CREATE TABLE card_abilities_meta (
-        ability_guid TEXT, is_triggered INTEGER, trigger_event_type TEXT,
-        game_text TEXT, raw_json TEXT, casting_behavior INTEGER,
-        is_manual INTEGER, activation_cost INTEGER, uses_per_game INTEGER,
-        uses_per_turn INTEGER, target_template_ids TEXT,
-        exhausts_on_use INTEGER DEFAULT 0)""")
-    db.execute("""CREATE TABLE ability_effects (
-        ability_guid TEXT, effect_guid TEXT, effect_order INTEGER,
-        effect_type TEXT, param TEXT, effect_group_id INTEGER DEFAULT 0,
-        condition_id TEXT DEFAULT '', target_index INTEGER DEFAULT -1,
-        effect_instance_id INTEGER DEFAULT -1,
-        contingent_effect_instance_id INTEGER DEFAULT -1,
-        secondary_target_index INTEGER DEFAULT -1,
-        recalculate_targets INTEGER DEFAULT -1,
-        is_optional INTEGER DEFAULT 0,
-        effect_duration TEXT DEFAULT 'Instant',
-        output_variables TEXT DEFAULT '{}')""")
-    db.execute("""CREATE TABLE ability_effect_conditions (
-        condition_id TEXT PRIMARY KEY, name TEXT, condition_json TEXT)""")
-    db.execute("""CREATE TABLE target_templates (
-        template_id TEXT PRIMARY KEY, game_text TEXT, is_auto_target INTEGER,
-        is_random_target INTEGER, optional INTEGER, explicit INTEGER,
-        player_filter TEXT, collection_flags TEXT, min_target_count INTEGER,
-        max_target_count INTEGER, filter_json TEXT)""")
-    db.execute("ALTER TABLE target_templates ADD COLUMN target_kind TEXT DEFAULT ''")
-    db.execute("""CREATE TABLE card_counter_templates (
-        template_id TEXT PRIMARY KEY, name TEXT, description TEXT)""")
-    db.execute("""CREATE TABLE decks (
-        id INTEGER PRIMARY KEY, user_id INTEGER, deck_name TEXT, cards TEXT,
-        active_gems TEXT DEFAULT '{}', last_saved TEXT, created_at TEXT,
-        pvp_champion_guid TEXT DEFAULT '')""")
-    db.execute("""CREATE TABLE arena_state (
-        user_id INTEGER PRIMARY KEY, deck_id INTEGER DEFAULT 0,
-        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
-        challenger_index INTEGER DEFAULT 0, fight_history TEXT DEFAULT '[]',
-        gold_earned INTEGER DEFAULT 0, chests_earned INTEGER DEFAULT 0,
-        sacks_earned INTEGER DEFAULT 0)""")
-    db.execute("""CREATE TABLE champion_abilities (
-        champion_guid TEXT, champion_name TEXT, ability_guid TEXT,
-        ability_name TEXT, charge_cost INTEGER, spell_cost INTEGER,
-        threshold_colors TEXT, game_text TEXT, casting_behavior INTEGER,
-        thresholds_json TEXT, target_template_ids TEXT)""")
-    for target_id in (
-            "571b110f-60f1-0210-6bb5-243c0bbb5218",
-            "4bfd42fa-d682-f72f-4aed-7471eb52fe76"):
-        for row in src.execute(
-                "SELECT * FROM target_templates WHERE template_id=?",
-                (target_id,)):
-            db.execute(
-                "INSERT INTO target_templates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                row)
-    for tid in ("ffccbb0c-8382-83cc-1fe3-67f52ed0ba60",   # champion or troop
-                "eb7e48cd-1c85-813f-6635-d43f50cf7809",   # You
-                "190a4d8c-7c2c-10d0-6429-99c5aeb0791f",   # this (Escalation)
-                "59334eca-d059-bd0a-4980-3938b892f269"):  # same name as this
-        for row in src.execute(
-                "SELECT * FROM target_templates WHERE template_id=?", (tid,)):
-            db.execute(
-                "INSERT OR IGNORE INTO target_templates VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
-    db.execute(
-        "INSERT INTO decks (id, user_id, deck_name, cards, active_gems, "
-        "last_saved, pvp_champion_guid) VALUES (6, 5, 'Orcs', '[]', "
-        "'{\"6515\": 5}', '2026-08-12 12:37:00', '4848068e-15fd-4f1d-8009-c136d9821a6d')")
-    db.execute("INSERT INTO arena_state (user_id, deck_id) VALUES (5, 0)")
-    db.execute(
-        "INSERT INTO champion_abilities (champion_guid, champion_name, "
-        "ability_guid, ability_name, charge_cost, spell_cost, "
-        "threshold_colors, game_text, casting_behavior, thresholds_json, "
-        "target_template_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("4848068e-15fd-4f1d-8009-c136d9821a6d", "Poca, The Conflagrater",
-         "3687a2ea-0000-0000-0000-000000000000", "Summon a Blaze Elemental",
-         4, 0, "Ruby", "Summon a <b>Blaze Elemental</b>.", 8, "{}",
-         '["eb7e48cd-1c85-813f-6635-d43f50cf7809"]'))
-    for row in src.execute(
-            "SELECT * FROM ability_effect_conditions "
-            "WHERE condition_id='d35818e3-7209-9c38-241f-6b5e2322d1c9'"):
-        db.execute(
-            "INSERT INTO ability_effect_conditions VALUES (?,?,?)", row)
-    for row in src.execute(
-            "SELECT * FROM card_counter_templates "
-            "WHERE template_id='12a1bb1f-6308-650c-4d75-35a12cb4c5cd'"):
-        db.execute(
-            "INSERT INTO card_counter_templates VALUES (?,?,?)", row)
-    db.execute("""CREATE TABLE card_templates (
-        guid TEXT, name TEXT, card_type TEXT, cost INTEGER, attack INTEGER,
-        defense INTEGER, attributes INTEGER, abilities_json TEXT,
-        threshold_json TEXT, subtype TEXT)""")
-    for guid in list(TPL.values()) + [TPL["sentinel"]]:
-        for row in src.execute(
-                "SELECT guid, name, card_type, cost, attack, defense, attributes, "
-                "abilities_json, threshold_json, subtype "
-                "FROM card_templates WHERE guid=?", (guid,)):
-            db.execute(
-                "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)", row)
-    for ag in ABILITIES:
-        for row in src.execute(
-                "SELECT ability_guid, is_triggered, trigger_event_type, game_text, "
-                "raw_json, casting_behavior, is_manual, activation_cost, "
-                "uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use "
-                "FROM card_abilities_meta WHERE ability_guid=?",
-                (ag,)):
-            db.execute(
-                "INSERT INTO card_abilities_meta VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?)", row)
-        for row in src.execute(
-                "SELECT ability_guid, effect_guid, effect_order, effect_type, param, "
-                "effect_group_id, condition_id, target_index, effect_instance_id, "
-                "contingent_effect_instance_id, secondary_target_index, "
-                "recalculate_targets, is_optional, effect_duration, output_variables "
-                "FROM ability_effects WHERE ability_guid=?", (ag,)):
-            db.execute(
-                "INSERT INTO ability_effects VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                row)
-    db.execute(
-        "INSERT INTO card_templates VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (TPL["plain_troop"], "Plain Troop", "Troop", 1, 1, 1, 0, "[]", "[]", ""))
+    db = sqlite3.connect(":memory:")
+    src.backup(db)
     src.close()
+    db.execute("DELETE FROM game_cards")
+    # The fixture Troop the "plain_troop" key names (not a production card).
+    db.execute(
+        "INSERT OR REPLACE INTO card_templates (guid, name, card_type, cost, "
+        "attack, defense, attributes, abilities_json, threshold_json, subtype) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("11111111-1111-1111-1111-111111111111", "Plain Troop", "Troop", 1, 1,
+         1, 0, "[]", "[]", ""))
     db.commit()
     return db
 
@@ -309,7 +195,10 @@ def add_card(db, uid, owner, tpl_key_or_guid, location, counters=None):
     ctype, attrs, ab = row
     pb = '{"counters": %s}' % (json.dumps(counters or {}),)
     db.execute(
-        "INSERT INTO game_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,'[]',0,?,?,?,0,'')",
+        "INSERT INTO game_cards (session_id, user_id, card_uid, template_guid, "
+        "card_template_id, location, position, card_state, card_abilities, "
+        "card_type, card_attributes, permanent_buffs, temporary_buffs, card_uses) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (1, owner, uid, tpl, tpl, location, 0, 0, ab, ctype, attrs, pb, "{}", "{}"))
     db.commit()
 
@@ -576,6 +465,7 @@ def test_escalation_preview_value(db):
 
     class EH:
         user_profile = {"id": 5}
+        _resolve_fra_deck_id = staticmethod(lambda deck_id: deck_id)
         _current_bstate = {"player_escalation_uses": 0}
 
         def _template_by_guid(self, tg):
@@ -682,6 +572,7 @@ def test_cardupdated_carries_counters_and_related(db):
 
     class EH:
         user_profile = {"id": 5}
+        _resolve_fra_deck_id = staticmethod(lambda deck_id: deck_id)
         _current_bstate = {"voided_by": {"102": [16385]}}
 
         def _template_by_guid(self, tg):
@@ -877,6 +768,7 @@ def test_consumed_one_shot_stays_off_card_updated(db):
 
     class EH:
         user_profile = {"id": 5}
+        _resolve_fra_deck_id = staticmethod(lambda deck_id: deck_id)
         _current_bstate = {}
 
         def _template_by_guid(self, tg):
@@ -912,8 +804,9 @@ def test_move_into_play_fires_deploy(db):
         "SELECT guid, name, card_type, cost, attack, defense, attributes, "
         "abilities_json, threshold_json, subtype FROM card_templates "
         "WHERE guid=?", (moon_tpl,)).fetchone()
-    db.execute("INSERT OR REPLACE INTO card_templates VALUES "
-               "(?,?,?,?,?,?,?,?,?,?)", row)
+    db.execute("INSERT OR REPLACE INTO card_templates (guid, name, card_type, "
+               "cost, attack, defense, attributes, abilities_json, "
+               "threshold_json, subtype) VALUES (?,?,?,?,?,?,?,?,?,?)", row)
     src.close()
     for ability_guid in (deploy, one_shot):
         src = sqlite3.connect(SRC)
@@ -923,8 +816,11 @@ def test_move_into_play_fires_deploy(db):
             "uses_per_game, uses_per_turn, target_template_ids, exhausts_on_use "
             "FROM card_abilities_meta WHERE ability_guid=?", (ability_guid,)
         ).fetchone()
-        db.execute("INSERT OR REPLACE INTO card_abilities_meta VALUES "
-                   "(?,?,?,?,?,?,?,?,?,?,?,?)", meta)
+        db.execute("INSERT OR REPLACE INTO card_abilities_meta (ability_guid, "
+                   "is_triggered, trigger_event_type, game_text, raw_json, "
+                   "casting_behavior, is_manual, activation_cost, uses_per_game, "
+                   "uses_per_turn, target_template_ids, exhausts_on_use) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", meta)
         for effect in src.execute(
                 "SELECT ability_guid, effect_guid, effect_order, effect_type, "
                 "param, effect_group_id, condition_id, target_index, "
@@ -1060,7 +956,8 @@ def test_outrider_attack(db):
 def test_angel_draw(db):
     add_card(db, 400, 5, "angel", "hand")
     pl_t, ai_t, game, bstate = new_game(db)
-    bstate["player_threshold"] = {game_engine.ECardShards.Diamond: 1}
+    # Thresholds are keyed by shard flag bits (Diamond = 64), as in live state.
+    bstate["player_threshold"] = {int(game_engine.SHARD_TO_FLAG["diamond"]): 1}
     bstate["player_draws_this_turn"] = 1
     session = SessionStub()
     handler = HandlerStub()
@@ -1068,8 +965,11 @@ def test_angel_draw(db):
     # CardDrawnEvent's source is the drawing champion and its target is the
     # card drawn.  Angel's TriggerTarget condition and play effect depend on
     # that distinction.
-    triggers.resolve_triggers(db, handler, game, session, pl_t, ai_t, bstate,
-                              "CardDrawnEvent", 999999, 5, extra_target=400)
+    from rules_port.triggers import dispatch_native_trigger
+    dispatch_native_trigger(
+        db=db, handler=handler, game=game, session=session, player_uid=pl_t,
+        ai_uid=ai_t, battle_state=bstate, event_type="CardDrawnEvent",
+        source_card_id=999999, source_player_id=5, target_card_id=400)
     drain_stack(db, handler, game, session, pl_t, ai_t, bstate)
     loc = db.execute(
         "SELECT location FROM game_cards WHERE card_uid=400").fetchone()[0]

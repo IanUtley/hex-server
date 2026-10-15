@@ -300,13 +300,16 @@ def handle_addnewdeck_2089(handler, target, instance, data_type, reqid, comp, se
     W("CardsInDeck"); S(); W(str(len(sz)-1)); S(); W(str(ft2("System.Collections.Generic.List`1#Game.Shared.Domain.card_instance_bits"))); S(); W("0"); S()
     W(str(len(card_ids))); S()
     for ci, cid in enumerate(card_ids):
-        # Look up template GUID from card_instances
+        # Rebuild the saved card instance from its authoritative inventory
+        # row so its alternate-art state survives the AddNewDeck response.
         tguid = "00000000-0000-0000-0000-000000000000"
+        is_extended = False
         if handler.user_profile:
-            instance_template = _hc.db_card_instance_template(
-                handler.user_profile["id"], cid, conn=_hc._db)
-            if instance_template:
-                tguid = instance_template
+            instance_art = _hc.db_card_instance_art(
+                user_id, cid, conn=_hc._db)
+            if instance_art:
+                tguid = instance_art[1]
+                is_extended = bool(instance_art[2])
         fe = b.tell(); sz.append(0); eidx = len(sz)-1
         W(str(ci)); S(); W(str(eidx)); S(); W(str(ft2("Game.Shared.Domain.card_instance_bits"))); S(); W("6"); S()
         # Id
@@ -321,10 +324,11 @@ def handle_addnewdeck_2089(handler, target, instance, data_type, reqid, comp, se
         W("guid"); S(); W(str(gidx)); S(); W(str(ft2("System.Guid"))); S(); W("0"); S()
         W("36"); S(); b.write(tguid.encode())
         sz[gidx] = b.tell() - gs; sz[tidx] = b.tell() - f2r
-        for bname in ("IsFoil", "IsExtended", "IsNotTradeable"):
+        for bname, value in (("IsFoil", False), ("IsExtended", is_extended),
+                             ("IsNotTradeable", False)):
             fb = b.tell(); sz.append(0)
             W(bname); S(); W(str(len(sz)-1)); S(); W(str(ft2("System.Boolean"))); S(); W("0"); S()
-            W("0"); sz[-1] = b.tell() - fb
+            W("1" if value else "0"); sz[-1] = b.tell() - fb
         # EscrowStatus
         fb = b.tell(); sz.append(0)
         W("EscrowStatus"); S(); W(str(len(sz)-1)); S(); W(str(ft2("System.String"))); S(); W("0"); S()
@@ -1131,6 +1135,42 @@ def handle_updatechampiontalents_2037(handler, target, instance, data_type, reqi
 
 
 # ServiceProfile — UpgradeExtendedArtOnCard (2185)
+# EUpgradeExtendedArtOnCardError: Ok, NotOwnedCard, InsufficientStardust,
+# AlreadyUpgraded.  The client treats only Ok as success and removes the
+# StardustInventoryId item it is given, so the stardust is spent here.
+_EXTENDED_ART_ERR_TYPE = "Game.Shared.Network.Profile.EUpgradeExtendedArtOnCardError"
+_EXTENDED_ART_OK = 0
+_EXTENDED_ART_NOT_OWNED = 1
+_EXTENDED_ART_INSUFFICIENT = 2
+_EXTENDED_ART_ALREADY = 3
+_EXTENDED_ART_STARDUST_KEY = {
+    "Common": "common", "Uncommon": "uncommon", "Rare": "rare",
+    "Legendary": "legendary", "Epic": "promo", "Promo": "promo",
+}
+
+
+def _spend_extended_art_stardust(handler, user_id, card_rarity):
+    """Consume one stardust of the card's rarity; return its client UID or None.
+
+    Mirrors HasStardustToUpgradeCard on the client: Epic and Promo cards use
+    promo stardust, the others the stardust of their own rarity.
+    """
+    import hconnect_server as _hc
+    key = _EXTENDED_ART_STARDUST_KEY.get(str(card_rarity or ""))
+    if key is None:
+        return None
+    template_guid = _hc.STARDUST_TEMPLATES[key]
+    row = _hc.db_inventory_item(user_id, template_guid, conn=_hc._db)
+    if not row or int(row[1] or 0) < 1:
+        return None
+    client_uid = int(row[2] or 0)
+    remaining = _hc.db_consume_inventory_row(row[0], 1, conn=_hc._db)
+    _hc.db_add_stardust(user_id, key, -1, conn=_hc._db)
+    handler.push_inventory_to_client(
+        qty=remaining, template_guid=template_guid, item_id=client_uid)
+    return client_uid
+
+
 def handle_upgradeextendedartoncard_2185(handler, target, instance, data_type, reqid, comp, session_id,
                                          conh, inner_obj, inner_bytes, raw_data_wrapper_bytes):
     import hconnect_server as _hc
@@ -1139,33 +1179,35 @@ def handle_upgradeextendedartoncard_2185(handler, target, instance, data_type, r
     user_id = handler.user_profile["id"] if handler.user_profile else 0
     row = _hc.db_card_instance_art(
         user_id, card_instance_id, conn=_hc._db)
+    stardust_id = 0
+    error = _EXTENDED_ART_OK
     if not row:
         _hc.log_req(f"    Card instance {card_instance_id} not found for user {user_id}")
-        resp_inner = _hc.encode_objfmt_response(
-            ["Game.Client.Network.Profile.UpgradeExtendedArtOnCardResponse",
-             "System.UInt64", "System.UInt64"],
-            [("StardustInventoryId", "ulong", 0),
-             ("CardInstanceId", "ulong", card_instance_id)]
-        )
+        error = _EXTENDED_ART_NOT_OWNED
     elif row[2]:
         _hc.log_req(f"    Card instance {card_instance_id} already extended art")
-        resp_inner = _hc.encode_objfmt_response(
-            ["Game.Client.Network.Profile.UpgradeExtendedArtOnCardResponse",
-             "System.UInt64", "System.UInt64"],
-            [("StardustInventoryId", "ulong", 0),
-             ("CardInstanceId", "ulong", card_instance_id)]
-        )
+        error = _EXTENDED_ART_ALREADY
     else:
-        _hc.db_set_card_instance_extended_art(
-            user_id, card_instance_id, conn=_hc._db)
-        _hc._db.commit()
-        _hc.log_req(f"    Upgraded card instance {card_instance_id} to extended art")
-        resp_inner = _hc.encode_objfmt_response(
-            ["Game.Client.Network.Profile.UpgradeExtendedArtOnCardResponse",
-             "System.UInt64", "System.UInt64"],
-            [("StardustInventoryId", "ulong", card_instance_id),
-             ("CardInstanceId", "ulong", card_instance_id)]
-        )
+        card = _hc._db.execute(
+            "SELECT rarity FROM card_templates WHERE guid=?", (row[1],)).fetchone()
+        stardust_id = _spend_extended_art_stardust(
+            handler, user_id, card[0] if card else None)
+        if stardust_id is None:
+            error = _EXTENDED_ART_INSUFFICIENT
+            _hc.log_req(f"    Not enough stardust for card instance {card_instance_id}")
+        else:
+            _hc.db_set_card_instance_extended_art(
+                user_id, card_instance_id, conn=_hc._db)
+            _hc.log_req(f"    Upgraded card instance {card_instance_id} to extended art")
+    _hc._db.commit()
+    resp_inner = _hc.encode_objfmt_response(
+        ["Game.Client.Network.Profile.UpgradeExtendedArtOnCardResponse",
+         "System.UInt64", "System.UInt64", "enum1", _EXTENDED_ART_ERR_TYPE,
+         "System.String"],
+        [("StardustInventoryId", "ulong", stardust_id or 0),
+         ("CardInstanceId", "ulong", card_instance_id),
+         ("Error", "enum1", (_EXTENDED_ART_ERR_TYPE, error)),
+         ("ErrorMessage", "string", "" if error == _EXTENDED_ART_OK else "Upgrade failed")])
     resp_body = _hc.compress_gzip(resp_inner) if comp else resp_inner
     resp_reqid = reqid | 1
     dw_bytes = _hc.encode_datawrapper(resp_reqid, data_type, resp_body, comp, session_id)
@@ -1175,9 +1217,7 @@ def handle_upgradeextendedartoncard_2185(handler, target, instance, data_type, r
         "issuer": issuer_str, "target": target, "instance": instance,
         "reqid": resp_reqid, "c": comp, "conh": conh, "sid": handler.sid,
     }, dw_bytes)
-    _hc.log_req(f"    Sent UpgradeExtendedArtOnCard ({len(dw_bytes)}b)")
-
-
+    _hc.log_req(f"    Sent UpgradeExtendedArtOnCard ({len(dw_bytes)}b, error={error})")
 
 LEGACY_HANDLERS = {
     2091: handle_createnewdeckfromtemplate_2091,

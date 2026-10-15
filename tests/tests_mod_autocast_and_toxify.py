@@ -21,7 +21,7 @@ import types
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path[:0] = [ROOT, os.path.join(ROOT, "tests"),
-                os.path.join(ROOT, "hex-private", "campaign")]
+                os.path.join(ROOT, "campaign")]
 
 import tests_card_play_matrix as matrix  # noqa: E402
 import game_engine  # noqa: E402

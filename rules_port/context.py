@@ -740,7 +740,10 @@ class EffectContext:
 
         target = self.target()
         if target is None:
-            target = self.resolved_target()
+            # The authored target is a player-chosen card ("up to three troops
+            # in a crypt").  With no selection, do not fall back to the source:
+            # Moldmass voided itself when the crypt choice was empty.
+            target = self.resolved_target(source_fallback=False)
         if target is None:
             return "void: no target"
         target = int(target)

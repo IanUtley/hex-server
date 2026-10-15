@@ -428,6 +428,23 @@ def area_payload(db: sqlite3.Connection | None, zone_id: str = AREA_TEMPLATE
         layout = json.loads(map_path.read_text(encoding="utf-8"))
     template = scene_template(entry["records"]) if entry.get("records") else None
     authored = _authored_items(template)
+    # A map node with no SceneData item of its own takes its name from its
+    # faction variants (Node023A/B -> Node023): Records name the variants only.
+    for layout_node in layout["nodes"]:
+        node_id = layout_node["id"]
+        if node_id in authored:
+            continue
+        variant = next((authored[k] for k in sorted(authored)
+                        if re.fullmatch(re.escape(node_id) + r"[A-Z]", k)
+                        and authored[k].get("title")), None)
+        if variant is not None:
+            # Terrain, totem, art and descriptions copy over; the visit events
+            # stay with the variants (each faction's battle).
+            authored[node_id] = {
+                "name": "", "title": variant["title"],
+                "terrain": variant["terrain"], "totem": variant["totem"],
+                "art": variant["art"], "visit_events": [],
+                "descriptions": list(variant["descriptions"])}
     data = zone_catalog(db, entry, authored)
 
     # NodeR -> Node00R is the overworld's spelling only (dungeons use NodeA..).
@@ -455,10 +472,14 @@ def area_payload(db: sqlite3.Connection | None, zone_id: str = AREA_TEMPLATE
     for node in layout["nodes"]:
         node_id = node["id"]
         link = links.get(node_id)
+        # A conversation with a quest row on this node plays as that quest row
+        # (offers.build_offers), so list it once.
+        quest_guids = {row["guid"] for row in quest_links.get(node_id, [])}
         nodes.append(dict(
             node, authored=authored.get(node_id), link=link,
             poi_kind=(link or {}).get("kind") or POI_KINDS.get(node.get("poi"), ""),
-            conversations=node_conversations.get(node_id, []),
+            conversations=[row for row in node_conversations.get(node_id, [])
+                           if row["guid"] not in quest_guids],
             quest_links=quest_links.get(node_id, []),
             encounters=encounters.get(node_id, [])))
     return {
@@ -471,7 +492,8 @@ def area_payload(db: sqlite3.Connection | None, zone_id: str = AREA_TEMPLATE
         "quests": data["quests"], "edges": data["edges"],
         "quest_actions": quest_action_index(db),
         "scene_names": _action_scene_names(data),
-        "issues": _issues(layout, authored, data, node_conversations)}
+        "issues": _issues(layout, authored, data, node_conversations,
+                          _panorama_npcs(zone_id))}
 
 
 def panorama_payload(db: sqlite3.Connection | None, entry: dict[str, Any]
@@ -515,6 +537,10 @@ def panorama_payload(db: sqlite3.Connection | None, entry: dict[str, Any]
                       if offers.canonical_node(raw) == node_id for row in rows]
         conv_rows = [row for raw, rows in data["node_conversations"].items()
                      if offers.canonical_node(raw) == node_id for row in rows]
+    # A conversation with a quest row plays as that row (offers.build_offers),
+    # so it is listed once, under the quest.
+    quest_guids = {row["guid"] for row in quest_rows}
+    conv_rows = [row for row in conv_rows if row["guid"] not in quest_guids]
     npcs = []
     claimed = set()
     for npc in scene.get("npcs") or ():
@@ -540,7 +566,18 @@ def panorama_payload(db: sqlite3.Connection | None, entry: dict[str, Any]
                         "name no NPC in this scene"}] if unassigned else []}
 
 
-def _issues(layout, authored, catalog, node_conversations) -> list[dict[str, str]]:
+def _panorama_npcs(zone_id: str) -> set[str]:
+    """NPC keys of the panoramas off ``zone_id``: their conversations are
+    mapped to the NPC, not to a node on the map, and play inside the panorama."""
+    names: set[str] = set()
+    for entry in zones():
+        if entry.get("kind") == "panorama" and entry.get("parent") == zone_id:
+            names.update(entry.get("npcs") or ())
+    return names
+
+
+def _issues(layout, authored, catalog, node_conversations,
+            panorama_npcs: set[str] = frozenset()) -> list[dict[str, str]]:
     """Cross-checks between the client prefab, Records and the server DB."""
     issues = []
     layout_nodes = {node["id"] for node in layout["nodes"]}
@@ -567,7 +604,8 @@ def _issues(layout, authored, catalog, node_conversations) -> list[dict[str, str
                            "campaign_node_edges" % tuple(sorted(edge))})
     known = set(conversations())
     for node, entries in node_conversations.items():
-        if node not in layout_nodes:
+        # A conversation on a panorama NPC plays inside that panorama.
+        if node not in layout_nodes and entries and node not in panorama_npcs:
             issues.append({"level": "warn", "node": node,
                            "text": "conversations are mapped to a node that "
                            "is not on the map"})

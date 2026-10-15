@@ -2812,7 +2812,7 @@ function sceneEntryLines(entry) {
   if ((entry.items || []).length || entry.item_guid || entry.item_guid_by_race) lines.push("equipment");
   if ((entry.mercenaries || []).length) lines.push(`${entry.mercenaries.map((m) => `${m.quantity > 1 ? `${m.quantity} ` : ""}${mercenaryName(m.guid)}`).join(", ")} (mercenary)`);
   if ((entry.sleeves || []).length) lines.push(`${entry.sleeves.map((m) => `${m.quantity > 1 ? `${m.quantity} ` : ""}${sleeveName(m.guid)}`).join(", ")} (sleeve)`);
-  const when = (entry.when || []).join(" and ");
+  const when = entry.when && entry.when.length ? fmtCond(entry.when) : "";
   return `${lines.join(" · ") || "(nothing)"}${when ? ` — only if ${when}` : ""}${entry.one_time === false ? " (repeatable)" : " (once)"}`;
 }
 
@@ -2824,6 +2824,22 @@ function sceneRewardSummary(rewards) {
 }
 
 let sceneDraft = null;    // {guid, entries: [...], extras: {...}, listShape: bool}
+
+// Reward "Only if" text: "a, b; c" = (a and b) or c. Stored flat when there is
+// one group, otherwise as a list of groups.
+function whenToText(when) {
+  if (!when || !when.length) return "";
+  if (isGroups(when)) return when.map((g) => g.join(", ")).join("; ");
+  return when.join(", ");
+}
+
+function parseWhenText(text) {
+  const groups = String(text || "").split(";")
+    .map((g) => g.split(",").map((t) => t.trim()).filter(Boolean))
+    .filter((g) => g.length);
+  if (!groups.length) return null;
+  return groups.length === 1 ? groups[0] : groups;
+}
 
 function sceneEntryForm(entry, i) {
   const items = entry.items || [];
@@ -2857,7 +2873,7 @@ function sceneEntryForm(entry, i) {
     ${rewardCatalog.races.map((r) => `<div class="reward-row"><span class="reward-race">${esc(r)}</span>
       <input list="rw-equip-list" class="sr-race-item" data-icon="equip" data-race="${esc(r)}" value="${esc(equipmentName(byRace[r]))}" placeholder="(none)">${iconImg(byRace[r])}</div>`).join("")}
     <div class="reward-row"><span class="reward-race">Only if</span>
-      <input list="sr-flag-list" class="sr-when" size="34" value="${esc((entry.when || []).join(", "))}" placeholder="flag(tamed:150b0ed9) — blank: always">
+      <input list="sr-flag-list" class="sr-when" size="34" value="${esc(whenToText(entry.when))}" placeholder="flag(tamed:150b0ed9); !flag(x), flag(y) — blank: always">
     </div>
   </div>`;
 }
@@ -2936,8 +2952,8 @@ function collectSceneEntries() {
     const stardust = collectStardust(box, "sr-sd");
     if (stardust.length) out.stardust = stardust;
     if (old.item_guid) out.item_guid = old.item_guid;
-    const when = box.querySelector(".sr-when").value.split(",").map((t) => t.trim()).filter(Boolean);
-    if (when.length) out.when = when;
+    const when = parseWhenText(box.querySelector(".sr-when").value);
+    if (when) out.when = when;
     return out;
   });
 }
