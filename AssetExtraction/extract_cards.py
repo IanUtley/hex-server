@@ -405,6 +405,11 @@ def _card_ability_bom(data, ability_guids):
         # ability to add to the target card's card_abilities list.
         if ttype == "GrantAbilityEffectTemplate":
             param = _guid(rec, "m_GrantedAbilityTemplateId") or ""
+        # ConversationAbilityEffectTemplate: the conversation the ability starts
+        # mid-battle (m_ConversationId).  Those conversations are not an
+        # encounter's own pre-battle talk.
+        if ttype == "ConversationAbilityEffectTemplate":
+            param = _guid(rec, "m_ConversationId") or ""
         # RevealCards carries recipient visibility on the effect template, not
         # on the ability or target template.  Preserve it in the BOM param so
         # PvP can keep "look at" effects private while still broadcasting true

@@ -252,6 +252,7 @@ def build_offers(zone: str, data: dict[str, Any],
     entries: dict[str, list] = {}
     starts: dict[str, list] = {}
     claims = panorama_claims(zone)
+    triggered = set(data.get("triggered_conversations") or ())
     for node_id, rows in sorted(data["quest_links"].items()):
         node_id = canonical_node(node_id)
         for row in rows:
@@ -397,7 +398,8 @@ def build_offers(zone: str, data: dict[str, Any],
                 if outcome_of(c):
                     outcome.setdefault(outcome_of(c), c)
             pre = [c for c in mine if not outcome_of(c) and
-                   c["trigger"].get("visit") != "repeat"]
+                   c["trigger"].get("visit") != "repeat" and
+                   c["guid"] not in triggered]
             # A tagged battle is offered through its tagged conversation (its
             # tags join the conversation's); on its own only when the node has
             # no tagged conversation, so the default path never skips a gate.

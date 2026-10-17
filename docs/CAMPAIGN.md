@@ -77,6 +77,84 @@ their race's starter panorama is unchanged.
   takes the retry path, and `--zones a,b` runs zones that are not switched on
   yet.
 
+## Node states, visibility and travel
+
+These rules live in `campaign/campaign_rules.py` (`apply`, `node_status`,
+`layout`, `travel_blocked`) and are shown to the client by
+`campaign/campaign_runtime/projection.py`.
+
+**Progress per node** (`state["nodes"][node]`):
+
+- `visits` - how many times the player has stood on the node. A node with
+  `visits > 0`, plus the current node, counts as *visited*.
+- `outcome` - `success` or `fail`, from the last encounter result.
+- `won` - set when a battle at the node is won. Nothing clears it.
+- `failed` - the last encounter result was a loss.
+- `retryable` - the node can be entered again (see below).
+- `completed` - the node is finished. A completed node is not offered again
+  unless the engine's `when` conditions offer something new.
+
+`node_status` returns the effective `(completed, retryable)`. A completion
+gate in the rules overrides the stored value, and `retryable` only counts while
+the node is not completed. Dungeon entrance nodes (`retryable_nodes`) are never
+completed.
+
+**Encounter results:**
+
+- **Win.** `won` is set. An overworld node stays repeatable (`retryable`). A
+  dungeon node completes, unless an outcome conversation still has to play; the
+  node then stays repeatable until that conversation ends and completes it.
+- **Loss.** `failed` is set, and `retryable` is set only if the node is a dungeon
+  node or has already been won. So an overworld loss before any win is not
+  repeatable, and a dungeon loss is repeatable until the battle is won.
+- A lost or unfinished battle stays the node's active entry, so it is offered
+  again while the node is not completed.
+
+**Visibility** (`layout`). A node is shown when a visited node that is *open*
+reveals it. A visited node is open when it is completed, retryable, let through
+by `let_pass()`, or has no action left to play. Forks are always shown. An
+authored `visible` condition is required when present, and `hidden` and
+`blocked` gates take precedence. A node that is not visible reports none of its
+other states.
+
+**Travel lock.** An unwon encounter holds the way shut. A node is *unwon* when
+its active entry is an encounter and it has no `won`. Such a node cannot be left
+for a node the player has not visited (`travel_blocked`). A visited neighbour
+stays reachable, so the way back is always open. An encounter whose conditions
+do not hold is not the active entry, so it does not lock anything.
+
+- The path is drawn locked (`locked: true, shown: false`) while the lock holds.
+- The server refuses the walk. `visit_path` stops at the last node the rules
+  allow and sets `force_move`, so the client walks its token back to the node
+  the server holds. The projection sends `force_move_dest` for dungeon and
+  overworld zones, along with `locked_paths` and `visited_paths`.
+
+**Client colours** (`UIDungeonMapNode.CalcNextStatus`/`DoStatusTransition`): a
+completed node is green; an impassable node is red; a repeatable node is blue;
+a visited node is yellow; anything else is grey. The projection sends
+`completed` (not for a retryable entrance) and `repeatable` (`retryable`).
+
+**The node info panel** (`UICampaignNodeInfoPanel.Show`): the completed OnMove
+text is shown only when the node is completed or repeatable and the player
+selects the node they are standing on. It comes from the client's node
+descriptions, not from the server.
+
+**Pre-battle talk.** An encounter's `pre` conversation plays before its battle.
+A conversation that an ability starts mid-battle (`ConversationAbilityEffectTemplate`,
+whose parameter is the conversation GUID) is never chosen as a pre-battle talk.
+It is listed on the node as an offer that is never selected (`when: False`).
+
+**Simulator** (`campaign_editor/autoplay.py`, used by the editor's Simulate view
+and `tests/tests_campaign_autoplay.py`):
+
+- A run stays in its home overworld and that overworld's dungeons. An offer
+  that teleports elsewhere is refused. A conversation is judged per ending: a
+  conversation is refused only if every ending leaves the area.
+- `lose` (with `lose_scope` `any` or `dungeon`) makes the first battles at
+  distinct nodes lost. A lost battle is offered again until it is won.
+- An offer that was already played is not repeated for the same node result. A
+  node's result (`outcome`, `won`, `failed`) is part of that key.
+
 ## The four campaign types
 
 `campaigns.campaign_type` is serialized to the client as the `CampType` enum:

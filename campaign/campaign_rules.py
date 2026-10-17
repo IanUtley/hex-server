@@ -880,8 +880,18 @@ def explain_entries(rules: dict[str, Any], state: dict[str, Any],
 
 def active_entry(rules: dict[str, Any], state: dict[str, Any],
                  node: str) -> dict[str, Any] | None:
-    """The first node entry whose ``when`` holds: what the node offers now."""
-    for entry in ((rules.get("nodes") or {}).get(node) or {}).get("entries") or ():
+    """The node entry that holds now: what the node offers.
+
+    A battle outcome is offered first: once a node has a result, its
+    ``outcome:success|fail`` conversation plays before the node's ordinary
+    entries.  Otherwise the first entry whose ``when`` holds wins."""
+    entries = ((rules.get("nodes") or {}).get(node) or {}).get("entries") or ()
+    if _node(state, node).get("outcome"):
+        for entry in entries:
+            if "outcome" in json.dumps(entry.get("when")) and evaluate(
+                    entry.get("when"), state, node):
+                return entry
+    for entry in entries:
         if evaluate(entry.get("when"), state, node):
             return entry
     return None
@@ -911,9 +921,13 @@ def node_status(rules: dict[str, Any], state: dict[str, Any],
     return completed, retryable and not completed
 
 
-def _finish_node(rules, node, node_id, *, repeatable=False):
-    """Content finished: complete it unless a completion gate decides."""
-    if _has_gate(rules, node_id, "completed") or _has_gate(rules, node_id, "retryable") or repeatable:
+def _finish_node(rules, node, node_id, *, repeatable=False, retry_on_win=False):
+    """Content finished: complete it unless a completion gate decides.
+
+    A won battle (``retry_on_win``) leaves its node retryable; a completion
+    gate, when present, overrides that (see ``node_status``)."""
+    if (retry_on_win or _has_gate(rules, node_id, "completed") or
+            _has_gate(rules, node_id, "retryable") or repeatable):
         node.update({"completed": False, "retryable": True, "failed": False})
     else:
         node.update({"completed": True, "retryable": False, "failed": False})
@@ -1232,6 +1246,10 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
             for flag in (conversation_flag(name), conversation_flag(
                     name, str(action.get("ending") or "").strip())):
                 _effect(rules, state, {"set_flag": flag}, log, [])
+        if node_id and entry is not None and "outcome" in json.dumps(entry.get("when")):
+            # The battle's outcome conversation has played: the node goes back
+            # to its ordinary offer (the encounter again on a retry).
+            nodes.setdefault(node_id, {}).pop("outcome", None)
         if node_id:   # the server's conversation_visits
             talked = nodes.setdefault(node_id, {})
             talked["talks"] = int(talked.get("talks", 0)) + 1
@@ -1244,8 +1262,11 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
         # A conversation whose ending starts a battle (encounter(...)) does not
         # finish its node: the battle's result does, as its victory completes it.
         started_battle = (state.get("encounter") or {}).get("node") == node_id
+        # A lost fight leaves its node failed (retryable), and its outcome:fail
+        # conversation must not complete it.
+        lost_battle = bool(nodes.get(node_id, {}).get("failed"))
         if entry is not None and entry.get("kind") == "conversation" and not \
-                started_battle and (
+                started_battle and not lost_battle and (
                 not action.get("conversation") or
                 entry.get("conversation") == action.get("conversation")):
             _finish_node(rules, nodes.setdefault(node_id, {}), node_id,
@@ -1258,6 +1279,14 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
     elif kind == "encounter_result":
         entry = active_entry(rules, state, node_id)
         started = state.get("encounter") or {}
+        node_entries = ((rules.get("nodes") or {}).get(node_id) or {}).get("entries") or ()
+        if started.get("node") != node_id and any(
+                e.get("kind") == "encounter" for e in node_entries) and not any(
+                e.get("kind") == "encounter" and evaluate(e.get("when"), state, node_id)
+                for e in node_entries):
+            # A node's own battle needs an encounter offer that holds (its gates:
+            # e.g. a dungeon's final battle waits for every other node).
+            raise RulesError(f"no battle is offered at {node_id} now")
         if started.get("node") == node_id:
             # A battle a conversation started: the node's content is that
             # conversation, so the result only records the outcome.
@@ -1293,7 +1322,13 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
             # it as Repeatable) unless a completion gate, such as a taming flag,
             # decides otherwise. A dungeon battle completes when won.
             node["won"] = True
+            # A dungeon win completes its node, unless an outcome conversation
+            # follows: that conversation's end completes it instead, so the
+            # client can still start it.
+            follow_up = any("outcome" in json.dumps(e.get("when")) for e in (
+                (rules.get("nodes") or {}).get(node_id) or {}).get("entries") or ())
             _finish_node(rules, node, node_id,
+                         retry_on_win=not rules.get("dungeon") or follow_up,
                          repeatable=bool(rules.get("battles_repeat")) or bool(
                              (entry or {}).get("repeatable")))
             # The victory conversation's actions (a won final battle may
@@ -1304,9 +1339,12 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
                 _run_actions(state, ending_actions((entry or {}).get("victory_actions")),
                              log, node_id, rules)
         else:
-            # A loss can be retried only once the node has had a win; otherwise
-            # losing every fight would walk the player through the overworld.
-            node.update({"failed": True, "retryable": bool(node.get("won"))})
+            # An overworld loss can be retried only once the node has had a win,
+            # so losing every fight cannot walk the player through the map.  A
+            # dungeon node stays repeatable until it is won.  Either way the
+            # battle stays offered and the path lock holds the way shut.
+            node.update({"failed": True, "retryable": bool(
+                node.get("won") or rules.get("dungeon"))})
         # Hooks run after the result so a completion gate can read the flags
         # they set (taming sets its flag on the same victory).
         _dispatch(rules, state, result_event, log)
@@ -1398,6 +1436,7 @@ def apply(rules: dict[str, Any], state: dict[str, Any],
     return state, log
 
 
+
 # ---------------------------------------------------------------- layout
 
 def path_id(rules, a, b):
@@ -1468,15 +1507,46 @@ def _battle_scene(state, node_id, entry):
     return entry.get("scene") if entry and entry.get("kind") == "encounter" else None
 
 
+def _unwon_encounter(rules, state, node_id) -> bool:
+    """True for a node with an encounter entry the player has not won yet.
+
+    A won battle sets ``won`` on the node (see the encounter resolver), so the
+    win is tracked in the saved state rather than by an authored conversation.
+    """
+    if _node(state, node_id).get("won"):
+        return False
+    # Only a battle the player can fight now holds the way shut: an encounter
+    # whose conditions are not met is not offered, so it cannot be won.
+    entry = active_entry(rules, state, node_id)
+    return bool(entry and entry.get("kind") == "encounter")
+
+
+def visited_nodes(state) -> set[str]:
+    """Nodes the player has stood on, plus the current one."""
+    visited = {n for n, v in (state.get("nodes") or {}).items()
+               if int(v.get("visits", 0)) > 0}
+    if state.get("current"):
+        visited.add(state["current"])
+    return visited
+
+
+def travel_blocked(rules, state, a, b, visited=None) -> bool:
+    """True when the path between ``a`` and ``b`` cannot be walked yet.
+
+    An unwon encounter node cannot be left for a node the player has not
+    visited.  Visited nodes stay reachable, so the way back is always open.
+    """
+    visited = visited_nodes(state) if visited is None else visited
+    return ((b not in visited and _unwon_encounter(rules, state, a)) or
+            (a not in visited and _unwon_encounter(rules, state, b)))
+
+
 def layout(rules: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     """Derive the client-visible map for ``state``."""
     node_rules = rules.get("nodes") or {}
     neighbours = _neighbours(rules)
     forks = {n for n in neighbours if n.startswith("Fork")}
-    visited = {n for n, v in (state.get("nodes") or {}).items()
-               if int(v.get("visits", 0)) > 0}
-    if state.get("current"):
-        visited.add(state["current"])
+    visited = visited_nodes(state)
 
     def gate(node_id, key):
         spec = node_rules.get(node_id) or {}
@@ -1533,13 +1603,15 @@ def layout(rules: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
             "enabled": visible and node_id not in forks,
             "blocked": node_id in blocked,
             "hidden": node_id in hidden,
-            "marker": node_id in markers,
+            # A quest marker only shows on a node the player can see.
+            "marker": node_id in markers and visible,
             **{key: node_id in nodes_with for key, nodes_with in flags_of.items()},
             "givequest": node_id in flags_of["givequest"] or give_marker,
             "turninquest": node_id in flags_of["turninquest"] or turnin_marker,
             "visited": node_id in visited,
             "completed": completed,
-            "retryable": retryable,
+            # A dungeon or panorama can be re-entered only once the node is visible.
+            "retryable": retryable and visible,
             # Drawn red by the client until completed (UIDungeonMapNode).
             "impassable": node_id in impassable and not completed,
             "failed": bool(progress.get("failed")),
@@ -1550,14 +1622,32 @@ def layout(rules: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
             "mod_choices": mod_choices_for(
                 rules, state, _battle_scene(state, node_id, entry) or "", node_id),
         }
+    # Unless a node is visible, none of its other states apply: it is not
+    # marked, offered, completable or retryable.  Blocked/hidden stay as the
+    # reason it is not visible.
+    for node_id, info in nodes.items():
+        if info["visible"]:
+            continue
+        for key, value in info.items():
+            if key in ("visible", "enabled", "blocked", "hidden", "visited"):
+                continue
+            if isinstance(value, bool):
+                info[key] = False
+            elif isinstance(value, list):
+                info[key] = []
+            elif key != "current":
+                info[key] = None
     paths = []
     for path in (rules.get("map") or {}).get("paths") or ():
         a, b = nodes.get(path["from"], {}), nodes.get(path["to"], {})
-        # A path is drawn once both ends are visible and either end has been
-        # visited, even while the visited node's own action is unfinished.
+        # Drawn once both ends are visible and either end has been visited (even
+        # while that node's action is unfinished), unless an unwon encounter
+        # holds the way shut to a node the player has not reached.
         locked = bool(a.get("visible") and b.get("visible") and not (
             path["from"] in visited or path["to"] in visited or
             path["from"] in forks or path["to"] in forks))
+        if travel_blocked(rules, state, path["from"], path["to"], visited):
+            locked = True
         paths.append({
             "id": path["id"],
             "shown": bool(a.get("visible") and b.get("visible")) and not locked,

@@ -59,6 +59,21 @@ def _visible(state):
     return {n for n, v in cr.layout(RULES, state)["nodes"].items() if v["visible"]}
 
 
+def test_unwon_encounter_locks_its_paths_to_unvisited_nodes_until_won():
+    """An encounter node the player has not won holds its paths shut to
+    unvisited nodes; a recorded win (``won``) opens them."""
+    rules = {"schema_version": 1, "start": {"node": "B", "flags": []},
+             "map": {"paths": [{"id": "Path_B_C", "from": "B", "to": "C"}]},
+             "nodes": {"B": {"entries": [{"kind": "encounter", "scene": SCENE,
+                                          "when": {}}]}}}
+    state = cr.initial_state(rules)
+    state, _ = cr.apply(rules, state, {"type": "visit", "node": "B"})
+    assert cr.travel_blocked(rules, state, "B", "C")
+    assert cr.layout(rules, state)["paths"][0]["locked"]
+    state["nodes"]["B"]["won"] = True
+    assert not cr.travel_blocked(rules, state, "B", "C")
+
+
 def test_conditional_encounter_stays_retryable_until_its_event():
     """Winning without taming leaves the node replayable; taming sets the flag
     its ``completed`` gate reads and advances the quest (the Tamed contract)."""
@@ -97,7 +112,8 @@ def test_same_node_offers_state_dependent_content_and_gates_follow_quests():
     state, _ = cr.apply(RULES, state, {"type": "conversation_end", "node": "B",
                                        "conversation": GIVER})
     assert _visible(state) == {"A", "B", "C"}          # D is quest-blocked
-    assert cr.layout(RULES, state)["nodes"]["E"]["marker"]
+    # E is marked only once it is visible (it is quest-gated until the turn-in).
+    assert not cr.layout(RULES, state)["nodes"]["E"]["marker"]
     state, _ = cr.apply(RULES, state, {"type": "visit", "node": "C"})
     state, _ = cr.apply(RULES, state, {"type": "encounter_result", "node": "C",
                                        "victory": True, "events": ["tamed_troop"]})
@@ -348,16 +364,16 @@ def test_editor_saves_tags_to_campaign_files():
             assert data["tables"]["campaign_node_conversations"] == []
             catalog.RULES_DIR.mkdir()
             Path(catalog.RULES_DIR, "Z.json").write_text(json.dumps(RULES))
-            editing.save_node_state("Z", "E", "hidden", ["completedQuest(tame)"])
+            editing.save_node_state("Z", "E", "marker", ["completedQuest(tame)"])
             assert json.loads(Path(catalog.RULES_DIR, "Z.json").read_text()
-                              )["nodes"]["E"]["hidden"] == ["completedQuest(tame)"]
+                              )["nodes"]["E"]["marker"] == ["completedQuest(tame)"]
             try:
-                editing.save_node_state("Z", "E", "hidden", ["bogus(x)"])
+                editing.save_node_state("Z", "E", "marker", ["bogus(x)"])
                 raise AssertionError("invalid tag saved")
             except ValueError:
                 pass
-            editing.save_node_state("Z", "E", "hidden", None)
-            assert "hidden" not in json.loads(Path(catalog.RULES_DIR, "Z.json")
+            editing.save_node_state("Z", "E", "marker", None)
+            assert "marker" not in json.loads(Path(catalog.RULES_DIR, "Z.json")
                                               .read_text())["nodes"]["E"]
         finally:
             catalog.DATA_DIR, catalog.RULES_DIR = saved
@@ -385,7 +401,7 @@ def test_or_groups_and_generated_crayburn_rules():
         print("SKIP generated Crayburn rules not present")
         return
     rules = copy.deepcopy(cr.load_rules(path))
-    rules["nodes"]["CastleGate"]["entries"] = [
+    rules["nodes"].setdefault("CastleGate", {})["entries"] = [
         {"id": race, "kind": "encounter", "scene": race, "when": [f"ChampionIsRace({race})"]}
         for race in ("Human", "Necrotic")]
     for node in ("WatchTower", "Drawbridge"):
@@ -435,6 +451,12 @@ def test_card_selector_offers_flagged_cards_and_clears_the_won_one():
     rules["start"]["flags"] = ["tower", "walls"]
     rules["mod_choices"] = {SCENE: cr.scene_mod_choices(mods)}
     state = cr.initial_state(rules)
+    # C is revealed by finishing B's conversation; nothing on a hidden node applies.
+    assert cr.layout(rules, state)["nodes"]["C"]["mod_choices"] == []
+    state, _ = cr.apply(rules, state, {"type": "visit", "node": "B"})
+    state, _ = cr.apply(rules, state, {"type": "conversation_end", "node": "B",
+                                       "conversation": GIVER})
+    assert "C" in _visible(state)
     assert cr.layout(rules, state)["nodes"]["C"]["mod_choices"] == [tower, walls]
     try:
         cr.apply(rules, state, {"type": "encounter_result", "node": "C", "scene": SCENE,

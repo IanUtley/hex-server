@@ -167,6 +167,8 @@ def project(rules: dict[str, Any], state: dict[str, Any],
             # entrance (always retryable) is reported as not completed.
             "completed": (bool(info.get("completed")) and not progress.get("result")
                           and node not in (rules.get("retryable_nodes") or ())),
+            # The client draws a repeatable node as "new"; a dungeon node that
+            # can be retried stays incomplete (visited) until it is completed.
             "repeatable": bool(info.get("retryable")),
             "givequest": bool(info.get("givequest")),
             "turninquest": bool(info.get("turninquest")),
@@ -263,19 +265,23 @@ def project(rules: dict[str, Any], state: dict[str, Any],
             pdata["PanoramaNode"] = zone_entry.get("parent_node")
             out["PanoramaSceneGuid"] = zone_entry["scene_guid"]
             out["PanoramaNode"] = zone_entry.get("parent_node")
-    if kind == "overworld":
-        # What the map client draws: visited and quest-objective nodes,
+    if kind in ("overworld", "dungeon"):
+        # What the map client draws: visited nodes (yellow until completed),
         # visited and still-locked paths, and a walk-back to perform.
         pdata["visited_nodes"] = sorted(
             display(n) for n, v in layout["nodes"].items() if v.get("visited"))
-        pdata["quest_nodes"] = sorted(
-            display(n) for n, v in layout["nodes"].items() if v.get("marker"))
+    if kind in ("overworld", "dungeon"):
         pdata["locked_paths"] = [p["id"] for p in layout["paths"] if p.get("locked")]
         pdata["visited_paths"] = list(state.get("visited_paths") or ())
-        if force_move:
-            pdata["force_move_dest"] = display(force_move)
-        else:
-            pdata.pop("force_move_dest", None)
+    if kind == "overworld":
+        pdata["quest_nodes"] = sorted(
+            display(n) for n, v in layout["nodes"].items() if v.get("marker"))
+    # A walk-back applies to every map kind: the client's token must return
+    # to the node the rules hold it on (a refused path walk, or an impassable).
+    if force_move:
+        pdata["force_move_dest"] = display(force_move)
+    else:
+        pdata.pop("force_move_dest", None)
     # The card selector lists the active battle's options (modlistId path).
     choices = ((state.get("nodes") or {}).get(aloc) or {}).get("choices") if aloc else None
     if choices:

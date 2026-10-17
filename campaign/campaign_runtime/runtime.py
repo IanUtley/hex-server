@@ -284,18 +284,26 @@ def _is_fork(node: str) -> bool:
     return str(node).startswith("Fork")
 
 
-def _route(zone: Zone, start: str, path_ids: list[str]) -> list[str]:
-    """The nodes a ``visit_path`` route walks through, ``start`` first."""
+def _route(zone: Zone, start: str, path_ids: list[str]) -> tuple[list[str], list[str], bool]:
+    """The nodes a ``visit_path`` route walks through, ``start`` first, the
+    path ids actually walked, and whether the rules stopped the walk early.
+    The walk stops before a step the rules lock (an unwon encounter may not be
+    left for an unvisited node)."""
     paths = {p["id"]: (p["from"], p["to"])
              for p in (zone.rules.get("map") or {}).get("paths") or ()}
-    nodes, current = ([start] if start else []), start
+    nodes, walked, current, blocked = ([start] if start else []), [], start, False
     for pid in path_ids:
         ends = paths.get(pid)
         if not ends:
             continue
-        current = ends[1] if current == ends[0] else ends[0] if current == ends[1] else ends[1]
-        nodes.append(current)
-    return nodes
+        nxt = ends[1] if current == ends[0] else ends[0] if current == ends[1] else ends[1]
+        if current and engine.travel_blocked(zone.rules, zone.eng, current, nxt):
+            blocked = True
+            break
+        nodes.append(nxt)
+        walked.append(pid)
+        current = nxt
+    return nodes, walked, blocked
 
 
 def _route_stop(zone: Zone, route: list[str]) -> str:
@@ -341,13 +349,17 @@ def visit_path(zone: Zone, oparms):
     values = oparms[0] if oparms and isinstance(oparms[0], list) else oparms
     ids = [str(v) for v in (values or ()) if v]
     seen = zone.eng.setdefault("visited_paths", [])
-    for pid in ids:
+    route, walked, blocked = _route(zone, str(zone.eng.get("current") or ""), ids)
+    for pid in walked:
         if pid not in seen:
             seen.append(pid)
-    route = _route(zone, str(zone.eng.get("current") or ""), ids)
     stop = _route_stop(zone, route)
     if stop and stop != zone.eng.get("current"):
         arrive(zone, stop, route)
+    if blocked:
+        # The client walks its token before it asks, so a refused step must
+        # be walked back to where the rules hold the player.
+        zone.rt["force_move"] = str(zone.eng.get("current") or "")
 
 
 def force_move(zone: Zone, oparms):
@@ -581,12 +593,20 @@ def battle_end(zone: Zone, session, won: bool):
     except engine.RulesError:
         action.pop("mod", None)        # the option is no longer on offer
         zone.apply(action)
+    if result is None and started.get("node") == node:
+        # A battle a conversation started has no authored result of its own:
+        # its ``outcome:success|fail`` follow-up conversation plays next.
+        follow = engine.active_entry(zone.rules, zone.eng, node)
+        if follow and follow.get("kind") == "conversation" and \
+                "outcome" in json.dumps(follow.get("when")):
+            result = follow.get("conversation")
+            entry = follow
     # A node-offered battle's authored result conversation plays next; its
     # ending actions run when it ends (conversation_done: result_of).
     if result:
         node_progress = zone.eng.setdefault("nodes", {}).setdefault(node, {})
         node_progress["result"] = result
-        node_progress["result_of"] = entry.get("id")
+        node_progress["result_of"] = (entry or {}).get("id")
     _count_dungeon_run(zone, won)
     # The client ignores a zone transition while it is still in the battle:
     # a teleport the result itself produced (a hook) waits for the client's
@@ -738,8 +758,34 @@ def handle_query(handler, db, zone_id, env_json, comp, session_id, reqid,
         zone.release_pending_teleport()
         handle_teleport(handler, zone)
         state = zone.commit(handler) if not zone.teleported else _commit_after_teleport(handler, zone)
-        return _respond(handler, zone, state, comp, session_id, reqid, target,
-                        instance, conh, uid)
+        response = _respond(handler, zone, state, comp, session_id, reqid, target,
+                            instance, conh, uid)
+        _push_active_journal(handler, db, camp_id, row[0], zone.template,
+                             comp, session_id, target, instance, conh, uid)
+        return response
+
+
+def _push_active_journal(handler, db, camp_id, champ_id, template, comp,
+                         session_id, target, instance, conh, uid):
+    """Send the champion's active quests to the client's journal.
+
+    The client only updates quests it already holds, so a quest that was
+    active before the zone loaded is spawned again here.  Each quest is sent
+    once per client connection, however often the zone state is queried."""
+    sent = getattr(handler, "_journal_sent", None)
+    if sent is None:
+        sent = handler._journal_sent = set()
+    rows = db.execute(
+        "SELECT id, template_name, state_json FROM campaigns "
+        "WHERE champion_id=? AND campaign_type='QUEST'", (champ_id,)).fetchall()
+    for quest_id, name, raw in rows:
+        quest = json.loads(raw or "{}")
+        if quest.get("Finished") or quest_id in sent:
+            continue
+        sent.add(quest_id)
+        _campaign().push_campspawn(handler, quest_id, champ_id, name, quest,
+                                   camp_id, template, comp, session_id, target,
+                                   instance, conh, uid)
 
 
 def handle_forfeit(handler, db, zone_id, env_json, comp, session_id, reqid,

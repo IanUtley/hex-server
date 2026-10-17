@@ -486,13 +486,20 @@ def server_catalog(db: sqlite3.Connection, template: str = AREA_TEMPLATE,
     edges = [dict(row) for row in _query(db,
         "SELECT from_node, to_node, path_name FROM campaign_node_edges "
         "WHERE campaign_template=?", (template,))]
+    # Conversations an ability starts mid-battle (ConversationAbilityEffect):
+    # they are not an encounter's pre-battle talk.
+    triggered = {str(row[0]).lower() for row in _query(db,
+        "SELECT DISTINCT param FROM ability_effects "
+        "WHERE effect_type='ConversationAbilityEffectTemplate' AND param<>''")}
     return {"node_conversations": node_conversations,
             "quest_links": quest_links, "encounters": encounters,
-            "quests": quests, "edges": edges}
+            "quests": quests, "edges": edges,
+            "triggered_conversations": triggered}
 
 
 _EMPTY_CATALOG = {"node_conversations": {}, "quest_links": {},
-                  "encounters": {}, "quests": [], "edges": []}
+                  "encounters": {}, "quests": [], "edges": [],
+                  "triggered_conversations": set()}
 
 
 def _map_node_ids(records_name: str) -> set[str]:

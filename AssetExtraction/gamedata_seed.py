@@ -127,7 +127,7 @@ def load_records_text(path: str | Path | None = None) -> str:
             if not line:
                 continue
             try:
-                value = json.loads(line)
+                value = json.loads(line, strict=False)
             except json.JSONDecodeError:
                 continue
             records.append(value if isinstance(value, str) else line)
@@ -162,7 +162,9 @@ def parse_record(raw: str) -> dict[str, Any] | None:
     """Parse a record, tolerating the export's trailing commas."""
     cleaned = re.sub(r",\s*([}\]])", r"\1", raw)
     try:
-        value = json.loads(cleaned)
+        # strict=False: the client export puts raw control characters (for
+        # example line breaks in m_GameText) inside string values.
+        value = json.loads(cleaned, strict=False)
     except (TypeError, json.JSONDecodeError):
         # ConversationTemplate records use relaxed JSON with integer object
         # keys (``0 : {...}``).  PyYAML is also what campaign.py uses for the
@@ -176,7 +178,7 @@ def parse_record(raw: str) -> dict[str, Any] | None:
             return None
     if isinstance(value, str):
         try:
-            value = json.loads(re.sub(r",\s*([}\]])", r"\1", value))
+            value = json.loads(re.sub(r",\s*([}\]])", r"\1", value), strict=False)
         except (TypeError, json.JSONDecodeError):
             if yaml is None:
                 return None
@@ -397,7 +399,9 @@ def _extract_targets(data: str) -> list[tuple[Any, ...]]:
             record.get("m_PlayerFilter") or "",
             record.get("m_CollectionFlags") or "",
             _target_count(record.get("m_MinTargetCount"), 0),
-            _target_count(record.get("m_MaxTargetCount"), 1),
+            # An unset maximum is C#'s int.MaxValue ("each ..." and every
+            # auto-target leave it unset), not a single target.
+            _target_count(record.get("m_MaxTargetCount"), 2147483647),
             json_text(record.get("m_CardFilter"), {}),
             str(record.get("_t") or "").split(".")[-1],
         )
@@ -1281,7 +1285,10 @@ def _extract_pack_map(data: str) -> list[tuple[Any, ...]]:
 
 
 _EXTRACT_CACHE: dict[str, dict[str, Any]] = {}
-_EXTRACT_CACHE_VERSION = 7   # 7: inventory_item_templates
+_EXTRACT_CACHE_VERSION = 10  # 10: ConversationAbilityEffect stores its conversation
+# 9: unset target max is int.MaxValue, not 1
+# 8: strict=False Records parsing (control chars)
+# 7: inventory_item_templates
 
 
 def _extract_cache_file(cache_key: str) -> str:

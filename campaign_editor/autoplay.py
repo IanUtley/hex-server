@@ -61,7 +61,10 @@ RACE_ORDER = list(catalog.FACTION_OF_RACE)
 # ---------------------------------------------------------------- zones
 
 def zone_scope(home: str) -> list[str]:
-    """``home`` and every dungeon/panorama reached from it (recursively)."""
+    """``home`` and every dungeon/panorama reached from it (recursively).
+
+    A race's starter panorama (``az0-<race>``) also reaches the overworld
+    AZ1: its teleport leaves for AZ1, which the run then follows."""
     found, todo = [home], [home]
     while todo:
         current = todo.pop()
@@ -69,6 +72,10 @@ def zone_scope(home: str) -> list[str]:
             if child["id"] not in found:
                 found.append(child["id"])
                 todo.append(child["id"])
+    if home.lower().startswith("az0-"):
+        # The starter's quests lead to Crayburn Castle, and from there to AZ1.
+        for extra in ("crayburn", "AZ1"):
+            found += [zone for zone in zone_scope(extra) if zone not in found]
     return found
 
 
@@ -91,27 +98,34 @@ def _has_lives(rules) -> bool:
 
 # ---------------------------------------------------------------- memo
 
-def new_run(db, home: str, race: str, limit: int = MAX_STEPS
-            ) -> tuple[dict[str, Any], dict[str, Any]]:
+def new_run(db, home: str, race: str, limit: int = MAX_STEPS, lose: int = 0,
+            lose_scope: str = "any") -> tuple[dict[str, Any], dict[str, Any]]:
     """``(state, memo)`` for a fresh run of ``home`` with ``race`` (the
-    state is the simulator's New game: ``engine.initial_state``)."""
-    memo = start_memo(db, home, race, limit)
+    state is the simulator's New game: ``engine.initial_state``).  ``lose``
+    is how many first battles, at distinct nodes, the run loses."""
+    memo = start_memo(db, home, race, limit, lose, lose_scope)
     state = engine.initial_state(_rules(db, home), race=race,
                                  faction=catalog.FACTION_OF_RACE[race])
     return state, memo
 
 
-def start_memo(db, home: str, race: str, limit: int = MAX_STEPS) -> dict[str, Any]:
+def start_memo(db, home: str, race: str, limit: int = MAX_STEPS,
+               lose: int = 0, lose_scope: str = "any") -> dict[str, Any]:
     """The run's bookkeeping for ``home`` (an overworld) and ``race``."""
     if race not in catalog.FACTION_OF_RACE:
         raise ValueError(f"unknown race {race!r}")
-    if catalog_data.zone(home).get("kind") != "overworld":
-        raise ValueError(f"{home} is not an overworld zone")
+    home_zone = catalog_data.zone(home)
+    starter = home_zone.get("kind") == "panorama" and bool(home_zone.get("race"))
+    if home_zone.get("kind") != "overworld" and not starter:
+        raise ValueError(f"{home} is not an overworld or a race starter zone")
     _rules(db, home)
     return {"home": home, "zone": home, "race": race,
             "expected": zone_quests(db, home, race),
             "faction": catalog.FACTION_OF_RACE[race],
             "limit": max(1, min(int(limit or MAX_STEPS), 20000)),
+            "lose": max(0, int(lose or 0)), "lost": [],
+            # "any": the first battles; "dungeon": only battles inside a child zone.
+            "lose_scope": lose_scope,
             "steps": 0, "battles": 0, "conversations": 0, "visits": 0,
             "zones": {}, "played": [], "entered": {}, "left": {},
             "entrance_done": [], "pre_done": [], "pending": None,
@@ -127,6 +141,15 @@ def _note(memo, text):
 def _log(memo, text):
     memo["log"].append(f"{memo['steps']}. [{memo['zone']}] {text}")
     del memo["log"][:-400]
+
+
+def _play_stamp(state, node_id) -> str:
+    """The state a played offer is keyed on: the run's signature plus the
+    node's own result, which the signature leaves out (a lost fight changes
+    only the node)."""
+    progress = (state.get("nodes") or {}).get(node_id) or {}
+    return (f"{_signature(state)}|{progress.get('outcome', '')}|"
+            f"{int(bool(progress.get('won')))}|{int(bool(progress.get('failed')))}")
 
 
 def _signature(state) -> str:
@@ -193,27 +216,45 @@ def _conversation_name(guid: str, fallback: str = "") -> str:
 
 
 def conversation_action(rules, state, node_id, guid, entry=None,
-                        result_of=None) -> dict[str, Any]:
+                        result_of=None, home=None) -> dict[str, Any]:
     """The ``conversation_end`` that does most for the quests (see module doc)."""
     base = {"type": "conversation_end", "node": node_id, "conversation": guid,
             "name": _conversation_name(guid, (entry or {}).get("label", ""))}
     if result_of:
         base["result_of"] = result_of
     endings = _endings(guid)
+    if not endings:
+        # A conversation whose answers are only its authored action keys (a
+        # dungeon's "one/two/three_point_answer" starts a battle) ends with
+        # the answer that does most, as the player would choose it.
+        answers = [key for key in ((entry or {}).get("actions") or {}) if key != "*"]
+        if answers:
+            candidates = [(dict(base, ending=key), False) for key in answers]
+            return _best(rules, state, candidates, node_id) or candidates[0][0]
     if len(endings) <= 1:
         return dict(base, ending=endings[0]["ending"] if endings else "")
     own = set((entry or {}).get("actions") or {}) - {"*"}
     candidates = [(dict(base, ending=e["ending"],
                         events=[e["ending"]] if e.get("event") else []),
                    e["ending"] in own) for e in endings]
+    if home:
+        # Inside the home overworld: an ending that teleports elsewhere is not
+        # taken while another ending stays put.
+        actions = (entry or {}).get("actions") or {}
+        staying = [c for c in candidates if not _leaves_area(
+            {"actions": {c[0]["ending"]: actions.get(c[0]["ending"], [])}}, home)]
+        candidates = staying or candidates
     return _best(rules, state, candidates, node_id) or candidates[0][0]
 
 
 def battle_action(rules, state, layout, node_id, scene, entry=None,
-                  result_conversation=False) -> dict[str, Any]:
-    """A won ``encounter_result`` with the events / selector card that do most."""
+                  result_conversation=False, victory=True) -> dict[str, Any]:
+    """A won ``encounter_result`` with the events / selector card that do most
+    (a lost one carries no events: a defeat grants no tamed troop)."""
     base = {"type": "encounter_result", "node": node_id, "scene": scene,
-            "victory": True}
+            "victory": bool(victory)}
+    if not victory:
+        return base
     if result_conversation:
         # The battle's victory conversation plays next (and runs its actions).
         base["result_conversation"] = True
@@ -265,12 +306,26 @@ def _playable(rules, state, layout, memo, zone_id, node_id):
     # entry there (the next step of a quest giver) is played like any other.
     if entry.get("kind") == "shroomhaus" and not entry.get("choices"):
         return None
-    key = f"{zone_id}|{node_id}|{entry.get('id')}"
-    if key + f"|{_signature(state)}" in memo["played"]:
+    if _leaves_area(entry, memo["home"]) and entry.get("kind") != "conversation":
+        # Runs stay inside their home overworld (and its dungeons): a battle
+        # whose offer teleports to another overworld is never played.  A
+        # conversation is judged per ending (conversation_action).
         return None
-    if any(p.startswith(key + "|") for p in memo["played"]) and not _quest_related(
-            rules, state, info, entry):
-        return None       # played already; again only when a quest moved on
+    if entry.get("kind") == "conversation" and entry.get("conversation"):
+        endings = _endings(entry["conversation"])
+        actions = entry.get("actions") or {}
+        if endings and all(_leaves_area({"actions": {e["ending"]: actions.get(e["ending"], [])}},
+                                        memo["home"]) for e in endings):
+            return None
+    key = f"{zone_id}|{node_id}|{entry.get('id')}"
+    if key + f"|{_play_stamp(state, node_id)}" in memo["played"]:
+        return None
+    if any(p.startswith(key + "|") for p in memo["played"]) and not (
+            _quest_related(rules, state, info, entry)
+            or (entry.get("kind") == "encounter" and not info.get("completed"))):
+        # Played already: again only when a quest moved on, or while an
+        # encounter is unfinished (a lost one stays playable until it is won).
+        return None
     return entry
 
 
@@ -305,7 +360,11 @@ def _worth_entering(db, state, memo, child) -> bool:
 
 def _route(rules, layout, start, goal):
     """Nodes from ``start`` to ``goal`` over the shown paths, or None."""
-    open_paths = {p["id"] for p in layout["paths"] if p["shown"] and not p["locked"]}
+    # The token walks up to an impassable node and stops there, so the last hop
+    # into an impassable goal may use its locked path; no other locked path opens.
+    goal_impassable = bool((layout["nodes"].get(goal) or {}).get("impassable"))
+    open_paths = {p["id"] for p in layout["paths"] if p["shown"] and (
+        not p["locked"] or (goal_impassable and goal in (p["from"], p["to"])))}
     links: dict[str, list[str]] = {}
     for path in (rules.get("map") or {}).get("paths") or ():
         if path["id"] in open_paths:
@@ -342,7 +401,8 @@ def _travel_target(db, rules, state, layout, memo, zone_id):
     """``(node to visit, why)`` or None (rule 7)."""
     current = state.get("current") or ""
     children = _children(zone_id)
-    npc_zone = bool(rules.get("npc_zone"))
+    # A zone with no paths (a starter panorama) lists its NPCs directly.
+    npc_zone = bool(rules.get("npc_zone")) or not (rules.get("map") or {}).get("paths")
     options = []
     for node_id, info in layout["nodes"].items():
         # A fork is a pass-through junction (no offer, never enabled): it is
@@ -357,6 +417,8 @@ def _travel_target(db, rules, state, layout, memo, zone_id):
             rank, why = 3, "through a fork"
         elif entry is not None:
             rank = 0 if _quest_related(rules, state, info, entry) else 1
+            if _leaves_area(entry, memo["home"]):
+                rank = 9   # leaving the area is the last thing to do
             why = f"for {entry.get('label') or entry.get('id')}"
         elif node_id in children and _worth_entering(db, state, memo, children[node_id]):
             rank, why = 2, f"to enter {children[node_id]['id']}"
@@ -417,6 +479,18 @@ def _enter(db, state, memo, dest, node, *, child_of=None, done_child=False):
     return new, log
 
 
+def _leaves_area(entry, home) -> bool:
+    """Whether an offer's actions teleport to another overworld than ``home``."""
+    for actions in (entry.get("actions") or {}).values():
+        for action in actions or ():
+            text = str(action)
+            if text.startswith("teleport("):
+                dest = text[len("teleport("):].split(",")[0].strip(") ")
+                if catalog_data.zone(dest).get("kind") == "overworld" and dest.lower() != str(home).lower():
+                    return True
+    return False
+
+
 def _step(db, zone_id, state, memo) -> dict[str, Any]:
     """The next step (without counting it): ``{"apply": action, "why"}``,
     ``{"enter": zone, "node", "state", "why"}`` or ``{"done": reason}``."""
@@ -433,10 +507,19 @@ def _step(db, zone_id, state, memo) -> dict[str, Any]:
                 return {"apply": {"type": "visit", "node": node},
                         "why": f"teleported to {node}"}
         else:
+            if (catalog_data.zone(dest).get("kind") == "overworld"
+                    and dest.lower() != str(memo["home"]).lower()):
+                # Another overworld is on offer: stop here, without entering it.
+                return {"done": f"stopped at the teleport to {dest}"
+                                f"{' ' + node if node else ''} (the next area)"}
             match = next((z for z in scope if z.lower() == dest.lower()), None)
             if match:
                 return {"enter": match, "node": node, "why": f"teleport to {match}",
                         "done_child": True}
+            if catalog_data.zone(dest).get("kind") == "overworld":
+                # The next overworld: the run plays everything up to here and stops.
+                return {"done": f"stopped at the teleport to {dest}"
+                                f"{' ' + node if node else ''} (the next area)"}
             _note(memo, f"teleport to {dest}{' ' + node if node else ''} "
                         f"(outside {memo['home']}) not followed")
 
@@ -472,23 +555,38 @@ def _step(db, zone_id, state, memo) -> dict[str, Any]:
 
     if current:
         entry = _playable(rules, state, layout, memo, zone_id, current)
+        if entry is not None and _leaves_area(entry, memo["home"]) and _travel_target(
+                db, rules, state, layout, memo, zone_id) is not None:
+            # Everything else in this area comes first: leaving is the last step.
+            entry = None
         pre_key = f"{zone_id}|{current}"
         if (entry is not None and entry["kind"] == "encounter" and entry.get("pre")
                 and pre_key not in memo["pre_done"]):
             # The client plays an offered battle's pre-battle conversation
             # first, once per node (projection: pre_done).
             memo["pre_done"].append(pre_key)
-            return {"apply": conversation_action(rules, state, current, entry["pre"]),
+            return {"apply": conversation_action(rules, state, current, entry["pre"],
+                                                 home=memo["home"]),
                     "why": f"pre-battle talk: {entry.get('label') or entry.get('id')}"}
         if entry is not None:
             memo["played"].append(
-                f"{zone_id}|{current}|{entry.get('id')}|{_signature(state)}")
+                f"{zone_id}|{current}|{entry.get('id')}|{_play_stamp(state, current)}")
             label = entry.get("label") or entry.get("id")
             if entry["kind"] == "conversation":
                 return {"apply": conversation_action(
-                    rules, state, current, entry["conversation"], entry),
-                    "why": f"talk: {label}"}
+                    rules, state, current, entry["conversation"], entry,
+                    home=memo["home"]), "why": f"talk: {label}"}
             if entry["kind"] == "encounter":
+                key = f"{zone_id}|{current}"
+                in_scope = (memo.get("lose_scope") == "any" or
+                            zone_id != memo["home"])
+                if memo.get("lose", 0) > 0 and key not in memo["lost"] and in_scope:
+                    memo["lose"] -= 1
+                    memo["lost"].append(key)
+                    return {"apply": battle_action(
+                        rules, state, layout, current, entry.get("scene", ""),
+                        entry, False, victory=False),
+                        "why": f"battle lost: {label}"}
                 if entry.get("victory"):
                     memo["pending"] = {"zone": zone_id, "node": current,
                                        "conversation": entry["victory"],
@@ -510,6 +608,10 @@ def _step(db, zone_id, state, memo) -> dict[str, Any]:
         node, why = found
         return {"apply": {"type": "visit", "node": node}, "why": f"go to {node} {why}"}
 
+    if zone_entry.get("kind") == "overworld" and zone_id != memo["home"]:
+        # Reached an overworld by teleport and nothing is left there: the run ends
+        # in that area (it does not return to a starter zone).
+        return {"done": f"finished in {zone_id}: nothing reachable left"}
     if zone_id != memo["home"]:
         back = state.get("return_to") or {}
         dest = back.get("zone") or zone_entry.get("parent") or memo["home"]
@@ -1029,11 +1131,11 @@ def api_step(db, body: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- offline
 
-def run(db, home: str, race: str, limit: int = MAX_STEPS
-        ) -> tuple[dict[str, Any], dict[str, Any]]:
+def run(db, home: str, race: str, limit: int = MAX_STEPS, lose: int = 0,
+        lose_scope: str = "any") -> tuple[dict[str, Any], dict[str, Any]]:
     """Play the whole run here (the editor's loop without the page):
-    ``(final state, summary)``."""
-    state, memo = new_run(db, home, race, limit)
+    ``(final state, summary)``.  ``lose`` battles are lost first."""
+    state, memo = new_run(db, home, race, limit, lose, lose_scope)
     zone_id, last = home, None
     while True:
         result = next_step(db, zone_id, state, memo, last)
